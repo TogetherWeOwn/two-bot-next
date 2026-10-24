@@ -30,13 +30,16 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | --- | --- | --- |
 | `gateway intents resolved` | `crates/bot/src/main.rs` (`run`) | Boot resolved the gateway intents; `voice_presences` states whether `GUILD_PRESENCES` was requested (the enabling flag may be a secret binding, so only the boolean is logged). `false` means voice-room game names can never be detected this boot |
 | `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs` (`run`) | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
+| `community facts arming refused; capture disabled` | `crates/bot/src/main.rs` (`run`) | Facts-sink arming refused at boot; capture stays disabled exactly like the scorecard flag being off |
 | `gateway shard loop started` | `crates/bot/src/gateway.rs` (`run_shard`) | Reception task entered the Twilight stream loop |
 | `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs` (`run_shard`) | Transport reconnect attempt failed; Twilight owns the retry |
 | `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs` (`run_shard`) | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
 | `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch committed and shard marked Connected |
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway leveling collect failed` | `crates/bot/src/gateway.rs` (`requests_or_hold_cursor`) | Leveling funnel collection refused (poisoned deferred buffer); checkpoint cursor held so the worker stops and the supervisor restarts |
 | `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
 | `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
+| `gateway community facts buffer poisoned` | `crates/bot/src/gateway.rs` (`hold_cursor_on_facts_poison`) | Community facts buffer poisoned; checkpoint cursor held so the worker stops and the supervisor restarts, unlike an ordinary write failure |
 | `gateway dispatch refused: duplicate JSON key` | `crates/bot/src/gateway.rs` (`run_shard`) | MESSAGE_UPDATE bytes carried a repeated JSON key; parse and dispatch skipped with no verdict input, worker still commits the checkpoint so a resume replays nothing |
 | `gateway onboarding job invalid` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs` (`onboarding_queue`) | Durable onboarding job recovered without callback credentials; kept as interruption receipt |

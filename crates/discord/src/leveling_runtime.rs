@@ -37,6 +37,17 @@ use crate::{
     PipelineSnapshots, SettingsChannelClassifier,
 };
 
+/// Stable reason codes for poisoned deferred capture buffers. These literals
+/// are the supervised-failure contract: error Displays, the gateway failure
+/// line and `docs/deferred-capture-poison.md` all carry them verbatim, and
+/// the poison acceptance suite pins them. Never rename one without updating
+/// all three.
+pub const DEFERRED_LEVELING_POISONED: &str = "deferred_leveling_poisoned";
+pub const DEFERRED_COMMUNITY_FACTS_POISONED: &str = "deferred_community_facts_poisoned";
+/// Next action for either poisoned buffer: supervisor restart inspection
+/// under the existing machine contract. The buffer never heals in place.
+pub const SUPERVISOR_RESTART_INSPECTION: &str = "supervisor_restart_inspection";
+
 /// Failures propagate to the gateway supervisor; Display never includes SQL
 /// connection details, Discord tokens, response bodies or member content.
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +66,18 @@ pub enum LevelingRuntimeError {
         cause: RoleApplicationError,
         awards: Vec<XpAward>,
     },
+    /// The deferred leveling buffer mutex is poisoned: a previous holder
+    /// panicked, so the buffered award requests are untrusted and stay
+    /// queued. Never healed in place; the supervisor restarts under the
+    /// existing contract. Carries no committed awards.
+    #[error("deferred leveling buffer poisoned (deferred_leveling_poisoned); next action: supervisor_restart_inspection")]
+    LevelingPoisoned,
+    /// The deferred community-facts buffer mutex is poisoned, observed while
+    /// collecting a dispatch: capture already latched its loss, so the owner
+    /// refuses before any award work. Same never-heal recovery contract as
+    /// the leveling poison refusal.
+    #[error("deferred community facts buffer poisoned (deferred_community_facts_poisoned); next action: supervisor_restart_inspection")]
+    CommunityFactsPoisoned,
 }
 
 impl LevelingRuntimeError {
@@ -156,7 +179,16 @@ impl DeferredLeveling {
         channel_id: u64,
         shape: two_bot_core::MessageShape,
     ) -> LevelOutcome {
-        self.0.lock().expect("leveling buffer").push(AwardRequest {
+        // The hook is infallible, so a poisoned buffer latches: report no
+        // threshold crossing here and let the owning collection/drain refuse
+        // with the typed poison error instead of panicking.
+        let Ok(mut pending) = self.0.lock() else {
+            return LevelOutcome {
+                leveled_up: false,
+                level: 0,
+            };
+        };
+        pending.push(AwardRequest {
             guild_id,
             member_id,
             channel_id,
@@ -180,7 +212,14 @@ impl DeferredLeveling {
         channel_id: u64,
         duration: Option<u64>,
     ) -> LevelOutcome {
-        self.0.lock().expect("leveling buffer").push(AwardRequest {
+        // Same latch as `push_message`: never panic on a poisoned buffer.
+        let Ok(mut pending) = self.0.lock() else {
+            return LevelOutcome {
+                leveled_up: false,
+                level: 0,
+            };
+        };
+        pending.push(AwardRequest {
             guild_id,
             member_id,
             channel_id,
@@ -196,8 +235,26 @@ impl DeferredLeveling {
         }
     }
 
-    fn take(&self) -> Vec<AwardRequest> {
-        std::mem::take(&mut *self.0.lock().expect("leveling buffer"))
+    fn take(&self) -> Result<Vec<AwardRequest>, LevelingRuntimeError> {
+        // Never `into_inner` a poisoned buffer and never report its
+        // untrusted contents as an empty success: refuse typed.
+        let mut pending = self
+            .0
+            .lock()
+            .map_err(|_| LevelingRuntimeError::LevelingPoisoned)?;
+        Ok(std::mem::take(&mut *pending))
+    }
+
+    /// Refuse when the buffer mutex is poisoned without touching the
+    /// untrusted contents. Drains call this before any store or Discord
+    /// work, so even an empty batch on a damaged buffer is a typed
+    /// refusal, never an `Ok` success.
+    fn check_healthy(&self) -> Result<(), LevelingRuntimeError> {
+        if self.0.is_poisoned() {
+            Err(LevelingRuntimeError::LevelingPoisoned)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -207,6 +264,23 @@ impl DeferredLeveling {
 pub enum CommunityFactsError {
     #[error("community facts store operation failed")]
     Store(#[from] CommunityStoreError),
+    /// The community-facts buffer mutex is poisoned: a previous holder
+    /// panicked, so every buffered family is untrusted and stays queued.
+    /// Never healed, cleared or partially drained; distinct from a normal
+    /// empty or disabled drain. The supervisor restarts under the existing
+    /// contract.
+    #[error("deferred community facts buffer poisoned (deferred_community_facts_poisoned); next action: supervisor_restart_inspection")]
+    Poisoned,
+}
+
+impl CommunityFactsError {
+    /// True only for the poisoned-buffer refusal, so the gateway holds the
+    /// cursor on poison while ordinary store failures keep their
+    /// warn-and-continue precedent.
+    #[must_use]
+    pub fn is_poison(&self) -> bool {
+        matches!(self, Self::Poisoned)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -277,72 +351,102 @@ impl DeferredCommunityFacts {
     /// Arm Postgres capture with the scorecard classifier resolved once from
     /// the process environment. Called once at boot when
     /// `TWO_COMMUNITY_SCORECARD=1`; tests call it with their fixture pool.
-    pub fn enable(&self, pool: PgPool) {
-        self.enable_with_config(pool, ClassifierConfig::from_env());
+    /// A poisoned buffer refuses typed and keeps its previous config.
+    pub fn enable(&self, pool: PgPool) -> Result<(), CommunityFactsError> {
+        self.enable_with_config(pool, ClassifierConfig::from_env())
     }
 
     /// Arm Postgres capture with an explicit classifier config, so the
     /// caller can seed the channel classifier from the same config and
-    /// the two never disagree.
-    pub fn enable_with_config(&self, pool: PgPool, config: ClassifierConfig) {
-        let mut state = self.0.lock().expect("community facts lock");
+    /// the two never disagree. A poisoned buffer refuses typed: the config
+    /// is not applied, and the owning drain refuses instead of panicking.
+    pub fn enable_with_config(
+        &self,
+        pool: PgPool,
+        config: ClassifierConfig,
+    ) -> Result<(), CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         state.pool = Some(pool);
         state.config = config;
+        Ok(())
     }
 
     /// Replace the classifier config used at record/drain time. Paired
     /// with the channel classifier refresh in
-    /// [`OrderedLevelingPipeline::refresh_classifier_config`].
-    pub fn refresh_config(&self, config: ClassifierConfig) {
-        let mut state = self.0.lock().expect("community facts lock");
+    /// [`OrderedLevelingPipeline::refresh_classifier_config`]. A poisoned
+    /// buffer refuses typed like [`Self::enable_with_config`].
+    pub fn refresh_config(&self, config: ClassifierConfig) -> Result<(), CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         if state.config != config {
             state.config = config;
+        }
+        Ok(())
+    }
+
+    /// Refuse when the buffer mutex is poisoned without touching the
+    /// untrusted families. Collectors call this after the funnel so a
+    /// latched capture loss reaches the owner before any award work.
+    fn check_healthy(&self) -> Result<(), CommunityFactsError> {
+        if self.0.is_poisoned() {
+            Err(CommunityFactsError::Poisoned)
+        } else {
+            Ok(())
         }
     }
 
     /// Take every buffered gate-clearing, leaving that buffer empty. Order is
     /// arrival order; gate-clear facts are order-insensitive (once per member).
-    /// Rules only — joins have their own [`Self::take_joins`].
-    pub fn take(&self) -> Vec<RulesAcceptedWrite> {
-        std::mem::take(&mut self.0.lock().expect("community facts lock").rules)
+    /// Rules only — joins have their own [`Self::take_joins`]. A poisoned
+    /// buffer refuses typed and keeps its untrusted contents queued.
+    pub fn take(&self) -> Result<Vec<RulesAcceptedWrite>, CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(std::mem::take(&mut state.rules))
     }
 
     /// Take every buffered gateway join, leaving that buffer empty. Order is
     /// arrival order; join facts are order-insensitive (one per join burst).
-    pub fn take_joins(&self) -> Vec<MemberJoinWrite> {
-        std::mem::take(&mut self.0.lock().expect("community facts lock").joins)
+    /// A poisoned buffer refuses typed and keeps its untrusted contents queued.
+    pub fn take_joins(&self) -> Result<Vec<MemberJoinWrite>, CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(std::mem::take(&mut state.joins))
     }
 
     /// Take every buffered fact write (`message_created`,
     /// `voice_session_started` / `voice_session_ended`), leaving that
-    /// buffer empty. Order is arrival order.
-    pub fn take_pending(&self) -> Vec<FactWrite> {
-        std::mem::take(&mut self.0.lock().expect("community facts lock").pending)
+    /// buffer empty. Order is arrival order. A poisoned buffer refuses
+    /// typed and keeps its untrusted contents queued.
+    pub fn take_pending(&self) -> Result<Vec<FactWrite>, CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(std::mem::take(&mut state.pending))
     }
 
-    /// Buffered gate-clearing count (tests, health). Rules only.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.lock().expect("community facts lock").rules.len()
+    /// Buffered gate-clearing count (tests, health). Rules only. A poisoned
+    /// buffer refuses typed, never a false zero.
+    pub fn len(&self) -> Result<usize, CommunityFactsError> {
+        let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(state.rules.len())
     }
 
-    /// Whether the gate-clearing buffer holds no writes. Rules only.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Whether the gate-clearing buffer holds no writes. Rules only. A
+    /// poisoned buffer refuses typed, never a false healthy read.
+    pub fn is_empty(&self) -> Result<bool, CommunityFactsError> {
+        Ok(self.len()? == 0)
     }
 
-    /// Buffered gateway-join count (tests, health).
-    #[must_use]
-    pub fn joins_len(&self) -> usize {
-        self.0.lock().expect("community facts lock").joins.len()
+    /// Buffered gateway-join count (tests, health). A poisoned buffer
+    /// refuses typed, never a false zero.
+    pub fn joins_len(&self) -> Result<usize, CommunityFactsError> {
+        let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(state.joins.len())
     }
 
     /// Persist every buffered fact. Returns the inserted count; a duplicate
-    /// delivery returns `false` from the store and is not counted twice.
+    /// delivery returns `false` from the store and is not counted twice. A
+    /// poisoned buffer refuses typed before any store work and keeps every
+    /// family queued: never a partial batch, never a false zero.
     pub async fn drain(&self) -> Result<usize, CommunityFactsError> {
         let (pool, config, pending, rules, joins) = {
-            let mut state = self.0.lock().expect("community facts lock");
+            let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
             (
                 state.pool.clone(),
                 state.config.clone(),
@@ -435,39 +539,42 @@ fn voice_classify(
 }
 
 impl FactsSink for DeferredCommunityFacts {
+    // The sink is infallible, so every callback latches on a poisoned
+    // buffer: drop the one fact without panicking and let the owning
+    // collection/drain refuse typed. Nothing here claims accepted work.
     fn record_member_join(&self, fact: MemberJoinFact<'_>) {
-        self.0
-            .lock()
-            .expect("community facts lock")
-            .joins
-            .push(MemberJoinWrite {
-                guild_id: fact.guild_id,
-                member_id: fact.member_id,
-                is_bot: fact.is_bot,
-                occurred_at: fact.occurred_at.to_owned(),
-                source_event_id: fact.source_event_id.to_owned(),
-                source: fact.source.to_owned(),
-                inviter_id: fact.inviter_id,
-            });
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        state.joins.push(MemberJoinWrite {
+            guild_id: fact.guild_id,
+            member_id: fact.member_id,
+            is_bot: fact.is_bot,
+            occurred_at: fact.occurred_at.to_owned(),
+            source_event_id: fact.source_event_id.to_owned(),
+            source: fact.source.to_owned(),
+            inviter_id: fact.inviter_id,
+        });
     }
 
     fn record_rules_accepted(&self, fact: RulesAcceptedFact<'_>) {
-        self.0
-            .lock()
-            .expect("community facts lock")
-            .rules
-            .push(RulesAcceptedWrite {
-                guild_id: fact.guild_id,
-                member_id: fact.member_id,
-                is_bot: fact.is_bot,
-                occurred_at: fact.occurred_at.to_owned(),
-                source_event_id: fact.source_event_id.clone(),
-                source: fact.source.to_owned(),
-            });
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        state.rules.push(RulesAcceptedWrite {
+            guild_id: fact.guild_id,
+            member_id: fact.member_id,
+            is_bot: fact.is_bot,
+            occurred_at: fact.occurred_at.to_owned(),
+            source_event_id: fact.source_event_id.clone(),
+            source: fact.source.to_owned(),
+        });
     }
 
     fn record_message(&self, fact: MessageFact<'_>) {
-        let mut state = self.0.lock().expect("community facts lock");
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
         if state.pool.is_none() {
             return;
         }
@@ -501,7 +608,11 @@ impl FactsSink for DeferredCommunityFacts {
     }
 
     fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
-        let mut state = self.0.lock().expect("community facts lock");
+        // Latch like the other callbacks, and never fabricate a session
+        // key the drain cannot persist: poisoned means `None`.
+        let Ok(mut state) = self.0.lock() else {
+            return None;
+        };
         state.pool.as_ref()?;
         // Bots are classified and captured here; the funnel gate in
         // `on_voice_join` already keeps them out of the XP/activity counts,
@@ -523,7 +634,9 @@ impl FactsSink for DeferredCommunityFacts {
     }
 
     fn record_voice_ended(&self, fact: VoiceEndedFact<'_>) {
-        let mut state = self.0.lock().expect("community facts lock");
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
         if state.pool.is_none() {
             return;
         }
@@ -893,21 +1006,30 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     /// Arm Postgres community-facts capture for all live streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
     /// it the sink drops every fact, exactly like the previous no-op seam.
-    pub fn enable_community_facts(&self, pool: PgPool) {
+    /// A poisoned facts buffer refuses typed and the classifier keeps its
+    /// previous config, so the two still agree.
+    pub fn enable_community_facts(&self, pool: PgPool) -> Result<(), CommunityFactsError> {
         // One config load seeds both the facts sink and the channel
         // classifier, so classification at record time and the stamped
         // channel class always read the same sets.
         let config = ClassifierConfig::from_env();
-        self.facts.enable_with_config(pool, config.clone());
+        self.facts.enable_with_config(pool, config.clone())?;
         self.classifier.refresh(config);
+        Ok(())
     }
 
     /// Refresh the classifier config live (settings poll): the channel
     /// classifier and the facts sink swap together, so a stored channel
     /// set reclassifies without a restart and the two never disagree.
-    pub fn refresh_classifier_config(&self, config: ClassifierConfig) {
-        self.facts.refresh_config(config.clone());
+    /// A poisoned facts buffer refuses typed before the classifier swaps,
+    /// so a failed refresh changes neither side.
+    pub fn refresh_classifier_config(
+        &self,
+        config: ClassifierConfig,
+    ) -> Result<(), CommunityFactsError> {
+        self.facts.refresh_config(config.clone())?;
         self.classifier.refresh(config);
+        Ok(())
     }
 
     /// Persist buffered community facts without holding the async
@@ -940,11 +1062,15 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     /// Drain deferred XP awards without holding the async dispatch lock.
     /// The caller owns ordering (the serial checkpoint writer); this only
-    /// preserves the funnel-before-award sequence per dispatch.
+    /// preserves the funnel-before-award sequence per dispatch. A fault
+    /// after collection refuses before any store or Discord work, so even
+    /// an empty batch on a poisoned buffer is a typed refusal, never an
+    /// `Ok` success.
     pub async fn drain(
         &self,
         requests: Vec<AwardRequest>,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
+        self.pending.check_healthy()?;
         let mut results = Vec::with_capacity(requests.len());
         if let Some(runtime) = &self.runtime {
             for request in requests {
@@ -974,36 +1100,52 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         eligibility: MessageEligibility,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
         let _dispatch = self.dispatch.lock().await;
-        let requests = self.collect_at(event, at, eligibility);
+        let requests = self.collect_at(event, at, eligibility)?;
         self.drain(requests).await
     }
 
     /// Drive one event through the funnel and return its deferred award
     /// requests for the caller to drain. Separated so the blocking
-    /// checkpoint writer can funnel synchronously, then await awards.
+    /// checkpoint writer can funnel synchronously, then await awards. A
+    /// poisoned leveling buffer refuses typed instead of an empty batch,
+    /// and a poisoned facts buffer — whose sink latched during the funnel
+    /// above — refuses before any award work is claimed.
     pub fn collect_at(
         &self,
         event: &Event,
         at: &str,
         eligibility: MessageEligibility,
-    ) -> Vec<AwardRequest> {
+    ) -> Result<Vec<AwardRequest>, LevelingRuntimeError> {
         self.pipeline
             .handle_at_with_eligibility(event, at, eligibility);
+        self.check_facts_healthy()?;
         self.pending.take()
     }
 
     /// [`Self::collect_at`] under the automod decision: the disposition and the
     /// replay clock reach the funnel in one call, never `collect_at` as well.
     /// `CaptureOnly` and `None` queue no award, so XP stays once per message.
+    /// Poisoned buffers refuse typed even when no award is due: no
+    /// disposition bypasses the failure.
     pub fn collect_at_with_message_disposition(
         &self,
         event: &Event,
         at: &str,
         disposition: FunnelDisposition,
-    ) -> Vec<AwardRequest> {
+    ) -> Result<Vec<AwardRequest>, LevelingRuntimeError> {
         self.pipeline
             .handle_at_with_message_disposition(event, at, disposition);
+        self.check_facts_healthy()?;
         self.pending.take()
+    }
+
+    /// Surface a latched facts-buffer failure under the leveling owner.
+    /// `check_healthy` fails only with the poison refusal, so the mapping
+    /// is exact.
+    fn check_facts_healthy(&self) -> Result<(), LevelingRuntimeError> {
+        self.facts
+            .check_healthy()
+            .map_err(|_| LevelingRuntimeError::CommunityFactsPoisoned)
     }
 }
 
@@ -1286,7 +1428,9 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
         );
-        pipeline.refresh_classifier_config(config);
+        pipeline
+            .refresh_classifier_config(config)
+            .expect("healthy config swap");
 
         assert_eq!(pipeline.classifier.classify(HUMAN), ChannelClass::Human);
         let state = pipeline.facts.0.lock().expect("community facts lock");
@@ -1306,7 +1450,9 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
         );
-        buffer.enable_with_config(pool, config);
+        buffer
+            .enable_with_config(pool, config)
+            .expect("healthy arming");
         let state = buffer.0.lock().expect("community facts lock");
         assert!(state.pool.is_some());
         assert_eq!(state.config.version, "community-v7");
@@ -1315,18 +1461,18 @@ mod tests {
     #[test]
     fn rules_take_returns_arrival_order_and_empties() {
         let buffer = DeferredCommunityFacts::new();
-        assert!(buffer.is_empty());
+        assert!(buffer.is_empty().expect("healthy health read"));
         buffer.record_rules_accepted(gate(1, "2026-09-20T12:00:00.000Z", "gateway"));
         buffer.record_rules_accepted(gate(2, "2026-09-20T12:01:00.000Z", "backfill:member_list"));
-        assert_eq!(buffer.len(), 2);
-        let writes = buffer.take();
+        assert_eq!(buffer.len().expect("healthy count"), 2);
+        let writes = buffer.take().expect("healthy rules take");
         assert_eq!(
             writes.iter().map(|w| w.member_id).collect::<Vec<_>>(),
             vec![1, 2]
         );
         assert_eq!(writes[1].source, "backfill:member_list");
-        assert!(buffer.is_empty());
-        assert!(buffer.take().is_empty());
+        assert!(buffer.is_empty().expect("healthy emptied read"));
+        assert!(buffer.take().expect("healthy empty take").is_empty());
     }
 
     fn join<'a>(
@@ -1370,15 +1516,18 @@ mod tests {
             source: "invite:abc",
             inviter_id: Some(9),
         });
-        assert_eq!(buffer.joins_len(), 2);
-        let writes = buffer.take_joins();
+        assert_eq!(buffer.joins_len().expect("healthy join count"), 2);
+        let writes = buffer.take_joins().expect("healthy joins take");
         assert_eq!(writes[0].source, "invite:abc");
         assert_eq!(writes[0].inviter_id, Some(9));
         assert_eq!(writes[0].source_event_id, "100:1:2026-09-20T12:00:00.000Z");
         assert!(!writes[0].is_bot);
         assert!(writes[1].is_bot, "bot joins buffer for capture");
-        assert_eq!(buffer.joins_len(), 0);
-        assert!(buffer.take_joins().is_empty());
+        assert_eq!(buffer.joins_len().expect("healthy emptied joins"), 0);
+        assert!(buffer
+            .take_joins()
+            .expect("healthy empty joins take")
+            .is_empty());
     }
 
     #[test]
@@ -1428,11 +1577,52 @@ mod tests {
             started_at: None,
             duration_seconds: None,
         });
-        assert_eq!(buffer.len(), 1, "the gate-clearing buffers unarmed");
         assert_eq!(
-            buffer.joins_len(),
+            buffer.len().expect("healthy count"),
+            1,
+            "the gate-clearing buffers unarmed"
+        );
+        assert_eq!(
+            buffer.joins_len().expect("healthy join count"),
             1,
             "the gateway join buffers unarmed alongside it"
         );
     }
+
+    #[test]
+    fn poison_displays_carry_the_stable_reason_and_action() {
+        // The reason-code constants, the gateway failure line and the
+        // recovery doc all carry these literals verbatim; a rename must
+        // update every surface together.
+        for (text, reason) in [
+            (
+                LevelingRuntimeError::LevelingPoisoned.to_string(),
+                DEFERRED_LEVELING_POISONED,
+            ),
+            (
+                LevelingRuntimeError::CommunityFactsPoisoned.to_string(),
+                DEFERRED_COMMUNITY_FACTS_POISONED,
+            ),
+            (
+                CommunityFactsError::Poisoned.to_string(),
+                DEFERRED_COMMUNITY_FACTS_POISONED,
+            ),
+        ] {
+            assert!(text.contains(reason), "missing reason: {text}");
+            assert!(
+                text.contains(SUPERVISOR_RESTART_INSPECTION),
+                "missing next action: {text}"
+            );
+            assert!(text.len() <= 256, "diagnostic must stay bounded");
+        }
+        assert!(CommunityFactsError::Poisoned.is_poison());
+    }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/deferred_capture_poison.rs"]
+mod deferred_capture_poison_acceptance;
+
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/deferred_worker_poison.rs"]
+pub mod deferred_worker_poison;
