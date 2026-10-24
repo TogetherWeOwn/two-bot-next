@@ -3945,10 +3945,12 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
-        self.retry_admission_blocked(|_| async {
-            self.edit_interaction_response(application_id, interaction_token, content)
-                .await
-        })
+        self.edit_response_with_blocked_retry_inner(
+            application_id,
+            interaction_token,
+            content,
+            true,
+        )
         .await
     }
 
@@ -3985,13 +3987,31 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
-        self.retry_admission_blocked(|_| async {
-            self.edit_interaction_response_without_mention_neutralization(
+        self.edit_response_with_blocked_retry_inner(
+            application_id,
+            interaction_token,
+            content,
+            false,
+        )
+        .await
+    }
+
+    // Keep one closure/future type for both mention policies: separate retry
+    // loops duplicate their async poll/drop machinery in the release binary.
+    async fn edit_response_with_blocked_retry_inner(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        neutralize_mentions: bool,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|_| {
+            self.edit_response_inner(
                 application_id,
                 interaction_token,
                 content,
+                neutralize_mentions,
             )
-            .await
         })
         .await
     }
