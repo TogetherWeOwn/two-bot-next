@@ -1593,14 +1593,14 @@ mod tests {
         );
         assert_eq!(parse_inspect_view(Some("body")), Ok(InspectView::Body));
         for unknown in [
-            "",
-            "METADATA",
-            "summary",
-            "metadata ",
-            "body ",
+            "".to_owned(),
+            "METADATA".to_owned(),
+            "summary".to_owned(),
+            "metadata ".to_owned(),
+            "body ".to_owned(),
             "x".repeat(9),
         ] {
-            let refusal = parse_inspect_view(Some(&unknown)).expect_err("unknown view");
+            let refusal = parse_inspect_view(Some(unknown.as_str())).expect_err("unknown view");
             assert!(
                 refusal.contains("/schedule-inspect") && refusal.contains("view:<metadata|body>"),
                 "{unknown:?} corrects: {refusal}"
