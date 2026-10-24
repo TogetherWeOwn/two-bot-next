@@ -171,8 +171,15 @@ pub fn expected_registry() -> Value {
     // Next-only `/help` discovery surface: no legacy counterpart. Insert at
     // the publish position (third, after the leveling core) as the exact
     // published definition, so parity pins its shape too.
-    let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
-        .expect("help serializes");
+    let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION).options(
+        vec![CommandOption::new(
+                "command",
+                "Command name (case-insensitive; optional leading /)",
+                CommandOptionType::String,
+            )
+            .max_length(32)],
+    ))
+    .expect("help serializes");
     commands.insert(2, help);
     // Next-only `/privacy` member self-serve: no legacy counterpart. Insert
     // at the publish position (fourth, after help) as the exact published
