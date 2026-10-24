@@ -113,6 +113,27 @@ class RollbackProofTests(unittest.TestCase):
                     proof.prove()
                 artifacts.assert_not_called()
 
+    def test_transient_display_title_before_completion_is_tolerated(self):
+        pending = run()
+        pending.update(status="in_progress", conclusion=None, display_title="deploy-staging")
+        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, pending, run(), jobs()]) as gh, \
+                patch.object(proof, "artifact_files", return_value=files()) as artifacts, \
+                redirect_stdout(io.StringIO()):
+            result = proof.prove(sleep=lambda _: None, clock=lambda: 0)
+        self.assertEqual(gh.call_count, 4)
+        artifacts.assert_called_once_with(123, "staging-rollout-evidence")
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["child_run_id"], 123)
+
+    def test_wrong_display_title_at_completion_still_fails_closed(self):
+        child = run()
+        child.update(display_title="deploy-staging")
+        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child]), \
+                patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(proof.ProofError, "child_not_rehearsal"):
+                proof.prove()
+            artifacts.assert_not_called()
+
     def test_timeout_does_not_cancel_or_redispatch_a_mutating_child(self):
         child = run()
         child["status"] = "in_progress"

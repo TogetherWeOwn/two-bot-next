@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "feed_sticky_strict_decode_acceptance_tests.rs"]
+mod feed_sticky_strict_decode_acceptance_tests;
 #[path = "reopen_dispatch_review_acceptance_tests.rs"]
 mod reopen_dispatch_review_acceptance_tests;
 
@@ -38,6 +40,12 @@ mod custom_command_list_pages_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
 
+#[path = "giveaway_admission_edge_acceptance_tests.rs"]
+mod giveaway_admission_edge_acceptance_tests;
+#[path = "giveaway_countdown_edge_acceptance_tests.rs"]
+mod giveaway_countdown_edge_acceptance_tests;
+#[path = "giveaway_create_entry_acceptance_tests.rs"]
+mod giveaway_create_entry_acceptance_tests;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
 
@@ -77,9 +85,9 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option,
-    help_command_selector, new_id, router_with_commands, sticky_options, CommandRuntime,
-    FeedListPage, RegistrySyncError,
+    actor_id, ephemeral, feed_add_options_strict, feed_list_page_request,
+    feed_remove_option_strict, help_command_selector, new_id, router_with_commands,
+    sticky_options_strict, CommandRuntime, FeedListPage, RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
@@ -1118,25 +1126,125 @@ async fn activation_boot_call_site_fixture() {
 }
 
 #[test]
-fn sticky_options_extract_body_and_debounce() {
-    let interaction = slash(
+fn sticky_options_strict_decodes_valid_and_ignores_unknown_names() {
+    let full = slash(
         "sticky",
         Some(CHANNEL),
         vec![
             option("body", CommandOptionValue::String("remember".to_owned())),
             option("debounce", CommandOptionValue::Integer(7)),
+            option("other", CommandOptionValue::Boolean(true)),
         ],
     );
     assert_eq!(
-        sticky_options(&interaction),
-        (Some("remember".to_owned()), Some(7))
+        sticky_options_strict(&full),
+        Ok(("remember".to_owned(), Some(7)))
+    );
+    let omitted_debounce = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option(
+            "body",
+            CommandOptionValue::String("remember".to_owned()),
+        )],
+    );
+    assert_eq!(
+        sticky_options_strict(&omitted_debounce),
+        Ok(("remember".to_owned(), None))
     );
 }
 
 #[test]
-fn sticky_options_missing_options_validate_to_rejection_inputs() {
-    let interaction = slash("sticky", Some(CHANNEL), Vec::new());
-    assert_eq!(sticky_options(&interaction), (None, None));
+fn sticky_options_strict_refuses_wrong_types_duplicates_and_missing_body() {
+    let wrong_body = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option("body", CommandOptionValue::Integer(9))],
+    );
+    assert_eq!(
+        sticky_options_strict(&wrong_body),
+        Err("Invalid body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let wrong_debounce = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("debounce", CommandOptionValue::String("soon".to_owned())),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&wrong_debounce),
+        Err("Invalid debounce. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let duplicate_body = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&duplicate_body),
+        Err("Duplicate body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let duplicate_debounce = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("debounce", CommandOptionValue::Integer(7)),
+            option("debounce", CommandOptionValue::Integer(7)),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&duplicate_debounce),
+        Err("Duplicate debounce. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let missing_body = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option("debounce", CommandOptionValue::Integer(7))],
+    );
+    assert_eq!(
+        sticky_options_strict(&missing_body),
+        Err("Missing body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    // Duplicates win over wrong types, and `body` wins over `debounce`.
+    let duplicate_wins = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("body", CommandOptionValue::Integer(9)),
+            option("debounce", CommandOptionValue::String("soon".to_owned())),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&duplicate_wins),
+        Err("Duplicate body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    // Wrong types beat a missing `body`: the unusable `debounce` is named
+    // even though `body` is absent.
+    let wrong_type_beats_missing = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option(
+            "debounce",
+            CommandOptionValue::String("soon".to_owned()),
+        )],
+    );
+    assert_eq!(
+        sticky_options_strict(&wrong_type_beats_missing),
+        Err("Invalid debounce. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let mut no_data = slash("sticky", Some(CHANNEL), Vec::new());
+    no_data.data = None;
+    assert_eq!(
+        sticky_options_strict(&no_data),
+        Err("Missing body. Use /sticky body:<text> debounce:<seconds>.")
+    );
 }
 
 #[test]
@@ -1308,10 +1416,12 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "giveaway"
                         | "reopen"
                 )
             })
             .collect();
+        assert!(!unwired.contains(&"giveaway"));
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
@@ -2566,7 +2676,8 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
     runtime.set_identity(1111, 1111);
 
     // Each accepted route fails validation before SQL: LFG lacks required
-    // options, sticky has no channel, and feeds have an invalid kind/id.
+    // options, sticky has no channel, and feeds lack required options (a
+    // strict-decode refusal naming the option with a correction).
     // This exercises feature execution, not just registry coexistence.
     for (index, (name, channel, permissions, expected)) in [
         (
@@ -2597,13 +2708,13 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
             "feed-add",
             Some(CHANNEL),
             Permissions::MANAGE_GUILD,
-            "Unknown feed kind.",
+            "Missing kind. Use /feed-add kind:rss source:<https-url>.",
         ),
         (
             "feed-remove",
             Some(CHANNEL),
             Permissions::MANAGE_GUILD,
-            "Invalid feed id.",
+            "Missing id. Use /feed-remove id:<relay-id>.",
         ),
     ]
     .into_iter()
@@ -2907,7 +3018,7 @@ async fn foreign_application_interactions_never_reach_a_feature() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn feed_add_options_extract_kind_and_source() {
+fn feed_add_options_strict_decodes_valid_and_ignores_unknown_names() {
     let interaction = slash(
         "feed-add",
         Some(CHANNEL),
@@ -2917,36 +3028,187 @@ fn feed_add_options_extract_kind_and_source() {
                 "source",
                 CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
             ),
+            option("other", CommandOptionValue::Boolean(true)),
         ],
     );
     assert_eq!(
-        feed_add_options(&interaction),
-        (
-            Some("rss".to_owned()),
-            Some("https://example.com/feed.xml".to_owned())
-        )
+        feed_add_options_strict(&interaction),
+        Ok(("rss".to_owned(), "https://example.com/feed.xml".to_owned()))
     );
 }
 
 #[test]
-fn feed_add_options_missing_values_decode_to_none() {
-    let interaction = slash("feed-add", Some(CHANNEL), Vec::new());
-    assert_eq!(feed_add_options(&interaction), (None, None));
+fn feed_add_options_strict_refuses_wrong_types_duplicates_and_missing_options() {
+    let wrong_kind = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::Integer(1)),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+            ),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_kind),
+        Err("Invalid kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let wrong_source = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::String("rss".to_owned())),
+            option("source", CommandOptionValue::Integer(7)),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_source),
+        Err("Invalid source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let duplicate_kind = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::String("rss".to_owned())),
+            option("kind", CommandOptionValue::String("rss".to_owned())),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+            ),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&duplicate_kind),
+        Err("Duplicate kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    // Duplicates win over wrong types, and `kind` wins over `source`.
+    let duplicate_wins = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::Integer(1)),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/a.xml".to_owned()),
+            ),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/b.xml".to_owned()),
+            ),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&duplicate_wins),
+        Err("Duplicate source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    // Wrong types beat missing options across options: a present-but-unusable
+    // value is named even when the other option is absent.
+    let wrong_type_beats_missing = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("source", CommandOptionValue::Integer(7))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_type_beats_missing),
+        Err("Invalid source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let wrong_kind_alone = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("kind", CommandOptionValue::Integer(1))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_kind_alone),
+        Err("Invalid kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let missing_kind = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option(
+            "source",
+            CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+        )],
+    );
+    assert_eq!(
+        feed_add_options_strict(&missing_kind),
+        Err("Missing kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let missing_source = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("kind", CommandOptionValue::String("rss".to_owned()))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&missing_source),
+        Err("Missing source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let mut no_data = slash("feed-add", Some(CHANNEL), Vec::new());
+    no_data.data = None;
+    assert_eq!(
+        feed_add_options_strict(&no_data),
+        Err("Missing kind. Use /feed-add kind:rss source:<https-url>.")
+    );
 }
 
 #[test]
-fn feed_remove_option_extracts_id() {
+fn feed_remove_option_strict_decodes_valid_and_ignores_unknown_names() {
     let interaction = slash(
         "feed-remove",
         Some(CHANNEL),
-        vec![option(
-            "id",
-            CommandOptionValue::String("feed-1".to_owned()),
-        )],
+        vec![
+            option("id", CommandOptionValue::String("feed-1".to_owned())),
+            option("other", CommandOptionValue::Boolean(true)),
+        ],
     );
-    assert_eq!(feed_remove_option(&interaction), Some("feed-1".to_owned()));
+    assert_eq!(
+        feed_remove_option_strict(&interaction),
+        Ok("feed-1".to_owned())
+    );
+    // Present-but-empty still decodes: the planner's `validate_id` owns
+    // that refusal.
+    let empty = slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::String(String::new()))],
+    );
+    assert_eq!(feed_remove_option_strict(&empty), Ok(String::new()));
+}
+
+#[test]
+fn feed_remove_option_strict_refuses_wrong_type_duplicate_and_missing_id() {
+    let wrong_type = slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::Integer(42))],
+    );
+    assert_eq!(
+        feed_remove_option_strict(&wrong_type),
+        Err("Invalid id. Use /feed-remove id:<relay-id>.")
+    );
+    let duplicate = slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![
+            option("id", CommandOptionValue::String("feed-1".to_owned())),
+            option("id", CommandOptionValue::String("feed-1".to_owned())),
+        ],
+    );
+    assert_eq!(
+        feed_remove_option_strict(&duplicate),
+        Err("Duplicate id. Use /feed-remove id:<relay-id>.")
+    );
     let missing = slash("feed-remove", Some(CHANNEL), Vec::new());
-    assert_eq!(feed_remove_option(&missing), None);
+    assert_eq!(
+        feed_remove_option_strict(&missing),
+        Err("Missing id. Use /feed-remove id:<relay-id>.")
+    );
+    let mut no_data = slash("feed-remove", Some(CHANNEL), Vec::new());
+    no_data.data = None;
+    assert_eq!(
+        feed_remove_option_strict(&no_data),
+        Err("Missing id. Use /feed-remove id:<relay-id>.")
+    );
 }
 
 #[test]
@@ -3336,13 +3598,188 @@ async fn feed_add_with_non_https_source_replies_ssrf_guard_error() {
 }
 
 #[tokio::test]
-async fn feed_remove_without_id_replies_invalid_id() {
+async fn feed_remove_without_id_names_the_missing_option() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     runtime
         .on_interaction(&slash("feed-remove", Some(CHANNEL), Vec::new()))
         .await;
-    assert_eq!(mock.deferred_reply()["content"], "Invalid feed id.");
+    // A missing `id` is a strict-decode refusal with a correction, not the
+    // planner's `InvalidId`: present-but-empty still replies "Invalid feed
+    // id." via `validate_id`.
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Missing id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_without_kind_names_the_missing_option() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![option(
+                "source",
+                CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+            )],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Missing kind. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_without_body_names_the_missing_option() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![option("debounce", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    // A missing `body` refuses before the existence read and the `rejected`
+    // audit; present-but-empty still validates (and audits) as before.
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Missing body. Use /sticky body:<text> debounce:<seconds>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_wrong_typed_source_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option("source", CommandOptionValue::Integer(7)),
+            ],
+        ))
+        .await;
+    // Exact dispatch pin: a fixed-text regression (e.g. always replying the
+    // missing-kind text) must fail here even though the corrected invocation
+    // names both options.
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid source. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_duplicated_kind_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option(
+                    "source",
+                    CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+                ),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate kind. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_remove_wrong_typed_id_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_remove_duplicated_id_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![
+                option("id", CommandOptionValue::String("feed-1".to_owned())),
+                option("id", CommandOptionValue::String("feed-1".to_owned())),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_wrong_typed_body_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![option("body", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid body. Use /sticky body:<text> debounce:<seconds>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_duplicated_debounce_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("remember".to_owned())),
+                option("debounce", CommandOptionValue::Integer(7)),
+                option("debounce", CommandOptionValue::Integer(7)),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate debounce. Use /sticky body:<text> debounce:<seconds>."
+    );
     mock.shutdown().await;
 }
 
@@ -3411,6 +3848,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "schedule-list",
         "sticky",
         "sticky-remove",
+        "giveaway",
         "rsvp",
         "rsvp-attendance",
         "lfg",
@@ -3552,6 +3990,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
+            HandlerId::Giveaway,
             HandlerId::Rsvp,
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
@@ -3616,6 +4055,18 @@ fn production_router_matches_composed_production_wiring() {
                         };
                         let real = composed(gates, member_present);
                         let seam = InteractionRouter::production_router(gates, member_present);
+                        // Equal absence is not conformance: both constructors
+                        // must register the dedicated handler while enabled.
+                        for (name, router) in [("composed", &real), ("seam", &seam)] {
+                            assert_eq!(
+                                router.handler_for(&HandlerId::Giveaway).map(|h| h.id()),
+                                automations.then_some(HandlerId::Giveaway),
+                                "{name} giveaway registration follows automations \
+                                 (scorecard={scorecard} automations={automations} \
+                                 announcements={announcements} moderation={moderation} \
+                                 member={member_present})"
+                            );
+                        }
                         for id in every_handler_id() {
                             assert_eq!(
                                 real.handler_for(&id).is_some(),

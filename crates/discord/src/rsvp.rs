@@ -525,7 +525,7 @@ async fn execute(
                     Membership::Current => {}
                     Membership::Absent => {
                         return Err(
-                            "You must still belong to this server to record attendance.".to_owned()
+                            "You must still be a member of this server to record attendance.".to_owned()
                         );
                     }
                     Membership::Unavailable => {
