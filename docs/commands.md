@@ -20,7 +20,21 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 51.
+## Private command help
+
+Use `/help` for the grouped index of this server's last confirmed publication.
+Use `/help command:rank` for a command's description, usage and optional member
+argument; `/help command:privacy` explains its subcommands and required inputs.
+The optional `command` selector trims surrounding whitespace, accepts one
+leading slash and compares ASCII case-insensitively. It does not expand aliases
+or name prefixes. Unknown or unpublished names return a correction to `/help`,
+never unpublished definitions. Custom commands appear only after publication
+is confirmed; failed or in-flight changes do not replace the confirmed help.
+Help is ephemeral and does not execute the selected command. The command picker
+hides gated commands you cannot use; help explains published requirements but
+does not evaluate every effective Discord permission or guarantee authorization.
+
+Built-in commands: 55.
 
 ## `/access`
 
@@ -79,6 +93,15 @@ Ban a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/channel-inspect`
+
+Privately inspect saved lockdown and live slowmode
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+No options.
 
 ## `/command`
 
@@ -195,6 +218,26 @@ Remove a feed relay
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | Feed id |
 
+## `/giveaway`
+
+Create, list or cancel a giveaway
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `create` | subcommand | false | — | — | — | — | Create a giveaway in this channel |
+| `create prize` | string | true | — | — | 200 | — | Prize text (up to 200 characters) |
+| `create duration` | integer | true | 1 | 43200 | — | — | Entry window in minutes (1–43200) |
+| `create winners` | integer | true | 1 | 100 | — | — | Number of winners |
+| `create required-role` | role | false | — | — | — | — | Role every entrant must hold |
+| `create min-account-age-days` | integer | false | 0 | 3650 | — | — | Minimum account age in days |
+| `create min-server-age-days` | integer | false | 0 | 3650 | — | — | Minimum time in this server in days |
+| `list` | subcommand | false | — | — | — | — | List open giveaways |
+| `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
+| `cancel id` | string | true | — | — | 64 | — | Giveaway id |
+
 ## `/group`
 
 Toggle shared numbering per category for one creator channel
@@ -214,7 +257,9 @@ Show this server's live commands, grouped by who can use them.
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `command` | string | false | — | — | 32 | — | Command name (case-insensitive; optional leading /) |
 
 ## `/import`
 
@@ -412,6 +457,17 @@ Delete recent messages
 | `count` | integer | true | 1 | 100 | — | — | Messages to delete (1-100) |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
+## `/purge-preview`
+
+Privately preview a purge without deleting messages
+
+- Default permissions: ManageMessages (`8192`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `count` | integer | true | 1 | 100 | — | — | Newest messages to sample (1-100) |
+
 ## `/rank`
 
 Show your XP, level and server rank.
@@ -431,6 +487,17 @@ Take back ownership of your temporary voice room
 - Available in DMs: false
 
 No options.
+
+## `/reopen`
+
+Reopen your games or session picker in a private menu.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kind` | string | true | — | — | — | Games = `"games"`; Session = `"session"` | Which picker to reopen. |
 
 ## `/rsvp`
 

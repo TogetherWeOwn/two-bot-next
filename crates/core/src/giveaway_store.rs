@@ -167,8 +167,8 @@ pub struct NewDraw {
 }
 
 /// Insert one giveaway definition, returning the stored row.
-pub async fn create_giveaway(
-    pool: &Pool<Postgres>,
+pub async fn create_giveaway<'e>(
+    pool: impl sqlx::Executor<'e, Database = Postgres>,
     input: &NewGiveaway,
 ) -> Result<GiveawayRow, sqlx::Error> {
     sqlx::query_as::<_, GiveawayRow>(
@@ -553,6 +553,217 @@ pub async fn latest_draw_no(
     .bind(giveaway_id)
     .fetch_one(pool)
     .await
+}
+
+/// Bound active definitions and every list/ticker batch for one guild.
+pub const MAX_OPEN_GIVEAWAYS: i64 = 25;
+/// Maximum number of distinct members admitted to one giveaway.
+pub const MAX_GIVEAWAY_ENTRIES: i32 = 10_000;
+
+/// Create and audit atomically, under a guild-scoped quota lock. An interaction
+/// id used as the opaque id also makes duplicate create deliveries harmless.
+pub async fn create_admitted(
+    pool: &Pool<Postgres>,
+    input: &NewGiveaway,
+) -> Result<Option<GiveawayRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("giveaway-quota:{}", input.guild_id))
+        .execute(&mut *tx)
+        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM giveaways WHERE guild_id = $1 AND status IN ('open', 'paused', 'drawing')",
+    ).bind(&input.guild_id).fetch_one(&mut *tx).await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM giveaways WHERE guild_id = $1 AND id = $2)",
+    )
+    .bind(&input.guild_id)
+    .bind(&input.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if count >= MAX_OPEN_GIVEAWAYS || exists {
+        return Ok(None);
+    }
+    let row = create_giveaway(&mut *tx, input).await?;
+    surface_audit(
+        &mut tx,
+        &row,
+        Some(&input.created_by),
+        "giveaway.create",
+        "ok",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(row))
+}
+
+/// Attach a confirmed message once. Pending/uncertain sends are never retried
+/// automatically, so a lost acknowledgement cannot create duplicate messages.
+pub async fn attach_message(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    message_id: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query("UPDATE giveaways SET message_id = $3, updated_at = now() WHERE guild_id = $1 AND id = $2 AND message_id = 'pending' AND status = 'open'")
+        .bind(guild_id).bind(id).bind(message_id).execute(pool).await?.rows_affected() == 1)
+}
+
+/// Bounded active list, shared by the slash command and countdown supervisor.
+pub async fn list_active(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+) -> Result<Vec<GiveawayRow>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM giveaways WHERE guild_id = $1 AND status IN ('open', 'paused') ORDER BY ends_at, id LIMIT $2")
+        .bind(guild_id).bind(MAX_OPEN_GIVEAWAYS).fetch_all(pool).await
+}
+
+/// Admission result; duplicate clicks are not writes and never refresh counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAdmission {
+    Entered,
+    AlreadyEntered,
+    Closed,
+    Full,
+    Ineligible,
+    RateLimited,
+}
+
+/// Status, deadline, capacity, eligibility and uniqueness share the parent row
+/// lock. Cancel and draw claims take the same lock via UPDATE, so no admission
+/// can race past a lifecycle change or oversubscribe the final place.
+pub async fn admit_entry(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    user_id: &str,
+    standing: &crate::giveaway::MemberStanding,
+    now: OffsetDateTime,
+) -> Result<EntryAdmission, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<GiveawayRow> =
+        sqlx::query_as("SELECT * FROM giveaways WHERE guild_id = $1 AND id = $2 FOR UPDATE")
+            .bind(guild_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(row) = row else {
+        return Ok(EntryAdmission::Closed);
+    };
+    if row.status != "open"
+        || row.ends_at <= now
+        || row.claim_token.is_some()
+        || row.message_id == "pending"
+    {
+        return Ok(EntryAdmission::Closed);
+    }
+    // Role ids originate as typed, nonzero Discord Role options. Deserialize
+    // the exact stored schema; never trust component-supplied requirements.
+    let requirements: crate::giveaway::GiveawayRequirements =
+        serde_json::from_value(row.requirements_json.clone())
+            .map_err(|_| sqlx::Error::Protocol("invalid giveaway requirements".into()))?;
+    if requirements.min_account_age_days > crate::giveaway::REQUIREMENT_MAX_AGE_DAYS
+        || requirements.min_guild_age_days > crate::giveaway::REQUIREMENT_MAX_AGE_DAYS
+        || requirements
+            .roles
+            .iter()
+            .any(|id| id.parse::<u64>().is_err() || id == "0")
+    {
+        return Ok(EntryAdmission::Ineligible);
+    }
+    if crate::giveaway::adjudicate_eligibility(&requirements, standing)
+        != crate::giveaway::Eligibility::Eligible
+    {
+        return Ok(EntryAdmission::Ineligible);
+    }
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM giveaway_entries WHERE guild_id = $1 AND giveaway_id = $2 AND user_id = $3)")
+        .bind(guild_id).bind(id).bind(user_id).fetch_one(&mut *tx).await?;
+    if exists {
+        return Ok(EntryAdmission::AlreadyEntered);
+    }
+    // A second, durable budget fences independent runtimes and restarts. Take
+    // it after the giveaway lock consistently; no path takes these in reverse.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("giveaway-entry:{guild_id}:{user_id}"))
+        .execute(&mut *tx)
+        .await?;
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM giveaway_entries WHERE guild_id = $1 AND user_id = $2 AND entered_at > $3")
+        .bind(guild_id).bind(user_id).bind(now - time::Duration::minutes(1)).fetch_one(&mut *tx).await?;
+    if writes >= 10 {
+        return Ok(EntryAdmission::RateLimited);
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM giveaway_entries WHERE guild_id = $1 AND giveaway_id = $2",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if count >= i64::from(row.max_entries) {
+        return Ok(EntryAdmission::Full);
+    }
+    sqlx::query("INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at) VALUES ($1, $2, $3, 1, $4) ON CONFLICT DO NOTHING")
+        .bind(guild_id).bind(id).bind(user_id).bind(now).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(EntryAdmission::Entered)
+}
+
+/// Count without loading the entrant identities into the request path.
+pub async fn entry_count(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM giveaway_entries WHERE guild_id = $1 AND giveaway_id = $2",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Cancel and its audit commit together, exactly once for a live definition.
+pub async fn cancel_audited(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    actor: &str,
+) -> Result<Option<GiveawayRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<GiveawayRow> = sqlx::query_as("UPDATE giveaways SET status = 'cancelled', claim_token = NULL, claimed_at = NULL, updated_at = now() WHERE guild_id = $1 AND id = $2 AND status IN ('open', 'paused') RETURNING *")
+        .bind(guild_id).bind(id).fetch_optional(&mut *tx).await?;
+    if let Some(row) = &row {
+        surface_audit(&mut tx, row, Some(actor), "giveaway.cancel", "ok").await?;
+    }
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// One durable marker per countdown bucket. Claim before REST: a crash or
+/// rejected edit may miss a cosmetic refresh, but never causes an edit storm.
+pub async fn claim_refresh(
+    pool: &Pool<Postgres>,
+    row: &GiveawayRow,
+    threshold: i64,
+) -> Result<bool, sqlx::Error> {
+    let id = format!("giveaway.refresh:{}:{}:{threshold}", row.guild_id, row.id);
+    Ok(sqlx::query("INSERT INTO automation_audit_log (id, guild_id, action, target_key, outcome, created_at) VALUES ($1, $2, 'giveaway.refresh', $3, 'claimed', $4) ON CONFLICT (id) DO NOTHING")
+        .bind(id).bind(&row.guild_id).bind(&row.id).bind(OffsetDateTime::now_utc())
+        .execute(pool).await?.rows_affected() == 1)
+}
+
+async fn surface_audit(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    row: &GiveawayRow,
+    actor: Option<&str>,
+    action: &str,
+    outcome: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+        .bind(format!("{action}:{}:{}", row.guild_id, row.id)).bind(&row.guild_id).bind(actor)
+        .bind(action).bind(&row.id).bind(outcome).bind(row.updated_at).execute(&mut **tx).await?;
+    Ok(())
 }
 
 #[cfg(test)]

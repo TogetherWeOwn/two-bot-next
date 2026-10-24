@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION,
+    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_GUILD, PRIVACY_DESCRIPTION,
+    REOPEN_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -37,7 +38,11 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("reopen", "docs/parity.md §1 reopen"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("giveaway", "docs/parity.md §1 giveaway"),
+    ("purge-preview", "docs/parity.md §1 purge-preview"),
+    ("channel-inspect", "docs/parity.md §1 channel-inspect"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -171,8 +176,15 @@ pub fn expected_registry() -> Value {
     // Next-only `/help` discovery surface: no legacy counterpart. Insert at
     // the publish position (third, after the leveling core) as the exact
     // published definition, so parity pins its shape too.
-    let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
-        .expect("help serializes");
+    let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION).options(
+        vec![CommandOption::new(
+                "command",
+                "Command name (case-insensitive; optional leading /)",
+                CommandOptionType::String,
+            )
+            .max_length(32)],
+    ))
+    .expect("help serializes");
     commands.insert(2, help);
     // Next-only `/privacy` member self-serve: no legacy counterpart. Insert
     // at the publish position (fourth, after help) as the exact published
@@ -231,6 +243,29 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only `/reopen` self-service picker recovery: no legacy
+    // counterpart. Insert at the publish position (fifth, after privacy) as
+    // the exact published definition, so parity pins its shape too.
+    let reopen = serde_json::to_value(
+        CommandDefinition::new("reopen", REOPEN_DESCRIPTION).options(vec![CommandOption::new(
+            "kind",
+            "Which picker to reopen.",
+            CommandOptionType::String,
+        )
+        .required()
+        .choices(vec![
+            CommandChoice {
+                name: "Games".to_owned(),
+                value: "games".to_owned(),
+            },
+            CommandChoice {
+                name: "Session".to_owned(),
+                value: "session".to_owned(),
+            },
+        ])]),
+    )
+    .expect("reopen serializes");
+    commands.insert(4, reopen);
     // Next-only saved-response inspection. This independent literal pins the
     // whole publication contract; never manufacture it from production shapes.
     let inspect = json!({
@@ -257,6 +292,100 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
+    // publish position (index 15, after sticky-remove and the
+    // inspect/help/privacy/reopen inserts above) as the exact published
+    // definition, so parity pins its shape too.
+    let giveaway = serde_json::to_value(
+        CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![
+                CommandOption::new(
+                    "create",
+                    "Create a giveaway in this channel",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new(
+                        "prize",
+                        "Prize text (up to 200 characters)",
+                        CommandOptionType::String,
+                    )
+                    .required()
+                    .max_length(200),
+                    CommandOption::new(
+                        "duration",
+                        "Entry window in minutes (1–43200)",
+                        CommandOptionType::Integer,
+                    )
+                    .required()
+                    .int_range(1, 43200),
+                    CommandOption::new("winners", "Number of winners", CommandOptionType::Integer)
+                        .required()
+                        .int_range(1, 100),
+                    CommandOption::new(
+                        "required-role",
+                        "Role every entrant must hold",
+                        CommandOptionType::Role,
+                    ),
+                    CommandOption::new(
+                        "min-account-age-days",
+                        "Minimum account age in days",
+                        CommandOptionType::Integer,
+                    )
+                    .int_range(0, 3650),
+                    CommandOption::new(
+                        "min-server-age-days",
+                        "Minimum time in this server in days",
+                        CommandOptionType::Integer,
+                    )
+                    .int_range(0, 3650),
+                ]),
+                CommandOption::new("list", "List open giveaways", CommandOptionType::SubCommand),
+                CommandOption::new(
+                    "cancel",
+                    "Cancel an open or paused giveaway",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+            ]),
+    )
+    .expect("giveaway serializes");
+    commands.insert(15, giveaway);
+    // Next-only read surfaces follow the nine historical mutations. Literal
+    // payloads keep the frozen snapshot intact and compare every read field.
+    let after_unlock = commands
+        .iter()
+        .position(|command| command["name"] == "unlock")
+        .expect("legacy unlock remains published")
+        + 1;
+    commands.insert(
+        after_unlock,
+        json!({
+            "name": "purge-preview",
+            "description": "Privately preview a purge without deleting messages",
+            "dm_permission": false,
+            "default_member_permissions": "8192",
+            "options": [{"name": "count", "description": "Newest messages to sample (1-100)",
+                "type": 4, "required": true, "min_value": 1, "max_value": 100}]
+        }),
+    );
+    commands.insert(
+        after_unlock + 1,
+        json!({
+            "name": "channel-inspect",
+            "description": "Privately inspect saved lockdown and live slowmode",
+            "options": [],
+            "dm_permission": false,
+            "default_member_permissions": "16"
+        }),
+    );
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

@@ -86,6 +86,9 @@ const PUT_REFUSED_FLAGS: ReadonlySet<string> = new Set([
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_ASSISTANT_ENDPOINT",
   "TWO_ASSISTANT_MODEL",
+  // Catalogue edits must serialize with durable self-role work in Postgres;
+  // the independently expiring ops layer cannot honor that drain boundary.
+  "TWO_SELF_ROLE_PANELS",
 ]);
 const FENCE_KEYS = ["automation", "automod", "publish", "gateway_park"] as const;
 export type FenceKey = (typeof FENCE_KEYS)[number];

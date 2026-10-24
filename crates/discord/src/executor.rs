@@ -2611,6 +2611,16 @@ impl ActionExecutor {
         channel_id: &str,
         count: u64,
     ) -> Result<Vec<Id<MessageMarker>>, DiscordError> {
+        Ok(self.sample_purge_messages(channel_id, count).await?.ids)
+    }
+
+    /// The same newest-page sample as execution, retaining only bounded counts
+    /// and validated IDs for a private preview. Never carries message content.
+    pub(crate) async fn sample_purge_messages(
+        &self,
+        channel_id: &str,
+        count: u64,
+    ) -> Result<PurgeSample, DiscordError> {
         if !(1..=100).contains(&count) {
             return Err(DiscordError::Rejected(format!(
                 "purge out of range: {count}"
@@ -2642,11 +2652,33 @@ impl ActionExecutor {
         } else {
             None
         };
-        Ok(rows
-            .into_iter()
-            .filter(|(_, row)| !purge_protected(row, own_id.as_deref()))
-            .map(|(id, _)| id)
-            .collect())
+        Ok(PurgeSample {
+            listed: rows.len(),
+            pinned: rows
+                .iter()
+                .filter(|(_, row)| row["pinned"].as_bool() == Some(true))
+                .count(),
+            own_bot: rows
+                .iter()
+                .filter(|(_, row)| {
+                    own_id
+                        .as_deref()
+                        .is_some_and(|own| row["author"]["id"].as_str() == Some(own))
+                })
+                .count(),
+            system: rows
+                .iter()
+                .filter(|(_, row)| {
+                    row.get("type")
+                        .is_some_and(|kind| !matches!(kind.as_u64(), Some(0 | 19)))
+                })
+                .count(),
+            ids: rows
+                .into_iter()
+                .filter(|(_, row)| !purge_protected(row, own_id.as_deref()))
+                .map(|(id, _)| id)
+                .collect(),
+        })
     }
 
     /// Deletion phase. Messages Discord still bulk-deletes go in one bulk call;
@@ -3836,7 +3868,7 @@ impl ActionExecutor {
     }
 
     /// Complete an acknowledged interaction without mention neutralization.
-    /// Only for ephemeral management views (saved-response inspection) whose
+    /// Only for ephemeral management views (saved responses or lockdown reasons) whose
     /// mention safety comes from this edit's explicit empty `allowed_mentions`
     /// — the admin must see the saved text exactly as stored. Every other
     /// completion must keep using [`Self::edit_interaction_response`].
@@ -3880,6 +3912,60 @@ impl ActionExecutor {
         Ok(())
     }
 
+    /// Complete an acknowledged interaction by editing its original response,
+    /// replacing the message content and its components (a reopened picker
+    /// menu). Same single-attempt, unpaced, receipt-checked contract as
+    /// [`ActionExecutor::edit_interaction_response`]: a lost menu edit must
+    /// not repeat already-committed store effects, and the interaction token
+    /// never appears in a returned error. The original callback decides
+    /// ephemerality; edits retain it.
+    pub async fn edit_interaction_response_with_components(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.edit_interaction_response_with_components_with_timeout(
+            application_id,
+            interaction_token,
+            content,
+            components,
+            self.inner.moderation_timeout,
+        )
+        .await
+    }
+
+    async fn edit_interaction_response_with_components_with_timeout(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+        timeout: Duration,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let content = two_bot_core::message_safety::content(content);
+        let mentions = AllowedMentions::default();
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(&content))
+                .components(Some(components))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        let req = Self::explicit_mentions(req, &mentions)?;
+        let mut res = self
+            .call_once_raw_lane_for(&req, &[200], None, timeout)
+            .await?;
+        mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(())
+    }
+
     /// Complete an acknowledged interaction with bounded contention tolerance:
     /// re-attempts ONLY admission-Blocked failures within the absolute
     /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget. A Blocked attempt never reached
@@ -3894,6 +3980,30 @@ impl ActionExecutor {
         self.retry_admission_blocked(|_| async {
             self.edit_interaction_response(application_id, interaction_token, content)
                 .await
+        })
+        .await
+    }
+
+    /// [`ActionExecutor::edit_interaction_response_with_components`] with the
+    /// same bounded contention tolerance as
+    /// [`ActionExecutor::edit_interaction_response_with_blocked_retry`]:
+    /// re-attempts ONLY admission-Blocked failures that never reached the
+    /// wire, so retrying cannot repeat an accepted menu edit.
+    pub async fn edit_interaction_response_with_components_and_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|timeout| {
+            self.edit_interaction_response_with_components_with_timeout(
+                application_id,
+                interaction_token,
+                content,
+                components,
+                timeout,
+            )
         })
         .await
     }
@@ -4118,6 +4228,14 @@ impl IntoOther for DiscordError {
             other => other,
         }
     }
+}
+
+pub(crate) struct PurgeSample {
+    pub ids: Vec<Id<MessageMarker>>,
+    pub listed: usize,
+    pub pinned: usize,
+    pub own_bot: usize,
+    pub system: usize,
 }
 
 /// Messages `/purge` leaves alone: pinned ones, and this bot's own posts.

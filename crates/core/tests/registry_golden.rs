@@ -59,6 +59,15 @@ fn fixture_and_exception_list_are_pinned_to_the_parity_matrix() {
 fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
     let mutations = [
         ("purge", "/options/0/min_value", json!(0)),
+        ("purge-preview", "/options/0/min_value", json!(0)),
+        ("purge-preview", "/options/0/max_value", json!(101)),
+        ("purge-preview", "/options/0/required", json!(false)),
+        ("purge-preview", "/default_member_permissions", json!("16")),
+        (
+            "channel-inspect",
+            "/default_member_permissions",
+            json!("8192"),
+        ),
         ("purge", "/options/0/max_value", json!(101)),
         ("slowmode", "/options/0/min_value", json!(-1)),
         ("slowmode", "/options/0/max_value", json!(21601)),
@@ -93,6 +102,18 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("leaderboard", "/description", json!("Changed copy")),
         ("leaderboard", "/dm_permission", json!(true)),
         ("leaderboard", "/type", json!(2)),
+        ("giveaway", "/default_member_permissions", json!("0")),
+        ("giveaway", "/dm_permission", json!(true)),
+        ("giveaway", "/description", json!("Changed copy")),
+        ("giveaway", "/options/0/options/0/max_length", json!(201)),
+        ("giveaway", "/options/0/options/1/min_value", json!(0)),
+        ("giveaway", "/options/0/options/1/max_value", json!(43201)),
+        ("giveaway", "/options/0/options/2/max_value", json!(101)),
+        ("giveaway", "/options/0/options/0/required", json!(false)),
+        ("giveaway", "/options/0/options/3/type", json!(3)),
+        ("giveaway", "/options/0/options/4/max_value", json!(3651)),
+        ("giveaway", "/options/0/options/5/min_value", json!(-1)),
+        ("giveaway", "/options/2/options/0/max_length", json!(65)),
     ];
     for (name, pointer, replacement) in mutations {
         let mut actual = canonical_registry(next_registry());

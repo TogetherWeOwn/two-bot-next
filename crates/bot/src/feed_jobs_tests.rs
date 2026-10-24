@@ -10,6 +10,7 @@ use two_bot_core::feeds_connector::{
     fetch_feed_with, FeedConnectError, FeedConnector, FeedResolver, FeedResponse, FetchOptions,
 };
 use two_bot_core::feeds_http::PublicRequest;
+use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
 use two_bot_testsupport::TestDatabase;
 
 use crate::{
@@ -515,6 +516,87 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
         )
         .is_none());
     }
+}
+
+#[test]
+fn live_announcements_gate_is_store_first_and_fail_closed() {
+    // No snapshot (poller parked or pre-first-poll) reads boot.
+    assert!(live_announcements_with(GUILD, true, None));
+    assert!(!live_announcements_with(GUILD, false, None));
+    let (mut writer, live) = live_channel();
+    assert!(live_announcements_with(GUILD, true, Some(&live)));
+    // Every publish moves the revision: the channel only republishes on
+    // moved marks, so a repeated revision would read back stale.
+    let mut revision = 0;
+    let mut publish = |rows: Vec<SettingRow>| {
+        revision += 1;
+        writer.publish(&SettingsSnapshot { revision, rows })
+    };
+    let row = |guild: &str, value: serde_json::Value| SettingRow {
+        guild_id: guild.to_owned(),
+        key: ANNOUNCEMENTS_KEY.to_owned(),
+        value,
+        version: 1,
+    };
+    // Stored rows win in both directions over the boot value.
+    for (stored, boot_on, expected) in [
+        (json!(false), true, false),
+        (json!(true), false, true),
+        (json!(0), true, false),
+        (json!(1), false, true),
+        (json!("0"), true, false),
+        (json!("1"), false, true),
+    ] {
+        publish(vec![row(GUILD, stored.clone())]);
+        assert_eq!(
+            live_announcements_with(GUILD, boot_on, Some(&live)),
+            expected,
+            "{stored} over boot {boot_on}"
+        );
+    }
+    // Anything else renders off, even over a boot-on deployment: a bypassed
+    // write guard must park the poller, never wedge it on.
+    for stored in [
+        json!("on"),
+        json!("true"),
+        json!(""),
+        json!(2),
+        json!({"on": true}),
+    ] {
+        publish(vec![row(GUILD, stored.clone())]);
+        assert!(
+            !live_announcements_with(GUILD, true, Some(&live)),
+            "{stored} must fail closed"
+        );
+    }
+    // Another guild's row never leaks across.
+    publish(vec![row("other-guild", json!(true))]);
+    assert!(live_announcements_with(GUILD, true, Some(&live)));
+    assert!(!live_announcements_with(GUILD, false, Some(&live)));
+    // Deleting the row hands the gate back to boot.
+    publish(vec![]);
+    assert!(live_announcements_with(GUILD, true, Some(&live)));
+    assert!(!live_announcements_with(GUILD, false, Some(&live)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_gate_off_skips_ticks_without_error() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let off = register_gated_with(60, action.clone(), GUILD.to_owned(), Arc::new(|| false))
+        .expect("gate shape still registers");
+    (off.action)().await.expect("skipped tick is not an error");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let on = register_gated_with(60, action.clone(), GUILD.to_owned(), Arc::new(|| true))
+        .expect("gate shape still registers");
+    (on.action)().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 struct Active(Arc<AtomicUsize>);
