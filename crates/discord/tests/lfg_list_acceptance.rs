@@ -278,10 +278,10 @@ fn ids(content: &str) -> Vec<String> {
     content
         .split('`')
         .enumerate()
-        .filter_map(|(n, part)| {
-            (n % 2 == 1 && part.starts_with("p-") && !part.contains(char::is_whitespace))
-                .then(|| part.to_owned())
+        .filter(|&(n, part)| {
+            n % 2 == 1 && part.starts_with("p-") && !part.contains(char::is_whitespace)
         })
+        .map(|(_, part)| part.to_owned())
         .collect()
 }
 
