@@ -8,7 +8,9 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -114,17 +116,10 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(slot.name, 'slot-0')
 
     def test_guard_stops_growth_and_retains_lease(self):
-        self.policy['slot_budget_bytes'] = 24 * 1024
-        self.save_policy()
-        self.fake.write_text('#!' + sys.executable + '\n'
-                             'import os,time,pathlib\n'
-                             'p=pathlib.Path(os.environ["CARGO_TARGET_DIR"])/"growing"\n'
-                             'with p.open("wb", buffering=0) as f:\n'
-                             ' while True: f.write(b"x"*4096); time.sleep(.05)\n')
-        with self.assertRaisesRegex(cache.Refusal, 'sampled byte budget'):
-            cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
-        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
-        self.assertLessEqual(cache.usage(self.pool / 'slot-0' / 'target'), 32 * 1024)
+        self.assert_growth_stopped('target', sampler_delay=0)
+
+    def test_target_growth_is_stopped_with_delayed_sampler(self):
+        self.assert_growth_stopped('target', sampler_delay=.40)
 
     def test_crash_sentinel_is_not_stolen(self):
         for slot in self.pool.glob('slot-*'):
@@ -247,20 +242,111 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(list(external.iterdir()), [])
 
     def test_scratch_growth_is_counted_and_stopped(self):
+        self.assert_growth_stopped('scratch', sampler_delay=0)
+
+    def test_scratch_growth_is_stopped_with_delayed_sampler(self):
+        self.assert_growth_stopped('scratch', sampler_delay=.35)
+
+    def assert_growth_stopped(self, growth_area, sampler_delay):
+        # Catch missing target/scratch accounting, refusal and full-group stop.
+        # Each case grows only one tree, independently of the other's accounting.
+        # The writer grants one bounded burst, not a scheduler-dependent rate:
+        # a sampled guard promises termination, not a hard overshoot ceiling.
+        growth_env = {'target': 'CARGO_TARGET_DIR', 'scratch': 'TMPDIR'}[growth_area]
+        idle_area = 'scratch' if growth_area == 'target' else 'target'
         self.policy['slot_budget_bytes'] = 32 * 1024
         self.save_policy()
         self.fake.write_text('#!' + sys.executable + '\n'
-                             'import os,time,pathlib\n'
-                             'p=pathlib.Path(os.environ["TMPDIR"])/"growing"\n'
-                             'with p.open("wb", buffering=0) as f:\n'
-                             ' while True: f.write(b"x"*4096); time.sleep(.05)\n')
-        with self.assertRaisesRegex(cache.Refusal, 'sampled byte budget'):
-            cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
+                             'import os,pathlib,select,signal,subprocess,sys\n'
+                             'if "--writer" not in sys.argv:\n'
+                             ' signal.signal(signal.SIGTERM, lambda *_: None)\n'
+                             ' writer=subprocess.Popen([sys.executable,__file__,"--writer"])\n'
+                             ' sys.exit(writer.wait(timeout=40))\n'
+                             f'p=pathlib.Path(os.environ[{growth_env!r}])/"growing"\n'
+                             'print("ready", flush=True)\n'
+                             'for _ in range(3):\n'
+                             ' if not select.select([sys.stdin],[],[],10)[0]: break\n'
+                             ' command=sys.stdin.readline().strip()\n'
+                             ' if command == "grow":\n'
+                             '  with p.open("wb", buffering=0) as f:\n'
+                             '   f.write(b"x"*65536); os.fsync(f.fileno())\n'
+                             '  print("grown", flush=True)\n'
+                             ' elif command == "after-stop":\n'
+                             '  with p.open("ab", buffering=0) as f:\n'
+                             '   f.write(b"y"*4096); os.fsync(f.fileno())\n'
+                             '  print("wrote-after-stop", flush=True)\n'
+                             ' else: break\n'
+                             'print("writer-exited", flush=True)\n')
+        children = []
+        real_popen, real_sleep = subprocess.Popen, time.sleep
+
+        def launch(*args, **kwargs):
+            child = real_popen(*args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               **kwargs)
+            children.append(child)
+            return child
+
+        def finish():
+            for child in children:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.communicate(timeout=5)
+
+        self.addCleanup(finish)
+
+        def read_reply(child):
+            self.assertTrue(select.select([child.stdout], [], [], 10)[0],
+                            f'{growth_area} writer did not acknowledge the command')
+            return child.stdout.readline()
+
+        grew = False
+
+        def sample_sleep(seconds):
+            nonlocal grew
+            if seconds != .01:
+                return real_sleep(seconds)
+            child = children[0]
+            if not grew:
+                self.assertEqual(read_reply(child), b'ready\n')
+                child.stdin.write(b'grow\n')
+                child.stdin.flush()
+                self.assertEqual(read_reply(child), b'grown\n')
+                grew = True
+                real_sleep(sampler_delay)
+            else:
+                # Missing accounting/refusal must fail, not hang. Let the
+                # bounded writer exit normally if the next sample missed it.
+                child.stdin.write(b'finish\n')
+                child.stdin.flush()
+                child.wait(timeout=10)
+
+        with patch.object(cache.subprocess, 'Popen', launch), \
+                patch.object(cache.time, 'sleep', sample_sleep):
+            with self.assertRaisesRegex(cache.Refusal, 'sampled byte budget'):
+                cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
         slot = self.pool / 'slot-0'
-        self.assertTrue((slot / 'lease.json').exists())
-        self.assertEqual(list((slot / 'target').iterdir()), [])
+        growing = slot / growth_area / 'growing'
+        self.assertTrue(grew, f'refusal must follow real {growth_area} growth, not admission')
+        self.assertEqual(growing.read_bytes(), b'x' * 65536)
+        allocated = growing.stat().st_blocks * 512
+        self.assertGreaterEqual(allocated, 65536)
+        self.assertGreaterEqual(cache.usage(slot / growth_area), allocated)
+        self.assertGreaterEqual(cache.usage(slot), allocated)
         self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'] - 1)
-        self.assertLessEqual(cache.usage(slot), 40 * 1024)
+        self.assertTrue((slot / 'lease.json').exists())
+        self.assertEqual(list((slot / idle_area).iterdir()), [])
+        child = children[0]
+        # Both leader and descendant hold these pipes. A surviving writer can
+        # accept this command and append another block even if Cargo is dead.
+        with self.assertRaises(BrokenPipeError):
+            child.stdin.write(b'after-stop\n')
+            child.stdin.flush()
+        self.assertEqual(read_reply(child), b'')
+        self.assertIsNotNone(child.poll(), 'Cargo leader survived budget refusal')
+        self.assertEqual(growing.read_bytes(), b'x' * 65536)
+        self.assertEqual(growing.stat().st_blocks * 512, allocated)
 
     def test_missing_or_symlink_scratch_refuses_admission(self):
         scratch = self.pool / 'slot-0' / 'scratch'
