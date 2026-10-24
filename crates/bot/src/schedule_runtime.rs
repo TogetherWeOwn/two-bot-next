@@ -765,12 +765,12 @@ pub(crate) fn schedule_options_strict(
     };
     let in_minutes = match in_minutes_opts.first() {
         None => None,
-        Some(CommandOptionValue::Integer(value)) => Some(**value),
+        Some(CommandOptionValue::Integer(value)) => Some(*value),
         Some(_) => return Err(SCHEDULE_INVALID_IN_MINUTES),
     };
     let every_minutes = match every_minutes_opts.first() {
         None => None,
-        Some(CommandOptionValue::Integer(value)) => Some(**value),
+        Some(CommandOptionValue::Integer(value)) => Some(*value),
         Some(_) => return Err(SCHEDULE_INVALID_EVERY_MINUTES),
     };
     Ok((body, in_minutes, every_minutes))
@@ -821,7 +821,7 @@ pub(crate) fn schedule_list_page_option_strict(
     }
     match pages.first() {
         None => Ok(None),
-        Some(CommandOptionValue::Integer(value)) => Ok(Some(**value)),
+        Some(CommandOptionValue::Integer(value)) => Ok(Some(*value)),
         Some(_) => Err(SCHEDULE_LIST_INVALID_PAGE),
     }
 }
