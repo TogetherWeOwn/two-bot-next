@@ -163,6 +163,52 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
     }
 }
 
+/// One immediate ephemeral detail reply for `/help command:name` (or its
+/// unknown-name correction). Short detail stays in content; longer detail
+/// moves to one embed description, truncated with an explicit notice past
+/// Discord's description ceiling. The executor sanitizer stays the final
+/// mention/length backstop.
+#[must_use]
+pub fn help_detail_response(detail: String) -> InteractionResponse {
+    if two_bot_core::message_safety::text_len(&detail)
+        <= two_bot_core::message_safety::CONTENT_LIMIT
+    {
+        return text_response(InteractionReply::new(detail, true));
+    }
+    let mut description = detail;
+    if two_bot_core::message_safety::text_len(&description)
+        > two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT
+    {
+        description = two_bot_core::message_safety::truncate(
+            &description,
+            two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT - 64,
+        ) + "…(detail truncated for display.)";
+    }
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            allowed_mentions: Some(Default::default()),
+            embeds: Some(vec![Embed {
+                author: None,
+                color: None,
+                description: Some(description),
+                fields: Vec::new(),
+                footer: None,
+                image: None,
+                kind: "rich".to_owned(),
+                provider: None,
+                thumbnail: None,
+                timestamp: None,
+                title: None,
+                url: None,
+                video: None,
+            }]),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
 #[must_use]
 pub fn deferred_response(ephemeral: bool) -> InteractionResponse {
     InteractionResponse {
@@ -892,7 +938,7 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
         kind,
         max_length: opt.max_length.and_then(|m| u16::try_from(m).ok()),
         max_value: opt.max_value.map(CommandOptionValue::Integer),
-        min_length: None,
+        min_length: opt.min_length.and_then(|m| u16::try_from(m).ok()),
         min_value: opt.min_value.map(CommandOptionValue::Integer),
         name: opt.name.clone(),
         name_localizations: None,
@@ -1012,5 +1058,93 @@ mod help_response_tests {
                 assert_eq!(tokens.iter().filter(|name| **name == token).count(), 1);
             }
         }
+    }
+
+    #[test]
+    fn short_detail_stays_in_ephemeral_content() {
+        let detail = "/rank — Show your XP, level and server rank.\nUsage: /rank [member]\n";
+        let wire =
+            serde_json::to_value(help_detail_response(detail.to_owned())).expect("serializes");
+        assert_eq!(wire["type"], 4);
+        assert_eq!(wire["data"]["flags"], 64);
+        assert_eq!(
+            wire["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(wire["data"]["content"], detail);
+        assert!(wire["data"]["embeds"].is_null());
+    }
+
+    #[test]
+    fn wide_rendered_detail_preserves_its_complete_notice_through_the_adapter() {
+        use two_bot_core::commands::{CommandChoice, CommandOption, CommandOptionType};
+
+        let options = (0..25)
+            .map(|n| {
+                CommandOption::new(
+                    &format!("option{n:02}"),
+                    &format!("Argument {n:02}"),
+                    CommandOptionType::String,
+                )
+                .choices(
+                    (0..25)
+                        .map(|c| CommandChoice {
+                            name: format!("Label {c:02} {}", "😀".repeat(40)),
+                            value: format!("value_{c:02}"),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let detail = CommandDefinition::new("maximum", "Valid wide definition")
+            .options(options)
+            .help_detail_text();
+        assert!(text_len(&detail) > CONTENT_LIMIT, "exercise the embed path");
+        assert!(
+            text_len(&detail) <= EMBED_DESCRIPTION_LIMIT,
+            "the renderer must fit without the adapter's fallback"
+        );
+        assert!(detail.ends_with("\n…(detail truncated; /help lists every confirmed command.)\n"));
+        let response = help_detail_response(detail.clone());
+        let safe =
+            crate::message_safety::interaction_response(&response).expect("sanitized detail reply");
+        for reply in [response, safe] {
+            let wire = serde_json::to_value(reply).expect("serializes");
+            assert_eq!(wire["type"], 4);
+            assert_eq!(wire["data"]["flags"], 64);
+            assert_eq!(
+                wire["data"]["allowed_mentions"]["parse"],
+                serde_json::json!([])
+            );
+            assert!(wire["data"]["content"].is_null());
+            assert_eq!(wire["data"]["embeds"].as_array().expect("embeds").len(), 1);
+            assert_eq!(wire["data"]["embeds"][0]["description"], detail);
+        }
+    }
+
+    #[test]
+    fn overlong_detail_moves_to_a_bounded_embed_description() {
+        let detail = "x".repeat(EMBED_DESCRIPTION_LIMIT + 500);
+        let wire = serde_json::to_value(help_detail_response(detail)).expect("serializes");
+        assert!(wire["data"]["content"].is_null());
+        let description = wire["data"]["embeds"][0]["description"]
+            .as_str()
+            .expect("embed description");
+        assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(description.contains("truncated"));
+    }
+
+    #[test]
+    fn declared_min_length_reaches_the_publish_boundary() {
+        let option = two_bot_core::commands::CommandOption::new(
+            "label",
+            "Short text",
+            two_bot_core::commands::CommandOptionType::String,
+        )
+        .min_length(2)
+        .max_length(37);
+        let wire = serde_json::to_value(option_to_twilight(&option)).expect("serializes");
+        assert_eq!(wire["min_length"], 2);
+        assert_eq!(wire["max_length"], 37);
     }
 }
