@@ -192,8 +192,11 @@ def prove(*, sleep=time.sleep, clock=time.monotonic):
         run = gh(f"repos/{REPO}/actions/runs/{run_id}")
         run_identity(run, WORKFLOW, "workflow_dispatch")
         require(run.get("id") == run_id and run.get("run_attempt") == 1, "run_id_or_attempt_changed")
-        require(run.get("display_title") == REHEARSAL_TITLE, "child_not_rehearsal")
         if run.get("status") == "completed":
+            # The run-name expression resolves after creation: early polls can
+            # read the workflow name while the child still becomes the
+            # rehearsal. Enforce the title only at completion (fail-closed).
+            require(run.get("display_title") == REHEARSAL_TITLE, "child_not_rehearsal")
             break
         require(clock() < deadline, "staging_run_timeout_inspect_child_no_redispatch")
         sleep(30)
