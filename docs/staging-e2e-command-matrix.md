@@ -54,8 +54,8 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 27 | `/lfg-close` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `id` required |
 | 28 | `/feed-add` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `kind` rss/youtube/twitch, `source` required |
 | 29 | `/feed-remove` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
-| 37 | `/feed-pause` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row; refused while pending recovery exists | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
-| 38 | `/feed-resume` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
+| 38 | `/feed-pause` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row; enabled-to-paused transition refused while pending recovery exists | `AnnouncementsDisabled`, `ManageServerRequired`, exactly one string `id` required |
+| 39 | `/feed-resume` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, exactly one string `id` required |
 | 30 | `/feed-list` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay list | `AnnouncementsDisabled`, `ManageServerRequired` |
 | 3 | `/ban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + REST ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Ban)`, member-moderation policy, `target`/`reason` required |
 | 4 | `/tempban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + timed ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(TempBan)`, member-moderation policy, `duration_seconds` ≥60 (runtime max 365d) |

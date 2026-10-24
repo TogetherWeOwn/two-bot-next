@@ -193,9 +193,9 @@ head; revisit if the binary approaches it. The 112 MiB image ceiling is
 unchanged (43.43 MiB measured on the same build).
 
 This branch's automation-only head separately measured 15,769,872 bytes
-(15.04 MiB) before the event-executor merge. This PR raises the binary
-ceiling to 17 MiB; the combined exact-head CI measurement is still
-required.
+(15.04 MiB) before the event-executor merge. The current binary ceiling is
+18 MiB following the 2026-10-24 calibration above; each combined exact-head
+CI measurement is still required.
 
 ### Docker history image measurement and immutable-ID pinning
 

@@ -185,20 +185,6 @@ pub async fn pause_feed(
 ) -> Result<FeedPauseOutcome, FeedStoreError> {
     let mut tx = pool.begin().await?;
     lock_feed_delivery(&mut tx, guild_id, id).await?;
-    // Under the fence: refuse while unresolved pending delivery evidence
-    // remains, so recovery stays discoverable behind the enabled relay.
-    let pending: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM feed_deliveries d JOIN feed_relays f ON f.id = d.feed_id
-         WHERE d.feed_id = $1 AND f.guild_id = $2 AND d.state = 'pending'",
-    )
-    .bind(id)
-    .bind(guild_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if pending > 0 {
-        tx.rollback().await?;
-        return Ok(FeedPauseOutcome::RecoveryRequired);
-    }
     let current: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
             .bind(guild_id)
@@ -215,6 +201,21 @@ pub async fn pause_feed(
             Ok(FeedPauseOutcome::AlreadyPaused)
         }
         Some(true) => {
+            // Only an enabled-to-paused transition can strand recovery.
+            // Missing/already-paused relays return above without changing
+            // pending evidence, including restored paused+pending state.
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM feed_deliveries d JOIN feed_relays f ON f.id = d.feed_id
+                 WHERE d.feed_id = $1 AND f.guild_id = $2 AND d.state = 'pending'",
+            )
+            .bind(id)
+            .bind(guild_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if pending > 0 {
+                tx.rollback().await?;
+                return Ok(FeedPauseOutcome::RecoveryRequired);
+            }
             sqlx::query(
                 "UPDATE feed_relays SET enabled = false,
                  updated_at = to_timestamp($3::bigint::double precision / 1000)

@@ -1,9 +1,9 @@
 # Feed supervisor operator guide
 
-How to run feed delivery (`/feed-add`, `/feed-list`, `/feed-remove` plus the
-managed poller). This is the operator view. The port record
-(`docs/feeds-port.md`) remains the domain/store contract; this guide does not
-restate it.
+How to run feed delivery (`/feed-add`, `/feed-list`, `/feed-remove`,
+`/feed-pause`, `/feed-resume` and the managed poller). This is the operator view.
+The port record (`docs/feeds-port.md`) remains the domain/store contract; this
+guide does not restate it.
 
 Out of scope: code changes and dashboard queries. Cadence hot-reload is
 shipped behavior (see [Fetch cadence](#fetch-cadence)): a stored interval
@@ -19,7 +19,7 @@ available in DMs (`docs/commands.md`):
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
 | `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation; short lists keep the exact legacy single reply (`crates/core/src/feeds.rs`). Every row labels its own `enabled`/`paused` state. |
 | `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` Guild-scoped delete. |
-| `/feed-pause` | `id` (required string, max 128 chars) | Pauses one relay without deleting its history: URL, destination, seen-item state and delivery evidence are preserved. Replies ``Feed relay paused: `<id>`.``, ``Feed relay is already paused: `<id>`.``, `No feed relay with that id.`, or — while a delivery is still pending recovery — `Feed relay kept enabled: deliveries are still pending recovery. Retry after recovery settles.` (relay stays enabled; already-admitted work is not cancelled). |
+| `/feed-pause` | `id` (required string, max 128 chars) | Pauses one relay without deleting its history: URL, destination, seen-item state and delivery evidence are preserved. Replies ``Feed relay paused: `<id>`.``, ``Feed relay is already paused: `<id>`.``, `No feed relay with that id.`, or — when an enabled relay has a delivery still pending recovery — `Feed relay kept enabled: deliveries are still pending recovery. Retry after recovery settles.` (relay stays enabled; already-admitted work is not cancelled). |
 | `/feed-resume` | `id` (required string, max 128 chars) | Resumes one paused relay with its history intact. Replies ``Feed relay resumed: `<id>`.``, ``Feed relay is already enabled: `<id>`.``, or `No feed relay with that id.` Catch-up keeps the existing 20-posts-per-pass budget; accepted items are never reposted. |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
@@ -40,8 +40,13 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
   remove again (`docs/feeds-port.md`). Do not remove and re-add a relay to
   "fix" it unless resetting its delivery history is intended — use
   `/feed-pause` to silence a relay temporarily (history preserved) and
-  `/feed-resume` to restore it. Pause is likewise refused while pending
-  recovery exists; retry after recovery settles.
+  `/feed-resume` to restore it. Pausing an enabled relay is likewise refused
+  while pending recovery exists; retry after recovery settles. An already-paused
+  relay stays unchanged and reports already paused, even if restored with
+  pending evidence. Resume that relay to make recovery discoverable again.
+- `/feed-remove`, `/feed-pause` and `/feed-resume` require exactly one string
+  `id` option. Duplicate, wrong-type or missing options refuse with the correct
+  command invocation before any store read or audit write.
 
 Gates (both must hold or the poller parks):
 
@@ -354,5 +359,6 @@ Committed tests behind this guide (all offline except where noted):
 constants (the exact strings each `--help` path prints). The `two-bot`
 binary was not built in this docs run, so no binary `--help` transcript
 is claimed. Slash-command options are pasted from `docs/commands.md`
-(rendered from the compiled registry) and the option decoders at
-`crates/bot/src/command_runtime.rs:2381-2416`.
+(rendered from the compiled registry) and the option decoders in
+`crates/bot/src/command_runtime.rs`: `feed_add_options_strict`,
+`feed_id_option_strict` and `feed_list_page_request`.

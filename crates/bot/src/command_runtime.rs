@@ -2147,8 +2147,8 @@ impl CommandRuntime {
     /// `/feed-pause`: decode `id` → plan → guild-scoped disable →
     /// `feed.pause` audit (`paused`/`already_paused`/`missing`/`recovery_required`
     /// outcome) → ephemeral confirmation. URL, destination, seen-item and
-    /// delivery history are preserved; only lifecycle state changes. A relay
-    /// carrying unresolved pending delivery evidence stays enabled with a
+    /// delivery history are preserved; only lifecycle state changes. An enabled
+    /// relay carrying unresolved pending delivery evidence stays enabled with a
     /// fixed retry-after-recovery reply, so recovery is never stranded behind
     /// disabled discovery. Already-admitted work is not cancelled, and no
     /// fresh post claim may begin after a successful pause. A store failure
@@ -2159,9 +2159,19 @@ impl CommandRuntime {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
-        let command = FeedCommand::Pause {
-            id: feed_remove_option(interaction).unwrap_or_default(),
+        let id = match feed_id_option_strict(
+            interaction,
+            FEED_PAUSE_INVALID_ID,
+            FEED_PAUSE_DUPLICATE_ID,
+            FEED_PAUSE_MISSING_ID,
+        ) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
         };
+        let command = FeedCommand::Pause { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Pause { guild_id, id }) => {
                 match pause_feed(&self.pool, &guild_id, &id, inputs.now_ms).await {
@@ -2212,9 +2222,19 @@ impl CommandRuntime {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
-        let command = FeedCommand::Resume {
-            id: feed_remove_option(interaction).unwrap_or_default(),
+        let id = match feed_id_option_strict(
+            interaction,
+            FEED_RESUME_INVALID_ID,
+            FEED_RESUME_DUPLICATE_ID,
+            FEED_RESUME_MISSING_ID,
+        ) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
         };
+        let command = FeedCommand::Resume { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Resume { guild_id, id }) => {
                 match resume_feed(&self.pool, &guild_id, &id, inputs.now_ms).await {
@@ -2598,6 +2618,12 @@ const FEED_ADD_MISSING_SOURCE: &str = "Missing source. Use /feed-add kind:rss so
 const FEED_REMOVE_INVALID_ID: &str = "Invalid id. Use /feed-remove id:<relay-id>.";
 const FEED_REMOVE_DUPLICATE_ID: &str = "Duplicate id. Use /feed-remove id:<relay-id>.";
 const FEED_REMOVE_MISSING_ID: &str = "Missing id. Use /feed-remove id:<relay-id>.";
+const FEED_PAUSE_INVALID_ID: &str = "Invalid id. Use /feed-pause id:<relay-id>.";
+const FEED_PAUSE_DUPLICATE_ID: &str = "Duplicate id. Use /feed-pause id:<relay-id>.";
+const FEED_PAUSE_MISSING_ID: &str = "Missing id. Use /feed-pause id:<relay-id>.";
+const FEED_RESUME_INVALID_ID: &str = "Invalid id. Use /feed-resume id:<relay-id>.";
+const FEED_RESUME_DUPLICATE_ID: &str = "Duplicate id. Use /feed-resume id:<relay-id>.";
+const FEED_RESUME_MISSING_ID: &str = "Missing id. Use /feed-resume id:<relay-id>.";
 
 /// Strictly decode `/feed-add`'s options: `kind` and `source` must each
 /// appear exactly once with a string value. Duplicates win over wrong types
@@ -2656,10 +2682,27 @@ pub(crate) fn feed_add_options_strict(
 /// Present-but-empty still decodes (the planner's `validate_id` owns that
 /// refusal), so valid invocations plan byte-identically to before.
 pub(crate) fn feed_remove_option_strict(interaction: &Interaction) -> Result<String, &'static str> {
+    feed_id_option_strict(
+        interaction,
+        FEED_REMOVE_INVALID_ID,
+        FEED_REMOVE_DUPLICATE_ID,
+        FEED_REMOVE_MISSING_ID,
+    )
+}
+
+/// Share strict relay-id decoding without sharing command-worded refusals.
+/// Malformed options refuse before planning, store access or audit writes;
+/// typed-empty values still reach the planner's `validate_id` check.
+fn feed_id_option_strict(
+    interaction: &Interaction,
+    invalid_id: &'static str,
+    duplicate_id: &'static str,
+    missing_id: &'static str,
+) -> Result<String, &'static str> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return Err(FEED_REMOVE_MISSING_ID);
+        return Err(missing_id);
     };
     let mut ids: Vec<&CommandOptionValue> = Vec::new();
     for option in &data.options {
@@ -2668,31 +2711,13 @@ pub(crate) fn feed_remove_option_strict(interaction: &Interaction) -> Result<Str
         }
     }
     if ids.len() > 1 {
-        return Err(FEED_REMOVE_DUPLICATE_ID);
+        return Err(duplicate_id);
     }
     match ids.first() {
-        None => Err(FEED_REMOVE_MISSING_ID),
+        None => Err(missing_id),
         Some(CommandOptionValue::String(value)) => Ok((*value).clone()),
-        Some(_) => Err(FEED_REMOVE_INVALID_ID),
+        Some(_) => Err(invalid_id),
     }
-}
-
-/// The stable relay `id` option shared by `/feed-pause` and `/feed-resume`
-/// (`/feed-remove` strictly decodes via [`feed_remove_option_strict`]);
-/// `None` plans against an empty id, which `validate_id` rejects with
-/// `InvalidId`.
-pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
-    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
-        &interaction.data
-    else {
-        return None;
-    };
-    data.options
-        .iter()
-        .find_map(|option| match (option.name.as_str(), &option.value) {
-            ("id", CommandOptionValue::String(value)) => Some(value.clone()),
-            _ => None,
-        })
 }
 
 /// `/help`'s optional `command` selector. Omitted means the grouped index.

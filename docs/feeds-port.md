@@ -146,11 +146,15 @@ removes again.
 Pause and resume share that same fence and change only the relay's
 lifecycle state (`enabled`/`updated_at`): URL, destination, seen-item
 high-water and the delivery/nonce ledger are preserved verbatim, and pending
-or uncertain-send settlement is untouched. Pause refuses — leaving the relay
-enabled with a fixed retry-after-recovery reply — while any pending delivery
-row for that guild/feed is unresolved, because pending discovery only reads
-enabled relays and pausing would strand recovery; already-admitted work is
-never cancelled, and no fresh post claim may begin after a successful pause.
+or uncertain-send settlement is untouched. An enabled-to-paused transition
+refuses — leaving the relay enabled with a fixed retry-after-recovery reply —
+while any pending delivery row for that guild/feed is unresolved, because
+pending discovery only reads enabled relays and pausing would strand recovery.
+An already-paused relay returns the idempotent already-paused outcome before
+checking pending evidence, without changing any stored state. If a restored
+paused relay carries pending evidence, resume it to restore recovery discovery.
+Already-admitted work is never cancelled, and no fresh post claim may begin
+after a successful pause.
 The poller re-reads live lifecycle state before each relay, so a stale
 enabled snapshot can neither fetch nor write high-water after a pause.
 Resume restores polling with the existing per-poll 20-attempt POST budget:
