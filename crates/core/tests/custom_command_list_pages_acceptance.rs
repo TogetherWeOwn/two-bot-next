@@ -121,3 +121,53 @@ fn custom_list_acceptance_small_mixed_set_keeps_disabled_and_slash_only_rows() {
 fn custom_list_acceptance_empty_reply_stays_backward_compatible() {
     assert_eq!(format_command_list(&[]), "No custom commands defined.");
 }
+
+#[test]
+fn custom_prefix_acceptance_registry_exposes_bounded_optional_name_prefix_on_existing_list() {
+    let definitions = automation_commands();
+    assert_eq!(
+        definitions
+            .iter()
+            .filter(|d| d.name == "command-list")
+            .count(),
+        1,
+        "extend the existing command, not a second search surface"
+    );
+    let definition = definitions
+        .iter()
+        .find(|d| d.name == "command-list")
+        .expect("list");
+    let wire = serde_json::to_value(definition).expect("compiled Discord registry payload");
+    assert_eq!(wire["default_member_permissions"], "32");
+    let options = wire["options"].as_array().expect("list options");
+    let prefixes: Vec<_> = options
+        .iter()
+        .filter(|o| o["name"] == "name-prefix")
+        .collect();
+    assert_eq!(
+        prefixes.len(),
+        1,
+        "one published name-prefix filter: {wire}"
+    );
+    let prefix = prefixes[0];
+    assert_eq!(prefix["type"], 3, "Discord String");
+    assert_ne!(
+        prefix["required"], true,
+        "omission preserves unfiltered discovery"
+    );
+    assert_eq!(
+        prefix["min_length"], 1,
+        "empty prefix is invalid, not omission"
+    );
+    assert_eq!(
+        prefix["max_length"], 32,
+        "same bound as saved command names"
+    );
+    let page = options
+        .iter()
+        .find(|o| o["name"] == "page")
+        .expect("existing page");
+    assert_eq!(page["type"], 4);
+    assert_ne!(page["required"], true);
+    assert_eq!(page["min_value"], 1);
+}
