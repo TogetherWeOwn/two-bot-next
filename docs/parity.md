@@ -50,7 +50,7 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 14 | `/command` | `name` req ≤32, `template` req ≤2000 (`{user} {username} {server} {channel}`), `description` opt ≤100, `text-trigger` opt ≤33 | `ManageGuild` (builder + runtime) | **S4** |
 | 15 | `/command-remove` | `name` req ≤32 | `ManageGuild` | **S4** |
 | 16 | `/command-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
-| 17 | `/schedule` | `body` req ≤2000; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required) | `ManageGuild`, runs in invoking channel | **S4** |
+| 17 | `/schedule` | `body` req ≤2000; `at` RFC3339 with explicit offset opt ≤64 (one-off only, future ≤365 days); or `in-minutes` 1–525600 opt / `every-minutes` 60–525600 opt (at least one timing required) | `ManageGuild`, runs in invoking channel | **S4**; Next adds absolute-time input; `at` conflicts with either relative option |
 | 18 | `/schedule-remove` | non-empty `id` prefix req ≤128 | `ManageGuild` | **S4** |
 | 19 | `/schedule-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 | 20 | `/sticky` | `body` req ≤2000, `debounce` 1–300 default 5 opt | `ManageGuild`, current channel | **S4** |
@@ -111,6 +111,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `command-remove` | docs/parity.md §1 #15 caps | Advertise only `max_length` 32 on `name`, matching the runtime cap; every other field stays legacy-identical. |
 | `command-list` | docs/parity.md §1 #16 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) for whole-row pages including disabled commands and triggers. Command name, description and permissions stay legacy-identical; quota and registry behavior do not change. |
 | `schedule` | docs/parity.md §1 #17 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
+| `schedule` | docs/parity.md §1 #17 absolute-time | Add only optional string `at` (max_length 64), explicit-offset RFC3339 for one-offs within the existing 365-day horizon; retain relative options, bounds and permissions. Set/list include canonical and localized due times with delivery uncertainty; cancellation names the stable ID. See [absolute scheduling](schedule-queue-order.md#schedule-at-a-known-instant). |
 | `schedule-remove` | docs/parity.md §1 #18 caps | Advertise only `max_length` 128 on `id`; empty and overlong prefixes are refused before resolution. |
 | `sticky` | docs/parity.md §1 #20 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
 | `lfg` | docs/parity.md §1 #26 caps | Advertise only `max_length` matching the runtime caps (`title` 100, `roles` 2339 UTF-16 units); every other field stays legacy-identical. |

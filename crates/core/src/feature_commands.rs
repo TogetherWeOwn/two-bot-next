@@ -44,7 +44,7 @@ use super::custom_commands::{
 };
 use super::feeds_http::MAX_FEED_SOURCE_BYTES;
 use super::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
-use super::scheduled::MAX_BODY_CHARS;
+use super::scheduled::{MAX_AT_CHARS, MAX_BODY_CHARS};
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
 /// RSVP-totals variant is the one that renames.
@@ -186,6 +186,18 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .int_range(60, 525600),
+                CommandOption::new(
+                    "at",
+                    "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+                    CommandOptionType::String,
+                )
+                .max_length(MAX_AT_CHARS as u32),
+            ])
+            .examples(vec![
+                "/schedule body:Meeting reminder at:2027-01-15T18:30:00+05:30".to_owned(),
+                "/schedule body:Meeting reminder at:2027-01-15T13:00:00Z".to_owned(),
+                "/schedule body:Meeting reminder in-minutes:30".to_owned(),
+                "/schedule body:Hourly reminder every-minutes:60".to_owned(),
             ]),
         CommandDefinition::new("schedule-remove", "Cancel a scheduled message")
             .permissions(PERM_MANAGE_GUILD)

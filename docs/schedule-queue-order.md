@@ -12,6 +12,46 @@ Run it with:
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test schedule_queue_order
 ```
 
+## Schedule at a known instant
+
+`/schedule` accepts an optional `at` RFC3339 string with an explicit `Z` UTC
+marker or numeric offset. These two copyable examples name the same instant;
+choose a future date within 365 days of the command:
+
+```text
+/schedule body:Meeting reminder at:2027-01-15T18:30:00+05:30
+/schedule body:Meeting reminder at:2027-01-15T13:00:00Z
+```
+
+The compiled command definition owns the picker bounds and `/help command:schedule`
+examples; the [generated command reference](commands.md#schedule) comes from that
+same registry. `at` accepts at most 64 ASCII characters. Fractional seconds are
+truncated to milliseconds, then persisted as `YYYY-MM-DDTHH:MM:SS.mmmZ`. The
+persisted instant must be strictly future and at most 525600 minutes (365 days)
+ahead. It is not rounded to a delay in minutes. Offset-free local times, invalid
+dates/offsets, overflowing years and past/due-now instants refuse with guidance
+before any schedule read, write or audit. Correct the timestamp; retrying the
+same invalid input will not help.
+
+`at` is one-off only. Supply either `at` or `in-minutes`, never both, and do not
+combine `at` with `every-minutes`. To recur, keep using `every-minutes:60` or
+`in-minutes:5 every-minutes:60`; the existing relative ranges and first-run
+semantics are unchanged. Body safety, Manage Guild authority, the guild/feature
+fences and the 25-schedule quota still apply.
+
+Set/list replies show the canonical UTC instant and a Discord timestamp rendered
+in each reader's local timezone. They retain the stable schedule ID; use
+`/schedule-remove id:<id>` to cancel, and check the named ID in the cancellation
+receipt. Delivery runs on the existing 15-second ticker and may be delayed by
+backlog, restarts, rate limits or outages. This is not an exact-second delivery
+promise. No timezone profile, natural-language parsing or DST-aware recurrence
+is implied.
+
+Absolute schedules use the same stored due instant, claim, occurrence nonce and
+uncertain-send fence as relative schedules. Restart does not recalculate the
+instant. Completed one-offs remain disabled; an uncertain send remains fenced
+through backup/restore rather than blindly posting again.
+
 ## Queue model
 
 The store keeps `next_run_at` as `TEXT` in the `format_iso_ms` shape
@@ -89,8 +129,9 @@ no row is claimed, posted or audited; the `/readyz` status map lists
    of the list. A failed hidden-window or overflow-count read fails closed
    ("Schedule command failed; try again.") instead of reporting a
    possibly-false out-of-range page. Rows past the cap keep their order
-   and keep firing via `claim_due`. At/under-cap guilds render exactly as
-   before.
+   and keep firing via `claim_due`. Runtime rows include localized due times
+   and delivery uncertainty before packing, so enrichment cannot overflow a
+   page or silently split an ID.
 
 ## Out of scope
 

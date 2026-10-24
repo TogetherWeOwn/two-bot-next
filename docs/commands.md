@@ -546,6 +546,7 @@ Schedule a message, once or recurring
 | `body` | string | true | — | — | 2000 | — | Message text |
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
+| `at` | string | false | — | — | 64 | — | One-off RFC3339 time with Z or offset; cannot combine with other timing |
 
 ## `/schedule-list`
 
