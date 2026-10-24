@@ -64,6 +64,8 @@ const NO_CHANNEL_REPLY: &str = "This command only works in a channel.";
 /// `/schedule`: validate → upsert → audit → ephemeral confirmation.
 /// Validation failures still audit (`rejected`): the id is minted before
 /// validation, exactly like legacy, so the trail names the attempted row.
+/// Malformed options refuse before any store read or audit via
+/// [`schedule_options_strict`]: no row, no audit, one private correction.
 pub(crate) async fn schedule_create(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -74,8 +76,14 @@ pub(crate) async fn schedule_create(
         finish(executor, interaction, NO_CHANNEL_REPLY).await;
         return;
     };
+    let (body, in_minutes, every_minutes) = match schedule_options_strict(interaction) {
+        Ok(decoded) => decoded,
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     let actor = actor_id(interaction);
-    let (body, in_minutes, every_minutes) = schedule_options(interaction);
     let id = new_id();
     let now_iso = format_iso_ms(now_millis());
 
@@ -231,14 +239,21 @@ pub(crate) async fn schedule_create(
 /// `/schedule-remove`: prefix-resolve the id → guild-scoped delete →
 /// `scheduled.delete` audit (`ok` / `absent`) → ephemeral confirmation.
 /// Zero or ambiguous prefix matches refuse with the shared no-unique-match
-/// text and mutate nothing.
+/// text and mutate nothing. Malformed `id` options refuse before any store
+/// read or audit via [`schedule_remove_option_strict`].
 pub(crate) async fn schedule_remove(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
     guild_id: &str,
     interaction: &Interaction,
 ) {
-    let prefix = schedule_remove_option(interaction).unwrap_or_default();
+    let prefix = match schedule_remove_option_strict(interaction) {
+        Ok(prefix) => prefix.unwrap_or_default(),
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     if prefix.is_empty() {
         finish(executor, interaction, no_unique_match_text(&prefix)).await;
         return;
@@ -353,7 +368,13 @@ pub(crate) async fn schedule_list(
     guild_id: &str,
     interaction: &Interaction,
 ) {
-    let page = schedule_list_page_option(interaction).unwrap_or(1);
+    let page = match schedule_list_page_option_strict(interaction) {
+        Ok(page) => page.unwrap_or(1),
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     if page < 1 {
         finish(executor, interaction, schedule_list_page_underflow_text()).await;
         return;
@@ -620,6 +641,10 @@ async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: i
 /// Extract `/schedule`'s options: `body` (required string) + `in-minutes` /
 /// `every-minutes` (optional integers). Missing values decode to `None`;
 /// validation owns the refusal text.
+///
+/// Lenient legacy shape: wrong-typed and duplicated options are ignored or
+/// last-wins. Handlers use [`schedule_options_strict`] instead; this stays
+/// for the pinned unit tests and keeps its happy-path behavior.
 pub(crate) fn schedule_options(
     interaction: &Interaction,
 ) -> (Option<String>, Option<i64>, Option<i64>) {
@@ -644,6 +669,9 @@ pub(crate) fn schedule_options(
 
 /// `/schedule-remove`'s optional `id` option; absent and empty values are
 /// refused before resolution, so they can never delete a schedule.
+///
+/// Lenient legacy shape: wrong-typed values decode to absent and duplicates
+/// are first-wins. Handlers use [`schedule_remove_option_strict`] instead.
 pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String> {
     let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
         return None;
@@ -657,8 +685,10 @@ pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String
 }
 
 /// `/schedule-list`'s optional 1-based `page` option; absent means page 1.
-/// A mismatched wire type decodes to absent (page 1) rather than refusing,
-/// so existing invocations keep working.
+///
+/// Lenient legacy shape: a mismatched wire type decodes to absent (page 1)
+/// and duplicates are first-wins. Handlers use
+/// [`schedule_list_page_option_strict`] instead.
 pub(crate) fn schedule_list_page_option(interaction: &Interaction) -> Option<i64> {
     let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
         return None;
@@ -669,4 +699,129 @@ pub(crate) fn schedule_list_page_option(interaction: &Interaction) -> Option<i64
             ("page", CommandOptionValue::Integer(value)) => Some(*value),
             _ => None,
         })
+}
+
+/// Refusal literals for malformed schedule options. Each names the offending
+/// option and carries a copyable corrected invocation, echoes no user input
+/// (mention-safe), and stays far under Discord's 2,000-unit cap (bounded).
+/// Handlers reply with these before any store read or audit write.
+const SCHEDULE_INVALID_BODY: &str =
+    "Invalid body option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_DUPLICATE_BODY: &str =
+    "Duplicate body option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_INVALID_IN_MINUTES: &str =
+    "Invalid in-minutes option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_DUPLICATE_IN_MINUTES: &str =
+    "Duplicate in-minutes option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_INVALID_EVERY_MINUTES: &str =
+    "Invalid every-minutes option. Use /schedule body:<text> every-minutes:<minutes>.";
+const SCHEDULE_DUPLICATE_EVERY_MINUTES: &str =
+    "Duplicate every-minutes option. Use /schedule body:<text> every-minutes:<minutes>.";
+const SCHEDULE_REMOVE_INVALID_ID: &str =
+    "Invalid id option. Use /schedule-remove id:<schedule-id>.";
+const SCHEDULE_REMOVE_DUPLICATE_ID: &str =
+    "Duplicate id option. Use /schedule-remove id:<schedule-id>.";
+const SCHEDULE_LIST_INVALID_PAGE: &str =
+    "Invalid page option. Use /schedule-list page:<number> with a whole number from 1.";
+const SCHEDULE_LIST_DUPLICATE_PAGE: &str =
+    "Duplicate page option. Use /schedule-list page:<number> with a whole number from 1.";
+
+/// Strictly decode `/schedule`'s options. A present option with the wrong
+/// wire type, or an option name sent twice, refuses with the literal naming
+/// that option; name-count wins over type-check, and `body` wins over
+/// `in-minutes` wins over `every-minutes`. Missing options decode to `None`
+/// (validation owns those refusals) and unknown names stay ignored, so valid
+/// invocations decode byte-identically to [`schedule_options`].
+pub(crate) fn schedule_options_strict(
+    interaction: &Interaction,
+) -> Result<(Option<String>, Option<i64>, Option<i64>), &'static str> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok((None, None, None));
+    };
+    let mut bodies: Vec<&CommandOptionValue> = Vec::new();
+    let mut in_minutes_opts: Vec<&CommandOptionValue> = Vec::new();
+    let mut every_minutes_opts: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        match option.name.as_str() {
+            "body" => bodies.push(&option.value),
+            "in-minutes" => in_minutes_opts.push(&option.value),
+            "every-minutes" => every_minutes_opts.push(&option.value),
+            _ => {}
+        }
+    }
+    if bodies.len() > 1 {
+        return Err(SCHEDULE_DUPLICATE_BODY);
+    }
+    if in_minutes_opts.len() > 1 {
+        return Err(SCHEDULE_DUPLICATE_IN_MINUTES);
+    }
+    if every_minutes_opts.len() > 1 {
+        return Err(SCHEDULE_DUPLICATE_EVERY_MINUTES);
+    }
+    let body = match bodies.first() {
+        None => None,
+        Some(CommandOptionValue::String(value)) => Some((*value).clone()),
+        Some(_) => return Err(SCHEDULE_INVALID_BODY),
+    };
+    let in_minutes = match in_minutes_opts.first() {
+        None => None,
+        Some(CommandOptionValue::Integer(value)) => Some(**value),
+        Some(_) => return Err(SCHEDULE_INVALID_IN_MINUTES),
+    };
+    let every_minutes = match every_minutes_opts.first() {
+        None => None,
+        Some(CommandOptionValue::Integer(value)) => Some(**value),
+        Some(_) => return Err(SCHEDULE_INVALID_EVERY_MINUTES),
+    };
+    Ok((body, in_minutes, every_minutes))
+}
+
+/// Strictly decode `/schedule-remove`'s `id` option. A wrong wire type or a
+/// duplicated name refuses; missing decodes to `None` (the empty-guard owns
+/// that refusal) and unknown names stay ignored.
+pub(crate) fn schedule_remove_option_strict(
+    interaction: &Interaction,
+) -> Result<Option<String>, &'static str> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(None);
+    };
+    let mut ids: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        if option.name.as_str() == "id" {
+            ids.push(&option.value);
+        }
+    }
+    if ids.len() > 1 {
+        return Err(SCHEDULE_REMOVE_DUPLICATE_ID);
+    }
+    match ids.first() {
+        None => Ok(None),
+        Some(CommandOptionValue::String(value)) => Ok(Some((*value).clone())),
+        Some(_) => Err(SCHEDULE_REMOVE_INVALID_ID),
+    }
+}
+
+/// Strictly decode `/schedule-list`'s `page` option. A wrong wire type or a
+/// duplicated name refuses; missing decodes to `None` (page 1) and unknown
+/// names stay ignored.
+pub(crate) fn schedule_list_page_option_strict(
+    interaction: &Interaction,
+) -> Result<Option<i64>, &'static str> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(None);
+    };
+    let mut pages: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        if option.name.as_str() == "page" {
+            pages.push(&option.value);
+        }
+    }
+    if pages.len() > 1 {
+        return Err(SCHEDULE_LIST_DUPLICATE_PAGE);
+    }
+    match pages.first() {
+        None => Ok(None),
+        Some(CommandOptionValue::Integer(value)) => Ok(Some(**value)),
+        Some(_) => Err(SCHEDULE_LIST_INVALID_PAGE),
+    }
 }
