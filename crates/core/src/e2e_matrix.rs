@@ -317,6 +317,22 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
         ),
         row(
+            "giveaway",
+            37,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "Giveaway",
+            "Ephemeral defer then ephemeral confirmation after create/list/cancel plus audit row.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:prize:required,1..=200",
+                "Valid:duration:1..=43200",
+                "Valid:winners:1..=100",
+            ],
+        ),
+        row(
             "rsvp",
             24,
             E2eGate::Announcements,
@@ -372,7 +388,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "lfg-list",
-            37,
+            38,
             E2eGate::Announcements,
             PERM_MANAGE_EVENTS,
             "ManageEvents",
