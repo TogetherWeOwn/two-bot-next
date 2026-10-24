@@ -1222,9 +1222,16 @@ mod tests {
 
     #[tokio::test]
     async fn entry_budgets_allow_ten_writes_per_minute_per_member() {
-        let pool = PgPool::connect_lazy("postgres://localhost:1/budget-unit").expect("lazy pool");
-        let executor = ActionExecutor::with_proxy("mock-token-not-a-credential".to_owned(), None)
-            .expect("proxy");
+        // A closed lazy pool makes any unexpected SQL fail, without a database.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy test pool");
+        pool.close().await;
+        let executor = ActionExecutor::with_proxy(
+            "mock-token-not-a-credential".to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+        )
+        .expect("synthetic executor");
         let runtime = GiveawayRuntime::new(pool, executor);
         for _ in 0..WRITE_BUDGET {
             assert!(runtime.take_budget("member-budget-unit"));
