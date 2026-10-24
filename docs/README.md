@@ -115,6 +115,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Leveling domain](leveling-port.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
+- [Proposed opt-in ready check (design only)](lfg-ready-check-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
 - [EventSub operations](eventsub-runbook.md)
