@@ -28,6 +28,8 @@ mod leveling_ack_visibility_acceptance_tests;
 mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
+#[path = "member_strict_decode_acceptance.rs"]
+mod member_strict_decode_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
 mod sticky_uncertain_acceptance_tests;
 
@@ -1298,6 +1300,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-remove"
                         | "feed-list"
                         | "purge"
+                        | "purge-preview"
+                        | "channel-inspect"
                         | "slowmode"
                         | "lockdown"
                         | "unlock"
@@ -1460,7 +1464,7 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_with_audit() {
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
         let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
-        runtime.on_interaction(&member_slash(name)).await;
+        runtime.on_interaction(&timed_member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
         assert_eq!(requests[1].method, "GET");
@@ -1512,7 +1516,7 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
         ])
         .await;
         let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
-        runtime.on_interaction(&member_slash(name)).await;
+        runtime.on_interaction(&timed_member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
@@ -1551,7 +1555,7 @@ async fn member_verbs_share_actor_cooldown_before_role_reads() {
         .into_iter()
         .enumerate()
     {
-        let mut interaction = member_slash(name);
+        let mut interaction = timed_member_slash(name);
         interaction.id = Id::new(100 + index as u64);
         runtime.on_interaction(&interaction).await;
         let requests = mock.requests();
@@ -1607,7 +1611,7 @@ fn authority_reads(first_command: bool) -> Vec<RestResponse> {
 
 fn timed_member_slash(name: &str) -> Interaction {
     let mut interaction = member_slash(name);
-    if name == "timeout" {
+    if matches!(name, "tempban" | "timeout") {
         let Some(InteractionData::ApplicationCommand(data)) = &mut interaction.data else {
             panic!("command fixture")
         };
@@ -3565,6 +3569,8 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::PurgePreview,
+            HandlerId::ChannelInspect,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids

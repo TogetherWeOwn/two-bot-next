@@ -59,6 +59,15 @@ fn fixture_and_exception_list_are_pinned_to_the_parity_matrix() {
 fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
     let mutations = [
         ("purge", "/options/0/min_value", json!(0)),
+        ("purge-preview", "/options/0/min_value", json!(0)),
+        ("purge-preview", "/options/0/max_value", json!(101)),
+        ("purge-preview", "/options/0/required", json!(false)),
+        ("purge-preview", "/default_member_permissions", json!("16")),
+        (
+            "channel-inspect",
+            "/default_member_permissions",
+            json!("8192"),
+        ),
         ("purge", "/options/0/max_value", json!(101)),
         ("slowmode", "/options/0/min_value", json!(-1)),
         ("slowmode", "/options/0/max_value", json!(21601)),
