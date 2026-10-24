@@ -1,0 +1,227 @@
+diff --git a/crates/core/src/feature_commands.rs b/crates/core/src/feature_commands.rs
+--- a/crates/core/src/feature_commands.rs
++++ b/crates/core/src/feature_commands.rs
+@@ -469,6 +469,7 @@
+                 "command-remove",
+                 "command-list",
+                 "command-inspect",
++                "command-clone",
+                 "schedule",
+                 "schedule-remove",
+                 "schedule-list",
+@@ -488,8 +489,8 @@
+     #[test]
+     fn no_collision_with_leveling_core_or_within_slice() {
+         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
+-        // 4 core + 1 scorecard + 9 automation + 7 announcement.
+-        assert_eq!(merged.len(), 21);
++        // 4 core + 1 scorecard + 10 automation + 7 announcement.
++        assert_eq!(merged.len(), 22);
+         assert_eq!(
+             &names(&merged)[..5],
+             ["rank", "leaderboard", "help", "privacy", "attendance"]
+@@ -515,6 +516,7 @@
+             "command-remove",
+             "command-list",
+             "command-inspect",
++            "command-clone",
+             "schedule",
+             "schedule-remove",
+             "schedule-list",
+@@ -553,6 +555,8 @@
+             ("command-remove", 0, 32),
+             ("command-inspect", 0, 32),
+             ("command-inspect", 2, 500),
++            ("command-clone", 0, 32),
++            ("command-clone", 1, 32),
+             ("schedule", 0, 2000),
+             ("schedule-remove", 0, 128),
+             ("sticky", 0, 2000),
+@@ -755,13 +759,14 @@
+         assert_eq!(json[0]["default_member_permissions"], "8589934592");
+         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
+         assert_eq!(json[0]["options"][0]["max_length"], 128);
+-        // Saved-response inspection publishes after `command-list`, shifting
+-        // the announcement slice one index later.
++        // Saved-response inspection and clone follow `command-list`, shifting
++        // the announcement slice two indices later.
+         assert_eq!(json[4]["name"], "command-inspect");
+         assert_eq!(json[4]["options"][2]["max_length"], 500);
+-        assert_eq!(json[11]["name"], "rsvp-attendance");
+-        assert!(json[11].get("default_member_permissions").is_none());
+-        assert_eq!(json[11]["options"][0]["name"], "event-id");
++        assert_eq!(json[5]["name"], "command-clone");
++        assert_eq!(json[12]["name"], "rsvp-attendance");
++        assert!(json[12].get("default_member_permissions").is_none());
++        assert_eq!(json[12]["options"][0]["name"], "event-id");
+     }
+
+     #[test]
+diff --git a/crates/core/src/router.rs b/crates/core/src/router.rs
+--- a/crates/core/src/router.rs
++++ b/crates/core/src/router.rs
+@@ -923,6 +923,7 @@
+             ("command-remove", HandlerId::AutomationAdmin),
+             ("command-list", HandlerId::AutomationAdmin),
+             ("command-inspect", HandlerId::AutomationAdmin),
++            ("command-clone", HandlerId::AutomationAdmin),
+             ("schedule", HandlerId::AutomationAdmin),
+             ("schedule-remove", HandlerId::AutomationAdmin),
+             ("schedule-list", HandlerId::AutomationAdmin),
+@@ -936,7 +937,7 @@
+             ("feed-remove", HandlerId::FeedRemove),
+             ("feed-list", HandlerId::FeedList),
+         ];
+-        assert_eq!(cases.len(), 30, "all 30 handler-owned builtins covered");
++        assert_eq!(cases.len(), 31, "all 31 handler-owned builtins covered");
+         for (name, handler) in cases {
+             assert_eq!(
+                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+@@ -1411,9 +1412,9 @@
+         }];
+         let set = r.publish_set(&custom).expect("full set assembles");
+         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
+-        // 4 core + 1 scorecard + 9 automation + 7 announcement + 9 moderation
+-        // + 1 custom = 31, in legacy publish order, guild-only throughout.
+-        assert_eq!(set.len(), 31);
++        // 4 core + 1 scorecard + 10 automation + 7 announcement + 9 moderation
++        // + 1 custom = 32, in legacy publish order, guild-only throughout.
++        assert_eq!(set.len(), 32);
+         assert_eq!(
+             &names[..5],
+             ["rank", "leaderboard", "help", "privacy", "attendance"]
+@@ -1421,13 +1422,13 @@
+         assert!(names.contains(&"rsvp-attendance"));
+         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
+         assert_eq!(
+-            &names[21..30],
++            &names[22..31],
+             [
+                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
+                 "unlock",
+             ]
+         );
+-        assert_eq!(names[30], "faq");
++        assert_eq!(names[31], "faq");
+         assert!(set.iter().all(|c| !c.dm_permission));
+     }
+
+@@ -1590,7 +1591,7 @@
+     fn voice_set_publishes_after_moderation_only_while_gated() {
+         let off = published(all_on());
+         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
+-        assert_eq!(off.len(), 30);
++        assert_eq!(off.len(), 31);
+         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
+             assert!(
+                 !off_names.contains(name),
+@@ -1600,16 +1601,16 @@
+
+         let on = published(voice_on());
+         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
+-        // 30 builtins keep their order; the 21 voice names that survive
++        // 31 builtins keep their order; the 21 voice names that survive
+         // first-wins follow in voice order. `kick` is already moderation's.
+-        assert_eq!(on.len(), 51);
+-        assert_eq!(on_names[..30], off_names[..]);
++        assert_eq!(on.len(), 52);
++        assert_eq!(on_names[..31], off_names[..]);
+         let expected: Vec<_> = VOICE_NAMES
+             .iter()
+             .copied()
+             .filter(|name| *name != "kick")
+             .collect();
+-        assert_eq!(on_names[30..], expected[..]);
++        assert_eq!(on_names[31..], expected[..]);
+         assert!(!on_names.contains(&"templateassistant"));
+         assert!(on.iter().all(|c| !c.dm_permission));
+     }
+@@ -1670,13 +1671,13 @@
+                 "voice={voice} assistant={assistant}"
+             );
+         }
+-        // Both gates on is the full voice set without the assistant: 30
++        // Both gates on is the full voice set without the assistant: 31
+         // builtins plus the 21 surviving voice names.
+         let both = published(RouterGates {
+             voice_assistant: true,
+             ..voice_on()
+         });
+-        assert_eq!(both.len(), 51);
++        assert_eq!(both.len(), 52);
+     }
+
+     #[test]
+diff --git a/crates/core/src/help.rs b/crates/core/src/help.rs
+--- a/crates/core/src/help.rs
++++ b/crates/core/src/help.rs
+@@ -274,11 +274,11 @@
+             );
+         }
+         // 28 legacy builtins plus the Next-only help, privacy and
+-        // command-inspect commands, plus the 21 gated voice commands (voice
++        // command-inspect and command-clone commands, plus the 21 gated voice commands (voice
+         // `kick` loses first-wins to moderation `/kick`; `/templateassistant`
+         // stays unpublished until its slice lands): matches the regenerated
+         // `docs/commands.md` total.
+-        assert!(text.contains("**Server commands** (51 live)"));
++        assert!(text.contains("**Server commands** (52 live)"));
+         assert!(
+             !text.contains("**Custom**"),
+             "every published name is grouped"
+@@ -399,10 +399,10 @@
+             .flat_map(|g| g.commands.iter().copied())
+             .collect();
+         // 27 legacy builtins plus the Next-only help, privacy and
+-        // command-inspect commands, then the 21 voice names (voice `kick`
++        // command-inspect and command-clone commands, then the 21 voice names (voice `kick`
+         // shares the Kick group). `/templateassistant` stays out until its
+         // slice lands.
+-        assert_eq!(grouped.len(), 51);
++        assert_eq!(grouped.len(), 52);
+         for name in [
+             "rank",
+             "leaderboard",
+@@ -410,6 +410,8 @@
+             "privacy",
+             "attendance",
+             "command",
++            "command-inspect",
++            "command-clone",
+             "schedule-list",
+             "sticky-remove",
+             "rsvp",
+diff --git a/crates/core/tests/support/registry_parity.rs b/crates/core/tests/support/registry_parity.rs
+--- a/crates/core/tests/support/registry_parity.rs
++++ b/crates/core/tests/support/registry_parity.rs
+@@ -38,6 +38,7 @@
+     ("privacy", "docs/parity.md §1 privacy"),
+     ("command-list", "docs/parity.md §1 #16 page"),
+     ("command-inspect", "docs/parity.md §1 command-inspect"),
++    ("command-clone", "docs/parity.md §1 command-clone"),
+ ];
+
+ pub fn all_on_router() -> InteractionRouter {
+@@ -257,6 +258,22 @@
+         .expect("legacy command-list remains published")
+         + 1;
+     commands.insert(after_list, inspect);
++    // Next-only create-only clone: no trigger, overwrite or enable options.
++    commands.insert(
++        after_list + 1,
++        json!({
++            "name": "command-clone",
++            "description": "Clone a saved custom command under a new name",
++            "dm_permission": false,
++            "default_member_permissions": "32",
++            "options": [
++                {"name": "source", "description": "Saved source command name, a-z 0-9 _ -",
++                 "type": 3, "required": true, "max_length": 32},
++                {"name": "destination", "description": "New absent destination name, a-z 0-9 _ -",
++                 "type": 3, "required": true, "max_length": 32}
++            ]
++        }),
++    );
+     // Picker-copy exceptions (registry golden exceptions table): command and
+     // option descriptions intentionally differ from legacy. Pointers mirror
+     // the published option order.
