@@ -10,8 +10,8 @@
 //! used. The real domain plans (`two_bot_core::channel_moderation`), audit row
 //! shape (`ChannelAuditRow`), router (`InteractionRouter`), and Discord
 //! boundary types (`ChannelCall`, `ChannelCallOutcome`, `DiscordError`) are
-//! re-exported unchanged; only `ChannelClaim`/`ChannelClaimTicket` are
-//! test-local, because the real ticket fields are private.
+//! re-exported unchanged; `ChannelClaim`/`ChannelClaimTicket` and `PurgeSample`
+//! are test-local, because the real ticket fields and sample type are private.
 //!
 //! Expected states: missing-channel and missing-member refusals each write one
 //! bound `refused` row; an in-flight retry after an uncertain mutation adds a
@@ -357,6 +357,13 @@ impl ChannelModerationStore {
         Ok(state.lockdowns.get(channel_id).cloned())
     }
 
+    pub async fn get_lockdown_details(
+        &self,
+        _record: &LockdownRecord,
+    ) -> Result<Option<(String, Option<String>)>, Error> {
+        panic!("lockdown metadata reads are outside this offline acceptance slice")
+    }
+
     pub async fn record_lockdown(
         &self,
         channel_id: &str,
@@ -398,6 +405,16 @@ impl ChannelModerationStore {
 }
 
 // --- offline transport boundary --------------------------------------------
+
+/// Shape-only mirror of the executor's crate-private purge sample. Read paths
+/// must compile with the included source but must never run in this harness.
+pub(crate) struct PurgeSample {
+    pub ids: Vec<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>>,
+    pub listed: usize,
+    pub pinned: usize,
+    pub own_bot: usize,
+    pub system: usize,
+}
 
 #[derive(Debug, Default)]
 struct Transport {
@@ -451,6 +468,30 @@ impl ActionExecutor {
         _content: &str,
     ) -> Result<(), DiscordError> {
         Ok(())
+    }
+
+    pub async fn edit_interaction_response_without_mention_neutralization_with_blocked_retry(
+        &self,
+        _application_id: u64,
+        _interaction_token: &str,
+        _content: &str,
+    ) -> Result<(), DiscordError> {
+        panic!("read-command replies are outside this offline acceptance slice")
+    }
+
+    pub async fn fetch_channel_document(
+        &self,
+        _channel_id: &str,
+    ) -> Result<serde_json::Value, DiscordError> {
+        panic!("channel document reads are outside this offline acceptance slice")
+    }
+
+    pub(crate) async fn sample_purge_messages(
+        &self,
+        _channel_id: &str,
+        _count: u64,
+    ) -> Result<PurgeSample, DiscordError> {
+        panic!("purge sample reads are outside this offline acceptance slice")
     }
 
     pub async fn execute_channel(
