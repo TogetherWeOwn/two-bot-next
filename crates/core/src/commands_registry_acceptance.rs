@@ -4,11 +4,12 @@
 #[test]
 fn core_commands_match_legacy_names() {
     let core = core_commands();
-    assert_eq!(core.len(), 4);
+    assert_eq!(core.len(), 5);
     assert_eq!(core[0].name, "rank");
     assert_eq!(core[1].name, "leaderboard");
     assert_eq!(core[2].name, "help");
     assert_eq!(core[3].name, "privacy");
+    assert_eq!(core[4].name, "reopen");
     // Guild-only, DM off (legacy `setDMPermission(false)`).
     assert!(core.iter().all(|c| !c.dm_permission));
     // `rank` and `help` have optional selectors; `leaderboard` takes none.
@@ -46,4 +47,20 @@ fn core_commands_match_legacy_names() {
             assert!(option.options.is_empty());
         }
     }
+    // The Next-only `reopen` picker recovery takes one required `kind`
+    // choice (games/session), is open to everyone, and takes no
+    // other-member target or role-management option.
+    assert_eq!(core[4].description, REOPEN_DESCRIPTION);
+    assert!(core[4].default_member_permissions.is_none());
+    assert_eq!(core[4].options.len(), 1);
+    let kind = &core[4].options[0];
+    assert_eq!(kind.name, "kind");
+    assert_eq!(kind.kind, CommandOptionType::String.as_u8());
+    assert_eq!(kind.required, Some(true));
+    let choices: Vec<(&str, &str)> = kind
+        .choices
+        .iter()
+        .map(|choice| (choice.name.as_str(), choice.value.as_str()))
+        .collect();
+    assert_eq!(choices, [("Games", "games"), ("Session", "session")]);
 }

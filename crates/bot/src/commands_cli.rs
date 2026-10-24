@@ -502,7 +502,7 @@ mod tests {
             desired_definitions(2222, &env)
                 .expect("desired registry assembles")
                 .len(),
-            4
+            5
         );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
@@ -513,9 +513,10 @@ mod tests {
             desired_definitions(2222, &env)
                 .expect("desired registry assembles")
                 .len(),
-            // 30 legacy/all-gate builtins plus the moderation-gated reads
-            // `/purge-preview` and `/channel-inspect`; no new feature gate.
-            32
+            // 31 all-gate builtins (30 plus always-on `/reopen`) plus the
+            // moderation-gated reads `/purge-preview` and `/channel-inspect`;
+            // no new feature gate.
+            33
         );
     }
 }

@@ -121,6 +121,7 @@ pub enum HandlerId {
     Leaderboard,
     Help,
     Privacy,
+    Reopen,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -423,6 +424,7 @@ impl InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Reopen,
         ] {
             register(id);
         }
@@ -654,6 +656,17 @@ impl InteractionRouter {
             // guild fence above plus the handler's own guild check.
             "privacy" => Row {
                 handler: HandlerId::Privacy,
+                gate: RowGate::Always,
+                permission_refusal: None,
+            },
+            // Self-service picker recovery: always on, open to everyone.
+            // The subject is always the invoker (a `kind` choice, no target
+            // option), so no permission gate applies; an unavailable kind
+            // gets private no-effect guidance from the handler after the
+            // defer, where the kind is visible — the router never sees
+            // options, so kind-level enablement cannot live here.
+            "reopen" => Row {
+                handler: HandlerId::Reopen,
                 gate: RowGate::Always,
                 permission_refusal: None,
             },
@@ -925,6 +938,7 @@ mod tests {
             ("leaderboard", HandlerId::Leaderboard),
             ("help", HandlerId::Help),
             ("privacy", HandlerId::Privacy),
+            ("reopen", HandlerId::Reopen),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -960,7 +974,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 32, "all 32 handler-owned builtins covered");
+        assert_eq!(cases.len(), 33, "all 33 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1479,24 +1493,31 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 4 core + 1 scorecard + 9 automation + 7 announcement + 9 mutations
-        // + 2 reads + 1 custom = 33, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 33);
+        // 5 core + 1 scorecard + 9 automation + 7 announcement + 9 mutations
+        // + 2 reads + 1 custom = 34, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 34);
         assert_eq!(
-            &names[..5],
-            ["rank", "leaderboard", "help", "privacy", "attendance"]
+            &names[..6],
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "attendance"
+            ]
         );
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[21..30],
+            &names[22..31],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[30..32], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[32], "faq");
+        assert_eq!(&names[31..33], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[33], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1511,7 +1532,7 @@ mod tests {
         });
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
     }
 
     #[test]
@@ -1532,7 +1553,7 @@ mod tests {
         // invocation refuses at dispatch, so publishing burns the ceiling.
         let set = off.publish_set(&[row()]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
             .map(|i| CustomCommand {
@@ -1542,7 +1563,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 4);
+        assert_eq!(set.len(), 5);
     }
 
     #[test]
@@ -1659,7 +1680,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 32);
+        assert_eq!(off.len(), 33);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1669,16 +1690,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 32 builtins keep their order; the 21 voice names that survive
+        // 33 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 53);
-        assert_eq!(on_names[..32], off_names[..]);
+        assert_eq!(on.len(), 54);
+        assert_eq!(on_names[..33], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[32..], expected[..]);
+        assert_eq!(on_names[33..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1739,13 +1760,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 32
+        // Both gates on is the full voice set without the assistant: 33
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 53);
+        assert_eq!(both.len(), 54);
     }
 
     #[test]
