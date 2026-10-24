@@ -28,6 +28,12 @@ const MANAGE_EVENTS: u64 = 1 << 33;
 #[path = "support/rsvp_personal_totals.rs"]
 mod saved_response_acceptance;
 
+#[path = "support/rsvp_event_links.rs"]
+mod event_link_acceptance;
+
+#[path = "support/event_link_id_controls.rs"]
+mod event_link_id_controls;
+
 fn router() -> InteractionRouter {
     InteractionRouter::new(RouterGates {
         configured_guild: Some(GUILD.parse().unwrap()),
