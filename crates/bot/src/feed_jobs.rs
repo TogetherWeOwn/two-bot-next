@@ -236,6 +236,36 @@ pub(crate) fn live_poll_seconds(guild: &str, fallback: u64) -> u64 {
     live_poll_seconds_with(guild, fallback, crate::settings_jobs::live().as_ref())
 }
 
+/// The announcements gate key served from the live settings snapshot. Job
+/// existence stays boot-gated (registration and the live-identity fence read
+/// the boot value); each tick re-checks the live value, so storing `0` parks
+/// a boot-enabled poller within one poll while enabling from a boot-off
+/// deployment needs a restart (no job exists to tick).
+pub(crate) const ANNOUNCEMENTS_KEY: &str = "TWO_ANNOUNCEMENTS";
+
+/// Effective announcements gate: the live snapshot wins over the boot value,
+/// an absent row falls back to boot, and any rendering other than exactly
+/// `"1"` reads off (fail-closed, like `FeatureGates::from_map`). Pure for
+/// tests via `live`.
+pub(crate) fn live_announcements_with(
+    guild: &str,
+    boot_on: bool,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> bool {
+    let Some(live) = live else {
+        return boot_on;
+    };
+    let Some(value) = live.get(guild, ANNOUNCEMENTS_KEY) else {
+        return boot_on;
+    };
+    two_bot_core::settings::to_env_string(&value).is_some_and(|rendered| rendered == "1")
+}
+
+/// Production reader: the poller-published snapshot, if any.
+pub(crate) fn live_announcements_on(guild: &str, boot_on: bool) -> bool {
+    live_announcements_with(guild, boot_on, crate::settings_jobs::live().as_ref())
+}
+
 /// Live-aware job: the supervisor's own cadence follows the live interval,
 /// and the non-overlapping schedule gate re-reads the same interval before
 /// every tick. A stored change reschedules the next run to last-run + new
@@ -301,6 +331,8 @@ pub(crate) fn scheduled_job_dynamic(
 /// The poll interval reads the live settings snapshot (TOG-19027): the
 /// supervisor cadence and the per-tick schedule gate both follow the stored
 /// value, so a changed interval reschedules the next run without a restart.
+/// Each tick also re-checks the announcements gate against the live snapshot,
+/// so storing `0` parks a boot-enabled poller within one poll.
 pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = match FeatureGates::from_env() {
         Ok(gates) => gates,
@@ -354,7 +386,36 @@ fn register_gated(gates: FeatureGates, action: JobAction, guild: String) -> Opti
     if !gates.announcements {
         return None;
     }
-    scheduled_job_live(gates.feed_poll_seconds, action, guild).ok()
+    let gate_guild = guild.clone();
+    register_gated_with(
+        gates.feed_poll_seconds,
+        action,
+        guild,
+        Arc::new(move || live_announcements_on(&gate_guild, true)),
+    )
+}
+
+/// [`register_gated`] over an injectable per-tick gate, for tests. The
+/// production gate reads the live announcements snapshot store-first over the
+/// boot value; a closed gate skips the tick without error (like the schedule
+/// gate below it), silently so a parked poller does not log every interval.
+fn register_gated_with(
+    feed_poll_seconds: u64,
+    action: JobAction,
+    guild: String,
+    gate: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Option<Job> {
+    let gated: JobAction = Arc::new(move || {
+        let inner = action.clone();
+        let gate = gate.clone();
+        Box::pin(async move {
+            if !gate() {
+                return Ok(());
+            }
+            inner().await
+        })
+    });
+    scheduled_job_live(feed_poll_seconds, gated, guild).ok()
 }
 
 #[derive(Default)]

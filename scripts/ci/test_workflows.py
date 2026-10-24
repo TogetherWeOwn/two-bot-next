@@ -273,6 +273,86 @@ def ignored_test_names(suite):
     return names
 
 
+def tokio_test_names(text):
+    """Collect each Tokio test through intervening trivia, or fail closed.
+
+    Like ignored_test_names this is a source-style scanner, not a Rust parser.
+    Every attribute mark must resolve, and every `tokio::test` token must be
+    consumed by exactly one mark; imported, renamed, cfg_attr or
+    macro-generated spellings the mark regex cannot see fail validation
+    instead of silently shrinking the skip set while other ordinary
+    declarations still match.
+    """
+    marks = list(re.finditer(r"^[ \t]*#\[(?:::)?tokio::test\b", text, re.MULTILINE))
+    tokens = re.findall(r"(?<!\w)tokio::test\b", text)
+    names = []
+    for mark in marks:
+        line_end = text.find("\n", mark.end())
+        name = None if line_end == -1 else _match_fn_name(text, _skip_trivia(text, line_end + 1))
+        if name is not None:
+            names.append(name)
+    if (
+        not marks
+        or len(tokens) != len(marks)
+        or len(names) != len(marks)
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError(
+            f"found {len(tokens)} tokio::test tokens and {len(marks)} marks "
+            f"for {len(names)} unique Tokio test functions; "
+            "extend the scanner for the unsupported declaration",
+        )
+    # The token census cannot see crate aliases or grouped/glob imports.
+    # This fixture paths Tokio fully: reject any use/extern item mentioning
+    # tokio, including visibility-qualified and nested use trees. Scan from
+    # the keyword, not the start of a line. Opaque import syntax also refuses
+    # validation: a comment/literal semicolon must not truncate the item and
+    # hide a Tokio rename. Like the census above this deliberately scans raw
+    # source and may reject prose; extend the scanner rather than waive it.
+    for keyword in re.finditer(r"(?<![\w$])(?:use|extern)\b", text):
+        stop = text.find(";", keyword.end())
+        item = text[keyword.end():] if stop == -1 else text[keyword.end():stop]
+        if re.search(r"\btokio\b|[/\"']", item):
+            raise ValueError(
+                "unsupported Tokio import or opaque import syntax; "
+                "path Tokio fully so every test attribute stays visible",
+            )
+    # Supported macro source is deliberately small: no local definitions
+    # (including nested/raw-identifier forms), macro imports or opaque item/
+    # source generators. Only these bare standard expression macros are used
+    # by the fixture. Do not try to expand arbitrary Rust with this scanner.
+    # Scan raw words so trivia, metavariables and repetitions cannot hide a
+    # definition; prose/literals may conservatively refuse validation too.
+    expression_macros = r"assert|assert_eq|assert_ne|eprintln|format|vec"
+    macro_error = (
+        "unsupported macro source; keep fixtures as direct Tokio test functions "
+        "and use only bare standard expression macros, or extend the scanner"
+    )
+    if re.search(r"\b(?:macro_rules|macro|macro_use)\b", text):
+        raise ValueError(macro_error)
+    for keyword in re.finditer(r"\buse\b", text):
+        stop = text.find(";", keyword.end())
+        item = text[keyword.end():] if stop == -1 else text[keyword.end():stop]
+        # A glob or renamed import could shadow an allowed expression macro.
+        if re.search(rf"\b(?:{expression_macros})\b|\*", item):
+            raise ValueError(macro_error)
+    for bang in re.finditer(r"!\s*(?:[({\[]|/\*|//)", text):
+        prefix = text[:bang.start()]
+        if prefix.rsplit("\n", 1)[-1].lstrip().startswith("//"):
+            continue  # Inner doc comments (`//!`) are not macro invocations.
+        name = re.search(rf"\b(?:{expression_macros})\s*$", prefix)
+        before = "" if name is None else prefix[:name.start()].rstrip()
+        # Require a bare name after an expression/statement separator. Refuse
+        # qualified/raw/Unicode-suffixed names and comment-obscured paths or
+        # delimiters rather than normalizing them into an allowed spelling.
+        # include! and imported item macros are opaque even without Tokio text.
+        if (name is None or (before and before[-1] not in "([{=,;}")
+                or "//" in before.rsplit("\n", 1)[-1]
+                or bang.group().rstrip().endswith(("/*", "//"))):
+            raise ValueError(macro_error)
+    return names
+
+
 def skip_blocks_test(skip, name):
     """Whether a cargo `--skip` token blocks a bare test fn `name`.
 
@@ -4522,6 +4602,65 @@ class WorkflowTests(unittest.TestCase):
                         step["run"].index("export TWO_TEST_DATABASE_URL="),
                     )
 
+    def test_invite_saturation_isolation_in_both_lanes(self):
+        suite = "invite_uses_saturation_acceptance"
+        source = (ROOT / f"crates/store/tests/{suite}.rs").read_text(encoding="utf-8")
+        names = set(tokio_test_names(source))
+        for job_name in ("rust-tests", "patch-coverage"):
+            with self.subTest(job=job_name):
+                steps = self.workflows["check.yml"]["jobs"][job_name]["steps"]
+                runs = [
+                    (step, line)
+                    for step in steps
+                    for line in shell_logical_lines(step.get("run", ""))
+                ]
+                sweeps = [
+                    line for _, line in runs
+                    if "--workspace" in line and ("--tests" in line or "--test '*'" in line)
+                    and "--ignored" not in line and "property_" not in line
+                ]
+                self.assertEqual(len(sweeps), 1)
+                skips = set(re.findall(r"--skip (\S+)", sweeps[0]))
+                for name in sorted(names):
+                    with self.subTest(fixture=name):
+                        self.assertIn(name, skips)
+                replays = [(step, line) for step, line in runs if f"--test {suite}" in line]
+                self.assertEqual(len(replays), 1)
+                step, replay = replays[0]
+                self.assertIn("-p two-bot-store", replay)
+                self.assertIn("--locked", replay)
+                self.assertIn("--test-threads=1", replay)
+                self.assertNotIn("--ignore-run-fail", replay)
+                self.assertNotIn("--ignored", replay)
+                # Neither Cargo's positional filter nor libtest's filters
+                # may silently narrow the complete serial replay.
+                self.assertEqual(
+                    replay.split(" -- ", 1)[0],
+                    f'cov_run "$COV" llvm-cov --no-report -p two-bot-store --features two-bot-core/db --locked --test {suite}'
+                    if job_name == "patch-coverage" else
+                    f"cargo test -p two-bot-store --test {suite} --features two-bot-core/db --locked",
+                )
+                self.assertEqual(
+                    replay.split(" -- ", 1)[1].split(),
+                    ["--test-threads=1", "--skip", "regenerate_reference_docs"]
+                    if job_name == "patch-coverage" else ["--test-threads=1"],
+                )
+                if job_name == "patch-coverage":
+                    self.assertIn("--no-report", replay)
+                    exports = [
+                        line for line in shell_logical_lines(step["run"].split(replay, 1)[0])
+                        if line.startswith("export TWO_TEST_DATABASE_URL=")
+                    ]
+                    self.assertTrue(exports)
+                    self.assertEqual(
+                        exports[-1],
+                        "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
+                    )
+                self.assertEqual(
+                    step["env"]["TWO_TEST_DATABASE_URL"],
+                    "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+                )
+
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         step = next(
@@ -4596,6 +4735,7 @@ class WorkflowTests(unittest.TestCase):
             "raid_list_db",
             "reengagement_list_db",
             "member_moderation_db",
+            "invite_uses_saturation_acceptance",
         ):
             with self.subTest(target=target):
                 self.assertIn(target, step["run"])
@@ -4719,6 +4859,19 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        # Invite saturation fixtures race the parallel sweep (nanos+pid
+        # schema nonce); they run only in the serial re-run below, never in
+        # the main sweep. Enumerate from the Rust source so a future sixth
+        # fixture cannot silently rejoin.
+        saturation_source = (
+            ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
+        ).read_text()
+        saturation_names = set(tokio_test_names(saturation_source))
+        self.assertTrue(saturation_names, "saturation fixtures must be discovered")
+        main_skips = set(re.findall(r"--skip (\S+)", main_sweep))
+        for name in sorted(saturation_names):
+            with self.subTest(saturation_skip=name):
+                self.assertIn(name, main_skips)
         # Staging fixtures accept only the exact agent_test URL; they run in
         # the dedicated staging_migrate_db re-run below, never in this
         # two_bot_test_ci sweep. Enumerate from the Rust source so a future
@@ -4751,7 +4904,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 16)
+        self.assertEqual(len(guarded), 17)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -4760,8 +4913,8 @@ class WorkflowTests(unittest.TestCase):
                 # Deliberate: a guard panic in a guarded suite fails the step.
                 self.assertNotIn("--ignore-run-fail", run)
         # needle -> carries `--features db` (core/discord suites need the db
-        # feature to build their guarded targets; cutover and store suites do
-        # not).
+        # feature to build their guarded targets; cutover and store suites
+        # do not).
         guarded_needles = {
             "--test stream_live_store": True,
             "--test mutation_429_proves_no_effect_channel": True,
@@ -4777,6 +4930,7 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
+            "--test invite_uses_saturation_acceptance": False,
             "--test starboard_store": False,
             "--test starboard_api": False,
             "--test starboard_config_updated_at": False,

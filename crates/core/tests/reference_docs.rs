@@ -72,19 +72,20 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-Live snapshot consumers at `1643438` (canonical table; nine `live()` call\n\
-sites total: eight across the six non-voice rows below, plus the voice\n\
+Live snapshot consumers (canonical table; twelve `live()` call\n\
+sites total: eleven across the seven non-voice rows below, plus the voice\n\
 gateway closure):\n\n\
 | Runtime | Call sites | Reads | When |\n\
 | --- | --- | --- | --- |\n\
 | automod | `automod_gateway.rs:211-223`, `:328` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
-| feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |\n\
+| feed | `feed_jobs.rs:235-237`, `:266` | `TWO_FEED_POLL_SECONDS` (`:207`), `TWO_ANNOUNCEMENTS` (`:244`) | supervisor cadence + per-tick gates (`:276-327`, `:385-419`) |\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
-| ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |\n\
+| ticket | `ticket_runtime.rs:749-752`, `:1491` | 3 destinations + cooldown (`:311-339`, `:719-744`) | every execute/recovery and purge; effective ops changes included |\n\
+| self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |\n\
 | gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:908-911`) |\n\
-| community | `community_jobs.rs:181-183` | 5 scorecard/presence/inactivity keys (`:170-176`) | every tick: probe (`:396`), scorecard (`:548`), sweep (`:634`) |\n\
-| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:9932`), invite code (`:9980`) | spawn (`:8097-8099`), maintenance (`:3421-3423`), `/invite` (`:13942-13943`) |\n\n\
-The forty-one keys in `STORE_READ_KEYS`\n\
+| community | `community_jobs.rs:185-187` | 5 scorecard/presence/inactivity keys (`:174-180`) | every tick: probe (`:400`), scorecard (`:552`), sweep (`:638`) |\n\
+| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8222-8230`), maintenance (`:3571-3573`), `/invite` (`:14195-14204`) |\n\n\
+The forty-four keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
@@ -109,7 +110,7 @@ on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:32
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the\n\
 supervisor cadence and its per-tick schedule gate, so a changed interval\n\
 reschedules the next run to last-run + new interval without a restart\n\
-(`crates/bot/src/feed_jobs.rs:235-287`); the audit mirror applies\n\
+(`crates/bot/src/feed_jobs.rs:235-237`, `:276-327`); the audit mirror applies\n\
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and\n\
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and\n\
 sweep (`crates/bot/src/audit_runtime.rs:60-63`, `:308`, `:438`), where blanking\n\
@@ -120,12 +121,26 @@ that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket\n\
 operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
-and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a\n\
-malformed row keeps the last good destinations like the audit mirror; the gateway funnel applies\n\
+and purge (`crates/bot/src/ticket_runtime.rs:778`, `:896`, `:1317`, `:1491`), where a\n\
+malformed row keeps the last good destinations like the audit mirror, and the same\n\
+refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the effective layered values,\n\
+including ops apply, clearing and expiry without a database revision change, with\n\
+last-good fallback (`crates/bot/src/ticket_runtime.rs:719-744`); the feed poller\n\
+re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while\n\
+a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role\n\
+dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every\n\
+interaction and sweep, falling back to the boot catalogue on absent or unparsable\n\
+rows (`crates/bot/src/self_role_handlers.rs:59-83`, `:224`, `:309`, `:377`, `:419`).\n\
+Catalogue edits and deletes refuse while processing, terminal repair or unknown\n\
+exchanges remain; admission rechecks the same snapshot revision under the settings\n\
+writer lock. Drain first, then retry through the settings API. Do not bypass the\n\
+boundary with SQL or change boot catalogues before draining. The independently\n\
+expiring ops overlay cannot set `TWO_SELF_ROLE_PANELS`;\n\
+the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8097-8099`, `:3421-3423`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13942-13943`), falling back to the live vanity code when the row is absent or invalid (`:9985-9990`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8222-8230`, `:3571-3573`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10239-10255`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:2203`); gateway intents plus ticket command\n\
@@ -233,8 +248,12 @@ const BOOT_ENV: &[&str] = &[
 /// gateway closure (`gateway.rs:2204-2206`), containment
 /// (`containment_runtime.rs:61-67`, `:278-286`), join-risk
 /// (`join_risk_runtime.rs:66-70`, `:239-249`), raid
-/// (`raid_runtime.rs:45-48`, `:194-202`), onboarding's per-event
-/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`), and the community
+/// (`raid_runtime.rs:45-48`, `:194-202`) and onboarding's per-event
+/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`), ticket's per-operation
+/// cooldown refresh (`ticket_runtime.rs:613-638`), the feed poller's per-tick
+/// announcements gate (`feed_jobs.rs:250-267`, `:385-419`) and self-role's
+/// per-dispatch catalogue resolve
+/// (`self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`), and the community
 /// jobs' per-tick refresh (`community_jobs.rs:170-268`).
 /// These rows say “applied live by runtime refresh” in the table below;
 /// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
@@ -275,6 +294,9 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     "TWO_GUILD_INVITE_CODE",
+    "TWO_TICKET_COOLDOWN_SECONDS",
+    "TWO_ANNOUNCEMENTS",
+    "TWO_SELF_ROLE_PANELS",
     "TWO_COMMUNITY_SCORECARD",
     "TWO_COMMUNITY_RECOMMENDATIONS",
     "TWO_COMMUNITY_CORRECTION_CYCLES",
