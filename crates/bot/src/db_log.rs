@@ -102,6 +102,8 @@ pub(crate) fn leveling_class(error: &LevelingRuntimeError) -> &'static str {
         LevelingRuntimeError::Store(LevelingStoreError::InvalidRewards(_)) => "invalid_rewards",
         LevelingRuntimeError::Discord(discord) => discord_class(discord),
         LevelingRuntimeError::InvalidInteraction => "invalid_interaction",
+        LevelingRuntimeError::LevelingPoisoned => "deferred_leveling_poisoned",
+        LevelingRuntimeError::CommunityFactsPoisoned => "deferred_community_facts_poisoned",
         LevelingRuntimeError::RoleApplication { cause, .. } => match cause {
             RoleApplicationError::Store(LevelingStoreError::Db(inner)) => db_class(inner),
             RoleApplicationError::Store(LevelingStoreError::InvalidTimestamp(_)) => {
@@ -355,6 +357,14 @@ mod tests {
         assert_eq!(
             leveling_class(&LevelingRuntimeError::InvalidInteraction),
             "invalid_interaction"
+        );
+        assert_eq!(
+            leveling_class(&LevelingRuntimeError::LevelingPoisoned),
+            "deferred_leveling_poisoned"
+        );
+        assert_eq!(
+            leveling_class(&LevelingRuntimeError::CommunityFactsPoisoned),
+            "deferred_community_facts_poisoned"
         );
     }
 
