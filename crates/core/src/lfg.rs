@@ -1345,7 +1345,11 @@ mod tests {
             ),
             ("Raid", "2099-09-11T20:00:00Z", "__leave__:Leave:1", "role"),
         ] {
-            let refusal = preview_lfg_content(title, starts_at, roles, 4_092_840_000_000)
+            // Validation runs title, then starts-at, then roles: `now` must sit
+            // after the past-time case but before the valid 2099 starts-at, so
+            // the role cases reach role validation instead of refusing on time.
+            let now_ms = 1_789_034_400_000; // 2026-09-10T10:00:00Z
+            let refusal = preview_lfg_content(title, starts_at, roles, now_ms)
                 .expect_err("invalid preview refuses");
             assert!(
                 refusal.to_lowercase().contains(field),
