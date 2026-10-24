@@ -20,7 +20,7 @@ pub(crate) fn owns_welcome_preview(interaction: &Interaction) -> bool {
     )
 }
 
-pub(super) fn is_preview_control(interaction: &Interaction) -> bool {
+pub(crate) fn is_preview_control(interaction: &Interaction) -> bool {
     interaction.kind == InteractionType::MessageComponent
         && interaction
             .message
@@ -127,7 +127,7 @@ impl OnboardingRuntime {
         // Components remain byte-identical to the live renderer. Their original
         // preview message banner fences submissions before config or mutations.
         self.executor
-            .edit_interaction_response_with_components(
+            .edit_interaction_response_with_components_and_blocked_retry(
                 interaction.application_id.get(),
                 &interaction.token,
                 &content,

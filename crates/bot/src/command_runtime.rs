@@ -1006,8 +1006,12 @@ impl CommandRuntime {
                 // The gateway also delivers these to the live voice sink. Yield
                 // before user-slot/lane admission so overload cannot answer a
                 // voice-owned command with the shared runtime's busy callback.
+                // Preview picker clicks yield the same way: onboarding owns
+                // their defer and guidance, so a saturated shared lane must
+                // not race it with a competing busy callback.
                 if self.voice_owns_interaction(&interaction)
                     || crate::onboarding::owns_welcome_preview(&interaction)
+                    || crate::onboarding::is_preview_control(&interaction)
                 {
                     return true;
                 }

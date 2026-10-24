@@ -20,7 +20,7 @@ use crate::gateway::GatewayPipeline;
 
 #[path = "welcome_preview.rs"]
 mod welcome_preview;
-pub(crate) use welcome_preview::owns_welcome_preview;
+pub(crate) use welcome_preview::{is_preview_control, owns_welcome_preview};
 
 const CONFIG_KEYS: &[&str] = &[
     "DISCORD_GUILD_ID",
@@ -349,7 +349,13 @@ impl OnboardingRuntime {
                 })
             }
             Event::InteractionCreate(interaction) if self.accepts_interaction(&interaction.0) => {
-                Some(OnboardingJob::Interaction(Box::new(interaction.0.clone())))
+                // Retain the canonical interaction for execution: downstream
+                // ownership checks must see the registered name, not the raw
+                // payload name.
+                self.executor
+                    .command_identities()
+                    .resolve_interaction(&interaction.0)
+                    .map(|resolved| OnboardingJob::Interaction(Box::new(resolved.into_owned())))
             }
             _ => None,
         }
@@ -359,6 +365,19 @@ impl OnboardingRuntime {
     /// never settings SQL. Stale/disabled mode submissions get an honest edit
     /// after defer; hot configuration cannot delay the initial acknowledgement.
     pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
+        // Resolve the registered slash identity exactly like shared dispatch
+        // (resolve_interaction before its onboarding yield), so both
+        // consumers agree on who owns a slash even when the payload name is
+        // stale. Unresolvable slashes stay silent on both sides; components
+        // pass through unchanged.
+        let Some(resolved) = self
+            .executor
+            .command_identities()
+            .resolve_interaction(interaction)
+        else {
+            return false;
+        };
+        let interaction = resolved.as_ref();
         let router = InteractionRouter::new(RouterGates {
             configured_guild: Some(self.guild_id),
             scorecard: false,

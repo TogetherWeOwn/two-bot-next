@@ -3855,6 +3855,28 @@ impl ActionExecutor {
         .await
     }
 
+    /// [`Self::edit_interaction_response_with_components`] with the same
+    /// bounded contention tolerance as
+    /// [`Self::edit_interaction_response_with_blocked_retry`].
+    pub async fn edit_interaction_response_with_components_and_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|_| async {
+            self.edit_interaction_response_with_components(
+                application_id,
+                interaction_token,
+                content,
+                components,
+            )
+            .await
+        })
+        .await
+    }
+
     /// Complete an acknowledged interaction without mention neutralization.
     /// Only for ephemeral management views (saved-response inspection) whose
     /// mention safety comes from this edit's explicit empty `allowed_mentions`
