@@ -453,7 +453,7 @@ async fn schedule_here_filters_sql_before_cap_offset_count_and_packing() {
     // 52 matching rows interleaved with 52 unrelated rows; two bounded
     // matching windows must not consume unrelated rows at either offset.
     let mut expected = Vec::new();
-    for n in (30..134).rev() {
+    for n in (30usize..134).rev() {
         let channel = if n.is_multiple_of(2) {
             CHANNEL_S
         } else {
