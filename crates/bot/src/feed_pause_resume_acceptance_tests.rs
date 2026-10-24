@@ -91,6 +91,48 @@ async fn invoke(
     replies.remove(0)
 }
 
+/// Silence-aware invocation for the foreign-guild refusal case. The shared
+/// router maps every generic builtin (including `feed-add`/`feed-remove`)
+/// from a foreign guild to `SlashOutcome::Ignore`, and `on_interaction`
+/// stays silent on `Ignore`, so zero REST requests is the correct
+/// no-effects posture — not one reply.
+async fn invoke_silent(pool: &PgPool, name: &str, id: Option<&str>, permission: u64, guild: &str) {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, json!({"id":"9001"})),
+    )
+    .await;
+    let runtime = CommandRuntime::new(
+        pool.clone(),
+        executor(&mock),
+        router_with_commands(RouterGates {
+            configured_guild: Some(2222),
+            scorecard: false,
+            automations: true,
+            announcements: true,
+            moderation: false,
+            voice: false,
+            voice_assistant: false,
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        }),
+        2222,
+        true,
+    );
+    runtime
+        .on_interaction(&slash(name, id, permission, guild))
+        .await;
+    let requests = mock.requests();
+    mock.shutdown().await;
+    assert!(
+        requests.is_empty(),
+        "foreign-guild {name} stays silent, got {} request(s)",
+        requests.len()
+    );
+}
+
 async fn command(pool: &PgPool, name: &str, id: &str) -> String {
     invoke(pool, name, Some(id), 32, GUILD).await
 }
@@ -227,6 +269,15 @@ async fn lifecycle_commands_refuse_insufficient_permissions_foreign_guilds_and_u
         store::add_feed(db.pool(), &relay).await.unwrap();
         for (permission, guild) in [(0, GUILD), (8192, GUILD), (32, "9999")] {
             let before = snapshot(db.pool(), true).await;
+            if guild != GUILD {
+                invoke_silent(db.pool(), name, Some(&relay.id), permission, guild).await;
+                assert_eq!(
+                    snapshot(db.pool(), true).await,
+                    before,
+                    "refused {name} must not alter either guild"
+                );
+                continue;
+            }
             let reply = invoke(db.pool(), name, Some(&relay.id), permission, guild).await;
             assert_eq!(
                 snapshot(db.pool(), true).await,
