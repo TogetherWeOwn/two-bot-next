@@ -1506,18 +1506,16 @@ mod tests {
     }
 
     fn assert_strict_unit_refusal(reply: &str, verb: &str, offending: &str) {
-        // Pin the quoted naming segment, not the bare option token: the
-        // always-present Try usage lists every valid option name, so a bare
-        // `contains` would stay green if the refusal stopped naming the
-        // offending option.
-        //
-        // Value refusals reuse the domain copy (`"reason" must be ...`), so
-        // the quoted name may lead the segment instead of `option`.
-        let quoted = format!("option \"{offending}\"");
-        let domain = format!("\"{offending}\" must be");
+        // Pin the quoted option name, not the bare token: the always-present
+        // Try usage lists every valid option name but never quotes one, so a
+        // quoted `contains` stays red if the refusal stops naming the
+        // offending option. One quoted check covers every refusal shape:
+        // `option "x" ...` plus the domain-copy value refusals (`"x" must
+        // be ...`, `"x" is longer ...`).
+        let quoted = format!("\"{offending}\"");
         assert!(
-            reply.contains(&quoted) || reply.contains(&domain),
-            "{verb}: refusal names {quoted} or {domain}, got {reply:?}"
+            reply.contains(&quoted),
+            "{verb}: refusal names {quoted}, got {reply:?}"
         );
         assert_strict_unit_refusal_shape(reply, verb);
     }
