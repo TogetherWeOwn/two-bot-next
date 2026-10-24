@@ -283,8 +283,9 @@ python3 scripts/check_docs_index.py --json
 ```
 
 The doctest reads the manifest from this file and checks it against
-`crates/core/src/settings.rs`: every key's class and hot-wired flag, state,
-gate and apply consistency, and reason/next_action presence. It checks no
+`crates/core/src/settings.rs`: every key's class and hot-wired flag, allowed
+state values with per-state gate and apply values, and reason/next_action
+presence. It checks no
 fixture row and does **not** run the bot, a database, a dashboard, or any apply
 path. Future protected acceptance tests must implement
 the oracle against real callers in a disposable database; zero tests is not
@@ -309,6 +310,12 @@ proof.
 >>> assert all(r["class"] == "env_only" for r in rows if r["state"] in ("read_only_env", "not_available"))
 >>> assert all(r["gate"] == "W2" for r in rows if r["state"] == "read_only_unwired")
 >>> assert all(r["apply"] == "none" for r in rows if r["state"] in ("read_only_unwired", "not_available"))
+>>> allowed = {"writable", "read_only_unwired", "read_only_env", "not_available"}
+>>> assert all(r["state"] in allowed for r in rows), [r["key"] for r in rows if r["state"] not in allowed]
+>>> assert all(r["gate"] in ("none", "W1") for r in rows if r["state"] == "writable")
+>>> assert all(r["apply"] in ("per_event_db_read", "live_poll_snapshot") for r in rows if r["state"] == "writable")
+>>> assert all(r["gate"] == "none" and r["apply"] == "boot_env" for r in rows if r["state"] == "read_only_env")
+>>> assert all(r["gate"] == "none" for r in rows if r["state"] == "not_available")
 >>> assert all(v["next_action"] and isinstance(v["retryable"], bool) for v in manifest["reasons"].values())
 >>> states = {s: sum(r["state"] == s for r in rows) for s in ("writable", "read_only_unwired", "read_only_env", "not_available")}
 >>> print(json.dumps(states, sort_keys=True))
