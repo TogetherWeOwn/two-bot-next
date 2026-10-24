@@ -214,7 +214,7 @@ async fn remind_event_attendees(
         {
             continue;
         }
-        let (outcome, reason) = if let Some(content) = event_reminder_content(&event) {
+        let (outcome, reason) = if let Some(content) = event_reminder_content(guild, &event) {
             match rest
                 .post_message_confirmed(&event.channel_id, &content, &random_nonce())
                 .await
@@ -250,28 +250,73 @@ async fn remind_event_attendees(
 }
 
 fn event_reminder_content(
+    guild: &str,
     event: &two_bot_core::event_reminder_store::EventReminder,
 ) -> Option<String> {
     use two_bot_core::message_safety::{text_len, truncate, CONTENT_LIMIT};
     use two_bot_core::rsvp::{is_snowflake, MAX_RSVPS_PER_EVENT};
 
     if event.attendees.is_empty()
-        || event.attendees.len() > MAX_RSVPS_PER_EVENT as usize
         || !is_snowflake(&event.event_id)
         || !is_snowflake(&event.channel_id)
         || event.attendees.iter().any(|id| !is_snowflake(id))
     {
         return None;
     }
-    let name = truncate(&neutralize_scheduled_body(&event.name), 200);
-    let attendees = event
-        .attendees
-        .iter()
-        .map(|id| format!("<@{id}>"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let content = format!("Event reminder: {name} starts soon.\n{attendees}");
-    // Do not split into a burst or truncate halfway through an attendee list.
+    // Do not split into a burst or truncate halfway through an attendee list:
+    // an oversized but otherwise valid roster falls back to one bounded,
+    // mention-free notice instead of silence.
+    if event.attendees.len() <= MAX_RSVPS_PER_EVENT as usize {
+        let name = truncate(&neutralize_scheduled_body(&event.name), 200);
+        let attendees = event
+            .attendees
+            .iter()
+            .map(|id| format!("<@{id}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let content = format!("Event reminder: {name} starts soon.\n{attendees}");
+        if text_len(&content) <= CONTENT_LIMIT {
+            return Some(content);
+        }
+    }
+    event_reminder_fallback(guild, event)
+}
+
+/// One bounded, mention-free notice for a valid reminder whose full-mention
+/// rendering would exceed `CONTENT_LIMIT` or whose roster exceeds the RSVP
+/// bound. Neutral event facts only: bounded name, attendee count, start time
+/// and event link. Never a partial roster, never a mention ping, never content
+/// from an incomplete source (callers validate first; empty rosters fail
+/// closed above). The caller posts this through the same committed-attempt
+/// path, so the fallback counts as the one delivery attempt.
+fn event_reminder_fallback(
+    guild: &str,
+    event: &two_bot_core::event_reminder_store::EventReminder,
+) -> Option<String> {
+    use two_bot_core::message_safety::{text_len, truncate, CONTENT_LIMIT};
+
+    // Break literal "<@" after mention neutralization so a hostile name cannot
+    // smuggle a mention-shaped ping into the mention-free fallback. The framing
+    // itself carries no mentions and no attendee ids.
+    let name = neutralize_scheduled_body(&event.name).replace("<@", "<\u{200b}@");
+    let count = event.attendees.len();
+    let attendees = if count == 1 {
+        "1 attendee".to_owned()
+    } else {
+        format!("{count} attendees")
+    };
+    let head = "Event reminder: ";
+    let tail = format!(
+        " starts at {} ({attendees}).\nSee https://discord.com/events/{guild}/{} for details.",
+        event.starts_at, event.event_id
+    );
+    let budget = CONTENT_LIMIT.saturating_sub(text_len(head) + text_len(&tail));
+    if budget == 0 {
+        // Only pathological framing (an unbounded stored start time) lands
+        // here; fail closed rather than emit an unbounded notice.
+        return None;
+    }
+    let content = format!("{head}{}{tail}", truncate(&name, budget));
     (text_len(&content) <= CONTENT_LIMIT).then_some(content)
 }
 
