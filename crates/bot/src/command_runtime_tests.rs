@@ -1301,6 +1301,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "unlock"
                         | "lfg"
                         | "lfg-close"
+                        | "lfg-edit"
                         | "schedule"
                         | "schedule-remove"
                         | "schedule-list"
@@ -2582,6 +2583,12 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
             "Missing id option.",
         ),
         (
+            "lfg-edit",
+            Some(CHANNEL),
+            Permissions::MANAGE_EVENTS,
+            "Missing id option.",
+        ),
+        (
             "sticky",
             None,
             Permissions::MANAGE_GUILD,
@@ -2669,7 +2676,7 @@ async fn lfg_commands_preserve_manage_events_and_disabled_refusals() {
     ] {
         let runtime = runtime_without_db(gates(true, announcements), true, origin.clone());
         runtime.set_identity(1111, 1111);
-        for name in ["lfg", "lfg-close"] {
+        for name in ["lfg", "lfg-close", "lfg-edit"] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
             interaction.member.as_mut().unwrap().permissions = permissions;
             let before = mock.requests().len();
@@ -2725,6 +2732,7 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
         for name in [
             "lfg",
             "lfg-close",
+            "lfg-edit",
             "sticky",
             "sticky-remove",
             "feed-add",
@@ -2827,6 +2835,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             for name in [
                 "lfg",
                 "lfg-close",
+                "lfg-edit",
                 "sticky",
                 "sticky-remove",
                 "feed-add",
@@ -2885,7 +2894,7 @@ async fn foreign_application_interactions_never_reach_a_feature() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     runtime.set_identity(1111, 1111);
-    for name in ["lfg", "lfg-close", "sticky", "feed-add"] {
+    for name in ["lfg", "lfg-close", "lfg-edit", "sticky", "feed-add"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         interaction.application_id = Id::new(9999);
         interaction.member.as_mut().unwrap().permissions =
@@ -3415,6 +3424,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-edit",
         "feed-add",
         "feed-remove",
         "feed-list",
@@ -3458,7 +3468,15 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
             "published set is missing {expected}"
         );
     }
-    for withheld in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+    for withheld in [
+        "feed-add",
+        "feed-remove",
+        "feed-list",
+        "rsvp",
+        "lfg",
+        "lfg-close",
+        "lfg-edit",
+    ] {
         assert!(
             !names.contains(&withheld),
             "gated-off {withheld} must not publish"
@@ -3556,6 +3574,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
             HandlerId::LfgClose,
+            HandlerId::LfgEdit,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
@@ -3568,7 +3587,7 @@ fn production_router_matches_composed_production_wiring() {
 
     // Composition mirrors production: the real `router_with_commands`, the
     // member verbs `CommandRuntime::build` adds while the member consumer
-    // exists, and the LFG pair `InteractionRuntime::with_router` adds. Only
+    // exists, and the LFG handlers `InteractionRuntime::with_router` adds. Only
     // `handler_for` presence is compared.
     fn composed(gates: RouterGates, member_present: bool) -> InteractionRouter {
         let mut router = router_with_commands(gates);
@@ -3585,6 +3604,7 @@ fn production_router_matches_composed_production_wiring() {
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
+        router.register(Box::new(Marker(HandlerId::LfgEdit)));
         router
     }
 

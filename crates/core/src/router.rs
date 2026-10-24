@@ -129,6 +129,7 @@ pub enum HandlerId {
     RsvpAttendance,
     Lfg,
     LfgClose,
+    LfgEdit,
     FeedAdd,
     FeedRemove,
     FeedList,
@@ -440,9 +441,10 @@ impl InteractionRouter {
                 register(HandlerId::Moderation(action));
             }
         }
-        // LFG pair (`InteractionRuntime::with_router`, ungated).
+        // LFG management (`InteractionRuntime::with_router`, ungated).
         register(HandlerId::Lfg);
         register(HandlerId::LfgClose);
+        register(HandlerId::LfgEdit);
         router
     }
 
@@ -708,6 +710,11 @@ impl InteractionRouter {
                 gate: RowGate::Announcements,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
+            "lfg-edit" => Row {
+                handler: HandlerId::LfgEdit,
+                gate: RowGate::Announcements,
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
+            },
             "feed-add" => Row {
                 handler: HandlerId::FeedAdd,
                 gate: RowGate::Announcements,
@@ -886,7 +893,7 @@ impl InteractionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::PERM_MANAGE_EVENTS;
+    use crate::commands::{PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD};
     use std::collections::HashMap;
 
     const GUILD: u64 = 2222;
@@ -970,11 +977,12 @@ mod tests {
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
             ("lfg-close", HandlerId::LfgClose),
+            ("lfg-edit", HandlerId::LfgEdit),
             ("feed-add", HandlerId::FeedAdd),
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 33, "all 33 handler-owned builtins covered");
+        assert_eq!(cases.len(), 34, "all 34 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1013,6 +1021,7 @@ mod tests {
             HandlerId::AutomationCustom,
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
+            HandlerId::LfgEdit,
             HandlerId::Moderation(ModerationAction::Ban),
             HandlerId::FeedList,
         ] {
@@ -1024,6 +1033,7 @@ mod tests {
             ("schedule", HandlerId::AutomationAdmin),
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
+            ("lfg-edit", HandlerId::LfgEdit),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("feed-list", HandlerId::FeedList),
         ] {
@@ -1062,6 +1072,7 @@ mod tests {
             ("rsvp", RouterRefusal::AnnouncementsDisabled),
             ("rsvp-attendance", RouterRefusal::AnnouncementsDisabled),
             ("lfg", RouterRefusal::AnnouncementsDisabled),
+            ("lfg-edit", RouterRefusal::AnnouncementsDisabled),
             ("feed-list", RouterRefusal::AnnouncementsDisabled),
             ("ban", RouterRefusal::ModerationDisabled),
             ("purge", RouterRefusal::ModerationDisabled),
@@ -1208,6 +1219,25 @@ mod tests {
                 handler: HandlerId::Lfg
             }
         );
+        for (name, handler) in [
+            ("lfg-close", HandlerId::LfgClose),
+            ("lfg-edit", HandlerId::LfgEdit),
+        ] {
+            for permissions in [None, Some(0), Some(8), Some(PERM_MANAGE_GUILD)] {
+                assert_eq!(
+                    r.route_slash(&ctx(name, Some(GUILD), permissions)),
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageEventsRequired
+                    },
+                    "{name} needs resolved ManageEvents"
+                );
+            }
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(PERM_MANAGE_EVENTS))),
+                SlashOutcome::Handled { handler },
+                "{name} accepts exactly ManageEvents"
+            );
+        }
         // Feed without ManageGuild.
         assert_eq!(
             r.route_slash(&ctx("feed-add", Some(GUILD), Some(PERM_MANAGE_EVENTS))),
@@ -1493,9 +1523,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 9 automation + 7 announcement + 9 mutations
-        // + 2 reads + 1 custom = 34, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 34);
+        // 5 core + 1 scorecard + 9 automation + 8 announcement + 9 mutations
+        // + 2 reads + 1 custom = 35, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 35);
         assert_eq!(
             &names[..6],
             [
@@ -1510,14 +1540,14 @@ mod tests {
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[22..31],
+            &names[23..32],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[31..33], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[33], "faq");
+        assert_eq!(&names[32..34], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[34], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1574,6 +1604,7 @@ mod tests {
         for (gate, builtin) in [
             ("moderation", "ban"),
             ("announcements", "lfg"),
+            ("announcements", "lfg-edit"),
             ("scorecard", "attendance"),
         ] {
             let mut gates = all_on();
@@ -1680,7 +1711,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 33);
+        assert_eq!(off.len(), 34);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1690,16 +1721,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 33 builtins keep their order; the 21 voice names that survive
+        // 34 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 54);
-        assert_eq!(on_names[..33], off_names[..]);
+        assert_eq!(on.len(), 55);
+        assert_eq!(on_names[..34], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[33..], expected[..]);
+        assert_eq!(on_names[34..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1760,13 +1791,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 33
+        // Both gates on is the full voice set without the assistant: 34
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 54);
+        assert_eq!(both.len(), 55);
     }
 
     #[test]

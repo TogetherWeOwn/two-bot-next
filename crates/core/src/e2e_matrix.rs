@@ -371,6 +371,23 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "lfg-edit",
+            26,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgEdit",
+            "Ephemeral saved-edit receipt with canonical start time; refreshes the existing post, preserving signups.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:id:required",
+                "Valid:title|starts-at:at-least-one",
+                "Valid:starts-at:future,ISO-8601",
+                "Valid:post:open,same-guild",
+            ],
+        ),
+        row(
             "feed-add",
             28,
             E2eGate::Announcements,
@@ -598,22 +615,33 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn matrix_names_are_unique_and_parity_rows_are_unique() {
+    fn matrix_names_are_unique_and_only_lfg_metadata_shares_a_parity_row() {
         let matrix = e2e_command_matrix();
         let mut names = HashSet::new();
         let mut parity = HashSet::new();
+        let mut lfg_companions = Vec::new();
         for row in &matrix {
             assert!(
                 names.insert(row.command),
                 "duplicate matrix row {}",
                 row.command
             );
-            assert!(
-                parity.insert(row.parity_row),
-                "duplicate parity row {}",
-                row.parity_row
-            );
+            if row.parity_row == 26 {
+                lfg_companions.push(row.command);
+            } else {
+                assert!(
+                    parity.insert(row.parity_row),
+                    "duplicate parity row {}",
+                    row.parity_row
+                );
+            }
         }
+        lfg_companions.sort_unstable();
+        assert_eq!(lfg_companions, ["lfg", "lfg-edit"]);
+        let edit = matrix.iter().find(|row| row.command == "lfg-edit").unwrap();
+        assert_eq!(edit.gate, E2eGate::Announcements);
+        assert_eq!(edit.required_permissions, 1 << 33);
+        assert_eq!(edit.handler, "LfgEdit");
     }
 
     #[test]

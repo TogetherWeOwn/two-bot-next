@@ -287,7 +287,9 @@ impl InteractionRuntime {
             &routed,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Handled {
-                    handler: two_bot_core::HandlerId::Lfg | two_bot_core::HandlerId::LfgClose,
+                    handler: two_bot_core::HandlerId::Lfg
+                        | two_bot_core::HandlerId::LfgClose
+                        | two_bot_core::HandlerId::LfgEdit,
                 },
                 ..
             } | RoutedInteraction::Component {
@@ -446,6 +448,7 @@ impl InteractionRuntime {
         }
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgEdit)));
         Self {
             router: std::sync::Arc::new(router),
             pool: pool.clone(),
@@ -567,7 +570,7 @@ impl InteractionRuntime {
             RoutedInteraction::Slash {
                 outcome:
                     SlashOutcome::Handled {
-                        handler: HandlerId::Lfg | HandlerId::LfgClose,
+                        handler: HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit,
                     },
                 ..
             } => {
@@ -596,6 +599,23 @@ impl InteractionRuntime {
                                 .as_ref()
                                 .map(|c| c.id.to_string())
                                 .ok_or_else(|| LfgError::Invalid("Missing channel.".into()))?,
+                        })
+                    })
+                } else if data.name == "lfg-edit" {
+                    let optional = |name: &str| -> Result<Option<String>, LfgError> {
+                        match data.options.iter().find(|option| option.name == name) {
+                            None => Ok(None),
+                            Some(option) => match &option.value {
+                                CommandOptionValue::String(value) => Ok(Some(value.clone())),
+                                _ => Err(LfgError::Invalid(format!("{name} must be text."))),
+                            },
+                        }
+                    };
+                    option("id").and_then(|post_id| {
+                        Ok(LfgRequest::Edit {
+                            post_id,
+                            title: optional("title")?,
+                            starts_at: optional("starts-at")?,
                         })
                     })
                 } else {

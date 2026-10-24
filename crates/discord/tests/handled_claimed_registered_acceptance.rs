@@ -71,7 +71,7 @@ impl InteractionHandler for Stub {
 /// - `CommandRuntime::build` member verbs (`command_runtime.rs`): the five
 ///   member moderation ids while a member consumer exists.
 /// - `InteractionRuntime::with_router` (`interactions.rs`, public, ungated):
-///   the `Lfg`/`LfgClose` pair.
+///   the `Lfg`/`LfgClose`/`LfgEdit` handlers.
 /// - Missing on the baseline: `Rsvp`, `RsvpAttendance`,
 ///   `ScorecardAttendance` — the RED this file pins.
 trait ProductionRegistrations {
@@ -119,6 +119,7 @@ impl ProductionRegistrations for InteractionRouter {
         }
         router.register(Box::new(Stub(HandlerId::Lfg)));
         router.register(Box::new(Stub(HandlerId::LfgClose)));
+        router.register(Box::new(Stub(HandlerId::LfgEdit)));
         router
     }
 
@@ -224,7 +225,11 @@ fn claiming_surfaces(
     if is_channel_claim(name, handler) && admitted {
         claims.push("channel");
     }
-    if matches!(handler, HandlerId::Lfg | HandlerId::LfgClose) && admitted {
+    if matches!(
+        handler,
+        HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit
+    ) && admitted
+    {
         claims.push("lfg");
     }
     if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) && admitted {
@@ -239,7 +244,11 @@ fn claiming_surfaces(
     let earlier_arm_matches = is_channel_claim(name, handler)
         || matches!(
             handler,
-            HandlerId::Lfg | HandlerId::LfgClose | HandlerId::Rank | HandlerId::Leaderboard
+            HandlerId::Lfg
+                | HandlerId::LfgClose
+                | HandlerId::LfgEdit
+                | HandlerId::Rank
+                | HandlerId::Leaderboard
         )
         || (name == "help" && handler == HandlerId::Help)
         || owner_map(name, member_present) == Some(handler);

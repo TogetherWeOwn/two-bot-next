@@ -77,10 +77,11 @@ use PolicyHook::{
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
-/// `/reopen` picker recovery (parity row 34), plus the private moderation
-/// reads `/purge-preview` (row 35) and `/channel-inspect` (row 36).
+/// `/reopen` picker recovery (parity row 34), plus `/lfg-edit`, a Next-only
+/// companion sharing LFG row 26, plus the private moderation reads
+/// `/purge-preview` (row 35) and `/channel-inspect` (row 36).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 36] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 37] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -162,6 +163,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 36] = [
     row(25, "rsvp-attendance", BuiltinSlash, 0, None),
     row(26, "lfg", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(27, "lfg-close", BuiltinSlash, PERM_MANAGE_EVENTS, None),
+    row(26, "lfg-edit", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(28, "feed-add", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),

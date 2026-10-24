@@ -9,9 +9,9 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 33 built-in slash commands (core + scorecard + automation +
+Scope: 34 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 54). No guild was
+the voice set; with the voice gates on it renders 55). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -51,6 +51,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 25 | `/rsvp-attendance` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral RSVP totals | `AnnouncementsDisabled`, `event-id` required |
 | 26 | `/lfg` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral signup post + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `title`/`starts-at`/`roles` required |
 | 27 | `/lfg-close` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `id` required |
+| 26 | `/lfg-edit` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral saved-edit receipt with canonical start time; refreshes the existing post, preserving signups | `AnnouncementsDisabled`, `ManageEventsRequired`, `id` required ≤128; `title` ≤100 or future ISO-8601 `starts-at` required; same-guild open post only |
 | 28 | `/feed-add` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `kind` rss/youtube/twitch, `source` required |
 | 29 | `/feed-remove` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
 | 30 | `/feed-list` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay list | `AnnouncementsDisabled`, `ManageServerRequired` |
