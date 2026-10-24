@@ -481,7 +481,11 @@ mod tests {
                     definition.name.as_str(),
                     "purge-preview" | "channel-inspect"
                 ) {
-                    let reason = definition.options.iter().find(|o| o.name == "reason").unwrap();
+                    let reason = definition
+                        .options
+                        .iter()
+                        .find(|o| o.name == "reason")
+                        .expect("mutating moderation commands require a reason option");
                     prop_assert_eq!(reason.required, Some(true));
                     prop_assert_eq!(reason.max_length, Some(512));
                 }
