@@ -1127,7 +1127,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 32, "no partial view");
+    assert_eq!(names.len(), 33, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
