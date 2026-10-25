@@ -1741,6 +1741,7 @@ mod tests {
                     "privacy",
                     "reopen",
                     "welcome-preview",
+                    "game-mix",
                 ];
                 if gates.scorecard {
                     expected.push("attendance");
