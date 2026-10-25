@@ -1,9 +1,8 @@
 # Documentation map
 
-Sole Markdown manifest, nested docs/index included.
-Rows: `- [Purpose](relative.md)` by area.
+Sole manifest: `- [Purpose](relative.md)` by area.
 
-Run `python3 scripts/check_docs_index.py --json` at repo root.
+Repo root: `python3 scripts/check_docs_index.py --json`.
 Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
 else exit 1, repair rows/split docs. Bad/duplicate rows use
 `docs/README.md:<line>` in `stale`.
@@ -142,6 +141,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
+- [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 
