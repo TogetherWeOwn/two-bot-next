@@ -192,7 +192,14 @@ impl GiveawayRuntime {
                 let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
                     return Ok(INVALID.into());
                 };
-                if !store::pause_giveaway(&self.pool, &guild, id, OffsetDateTime::now_utc()).await?
+                if !store::pause_audited(
+                    &self.pool,
+                    &guild,
+                    id,
+                    Some(&actor_id(interaction)),
+                    OffsetDateTime::now_utc(),
+                )
+                .await?
                 {
                     return Ok("Giveaway is unknown, already closed, or mid-draw.".into());
                 }
@@ -207,9 +214,15 @@ impl GiveawayRuntime {
                 let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
                     return Ok(INVALID.into());
                 };
-                if store::resume_giveaway(&self.pool, &guild, id, OffsetDateTime::now_utc())
-                    .await?
-                    .is_none()
+                if store::resume_audited(
+                    &self.pool,
+                    &guild,
+                    id,
+                    Some(&actor_id(interaction)),
+                    OffsetDateTime::now_utc(),
+                )
+                .await?
+                .is_none()
                 {
                     return Ok("Giveaway is unknown or not paused.".into());
                 }
@@ -233,11 +246,12 @@ impl GiveawayRuntime {
                 if giveaway::extend_deadline_ms(0, seconds).is_err() {
                     return Ok(INVALID.into());
                 }
-                if store::extend_giveaway(
+                if store::extend_audited(
                     &self.pool,
                     &guild,
                     id,
                     seconds,
+                    Some(&actor_id(interaction)),
                     OffsetDateTime::now_utc(),
                 )
                 .await?
