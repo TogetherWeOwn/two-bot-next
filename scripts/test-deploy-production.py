@@ -2684,5 +2684,16 @@ class ReadyzVerdictTests(unittest.TestCase):
         self.assertIn("pre-stamp version", message)
 
 
+# This explicit suite is CI's production-deploy entrypoint; keep the immutable
+# acceptance cases in it as well as ordinary unittest discovery.
+from test_immutable_bot_promotion import (
+    AdmittedArtifactReadinessTests,
+    AdmittedArtifactRenderTests,
+    ImmutablePromotionIntakeTests,
+    ImmutablePromotionProducerTests,
+    ImmutablePromotionWorkflowTests,
+)
+
+
 if __name__ == "__main__":
     unittest.main()
