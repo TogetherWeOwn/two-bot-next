@@ -22,7 +22,7 @@ use two_bot_core::{
     self_roles::{
         event_order_for_event_id, event_order_from_snowflake, is_snowflake,
         parse_self_role_custom_id, parse_self_role_panels, reaction_option_key, self_role_reply,
-        PanelMode, SelfRoleGates, SelfRolePanel, SettledOutcome,
+        PanelMode, SafeRefusal, SelfRoleGates, SelfRolePanel, SettledOutcome,
     },
     settings::{to_env_string, LiveSettings, SettingsCache},
 };
@@ -93,7 +93,10 @@ pub(crate) enum SelfRoleResult {
     DryRun,
     Duplicate,
     Ignored,
+    /// A definitive pre-mutation refusal without a member-explainable category.
     Rejected,
+    /// A definitive pre-mutation refusal with a vetted reason and next action.
+    Refused(SafeRefusal),
     Pending,
 }
 
@@ -103,9 +106,13 @@ impl SelfRoleResult {
             Self::Settled(outcome) => self_role_reply(outcome, color),
             Self::DryRun => "Dry run recorded; no roles were changed.",
             Self::Duplicate => "This selection is already being handled or was handled earlier.",
-            Self::Ignored | Self::Rejected => "This role selection could not be applied.",
+            Self::Ignored => "This role selection could not be applied.",
+            Self::Rejected => {
+                "This role selection could not be applied. Try again later, or contact a server admin to check this panel."
+            }
+            Self::Refused(refusal) => refusal.reply(),
             Self::Pending => {
-                "This role selection is unresolved; no successful change has been confirmed."
+                "This role selection is unresolved; no successful change has been confirmed. Please wait a moment and try again; if it keeps failing, contact a server admin."
             }
         }
     }
@@ -540,7 +547,10 @@ impl SelfRoleService {
             Ok(Admission::Ready(prepared)) => prepared,
             Ok(Admission::Duplicate) => return SelfRoleResult::Duplicate,
             Ok(Admission::Ignored) => return SelfRoleResult::Ignored,
-            Ok(Admission::Rejected(_)) => return SelfRoleResult::Rejected,
+            Ok(Admission::Rejected(code)) => {
+                return SafeRefusal::from_code(code)
+                    .map_or(SelfRoleResult::Rejected, SelfRoleResult::Refused)
+            }
             Err(error) => {
                 warn!(?error, event_id = %event_id, "self-role admission unresolved");
                 return SelfRoleResult::Pending;

@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 59.
+Built-in commands: 63.
 
 ## `/access`
 
@@ -46,6 +46,7 @@ Set who can create voice rooms and use room commands
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `show` | subcommand | false | — | — | — | — | Show the current voice-room access settings |
+| `show page` | integer | false | 1 | — | — | — | Page of access settings to show (starts at 1) |
 | `creation` | subcommand | false | — | — | — | — | Turn temporary room creation on or off |
 | `creation enabled` | boolean | true | — | — | — | — | On allows new rooms, off stops them (existing rooms keep working) |
 | `role` | subcommand | false | — | — | — | — | Set or clear the role required to use room commands |
@@ -116,6 +117,28 @@ Define or replace a custom command
 | `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
 | `description` | string | false | — | — | 100 | — | Shown in the command picker |
 | `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
+
+## `/command-disable`
+
+Pause a saved custom command without deleting it
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+
+## `/command-enable`
+
+Resume a saved custom command
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
 
 ## `/command-inspect`
 
@@ -253,7 +276,7 @@ Resume a paused feed relay
 
 ## `/giveaway`
 
-Create, list or cancel a giveaway
+Create, draw, reroll or cancel a giveaway
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
@@ -270,6 +293,18 @@ Create, list or cancel a giveaway
 | `list` | subcommand | false | — | — | — | — | List open giveaways |
 | `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
 | `cancel id` | string | true | — | — | 64 | — | Giveaway id |
+| `end` | subcommand | false | — | — | — | — | Draw now, before the deadline |
+| `end id` | string | true | — | — | 64 | — | Giveaway id |
+| `pause` | subcommand | false | — | — | — | — | Pause entry without drawing |
+| `pause id` | string | true | — | — | 64 | — | Giveaway id |
+| `resume` | subcommand | false | — | — | — | — | Resume a paused giveaway |
+| `resume id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend` | subcommand | false | — | — | — | — | Add minutes to the deadline |
+| `extend id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend duration-minutes` | integer | true | 1 | 43200 | — | — | Minutes to add (1–43200) |
+| `reroll` | subcommand | false | — | — | — | — | Redraw the winners |
+| `reroll id` | string | true | — | — | 64 | — | Giveaway id |
+| `reroll user` | user | false | — | — | — | — | Replace only this winner |
 
 ## `/group`
 
@@ -372,6 +407,19 @@ Close a raid/LFG signup
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+
+## `/lfg-edit`
+
+Update a raid/LFG title or start time
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+| `title` | string | false | — | — | 100 | — | Event or group title |
+| `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
 
 ## `/lfg-list`
 
@@ -579,6 +627,7 @@ Schedule a message, once or recurring
 | `body` | string | true | — | — | 2000 | — | Message text |
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
+| `at` | string | false | — | — | 64 | — | One-off RFC3339 time with Z or offset; cannot combine with other timing |
 
 ## `/schedule-list`
 
@@ -609,7 +658,9 @@ Show voice-room status, health and creator channels
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of creator channels to show (starts at 1) |
 
 ## `/slowmode`
 
@@ -726,3 +777,12 @@ Record a warning for a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/welcome-preview`
+
+Privately preview the current welcome for a synthetic newcomer. No delivery.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.

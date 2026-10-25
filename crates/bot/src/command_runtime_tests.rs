@@ -37,6 +37,8 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
+#[path = "custom_command_toggle_acceptance.rs"]
+mod custom_command_toggle_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
 
@@ -46,6 +48,10 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
+#[path = "schedule_absolute_acceptance_tests.rs"]
+mod schedule_absolute_acceptance;
+#[path = "schedule_absolute_correction_tests.rs"]
+mod schedule_absolute_correction_tests;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
 
@@ -392,11 +398,22 @@ pub(crate) fn slash(
             guild: Some(AnonymizableId::Id(Id::new(GUILD))),
             user: None,
         },
-        channel: None,
+        // Real Discord populates both for guild slash commands: the
+        // registration guild (identity resolution scopes guild receipts by
+        // it) and the channel object (template context needs it).
+        channel: channel.map(|id| {
+            serde_json::from_value::<twilight_model::channel::Channel>(serde_json::json!({
+                "id": id.to_string(),
+                "guild_id": GUILD.to_string(),
+                "type": 0,
+                "name": "commands",
+            }))
+            .expect("slash fixture channel")
+        }),
         channel_id: channel.map(Id::new),
         context: None,
         data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
-            guild_id: None,
+            guild_id: Some(Id::new(GUILD)),
             id: Id::new(1),
             name: name.to_owned(),
             kind: CommandType::ChatInput,
@@ -463,12 +480,41 @@ fn interaction_event(interaction: Interaction) -> Event {
 
 /// A router-refused command: the first thing it does is one REST callback, so
 /// a delayed mock reply holds its worker slot without any database.
+/// Move an interaction to another invocation guild. Real guild slash
+/// payloads carry the same guild in `data.guild_id`, so keep both aligned.
+fn set_guild(
+    interaction: &mut Interaction,
+    guild: Option<twilight_model::id::Id<twilight_model::id::marker::GuildMarker>>,
+) {
+    interaction.guild_id = guild;
+    if let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_mut() {
+        if command.guild_id.is_some() {
+            command.guild_id = guild;
+        }
+    }
+}
+
 fn open_command(member: u64) -> Event {
     interaction_event(from_member(
         slash("sticky-remove", Some(CHANNEL), Vec::new()),
         member,
         Permissions::empty(),
     ))
+}
+
+/// `open_command` as a global-registration payload (no registration guild).
+/// Scope-closure probes use it so a registry installed earlier in the test
+/// cannot swallow the invocation before the closed scope is consulted.
+fn open_command_global(member: u64) -> Event {
+    let mut interaction = from_member(
+        slash("sticky-remove", Some(CHANNEL), Vec::new()),
+        member,
+        Permissions::empty(),
+    );
+    if let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_mut() {
+        command.guild_id = None;
+    }
+    interaction_event(interaction)
 }
 
 /// `/timeout` from a member who holds `MODERATE_MEMBERS`; moderation is gated
@@ -698,7 +744,12 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
         }
         // LFG adapter ownership is composed unconditionally, unlike the
         // activation-fenced publication and invocation checked separately.
-        for handler in [HandlerId::Lfg, HandlerId::LfgClose, HandlerId::LfgList] {
+        for handler in [
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::LfgEdit,
+            HandlerId::LfgList,
+        ] {
             assert_eq!(
                 runtime.router().handler_for(&handler).map(|h| h.id()),
                 Some(handler),
@@ -768,7 +819,14 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
                 }
                 let mut interaction = slash("lfg-list", Some(CHANNEL), Vec::new());
                 interaction.application_id = Id::new(app);
+                // Global-registration payload: an unpublished command has no
+                // guild registration to resolve, so the router must see it.
                 interaction.guild_id = interaction_guild.map(Id::new);
+                if let Some(InteractionData::ApplicationCommand(command)) =
+                    interaction.data.as_mut()
+                {
+                    command.guild_id = None;
+                }
                 interaction.member.as_mut().unwrap().permissions = permissions;
                 let before = mock.requests().len();
                 tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
@@ -852,7 +910,14 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help", "privacy", "reopen"],
+                vec![
+                    "rank",
+                    "leaderboard",
+                    "help",
+                    "privacy",
+                    "reopen",
+                    "welcome-preview"
+                ],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -966,7 +1031,17 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
+        assert_eq!(
+            names,
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview"
+            ]
+        );
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -1511,6 +1586,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "unlock"
                         | "lfg"
                         | "lfg-close"
+                        | "lfg-edit"
                         | "lfg-list"
                         | "schedule"
                         | "schedule-remove"
@@ -1521,6 +1597,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "privacy"
                         | "giveaway"
                         | "reopen"
+                        | "welcome-preview"
                 )
             })
             .collect();
@@ -1531,6 +1608,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"privacy"));
         assert!(!unwired.contains(&"lfg-list"));
         assert!(!unwired.contains(&"reopen"));
+        assert!(!unwired.contains(&"welcome-preview"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -2191,7 +2269,7 @@ async fn foreign_non_moderation_commands_remain_silent() {
     for name in ["not-a-command", "rank", "rsvp", "command", "schedule"] {
         for guild in [Some(Id::new(9999)), None] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             runtime.on_interaction(&interaction).await;
         }
     }
@@ -2232,7 +2310,7 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
     ] {
         for guild in [Some(Id::new(9999)), None] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             let handled = leveling
                 .handle_interaction(&interaction, handler)
                 .await
@@ -2306,7 +2384,7 @@ async fn foreign_moderation_preserves_the_router_guild_refusal() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(false, false), false, origin);
     let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
-    interaction.guild_id = Some(Id::new(9999));
+    set_guild(&mut interaction, Some(Id::new(9999)));
     runtime.on_interaction(&interaction).await;
     let callbacks = mock.posts_to("/callback").await;
     assert_eq!(callbacks.len(), 1);
@@ -2513,7 +2591,7 @@ async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_e
     .await;
     let sent = mock.requests().len();
     assert!(
-        !runtime.dispatch(&open_command(500)),
+        !runtime.dispatch(&open_command_global(500)),
         "closed scope refuses new work"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2797,6 +2875,12 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
             "Missing id option.",
         ),
         (
+            "lfg-edit",
+            Some(CHANNEL),
+            Permissions::MANAGE_EVENTS,
+            "Missing id option.",
+        ),
+        (
             "sticky",
             None,
             Permissions::MANAGE_GUILD,
@@ -2933,7 +3017,7 @@ async fn lfg_commands_preserve_manage_events_and_disabled_refusals() {
     ] {
         let runtime = runtime_without_db(gates(true, announcements), true, origin.clone());
         runtime.set_identity(1111, 1111);
-        for name in ["lfg", "lfg-close"] {
+        for name in ["lfg", "lfg-close", "lfg-edit"] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
             interaction.member.as_mut().unwrap().permissions = permissions;
             let before = mock.requests().len();
@@ -2989,6 +3073,7 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
         for name in [
             "lfg",
             "lfg-close",
+            "lfg-edit",
             "sticky",
             "sticky-remove",
             "feed-add",
@@ -2996,13 +3081,13 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
             "feed-list",
         ] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             interaction.member.as_mut().unwrap().permissions =
                 Some(Permissions::MANAGE_EVENTS | Permissions::MANAGE_GUILD);
             runtime.on_interaction(&interaction).await;
         }
         let mut interaction = lfg_select(Vec::new());
-        interaction.guild_id = guild;
+        set_guild(&mut interaction, guild);
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -3013,7 +3098,7 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
     // Moderation's guild fence remains an explicit refusal, unlike the
     // announcement/automation routes above, even with its feature gate off.
     let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
-    interaction.guild_id = Some(Id::new(9999));
+    set_guild(&mut interaction, Some(Id::new(9999)));
     runtime.on_interaction(&interaction).await;
     let requests = mock.requests();
     assert_eq!(requests.len(), 1, "only the moderation guild refusal");
@@ -3091,6 +3176,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             for name in [
                 "lfg",
                 "lfg-close",
+                "lfg-edit",
                 "sticky",
                 "sticky-remove",
                 "feed-add",
@@ -3149,7 +3235,7 @@ async fn foreign_application_interactions_never_reach_a_feature() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     runtime.set_identity(1111, 1111);
-    for name in ["lfg", "lfg-close", "sticky", "feed-add"] {
+    for name in ["lfg", "lfg-close", "lfg-edit", "sticky", "feed-add"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         interaction.application_id = Id::new(9999);
         interaction.member.as_mut().unwrap().permissions =
@@ -3662,7 +3748,7 @@ async fn feed_commands_from_other_guilds_are_silent() {
         "feed-inspect",
     ] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-        interaction.guild_id = Some(Id::new(9999));
+        set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -3730,7 +3816,7 @@ async fn schedule_commands_from_other_guilds_are_silent() {
     let runtime = runtime_without_db(gates(true, true), true, origin);
     for name in ["schedule", "schedule-remove", "schedule-list"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-        interaction.guild_id = Some(Id::new(9999));
+        set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -4042,6 +4128,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-edit",
         "lfg-list",
         "feed-add",
         "feed-remove",
@@ -4096,6 +4183,8 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
         "feed-inspect",
         "rsvp",
         "lfg",
+        "lfg-close",
+        "lfg-edit",
         "lfg-list",
     ] {
         assert!(
@@ -4188,6 +4277,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Help,
             HandlerId::Privacy,
             HandlerId::Reopen,
+            HandlerId::WelcomePreview,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
@@ -4196,6 +4286,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
             HandlerId::LfgClose,
+            HandlerId::LfgEdit,
             HandlerId::LfgList,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
@@ -4229,6 +4320,7 @@ fn production_router_matches_composed_production_wiring() {
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
+        router.register(Box::new(Marker(HandlerId::LfgEdit)));
         router.register(Box::new(Marker(HandlerId::LfgList)));
         router
     }
@@ -4516,7 +4608,7 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
     runtime.on_interaction(&leaderboard).await;
     for name in ["rank", "leaderboard"] {
         let mut foreign = slash(name, Some(CHANNEL), Vec::new());
-        foreign.guild_id = Some(Id::new(9999));
+        set_guild(&mut foreign, Some(Id::new(9999)));
         runtime.on_interaction(&foreign).await;
     }
     let requests = mock.requests();
@@ -7264,8 +7356,9 @@ async fn feed_store_failure_replies_generic_and_audits_nothing() {
 // fixed store-failure text. Feed-list and feed-inspect stay unaudited even
 // on failure (legacy list parity): a failed read replies with the same safe
 // text and writes no audit row. A dead pool (the audit write itself
-// impossible) degrades to a warn log plus that same safe reply with no
-// panic and no leaked internals.
+// impossible)
+// degrades to a warn log plus that same safe reply with no panic and no
+// leaked internals.
 
 const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
 
@@ -8670,7 +8763,7 @@ async fn schedule_list_invalid_and_out_of_range_pages_refuse_without_writes() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
+async fn schedule_list_over_cap_keeps_truncation_visible_across_packed_pages() {
     let db = TestDb::new().await;
     // 27 rows (direct seeds bypass quota admission), inserted newest-first.
     // The listing cap is pinned at 25: raising it must break this test.
@@ -8686,25 +8779,45 @@ async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    runtime
-        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
-        .await;
+    // Localized due-time rows pack into two replies. Walk both pages of the
+    // first capped window so every listed row and the overflow remain visible.
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
 
-    // deferred_reply() already asserts the ephemeral defer (flags 64).
-    let json = mock.deferred_reply();
-    let content = json["content"].as_str().expect("list content");
-    let mut expected_lines: Vec<String> = (0..25u32)
-        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+    let contents = schedule_list_reply_contents(&mock, 2);
+    assert_eq!(schedule_list_page_indicator(&contents[0]), Some((1, 2)));
+    assert_eq!(schedule_list_page_indicator(&contents[1]), Some((2, 2)));
+    let listed_ids: Vec<&str> = contents
+        .iter()
+        .flat_map(|content| schedule_list_row_lines(content))
+        .map(schedule_list_row_id)
         .collect();
-    expected_lines.push("(truncated, 2 more)".to_owned());
+    let expected_ids: Vec<String> = (0..25u32).map(|n| format!("cap-{n:02}")).collect();
     assert_eq!(
-        content,
-        expected_lines.join("\n"),
-        "over-cap listing: 25 earliest rows, then the overflow line"
+        listed_ids,
+        expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        "the first capped window lists its 25 earliest ids exactly once"
+    );
+    for line in contents
+        .iter()
+        .flat_map(|content| schedule_list_row_lines(content))
+    {
+        assert!(
+            line.contains("<t:")
+                && line.contains(":F>. The 15s ticker and delivery may be delayed."),
+            "each whole row includes its localized due time and uncertainty: {line}"
+        );
+    }
+    assert!(
+        contents[1].contains("(truncated, 2 more)") && contents[1].contains("Continued on page 3."),
+        "the last first-window page names both the cut and the reachable continuation: {}",
+        contents[1]
     );
     assert!(
-        !content.contains("cap-25") && !content.contains("cap-26"),
-        "rows past the cap are counted, not listed: {content}"
+        !contents
+            .iter()
+            .any(|content| content.contains("cap-25") || content.contains("cap-26")),
+        "rows past the cap are counted, not listed: {contents:?}"
     );
     assert!(
         db.schedule_audits().await.is_empty(),
@@ -8716,7 +8829,7 @@ async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
+async fn schedule_list_at_cap_enumerates_every_row_without_an_overflow_line() {
     let db = TestDb::new().await;
     for n in (0..25u32).rev() {
         db.seed_schedule_row(
@@ -8730,34 +8843,56 @@ async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    runtime
-        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
-        .await;
-
-    let json = mock.deferred_reply();
-    let content = json["content"].as_str().expect("list content");
-    let expected_lines: Vec<String> = (0..25u32)
-        .map(|n| format!("`full-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
-        .collect();
-    assert_eq!(
-        content,
-        expected_lines.join("\n"),
-        "exactly at the cap nothing is truncated"
-    );
+    invoke_schedule_list(&runtime, None).await;
+    let first = schedule_list_reply_contents(&mock, 1);
+    let (current, total_pages) = schedule_list_page_indicator(&first[0])
+        .expect("localized cap-sized list spans announced pages");
+    assert_eq!(current, 1);
     assert!(
-        !content.contains("truncated"),
-        "no overflow line at the cap: {content}"
+        total_pages >= 2,
+        "localized rows require more than one page"
     );
+    for page in 2..=total_pages {
+        invoke_schedule_list(&runtime, Some(page)).await;
+    }
+
+    let contents = schedule_list_reply_contents(&mock, total_pages as usize);
+    let listed_ids: Vec<&str> = contents
+        .iter()
+        .flat_map(|content| schedule_list_row_lines(content))
+        .map(schedule_list_row_id)
+        .collect();
+    let expected_ids: Vec<String> = (0..25u32).map(|n| format!("full-{n:02}")).collect();
+    assert_eq!(
+        listed_ids,
+        expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        "exactly at the cap still exposes every configured id in order"
+    );
+    for (index, content) in contents.iter().enumerate() {
+        assert_eq!(
+            schedule_list_page_indicator(content),
+            Some((index as i64 + 1, total_pages)),
+            "every packed page announces its position"
+        );
+        assert!(
+            !content.contains("truncated"),
+            "no overflow line at the cap: {content}"
+        );
+        assert!(
+            content.encode_utf16().count() <= 2000,
+            "whole-row page stays within Discord's cap: {content}"
+        );
+    }
     mock.shutdown().await;
     db.close().await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
+async fn schedule_list_over_cap_third_page_lists_hidden_rows() {
     let db = TestDb::new().await;
-    // Same 27-row over-cap guild as the page-1 acceptance test: page 2 must
-    // reach the bounded hidden window instead of re-paging the first 25.
+    // The localized first window packs across pages 1 and 2, so page 3 must
+    // reach the bounded hidden window instead of re-paging the first 25 rows.
     for n in (0..27u32).rev() {
         db.seed_schedule_row(
             GUILD_S,
@@ -8770,15 +8905,31 @@ async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     let contents = schedule_list_reply_contents(&mock, 1);
+    let rows = schedule_list_row_lines(&contents[0]);
     assert_eq!(
-        contents[0],
-        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
-         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
-        "page 2 lists exactly the rows past the capped first window"
+        rows.iter()
+            .map(|line| schedule_list_row_id(line))
+            .collect::<Vec<_>>(),
+        vec!["cap-25", "cap-26"],
+        "page 3 lists exactly the rows past the capped first window"
     );
+    for (line, due) in rows
+        .iter()
+        .zip(["2030-01-26T00:00:00.000Z", "2030-01-27T00:00:00.000Z"])
+    {
+        assert!(
+            line.contains(due),
+            "hidden row keeps its canonical due time: {line}"
+        );
+        assert!(
+            line.contains("<t:")
+                && line.contains(":F>. The 15s ticker and delivery may be delayed."),
+            "hidden row retains its localized due time and uncertainty: {line}"
+        );
+    }
     assert!(
         db.schedule_audits().await.is_empty(),
         "list writes no audit row"
@@ -8789,11 +8940,11 @@ async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
+async fn schedule_list_far_over_cap_walks_hidden_rows_and_names_remaining_overflow() {
     let db = TestDb::new().await;
     // 52 rows: the hidden window itself fills (25 rows) with 2 more behind
-    // it, so page 2 carries its own overflow line; minute-spaced stamps keep
-    // (next_run_at, id) order aligned with id order.
+    // it. Localized rows may use several replies, but every hidden id remains
+    // reachable and the terminal hidden page must name the remaining cut.
     for n in (0..52u32).rev() {
         db.seed_schedule_row(
             GUILD_S,
@@ -8806,32 +8957,79 @@ async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
-    invoke_schedule_list(&runtime, Some(99)).await;
-
-    let contents = schedule_list_reply_contents(&mock, 2);
-    let mut expected_lines: Vec<String> = (25..50u32)
-        .map(|n| {
-            format!(
-                "`big-{n:02}` `<#3333>` 2030-03-01T{:02}:{:02}:00.000Z",
-                n / 60,
-                n % 60
-            )
-        })
-        .collect();
-    expected_lines.push("(truncated, 2 more)".to_owned());
+    invoke_schedule_list(&runtime, None).await;
+    let first = schedule_list_reply_contents(&mock, 1);
+    let (_, first_total) = schedule_list_page_indicator(&first[0])
+        .expect("the localized first window announces its packed page count");
+    assert!(
+        first_total > 1,
+        "localized rows require more than one first-window page: {}",
+        first[0]
+    );
+    let first_hidden_page = first_total + 1;
+    invoke_schedule_list(&runtime, Some(first_total)).await;
+    let first_window = schedule_list_reply_contents(&mock, 2);
+    assert!(
+        first_window[1].contains(&format!("Continued on page {first_hidden_page}.")),
+        "the terminal first-window page names the reachable hidden page: {}",
+        first_window[1]
+    );
+    invoke_schedule_list(&runtime, Some(first_hidden_page)).await;
+    let initial_contents = schedule_list_reply_contents(&mock, 3);
+    let (_, total_pages) = schedule_list_page_indicator(&initial_contents[2])
+        .expect("a multi-page hidden window carries global page numbers");
     assert_eq!(
-        contents[0],
-        expected_lines.join("\n"),
-        "page 2 lists the full hidden window plus its own overflow line"
+        schedule_list_page_indicator(&initial_contents[2]).map(|(current, _)| current),
+        Some(first_hidden_page),
+        "the first page after the capped window starts the hidden range"
+    );
+    for page in first_hidden_page + 1..=total_pages {
+        invoke_schedule_list(&runtime, Some(page)).await;
+    }
+
+    let invocations = 2 + usize::try_from(total_pages - first_total)
+        .expect("global page total follows the first window");
+    let contents = schedule_list_reply_contents(&mock, invocations);
+    let hidden_ids: Vec<&str> = contents
+        .iter()
+        .skip(2)
+        .flat_map(|content| schedule_list_row_lines(content))
+        .map(schedule_list_row_id)
+        .collect();
+    let expected_hidden_ids: Vec<String> = (25..50u32).map(|n| format!("big-{n:02}")).collect();
+    assert_eq!(
+        hidden_ids,
+        expected_hidden_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "walking every hidden page exposes the bounded second window in order"
+    );
+    let terminal_hidden_page = contents.last().expect("at least one hidden page");
+    assert!(
+        terminal_hidden_page.contains("(truncated, 2 more)"),
+        "the terminal hidden page names rows beyond the bounded window: {terminal_hidden_page}"
     );
     assert!(
-        !contents[0].contains("big-50") && !contents[0].contains("big-51"),
-        "rows past the hidden window are counted, not listed: {}",
-        contents[0]
+        !contents
+            .iter()
+            .any(|content| content.contains("big-50") || content.contains("big-51")),
+        "rows past the hidden window are counted, not listed: {contents:?}"
     );
+    for content in &contents {
+        assert!(
+            content.encode_utf16().count() <= 2000,
+            "every packed response stays within Discord's cap: {content}"
+        );
+    }
+
+    invoke_schedule_list(&runtime, Some(99)).await;
+    let contents = schedule_list_reply_contents(&mock, invocations + 1);
     assert_eq!(
-        contents[1], "Page 99 is out of range: this server has 2 page(s) of schedules.",
+        contents.last(),
+        Some(&format!(
+            "Page 99 is out of range: this server has {total_pages} page(s) of schedules."
+        )),
         "pages past both windows refuse with the combined page total"
     );
     assert!(
@@ -8844,7 +9042,7 @@ async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_under_cap_renders_byte_identical_to_before() {
+async fn schedule_list_under_cap_preserves_rows_with_localized_due_and_uncertainty() {
     let db = TestDb::new().await;
     db.seed_schedule_row(
         GUILD_S,
@@ -8864,6 +9062,15 @@ async fn schedule_list_under_cap_renders_byte_identical_to_before() {
         false,
     )
     .await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "completed",
+        "2026-10-01T00:00:00.000Z",
+        None,
+        false,
+    )
+    .await;
+    let before = schedule_absolute_correction_tests::state(&db.pool).await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
     runtime
@@ -8874,10 +9081,16 @@ async fn schedule_list_under_cap_renders_byte_identical_to_before() {
     let json = mock.deferred_reply();
     assert_eq!(
         json["content"],
-        "`once` `<#3333>` 2030-01-01T00:00:00.000Z\n\
+        "`completed` `<#3333>` 2026-10-01T00:00:00.000Z (disabled)\n\
+         `once` `<#3333>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
          `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled)\n\
-         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m",
-        "under-cap listing must not change a single byte"
+         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m <t:1896321906:F>. The 15s ticker and delivery may be delayed.",
+        "list retains ordered complete rows, intervals and disabled state, with localized due times and delivery uncertainty only for enabled rows"
+    );
+    assert_eq!(
+        schedule_absolute_correction_tests::state(&db.pool).await,
+        before,
+        "listing cannot change schedules, audits or commands"
     );
     assert!(
         db.schedule_audits().await.is_empty(),
@@ -8939,7 +9152,7 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
         .collect();
     assert_eq!(edits.len(), 3, "one completion per remove");
     let removed: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
-    assert_eq!(removed["content"], "Cancelled.");
+    assert_eq!(removed["content"], "Cancelled. Schedule `xyz999`.");
     let ambiguous: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
     assert_eq!(
         ambiguous["content"],
@@ -9245,7 +9458,7 @@ async fn schedule_remove_invalid_ids_leave_store_untouched() {
         .collect();
     assert_eq!(edits.len(), 10, "one completion per interaction");
     let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
-    assert_eq!(valid["content"], "Cancelled.");
+    assert_eq!(valid["content"], "Cancelled. Schedule `xyz999`.");
     mock.shutdown().await;
     db.close().await;
 }
@@ -9697,7 +9910,8 @@ async fn fail_scheduled_selects_matching(db: &TestDb, pattern: &str) {
 }
 
 /// The 27-row over-cap guild shared by the deep-pagination tests; direct
-/// seeds bypass quota admission, and page 2 is the first deep page.
+/// seeds bypass quota admission, and page 3 follows the two localized
+/// first-window pages.
 async fn seed_over_cap_schedule_rows(db: &TestDb) {
     for n in (0..27u32).rev() {
         db.seed_schedule_row(
@@ -9719,7 +9933,7 @@ async fn schedule_list_hidden_window_store_failure_audits_one_rejected_row() {
     fail_scheduled_selects_matching(&db, "%OFFSET%").await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     assert_eq!(
         schedule_list_reply_contents(&mock, 1),
@@ -9761,7 +9975,7 @@ async fn schedule_list_unknown_overflow_store_failure_audits_one_rejected_row() 
     fail_scheduled_selects_matching(&db, "%count(*)%").await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     assert_eq!(
         schedule_list_reply_contents(&mock, 1),
@@ -9796,9 +10010,9 @@ async fn schedule_list_unknown_overflow_store_failure_audits_one_rejected_row() 
 }
 
 /// Control: with the fault view installed but matching no statement, the
-/// page-1 over-cap render and the successful deep page are byte-identical
-/// to the unfaulted listings and neither writes an audit row. This proves
-/// the fault harness itself, not just the failures it induces, is inert.
+/// packed page-1 render and the successful hidden page retain their rows and
+/// neither writes an audit row. This proves the fault harness itself, not just
+/// the failures it induces, is inert.
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
@@ -9808,22 +10022,35 @@ async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
     invoke_schedule_list(&runtime, Some(1)).await;
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     let contents = schedule_list_reply_contents(&mock, 2);
-    let mut expected_lines: Vec<String> = (0..25u32)
-        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
-        .collect();
-    expected_lines.push("(truncated, 2 more)".to_owned());
     assert_eq!(
-        contents[0],
-        expected_lines.join("\n"),
-        "page-1 over-cap render is unchanged"
+        schedule_list_page_indicator(&contents[0]),
+        Some((1, 2)),
+        "the first capped window remains packed across its localized pages"
     );
+    let first_rows = schedule_list_row_lines(&contents[0]);
     assert_eq!(
-        contents[1],
-        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
-         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
+        first_rows.first().map(|line| schedule_list_row_id(line)),
+        Some("cap-00"),
+        "page 1 starts at the earliest row"
+    );
+    assert!(
+        first_rows.iter().all(|line| {
+            line.contains("<t:")
+                && line.contains(":F>. The 15s ticker and delivery may be delayed.")
+        }),
+        "the inert fault view preserves enriched page-1 rows: {}",
+        contents[0]
+    );
+    let hidden_ids: Vec<&str> = schedule_list_row_lines(&contents[1])
+        .iter()
+        .map(|line| schedule_list_row_id(line))
+        .collect();
+    assert_eq!(
+        hidden_ids,
+        vec!["cap-25", "cap-26"],
         "a successful deep page still lists the hidden rows"
     );
     assert!(
@@ -9835,7 +10062,7 @@ async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
 }
 
 /// Dead-pool control for a deep page: a closed pool fails the first read,
-/// so no audit write is possible either; asking for page 2 must still
+/// so no audit write is possible either; asking for page 3 must still
 /// finish with the fixed safe reply — no panic, no leaked internals.
 #[tokio::test]
 async fn schedule_list_deep_page_on_dead_pool_replies_safely() {
@@ -9856,7 +10083,7 @@ async fn schedule_list_deep_page_on_dead_pool_replies_safely() {
         .on_interaction(&slash(
             "schedule-list",
             Some(CHANNEL),
-            vec![option("page", CommandOptionValue::Integer(2))],
+            vec![option("page", CommandOptionValue::Integer(3))],
         ))
         .await;
 
@@ -9995,7 +10222,7 @@ fn kick_as(permissions: Permissions, guild: u64) -> Interaction {
         vec![option("member", CommandOptionValue::User(Id::new(303)))],
     );
     interaction.member.as_mut().unwrap().permissions = Some(permissions);
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 
@@ -11044,7 +11271,7 @@ fn privacy_interaction(member: u64, subcommand: Option<&str>) -> Interaction {
 /// purge. Callers pass real-shaped snowflake IDs for both.
 fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> Interaction {
     let mut interaction = privacy_interaction(member, subcommand);
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 
@@ -11071,7 +11298,7 @@ fn privacy_request_interaction_in(
         member,
         Permissions::empty(),
     );
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 

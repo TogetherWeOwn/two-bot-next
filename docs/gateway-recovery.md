@@ -106,6 +106,26 @@ Exit codes: 0 ok, 1 database failure (including a database without migration 032
 
 Residual window: the directive is consumed when the boot read commits. If the process dies before the discard and READY are committed, a restart within 15 minutes could RESUME the old checkpoint. After every armed boot, run the dry run; if the directive is consumed but no new READY checkpoint was recorded, arm again before the next start.
 
+## Reconnect timing entry points
+
+`crates/bot/src/gateway_backoff.rs` separates the live receive loop's timing
+choice from its timer effect:
+
+- `reconnect_spread(seed, attempt)` calculates the deterministic, non-growing
+  500 ms–1 s spread with no timer, network or database access.
+- `wait_reconnect_spread(seed, attempt)` awaits that delay and returns the
+  requested duration for logging. The receive loop in `gateway.rs` uses this
+  wrapper; Twilight still owns connection backoff.
+- `reconnect_delay(policy, attempt)` is the separate, bounded exponential
+  schedule for the test-only supervised runner, not the live receive loop.
+
+Before changing this boundary, run the pure `gateway_backoff::spread_tests`
+unit tests and the existing `reconnect_spread_runtime_acceptance` and
+`reconnect_adoption_guard` integration targets through the bounded cache.
+Together they check seeded draws and extreme attempts, the actual awaited
+500 ms–1 s timer, and receive-loop adoption. Keep exact-head CI and independent
+review as gates; this seam does not enable broader automation or retry authority.
+
 ## Verification (test containers only)
 
 On the persistent controller, compiling commands use the bounded cache wrapper

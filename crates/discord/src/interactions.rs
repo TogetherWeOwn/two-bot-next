@@ -277,9 +277,10 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
 }
 
 /// Shared execution runtime: route once, acknowledge promptly, then run the
-/// registered feature (RSVP/attendance totals and host check-in, LFG, and the
-/// other wired slices) through the shared REST executor. Unsupported features
-/// remain owned by their integration slices, not by a second dispatcher.
+/// registered feature (RSVP/attendance totals and host check-in, LFG,
+/// giveaways, and the other wired slices) through the shared REST executor.
+/// Unsupported features remain owned by their integration slices, not by a
+/// second dispatcher.
 #[cfg(feature = "db")]
 #[derive(Debug)]
 pub struct InteractionRuntime {
@@ -292,6 +293,7 @@ pub struct InteractionRuntime {
     pub classifier: two_bot_core::ClassifierConfig,
     classifier_provider: Option<std::sync::Arc<dyn crate::rsvp::ClassifierProvider>>,
     lfg: crate::lfg_interactions::LfgInteractions,
+    giveaway: crate::giveaway::GiveawayRuntime,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
 }
@@ -323,6 +325,7 @@ impl InteractionRuntime {
                 outcome: SlashOutcome::Handled {
                     handler: two_bot_core::HandlerId::Lfg
                         | two_bot_core::HandlerId::LfgClose
+                        | two_bot_core::HandlerId::LfgEdit
                         | two_bot_core::HandlerId::LfgList,
                 },
                 ..
@@ -334,6 +337,22 @@ impl InteractionRuntime {
             }
         ) {
             return self.handle_routed(interaction, routed).await;
+        }
+        if matches!(
+            &routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: two_bot_core::HandlerId::Giveaway,
+                },
+                ..
+            } | RoutedInteraction::Component {
+                outcome: two_bot_core::ComponentOutcome::Handled {
+                    handler: two_bot_core::ComponentHandler::GiveawayEntry,
+                },
+                ..
+            }
+        ) {
+            return self.handle_giveaway(interaction, routed).await;
         }
         // A refusal for a non-RSVP command (LFG permission or feature gates)
         // must still be answered. The RSVP path ignores those names, so it
@@ -357,6 +376,54 @@ impl InteractionRuntime {
             interaction,
         )
         .await
+    }
+
+    /// Run one routed giveaway interaction: defer ephemerally, then execute
+    /// the slash command or the entry button through the shared giveaway
+    /// runtime. A failed defer owns the interaction without running, exactly
+    /// like the bot dispatch path.
+    async fn handle_giveaway(
+        &self,
+        interaction: &Interaction,
+        routed: RoutedInteraction,
+    ) -> Result<bool, crate::DiscordError> {
+        if self
+            .executor
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &deferred_response(true),
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!(interaction_id = %interaction.id, "giveaway defer failed; details withheld");
+            return Ok(true);
+        }
+        match routed {
+            RoutedInteraction::Slash { .. } => self.giveaway.command(interaction).await,
+            RoutedInteraction::Component { custom_id, .. } => {
+                self.giveaway.enter(interaction, &custom_id).await;
+            }
+            RoutedInteraction::Modal { .. } | RoutedInteraction::Ignore => {}
+        }
+        Ok(true)
+    }
+
+    /// One giveaway due-scan tick over the configured guild: draw what is due
+    /// and re-announce what is drawn but unannounced. No configured guild
+    /// means no work. Inherent and zero-argument by contract: the timed-draw
+    /// acceptance calls this unqualified, shadowing its baseline adapter.
+    pub async fn tick_giveaways(
+        &self,
+    ) -> Result<crate::giveaway::GiveawayTickSummary, crate::giveaway::GiveawayJobError> {
+        let Some(guild) = self.router.gates().configured_guild else {
+            return Ok(crate::giveaway::GiveawayTickSummary {
+                drawn: 0,
+                announced: 0,
+            });
+        };
+        self.giveaway.tick(&guild.to_string()).await
     }
 
     /// True when this interaction can reach RSVP admission: the same
@@ -482,14 +549,16 @@ impl InteractionRuntime {
         }
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgEdit)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgList)));
         Self {
             router: std::sync::Arc::new(router),
             pool: pool.clone(),
-            executor,
+            executor: executor.clone(),
             classifier,
             classifier_provider: None,
-            lfg: crate::lfg_interactions::LfgInteractions::new(pool),
+            lfg: crate::lfg_interactions::LfgInteractions::new(pool.clone()),
+            giveaway: crate::giveaway::GiveawayRuntime::new(pool.clone(), executor.clone()),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
         }
@@ -650,7 +719,7 @@ impl InteractionRuntime {
             RoutedInteraction::Slash {
                 outcome:
                     SlashOutcome::Handled {
-                        handler: HandlerId::Lfg | HandlerId::LfgClose,
+                        handler: HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit,
                     },
                 ..
             } => {
@@ -695,6 +764,23 @@ impl InteractionRuntime {
                                         })?,
                                 })
                             }
+                        })
+                    })
+                } else if data.name == "lfg-edit" {
+                    let optional = |name: &str| -> Result<Option<String>, LfgError> {
+                        match data.options.iter().find(|option| option.name == name) {
+                            None => Ok(None),
+                            Some(option) => match &option.value {
+                                CommandOptionValue::String(value) => Ok(Some(value.clone())),
+                                _ => Err(LfgError::Invalid(format!("{name} must be text."))),
+                            },
+                        }
+                    };
+                    option("id").and_then(|post_id| {
+                        Ok(LfgRequest::Edit {
+                            post_id,
+                            title: optional("title")?,
+                            starts_at: optional("starts-at")?,
                         })
                     })
                 } else {

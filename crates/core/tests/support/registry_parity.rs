@@ -28,6 +28,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command", "docs/parity.md §1 #14 caps"),
     ("command-remove", "docs/parity.md §1 #15 caps"),
     ("schedule", "docs/parity.md §1 #17 caps"),
+    ("schedule", "docs/parity.md §1 #17 absolute-time"),
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
     ("lfg", "docs/parity.md §1 #26 caps"),
@@ -42,9 +43,13 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("reopen", "docs/parity.md §1 reopen"),
     ("feed-inspect", "docs/parity.md §1 feed-inspect"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("lfg-edit", "docs/parity.md §1 #26 Next-only companion"),
+    ("command-disable", "docs/parity.md §1 command-disable"),
+    ("command-enable", "docs/parity.md §1 command-enable"),
     ("giveaway", "docs/parity.md §1 giveaway"),
     ("feed-pause", "docs/parity.md §1 feed-pause"),
     ("feed-resume", "docs/parity.md §1 feed-resume"),
+    ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
     ("lfg-list", "docs/parity.md §1 lfg-list"),
@@ -273,6 +278,15 @@ pub fn expected_registry() -> Value {
     )
     .expect("reopen serializes");
     commands.insert(4, reopen);
+    let welcome_preview = serde_json::to_value(
+        CommandDefinition::new(
+            "welcome-preview",
+            "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+        )
+        .permissions(32),
+    )
+    .expect("welcome preview serializes");
+    commands.insert(5, welcome_preview);
     // Next-only saved-response inspection. This independent literal pins the
     // whole publication contract; never manufacture it from production shapes.
     let inspect = json!({
@@ -299,6 +313,52 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Next-only metadata editing reuses LFG's parity row, never the frozen
+    // legacy snapshot. Pin the complete wire shape independently of production.
+    assert!(commands.iter().all(|command| command["name"] != "lfg-edit"));
+    let edit = json!({
+        "name": "lfg-edit",
+        "description": "Update a raid/LFG title or start time",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+             "required": true, "max_length": 128},
+            {"name": "title", "description": "Event or group title", "type": 3,
+             "max_length": 100},
+            {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+             "type": 3}
+        ]
+    });
+    let after_close = commands
+        .iter()
+        .position(|command| command["name"] == "lfg-close")
+        .expect("legacy lfg-close remains published")
+        + 1;
+    commands.insert(after_close, edit);
+    // Saved-response lifecycle is intentionally independent of replacement.
+    for (offset, name, description) in [
+        (
+            1,
+            "command-disable",
+            "Pause a saved custom command without deleting it",
+        ),
+        (2, "command-enable", "Resume a saved custom command"),
+    ] {
+        commands.insert(
+            after_list + offset,
+            json!({
+                "name": name,
+                "description": description,
+                "dm_permission": false,
+                "default_member_permissions": "32",
+                "options": [
+                    {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
+                     "required": true, "max_length": 32}
+                ]
+            }),
+        );
+    }
     // Next-only current-channel discovery has its own independent literal.
     // No production constants or registry builders supply either expectation.
     let lfg_list = json!({
@@ -311,17 +371,18 @@ pub fn expected_registry() -> Value {
              "max_length": 512}
         ]
     });
-    let lfg_close_pos = commands
+    let after_edit = commands
         .iter()
-        .position(|c| c["name"] == "lfg-close")
-        .expect("lfg-close is published");
-    commands.insert(lfg_close_pos + 1, lfg_list);
+        .position(|c| c["name"] == "lfg-edit")
+        .expect("lfg-edit is published")
+        + 1;
+    commands.insert(after_edit, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 15, after sticky-remove and the
-    // inspect/help/privacy/reopen inserts above) as the exact published
-    // definition, so parity pins its shape too.
+    // publish position (index 18, after sticky-remove, the pause/resume
+    // lifecycle and the inspect/help/privacy/reopen/welcome-preview inserts above) as the
+    // exact published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
-        CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+        CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
                 CommandOption::new(
@@ -378,10 +439,74 @@ pub fn expected_registry() -> Value {
                 )
                 .required()
                 .max_length(64)]),
+                CommandOption::new(
+                    "end",
+                    "Draw now, before the deadline",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "pause",
+                    "Pause entry without drawing",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "resume",
+                    "Resume a paused giveaway",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "extend",
+                    "Add minutes to the deadline",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                        .required()
+                        .max_length(64),
+                    CommandOption::new(
+                        "duration-minutes",
+                        "Minutes to add (1–43200)",
+                        CommandOptionType::Integer,
+                    )
+                    .required()
+                    .int_range(1, 43200),
+                ]),
+                CommandOption::new(
+                    "reroll",
+                    "Redraw the winners",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                        .required()
+                        .max_length(64),
+                    CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
+                ]),
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(15, giveaway);
+    commands.insert(18, giveaway);
     // Next-only feed lifecycle pair. These independent literals pin the whole
     // publication contract; never manufacture them from production shapes.
     // The feed-remove lookup stays dynamic so the giveaway insert above does
@@ -616,6 +741,30 @@ pub fn expected_registry() -> Value {
             "type": 5
         }));
     }
+    // Absolute-time scheduling adds ONLY one optional string to the legacy
+    // body / in-minutes / every-minutes options, leaving their fields intact.
+    // Keep this independent of the compiled production registry.
+    {
+        let reference = "docs/parity.md §1 #17 absolute-time";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("schedule", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule")
+            .expect(reference);
+        let options = command["options"]
+            .as_array_mut()
+            .expect("schedule options array");
+        assert_eq!(options.len(), 3, "legacy schedule has three options");
+        assert_eq!(options[0]["name"], json!("body"));
+        assert_eq!(options[1]["name"], json!("in-minutes"));
+        assert_eq!(options[2]["name"], json!("every-minutes"));
+        options.push(json!({
+            "name": "at",
+            "description": "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+            "type": 3,
+            "max_length": 64
+        }));
+    }
     // Schedule-list pagination: the Next-only additive `page` option keeps
     // every configured id discoverable within Discord's 2,000-unit cap.
     // Legacy publishes no options on `schedule-list`; permissions and the
@@ -708,8 +857,8 @@ pub fn expected_registry() -> Value {
         command["options"] = json!([page]);
     }
     // Next-only saved-relay inspection has no frozen legacy counterpart.
-    // Pin the documented shape independently (docs/commands.md): guild-only,
-    // Manage Server, and exactly one required stable-id string capped at 128.
+    // Pin the documented shape independently: guild-only, Manage Server, and
+    // exactly one required stable-id string capped at 128.
     let feed_inspect_position = commands
         .iter()
         .position(|command| command["name"] == "feed-list")
