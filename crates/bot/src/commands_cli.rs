@@ -512,11 +512,11 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 34 all-gate builtins (31 plus automations-gated `/giveaway`
-            // and the Announcements-gated `/lfg-list` and `/lfg-edit`) plus the
-            // moderation-gated reads `/purge-preview` and
-            // `/channel-inspect`; no new feature gate.
-            36
+            // 35 all-gate builtins (31 plus automations-gated `/giveaway`
+            // and the announcements-gated `/lfg-edit`, `/lfg-list`, and
+            // `/feed-inspect`) plus the moderation-gated reads `/purge-preview`
+            // and `/channel-inspect`; no new feature gate.
+            37
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -530,9 +530,17 @@ mod tests {
             all_on.iter().any(|def| def.name == "lfg-edit"),
             "lfg-edit survives the all-on registry"
         );
+        assert!(
+            all_on.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the all-on registry"
+        );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 57);
+        assert_eq!(with_voice.len(), 58);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -544,6 +552,14 @@ mod tests {
         assert!(
             with_voice.iter().any(|def| def.name == "lfg-edit"),
             "lfg-edit survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the voice registry"
         );
     }
 
