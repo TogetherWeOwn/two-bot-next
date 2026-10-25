@@ -412,7 +412,9 @@ jobs:
           set -euo pipefail
           # This dry run only packages JavaScript. The real staging deploy
           # below builds the container once and serves these saved modules.
-          npx --no-install wrangler deploy --config "$ROLLOUT_DIR/staging-deploy.json" \
+          # Wrangler writes deploy/session records even on --dry-run. Keep
+          # packaging out of the single-deploy receipt consumed below.
+          env -u WRANGLER_OUTPUT_FILE_PATH npx --no-install wrangler deploy --config "$ROLLOUT_DIR/staging-deploy.json" \
             --env staging --dry-run --containers-rollout=none --outdir "$ROLLOUT_DIR/worker-modules"
           python3 - "$ROLLOUT_DIR" <<'PY'
           import json, pathlib, sys

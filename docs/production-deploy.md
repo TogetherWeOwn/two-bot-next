@@ -311,6 +311,11 @@ once. After deploy/readiness, voice synthetic and the pinned-history guard all
 pass, `certify-promotion` uploads `bot-promotion-<run id>-<attempt>`. Fault drills,
 rollback proofs and an opted-out voice gate never certify. The diagnostic
 `staging-rollout-evidence` upload stays independent and still runs on failure.
+Packaging unsets `WRANGLER_OUTPUT_FILE_PATH`: Wrangler's dry run writes session
+and deploy records too, and must not contaminate the real deploy's single receipt.
+Only **Re-run all jobs** is supported for certification. A partial job rerun can
+reuse an earlier deploy attempt; certification intentionally refuses that old
+build evidence rather than relabeling it as the new current attempt.
 
 The certificate contains only a closed version-1 receipt and `modules/`: source
 repository/SHA/run/attempt, original compiled stamps, verified staging Worker and
@@ -337,9 +342,17 @@ It removes image build inputs, disables rebundling and refuses compatibility
 drift. Production has its own Worker UUID and Deployment event ID, while the
 binary keeps the exact original staging `build_revision`, `build_id` and
 `deploy_id`. The readiness gate judges those admitted stamps plus the new exact
-serving Worker headers; GET-only control-plane checks bind the converged image
-and Worker before and after the stable readiness window. A different same-SHA
-build still refuses. The production event ID is not restamped into the image.
+serving Worker headers. Before the stable readiness window, a GET-only identity
+preflight checks the intended production Worker, application image and target
+rollout without demanding running instances: takeover stops the process, and the
+first owned `/health` probe starts it. After the window, a separate GET-only proof
+requires image convergence and live exact-version `/health` plus original-stamp
+`/readyz`. The two supported completed Durable Object counter shapes (active/healthy
+0/1 or 1/0) need two consecutive fully passing observations, finished rollout steps
+and all instances updated; any miss resets confirmations. Empty rollout listings
+or the exact older rollout identified by the pre-deploy snapshot may poll; a newer
+foreign-image rollout refuses. A different same-SHA build still refuses. The
+production event ID is not restamped into the image.
 
 Rollback and explicitly authorized live-SHA recovery remain independent of
 artifact retention. Only live-SHA recovery builds a fresh image. Its rendered

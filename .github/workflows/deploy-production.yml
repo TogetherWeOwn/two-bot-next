@@ -1589,8 +1589,12 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          python3 ../tooling/scripts/production_deploy.py serving --sha "$SHA" --deploy-id "$DEPLOY_ID" \
+          # Identity only: takeover intentionally leaves the process stopped.
+          # The next owned /health probe starts it; convergence is proved after
+          # the stable readiness window, never before that first request.
+          python3 ../tooling/scripts/production_deploy.py serving --preflight --sha "$SHA" --deploy-id "$DEPLOY_ID" \
             --artifact "$RUNNER_TEMP/bot-promotion/admitted.json" \
+            --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" \
             --expected-worker-version "$NEW_VERSION" --out "$RUNNER_TEMP/production-promotion-evidence.json"
       # Same contract as staging, plus the build identity and stability:
       # /health must be 200, which proves the Container/DO bindings are wired.
@@ -1703,10 +1707,12 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PRODUCTION_URL: ${{ vars.PRODUCTION_WORKER_URL }}
         run: |
           set -euo pipefail
           python3 ../tooling/scripts/production_deploy.py serving --sha "$SHA" --deploy-id "$DEPLOY_ID" \
             --artifact "$RUNNER_TEMP/bot-promotion/admitted.json" \
+            --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" --url "$PRODUCTION_URL" \
             --expected-worker-version "$NEW_VERSION" --out "$RUNNER_TEMP/production-promotion-evidence.json"
       # REST 5xx error-rate promotion gate, staging parity: judges the same
       # evaluatePromotionGate() verdict over live production /ops/metrics, so
