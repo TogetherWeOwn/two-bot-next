@@ -8655,6 +8655,14 @@ async fn schedule_list_under_cap_preserves_rows_with_localized_due_and_uncertain
         false,
     )
     .await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "completed",
+        "2026-10-01T00:00:00.000Z",
+        None,
+        false,
+    )
+    .await;
     let before = schedule_absolute_correction_tests::state(&db.pool).await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
@@ -8666,10 +8674,11 @@ async fn schedule_list_under_cap_preserves_rows_with_localized_due_and_uncertain
     let json = mock.deferred_reply();
     assert_eq!(
         json["content"],
-        "`once` `<#3333>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
-         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled) <t:1894710600:F>. The 15s ticker and delivery may be delayed.\n\
+        "`completed` `<#3333>` 2026-10-01T00:00:00.000Z (disabled)\n\
+         `once` `<#3333>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
+         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled)\n\
          `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m <t:1896321906:F>. The 15s ticker and delivery may be delayed.",
-        "list retains ordered complete rows, intervals and disabled state, with localized due times and delivery uncertainty"
+        "list retains ordered complete rows, intervals and disabled state, with localized due times and delivery uncertainty only for enabled rows"
     );
     assert_eq!(
         schedule_absolute_correction_tests::state(&db.pool).await,
