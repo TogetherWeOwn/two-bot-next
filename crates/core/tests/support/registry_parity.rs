@@ -40,10 +40,12 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
     ("reopen", "docs/parity.md §1 reopen"),
+    ("feed-inspect", "docs/parity.md §1 feed-inspect"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("giveaway", "docs/parity.md §1 giveaway"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
 ];
@@ -672,6 +674,31 @@ pub fn expected_registry() -> Value {
         .expect("page option serializes");
         command["options"] = json!([page]);
     }
+    // Next-only saved-relay inspection has no frozen legacy counterpart.
+    // Pin the documented shape independently (docs/commands.md): guild-only,
+    // Manage Server, and exactly one required stable-id string capped at 128.
+    let feed_inspect_position = commands
+        .iter()
+        .position(|command| command["name"] == "feed-list")
+        .expect("feed-list anchors the announcement set")
+        + 1;
+    commands.insert(
+        feed_inspect_position,
+        json!({
+            "name": "feed-inspect",
+            "description": "Show a saved feed relay's source and last attempt",
+            "type": 1,
+            "default_member_permissions": "32",
+            "dm_permission": false,
+            "options": [{
+                "name": "id",
+                "description": "Feed id",
+                "type": 3,
+                "required": true,
+                "max_length": 128
+            }]
+        }),
+    );
     canonical_registry(json!(commands))
 }
 
