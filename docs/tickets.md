@@ -40,6 +40,31 @@ Pressing Open again explains the invoking member's existing ticket in this guild
 
 These explanations create no ticket, channel, controls, transcript, repair or retry job. Active-ticket precedence, the guild/opener lock, cooldown duration, authorization and ephemeral acknowledgement/mention suppression remain unchanged. Existing recovery supervision, not a repeated button press, owns lifecycle progress.
 
+## Private ticket lists
+
+`/mytickets` shows only the invoking member's non-closed tickets in the configured
+guild: ticket ID, lifecycle status, claim state and an Open row's stored channel
+link. An empty list says there are no open tickets. The reply stays within Discord's
+2,000 UTF-16-unit limit and states how many rows are shown when truncated.
+
+`/ticket-queue [page]` shows the same guild's non-closed tickets, five per page,
+ordered by creation instant then ticket ID. Pages start at 1 and include the opener,
+status, Discord-localized creation time and claim state. Queue access uses the
+existing ticket staff role, Manage Channels or Administrator policy; it adds no new
+role. Invalid and unavailable pages ask staff to start again at page 1.
+
+Both commands publish only when the boot ticket configuration is valid. Replies
+are private and suppress mentions; persisted display values are single-line,
+escaped and bounded. Creating, Closing and Cleanup Pending rows never offer a
+channel link. An Open row's channel link is a stored convenience, not fresh proof
+of channel liveness or permissions: Discord may render a deleted channel, and the
+list never promises readiness or recovery. Closed rows are omitted.
+
+These paths only read ticket rows. They do not fetch Discord channels, reserve,
+claim, close, repair, capture transcripts, write audit records or schedule recovery.
+A database failure returns private retry guidance without lifecycle work. Existing
+button receipts, reserve policy and supervisor retries remain unchanged.
+
 ## Shared-router / executor integration checklist
 
 1. Register all three component IDs through the shared router. Guild-fence first; Open defers an ephemeral reply, and Claim/Close additionally run `authorize`. Claim/Close resolve `by_channel` in the same guild; never trust an interaction-supplied ticket ID.

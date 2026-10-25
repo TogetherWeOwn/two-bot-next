@@ -9,24 +9,28 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 36 built-in slash commands (core + scorecard + automation +
-announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 57). No guild was
+Scope: 38 built-in slash commands (core + scorecard + automation +
+announcement + tickets + moderation — the commands `docs/commands.md` renders
+ahead of the voice set; with the voice gates on it renders 59). No guild was
 touched, no staging secrets used, no credentials created.
 
-Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
-`TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`, `TWO_MODERATION=1` on the
-staging host so every row below is published. The suite asserts the ACK
-contract from `docs/interaction-replies.md` for every probe: first callback
-within the 3 s budget (type 4 or type 5 + PATCH `@original`), mentions
-suppressed, content ≤2000 scalars; failures surface only the generic
-`Something went wrong (ref …)` text, never internals.
+Staging configuration the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
+`TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`, `TWO_MODERATION=1`, and all three
+ticket settings: `DISCORD_TICKET_CATEGORY_ID`,
+`DISCORD_TICKET_PANEL_CHANNEL_ID`, and `DISCORD_TICKET_STAFF_ROLE_ID`. Ticket
+publication has no synthetic boolean switch: the three settings form one
+configuration requirement. The suite asserts the ACK contract from
+`docs/interaction-replies.md` for every probe: first callback within the 3 s
+budget (type 4 or type 5 + PATCH `@original`), mentions suppressed, content
+≤2000 scalars; failures surface only the generic `Something went wrong (ref
+…)` text, never internals.
 
 Shared denial paths (every row): foreign or missing guild → moderation
 answers `GuildRestricted` (`This command is restricted to the configured
 guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
-→ ephemeral `UNKNOWN_COMMAND_REPLY`; handler failure → generic ref error
-(watch-log class only for the store path: `store_unavailable`).
+→ ephemeral `UNKNOWN_COMMAND_REPLY`; handler failure → generic ref error.
+Ticket-list storage failures instead return their fixed private retry guidance,
+without a lifecycle effect or diagnostic leak.
 
 ## Matrix
 
@@ -57,6 +61,8 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 29 | `/feed-remove` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
 | 30 | `/feed-list` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay list | `AnnouncementsDisabled`, `ManageServerRequired` |
 | 39 | `/feed-inspect` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay detail with safe source and last attempt | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
+| 40 | `/mytickets` | ticket configuration triple | Everyone | Immediate private list of only the invoker's non-closed stored tickets; truthful status and claim state; channel link only for a valid stored Open channel; no lifecycle, audit, or Discord REST work | `TicketsDisabled`; private fixed retry guidance if the list store is unavailable |
+| 41 | `/ticket-queue` | ticket configuration triple | Everyone at publication; configured ticket-staff role, Manage Channels, or Administrator at runtime | Immediate private bounded page of non-closed stored guild tickets; no lifecycle, audit, or Discord REST work | `TicketsDisabled`; staff-policy denial before page parsing or store access; one optional positive integer `page`; private fixed retry guidance if the list store is unavailable |
 | 3 | `/ban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + REST ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Ban)`, member-moderation policy, `target`/`reason` required |
 | 4 | `/tempban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + timed ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(TempBan)`, member-moderation policy, `duration_seconds` ≥60 (runtime max 365d) |
 | 5 | `/kick` | `TWO_MODERATION` | KickMembers | Ephemeral outcome + REST kick + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Kick)`, member-moderation policy, `target`/`reason` required |
@@ -78,7 +84,7 @@ unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 36-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 38-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

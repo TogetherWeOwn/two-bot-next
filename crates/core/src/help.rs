@@ -66,6 +66,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Tickets",
+        requires: None,
+        commands: &["mytickets", "ticket-queue"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Community check-in",
         requires: Some("Manage Events"),
         commands: &["attendance"],
@@ -761,13 +767,13 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 36 non-voice commands (5 core + 20 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, giveaway, lfg-list, purge-preview,
-        // channel-inspect and feed-inspect, plus 21 additional voice commands
-        // (voice `kick` loses first-wins to moderation `/kick`).
-        // `/templateassistant` stays unpublished until its slice lands:
-        // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (57 live)"));
+        // 38 non-voice commands (5 core + 20 feature + 2 ticket views + 9
+        // moderation + 2 reads), including inspection, reopen, giveaway,
+        // lfg-list, purge-preview, channel-inspect and feed-inspect, plus 21
+        // additional voice commands (voice `kick` loses first-wins to
+        // moderation `/kick`). `/templateassistant` stays unpublished until its
+        // slice lands: matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (59 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -805,9 +811,11 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line}");
         }
-        // Open groups carry no gate.
+        // Open groups carry no static gate. Queue staff authorization remains
+        // runtime-only so a configured ticket-staff role stays eligible.
         assert!(text.contains("**Leveling**\n"));
         assert!(text.contains("**Discovery**\n/help\n"));
+        assert!(text.contains("**Tickets**\n/mytickets · /ticket-queue\n"));
     }
 
     #[test]
@@ -819,6 +827,7 @@ mod tests {
             moderation: false,
             voice: false,
             voice_assistant: false,
+            tickets: false,
             ..all_on()
         });
         let defs = off.publish_set(&[]).expect("core-only set");
@@ -893,17 +902,19 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 36 non-voice names, including inspection, reopen, giveaway,
-        // lfg-list, purge-preview, channel-inspect and feed-inspect, plus 21
-        // additional voice names (voice `kick` shares the Kick group).
+        // 38 non-voice names, including the ticket views, inspection, reopen,
+        // giveaway, lfg-list, purge-preview, channel-inspect and feed-inspect,
+        // plus 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 57);
+        assert_eq!(grouped.len(), 59);
         for name in [
             "rank",
             "leaderboard",
             "help",
             "privacy",
             "reopen",
+            "mytickets",
+            "ticket-queue",
             "attendance",
             "command",
             "command-inspect",

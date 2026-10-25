@@ -1,6 +1,6 @@
 {
-  "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 36,
+  "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, tickets, moderation), no custom rows",
+  "count": 38,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -884,6 +884,41 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs a live feed id; sequenced after a feed-add, not standalone."
+    },
+    {
+      "name": "mytickets",
+      "description": "Show your open support tickets.",
+      "family": "tickets",
+      "gate": "tickets",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Private member-scoped database read that needs configured ticket settings and seeded non-closed rows; the gateway and disposable-database ticket-list acceptance coverage proves the isolation, no-effect, and rendering contracts."
+    },
+    {
+      "name": "ticket-queue",
+      "description": "Show the open support ticket queue.",
+      "family": "tickets",
+      "gate": "tickets",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "page",
+          "description": "Page of the ticket queue (1-based)",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Private staff-gated database read that needs configured ticket settings, a ticket-staff member, and seeded non-closed rows; the gateway and disposable-database ticket-list acceptance coverage proves authorization order, strict paging, and no-effect behavior."
     },
     {
       "name": "ban",

@@ -235,6 +235,75 @@ async fn restart_recovers_open_tickets_and_fences_stale_close_snapshot() {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or a CI service container"]
+async fn non_closed_lists_are_guild_and_opener_scoped_in_chronological_order() {
+    let db = TestDb::new(false).await;
+    let store = db.store("guild");
+    let other_guild = db.store("other-guild");
+
+    for (id, opener, created_at) in [
+        ("t-first", "first", 10),
+        ("t-same-a", "same-a", 100),
+        ("t-same-b", "same-b", 100),
+        ("t-last", "member", 200),
+    ] {
+        created(
+            store
+                .reserve(id, opener, created_at, COOLDOWN_SECONDS)
+                .await
+                .unwrap(),
+        );
+    }
+    let closed = created(
+        store
+            .reserve("t-closed", "closed", 50, COOLDOWN_SECONDS)
+            .await
+            .unwrap(),
+    );
+    store.activate(&closed.id, "closed-channel").await.unwrap();
+    let closing = store.begin_close(&closed.id, 51).await.unwrap();
+    store
+        .save_transcript(
+            &closed.id,
+            closing.closing_started_at.unwrap(),
+            52,
+            format_transcript(vec![]),
+        )
+        .await
+        .unwrap();
+    store.finish_cleanup(&closed.id, 53).await.unwrap();
+    created(
+        other_guild
+            .reserve("t-foreign", "member", 0, COOLDOWN_SECONDS)
+            .await
+            .unwrap(),
+    );
+
+    let mine = store.list_non_closed_for_opener("member").await.unwrap();
+    assert_eq!(
+        mine.iter()
+            .map(|ticket| ticket.id.as_str())
+            .collect::<Vec<_>>(),
+        ["t-last"]
+    );
+    assert!(store
+        .list_non_closed_for_opener("missing")
+        .await
+        .unwrap()
+        .is_empty());
+    let queue = store.list_non_closed().await.unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .map(|ticket| ticket.id.as_str())
+            .collect::<Vec<_>>(),
+        ["t-first", "t-same-a", "t-same-b", "t-last"]
+    );
+
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or a CI service container"]
 async fn transcript_insert_failure_rolls_back_state_and_body() {
     let db = TestDb::new(false).await;
     let store = db.store("guild");

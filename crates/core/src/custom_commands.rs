@@ -313,6 +313,7 @@ pub fn builtin_command_names() -> HashSet<String> {
     super::commands::core_commands()
         .iter()
         .chain(super::feature_commands::feature_commands().iter())
+        .chain(super::tickets::ticket_commands().iter())
         .chain(super::moderation::moderation_commands().iter())
         .map(|d| d.name.clone())
         .collect()

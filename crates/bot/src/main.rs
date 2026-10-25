@@ -146,6 +146,7 @@ mod shutdown;
 mod smoke_error_contract_tests;
 #[cfg(test)]
 mod ticket_component_admission_acceptance_tests;
+mod ticket_lists;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]

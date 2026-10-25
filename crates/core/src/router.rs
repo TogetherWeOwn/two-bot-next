@@ -64,6 +64,7 @@ use super::feature_commands::{
 };
 use super::moderation::{ModerationAction, ModerationGates};
 use super::onboarding::{GAME_SELECT_ID, SESSION_SELECT_ID};
+use super::tickets::ticket_commands;
 use super::voice_rooms::voice_commands;
 
 /// Names of the voice command set, computed once: the router consults them on
@@ -107,6 +108,8 @@ pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on th
 pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
 pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
+/// Tickets gate: configured destinations, not a Discord role — say who enables it.
+pub const TICKETS_DISABLED_REPLY: &str = "Tickets are not enabled on this server. Ask a server admin to configure them in the bot configuration — this is a host setting, not a Discord role.";
 
 // --- handler identity ----------------------------------------------------------
 
@@ -135,6 +138,8 @@ pub enum HandlerId {
     FeedRemove,
     FeedList,
     FeedInspect,
+    TicketMine,
+    TicketQueue,
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
@@ -271,6 +276,7 @@ pub enum RouterRefusal {
     AnnouncementsDisabled,
     ModerationDisabled,
     ScorecardDisabled,
+    TicketsDisabled,
     ManageServerRequired,
     ManageEventsRequired,
     GuildRestricted,
@@ -289,6 +295,7 @@ impl RouterRefusal {
             Self::AnnouncementsDisabled => ANNOUNCEMENTS_DISABLED_REPLY.to_owned(),
             Self::ModerationDisabled => MODERATION_DISABLED_REPLY.to_owned(),
             Self::ScorecardDisabled => SCORECARD_DISABLED_REPLY.to_owned(),
+            Self::TicketsDisabled => TICKETS_DISABLED_REPLY.to_owned(),
             Self::ManageServerRequired => MANAGE_SERVER_REQUIRED.to_owned(),
             Self::ManageEventsRequired => MANAGE_EVENTS_REQUIRED.to_owned(),
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
@@ -424,6 +431,10 @@ impl InteractionRouter {
         }
         if gates.scorecard {
             register(HandlerId::ScorecardAttendance);
+        }
+        if gates.tickets {
+            register(HandlerId::TicketMine);
+            register(HandlerId::TicketQueue);
         }
         for id in [
             HandlerId::Rank,
@@ -611,6 +622,7 @@ impl InteractionRouter {
             Automations,
             Announcements,
             Scorecard,
+            Tickets,
         }
 
         impl RowGate {
@@ -620,6 +632,7 @@ impl InteractionRouter {
                     Self::Automations => Some(RouterRefusal::AutomationsDisabled),
                     Self::Announcements => Some(RouterRefusal::AnnouncementsDisabled),
                     Self::Scorecard => Some(RouterRefusal::ScorecardDisabled),
+                    Self::Tickets => Some(RouterRefusal::TicketsDisabled),
                 }
             }
 
@@ -629,6 +642,7 @@ impl InteractionRouter {
                     Self::Automations => gates.automations,
                     Self::Announcements => gates.announcements,
                     Self::Scorecard => gates.scorecard,
+                    Self::Tickets => gates.tickets,
                 }
             }
         }
@@ -685,6 +699,16 @@ impl InteractionRouter {
                 handler: HandlerId::ScorecardAttendance,
                 gate: RowGate::Scorecard,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
+            },
+            "mytickets" => Row {
+                handler: HandlerId::TicketMine,
+                gate: RowGate::Tickets,
+                permission_refusal: None,
+            },
+            "ticket-queue" => Row {
+                handler: HandlerId::TicketQueue,
+                gate: RowGate::Tickets,
+                permission_refusal: None,
             },
             "command" | "command-remove" | "command-list" | "command-inspect" | "schedule"
             | "schedule-remove" | "schedule-list" | "sticky" | "sticky-remove" => Row {
@@ -832,6 +856,7 @@ impl InteractionRouter {
             .chain(std::iter::once(&scorecard_attendance_command()))
             .chain(automation_commands().iter())
             .chain(announcement_commands().iter())
+            .chain(ticket_commands().iter())
             .chain(super::moderation::moderation_commands().iter())
             .map(|def| def.name.clone())
             .collect()
@@ -882,6 +907,9 @@ impl InteractionRouter {
         }
         if self.gates.announcements {
             extra.push(announcement_commands());
+        }
+        if self.gates.tickets {
+            extra.push(ticket_commands());
         }
         if self.gates.moderation {
             extra.push(super::moderation::moderation_commands());
@@ -966,6 +994,8 @@ mod tests {
             ("help", HandlerId::Help),
             ("privacy", HandlerId::Privacy),
             ("reopen", HandlerId::Reopen),
+            ("mytickets", HandlerId::TicketMine),
+            ("ticket-queue", HandlerId::TicketQueue),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -1004,7 +1034,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 36, "all 36 handler-owned builtins covered");
+        assert_eq!(cases.len(), 38, "all 38 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1082,6 +1112,7 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            tickets: false,
             ..all_on()
         };
         let r = InteractionRouter::new(off);
@@ -1093,6 +1124,8 @@ mod tests {
             ("rsvp-attendance", RouterRefusal::AnnouncementsDisabled),
             ("lfg", RouterRefusal::AnnouncementsDisabled),
             ("feed-list", RouterRefusal::AnnouncementsDisabled),
+            ("mytickets", RouterRefusal::TicketsDisabled),
+            ("ticket-queue", RouterRefusal::TicketsDisabled),
             ("ban", RouterRefusal::ModerationDisabled),
             ("purge", RouterRefusal::ModerationDisabled),
             ("purge-preview", RouterRefusal::ModerationDisabled),
@@ -1122,6 +1155,7 @@ mod tests {
             RouterRefusal::AnnouncementsDisabled,
             RouterRefusal::ModerationDisabled,
             RouterRefusal::ScorecardDisabled,
+            RouterRefusal::TicketsDisabled,
         ] {
             let text = refusal.message();
             assert!(
@@ -1383,7 +1417,16 @@ mod tests {
     fn guild_fence_binds_everything() {
         let r = router();
         // Wrong guild: silence everywhere except moderation's refusal.
-        for name in ["rank", "attendance", "command", "rsvp", "lfg", "feed-list"] {
+        for name in [
+            "rank",
+            "attendance",
+            "command",
+            "rsvp",
+            "lfg",
+            "feed-list",
+            "mytickets",
+            "ticket-queue",
+        ] {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(9999), Some(u64::MAX))),
                 SlashOutcome::Ignore,
@@ -1586,9 +1629,10 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 10 automation + 9 announcement + 9 moderation
-        // + 2 reads + 1 custom = 37, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 37);
+        // 5 core + 1 scorecard + 10 automation + 9 announcement + 2 ticket
+        // views + 9 moderation + 2 reads + 1 custom = 39, in publish order,
+        // guild-only throughout.
+        assert_eq!(set.len(), 39);
         assert_eq!(
             &names[..6],
             [
@@ -1607,15 +1651,16 @@ mod tests {
         assert_eq!(names[20], "lfg-list");
         assert_eq!(&names[21..24], ["feed-add", "feed-remove", "feed-list"]);
         assert_eq!(names[24], "feed-inspect");
+        assert_eq!(&names[25..27], ["mytickets", "ticket-queue"]);
         assert_eq!(
-            &names[25..34],
+            &names[27..36],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[34..36], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[36], "faq");
+        assert_eq!(&names[36..38], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[38], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1626,6 +1671,7 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            tickets: false,
             ..all_on()
         });
         let set = off.publish_set(&[]).expect("core-only set");
@@ -1640,6 +1686,7 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            tickets: false,
             ..all_on()
         });
         let row = || CustomCommand {
@@ -1673,12 +1720,15 @@ mod tests {
             ("moderation", "ban"),
             ("announcements", "lfg"),
             ("scorecard", "attendance"),
+            ("tickets", "mytickets"),
         ] {
             let mut gates = all_on();
             match gate {
                 "moderation" => gates.moderation = false,
                 "announcements" => gates.announcements = false,
-                _ => gates.scorecard = false,
+                "scorecard" => gates.scorecard = false,
+                "tickets" => gates.tickets = false,
+                _ => unreachable!("known gate"),
             }
             let r = InteractionRouter::new(gates);
             let row = CustomCommand {
@@ -1778,7 +1828,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 36);
+        assert_eq!(off.len(), 38);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1788,16 +1838,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 36 builtins keep their order; the 21 voice names that survive
+        // 38 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 57);
-        assert_eq!(on_names[..36], off_names[..]);
+        assert_eq!(on.len(), 59);
+        assert_eq!(on_names[..38], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[36..], expected[..]);
+        assert_eq!(on_names[38..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1858,13 +1908,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 36
+        // Both gates on is the full voice set without the assistant: 38
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 57);
+        assert_eq!(both.len(), 59);
     }
 
     #[test]

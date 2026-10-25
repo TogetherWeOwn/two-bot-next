@@ -9,9 +9,9 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 36 non-voice built-in slash commands in `docs/commands.md` (core +
-//! scorecard + automation + announcement + moderation). Out of scope on
-//! purpose: voice commands (`voice_commands`, separate slice with its own
+//! Scope: the 38 non-voice built-in slash commands in `docs/commands.md` (core +
+//! scorecard + automation + announcement + tickets + moderation). Out of scope
+//! on purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
 //! of moderation), `/templateassistant` (unpublished until its slice lands;
 //! the name and intended gate stay pinned by the `voice` section of
@@ -30,8 +30,8 @@ use crate::commands::{
     PERM_MANAGE_GUILD, PERM_MANAGE_MESSAGES, PERM_MODERATE_MEMBERS,
 };
 
-/// Which publish gate a matrix row needs. The env var is what the live suite
-/// must set on staging for the command to be published at all.
+/// Which publish gate a matrix row needs. The configuration input or inputs
+/// are what the live suite must set on staging for the command to publish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
     /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`).
@@ -42,12 +42,16 @@ pub enum E2eGate {
     Automations,
     /// `TWO_ANNOUNCEMENTS=1`.
     Announcements,
+    /// All three ticket settings: category, panel channel, and staff role.
+    Tickets,
     /// `TWO_MODERATION=1`.
     Moderation,
 }
 
 impl E2eGate {
-    /// The env flag the live suite needs, or `None` for always-on commands.
+    /// The configuration requirement for the live suite, or `None` for
+    /// always-on commands. Ticket publication intentionally has no synthetic
+    /// boolean flag: the runtime requires all three listed settings.
     #[must_use]
     pub fn env_flag(self) -> Option<&'static str> {
         match self {
@@ -55,6 +59,9 @@ impl E2eGate {
             Self::Scorecard => Some("TWO_COMMUNITY_SCORECARD"),
             Self::Automations => Some("TWO_AUTOMATIONS"),
             Self::Announcements => Some("TWO_ANNOUNCEMENTS"),
+            Self::Tickets => Some(
+                "DISCORD_TICKET_CATEGORY_ID + DISCORD_TICKET_PANEL_CHANNEL_ID + DISCORD_TICKET_STAFF_ROLE_ID",
+            ),
             Self::Moderation => Some("TWO_MODERATION"),
         }
     }
@@ -122,9 +129,9 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 36-row contract in publish order (core, scorecard, automation,
-/// announcement, moderation). The coverage test asserts this is exactly the
-/// all-gates-on [`crate::router::InteractionRouter::publish_set`].
+/// The 38-row contract in publish order (core, scorecard, automation,
+/// announcement, tickets, moderation). The coverage test asserts this is
+/// exactly the all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
 pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
     vec![
@@ -451,6 +458,31 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:AnnouncementsDisabled",
                 "Perm:ManageServerRequired",
                 "Valid:id:required",
+            ],
+        ),
+        row(
+            "mytickets",
+            40,
+            E2eGate::Tickets,
+            0,
+            "Everyone",
+            "TicketMine",
+            "Immediate private text reply showing only the invoker's non-closed stored tickets; truthful status and claim state with a channel link only for a valid stored Open channel; no ticket lifecycle, audit, or Discord REST work.",
+            &["Gate:TicketsDisabled", "Store:TicketListUnavailable"],
+        ),
+        row(
+            "ticket-queue",
+            41,
+            E2eGate::Tickets,
+            0,
+            "Everyone (runtime ticket staff policy)",
+            "TicketQueue",
+            "Immediate private bounded page of non-closed stored guild tickets. Runtime access permits the configured ticket-staff role, Manage Channels, or Administrator; no ticket lifecycle, audit, or Discord REST work.",
+            &[
+                "Gate:TicketsDisabled",
+                "Policy:TicketStaffRole|ManageChannels|Administrator",
+                "Valid:page:optional,positive-integer,single",
+                "Store:TicketListUnavailable",
             ],
         ),
         row(

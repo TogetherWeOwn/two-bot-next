@@ -119,6 +119,7 @@ fn desired_definitions(
             .is_some_and(|v| v == "1"),
         voice: VoiceGates::from_map(vars).enabled,
         voice_assistant: AssistantConfig::from_map(vars).is_some(),
+        tickets: crate::ticket_runtime::TicketConfig::from_deployment_vars(vars, guild).is_some(),
         ..SurfaceFlags::default()
     };
     InteractionRouter::new(RouterGates::from_slices(
@@ -509,15 +510,27 @@ mod tests {
         env.insert("TWO_COMMUNITY_SCORECARD".into(), "1".into());
         env.insert("TWO_MODERATION".into(), "1".into());
         env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+        env.insert(
+            "DISCORD_TICKET_CATEGORY_ID".into(),
+            "123456789012345679".into(),
+        );
+        env.insert(
+            "DISCORD_TICKET_PANEL_CHANNEL_ID".into(),
+            "123456789012345680".into(),
+        );
+        env.insert(
+            "DISCORD_TICKET_STAFF_ROLE_ID".into(),
+            "123456789012345681".into(),
+        );
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
             // 33 all-gate builtins (31 plus automations-gated `/giveaway`
             // and announcement-gated `/lfg-list`) plus the
             // moderation-gated reads `/purge-preview` and
-            // `/channel-inspect` and the Next-only `/feed-inspect` relay
-            // detail; no new feature gate.
-            36
+            // `/channel-inspect`, the Next-only `/feed-inspect` relay
+            // detail, and two configured-ticket views.
+            38
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -535,9 +548,17 @@ mod tests {
             all_on.iter().any(|def| def.name == "feed-inspect"),
             "feed-inspect survives the all-on registry"
         );
+        assert!(
+            all_on.iter().any(|def| def.name == "mytickets"),
+            "configured tickets publish mytickets"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "ticket-queue"),
+            "configured tickets publish ticket-queue"
+        );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 57);
+        assert_eq!(with_voice.len(), 59);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"

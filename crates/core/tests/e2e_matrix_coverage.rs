@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
         matrix_names, published_names,
         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
     );
-    assert_eq!(matrix.len(), 36, "contract covers the 36 built-in commands");
+    assert_eq!(matrix.len(), 38, "contract covers the 38 built-in commands");
 }
 
 #[test]
@@ -121,6 +121,8 @@ fn matrix_gates_and_permissions_match_the_registry() {
             .contains(&row.command)
             {
                 E2eGate::Announcements
+            } else if ["mytickets", "ticket-queue"].contains(&row.command) {
+                E2eGate::Tickets
             } else {
                 E2eGate::Moderation
             };

@@ -2,7 +2,7 @@
 //! The interaction router owns acknowledgement; the shared REST executor owns
 //! channel/permission/message calls. A transcript must be durable before delete.
 
-use crate::commands::PERM_MANAGE_CHANNELS;
+use crate::commands::{CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS};
 use crate::funnel::format_iso_millis;
 
 pub const TICKET_OPEN_ID: &str = "two:tickets:open";
@@ -16,6 +16,23 @@ pub const TRANSCRIPT_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 pub const MAX_TRANSCRIPT_UTF16_UNITS: usize = 200_000;
 pub const PANEL_TEXT: &str =
     "**Support tickets**\nOpen a private ticket and a staff member will help you.";
+
+/// Guild ticket-list commands. Queue visibility is authorized at runtime so a
+/// configured ticket-staff role remains valid alongside Discord permissions.
+#[must_use]
+pub fn ticket_commands() -> Vec<CommandDefinition> {
+    vec![
+        CommandDefinition::new("mytickets", "Show your open support tickets."),
+        CommandDefinition::new("ticket-queue", "Show the open support ticket queue.").options(
+            vec![CommandOption::new(
+                "page",
+                "Page of the ticket queue (1-based)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)],
+        ),
+    ]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketAction {
@@ -550,6 +567,31 @@ mod tests {
         t.finish_cleanup(30).unwrap();
         assert_eq!(t.closed_at, Some(20));
         assert_eq!(t.begin_close(40), Err(TicketError::InvalidTransition));
+    }
+
+    #[test]
+    fn ticket_list_command_shapes_are_open_and_paginated() {
+        let commands = ticket_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["mytickets", "ticket-queue"]
+        );
+        assert!(commands.iter().all(|command| {
+            command.default_member_permissions.is_none() && !command.dm_permission
+        }));
+        assert!(commands[0].options.is_empty());
+        let page = &commands[1].options[0];
+        assert_eq!(page.name, "page");
+        assert_eq!(
+            page.kind,
+            crate::commands::CommandOptionType::Integer.as_u8()
+        );
+        assert_eq!(page.required, None);
+        assert_eq!(page.min_value, Some(1));
+        assert_eq!(page.max_value, None);
     }
 
     #[test]

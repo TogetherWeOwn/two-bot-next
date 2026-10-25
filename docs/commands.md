@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 57.
+Built-in commands: 59.
 
 ## `/access`
 
@@ -401,6 +401,15 @@ Set where room health notices go and how much they say
 | `mention` | subcommand | false | — | — | — | — | Set or clear the role mentioned on errors |
 | `mention role` | role | false | — | — | — | — | Role to mention; leave empty to clear it |
 
+## `/mytickets`
+
+Show your open support tickets.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
 ## `/name`
 
 Set a custom name for your temporary voice room, or restore the template name
@@ -648,6 +657,17 @@ Toggle companion text channels for one creator channel
 | `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (leave empty to keep the stored value) |
 | `name` | string | false | — | — | 100 | — | Companion channel name (default voice-chat) |
 | `viewer-role` | role | false | — | — | — | — | Extra role that may view companions (@everyone for all) |
+
+## `/ticket-queue`
+
+Show the open support ticket queue.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of the ticket queue (1-based) |
 
 ## `/timeout`
 

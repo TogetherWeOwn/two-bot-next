@@ -117,13 +117,38 @@ impl TicketStore {
         .transpose()
     }
 
+    /// Lists non-terminal tickets owned by one member in chronological order.
+    pub async fn list_non_closed_for_opener(
+        &self,
+        opener_id: &str,
+    ) -> Result<Vec<Ticket>, StoreError> {
+        // ORDER BY instant, not TEXT: see reserve().
+        sqlx::query("SELECT id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at, closed_at FROM tickets WHERE guild_id = $1 AND opener_id = $2 AND status <> 'closed' ORDER BY created_at::timestamptz, id")
+            .bind(&self.guild_id)
+            .bind(opener_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(decode_ticket)
+            .collect()
+    }
+
+    /// Lists all non-terminal tickets in this guild in chronological order.
+    pub async fn list_non_closed(&self) -> Result<Vec<Ticket>, StoreError> {
+        // ORDER BY instant, not TEXT: see reserve().
+        sqlx::query("SELECT id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at, closed_at FROM tickets WHERE guild_id = $1 AND status <> 'closed' ORDER BY created_at::timestamptz, id")
+            .bind(&self.guild_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(decode_ticket)
+            .collect()
+    }
+
     /// Ready loads open tickets as well as interrupted workflows; no runtime
     /// map is authoritative. The pure recovery_action determines the next call.
     pub async fn recoverable(&self) -> Result<Vec<Ticket>, StoreError> {
-        // ORDER BY instant, not TEXT: see reserve().
-        sqlx::query("SELECT id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at, closed_at FROM tickets WHERE guild_id = $1 AND status <> 'closed' ORDER BY created_at::timestamptz, id")
-            .bind(&self.guild_id).fetch_all(&self.pool).await?
-            .into_iter().map(decode_ticket).collect()
+        self.list_non_closed().await
     }
 
     async fn locked(&self, conn: &mut PgConnection, id: &str) -> Result<Ticket, StoreError> {

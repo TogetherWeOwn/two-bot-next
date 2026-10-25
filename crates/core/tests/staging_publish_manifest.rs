@@ -110,13 +110,13 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 36 all-on builtins minus 10 automation-gated commands, including
-    // command-inspect and giveaway; announcements-gated feed-inspect still
-    // publishes and read-only current-channel discovery lfg-list stays
-    // published. The stored dynamic row stays unpublished: every such
-    // invocation refuses at dispatch while gated off, so publishing would
-    // burn the ceiling.
-    assert_eq!(names.len(), 26, "automations-off staging set: {names:?}");
+    // 38 all-on builtins minus 10 automation-gated commands, including
+    // command-inspect and giveaway; announcements-gated feed-inspect and the
+    // ticket-list reads still publish. Read-only current-channel discovery
+    // lfg-list also stays published. The stored dynamic row stays unpublished:
+    // every such invocation refuses at dispatch while gated off, so publishing
+    // would burn the ceiling.
+    assert_eq!(names.len(), 28, "automations-off staging set: {names:?}");
     assert!(
         names.iter().any(|name| name == "lfg-list"),
         "read-only current-channel discovery stays published while automations are off"

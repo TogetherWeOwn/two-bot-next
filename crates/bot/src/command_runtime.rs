@@ -34,6 +34,9 @@
 //! - discovery (`/help`): one immediate ephemeral callback rendered from the
 //!   live publish set, grouped with permission hints; never deferred, never
 //!   stored.
+//! - ticket lists (`/mytickets`, `/ticket-queue [page]`): one immediate,
+//!   mention-suppressed private callback over guild-scoped reads; never a
+//!   ticket lifecycle action, defer, recovery, or channel REST probe.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -55,6 +58,11 @@ use std::{
 
 use crate::member_runtime::MemberRuntime;
 use crate::self_role_handlers::SelfRoleService;
+use crate::ticket_lists::{
+    render_my_tickets, render_ticket_queue, ticket_queue_page_request, TicketQueuePage,
+    TICKET_LIST_STORE_FAILURE, TICKET_LIST_UNAVAILABLE, TICKET_QUEUE_PAGE_INVALID,
+    TICKET_QUEUE_STAFF_ONLY,
+};
 use sqlx::{Pool, Postgres};
 use tracing::warn;
 use twilight_gateway::Event;
@@ -77,7 +85,7 @@ use two_bot_core::{
     funnel::now_millis_for_test,
     help::{canonical_help_selector, unknown_help_correction},
     moderation::ModerationAction,
-    router::replies::EXPIRED_COMPONENT_REPLY,
+    router::replies::{InteractionReply, EXPIRED_COMPONENT_REPLY},
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -90,8 +98,8 @@ use two_bot_core::{
 };
 use two_bot_discord::{
     help_detail_response, help_response, publish_commands, register_channel_handlers,
-    response_for_slash, route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError,
-    LevelingRuntime, RoutedInteraction,
+    response_for_slash, route_interaction, text_response, ActionExecutor, ChannelModerationRuntime,
+    DiscordError, LevelingRuntime, RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -908,7 +916,7 @@ impl CommandRuntime {
         executor: ActionExecutor,
         tickets: Arc<crate::ticket_runtime::TicketRuntime>,
     ) -> Arc<Self> {
-        let router = InteractionRouter::new(RouterGates {
+        let router = router_with_commands(RouterGates {
             configured_guild: Some(100),
             tickets: true,
             scorecard: false,
@@ -1490,6 +1498,10 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
+        if matches!(handler, HandlerId::TicketMine | HandlerId::TicketQueue) {
+            self.ticket_list_command(interaction, handler).await;
+            return;
+        }
         // No `"help"` entry: the help arm above owns `/help` and returns
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
@@ -1598,6 +1610,62 @@ impl CommandRuntime {
             return;
         };
         crate::member_runtime::handle_command(member, &self.executor, interaction, action).await;
+    }
+
+    /// Answer a ticket list with exactly one immediate, mention-suppressed
+    /// callback. Lists are pure reads, so they must never enter the ticket
+    /// component lifecycle's defer/execute path.
+    async fn ticket_list_command(&self, interaction: &Interaction, handler: HandlerId) {
+        let Some(tickets) = self.tickets.clone() else {
+            self.ticket_list_reply(interaction, TICKET_LIST_UNAVAILABLE)
+                .await;
+            return;
+        };
+        match handler {
+            HandlerId::TicketMine => {
+                let content = match tickets.list_my_tickets(&actor_id(interaction)).await {
+                    Ok(rows) => render_my_tickets(&rows),
+                    Err(_) => TICKET_LIST_STORE_FAILURE.to_owned(),
+                };
+                self.ticket_list_reply(interaction, content).await;
+            }
+            HandlerId::TicketQueue => {
+                // Policy comes before option decoding and every store access:
+                // unprivileged requests must not reveal queue state or even
+                // spend time waiting on an unavailable database.
+                if tickets.authorize_queue(interaction).is_err() {
+                    self.ticket_list_reply(interaction, TICKET_QUEUE_STAFF_ONLY)
+                        .await;
+                    return;
+                }
+                let page = match ticket_queue_page_request(interaction) {
+                    TicketQueuePage::Default => 1,
+                    TicketQueuePage::Page(page) => page,
+                    TicketQueuePage::Invalid => {
+                        self.ticket_list_reply(interaction, TICKET_QUEUE_PAGE_INVALID)
+                            .await;
+                        return;
+                    }
+                };
+                let content = match tickets.list_ticket_queue().await {
+                    Ok(rows) => match render_ticket_queue(&rows, page) {
+                        Ok(content) => content,
+                        Err(reply) => reply.to_owned(),
+                    },
+                    Err(_) => TICKET_LIST_STORE_FAILURE.to_owned(),
+                };
+                self.ticket_list_reply(interaction, content).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn ticket_list_reply(&self, interaction: &Interaction, content: impl Into<String>) {
+        self.answer(
+            interaction,
+            text_response(InteractionReply::new(content, true)),
+        )
+        .await;
     }
 
     async fn on_ticket_interaction(
@@ -2699,6 +2767,11 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     if gates.scorecard {
         router.register(Box::new(SliceHandler(HandlerId::ScorecardAttendance)));
+    }
+    if gates.tickets {
+        for id in [HandlerId::TicketMine, HandlerId::TicketQueue] {
+            router.register(Box::new(SliceHandler(id)));
+        }
     }
     // Leveling is not an activation-fenced capability: the core rank and
     // leaderboard commands stay available to every permitted identity.

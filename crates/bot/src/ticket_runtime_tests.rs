@@ -58,11 +58,23 @@ fn deployment_vars() -> HashMap<String, String> {
 #[test]
 fn ticket_destinations_resolve_and_conflicts_refuse() {
     let vars = deployment_vars();
-    let config = TicketConfig::from_vars(&vars, 100, COOLDOWN_SECONDS).unwrap();
+    let config = TicketConfig::from_deployment_vars(&vars, 100).unwrap();
     assert_eq!(config.category_id, "200");
     assert_eq!(config.panel_channel_id, "700");
     assert_eq!(config.staff_role_id, "300");
     assert_eq!(config.cooldown_seconds, COOLDOWN_SECONDS);
+
+    let mut configured_cooldown = vars.clone();
+    configured_cooldown.insert(COOLDOWN_KEY.to_owned(), "60".to_owned());
+    assert_eq!(
+        TicketConfig::from_deployment_vars(&configured_cooldown, 100)
+            .unwrap()
+            .cooldown_seconds,
+        60
+    );
+    let mut malformed_cooldown = vars.clone();
+    malformed_cooldown.insert(COOLDOWN_KEY.to_owned(), "not-a-number".to_owned());
+    assert!(TicketConfig::from_deployment_vars(&malformed_cooldown, 100).is_none());
 
     // The staff role must not be the guild id.
     let mut staff_is_guild = vars.clone();

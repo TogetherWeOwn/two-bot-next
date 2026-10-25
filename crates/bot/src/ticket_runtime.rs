@@ -394,22 +394,32 @@ pub(crate) struct TicketConfig {
 impl TicketConfig {
     pub fn from_env(guild_id: u64) -> Option<Self> {
         let vars: HashMap<String, String> = std::env::vars().collect();
-        let cooldown_seconds = match std::env::var("TWO_TICKET_COOLDOWN_SECONDS") {
-            Ok(value) => match value.parse() {
-                Ok(value) => value,
-                Err(_) => {
-                    tracing::warn!("invalid ticket cooldown; tickets disabled");
-                    return None;
-                }
-            },
-            Err(std::env::VarError::NotPresent) => COOLDOWN_SECONDS,
-            Err(_) => return None,
+        let Some(cooldown_seconds) = Self::cooldown_from_vars(&vars) else {
+            tracing::warn!("invalid ticket cooldown; tickets disabled");
+            return None;
         };
         let config = Self::from_vars(&vars, guild_id, cooldown_seconds);
         if config.is_none() && LIVE_KEYS.iter().all(|key| vars.contains_key(*key)) {
             tracing::warn!("invalid ticket configuration; tickets disabled");
         }
         config
+    }
+
+    /// Parse the deployment setting set used by both boot and command
+    /// publication. An invalid explicit cooldown disables the ticket surface,
+    /// matching boot rather than publishing commands with no runtime.
+    pub(crate) fn from_deployment_vars(
+        vars: &HashMap<String, String>,
+        guild_id: u64,
+    ) -> Option<Self> {
+        Self::from_vars(vars, guild_id, Self::cooldown_from_vars(vars)?)
+    }
+
+    fn cooldown_from_vars(vars: &HashMap<String, String>) -> Option<u64> {
+        match vars.get(COOLDOWN_KEY) {
+            Some(value) => value.parse().ok(),
+            None => Some(COOLDOWN_SECONDS),
+        }
     }
 
     /// Pure constructor over layered vars: destinations resolve, the staff
@@ -979,6 +989,28 @@ impl TicketRuntime {
             permissions,
             &config.staff_role_id,
         )
+    }
+
+    /// Checks queue visibility with the established ticket staff policy, without
+    /// touching a ticket or scheduling lifecycle work.
+    pub(crate) fn authorize_queue(
+        &self,
+        interaction: &Interaction,
+    ) -> std::result::Result<(), TicketError> {
+        self.authorize(interaction, TicketAction::Claim)
+    }
+
+    /// Reads only the invoking member's active ticket rows in this runtime's guild.
+    pub(crate) async fn list_my_tickets(
+        &self,
+        opener_id: &str,
+    ) -> std::result::Result<Vec<Ticket>, StoreError> {
+        self.store.list_non_closed_for_opener(opener_id).await
+    }
+
+    /// Reads only active rows in this runtime's configured guild.
+    pub(crate) async fn list_ticket_queue(&self) -> std::result::Result<Vec<Ticket>, StoreError> {
+        self.store.list_non_closed().await
     }
 
     /// Resolve the ticket context for the `ticket action incomplete` warn:
