@@ -50,7 +50,7 @@ fn fixture() -> Value {
         + 1;
     rows.insert(after_close, serde_json::json!({
         "name": "lfg-edit",
-        "description": "Update a raid/LFG title or start time",
+        "description": "Update LFG metadata or increase one role's seats",
         "dm_permission": false,
         "default_member_permissions": "8589934592",
         "options": [
@@ -59,7 +59,11 @@ fn fixture() -> Value {
             {"name": "title", "description": "Event or group title", "type": "string",
              "required": false, "max_length": 100, "choices": []},
             {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
-             "type": "string", "required": false, "choices": []}
+             "type": "string", "required": false, "choices": []},
+            {"name": "role", "description": "Existing signup role key (use with seats)",
+             "type": "string", "required": false, "max_length": 32, "choices": []},
+            {"name": "seats", "description": "Absolute seat target, increase only (1-99; use with role)",
+             "type": "integer", "required": false, "min_value": 1, "max_value": 99, "choices": []}
         ],
         "smoke": "deferred",
         "expected_response": null,
