@@ -9124,10 +9124,8 @@ fn setup_many_pages_stay_bounded_and_cover_every_row_once() {
     assert_eq!(covered, expected);
 }
 
-#[test]
-fn setup_worst_case_diagnostics_leave_room_for_rows_and_navigation() {
-    let channel_id = 1_844_674_407_370_955_615;
-    let failure = failure_line(&LifecycleFailure::MissingPermission {
+fn setup_move_permission_failure(channel_id: Snowflake) -> String {
+    failure_line(&LifecycleFailure::MissingPermission {
         write: RefusedWrite::Move,
         channel_id,
         findings: [
@@ -9144,7 +9142,132 @@ fn setup_worst_case_diagnostics_leave_room_for_rows_and_navigation() {
             channel_id: Some(channel_id),
         })
         .collect(),
-    });
+    })
+}
+
+#[test]
+fn setup_fitting_diagnostics_keep_the_exact_reply_at_the_transport_boundary() {
+    let channel_id = 100_000_000;
+    let failures: Vec<_> = (0..5)
+        .map(|index| setup_move_permission_failure(channel_id + index))
+        .collect();
+    let diagnostic_lines = failures
+        .iter()
+        .map(|failure| format!("- {failure}"))
+        .collect::<Vec<_>>();
+    // Adding a tracked-room digit crosses 1998/1999/2000/2001 UTF-16 units
+    // without changing the production-shaped diagnostics or creator rows.
+    for (tracked_rooms, expected_units) in [(7, 1998), (77, 1999), (777, 2000), (7777, 2001)] {
+        let summary = SetupSummary {
+            guild_id: GUILD,
+            creators: vec![
+                CreatorChannel::new(GUILD, channel_id),
+                CreatorChannel::new(GUILD, channel_id + 1),
+            ],
+            tracked_rooms,
+            failures: failures.clone(),
+            halted: false,
+            store_error: None,
+        };
+        let prefix = format!(
+            "**Voice rooms**\n\
+             Voice rooms are running.\n\
+             Creator channels (2)\n\
+             - <#100000000>: new rooms above\n\
+             - <#100000001>: new rooms above\n\
+             Tracked rooms: {tracked_rooms}.\n\
+             Recent failures (5)\n"
+        );
+        let full_reply = format!("{prefix}{}", diagnostic_lines.join("\n"));
+        assert_eq!(text_len(&full_reply), expected_units, "boundary fixture");
+        assert_eq!(setup_page_total(&summary), 1);
+        let panel = setup_panel_page(&summary, 1);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        if expected_units <= CONTENT_LIMIT {
+            assert_eq!(reply, full_reply, "keep every fitting diagnostic unchanged");
+            assert!(!reply.contains("Additional failure details not shown"));
+        } else {
+            assert_eq!(
+                reply,
+                format!(
+                    "{prefix}{}\nAdditional failure details not shown: 1.",
+                    diagnostic_lines[..4].join("\n")
+                ),
+                "omit only the complete trailing diagnostic at 2001 units"
+            );
+            assert!(!reply.contains(&failures[4]));
+        }
+        assert!(text_len(&reply) <= CONTENT_LIMIT);
+        assert!(!reply.contains("Page "));
+        assert!(!reply.contains("Next page:"));
+        assert_eq!(setup_panel(&summary), panel);
+        assert_eq!(setup_panel_page(&summary, 1), panel);
+    }
+}
+
+#[test]
+fn setup_overflow_keeps_live_health_then_leading_history_on_every_page() {
+    let channel_id = 1_844_674_407_370_955_615;
+    // Match dispatch order: live health precedes distinct historical failures.
+    let mut failures = vec![health_line(&PermissionFinding {
+        permission: VoicePermission::ManageChannels,
+        scope: VoicePermissionScope::Channel,
+        category_id: None,
+        channel_id: Some(channel_id),
+    })];
+    failures.extend((1..5).map(|index| setup_move_permission_failure(channel_id + index)));
+    let expected_diagnostics = format!(
+        "{}\nAdditional failure details not shown: 1.",
+        failures[..4]
+            .iter()
+            .map(|failure| format!("- {failure}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let summary = SetupSummary {
+        guild_id: GUILD,
+        creators: (0..120)
+            .map(|index| CreatorChannel::new(GUILD, channel_id + index))
+            .collect(),
+        tracked_rooms: 7,
+        failures,
+        halted: true,
+        store_error: None,
+    };
+    let total = setup_page_total(&summary);
+    assert!(total > 1, "exercise diagnostic selection on multiple pages");
+    for number in 1..=total {
+        let panel = setup_panel_page(&summary, number);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        assert!(text_len(&reply) <= CONTENT_LIMIT, "page {number} bound");
+        assert!(reply.contains("paused"));
+        assert!(reply.contains("Tracked rooms: 7."));
+        let (_, diagnostics_and_navigation) = panel
+            .description
+            .split_once("Recent failures (5)\n")
+            .expect("truthful full diagnostic count");
+        let (diagnostics, _) = diagnostics_and_navigation
+            .split_once("\nPage ")
+            .expect("page metadata follows diagnostics");
+        assert_eq!(
+            diagnostics, expected_diagnostics,
+            "page {number} retains the exact ordered prefix, not any subset"
+        );
+        assert!(!reply.contains(&summary.failures[4]), "omit the tail only");
+        assert!(reply.contains(&format!("Page {number} of {total}")));
+        if number < total {
+            assert!(reply.ends_with(&format!("Next page: /setup page:{}", number + 1)));
+        } else {
+            assert!(reply.ends_with(&format!("Page {number} of {total}")));
+        }
+        assert_eq!(setup_panel_page(&summary, number), panel);
+    }
+}
+
+#[test]
+fn setup_worst_case_diagnostics_leave_room_for_rows_and_navigation() {
+    let channel_id = 1_844_674_407_370_955_615;
+    let failure = setup_move_permission_failure(channel_id);
     assert!(
         text_len(&failure) > 400,
         "production-shaped permission failure"
