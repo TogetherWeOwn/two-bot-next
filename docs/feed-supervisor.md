@@ -1,9 +1,9 @@
 # Feed supervisor operator guide
 
-How to run feed delivery (`/feed-add`, `/feed-list`, `/feed-remove` plus the
-managed poller). This is the operator view. The port record
-(`docs/feeds-port.md`) remains the domain/store contract; this guide does not
-restate it.
+How to run feed delivery (`/feed-add`, `/feed-list`, `/feed-remove`,
+`/feed-inspect` plus the managed poller). This is the operator view. The port
+record (`docs/feeds-port.md`) remains the domain/store contract; this guide
+does not restate it.
 
 Out of scope: code changes and dashboard queries. Cadence hot-reload is
 shipped behavior (see [Fetch cadence](#fetch-cadence)): a stored interval
@@ -11,14 +11,15 @@ change reschedules the next run without a restart.
 
 ## Source configuration
 
-Three slash commands, all guild-only, all requiring ManageGuild (`32`), none
+Four slash commands, all guild-only, all requiring ManageGuild (`32`), none
 available in DMs (`docs/commands.md`):
 
 | Command | Options | Notes |
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
-| `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation; short lists keep the exact legacy single reply (`crates/core/src/feeds.rs`). |
-| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` (`crates/core/src/feeds.rs:503-509`) or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs:511-515`). Guild-scoped delete. |
+| `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation. Every row carries its last-attempt phrase and every reply points at `/feed-inspect` (`crates/core/src/feeds.rs`). |
+| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs`). Guild-scoped delete. |
+| `/feed-inspect` | `id` (required string, max 128 chars) | Ephemeral detail for one saved relay: id, kind, destination, enabled state, redacted source and last attempted poll. Pure read, no audit row. The attempt is attempt evidence only, never a health verdict (`crates/core/src/feeds.rs`). |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 
@@ -39,7 +40,7 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 Gates (both must hold or the poller parks):
 
 - `TWO_ANNOUNCEMENTS=1` — exact `1` enables; anything else is off.
-  Default off (`crates/core/src/feature_commands.rs:358-395`).
+  Default off (`crates/core/src/feature_commands.rs:360-397`).
 - Boot identity must permit the `announcements` capability
   (`feed_jobs::register_fenced`, the live-identity fence). A mismatched or
   unparseable identity parks the job with
@@ -50,7 +51,7 @@ Gates (both must hold or the poller parks):
   `feed poller parked: invalid feature configuration`
   (`crates/bot/src/feed_jobs.rs:274-284`); the gate error text is
   `TWO_FEED_POLL_SECONDS must be an integer between 60 and 86400`
-  (`crates/core/src/feature_commands.rs:366-369`).
+  (`crates/core/src/feature_commands.rs:368-371`).
 
 Per-feed fetch contract (what a "source is down" means): exact User-Agent
 `Owen/1.0 (+https://two.gg)`, 15-second total deadline across
@@ -276,8 +277,10 @@ not part of feed operation.
    `/feed-add kind:rss source:https://example.com/feed.xml`.
    Expect the relay id in the confirmation reply; copy it.
 2. Run `/feed-list` in the same guild. Expect a line
-   `` `<id>` rss → <#<channel>> https://example.com/feed.xml ``
-   (sources shrink to fit at capacity; every relay id stays listed).
+   `` `<id>` rss → <#<channel>> https://example.com/feed.xml `` followed by
+   its last-attempt phrase (sources shrink to fit at capacity; every relay
+   id stays listed). Run `/feed-inspect id:<id>` for the saved source and
+   last-attempt detail without touching the relay.
 3. Wait one poll interval (default 300 s; configured via
    `TWO_FEED_POLL_SECONDS`). Adding a relay does not fetch the source —
    the first delivery happens on the next pass.

@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 36 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 37 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -34,7 +34,7 @@ use crate::commands::{
 /// must set on staging for the command to be published at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
-    /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`).
+    /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`, `game-mix`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 34-row contract in publish order (core, scorecard, automation,
+/// The 36-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -183,7 +183,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "game-mix",
-            39,
+            40,
             E2eGate::Always,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -349,10 +349,10 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Rsvp",
-            "Ephemeral `RSVP saved: <status>.` confirmation.",
+            "Ephemeral `RSVP saved: <status>.` confirmation (pasted links append the event id).",
             &[
                 "Gate:AnnouncementsDisabled",
-                "Valid:event-id:required",
+                "Valid:event-id:required,max128",
                 "Valid:status:going|interested|declined",
             ],
         ),
@@ -364,7 +364,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Everyone",
             "RsvpAttendance",
             "Ephemeral RSVP totals for the scheduled event.",
-            &["Gate:AnnouncementsDisabled", "Valid:event-id:required"],
+            &["Gate:AnnouncementsDisabled", "Valid:event-id:required,max128"],
         ),
         row(
             "lfg",
@@ -448,6 +448,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "FeedList",
             "Ephemeral guild-scoped relay list.",
             &["Gate:AnnouncementsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "feed-inspect",
+            39,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedInspect",
+            "Ephemeral guild-scoped relay detail with safe source and last attempt; absent and invalid ids refuse distinctly without mutation.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
         ),
         row(
             "ban",

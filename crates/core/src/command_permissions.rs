@@ -83,17 +83,18 @@ use PolicyHook::{
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), the private moderation reads
 /// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
-/// timed entry (parity row 37), channel LFG discovery (row 38), and staff
-/// aggregate `/game-mix` (row 39). Only `/game-mix` admits Administrator
-/// alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
+/// timed entry (parity row 37), channel LFG discovery (parity row 38), the
+/// Next-only `/feed-inspect` relay detail (parity row 39), and staff aggregate
+/// `/game-mix` (parity row 40). Only `/game-mix` admits Administrator alone;
+/// legacy masks are unchanged.
+pub const COMMAND_PERMISSIONS: [CommandPermission; 40] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
     row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(39, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(40, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",
@@ -174,6 +175,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
     row(28, "feed-add", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(39, "feed-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
 ];
 
 /// Only retained builtins participate in slash-name lookup. The dropped and

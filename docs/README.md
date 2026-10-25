@@ -23,7 +23,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
 - [Read-only MCP tools](mcp.md)
-- [Admin token registry contract](admin-registry.md)
+- [Admin token registry](admin-registry.md)
 
 ## Operations and observability
 
@@ -46,12 +46,12 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Gateway event catalog](observability-event-catalog.md)
 - [Pool gauge ownership](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
-- [Keepalive-gap spec](keepalive-gap-detector.md)
-- [Gateway alert queries](worker-gateway-failure-alerts.md)
-- [EventSub health queries](eventsub-subscription-health-queries.md)
-- [October 1 tabletop](incident-tabletop-2026-10-01.md)
-- [October 6 tabletop](incident-tabletop-2026-10-06.md)
-- [Gateway incident review](production-incident-2026-10-15-postmortem.md)
+- [Keepalive-gap](keepalive-gap-detector.md)
+- [Gateway alerts](worker-gateway-failure-alerts.md)
+- [EventSub health](eventsub-subscription-health-queries.md)
+- [Oct 1 tabletop](incident-tabletop-2026-10-01.md)
+- [Oct 6 tabletop](incident-tabletop-2026-10-06.md)
+- [Incident review](production-incident-2026-10-15-postmortem.md)
 - [Ops audit reads](ops-control.md)
 
 ## Storage and internal actions
@@ -134,6 +134,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [RSVP seats and waitlist (design only)](rsvp-capacity-spec.md)
 - [Private event agenda (design only)](event-agenda-spec.md)
 - [Calendar handoff (design only)](event-calendar-handoff-spec.md)
+- [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket runtime](tickets.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
