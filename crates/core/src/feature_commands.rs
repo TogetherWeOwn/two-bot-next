@@ -11,7 +11,7 @@
 //!   (`automationCommandData`) — all eight `ManageGuild`-gated.
 //! - announcements (#24–#30): `src/announcements/discord.ts`
 //!   (`announcementCommandData`) — `/rsvp` + RSVP totals open to everyone,
-//!   `/lfg` pair `ManageEvents`, `/feed-*` trio `ManageGuild`.
+//!   `/lfg` pair `ManageEvents`, `/feed-*` quartet `ManageGuild`.
 //! - scorecard (#12): `src/analytics/communityAttendance.ts`
 //!   (`COMMUNITY_ATTENDANCE_COMMAND`) — keeps the `attendance` name.
 //!
@@ -289,7 +289,7 @@ pub fn giveaway_command() -> CommandDefinition {
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.
 ///
 /// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` management requires
-/// `ManageEvents`; `/feed-*` trio requires `ManageGuild`. All guild-only.
+/// `ManageEvents`; `/feed-*` quartet requires `ManageGuild`. All guild-only.
 #[must_use]
 pub fn announcement_commands() -> Vec<CommandDefinition> {
     vec![
@@ -423,6 +423,18 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
+        CommandDefinition::new(
+            "feed-inspect",
+            "Show a saved feed relay's source and last attempt",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "id",
+            "Feed id",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
     ]
 }
 
@@ -566,6 +578,7 @@ mod tests {
                 "feed-add",
                 "feed-remove",
                 "feed-list",
+                "feed-inspect",
             ]
         );
     }
@@ -573,8 +586,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 10 automation + 8 announcement.
-        assert_eq!(merged.len(), 24);
+        // 5 core + 1 scorecard + 10 automation + 9 announcement.
+        assert_eq!(merged.len(), 25);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -619,7 +632,7 @@ mod tests {
         assert_eq!(is(&ann, "lfg"), manage_events);
         assert_eq!(is(&ann, "lfg-close"), manage_events);
         assert_eq!(is(&ann, "lfg-list"), manage_events);
-        for name in ["feed-add", "feed-remove", "feed-list"] {
+        for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
         }
         // Open to everyone: no permission gate.
@@ -686,6 +699,7 @@ mod tests {
             ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
+            ("feed-inspect", 0, 128),
             ("rsvp", 0, 128),
             ("rsvp-attendance", 0, 128),
         ] {
