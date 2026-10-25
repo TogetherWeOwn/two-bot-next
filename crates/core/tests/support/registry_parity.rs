@@ -11,7 +11,7 @@ use two_bot_core::custom_commands::{
 use two_bot_core::feeds_http::MAX_FEED_SOURCE_BYTES;
 use two_bot_core::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
-use two_bot_core::scheduled::MAX_BODY_CHARS;
+use two_bot_core::scheduled::{MAX_AT_CHARS, MAX_BODY_CHARS};
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
@@ -28,6 +28,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command", "docs/parity.md §1 #14 caps"),
     ("command-remove", "docs/parity.md §1 #15 caps"),
     ("schedule", "docs/parity.md §1 #17 caps"),
+    ("schedule", "docs/parity.md §1 #17 absolute-time"),
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
     ("lfg", "docs/parity.md §1 #26 caps"),
@@ -527,6 +528,39 @@ pub fn expected_registry() -> Value {
             "legacy {name}/{option_name}"
         );
         option["max_length"] = json!(max_length);
+    }
+    // Absolute one-off scheduling adds only the optional RFC3339 `at` string;
+    // the legacy body and relative timing options keep their exact wire shape.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, reference)| {
+                *command == "schedule" && *reference == "docs/parity.md §1 #17 absolute-time"
+            })
+            .expect("absolute-time has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule")
+            .expect("docs/parity.md §1 #17 absolute-time");
+        let options = command["options"]
+            .as_array_mut()
+            .expect("schedule options array");
+        assert_eq!(
+            options.len(),
+            3,
+            "legacy schedule publishes body and two relative timing options"
+        );
+        options.push(
+            serde_json::to_value(
+                CommandOption::new(
+                    "at",
+                    "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+                    CommandOptionType::String,
+                )
+                .max_length(MAX_AT_CHARS as u32),
+            )
+            .expect("absolute-time option serializes"),
+        );
     }
     // LFG private preview: the Next-only additive fourth `preview` boolean
     // keeps the signup form submittable without posting. The three legacy

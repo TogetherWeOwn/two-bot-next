@@ -143,6 +143,7 @@ pub(crate) async fn schedule_create(
             return;
         }
     };
+    let is_absolute = absolute_due.is_some();
     let next_run_at =
         format_iso_ms(absolute_due.unwrap_or_else(|| next_run_at_ms(now, validated.delay_minutes)));
     // Whole minutes by construction (`every-minutes * 60`), so this inverts
@@ -188,7 +189,7 @@ pub(crate) async fn schedule_create(
             finish(
                 executor,
                 interaction,
-                schedule_confirmation(created, &id, every_m, &next_run_at),
+                schedule_confirmation(created, &id, every_m, &next_run_at, is_absolute),
             )
             .await;
         }
@@ -606,12 +607,15 @@ fn schedule_confirmation(
     id: &str,
     every_minutes: Option<i64>,
     next_run_at: &str,
+    include_delivery_hint: bool,
 ) -> String {
     let mut text = schedule_confirm_text(created, id, every_minutes, next_run_at);
     if every_minutes.is_some() {
         text.push_str(&format!(" First due at {next_run_at}."));
     }
-    text.push_str(&schedule_delivery_hint(next_run_at));
+    if include_delivery_hint {
+        text.push_str(&schedule_delivery_hint(next_run_at));
+    }
     text
 }
 
