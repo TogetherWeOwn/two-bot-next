@@ -329,7 +329,7 @@ async fn direct_message_gateway_is_silent_and_never_exposes_guild_data() {
     seed(db.pool(), "GuildOnlyAggregateProbe", 0).await;
     let before = state(db.pool()).await;
     let mut dm = staff();
-    dm.guild_id = None;
+    set_guild(&mut dm, None);
     dm.member = None;
     dm.authorizing_integration_owners.guild = None;
     let requests = dispatch(db.pool().clone(), dm).await;
@@ -427,7 +427,7 @@ async fn configured_live_guild_gets_an_activation_refusal_even_when_store_is_una
         .await
         .expect("audit count");
     let mut interaction = staff();
-    interaction.guild_id = Some(Id::new(live));
+    set_guild(&mut interaction, Some(Id::new(live)));
     interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(live)));
     let requests = dispatch_for_guild(db.pool().clone(), interaction, live).await;
     let audits_after = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM automation_audit_log")

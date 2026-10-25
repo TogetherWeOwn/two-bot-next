@@ -692,7 +692,7 @@ async fn foreign_guild_interaction_is_fenced_with_zero_reads() {
     // the home rows. This is what fails RED before the command exists.
     let home = dispatch(db.pool().clone(), staff(Permissions::MANAGE_GUILD)).await;
     let mut foreign = staff(Permissions::MANAGE_GUILD);
-    foreign.guild_id = Some(Id::new(FOREIGN_GUILD));
+    set_guild(&mut foreign, Some(Id::new(FOREIGN_GUILD)));
     let fenced = dispatch(db.pool().clone(), foreign).await;
     let after = state(db.pool()).await;
     db.close().await.expect("drop only owned fixture");
