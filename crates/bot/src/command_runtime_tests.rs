@@ -64,6 +64,8 @@ mod schedule_absolute_acceptance;
 mod schedule_absolute_correction_tests;
 #[path = "schedule_preview_dispatch_acceptance.rs"]
 mod schedule_preview_dispatch_acceptance;
+#[path = "schedule_retime_acceptance_tests.rs"]
+mod schedule_retime_acceptance;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
 
