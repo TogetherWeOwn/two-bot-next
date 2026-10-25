@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION,
-    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_GUILD, PRIVACY_DESCRIPTION,
-    REOPEN_DESCRIPTION,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, EVENT_REFERENCE_MAX_CHARS,
+    HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_GUILD,
+    PRIVACY_DESCRIPTION, REOPEN_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -31,6 +31,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
     ("lfg", "docs/parity.md §1 #26 caps"),
+    ("lfg", "docs/parity.md §1 #26 preview"),
     ("lfg-close", "docs/parity.md §1 #27 caps"),
     ("feed-add", "docs/parity.md §1 #28 caps"),
     ("feed-remove", "docs/parity.md §1 #29 caps"),
@@ -43,6 +44,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("giveaway", "docs/parity.md §1 giveaway"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("rsvp", "docs/parity.md §1 #24 caps"),
+    ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -415,12 +418,12 @@ pub fn expected_registry() -> Value {
         (
             "attendance",
             "/options/0/description",
-            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+            "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
         ),
         (
             "rsvp",
             "/options/0/description",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
         ),
         (
             "rsvp-attendance",
@@ -430,7 +433,7 @@ pub fn expected_registry() -> Value {
         (
             "rsvp-attendance",
             "/options/0/description",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
         ),
         (
             "lfg",
@@ -506,6 +509,18 @@ pub fn expected_registry() -> Value {
             MAX_RESOURCE_ID_CHARS,
             "docs/parity.md §1 #29 caps",
         ),
+        (
+            "rsvp",
+            "event-id",
+            EVENT_REFERENCE_MAX_CHARS,
+            "docs/parity.md §1 #24 caps",
+        ),
+        (
+            "rsvp-attendance",
+            "event-id",
+            EVENT_REFERENCE_MAX_CHARS,
+            "docs/parity.md §1 #25 caps",
+        ),
     ] {
         let _ = INTENTIONAL_DIFFERENCES
             .iter()
@@ -526,6 +541,45 @@ pub fn expected_registry() -> Value {
             "legacy {name}/{option_name}"
         );
         option["max_length"] = json!(max_length);
+    }
+    // LFG private preview: the Next-only additive fourth `preview` boolean
+    // keeps the signup form submittable without posting. The three legacy
+    // string options (title, starts-at, roles) and their bounds stay
+    // untouched; the option itself is optional (`required` omitted, which the
+    // canonical form normalizes to false) with no bounds or choices.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, reference)| {
+                *command == "lfg" && *reference == "docs/parity.md §1 #26 preview"
+            })
+            .expect("preview has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "lfg")
+            .expect("docs/parity.md §1 #26 preview");
+        assert_eq!(command["default_member_permissions"], json!("8589934592"));
+        assert_eq!(command["dm_permission"], json!(false));
+        let options = command["options"]
+            .as_array_mut()
+            .expect("command options array");
+        assert_eq!(
+            options.len(),
+            3,
+            "legacy lfg publishes exactly title, starts-at, roles"
+        );
+        assert_eq!(options[0]["name"], json!("title"));
+        assert_eq!(options[1]["name"], json!("starts-at"));
+        assert_eq!(options[2]["name"], json!("roles"));
+        for option in options.iter() {
+            assert_eq!(option["type"], json!(3), "legacy lfg options stay strings");
+            assert_eq!(option["required"], json!(true));
+        }
+        options.push(json!({
+            "name": "preview",
+            "description": "Privately preview without posting",
+            "type": 5
+        }));
     }
     // Schedule-list pagination: the Next-only additive `page` option keeps
     // every configured id discoverable within Discord's 2,000-unit cap.

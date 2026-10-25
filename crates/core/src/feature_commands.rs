@@ -35,8 +35,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, EVENT_REFERENCE_MAX_CHARS,
+    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 use super::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_INSPECT_ARGUMENT_UNITS, MAX_TEMPLATE_CHARS,
@@ -58,7 +58,7 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
     .options(vec![
         CommandOption::new(
             "event-occurrence",
-            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+            "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
             CommandOptionType::String,
         )
         .required()
@@ -296,10 +296,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("rsvp", "RSVP to a Discord scheduled event").options(vec![
             CommandOption::new(
                 "event-id",
-                "Discord scheduled event id (number in the event URL), e.g. 12345",
+                "Scheduled event id or pasted event link, e.g. 12345",
                 CommandOptionType::String,
             )
-            .required(),
+            .required()
+            .max_length(EVENT_REFERENCE_MAX_CHARS as u32),
             CommandOption::new("status", "Your response", CommandOptionType::String)
                 .required()
                 .choices(vec![
@@ -325,10 +326,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         )
         .options(vec![CommandOption::new(
             "event-id",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
             CommandOptionType::String,
         )
-        .required()]),
+        .required()
+        .max_length(EVENT_REFERENCE_MAX_CHARS as u32)]),
         CommandDefinition::new("lfg", "Post a raid/LFG signup with role slots")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![
@@ -348,6 +350,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 )
                 .required()
                 .max_length(MAX_ROLE_SPEC_CHARS as u32),
+                CommandOption::new(
+                    "preview",
+                    "Privately preview without posting",
+                    CommandOptionType::Boolean,
+                ),
             ]),
         CommandDefinition::new("lfg-close", "Close a raid/LFG signup")
             .permissions(PERM_MANAGE_EVENTS)
@@ -679,6 +686,8 @@ mod tests {
             ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
+            ("rsvp", 0, 128),
+            ("rsvp-attendance", 0, 128),
         ] {
             assert_eq!(
                 get(&ann, command).options[option].max_length,
@@ -717,6 +726,15 @@ mod tests {
             score.options[0].max_length,
             Some(OCCURRENCE_ID_MAX_CHARS as u32)
         );
+        // event-id advertises the shared pasted-reference bound (pinned
+        // literal: a const change must update docs/parity.md and commands.md).
+        for command in ["rsvp", "rsvp-attendance"] {
+            assert_eq!(
+                get(&ann, command).options[0].max_length,
+                Some(EVENT_REFERENCE_MAX_CHARS as u32),
+                "{command} event-id bound"
+            );
+        }
     }
 
     #[test]

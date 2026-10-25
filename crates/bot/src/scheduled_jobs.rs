@@ -214,7 +214,7 @@ async fn remind_event_attendees(
         {
             continue;
         }
-        let (outcome, reason) = if let Some(content) = event_reminder_content(&event) {
+        let (outcome, reason) = if let Some(content) = event_reminder_content(guild, &event) {
             match rest
                 .post_message_confirmed(&event.channel_id, &content, &random_nonce())
                 .await
@@ -250,28 +250,79 @@ async fn remind_event_attendees(
 }
 
 fn event_reminder_content(
+    guild: &str,
     event: &two_bot_core::event_reminder_store::EventReminder,
 ) -> Option<String> {
     use two_bot_core::message_safety::{text_len, truncate, CONTENT_LIMIT};
     use two_bot_core::rsvp::{is_snowflake, MAX_RSVPS_PER_EVENT};
 
+    let count = usize::try_from(event.attendee_count).ok()?;
     if event.attendees.is_empty()
-        || event.attendees.len() > MAX_RSVPS_PER_EVENT as usize
+        || event.attendees.len() != count.min(MAX_RSVPS_PER_EVENT as usize + 1)
         || !is_snowflake(&event.event_id)
         || !is_snowflake(&event.channel_id)
         || event.attendees.iter().any(|id| !is_snowflake(id))
     {
         return None;
     }
-    let name = truncate(&neutralize_scheduled_body(&event.name), 200);
-    let attendees = event
-        .attendees
-        .iter()
-        .map(|id| format!("<@{id}>"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let content = format!("Event reminder: {name} starts soon.\n{attendees}");
-    // Do not split into a burst or truncate halfway through an attendee list.
+    // Do not split into a burst or truncate halfway through an attendee list:
+    // an oversized but otherwise valid reminder falls back to one bounded,
+    // mention-free notice instead of silence. Size the full rendering with the
+    // untruncated name: a huge name forces the fallback path even when a
+    // truncated name plus the roster would fit.
+    if event.attendees.len() <= MAX_RSVPS_PER_EVENT as usize {
+        let neutral = neutralize_scheduled_body(&event.name);
+        let attendees = event
+            .attendees
+            .iter()
+            .map(|id| format!("<@{id}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let full = format!("Event reminder: {neutral} starts soon.\n{attendees}");
+        if text_len(&full) <= CONTENT_LIMIT {
+            let name = truncate(&neutral, 200);
+            let content = format!("Event reminder: {name} starts soon.\n{attendees}");
+            return Some(content);
+        }
+    }
+    event_reminder_fallback(guild, event)
+}
+
+/// One bounded, mention-free notice for a valid reminder whose full-mention
+/// rendering would exceed `CONTENT_LIMIT` or whose roster exceeds the RSVP
+/// bound. Neutral event facts only: bounded name, attendee count, start time
+/// and event link. Never a partial roster, never a mention ping, never content
+/// from an incomplete source (callers validate first; empty rosters fail
+/// closed above). The caller posts this through the same committed-attempt
+/// path, so the fallback counts as the one delivery attempt.
+fn event_reminder_fallback(
+    guild: &str,
+    event: &two_bot_core::event_reminder_store::EventReminder,
+) -> Option<String> {
+    use two_bot_core::message_safety::{text_len, truncate, CONTENT_LIMIT};
+
+    // Break literal "<@" after mention neutralization so a hostile name cannot
+    // smuggle a mention-shaped ping into the mention-free fallback. The framing
+    // itself carries no mentions and no attendee ids.
+    let name = neutralize_scheduled_body(&event.name).replace("<@", "<\u{200b}@");
+    let count = event.attendee_count;
+    let attendees = if count == 1 {
+        "1 attendee".to_owned()
+    } else {
+        format!("{count} attendees")
+    };
+    let head = "Event reminder: ";
+    let tail = format!(
+        " starts at {} ({attendees}).\nSee https://discord.com/events/{guild}/{} for details.",
+        event.starts_at, event.event_id
+    );
+    let budget = CONTENT_LIMIT.saturating_sub(text_len(head) + text_len(&tail));
+    if budget == 0 {
+        // Only pathological framing (an unbounded stored start time) lands
+        // here; fail closed rather than emit an unbounded notice.
+        return None;
+    }
+    let content = format!("{head}{}{tail}", truncate(&name, budget));
     (text_len(&content) <= CONTENT_LIMIT).then_some(content)
 }
 
@@ -609,5 +660,176 @@ fn store_error_name(error: &ScheduledStoreError) -> &'static str {
     match error {
         ScheduledStoreError::CorruptNextRunAt { .. } => "corrupt_next_run_at",
         ScheduledStoreError::Sql(_) => "database",
+    }
+}
+
+#[cfg(test)]
+mod event_reminder_review_regressions {
+    use super::*;
+    use two_bot_core::event_reminder_store::{
+        begin_event_reminder_delivery, due_event_reminders, EventReminder,
+    };
+    use two_bot_core::message_safety::{contains_mass_mention, text_len, CONTENT_LIMIT};
+    use two_bot_testsupport::TestDatabase;
+
+    const GUILD: &str = "3333";
+    const EVENT: &str = "1546451670500642999";
+    const CHANNEL: &str = "1546451670500642111";
+    const NOW: u64 = 1_790_000_000_000;
+
+    async fn overflow_fixture() -> Option<TestDatabase> {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded disposable database"
+            );
+            eprintln!("SKIP reminder overflow regression: TWO_TEST_DATABASE_URL is not set");
+            return None;
+        };
+        let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("create disposable reminder database");
+        sqlx::query(
+            "INSERT INTO scheduled_events
+             (guild_id, event_id, name, starts_at, channel_id, status, updated_at)
+             VALUES ($1, $2, 'Overflow', $3, $4, 'scheduled', $5)",
+        )
+        .bind(GUILD)
+        .bind(EVENT)
+        .bind(format_iso_ms(NOW + 900_000))
+        .bind(CHANNEL)
+        .bind(format_iso_ms(NOW))
+        .execute(db.pool())
+        .await
+        .expect("seed due event");
+        // Bypass RSVP admission to exercise overflow, as legacy/direct rows can.
+        // Only the first 1,500 rows qualify; declined/foreign rows must not count.
+        sqlx::query(
+            "INSERT INTO event_rsvps (guild_id, event_id, user_id, status, responded_at)
+             SELECT $1, $2, (1546451670500600000::bigint + n)::text,
+                    CASE WHEN n > 1500 THEN 'declined'
+                         WHEN n % 2 = 0 THEN 'going' ELSE 'interested' END, now()
+               FROM generate_series(1, 1510) n
+             UNION ALL SELECT '7777', $2, '1546451670500642888', 'going', now()
+             UNION ALL SELECT $1, '1546451670500643001', '1546451670500642888', 'going', now()",
+        )
+        .bind(GUILD)
+        .bind(EVENT)
+        .execute(db.pool())
+        .await
+        .expect("seed oversized RSVP source with excluded rows");
+        Some(db)
+    }
+
+    async fn selected(pool: &PgPool) -> EventReminder {
+        let mut events = due_event_reminders(pool, GUILD, NOW)
+            .await
+            .expect("read due reminder");
+        assert_eq!(events.len(), 1);
+        events.pop().expect("one due reminder")
+    }
+
+    #[tokio::test]
+    async fn overflow_fallback_counts_the_whole_eligible_roster() {
+        let Some(db) = overflow_fixture().await else {
+            return;
+        };
+        let event = selected(db.pool()).await;
+        assert_eq!(event.attendees.len(), 1001, "member reads stay capped");
+        let content = event_reminder_content(GUILD, &event).expect("overflow fallback");
+        assert!(content.contains("(1500 attendees)"), "{content}");
+        assert!(!content.contains("<@"));
+        assert!(text_len(&content) <= CONTENT_LIMIT);
+        db.close().await.expect("verified teardown");
+    }
+
+    #[tokio::test]
+    async fn overflow_count_changes_beyond_the_capped_prefix_reject_stale_admission() {
+        let Some(db) = overflow_fixture().await else {
+            return;
+        };
+        let event = selected(db.pool()).await;
+        let writer = db
+            .independent_pool()
+            .await
+            .expect("independent RSVP writer");
+        sqlx::query(
+            "INSERT INTO event_rsvps (guild_id, event_id, user_id, status, responded_at)
+             VALUES ($1, $2, '9999999999999999999', 'going', now())",
+        )
+        .bind(GUILD)
+        .bind(EVENT)
+        .execute(&writer)
+        .await
+        .expect("add attendee beyond capped prefix");
+        let fresh = selected(db.pool()).await;
+        assert_eq!(event.attendees, fresh.attendees, "prefix did not change");
+        assert!(
+            !begin_event_reminder_delivery(db.pool(), GUILD, &event, NOW)
+                .await
+                .expect("reject stale total")
+        );
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM automation_audit_log WHERE action = 'rsvp.reminder_attempt'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("read attempt count");
+        assert_eq!(attempts, 0, "rejection cannot consume the attempt");
+        let content = event_reminder_content(GUILD, &fresh).expect("fresh overflow fallback");
+        assert!(content.contains("(1501 attendees)"), "{content}");
+        assert!(begin_event_reminder_delivery(db.pool(), GUILD, &fresh, NOW)
+            .await
+            .expect("admit fresh total"));
+        assert!(
+            !begin_event_reminder_delivery(db.pool(), GUILD, &fresh, NOW)
+                .await
+                .expect("refuse duplicate attempt")
+        );
+        writer.close().await;
+        db.close().await.expect("verified teardown");
+    }
+
+    #[test]
+    fn inconsistent_attendee_totals_fail_closed() {
+        let mut event = EventReminder {
+            event_id: EVENT.to_owned(),
+            name: "Games night".to_owned(),
+            starts_at: format_iso_ms(NOW + 900_000),
+            channel_id: CHANNEL.to_owned(),
+            attendees: vec!["1546451670500642666".to_owned()],
+            attendee_count: 1,
+        };
+        assert!(event_reminder_content(GUILD, &event).is_some());
+        for count in [-1, 0, 2, 1500] {
+            event.attendee_count = count;
+            assert!(event_reminder_content(GUILD, &event).is_none(), "{count}");
+        }
+    }
+
+    #[test]
+    fn fallback_defuses_hostile_names_before_executor_sanitization() {
+        let event = EventReminder {
+            event_id: EVENT.to_owned(),
+            name: format!(
+                "Party <@1546451670500642888> <@&1546451670500642777> @everyone @here discord.gg/x DISCORD.COM/INVITE/y discordapp.com/invite/z {}",
+                "🚀".repeat(3000)
+            ),
+            starts_at: format_iso_ms(NOW + 900_000),
+            channel_id: CHANNEL.to_owned(),
+            attendees: vec!["1546451670500642666".to_owned()],
+            attendee_count: 1,
+        };
+        // Inspect the renderer itself: the executor cannot mask a regression.
+        let content = event_reminder_content(GUILD, &event).expect("huge name falls back");
+        assert!(content.contains("1 attendee"));
+        assert!(content.contains(&format!("https://discord.com/events/{GUILD}/{EVENT}")));
+        assert!(!content.contains("<@"), "literal mention shape escaped");
+        assert!(!contains_mass_mention(&content));
+        for host in ["discord.gg", "discord.com/invite", "discordapp.com/invite"] {
+            assert!(!content.to_ascii_lowercase().contains(host), "{host}");
+        }
+        assert!(text_len(&content) <= CONTENT_LIMIT);
+        assert!(content.contains('🚀'), "bounded name must retain safe text");
     }
 }

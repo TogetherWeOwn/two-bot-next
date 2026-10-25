@@ -38,7 +38,7 @@ no owner step, new spend, production enablement or routine approval hop is added
 
 Baseline: `90e57c7a965faa59d0d3cbddafe0e63dc8da6c0c`.
 
-- `crates/core/src/rsvp.rs:36-42,429-456`: Going, Interested and Declined;
+- `crates/core/src/rsvp.rs:36-42,489-516`: Going, Interested and Declined;
   **1,000 rows/event across all choices**, **20 writes/member/guild/UTC minute**.
   `crates/cutover/migrations/0160_rsvp.sql:24-34` keys `event_rsvps` by
   `(guild_id,event_id,user_id)`; there is no occurrence key or event FK/cascade.
@@ -50,7 +50,7 @@ Baseline: `90e57c7a965faa59d0d3cbddafe0e63dc8da6c0c`.
   audit-ID deduplication alone does **not** deduplicate the preceding upsert.
 - `crates/core/src/router.rs:638-674`: ordinary RSVP/totals are member commands
   behind Announcements; staff check-in separately requires Manage Events and
-  Scorecard. `crates/discord/src/rsvp.rs:158-239,298-389` checks live actor
+  Scorecard. `crates/discord/src/rsvp.rs:159-240,299-404` checks live actor
   membership before event lookup, and rechecks after commit with compensation.
   Scheduled, Active and Completed currently pass; Canceled refuses. The new
   start cutoff applies only to seat mode, not historical legacy RSVP/totals.
@@ -67,7 +67,7 @@ Baseline: `90e57c7a965faa59d0d3cbddafe0e63dc8da6c0c`.
   votes, consent or deadlines. No running sibling is changed by this spec.
 
 **Premise gap:** the inspected RSVP path defers an ephemeral reply
-(`crates/discord/src/rsvp.rs:104-119`); no durable public RSVP-post binding was
+(`crates/discord/src/rsvp.rs:105-120`); no durable public RSVP-post binding was
 established. Existing-event support is proven; existing bound-post support is
 not. This is a review assumption/possible defer, not a delivered post feature.
 Only existing scheduled events and their existing RSVP surface are in scope.
@@ -195,7 +195,7 @@ compatibility without enumerating and proving the real writers.
 Local writer inventory to cover before enabling:
 
 - `rsvp_store.rs:68,91,195`: `put_rsvp`, `put_rsvp_with_audit` and their shared
-  upsert; `discord/src/rsvp.rs:260,338` is the verified runtime producer.
+  upsert; `discord/src/rsvp.rs:261,353` is the verified runtime producer.
 - `rsvp_store.rs:555-569`: compensation UPDATE/DELETE; preserve predecessor and
   newer-write fences in the event-slot protocol, not just ordinary upserts.
 - `rsvp_store.rs:699`: `prune_rsvp_history` deletes; apply existing retention
