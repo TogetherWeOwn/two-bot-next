@@ -142,16 +142,17 @@ Resume a saved custom command
 
 ## `/command-inspect`
 
-Inspect or privately preview a saved custom command
+Inspect a saved command or privately preview an unsaved draft
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
-| `view` | string | false | — | — | — | Summary = `"summary"`; Saved template = `"template"`; Preview = `"preview"` | Private view (summary by default) |
+| `name` | string | false | — | — | 32 | — | Saved command name, a-z 0-9 _ - (choose name or draft) |
+| `view` | string | false | — | — | — | Summary = `"summary"`; Saved template = `"template"`; Preview = `"preview"` | Private view (saved: summary by default; draft: preview only) |
 | `arguments` | string | false | — | — | 500 | — | Sample invocation arguments (ignored by current templates) |
+| `draft` | string | false | — | — | 2000 | — | Proposed template to preview without saving (choose name or draft) |
 
 ## `/command-list`
 
