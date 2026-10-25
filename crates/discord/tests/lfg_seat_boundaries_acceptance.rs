@@ -216,7 +216,8 @@ async fn audit_insert_failure_rolls_back_capacity_and_never_refreshes_the_messag
         .expect("seed prior committed audit history"),
         store::LfgSeatEditOutcome::Updated
     );
-    sqlx::query("ALTER TABLE announcements_audit_log ADD CONSTRAINT seat_boundary_audit_fault CHECK (target_key IS DISTINCT FROM 'seat-boundary-fixture')")
+    // Preserve committed history while still rejecting subsequent audit INSERTs.
+    sqlx::query("ALTER TABLE announcements_audit_log ADD CONSTRAINT seat_boundary_audit_fault CHECK (target_key IS DISTINCT FROM 'seat-boundary-fixture') NOT VALID")
         .execute(db.pool()).await.expect("disposable audit INSERT fault");
     let before = snapshot(db.pool()).await;
     let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "5000"}))).await;
