@@ -1,4 +1,4 @@
-//! Protected acceptance: complete voice-config review diff (TOG-39444 test card).
+//! Protected acceptance: complete voice-config review diff.
 //!
 //! This file pins the core-level fixtures and properties the full-review
 //! artifact must satisfy. It uses only stable `two_bot_core` seams
