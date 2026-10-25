@@ -39,9 +39,11 @@ budget and nonce recovery remain mandatory, before and after any future matcher.
 
 - [Model](../crates/core/src/feeds.rs#L65-L85) has no title-filter setting or
   durable filtered outcome. The [parser](../crates/core/src/feeds.rs#L1076-L1091)
-  substitutes `Untitled` for missing, empty, whitespace-only or repeated title
-  fields, losing presence evidence;
-  an actual title `Untitled` is indistinguishable through `FeedItem.title` alone.
+  substitutes `Untitled` for missing, empty, repeated or literal JS-trim-whitespace-only
+  title fields, losing presence evidence. Numeric references such as `&#32;` stay
+  present as literal text: [decoding](../crates/core/src/feeds.rs#L1360-L1370) does
+  **not** convert them to whitespace. An actual title `Untitled` is indistinguishable
+  through `FeedItem.title` alone.
   [Scalar extraction](../crates/core/src/feeds.rs#L1159-L1187) rejects repeated
   title fields and omits nested element text. B needs a separate presence/usability
   signal before fallback; this design does not implement it.
@@ -332,7 +334,18 @@ import hashlib, json, re, subprocess, sys
 root = Path.cwd().resolve()
 spec = root / "docs/feed-title-filter-spec.md"
 try:
-    text = spec.read_text()
+    protected = ["AGENTS.md", "SECURITY.md", "CONSTRAINTS.md",
+                 "crates/core/src/feeds.rs", "crates/core/src/feeds_store.rs",
+                 "crates/bot/src/feed_jobs.rs",
+                 "crates/cutover/migrations/0180_feeds.sql",
+                 "crates/cutover/src/member_erasure_plan.json"]
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    tracked = ["docs/feed-title-filter-spec.md", *protected]
+    committed = {p: subprocess.check_output(["git", "show", f"{commit}:{p}"])
+                 for p in tracked}
+    if any((root / p).read_bytes() != committed[p] for p in tracked):
+        raise ValueError("DIRTY_CHECKED_FILE")
+    text = committed["docs/feed-title-filter-spec.md"].decode("utf-8")
     checked = 0
     for link in re.findall(r"\]\(([^)\s]+)\)", text):
         if "://" in link or link.startswith("#"):
@@ -344,19 +357,14 @@ try:
     cases = re.findall(r"^\| (F\d{2}) ", text, re.M)
     if cases != [f"F{i:02}" for i in range(1, 18)]:
         raise ValueError("MATRIX_INCOMPLETE")
-    protected = ["AGENTS.md", "SECURITY.md", "CONSTRAINTS.md",
-                 "crates/core/src/feeds.rs", "crates/core/src/feeds_store.rs",
-                 "crates/bot/src/feed_jobs.rs",
-                 "crates/cutover/migrations/0180_feeds.sql",
-                 "crates/cutover/src/member_erasure_plan.json"]
-    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    sha = lambda p: hashlib.sha256(committed[p]).hexdigest()
     print(json.dumps({"version": 1, "outcome": "documentation_checked",
         "code": "PATHS_AND_MATRIX_ONLY", "retryable": False,
         "next_action": "request_exact_revision_disposition",
-        "spec_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "spec_sha256": sha(spec), "relative_links_checked": checked,
+        "spec_commit": commit,
+        "spec_sha256": sha("docs/feed-title-filter-spec.md"), "relative_links_checked": checked,
         "matrix_rows": len(cases), "runtime_verified": False,
-        "protected_sha256": {p: sha(root / p) for p in protected}}, sort_keys=True))
+        "protected_sha256": {p: sha(p) for p in protected}}, sort_keys=True))
 except (OSError, ValueError, subprocess.CalledProcessError):
     print(json.dumps({"version": 1, "outcome": "failed", "code": "DOC_CONTRACT_FAILED",
         "retryable": False, "next_action": "fix_paths_or_matrix"}))
@@ -364,6 +372,8 @@ except (OSError, ValueError, subprocess.CalledProcessError):
 PY
 ```
 
+Run after committing: staged or unstaged changes to the spec/protected files
+refuse a receipt. Hashes come from the captured commit's blobs, not mutable files.
 This checks paths/inventory and fingerprints only; it does **not** execute the
 planned oracles, validate source semantics, prove demand or approve storage.
 Before push also run `git diff --check` and `context-pack --base origin/main`.
