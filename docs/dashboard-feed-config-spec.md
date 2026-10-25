@@ -326,14 +326,18 @@ mutations, source sampling or delivery probes were performed.
 
 ## Intent gate and bounded follow-ups
 
-Before **any** build card, bind CEO/host intent alignment to the exact task
-specification revision, repository commit and this file's SHA-256. A request
-queued for review is not acceptance. Record alignment through the existing
-intent path, not a new owner approval hop. Review by 2026-10-31; no answer means
-**no-build**, never timeout approval. New auth/data/network boundaries require
-actual CISO disposition; documenting existing fences creates no new permission.
+Before **any** build card, bind both design acceptance and actual host intent
+alignment to the exact task specification revision, repository commit and this
+file's SHA-256. These are separate records: accepting the design does not attest
+host alignment. **Host intent alignment: NOT RECORDED.** The existing parity
+directive supports investigation, not an exact-target alignment receipt.
+A queued review is not acceptance. Record actual alignment through the existing
+intent path, not a new owner approval hop. Review by 2026-10-31; no answer or
+missing alignment means **no-build**, never timeout approval. New auth/data/network
+boundaries require actual CISO disposition; documenting existing fences creates
+no new permission.
 
-After acceptance only: `FC-W1` shares typed cadence validation with the real
+Only after both records exist: `FC-W1` shares typed cadence validation with the real
 reader; `FC-W2` defines missing signed relay reads and mutations with scoped
 validation, audit, idempotency and a concurrency token honored by **all** slash
 and dashboard writers; `FC-W3` proves web authority and truthful storage/runtime
