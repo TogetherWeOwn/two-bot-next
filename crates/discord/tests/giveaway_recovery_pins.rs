@@ -12,6 +12,7 @@
 //! store-level pin for the atomic reroll reopen lives in
 //! `crates/core/tests/giveaway_store.rs`.
 
+#[allow(dead_code)]
 mod common;
 
 use std::collections::HashMap;
