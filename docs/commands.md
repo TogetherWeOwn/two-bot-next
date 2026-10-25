@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 57.
+Built-in commands: 58.
 
 ## `/access`
 
@@ -79,7 +79,7 @@ Check in a verified human attendee for a scheduled event (scorecard)
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly |
+| `event-occurrence` | string | true | — | — | 128 | — | Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
@@ -195,6 +195,17 @@ Relay an RSS, YouTube, or Twitch feed into this channel
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `kind` | string | true | — | — | — | RSS = `"rss"`; YouTube = `"youtube"`; Twitch = `"twitch"` | Feed kind |
 | `source` | string | true | — | — | 2048 | — | HTTPS URL or YouTube channel id |
+
+## `/feed-inspect`
+
+Show a saved feed relay's source and last attempt
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
 
 ## `/feed-list`
 
@@ -533,7 +544,7 @@ RSVP to a Discord scheduled event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 | `status` | string | true | — | — | — | Going = `"going"`; Interested = `"interested"`; Declined = `"declined"` | Your response |
 
 ## `/rsvp-attendance`
@@ -545,7 +556,7 @@ Show RSVP totals and your saved response for an event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 
 ## `/schedule`
 

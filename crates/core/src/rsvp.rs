@@ -89,14 +89,64 @@ pub fn is_snowflake(s: &str) -> bool {
     (17..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// True when `s` is a snowflake Discord could have issued: the legacy shape
+/// plus a nonzero `u64` value. All-zero strings and values past `u64::MAX`
+/// are representable shapes, but no live guild, event or member can carry
+/// them, so event references refuse them before any lookup or write.
+#[must_use]
+fn is_strict_snowflake(s: &str) -> bool {
+    is_snowflake(s) && s.parse::<u64>().is_ok_and(|id| id != 0)
+}
+
 /// Validate an `/rsvp` or `/rsvp-attendance` event id (legacy
-/// `assertSnowflake(eventId, 'event id')`).
+/// `assertSnowflake(eventId, 'event id')`, tightened to ids Discord could
+/// have issued: all-zero and `u64`-overflowing shapes refuse).
 pub fn validate_event_id(value: &str) -> Result<String, RsvpError> {
-    if is_snowflake(value) {
+    if is_strict_snowflake(value) {
         Ok(value.to_owned())
     } else {
         Err(RsvpError::InvalidEventId)
     }
+}
+
+/// Canonical pasted event-link prefix, matched literally: links are parsed
+/// locally only, never fetched, decoded or allow-listed.
+const EVENT_LINK_PREFIX: &str = "https://discord.com/events/";
+
+/// Normalize a pasted Discord event link to its event id (`Some`), or `None`
+/// when the input is not a link. Callers fall through to the existing numeric
+/// / `ID:label` parsing on `None`, so malformed input keeps the legacy
+/// refusals (bounded, never echoing the input).
+///
+/// Accepted shape: exactly
+/// `https://discord.com/events/<guild>/<event>`, optionally wrapped in one
+/// `<...>` pair (Discord's embed-suppressing paste). Both ids are strict
+/// snowflakes (17–20 ASCII digits, nonzero, fitting `u64`); the link guild
+/// must equal the invoking guild. Anything else — other schemes, hosts,
+/// userinfo, ports, trailing dots, queries, fragments, trailing slashes,
+/// extra segments, backslashes, percent-escapes, unbalanced or doubled
+/// brackets, markdown, surrounding text — is not a link.
+#[must_use]
+pub fn normalize_event_link(value: &str, invoking_guild_id: &str) -> Option<String> {
+    let inner = if let Some(unwrapped) = value.strip_prefix('<') {
+        unwrapped.strip_suffix('>')?
+    } else if value.ends_with('>') {
+        return None;
+    } else {
+        value
+    };
+    let rest = inner.strip_prefix(EVENT_LINK_PREFIX)?;
+    let (guild, event) = rest.split_once('/')?;
+    if event.contains('/') {
+        return None;
+    }
+    if !is_strict_snowflake(guild) || guild != invoking_guild_id {
+        return None;
+    }
+    if !is_strict_snowflake(event) {
+        return None;
+    }
+    Some(event.to_owned())
 }
 
 /// One RSVP row (legacy `EventRsvpRow`): the durable per-member response.
@@ -193,6 +243,15 @@ pub fn rsvp_saved_text(status: RsvpStatus) -> String {
     format!("RSVP saved: {}.", status.as_str())
 }
 
+/// `/rsvp` reply when the member pasted an event link: the legacy status
+/// sentence plus the stable numeric identity the link normalized to. The URL
+/// itself is never echoed. Raw numeric input keeps [`rsvp_saved_text`]
+/// byte-identical.
+#[must_use]
+pub fn rsvp_saved_text_with_event(status: RsvpStatus, event_id: &str) -> String {
+    format!("{} Event `{event_id}`.", rsvp_saved_text(status))
+}
+
 /// `/rsvp-attendance` totals reply (legacy `` `Going: ${g}\nInterested:
 /// ${i}\nDeclined: ${d}` ``, ephemeral).
 #[must_use]
@@ -273,11 +332,12 @@ pub struct AttendanceOccurrence {
 /// must anchor to one as `{event_id}:{label}` so the handler can prove the
 /// event exists in this guild before recording; the free-text format stays
 /// accepted (parity §1 #12) while bare slugs with no anchor refuse, because no
-/// live authority could vouch for them. Input must already be trimmed
-/// ([`validate_occurrence_id`]); the anchor and label trim again so the
-/// canonical id has one stable shape.
+/// live authority could vouch for them. Anchors are strict snowflakes: an
+/// all-zero or `u64`-overflowing anchor refuses even behind a label. Input
+/// must already be trimmed ([`validate_occurrence_id`]); the anchor and label
+/// trim again so the canonical id has one stable shape.
 pub fn parse_attendance_occurrence(value: &str) -> Result<AttendanceOccurrence, CheckinError> {
-    if is_snowflake(value) {
+    if is_strict_snowflake(value) {
         return Ok(AttendanceOccurrence {
             anchor_event_id: value.to_owned(),
             canonical_id: value.to_owned(),
@@ -288,7 +348,7 @@ pub fn parse_attendance_occurrence(value: &str) -> Result<AttendanceOccurrence, 
         .ok_or(CheckinError::UnanchoredOccurrence)?;
     let anchor = anchor_raw.trim();
     let label = label_raw.trim();
-    if !is_snowflake(anchor) || label.is_empty() {
+    if !is_strict_snowflake(anchor) || label.is_empty() {
         return Err(CheckinError::UnanchoredOccurrence);
     }
     Ok(AttendanceOccurrence {

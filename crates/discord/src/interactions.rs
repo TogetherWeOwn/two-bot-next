@@ -1135,7 +1135,12 @@ mod help_response_tests {
                 .as_str()
                 .expect("embed description");
             assert_eq!(description, text, "no truncation at the REST boundary");
-            let tokens: Vec<_> = description
+            // The RSVP note carries a copyable event-link example whose
+            // slashes tokenize as path fragments, not commands; exclude it
+            // from the exact-once command count.
+            let without_example =
+                description.replace("https://discord.com/events/<server-id>/<event-id>", "");
+            let tokens: Vec<_> = without_example
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
                 .filter(|token| token.starts_with('/') && token.len() > 1)
                 .collect();

@@ -135,6 +135,7 @@ pub enum HandlerId {
     FeedAdd,
     FeedRemove,
     FeedList,
+    FeedInspect,
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
@@ -415,6 +416,7 @@ impl InteractionRouter {
                 HandlerId::FeedAdd,
                 HandlerId::FeedRemove,
                 HandlerId::FeedList,
+                HandlerId::FeedInspect,
                 HandlerId::Rsvp,
                 HandlerId::RsvpAttendance,
             ] {
@@ -742,6 +744,11 @@ impl InteractionRouter {
             },
             "feed-list" => Row {
                 handler: HandlerId::FeedList,
+                gate: RowGate::Announcements,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
+            },
+            "feed-inspect" => Row {
+                handler: HandlerId::FeedInspect,
                 gate: RowGate::Announcements,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },

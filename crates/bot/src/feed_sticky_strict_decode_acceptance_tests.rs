@@ -918,7 +918,7 @@ async fn feed_list_omitted_page_lists_first_page() {
 
     assert_eq!(
         single_private_reply(&mock),
-        "`feed-keep` rss → <#3333> https://example.com/feed-keep.xml"
+        "`feed-keep` rss → <#3333> https://example.com/feed-keep.xml · Last attempt: never\nRun /feed-inspect id:<relay-id> for source and last-attempt detail."
     );
     mock.shutdown().await;
     db.close().await;
