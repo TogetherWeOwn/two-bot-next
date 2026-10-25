@@ -847,10 +847,10 @@ async fn selectors_never_bypass_staff_guild_or_live_refusal_before_reads() {
             .permissions = None;
         results.push(dispatch(db.pool().clone(), missing_authority, GUILD).await);
         let mut live_call = staff(options.clone());
-        set_guild(&mut live_call, live);
+        set_guild(&mut live_call, Some(Id::new(live)));
         results.push(dispatch(db.pool().clone(), live_call, live).await);
         let mut foreign = staff(options.clone());
-        set_guild(&mut foreign, 9999);
+        set_guild(&mut foreign, Some(Id::new(9999)));
         assert!(
             dispatch(db.pool().clone(), foreign, GUILD).await.is_empty(),
             "foreign guild ignored before REST"
@@ -1007,7 +1007,7 @@ async fn every_reply_and_refusal_path_attempts_zero_table_writes_and_no_unrelate
             .parse()
             .expect("live guild");
         let mut live_call = staff(selected(1, "play", format));
-        set_guild(&mut live_call, live);
+        set_guild(&mut live_call, Some(Id::new(live)));
         replies.push(dispatch(db.pool().clone(), live_call, live).await);
     }
     sqlx::query("ALTER TABLE game_activity_guild_aggregates RENAME TO game_mix_outage_rows")

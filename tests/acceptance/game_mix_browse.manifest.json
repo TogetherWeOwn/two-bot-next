@@ -4,7 +4,7 @@
   "baseCommit": "8c1dba5a9e9b485e57e70f3df1b29b02ad56e186",
   "branch": "test/game-mix-browse-acceptance",
   "protectedFiles": [
-    {"path": "crates/bot/src/game_mix_browse_acceptance_tests.rs", "sha256": "7519fc8437d737ccb35f2af6708477426bd43070010f9658ba565d7d6a405ece", "tests": 15}
+    {"path": "crates/bot/src/game_mix_browse_acceptance_tests.rs", "sha256": "d8985d6706a419fdfa582b4b1639416adc9b94914232c521785b9d982f9cfe70", "tests": 15}
   ],
   "registration": {"path": "crates/bot/src/command_runtime_tests.rs", "module": "game_mix_browse_acceptance_tests", "productionBehaviorChanged": false},
   "commands": {
@@ -24,7 +24,7 @@
     "greenIntegration": "Registry/help/reference and option decoder must agree. Older no-options picker pins describe the superseded selector surface, not an authorization to edit another protected handoff; coordinate a bounded oracle correction with its author if still protected. Keep all legacy data/authority/CLI controls. No production opt-in."
   },
   "observed": {
-    "behavioralRed": "UNVERIFIED: local compiling commands were refused before Cargo executed; missing compilation or zero selected tests is not RED.",
+    "behavioralRed": "UNVERIFIED: hosted candidate bfb498100374 failed compilation with three E0308 fixture argument errors, not behavioral RED. Corrected set_guild inputs to Option<Id<GuildMarker>> without changing assertions. Corrected candidate local verification was refused before Cargo; compiled RED/control evidence still required.",
     "runtime": {"exitCode": 75, "finding": "refused", "reason": "no idle, below-budget slot; no per-worktree fallback", "selectedTests": 0},
     "cliRenderer": {"attempts": 2, "exitCode": 75, "selectedTests": 0},
     "fastChecks": "PASS: cargo fmt --all -- --check; git diff --check; secret Debug guard and 23 fixtures; Docker dependency shape; 80 cache fixtures; soak checklist and 49 fixtures; 338 voice corpus validation cases and 22 fixtures; floor guard; test inventory; docs index.",
