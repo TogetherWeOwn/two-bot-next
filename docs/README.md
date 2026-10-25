@@ -1,8 +1,7 @@
 # Documentation map
 
-Link labels are one-line purposes; this is the sole discovery manifest.
-Rows use `- [Purpose](relative.md)` under area headings, including this index.
-Add a row with every new Markdown doc, including nested docs.
+This is the sole discovery manifest. Under area headings, use
+`- [Purpose](relative.md)` for every Markdown doc, including nested docs.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
 Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
@@ -139,6 +138,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Event role (design only)](event-role-spec.md)
 - [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
