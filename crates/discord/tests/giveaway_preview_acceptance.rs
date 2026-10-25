@@ -56,7 +56,14 @@ fn router(enabled: bool) -> InteractionRouter {
         configured_guild: Some(GUILD.parse().expect("fixture guild")),
         automations: enabled,
         announcements: true,
-        ..RouterGates::default()
+        scorecard: false,
+        moderation: false,
+        voice: false,
+        voice_assistant: false,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: false,
+        session_picker: false,
     })
 }
 

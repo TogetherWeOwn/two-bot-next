@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/discord/tests/giveaway_preview_acceptance.rs",
-      "sha256": "2992435e992d556d5ef98f086b5484536c5abf73e9b74ceb7788b867c78aa8c5",
+      "sha256": "fc3309bfb6c23ea4aac17d8dc8a1a456864699cb0fbea1826a4aa1ee35967233",
       "tests": 16
     }
   ],
@@ -44,7 +44,8 @@
     "compatibility": "Missing or false preview creates normally; replay publishes/audits once. Existing create, timed-draw, replay and recovery suites remain unchanged."
   },
   "observedBeforePublication": {
-    "runtime": "NOT RUN: bounded Cargo refused admission three times, exit 75, no idle below-budget slot. This is not RED and is not a compilation result.",
+    "runtime": "Initial local run refused admission three times. Original head 9f68a91e64b22640e2d8f4653dc91a9eea4e8c87 CI run 40204641962 exposed test-owned E0599 at RouterGates::default(), not behavioral RED. Corrected by an explicit gate fixture; renewed bounded Cargo attempt refused exit 75. New-head compilation and behavior-specific RED remain pending.",
+    "originalHeadControls": "Original CI rust-tests job 121202913222 logged 37 passing giveaway-related lib/bin tests before integration compilation failed. This is not a completed integration/recovery-control run.",
     "format": "PASS",
     "floorGuard": "PASS",
     "testInventory": "PASS",
