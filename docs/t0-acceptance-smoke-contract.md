@@ -92,7 +92,7 @@ routing proof `crates/discord/tests/top5_reply_fixtures.rs:196-213`.
 | `/lfg` | `Lfg` | `Manage Events` (`8589934592`) |
 | `/ban` | `Moderation(Ban)` | `Ban Members` (`4`) |
 
-Permission bits: `crates/core/src/commands.rs:233-239`. Open-command proof
+Permission bits: `crates/core/src/commands.rs:240-246`. Open-command proof
 (`rank`/`leaderboard`/`rsvp` route with zero bits):
 `crates/discord/tests/top5_reply_fixtures.rs:216-237`.
 Permission-gate proof (`lfg`/`ban` refuse at 0, route with the bit):

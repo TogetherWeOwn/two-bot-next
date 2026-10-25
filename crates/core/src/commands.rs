@@ -57,6 +57,13 @@ pub const STICKY_DEBOUNCE_DEFAULT_SECONDS: i64 = 5;
 /// limit. Builders advertise it via `max_length`; `crate::rsvp` refuses
 /// longer IDs before any record operation.
 pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
+/// `/rsvp` + `/rsvp-attendance` `event-id` bound (UTF-16 units, the same
+/// shared bound as occurrences): the event id itself or a pasted
+/// `https://discord.com/events/` link, optionally `<...>`-wrapped. The
+/// longest such link (20-digit guild + 20-digit event) is 68 units, far under
+/// the bound; builders advertise it via `max_length`, and anything longer
+/// refuses as an invalid id before any lookup or write.
+pub const EVENT_REFERENCE_MAX_CHARS: usize = 128;
 /// Maximum user-supplied resource ID or prefix accepted by an admin command.
 pub const MAX_RESOURCE_ID_CHARS: usize = 128;
 

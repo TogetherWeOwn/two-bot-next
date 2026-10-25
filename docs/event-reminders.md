@@ -11,6 +11,15 @@ but the closed outbound mention policy suppresses notifications. Event-controlle
 mass mentions are neutralized. No attendee list, event name or message content is
 written to reminder logs or audit records.
 
+When the complete attendee list cannot fit in one 2,000-UTF-16-unit message, or
+the roster exceeds the RSVP bound, the channel still gets exactly one bounded
+fallback notice instead of silence: the event name, the attendee count, the
+start time and the event link, with no mentions and never a partial roster.
+The count covers all Going and Interested RSVPs, even when the stored roster
+exceeds the 1,001-member read cap; declined RSVPs do not count. The scheduler
+revalidates that total alongside the capped member list before admission. The
+fallback counts as the event's one delivery attempt.
+
 The existing activation-fenced automation scheduler must be enabled; its normal
 15-second cadence also handles these reminders, at most two events per tick.
 Ordinary scheduled messages run first: a failure that stops their batch also
@@ -30,8 +39,9 @@ This is a best-effort reminder, not a delivery guarantee. Each guild/event gets
 or a lost success reply. Database trouble before admission sends nothing. A
 refusal, rate limit, uncertain result or crash after admission can leave no
 reminder; the next tick does not repost. An event whose attendees cannot all fit
-in one 2,000-UTF-16-unit message is skipped rather than partially naming people
-or splitting the reminder into a burst.
+in one 2,000-UTF-16-unit message gets the bounded fallback notice described
+above, never a partial roster or a burst of messages. Events with invalid ids
+still fail closed with no post.
 
 The immutable `rsvp.reminder_attempt` fact in `automation_audit_log` is the
 pre-wire uncertainty fence, following the existing scheduler and text-command
