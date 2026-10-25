@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Test-only RED-first game-mix browsing candidate; not an implementation and not eligible to merge into main.",
+  "baseCommit": "8c1dba5a9e9b485e57e70f3df1b29b02ad56e186",
+  "branch": "test/game-mix-browse-acceptance",
+  "protectedFiles": [
+    {"path": "crates/bot/src/game_mix_browse_acceptance_tests.rs", "sha256": "7519fc8437d737ccb35f2af6708477426bd43070010f9658ba565d7d6a405ece", "tests": 15}
+  ],
+  "registration": {"path": "crates/bot/src/command_runtime_tests.rs", "module": "game_mix_browse_acceptance_tests", "productionBehaviorChanged": false},
+  "commands": {
+    "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot game_mix_browse_acceptance_tests -- --nocapture --test-threads=1",
+    "unchangedRuntimeControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot game_mix_acceptance_tests -- --nocapture --test-threads=1",
+    "unchangedContentControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot game_mix_content_acceptance_tests -- --nocapture --test-threads=1",
+    "cliRendererControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test game_activity_report_render -- --nocapture",
+    "cliProcessControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test game_activity_report_cli -- --nocapture --test-threads=1"
+  },
+  "database": {"guard": "two_bot_testsupport::TestDatabase", "missingEnvironment": "Fails fixture setup, never reports skipped/zero-test work as RED.", "ciRoute": "check.yml workspace lib/bins unit step supplies the authorized disposable database and executes the registered module.", "effects": "Owned disposable databases and loopback Discord only; no staging/production access."},
+  "contract": {
+    "selectors": "Optional page integer with published finite positive bounds; sort play|voice; format json|summary. Ten complete rows per page except the last. Defaults: page 1, play, json.",
+    "compatibility": "Optionless JSON and the operator CLI remain unchanged. JSON metadata layout, prose layout, label-shortening algorithm and ascending/descending lexical full-tie direction are not pinned.",
+    "coverage": "0/1/10/12/13/105 rows; all pages; differing play/voice order; full ties; independent legacy golden; readable exact second durations including BIGINT hours; supplementary Unicode/control/fence/mention/escaping safety and whole-content UTF-16 budget; foreign guilds; malformed/duplicate/unknown/type-confused selectors; empty/out-of-range/outage distinction.",
+    "spies": "Volatile aggregate predicate with positive read control; empty set-returning member-table readers with a positive COUNT control; statement triggers plus a nontransactional sequence detect even zero-row/rolled-back writes; REST capture permits only private callback and optional original-message edit.",
+    "limits": "Tests use unchanged snapshots, not concurrent snapshot guarantees. No new date window or collector. Probe counts are not query-count or storage-reader-bound oracles.",
+    "greenIntegration": "Registry/help/reference and option decoder must agree. Older no-options picker pins describe the superseded selector surface, not an authorization to edit another protected handoff; coordinate a bounded oracle correction with its author if still protected. Keep all legacy data/authority/CLI controls. No production opt-in."
+  },
+  "observed": {
+    "behavioralRed": "UNVERIFIED: local compiling commands were refused before Cargo executed; missing compilation or zero selected tests is not RED.",
+    "runtime": {"exitCode": 75, "finding": "refused", "reason": "no idle, below-budget slot; no per-worktree fallback", "selectedTests": 0},
+    "cliRenderer": {"attempts": 2, "exitCode": 75, "selectedTests": 0},
+    "fastChecks": "PASS: cargo fmt --all -- --check; git diff --check; secret Debug guard and 23 fixtures; Docker dependency shape; 80 cache fixtures; soak checklist and 49 fixtures; 338 voice corpus validation cases and 22 fixtures; floor guard; test inventory; docs index.",
+    "notRun": "Rust workspace tests, clippy and CLI/runtime controls require admitted cache or hosted CI. No cache fallback used."
+  },
+  "handoff": "Candidate only until an actual compiled behavior-specific RED and unchanged controls are observed. Builder remains blocked. Preserve protected bytes; return oracle defects to their author. Do not merge an intentionally failing test-only PR."
+}
