@@ -1,14 +1,14 @@
 # Documentation map
 
-Sole Markdown manifest (nested docs and this index too).
+All Markdown docs, including this index.
 Under area headings: `- [Purpose](relative.md)`.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
 Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
 Else exit 1: fix rows or split oversized docs.
 Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Budgets: index <12,000 bytes; others ≤65,536. Legacy exceptions and reasons:
+`LARGE_DOCS` in `scripts/check_docs_index.py`.
 
 ## References and architecture
 
@@ -124,6 +124,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [LFG voice (design only)](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
+- [Title filters (design only)](feed-title-filter-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Staff game mix report](game-activity-report.md)
