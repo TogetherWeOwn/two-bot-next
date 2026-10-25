@@ -9,8 +9,9 @@
 //! shrinking it, a two-winner single reroll keeps the full winner set, a
 //! corrupt row holds its claim while later-due rows still draw, and a
 //! refused or pending entry message never wedges the winners post. The
-//! store-level pin for the atomic reroll reopen lives in
-//! `crates/core/tests/giveaway_store.rs`.
+//! reroll recovery pin also checks that the interaction reopens the pending
+//! marker before a refused winners post; the store-level atomicity pin lives
+//! in `crates/core/tests/giveaway_store.rs`.
 
 #[allow(dead_code)]
 mod common;
@@ -25,7 +26,9 @@ use common::{MockRest, RestRequest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::{Pool, Postgres, Row};
 use twilight_model::application::interaction::Interaction;
-use two_bot_core::{commands::PERM_MANAGE_GUILD, ClassifierConfig, InteractionRouter, RouterGates};
+use two_bot_core::{
+    commands::PERM_MANAGE_GUILD, giveaway_store, ClassifierConfig, InteractionRouter, RouterGates,
+};
 use two_bot_discord::{
     giveaway::GiveawayJobError, interactions::InteractionRuntime, ActionExecutor,
 };
@@ -148,7 +151,23 @@ async fn start_mock(
     members: HashMap<String, MemberAnswer>,
     fail_edits: Arc<AtomicBool>,
 ) -> MockRest {
+    start_mock_with_post_failure(members, fail_edits, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Refuse only channel posts, not the interaction callback, response edit,
+/// or entry-message edit. Toggle after round zero has actually announced.
+async fn start_mock_with_post_failure(
+    members: HashMap<String, MemberAnswer>,
+    fail_edits: Arc<AtomicBool>,
+    fail_posts: Arc<AtomicBool>,
+) -> MockRest {
     MockRest::with_responder(move |request: &RestRequest| {
+        if request.method == "POST"
+            && request.path == channel_path()
+            && fail_posts.load(Ordering::SeqCst)
+        {
+            return ScriptedResponse::status(403);
+        }
         if request.path.contains("/interactions/") {
             return ScriptedResponse::status(204);
         }
@@ -436,6 +455,163 @@ async fn single_reroll_on_two_winners_keeps_the_full_set() {
         "the kept winner stays a valid reroll target"
     );
     assert_eq!(third[2].winners.len(), 2);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn reroll_reopens_pending_announcement_and_recovers_the_stored_round() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    let fail_posts = Arc::new(AtomicBool::new(false));
+    let mock = start_mock_with_post_failure(HashMap::new(), live_edits(), fail_posts.clone()).await;
+    let gid = create_giveaway(fixture.pool(), &mock, 601, "Reroll Recovery Prize", 60, 1).await;
+    enter(fixture.pool(), &mock, 602, ALICE, &gid).await;
+    enter(fixture.pool(), &mock, 603, BOB, &gid).await;
+    let end = slash(
+        604,
+        MOD,
+        "giveaway",
+        PERM_MANAGE_GUILD,
+        id_options("end", &gid),
+    );
+    handled(fixture.pool(), &mock, &end, "end").await;
+    let first = draw_rows(fixture.pool(), &gid).await;
+    assert_eq!(first.len(), 1);
+    assert!(
+        giveaway_row(fixture.pool(), &gid).await.announced,
+        "round zero must be announced so its stamp cannot hide a lost reroll"
+    );
+    assert!(giveaway_store::list_unannounced(fixture.pool(), GUILD, 25)
+        .await
+        .expect("initial recovery sweep")
+        .is_empty());
+
+    let before_reroll = mock.requests().len();
+    fail_posts.store(true, Ordering::SeqCst);
+    let reroll = slash(
+        605,
+        MOD,
+        "giveaway",
+        PERM_MANAGE_GUILD,
+        id_options("reroll", &gid),
+    );
+    handled(fixture.pool(), &mock, &reroll, "reroll with refused post").await;
+    let pending_draws = draw_rows(fixture.pool(), &gid).await;
+    assert_eq!(
+        pending_draws.len(),
+        2,
+        "reroll commits despite the refused post"
+    );
+    assert_eq!(pending_draws[0], first[0], "round zero stays intact");
+    assert_eq!(pending_draws[1].draw_no, 1);
+    assert_eq!(pending_draws[1].reroll_kind.as_deref(), Some("full"));
+    assert!(
+        !giveaway_row(fixture.pool(), &gid).await.announced,
+        "the command must reopen the marker, not retain round zero's stamp"
+    );
+    let pending = giveaway_store::list_unannounced(fixture.pool(), GUILD, 25)
+        .await
+        .expect("pending reroll recovery sweep");
+    assert_eq!(pending.len(), 1, "the refused reroll remains recoverable");
+    assert_eq!(pending[0].id, gid);
+    let requests = mock.requests();
+    let refused_post = requests[before_reroll..]
+        .iter()
+        .find(|request| request.method == "POST" && request.path == channel_path())
+        .expect("reroll attempted the winners post");
+    assert!(
+        String::from_utf8_lossy(&refused_post.body).contains(&pending_draws[1].seed),
+        "the refused post belongs to the newly stored round"
+    );
+    let refused_body = refused_post.body.clone();
+
+    // A fresh runtime represents restart: only durable rows carry recovery.
+    let before_recovery = requests.len();
+    fail_posts.store(false, Ordering::SeqCst);
+    let summary = runtime(fixture.pool(), &mock)
+        .tick_giveaways()
+        .await
+        .expect("retry the stored reroll announcement");
+    assert_eq!(summary.drawn, 0, "recovery must never draw another round");
+    assert_eq!(summary.announced, 1);
+    assert_eq!(
+        draw_rows(fixture.pool(), &gid).await,
+        pending_draws,
+        "recovery preserves both rounds, their seeds and their winners"
+    );
+    assert!(giveaway_row(fixture.pool(), &gid).await.announced);
+    assert!(giveaway_store::list_unannounced(fixture.pool(), GUILD, 25)
+        .await
+        .expect("settled recovery sweep")
+        .is_empty());
+    let recovered_requests = mock.requests();
+    let posts: Vec<_> = recovered_requests[before_recovery..]
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == channel_path())
+        .collect();
+    assert_eq!(posts.len(), 1, "recovery delivers one winners post");
+    assert_eq!(
+        posts[0].body, refused_body,
+        "recovery replays the stored announcement"
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn invalid_requirements_hold_the_claim_while_later_rows_draw() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    let mock = start_mock(HashMap::new(), live_edits()).await;
+    let broken = create_giveaway(
+        fixture.pool(),
+        &mock,
+        701,
+        "Damaged Requirements Prize",
+        60,
+        1,
+    )
+    .await;
+    enter(fixture.pool(), &mock, 702, ALICE, &broken).await;
+    let healthy = create_giveaway(
+        fixture.pool(),
+        &mock,
+        703,
+        "Valid Requirements Prize",
+        60,
+        1,
+    )
+    .await;
+    enter(fixture.pool(), &mock, 704, BOB, &healthy).await;
+    force_due(fixture.pool(), &broken, 2).await;
+    force_due(fixture.pool(), &healthy, 1).await;
+    sqlx::query(
+        "UPDATE giveaways SET requirements_json = '{\"roles\":\"damaged\"}'::jsonb \
+         WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(GUILD)
+    .bind(&broken)
+    .execute(fixture.pool())
+    .await
+    .expect("damage requirements without changing the valid nonce");
+    let outcome = runtime(fixture.pool(), &mock).tick_giveaways().await;
+    assert!(
+        matches!(outcome, Err(GiveawayJobError::Announce)),
+        "damaged requirements fail the tick loudly: {outcome:?}"
+    );
+    assert!(draw_rows(fixture.pool(), &broken).await.is_empty());
+    assert!(
+        giveaway_row(fixture.pool(), &broken).await.claim_open,
+        "the invalid-requirements branch retains its claim until lease expiry"
+    );
+    let healthy_draws = draw_rows(fixture.pool(), &healthy).await;
+    assert_eq!(healthy_draws.len(), 1, "later due rows are not starved");
+    assert_eq!(healthy_draws[0].winners, vec![BOB.to_owned()]);
+    assert!(
+        giveaway_row(fixture.pool(), &healthy).await.announced,
+        "the later-due giveaway still announces in the same tick"
+    );
     fixture.close().await;
 }
 
