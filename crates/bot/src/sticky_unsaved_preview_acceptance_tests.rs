@@ -189,6 +189,30 @@ async fn maximum_valid_unicode_preview_is_bounded_and_explicitly_truncated() {
     assert_preview(&text, 5);
 }
 
+// Catches dropping proposed mentions or leaving them active; short input cannot
+// accidentally satisfy the mention-safety oracle merely by being truncated.
+#[tokio::test]
+async fn short_preview_neutralizes_mentions_without_dropping_proposed_content() {
+    let text = answer(&proposed(
+        "before @everyone @here <@123456789012345678> <@&234567890123456789> after",
+        None,
+        Some(true),
+    ))
+    .await;
+    assert_preview(&text, 5);
+    for retained in [
+        "before",
+        "everyone",
+        "here",
+        "123456789012345678",
+        "234567890123456789",
+        "after",
+    ] {
+        assert!(text.contains(retained), "preserve proposed content: {text}");
+    }
+    assert!(!text.to_lowercase().contains("truncat"));
+}
+
 fn malformed() -> Vec<Interaction> {
     let mut inputs = Vec::new();
     for value in [
@@ -265,10 +289,17 @@ async fn preview_obeys_existing_authority_and_activation_fences() {
         }
         let (runtime, mock) = closed_runtime(router_gates, router_gates.automations).await;
         runtime.on_interaction(&input).await;
-        let text = private_reply(&mock);
-        assert!(!text.contains("private proposed sentinel"));
-        assert!(!text.contains("Preview — not saved"));
-        assert_ne!(text, STICKY_STORE_FAILURE_REPLY);
+        if matches!(case, 2 | 3) {
+            assert!(
+                mock.requests().is_empty(),
+                "foreign and missing guilds retain the existing silent fence"
+            );
+        } else {
+            let text = private_reply(&mock);
+            assert!(!text.contains("private proposed sentinel"));
+            assert!(!text.contains("Preview — not saved"));
+            assert_ne!(text, STICKY_STORE_FAILURE_REPLY);
+        }
         mock.shutdown().await;
     }
 }
@@ -450,7 +481,11 @@ async fn valid_invalid_and_forged_preview_attempt_zero_store_operations() {
                         before,
                         "no audit, sticky, claim, fence or job mutation"
                     );
-                    private_reply(&mock);
+                    if input.guild_id == Some(Id::new(GUILD)) {
+                        private_reply(&mock);
+                    } else {
+                        assert!(mock.requests().is_empty(), "foreign-guild silent fence");
+                    }
                     drop(runtime);
                     pool.close().await;
                     mock.shutdown().await;
@@ -501,6 +536,9 @@ async fn control_omitted_false_save_and_invalid_save_keep_existing_semantics() {
                 (None, "café 😀", None, 5_i32),
                 (Some(false), "other proposed body", Some(300), 300),
             ] {
+                if preview == Some(false) {
+                    seed(db, true).await;
+                }
                 let (runtime, mock, pool, calls) = observed_runtime(db).await;
                 runtime
                     .on_interaction(&proposed(body, debounce, preview))
@@ -517,6 +555,13 @@ async fn control_omitted_false_save_and_invalid_save_keep_existing_semantics() {
                 pool.close().await;
                 mock.shutdown().await;
             }
+            let recovery: (bool, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT delivery_uncertain, claim_token, last_message_id FROM sticky_messages",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("false save resets uncertainty independently of preview RED");
+            assert_eq!(recovery, (false, None, Some(OLD.into())));
             let before = snapshot(db.pool()).await;
             let (runtime, mock, pool, calls) = observed_runtime(db).await;
             runtime
