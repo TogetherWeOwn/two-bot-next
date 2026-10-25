@@ -77,6 +77,11 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "/{} permission row drifted from the permission table",
             row.command
         );
+        assert_eq!(
+            row.parity_row, table.parity_row,
+            "/{} parity row drifted from the permission table",
+            row.command
+        );
         assert!(
             !def.dm_permission,
             "/{} must stay guild-only (dm_permission false)",

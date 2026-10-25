@@ -611,7 +611,9 @@ mod tests {
             text in proptest::collection::vec(any::<char>(), 0..128)
                 .prop_map(|chars| chars.into_iter().collect::<String>()),
         ) {
-            let expected_id = (17..=20).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
+            let expected_id = (17..=20).contains(&text.len())
+                && text.bytes().all(|b| b.is_ascii_digit())
+                && text.parse::<u64>().is_ok_and(|id| id != 0);
             prop_assert_eq!(validate_event_id(&text).is_ok(), expected_id);
             if let Ok(id) = validate_event_id(&text) {
                 prop_assert_eq!(validate_event_id(&id), Ok(id));
@@ -625,8 +627,10 @@ mod tests {
             digits in "[0-9]{0,23}",
             status in prop::sample::select(RsvpStatus::ALL.to_vec()),
         ) {
-            prop_assert_eq!(validate_event_id(&digits).is_ok(), (17..=20).contains(&digits.len()));
-            if (17..=20).contains(&digits.len()) {
+            let expected = (17..=20).contains(&digits.len())
+                && digits.parse::<u64>().is_ok_and(|id| id != 0);
+            prop_assert_eq!(validate_event_id(&digits).is_ok(), expected);
+            if expected {
                 prop_assert_eq!(validate_event_id(&digits), Ok(digits));
             }
             prop_assert_eq!(RsvpStatus::parse(&status.to_string()), Ok(status));
@@ -680,10 +684,95 @@ mod tests {
             validate_event_id(&"9".repeat(21)),
             Err(RsvpError::InvalidEventId)
         );
-        // 17-digit lower bound and 20-digit upper bound both pass.
+        // 17-digit lower bound passes; the 20-digit shape passes only when it
+        // fits a nonzero u64 (all-zero and overflowing shapes refuse).
         assert!(validate_event_id(&"1".repeat(17)).is_ok());
-        assert!(validate_event_id(&"9".repeat(20)).is_ok());
+        assert_eq!(
+            validate_event_id(&"9".repeat(20)),
+            Err(RsvpError::InvalidEventId)
+        );
+        assert_eq!(
+            validate_event_id("18446744073709551615"),
+            Ok("18446744073709551615".to_owned())
+        );
+        assert_eq!(
+            validate_event_id("18446744073709551616"),
+            Err(RsvpError::InvalidEventId)
+        );
+        assert_eq!(
+            validate_event_id("00000000000000000"),
+            Err(RsvpError::InvalidEventId)
+        );
         assert!(!is_snowflake("1234567890123456x"));
+    }
+
+    #[test]
+    fn event_links_normalize_to_the_invoking_guild_event() {
+        let link = format!("https://discord.com/events/{GUILD}/{EVENT}");
+        assert_eq!(normalize_event_link(&link, GUILD), Some(EVENT.to_owned()));
+        assert_eq!(
+            normalize_event_link(&format!("<{link}>"), GUILD),
+            Some(EVENT.to_owned())
+        );
+        // Non-links fall through to the numeric / ID:label parsers.
+        assert_eq!(normalize_event_link(EVENT, GUILD), None);
+        assert_eq!(
+            normalize_event_link(&format!("{EVENT}:weekly"), GUILD),
+            None
+        );
+        assert_eq!(normalize_event_link("", GUILD), None);
+    }
+
+    #[test]
+    fn event_link_refusals_stay_literal_and_guild_bound() {
+        let link = format!("https://discord.com/events/{GUILD}/{EVENT}");
+        let foreign = "1545644954272137001";
+        let overflow = "18446744073709551616";
+        for not_a_link in [
+            format!("https://discord.com/events/{foreign}/{EVENT}"),
+            link.replacen("https:", "http:", 1),
+            link.replacen("discord.com", "discordapp.com", 1),
+            link.replacen("discord.com", "www.discord.com", 1),
+            link.replacen("discord.com", "discord.com.evil.example", 1),
+            link.replacen("discord.com", "user@discord.com", 1),
+            link.replacen("discord.com", "discord.com:443", 1),
+            link.replacen("discord.com", "discord.com.", 1),
+            format!("{link}?x=1"),
+            format!("{link}#frag"),
+            format!("{link}/"),
+            format!("{link}/extra"),
+            format!("https://discord.com/events//{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/../{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/%31{EVENT}"),
+            format!("https://discord.com/events/{GUILD}\\{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/{overflow}"),
+            format!("https://discord.com/events/{overflow}/{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/00000000000000000"),
+            format!("https://discord.com/events/{GUILD}/1234567890123456"),
+            format!("<{link}"),
+            format!("{link}>"),
+            format!("<<{link}>>"),
+            format!("[event]({link})"),
+            format!("{link}\n{link}"),
+            "HTTPS://discord.com/events/".to_owned() + GUILD + "/" + EVENT,
+            format!(" {link} "),
+        ] {
+            assert_eq!(
+                normalize_event_link(&not_a_link, GUILD),
+                None,
+                "{not_a_link:?} is not a link"
+            );
+        }
+    }
+
+    #[test]
+    fn link_confirmation_keeps_the_status_sentence_and_names_the_event() {
+        assert_eq!(
+            rsvp_saved_text_with_event(RsvpStatus::Going, EVENT),
+            format!("RSVP saved: going. Event `{EVENT}`.")
+        );
+        // Raw numeric confirmations stay byte-identical.
+        assert_eq!(rsvp_saved_text(RsvpStatus::Going), "RSVP saved: going.");
     }
 
     #[test]
