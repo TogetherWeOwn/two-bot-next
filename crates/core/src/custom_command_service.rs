@@ -11,8 +11,8 @@ use crate::automation_transfer::{diff_import, ImportOutcome, ParsedImport};
 use crate::custom_command_store as store;
 use crate::custom_commands::{
     adjudicate_delete, adjudicate_put, check_capacity, error_code, require_automations_enabled,
-    reserved_command_names, validate_put_input, AuditRecord, CommandError, DeleteDecision,
-    PutCommandInput, PutDecision, StoredCommand,
+    reserved_command_names, validate_put_input, AuditRecord, CloneCommandInput, CommandError,
+    DeleteDecision, PutCommandInput, PutDecision, StoredCommand,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +21,10 @@ pub enum ServiceError {
     Validation(#[from] CommandError),
     #[error("That text trigger is already assigned to another command.")]
     TriggerInUse,
+    #[error("No saved source command found in this server.")]
+    SourceNotFound,
+    #[error("Destination command already exists. Choose a new name; cloning never overwrites.")]
+    DestinationExists,
     #[error("Custom-command storage failed.")]
     Storage(#[from] sqlx::Error),
 }
@@ -80,6 +84,77 @@ pub async fn put(
     store::audit(&mut *tx, &decision.audit, audit_id, at).await?;
     tx.commit().await?;
     Ok(decision)
+}
+
+/// Clone into a new same-guild name. The source and its execution history are
+/// read-only; the unique trigger is deliberately omitted. All checks, the
+/// create-only INSERT and content-free audit share the existing guild lock.
+pub async fn clone_command(
+    pool: &PgPool,
+    enabled: bool,
+    guild: &str,
+    actor: &str,
+    input: &CloneCommandInput,
+    audit_id: &str,
+    at: &str,
+) -> Result<StoredCommand, ServiceError> {
+    require_automations_enabled(enabled)?;
+    let builtins = reserved_command_names();
+    let source = normalized_clone_name(&input.source, &builtins)?;
+    let destination = normalized_clone_name(&input.destination, &builtins)?;
+    let mut tx = pool.begin().await?;
+    store::lock_command_capacity(&mut tx, guild).await?;
+    let source = store::get_command(&mut *tx, guild, &source)
+        .await?
+        .ok_or(ServiceError::SourceNotFound)?;
+    if store::get_command(&mut *tx, guild, &destination)
+        .await?
+        .is_some()
+    {
+        return Err(ServiceError::DestinationExists);
+    }
+    let rows = store::list_commands(&mut *tx, guild).await?;
+    let definition = PutCommandInput {
+        name: destination.clone(),
+        description: source.description.clone(),
+        template: source.template.clone(),
+        text_trigger: None,
+    };
+    validate_put_input(&definition, &builtins)?;
+    check_capacity(rows.len(), true, builtins.len())?;
+    let row = StoredCommand {
+        guild_id: guild.to_owned(),
+        name: destination,
+        description: source.description,
+        template: source.template,
+        text_trigger: None,
+        enabled: source.enabled,
+    };
+    // An old writer may not honor the guild lock. Never fall back to the put
+    // upsert when it wins the destination key after our absent-name check.
+    if !store::create_command(&mut *tx, &row, actor, at).await? {
+        return Err(ServiceError::DestinationExists);
+    }
+    store::audit(
+        &mut *tx,
+        &AuditRecord::put(guild, actor, &row.name, true),
+        audit_id,
+        at,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+fn normalized_clone_name(name: &str, reserved: &HashSet<String>) -> Result<String, CommandError> {
+    let name = name.to_lowercase();
+    if !crate::leveling::valid_command_name(&name) {
+        return Err(CommandError::InvalidName);
+    }
+    if reserved.contains(&name) {
+        return Err(CommandError::ReservedName(name));
+    }
+    Ok(name)
 }
 
 pub async fn delete(

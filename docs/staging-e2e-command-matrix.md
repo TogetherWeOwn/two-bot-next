@@ -9,9 +9,9 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 35 built-in slash commands (core + scorecard + automation +
+Scope: 36 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 56). No guild was
+the voice set; with the voice gates on it renders 57). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -42,6 +42,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
 | 16 | `/command-list` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral custom-command list | `AutomationsDisabled`, `ManageServerRequired` |
 | 33 | `/command-inspect` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then one private content-only view (summary, saved template, or rendered preview); no send, registration, cooldown, mutation or run audit | `AutomationsDisabled`, `ManageServerRequired`, `name` required, `view` summary/template/preview, `arguments` ≤500 |
+| 39 | `/command-clone` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral saved-state confirmation, atomic create-only clone plus content-free audit, full-registry publication; committed save reported separately from picker failure | `AutomationsDisabled`, `ManageServerRequired`, required `source`/`destination` ≤32, valid nonreserved names, absent destination, valid saved template/description, capacity including disabled rows |
 | 17 | `/schedule` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then completion; one timing option required | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `in-minutes` 1–525600, `every-minutes` 60–525600 |
 | 18 | `/schedule-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `id` required |
 | 19 | `/schedule-list` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral schedule list | `AutomationsDisabled`, `ManageServerRequired` |
@@ -77,7 +78,7 @@ unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 35-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 36-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

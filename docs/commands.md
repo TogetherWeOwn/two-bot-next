@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 56.
+Built-in commands: 57.
 
 ## `/access`
 
@@ -116,6 +116,18 @@ Define or replace a custom command
 | `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
 | `description` | string | false | — | — | 100 | — | Shown in the command picker |
 | `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
+
+## `/command-clone`
+
+Clone a saved custom command under a new name
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `source` | string | true | — | — | 32 | — | Saved source command name, a-z 0-9 _ - |
+| `destination` | string | true | — | — | 32 | — | New absent destination name, a-z 0-9 _ - |
 
 ## `/command-inspect`
 

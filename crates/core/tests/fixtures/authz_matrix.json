@@ -40,6 +40,7 @@
     {"name": "command-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "command-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "command-inspect", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "command-clone", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},

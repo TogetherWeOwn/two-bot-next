@@ -684,12 +684,14 @@ impl InteractionRouter {
                 gate: RowGate::Scorecard,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
-            "command" | "command-remove" | "command-list" | "command-inspect" | "schedule"
-            | "schedule-remove" | "schedule-list" | "sticky" | "sticky-remove" => Row {
-                handler: HandlerId::AutomationAdmin,
-                gate: RowGate::Automations,
-                permission_refusal: Some(RouterRefusal::ManageServerRequired),
-            },
+            "command" | "command-remove" | "command-list" | "command-inspect" | "command-clone"
+            | "schedule" | "schedule-remove" | "schedule-list" | "sticky" | "sticky-remove" => {
+                Row {
+                    handler: HandlerId::AutomationAdmin,
+                    gate: RowGate::Automations,
+                    permission_refusal: Some(RouterRefusal::ManageServerRequired),
+                }
+            }
             "giveaway" => Row {
                 handler: HandlerId::Giveaway,
                 gate: RowGate::Automations,
@@ -981,6 +983,7 @@ mod tests {
             ("command-remove", HandlerId::AutomationAdmin),
             ("command-list", HandlerId::AutomationAdmin),
             ("command-inspect", HandlerId::AutomationAdmin),
+            ("command-clone", HandlerId::AutomationAdmin),
             ("schedule", HandlerId::AutomationAdmin),
             ("schedule-remove", HandlerId::AutomationAdmin),
             ("schedule-list", HandlerId::AutomationAdmin),
@@ -996,7 +999,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 35, "all 35 handler-owned builtins covered");
+        assert_eq!(cases.len(), 36, "all 36 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1578,9 +1581,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 10 automation + 8 announcement + 9 mutations
-        // + 2 reads + 1 custom = 36, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 36);
+        // 5 core + 1 scorecard + 11 automation + 8 announcement + 9 mutations
+        // + 2 reads + 1 custom = 37, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 37);
         assert_eq!(
             &names[..6],
             [
@@ -1593,18 +1596,19 @@ mod tests {
             ]
         );
         assert_eq!(names[9], "command-inspect");
-        assert_eq!(&names[14..17], ["sticky-remove", "giveaway", "rsvp"]);
+        assert_eq!(names[10], "command-clone");
+        assert_eq!(&names[15..18], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[24..33],
+            &names[25..34],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[33..35], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[35], "faq");
+        assert_eq!(&names[34..36], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[36], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1767,7 +1771,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 35);
+        assert_eq!(off.len(), 36);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1777,16 +1781,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 35 builtins keep their order; the 21 voice names that survive
+        // 36 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 56);
-        assert_eq!(on_names[..35], off_names[..]);
+        assert_eq!(on.len(), 57);
+        assert_eq!(on_names[..36], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[35..], expected[..]);
+        assert_eq!(on_names[36..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1847,13 +1851,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 35
+        // Both gates on is the full voice set without the assistant: 36
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 56);
+        assert_eq!(both.len(), 57);
     }
 
     #[test]

@@ -66,8 +66,8 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 38 rows (35 retained builtins — the 27 legacy ones plus the Next-only
-`/help`, `/privacy`, `/command-inspect`, `/reopen`, `/purge-preview`,
+all 39 rows (36 retained builtins — the 27 legacy ones plus the Next-only
+`/help`, `/privacy`, `/command-inspect`, `/command-clone`, `/reopen`, `/purge-preview`,
 `/channel-inspect`, `/giveaway` and `/lfg-list` — the dropped rota command, custom slash commands,
 and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
@@ -123,6 +123,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `giveaway` | docs/parity.md §1 giveaway | Add the Next-only `/giveaway` timed-entry command (no legacy counterpart): automations-gated, ManageGuild, guild-only. `create` takes `prize` (required string, `max_length` 200, matching the domain cap), `duration` (1–43200 minutes) and `winners` (1–100) plus optional `required-role`, `min-account-age-days` and `min-server-age-days` (0–3650); `list` takes no options; `cancel` takes `id` (required string, `max_length` 64). |
 | `command-inspect` | docs/parity.md §1 command-inspect | Add the Next-only `/command-inspect` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published after `command-list`. Required `name` (≤32), optional `view` choice (summary/template/preview, summary by default) and optional `arguments` sample (≤500 UTF-16 units, ignored by the four-variable template language). One private ephemeral content-only view per call — metadata summary, saved template, or rendered preview — with Markdown-escaped untrusted text and explicit truncation markers; never a channel send, registration, cooldown/claim touch, definition mutation or `command.run` fact. |
 
+| `command-clone` | docs/parity.md §1 command-clone | Add the Next-only `/command-clone` management command (no legacy counterpart): automation-gated, guild-only, ManageGuild, published immediately after `command-inspect`. Required string `source` and `destination` (each ≤32) name a saved response and a new absent destination. Create-only, same-guild clone copies template, description and saved enabled state, omits the unique text trigger, and uses fresh actor provenance. Source/history/replay fences stay unchanged. Private confirmation distinguishes a committed save from failed full-registry publication. |
 | `purge-preview` | docs/parity.md §1 purge-preview | Add the Next-only staff-private purge sample, appended after `unlock`: moderation-gated, guild-only, ManageMessages, one required integer `count` (1–100), no reason. Shares execution's pin/own-bot filtering and bulk/single age planner; never deletes or writes audit/claim/lease state. |
 | `channel-inspect` | docs/parity.md §1 channel-inspect | Add the Next-only staff-private channel restriction snapshot after `purge-preview`: moderation-gated, guild-only, ManageChannels, no options. Saved lockdown plus live slowmode; explicit unknown setter/time where unavailable, no state mutation. |
 

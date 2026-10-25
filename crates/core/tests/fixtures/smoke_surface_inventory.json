@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 35,
+  "count": 36,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -368,6 +368,39 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Read-only but needs a named DB-backed custom row to inspect, which the no-DB offline rule excludes; covered by the disposable-database acceptance instead."
+    },
+    {
+      "name": "command-clone",
+      "description": "Clone a saved custom command under a new name",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "source",
+          "description": "Saved source command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        },
+        {
+          "name": "destination",
+          "description": "New absent destination name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "State-mutating create-only copy into a new saved row; pinned by the disposable-database acceptance rather than the live smoke five."
     },
     {
       "name": "schedule",

@@ -252,6 +252,21 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "command-clone",
+            39,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then saved-state confirmation; create-only clone without text trigger. Republish the full registry; report committed saves separately from publication failures.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:source:required",
+                "Valid:destination:required",
+            ],
+        ),
+        row(
             "schedule",
             17,
             E2eGate::Automations,

@@ -153,6 +153,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 38] = [
     row(15, "command-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(16, "command-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(39, "command-clone", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),

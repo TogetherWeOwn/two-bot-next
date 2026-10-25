@@ -168,6 +168,27 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
         ]),
+        CommandDefinition::new(
+            "command-clone",
+            "Clone a saved custom command under a new name",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "source",
+                "Saved source command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+            CommandOption::new(
+                "destination",
+                "New absent destination name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+        ]),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
@@ -541,7 +562,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
-        assert_eq!(automation_commands().len(), 10);
+        assert_eq!(automation_commands().len(), 11);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -550,6 +571,7 @@ mod tests {
                 "command-remove",
                 "command-list",
                 "command-inspect",
+                "command-clone",
                 "schedule",
                 "schedule-remove",
                 "schedule-list",
@@ -571,8 +593,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 10 automation + 8 announcement.
-        assert_eq!(merged.len(), 24);
+        // 5 core + 1 scorecard + 11 automation + 8 announcement.
+        assert_eq!(merged.len(), 25);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -605,6 +627,7 @@ mod tests {
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -645,6 +668,8 @@ mod tests {
             ("command-remove", 0, 32),
             ("command-inspect", 0, 32),
             ("command-inspect", 2, 500),
+            ("command-clone", 0, 32),
+            ("command-clone", 1, 32),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
             ("sticky", 0, 2000),
@@ -848,15 +873,16 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        // Inspection follows command-list; giveaway follows sticky-remove.
-        // Both shift the announcement slice without replacing any command.
+        // Inspection and clone follow command-list; giveaway follows sticky-remove.
+        // All shift the announcement slice without replacing any command.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
-        assert_eq!(json[10]["name"], "giveaway");
-        assert_eq!(json[10]["default_member_permissions"], "32");
-        assert_eq!(json[12]["name"], "rsvp-attendance");
-        assert!(json[12].get("default_member_permissions").is_none());
-        assert_eq!(json[12]["options"][0]["name"], "event-id");
+        assert_eq!(json[5]["name"], "command-clone");
+        assert_eq!(json[11]["name"], "giveaway");
+        assert_eq!(json[11]["default_member_permissions"], "32");
+        assert_eq!(json[13]["name"], "rsvp-attendance");
+        assert!(json[13].get("default_member_permissions").is_none());
+        assert_eq!(json[13]["options"][0]["name"], "event-id");
     }
 
     #[test]
