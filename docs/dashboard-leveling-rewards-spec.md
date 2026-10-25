@@ -352,16 +352,30 @@ browser, DB, role-grant and staging/production acceptance were **not run here**.
 
 ## Exact-revision intent gate and follow-up ownership
 
-Bind the proposed issue spec to this file's commit and SHA-256; request CEO/host
-intent alignment and an **independent CISO boundary disposition** against that
-exact revision before bot/web build cards. Queued requests, merged docs and silence
-are not acceptance. Default on 2026-11-01 without both dispositions: **no-build**.
-Metric: every inventory class has source/state evidence and all 24 decision
-fixtures have an explicit oracle; not measured demand or production parity.
+Bind the proposed issue spec to this file's commit and SHA-256. Before any bot/web
+build card, require three separate exact-revision records:
 
-After both accepted dispositions only: bot contract/CAS/audit and protected tests
-belong in this bot project; a separate web-page card belongs in its single-repo
-web project and consumes the accepted bot contract. Neither is created here.
+1. **CEO design acceptance** of the proposed page/verb scope only. This is not a
+   host receipt, security verdict or authorization to implement or operate it.
+2. **Factual authorized host alignment**: **NOT RECORDED** unless an actual receipt
+   identifies its authorized source/attestor, timestamp, exact commit/hash and
+   explicit alignment with that scope. CEO acceptance, this proposal, a merged PR
+   or an assumed host state cannot substitute for that evidence. No host action
+   or new authority is requested by this design.
+3. **Independent, non-author CISO boundary disposition** for that exact scope.
+   Neither the design author nor a CEO design confirmation supplies this verdict.
+
+Queued requests, expired/rejected confirmations, merged docs and silence are not
+acceptance or a host receipt. Default on 2026-11-01 without all three records:
+**no-build**, retaining the existing operator CLI. Metric: every inventory class
+has source/state evidence and all 24 decision fixtures have an explicit oracle;
+not measured demand or production parity.
+
+Only after CEO design acceptance, evidenced authorized host alignment and the
+independent non-author CISO disposition: bot contract/CAS/audit and protected
+tests belong in this bot project; a separate web-page card belongs in its
+single-repo web project and consumes the accepted bot contract. Neither is
+created here.
 Authority, effect-time grant policy and any reconciliation remain independently
 gated; no implementation card may imply permission to bypass the receiver,
 staging guild, token, imported-XP or existing role-write fences.
