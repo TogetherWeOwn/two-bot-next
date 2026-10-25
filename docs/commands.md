@@ -397,7 +397,7 @@ Close a raid/LFG signup
 
 ## `/lfg-edit`
 
-Update a raid/LFG title or start time
+Update LFG metadata or increase one role's seats
 
 - Default permissions: ManageEvents (`8589934592`)
 - Available in DMs: false
@@ -407,6 +407,8 @@ Update a raid/LFG title or start time
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
 | `title` | string | false | — | — | 100 | — | Event or group title |
 | `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
+| `role` | string | false | — | — | 32 | — | Existing signup role key (use with seats) |
+| `seats` | integer | false | 1 | 99 | — | — | Absolute seat target, increase only (1-99; use with role) |
 
 ## `/lfg-list`
 

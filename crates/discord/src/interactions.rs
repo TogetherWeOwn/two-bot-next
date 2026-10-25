@@ -264,6 +264,79 @@ fn decode_lfg_preview(
     }
 }
 
+/// Decode the entire edit before executing either mode. Unknown/duplicate fields
+/// cannot silently turn a malformed capacity request into a metadata mutation.
+#[cfg(feature = "db")]
+fn decode_lfg_edit(
+    options: &[twilight_model::application::interaction::application_command::CommandDataOption],
+) -> Result<crate::lfg_interactions::LfgRequest, crate::lfg_interactions::LfgError> {
+    use crate::lfg_interactions::{LfgError, LfgRequest};
+    use twilight_model::application::interaction::application_command::CommandOptionValue;
+    let mut seen = std::collections::HashSet::new();
+    for option in options {
+        if !matches!(
+            option.name.as_str(),
+            "id" | "title" | "starts-at" | "role" | "seats"
+        ) {
+            return Err(LfgError::Invalid("Invalid LFG edit option.".into()));
+        }
+        if !seen.insert(option.name.as_str()) {
+            return Err(LfgError::Invalid("Duplicate LFG edit option.".into()));
+        }
+    }
+    let text = |name: &str| -> Result<Option<String>, LfgError> {
+        match options.iter().find(|option| option.name == name) {
+            None => Ok(None),
+            Some(option) => match &option.value {
+                CommandOptionValue::String(value) => Ok(Some(value.clone())),
+                _ => Err(LfgError::Invalid(format!("{name} must be text."))),
+            },
+        }
+    };
+    let post_id = text("id")?.ok_or_else(|| LfgError::Invalid("Missing id option.".into()))?;
+    let title = text("title")?;
+    let starts_at = text("starts-at")?;
+    let role = text("role")?;
+    let seats = options.iter().find(|option| option.name == "seats");
+    match (role, seats) {
+        (None, None) => Ok(LfgRequest::Edit {
+            post_id,
+            title,
+            starts_at,
+        }),
+        (Some(role_key), Some(seats)) => {
+            let CommandOptionValue::Integer(seats) = &seats.value else {
+                return Err(LfgError::Invalid(
+                    "Seats must be an integer from 1-99.".into(),
+                ));
+            };
+            if !(1..=i64::from(two_bot_core::lfg::MAX_ROLE_SLOTS)).contains(seats) {
+                return Err(LfgError::Invalid(
+                    "Seats must be an integer from 1-99.".into(),
+                ));
+            }
+            if !two_bot_core::lfg::valid_role_key(&role_key) {
+                return Err(LfgError::Invalid(
+                    "Use an existing signup role key, not its label.".into(),
+                ));
+            }
+            if title.is_some() || starts_at.is_some() {
+                return Err(LfgError::Invalid(
+                    "Edit role/seats separately from title or starts-at.".into(),
+                ));
+            }
+            Ok(LfgRequest::EditSeats {
+                post_id,
+                role_key,
+                seats: *seats as u8,
+            })
+        }
+        _ => Err(LfgError::Invalid(
+            "Provide role and seats together to increase capacity.".into(),
+        )),
+    }
+}
+
 #[must_use]
 pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse> {
     match outcome {
@@ -767,22 +840,7 @@ impl InteractionRuntime {
                         })
                     })
                 } else if data.name == "lfg-edit" {
-                    let optional = |name: &str| -> Result<Option<String>, LfgError> {
-                        match data.options.iter().find(|option| option.name == name) {
-                            None => Ok(None),
-                            Some(option) => match &option.value {
-                                CommandOptionValue::String(value) => Ok(Some(value.clone())),
-                                _ => Err(LfgError::Invalid(format!("{name} must be text."))),
-                            },
-                        }
-                    };
-                    option("id").and_then(|post_id| {
-                        Ok(LfgRequest::Edit {
-                            post_id,
-                            title: optional("title")?,
-                            starts_at: optional("starts-at")?,
-                        })
-                    })
+                    decode_lfg_edit(&data.options)
                 } else {
                     option("id").map(|post_id| LfgRequest::Close { post_id })
                 }
