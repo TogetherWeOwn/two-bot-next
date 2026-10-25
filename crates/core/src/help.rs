@@ -79,6 +79,8 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-disable",
+            "command-enable",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -761,13 +763,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 36 non-voice commands (5 core + 20 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, giveaway, lfg-list, purge-preview,
-        // channel-inspect and feed-inspect, plus 21 additional voice commands
-        // (voice `kick` loses first-wins to moderation `/kick`).
-        // `/templateassistant` stays unpublished until its slice lands:
-        // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (57 live)"));
+        // 38 non-voice commands (5 core + 22 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, pause/resume, giveaway, lfg-list, feed-inspect,
+        // purge-preview and channel-inspect, plus 21 additional voice commands (voice
+        // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
+        // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (59 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -893,11 +894,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 36 non-voice names, including inspection, reopen, giveaway,
-        // lfg-list, purge-preview, channel-inspect and feed-inspect, plus 21
-        // additional voice names (voice `kick` shares the Kick group).
+        // 38 non-voice names, including inspection, reopen, pause/resume,
+        // giveaway, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
+        // 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 57);
+        assert_eq!(grouped.len(), 59);
         for name in [
             "rank",
             "leaderboard",
@@ -906,6 +907,8 @@ mod tests {
             "reopen",
             "attendance",
             "command",
+            "command-disable",
+            "command-enable",
             "command-inspect",
             "schedule-list",
             "sticky-remove",
