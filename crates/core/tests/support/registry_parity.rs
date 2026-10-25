@@ -31,6 +31,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("schedule", "docs/parity.md §1 #17 absolute-time"),
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
+    ("sticky", "docs/parity.md §1 #20 preview"),
     ("lfg", "docs/parity.md §1 #26 caps"),
     ("lfg", "docs/parity.md §1 #26 preview"),
     ("lfg-close", "docs/parity.md §1 #27 caps"),
@@ -681,6 +682,24 @@ pub fn expected_registry() -> Value {
             "legacy {name}/{option_name}"
         );
         option["max_length"] = json!(max_length);
+    }
+    // Sticky preview adds only an optional Boolean to the legacy setup fields.
+    {
+        let reference = "docs/parity.md §1 #20 preview";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("sticky", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "sticky")
+            .expect(reference);
+        let options = command["options"].as_array_mut().expect("sticky options");
+        assert_eq!(options.len(), 2, "legacy body and debounce stay intact");
+        assert_eq!(options[0]["name"], json!("body"));
+        assert_eq!(options[1]["name"], json!("debounce"));
+        options.push(json!({
+            "name": "preview",
+            "description": "Privately preview without saving",
+            "type": 5
+        }));
     }
     // LFG private preview: the Next-only additive fourth `preview` boolean
     // keeps the signup form submittable without posting. The three legacy

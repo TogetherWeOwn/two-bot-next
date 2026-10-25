@@ -672,6 +672,7 @@ Set this channel's sticky message
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `body` | string | true | — | — | 2000 | — | Sticky text |
 | `debounce` | integer | false | 1 | 300 | — | — | Quiet seconds before re-posting (default 5, max 300) |
+| `preview` | boolean | false | — | — | — | — | Privately preview without saving |
 
 ## `/sticky-remove`
 

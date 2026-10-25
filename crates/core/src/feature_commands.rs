@@ -255,6 +255,15 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .int_range(1, 300),
+                CommandOption::new(
+                    "preview",
+                    "Privately preview without saving",
+                    CommandOptionType::Boolean,
+                ),
+            ])
+            .examples(vec![
+                "/sticky body:Read the rules debounce:5 preview:true".to_owned(),
+                "/sticky body:Read the rules debounce:5 preview:false".to_owned(),
             ]),
         CommandDefinition::new("sticky-remove", "Remove this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD),
