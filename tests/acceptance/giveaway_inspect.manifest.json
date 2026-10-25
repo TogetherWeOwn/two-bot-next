@@ -6,7 +6,7 @@
   "protected_paths": [
     {
       "path": "crates/discord/tests/giveaway_inspect_acceptance.rs",
-      "sha256": "f79a35cbf67a5f35e71404b7106c2100a738e2ac5b9b30af55739a6f9e869b38",
+      "sha256": "50affde31149956c408a3da58f83346a7527a83e9e6be901485d054587305c91",
       "test_count": 18
     }
   ],
@@ -27,8 +27,17 @@
     "retained_timed_draw_controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_timed_draw_acceptance -- --test-threads=1 --nocapture"
   },
   "verification_at_publication": {
-    "valid_behavior_red": null,
-    "reason": "Pending executable evidence. Controller compilation was refused with exit 75: no idle, below-budget slot; no fallback was used. Refusal is not RED.",
+    "valid_behavior_red": {
+      "evidence_head": "975b356b414ae7232ea95da6ab748c6c64a9d786",
+      "run_url": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40213772484",
+      "job_id": 121230431949,
+      "behavior_failures": 13,
+      "unchanged_controls_passed": 4,
+      "fixture_failures": 1,
+      "retained_timed_draw_controls_passed": 17,
+      "retained_controls_job_id": 121230431932
+    },
+    "reason": "Prior head compiled and produced assertion-level RED for absent inspect mode and static entry requirements, plus one foreign-key fixture defect. This revision removes child fixture rows before their parent; corrected-head execution is pending. Controller verification refused exit 75; refusal is not RED. Do not release the Builder dependency until the corrected hidden-ID oracle executes.",
     "passed": ["cargo fmt", "secret-debug guard and 23 self-tests", "Docker dependency shape", "80 cache fixture tests", "soak checklist and 49 self-tests", "voice corpus and 22 validator tests", "docs index", "floor guard", "test inventory"],
     "not_executed": ["focused Rust acceptance target", "retained Rust runtime controls", "workspace Rust tests", "workspace clippy"]
   },
