@@ -808,7 +808,7 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
                 }
                 let mut interaction = slash("lfg-list", Some(CHANNEL), Vec::new());
                 interaction.application_id = Id::new(app);
-                interaction.guild_id = interaction_guild.map(Id::new);
+                set_guild(&mut interaction, interaction_guild.map(Id::new));
                 interaction.member.as_mut().unwrap().permissions = permissions;
                 let before = mock.requests().len();
                 tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
