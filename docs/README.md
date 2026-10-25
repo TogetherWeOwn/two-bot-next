@@ -1,14 +1,13 @@
 # Documentation map
 
-Sole Markdown manifest (nested docs and this index too).
-Under area headings: `- [Purpose](relative.md)`.
+Sole Markdown manifest, including nested docs and this index.
+Rows: `- [Purpose](relative.md)` under area headings.
 
-Check: `python3 scripts/check_docs_index.py --json` from the repo root.
-Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
-Else exit 1: fix rows or split oversized docs.
-Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Run `python3 scripts/check_docs_index.py --json` from repo root.
+Sorted `{missing,stale,oversize}` path arrays: empty = PASS/0; else fix rows/size (exit 1).
+Malformed/duplicate rows appear as `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions/reasons:
+`scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
 
 ## References and architecture
 
@@ -115,6 +114,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
+- [Rewards design](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
