@@ -28,6 +28,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command", "docs/parity.md §1 #14 caps"),
     ("command-remove", "docs/parity.md §1 #15 caps"),
     ("schedule", "docs/parity.md §1 #17 caps"),
+    ("schedule", "docs/parity.md §1 #17 absolute-time"),
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
     ("lfg", "docs/parity.md §1 #26 caps"),
@@ -565,6 +566,30 @@ pub fn expected_registry() -> Value {
             "name": "preview",
             "description": "Privately preview without posting",
             "type": 5
+        }));
+    }
+    // Absolute-time scheduling adds ONLY one optional string to the legacy
+    // body / in-minutes / every-minutes options, leaving their fields intact.
+    // Keep this independent of the compiled production registry.
+    {
+        let reference = "docs/parity.md §1 #17 absolute-time";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("schedule", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule")
+            .expect(reference);
+        let options = command["options"]
+            .as_array_mut()
+            .expect("schedule options array");
+        assert_eq!(options.len(), 3, "legacy schedule has three options");
+        assert_eq!(options[0]["name"], json!("body"));
+        assert_eq!(options[1]["name"], json!("in-minutes"));
+        assert_eq!(options[2]["name"], json!("every-minutes"));
+        options.push(json!({
+            "name": "at",
+            "description": "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+            "type": 3,
+            "max_length": 64
         }));
     }
     // Schedule-list pagination: the Next-only additive `page` option keeps

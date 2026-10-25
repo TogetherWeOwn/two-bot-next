@@ -46,10 +46,12 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
-#[path = "schedule_strict_decode_acceptance_tests.rs"]
-mod schedule_strict_decode_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
 mod schedule_absolute_acceptance;
+#[path = "schedule_absolute_correction_tests.rs"]
+mod schedule_absolute_correction_tests;
+#[path = "schedule_strict_decode_acceptance_tests.rs"]
+mod schedule_strict_decode_acceptance_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -8528,7 +8530,7 @@ async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_under_cap_renders_byte_identical_to_before() {
+async fn schedule_list_under_cap_preserves_rows_with_localized_due_and_uncertainty() {
     let db = TestDb::new().await;
     db.seed_schedule_row(
         GUILD_S,
@@ -8548,6 +8550,7 @@ async fn schedule_list_under_cap_renders_byte_identical_to_before() {
         false,
     )
     .await;
+    let before = schedule_absolute_correction_tests::state(&db.pool).await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
     runtime
@@ -8558,10 +8561,15 @@ async fn schedule_list_under_cap_renders_byte_identical_to_before() {
     let json = mock.deferred_reply();
     assert_eq!(
         json["content"],
-        "`once` `<#3333>` 2030-01-01T00:00:00.000Z\n\
-         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled)\n\
-         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m",
-        "under-cap listing must not change a single byte"
+        "`once` `<#3333>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
+         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled) <t:1894710600:F>. The 15s ticker and delivery may be delayed.\n\
+         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m <t:1896321906:F>. The 15s ticker and delivery may be delayed.",
+        "list retains ordered complete rows, intervals and disabled state, with localized due times and delivery uncertainty"
+    );
+    assert_eq!(
+        schedule_absolute_correction_tests::state(&db.pool).await,
+        before,
+        "listing cannot change schedules, audits or commands"
     );
     assert!(
         db.schedule_audits().await.is_empty(),
@@ -8623,7 +8631,7 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
         .collect();
     assert_eq!(edits.len(), 3, "one completion per remove");
     let removed: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
-    assert_eq!(removed["content"], "Cancelled.");
+    assert_eq!(removed["content"], "Cancelled. Schedule `xyz999`.");
     let ambiguous: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
     assert_eq!(
         ambiguous["content"],
@@ -8929,7 +8937,7 @@ async fn schedule_remove_invalid_ids_leave_store_untouched() {
         .collect();
     assert_eq!(edits.len(), 10, "one completion per interaction");
     let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
-    assert_eq!(valid["content"], "Cancelled.");
+    assert_eq!(valid["content"], "Cancelled. Schedule `xyz999`.");
     mock.shutdown().await;
     db.close().await;
 }
