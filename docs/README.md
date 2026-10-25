@@ -1,11 +1,11 @@
 # Documentation map
 
-This is the sole discovery manifest. Under area headings, use
-`- [Purpose](relative.md)` for every Markdown doc, including nested docs.
+Sole Markdown manifest (nested docs and this index too).
+Under area headings: `- [Purpose](relative.md)`.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
 Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
-Otherwise exit 1: repair missing/stale rows or split oversized docs.
+Else exit 1: fix rows or split oversized docs.
 Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
 Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
 and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
@@ -131,6 +131,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
+- [Session-change notices (design only)](event-change-notices-spec.md)
 - [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
 - [Private agenda (design only)](event-agenda-spec.md)
