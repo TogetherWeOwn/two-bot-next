@@ -280,7 +280,7 @@ fn assert_updated_time(text: &str) {
 }
 
 #[test]
-fn registry_exposes_only_metadata_options_with_the_existing_management_permission() {
+fn registry_exposes_metadata_and_seat_options_with_the_existing_management_permission() {
     let commands = two_bot_core::announcement_commands();
     let command = commands
         .iter()
@@ -292,9 +292,21 @@ fn registry_exposes_only_metadata_options_with_the_existing_management_permissio
     );
     assert!(!command.dm_permission);
     assert_eq!(
+        command.description,
+        "Update LFG metadata or increase one role's seats"
+    );
+    assert_eq!(
         command.options.len(),
-        3,
-        "role/channel/roster edits are not part of this command"
+        5,
+        "only metadata and an existing role's absolute seat target are editable"
+    );
+    assert_eq!(
+        command
+            .options
+            .iter()
+            .map(|option| option.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "title", "starts-at", "role", "seats"]
     );
     let id = command
         .options
@@ -316,8 +328,35 @@ fn registry_exposes_only_metadata_options_with_the_existing_management_permissio
     assert_eq!(title.max_length, Some(100));
     assert_ne!(title.required, Some(true));
     assert_ne!(starts_at.required, Some(true));
-    for option in &command.options {
-        assert_eq!(option.kind, 3, "metadata and id options use string input");
+    let role = command
+        .options
+        .iter()
+        .find(|o| o.name == "role")
+        .expect("role option");
+    let seats = command
+        .options
+        .iter()
+        .find(|o| o.name == "seats")
+        .expect("seats option");
+    assert_eq!(
+        role.description,
+        "Existing signup role key (use with seats)"
+    );
+    assert_eq!(role.max_length, Some(32));
+    assert_ne!(role.required, Some(true));
+    assert_ne!(seats.required, Some(true));
+    assert_eq!(
+        serde_json::to_value(seats).expect("seat option serializes"),
+        json!({
+            "name": "seats",
+            "description": "Absolute seat target, increase only (1-99; use with role)",
+            "type": 4,
+            "min_value": 1,
+            "max_value": 99
+        })
+    );
+    for option in [id, title, starts_at, role] {
+        assert_eq!(option.kind, 3, "metadata, id and role use string input");
     }
 }
 
