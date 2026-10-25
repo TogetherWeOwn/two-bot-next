@@ -44,6 +44,8 @@ mod help_detail_acceptance;
 
 #[path = "game_mix_acceptance_tests.rs"]
 mod game_mix_acceptance_tests;
+#[path = "game_mix_browse_acceptance_tests.rs"]
+mod game_mix_browse_acceptance_tests;
 #[path = "game_mix_content_acceptance_tests.rs"]
 mod game_mix_content_acceptance_tests;
 // Builder-owned: pins the classified store-failure warn the protected
