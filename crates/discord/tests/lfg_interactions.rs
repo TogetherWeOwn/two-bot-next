@@ -1381,6 +1381,9 @@ async fn direct_replay_retries_refresh_without_duplicating_signup_audit_or_resur
     db.cleanup().await;
 }
 
+#[path = "support/lfg_preview_acceptance.rs"]
+mod preview_acceptance;
+
 // Real PostgreSQL counterparts to the offline acceptance suite. New cases use
 // the guarded disposable-database fixture and run in the normal db test lane.
 async fn durable_select_db() -> two_bot_testsupport::TestDatabase {

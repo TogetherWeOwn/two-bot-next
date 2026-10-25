@@ -108,9 +108,13 @@ fn help_lists_only_handled_commands() {
     let defs = router.publish_set(&[]).expect("full set assembles");
     let text = help_text(&defs);
     let voice = voice_names();
+    // The RSVP note carries a copyable event-link example whose slashes
+    // tokenize as path fragments, not commands; exclude it from the handled
+    // check.
+    let without_example = text.replace("https://discord.com/events/<server-id>/<event-id>", "");
     // Exact slash tokens (same tokenizer as the help unit tests: a substring
     // count would triple-count `/command` inside `/command-remove`).
-    let tokens: Vec<&str> = text
+    let tokens: Vec<&str> = without_example
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
         .filter(|t| t.starts_with('/') && t.len() > 1)
         .collect();

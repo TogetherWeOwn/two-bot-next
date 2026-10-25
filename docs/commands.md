@@ -79,7 +79,7 @@ Check in a verified human attendee for a scheduled event (scorecard)
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly |
+| `event-occurrence` | string | true | — | — | 128 | — | Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
@@ -338,6 +338,7 @@ Post a raid/LFG signup with role slots
 | `title` | string | true | — | — | 100 | — | Event or group title |
 | `starts-at` | string | true | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
 | `roles` | string | true | — | — | 2339 | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
+| `preview` | boolean | false | — | — | — | — | Privately preview without posting |
 
 ## `/lfg-close`
 
@@ -530,7 +531,7 @@ RSVP to a Discord scheduled event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 | `status` | string | true | — | — | — | Going = `"going"`; Interested = `"interested"`; Declined = `"declined"` | Your response |
 
 ## `/rsvp-attendance`
@@ -542,7 +543,7 @@ Show RSVP totals and your saved response for an event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 
 ## `/schedule`
 

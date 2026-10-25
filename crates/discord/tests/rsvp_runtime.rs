@@ -28,6 +28,12 @@ const MANAGE_EVENTS: u64 = 1 << 33;
 #[path = "support/rsvp_personal_totals.rs"]
 mod saved_response_acceptance;
 
+#[path = "support/rsvp_event_links.rs"]
+mod event_link_acceptance;
+
+#[path = "support/event_link_id_controls.rs"]
+mod event_link_id_controls;
+
 fn router() -> InteractionRouter {
     InteractionRouter::new(RouterGates {
         configured_guild: Some(GUILD.parse().unwrap()),
@@ -288,7 +294,18 @@ fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
             last.path,
             "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
         );
-        assert_eq!(body["content"], content);
+        if content.starts_with("RSVP saved:") {
+            // Event-link confirmations may append the stable numeric identity.
+            // Keep the existing status sentence and every refusal oracle intact;
+            // the protected link tests independently require the event identity.
+            let actual = body["content"].as_str().expect("RSVP confirmation");
+            assert!(
+                actual == content || (actual.starts_with(content) && actual.contains(EVENT)),
+                "expected the saved status, optionally followed by event identity: {actual}"
+            );
+        } else {
+            assert_eq!(body["content"], content);
+        }
         // Executor defaults continue to suppress mentions on deferred edits.
         assert_eq!(body["allowed_mentions"]["parse"], json!([]));
     } else {
