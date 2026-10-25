@@ -39,13 +39,14 @@ combine `at` with `every-minutes`. To recur, keep using `every-minutes:60` or
 semantics are unchanged. Body safety, Manage Guild authority, the guild/feature
 fences and the 25-schedule quota still apply.
 
-Set/list replies show the canonical UTC instant and a Discord timestamp rendered
-in each reader's local timezone. They retain the stable schedule ID; use
-`/schedule-remove id:<id>` to cancel, and check the named ID in the cancellation
-receipt. Delivery runs on the existing 15-second ticker and may be delayed by
-backlog, restarts, rate limits or outages. This is not an exact-second delivery
-promise. No timezone profile, natural-language parsing or DST-aware recurrence
-is implied.
+Explicit-time confirmations and enabled list rows show the canonical UTC instant
+and a Discord timestamp rendered in each reader's local timezone. Disabled list
+rows keep their canonical timestamp, stable ID and disabled marker without a
+pending-delivery hint. Use `/schedule-remove id:<id>` to cancel, and check the
+named ID in the cancellation receipt. Delivery runs on the existing 15-second
+ticker and may be delayed by backlog, restarts, rate limits or outages. This is
+not an exact-second delivery promise. No timezone profile, natural-language
+parsing or DST-aware recurrence is implied.
 
 Absolute schedules use the same stored due instant, claim, occurrence nonce and
 uncertain-send fence as relative schedules. Restart does not recalculate the
@@ -129,9 +130,9 @@ no row is claimed, posted or audited; the `/readyz` status map lists
    of the list. A failed hidden-window or overflow-count read fails closed
    ("Schedule command failed; try again.") instead of reporting a
    possibly-false out-of-range page. Rows past the cap keep their order
-   and keep firing via `claim_due`. Runtime rows include localized due times
-   and delivery uncertainty before packing, so enrichment cannot overflow a
-   page or silently split an ID.
+   and keep firing via `claim_due`. Enabled runtime rows include localized due
+   times and delivery uncertainty before packing, so enrichment cannot overflow
+   a page or silently split an ID.
 
 ## Out of scope
 

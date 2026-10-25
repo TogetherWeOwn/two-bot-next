@@ -624,7 +624,9 @@ fn schedule_list_line_localized(
     enabled: bool,
 ) -> String {
     let mut line = schedule_list_line(id, channel_id, next_run_at, interval_seconds, enabled);
-    line.push_str(&schedule_delivery_hint(next_run_at));
+    if enabled {
+        line.push_str(&schedule_delivery_hint(next_run_at));
+    }
     line
 }
 
