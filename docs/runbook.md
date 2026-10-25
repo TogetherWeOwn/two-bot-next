@@ -3628,14 +3628,16 @@ lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.
 
 ## Giveaways
 
-`/giveaway create|list|cancel` requires Manage Server; entry buttons are open
-to human members with per-interaction role and age checks. Limits: prize
-1–200 characters, duration 1–43200 minutes, winners 1–100, 25 active
-giveaways per guild, 10000 entrants each. Entry attempts have a bounded
-process-local 10/minute member budget, and successful entries share a
-durable 10/minute guild/member budget across giveaways and restarts.
-Duplicates collapse to one row. `gw:<id>` carries only the opaque id; the
-server resolves guild, message, deadline, status, requirements and capacity.
+`/giveaway create|list|cancel|end|pause|resume|extend|reroll` requires Manage
+Server; entry buttons are open to human members with per-interaction role and
+age checks. Limits: prize 1–200 characters, duration 1–43200 minutes,
+winners 1–100, 10 active giveaways per guild, 1000 entrants each (one paced
+membership re-check per entrant must fit the 300 s draw run). Entry
+attempts have a bounded process-local 10/minute member budget, and successful
+entries share a durable 10/minute guild/member budget across giveaways and
+restarts. Duplicates collapse to one row. `gw:<id>` carries only the opaque
+id; the server resolves guild, message, deadline, status, requirements and
+capacity.
 
 The giveaway row is recorded before its message posts. If sending or the
 message-id attachment fails, never blindly re-post: inspect the channel for
@@ -3647,6 +3649,15 @@ one cosmetic refresh at each 1h, 10min, 1min and ending-soon threshold
 through the shared REST pacing guard. Count edits are best-effort; the
 entry row stays authoritative when a display edit fails.
 
-This slice does not draw winners or send winner DMs; entry closes at the
-stored deadline. Staging smoke: create, enter from two test members, verify
-two rows plus ephemeral replies, cancel, and verify a later entry is refused.
+`giveaway_draw` ticks every 15 seconds: it claims due giveaways under a
+10-minute lease, re-validates eligibility from fresh membership reads, runs
+the pure draw, commits one draw row and flips to drawn, then announces (edit
+the giveaway message, post the winners with seed and revealed nonce, mark
+announced). Drawn-but-unannounced rows re-announce from the stored row and
+never re-draw; a stale claim with a stored draw skips to announce. Pause
+excludes a giveaway from the due scan; resume extends the deadline by the
+paused span. Rerolls append a new draw round and leave history intact. No
+winner DMs: deferred until a DM send path exists. Staging smoke: create,
+enter from two test members, verify two rows plus ephemeral replies, end,
+verify the draw row plus winners post, reroll, verify a second round, then
+cancel a fresh giveaway and verify a later entry is refused.

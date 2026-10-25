@@ -35,7 +35,7 @@ use two_bot_core::{
         schedule_list_line, schedule_list_overflow_for_count, schedule_list_overflow_line,
         schedule_list_page, schedule_list_page_out_of_range_text,
         schedule_list_page_underflow_text, schedule_list_pages, schedule_list_pages_global,
-        validate_schedule, ScheduleInput,
+        validate_schedule, validate_schedule_at, ScheduleInput, IN_MINUTES_MIN,
     },
     scheduled_store::{
         audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
@@ -83,13 +83,24 @@ pub(crate) async fn schedule_create(
             return;
         }
     };
+    let now = now_millis();
+    let absolute_due = match schedule_absolute_due(interaction, in_minutes, every_minutes, now) {
+        Ok(due) => due,
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     let actor = actor_id(interaction);
     let id = new_id();
-    let now_iso = format_iso_ms(now_millis());
+    let now_iso = format_iso_ms(now);
 
+    // The relative validator owns the unchanged body/mention and interval
+    // checks. An already validated absolute one-shot supplies its minimum
+    // delay only to select that branch; its due instant never uses the delay.
     let validated = match validate_schedule(&ScheduleInput {
         body: body.as_deref().unwrap_or_default(),
-        in_minutes,
+        in_minutes: absolute_due.map(|_| IN_MINUTES_MIN).or(in_minutes),
         every_minutes,
     }) {
         Ok(validated) => validated,
@@ -132,7 +143,9 @@ pub(crate) async fn schedule_create(
             return;
         }
     };
-    let next_run_at = format_iso_ms(next_run_at_ms(now_millis(), validated.delay_minutes));
+    let is_absolute = absolute_due.is_some();
+    let next_run_at =
+        format_iso_ms(absolute_due.unwrap_or_else(|| next_run_at_ms(now, validated.delay_minutes)));
     // Whole minutes by construction (`every-minutes * 60`), so this inverts
     // exactly; the confirm helper renders the recurring shape from it.
     let every_m = validated.interval_seconds.map(|s| s / 60);
@@ -176,7 +189,7 @@ pub(crate) async fn schedule_create(
             finish(
                 executor,
                 interaction,
-                schedule_confirm_text(created, &id, every_m, &next_run_at),
+                schedule_confirmation(created, &id, every_m, &next_run_at, is_absolute),
             )
             .await;
         }
@@ -312,7 +325,12 @@ pub(crate) async fn schedule_remove(
                 &now_iso,
             )
             .await;
-            finish(executor, interaction, schedule_cancelled_text()).await;
+            finish(
+                executor,
+                interaction,
+                format!("{} Schedule `{id}`.", schedule_cancelled_text()),
+            )
+            .await;
         }
         Ok(false) => {
             // Resolved but already gone (raced delete): legacy's `absent`.
@@ -385,7 +403,7 @@ pub(crate) async fn schedule_list(
             let mut lines: Vec<String> = rows
                 .iter()
                 .map(|row| {
-                    schedule_list_line(
+                    schedule_list_line_localized(
                         &row.id,
                         &row.channel_id,
                         &row.next_run_at,
@@ -441,7 +459,7 @@ pub(crate) async fn schedule_list(
                                 let mut hidden_lines: Vec<String> = hidden
                                     .iter()
                                     .map(|row| {
-                                        schedule_list_line(
+                                        schedule_list_line_localized(
                                             &row.id,
                                             &row.channel_id,
                                             &row.next_run_at,
@@ -572,6 +590,85 @@ pub(crate) async fn schedule_list(
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
+}
+
+/// Localize only a validated stored instant; a corrupt legacy row must not
+/// panic or invent a due time. Enrichment happens before whole-row packing.
+fn schedule_delivery_hint(next_run_at: &str) -> String {
+    let localized =
+        time::OffsetDateTime::parse(next_run_at, &time::format_description::well_known::Rfc3339)
+            .map(|due| format!(" <t:{}:F>.", due.unix_timestamp()))
+            .unwrap_or_default();
+    format!("{localized} The 15s ticker and delivery may be delayed.")
+}
+
+fn schedule_confirmation(
+    created: bool,
+    id: &str,
+    every_minutes: Option<i64>,
+    next_run_at: &str,
+    include_delivery_hint: bool,
+) -> String {
+    let mut text = schedule_confirm_text(created, id, every_minutes, next_run_at);
+    if include_delivery_hint {
+        text.push_str(&schedule_delivery_hint(next_run_at));
+    }
+    text
+}
+
+fn schedule_list_line_localized(
+    id: &str,
+    channel_id: &str,
+    next_run_at: &str,
+    interval_seconds: Option<i64>,
+    enabled: bool,
+) -> String {
+    let mut line = schedule_list_line(id, channel_id, next_run_at, interval_seconds, enabled);
+    if enabled {
+        line.push_str(&schedule_delivery_hint(next_run_at));
+    }
+    line
+}
+
+/// Decode and validate the optional absolute instant before any store or audit
+/// effect. Legacy relative/recurring validation remains in `validate_schedule`.
+fn schedule_absolute_due(
+    interaction: &Interaction,
+    in_minutes: Option<i64>,
+    every_minutes: Option<i64>,
+    now_ms: u64,
+) -> Result<Option<u64>, String> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(None);
+    };
+    let mut options = data.options.iter().filter(|option| option.name == "at");
+    let Some(option) = options.next() else {
+        return Ok(None);
+    };
+    if options.next().is_some() {
+        return Err(
+            "Duplicate at option. Supply one RFC3339 timestamp with Z or a numeric offset."
+                .to_owned(),
+        );
+    }
+    let CommandOptionValue::String(at) = &option.value else {
+        return Err(
+            "Invalid at option. Supply an RFC3339 string timestamp with Z or a numeric offset."
+                .to_owned(),
+        );
+    };
+    if in_minutes.is_some() {
+        return Err(
+            "Choose either at or in-minutes, not both. Use at for a one-off RFC3339 time."
+                .to_owned(),
+        );
+    }
+    if every_minutes.is_some() {
+        return Err("The at option is one-off only; do not combine it with every-minutes. Use in-minutes with every-minutes for recurring schedules.".to_owned());
+    }
+    validate_schedule_at(at, now_ms)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// Current epoch millis, clamped non-negative for the ISO formatter.

@@ -44,7 +44,7 @@ use super::custom_commands::{
 };
 use super::feeds_http::MAX_FEED_SOURCE_BYTES;
 use super::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
-use super::scheduled::MAX_BODY_CHARS;
+use super::scheduled::{MAX_AT_CHARS, MAX_BODY_CHARS};
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
 /// RSVP-totals variant is the one that renames.
@@ -213,6 +213,18 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .int_range(60, 525600),
+                CommandOption::new(
+                    "at",
+                    "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+                    CommandOptionType::String,
+                )
+                .max_length(MAX_AT_CHARS as u32),
+            ])
+            .examples(vec![
+                "/schedule body:Meeting reminder at:2027-01-15T18:30:00+05:30".to_owned(),
+                "/schedule body:Meeting reminder at:2027-01-15T13:00:00Z".to_owned(),
+                "/schedule body:Meeting reminder in-minutes:30".to_owned(),
+                "/schedule body:Hourly reminder every-minutes:60".to_owned(),
             ]),
         CommandDefinition::new("schedule-remove", "Cancel a scheduled message")
             .permissions(PERM_MANAGE_GUILD)
@@ -253,7 +265,7 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
 /// Manage-Server-only giveaway administration; entry buttons remain open to members.
 #[must_use]
 pub fn giveaway_command() -> CommandDefinition {
-    CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+    CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
         .permissions(PERM_MANAGE_GUILD)
         .options(vec![
             CommandOption::new(
@@ -310,6 +322,70 @@ pub fn giveaway_command() -> CommandDefinition {
             )
             .required()
             .max_length(64)]),
+            CommandOption::new(
+                "end",
+                "Draw now, before the deadline",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+            CommandOption::new(
+                "pause",
+                "Pause entry without drawing",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+            CommandOption::new(
+                "resume",
+                "Resume a paused giveaway",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+            CommandOption::new(
+                "extend",
+                "Add minutes to the deadline",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                    .required()
+                    .max_length(64),
+                CommandOption::new(
+                    "duration-minutes",
+                    "Minutes to add (1–43200)",
+                    CommandOptionType::Integer,
+                )
+                .required()
+                .int_range(1, 43200),
+            ]),
+            CommandOption::new(
+                "reroll",
+                "Redraw the winners",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                    .required()
+                    .max_length(64),
+                CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
+            ]),
         ])
 }
 
@@ -392,6 +468,24 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new("lfg-edit", "Update a raid/LFG title or start time")
+            .permissions(PERM_MANAGE_EVENTS)
+            .options(vec![
+                CommandOption::new(
+                    "id",
+                    "LFG id from the posted signup",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(MAX_RESOURCE_ID_CHARS as u32),
+                CommandOption::new("title", "Event or group title", CommandOptionType::String)
+                    .max_length(MAX_TITLE_CHARS as u32),
+                CommandOption::new(
+                    "starts-at",
+                    "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                    CommandOptionType::String,
+                ),
+            ]),
         CommandDefinition::new("lfg-list", "List open game posts in this channel")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![CommandOption {
@@ -603,6 +697,7 @@ mod tests {
                 "rsvp-attendance",
                 "lfg",
                 "lfg-close",
+                "lfg-edit",
                 "lfg-list",
                 "feed-add",
                 "feed-remove",
@@ -615,8 +710,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 7 core + 1 scorecard + 12 automation + 9 announcements.
-        assert_eq!(merged.len(), 29);
+        // 7 core + 1 scorecard + 12 automation + 10 announcements.
+        assert_eq!(merged.len(), 30);
         assert_eq!(
             &names(&merged)[..8],
             [
@@ -664,6 +759,7 @@ mod tests {
         }
         assert_eq!(is(&ann, "lfg"), manage_events);
         assert_eq!(is(&ann, "lfg-close"), manage_events);
+        assert_eq!(is(&ann, "lfg-edit"), manage_events);
         assert_eq!(is(&ann, "lfg-list"), manage_events);
         for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
@@ -731,6 +827,8 @@ mod tests {
             ("lfg", 0, 100),
             ("lfg", 2, 2339),
             ("lfg-close", 0, 128),
+            ("lfg-edit", 0, 128),
+            ("lfg-edit", 1, 100),
             ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
@@ -784,6 +882,35 @@ mod tests {
                 "{command} event-id bound"
             );
         }
+    }
+
+    #[test]
+    fn lfg_edit_advertises_only_bounded_metadata_options_in_publish_order() {
+        let announcements = announcement_commands();
+        let close = announcements
+            .iter()
+            .position(|command| command.name == "lfg-close")
+            .expect("existing close command");
+        let edit = announcements
+            .get(close + 1)
+            .expect("metadata companion follows close");
+        assert_eq!(
+            serde_json::to_value(edit).expect("command serializes"),
+            serde_json::json!({
+                "name": "lfg-edit",
+                "description": "Update a raid/LFG title or start time",
+                "dm_permission": false,
+                "default_member_permissions": "8589934592",
+                "options": [
+                    {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+                     "required": true, "max_length": 128},
+                    {"name": "title", "description": "Event or group title", "type": 3,
+                     "max_length": 100},
+                    {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                     "type": 3}
+                ]
+            })
+        );
     }
 
     #[test]

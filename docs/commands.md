@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 61.
+Built-in commands: 62.
 
 ## `/access`
 
@@ -263,7 +263,7 @@ No options.
 
 ## `/giveaway`
 
-Create, list or cancel a giveaway
+Create, draw, reroll or cancel a giveaway
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
@@ -280,6 +280,18 @@ Create, list or cancel a giveaway
 | `list` | subcommand | false | — | — | — | — | List open giveaways |
 | `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
 | `cancel id` | string | true | — | — | 64 | — | Giveaway id |
+| `end` | subcommand | false | — | — | — | — | Draw now, before the deadline |
+| `end id` | string | true | — | — | 64 | — | Giveaway id |
+| `pause` | subcommand | false | — | — | — | — | Pause entry without drawing |
+| `pause id` | string | true | — | — | 64 | — | Giveaway id |
+| `resume` | subcommand | false | — | — | — | — | Resume a paused giveaway |
+| `resume id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend` | subcommand | false | — | — | — | — | Add minutes to the deadline |
+| `extend id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend duration-minutes` | integer | true | 1 | 43200 | — | — | Minutes to add (1–43200) |
+| `reroll` | subcommand | false | — | — | — | — | Redraw the winners |
+| `reroll id` | string | true | — | — | 64 | — | Giveaway id |
+| `reroll user` | user | false | — | — | — | — | Replace only this winner |
 
 ## `/group`
 
@@ -382,6 +394,19 @@ Close a raid/LFG signup
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+
+## `/lfg-edit`
+
+Update a raid/LFG title or start time
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+| `title` | string | false | — | — | 100 | — | Event or group title |
+| `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
 
 ## `/lfg-list`
 
@@ -589,6 +614,7 @@ Schedule a message, once or recurring
 | `body` | string | true | — | — | 2000 | — | Message text |
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
+| `at` | string | false | — | — | 64 | — | One-off RFC3339 time with Z or offset; cannot combine with other timing |
 
 ## `/schedule-list`
 

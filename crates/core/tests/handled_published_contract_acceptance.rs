@@ -109,8 +109,8 @@ fn help_lists_only_handled_commands() {
     let text = help_text(&defs);
     let voice = voice_names();
     // The RSVP note carries a copyable event-link example whose slashes
-    // tokenize as path fragments, not commands; exclude it from the handled
-    // check.
+    // tokenize as path fragments, not commands; exclude it before checking
+    // that every displayed slash token routes.
     let without_example = text.replace("https://discord.com/events/<server-id>/<event-id>", "");
     // Exact slash tokens (same tokenizer as the help unit tests: a substring
     // count would triple-count `/command` inside `/command-remove`).
@@ -182,6 +182,7 @@ fn parity_builtins_route_to_their_handlers() {
         ("rsvp-attendance", HandlerId::RsvpAttendance),
         ("lfg", HandlerId::Lfg),
         ("lfg-close", HandlerId::LfgClose),
+        ("lfg-edit", HandlerId::LfgEdit),
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
@@ -206,7 +207,7 @@ fn parity_builtins_route_to_their_handlers() {
     let lfg_list = defs
         .iter()
         .find(|d| d.name == "lfg-list")
-        .expect("lfg-list is published right after lfg-close");
+        .expect("lfg-list is published after lfg-close and lfg-edit");
     assert_eq!(
         lfg_list.description.as_str(),
         "List open game posts in this channel"
@@ -254,6 +255,7 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
+    assert_eq!(matrix.len(), 40, "contract covers the 40 built-in commands");
     assert_eq!(
         matrix
             .iter()

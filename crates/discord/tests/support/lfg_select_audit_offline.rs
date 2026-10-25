@@ -498,6 +498,26 @@ pub mod lfg_store {
         post.closed_at = Some(at.into());
         Ok(true)
     }
+    // The included service also compiles its metadata-edit branch. Keep that
+    // store boundary explicit without pretending this signup/audit double tests it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LfgEditOutcome {
+        Missing,
+        Closed,
+        Unchanged { starts_at: String },
+        Updated { starts_at: String },
+    }
+
+    pub async fn edit_lfg_metadata(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+        _title: Option<&str>,
+        _starts_at: Option<&str>,
+    ) -> Result<LfgEditOutcome, Error> {
+        panic!("metadata edit is outside this offline acceptance slice")
+    }
+
     // Create/nonce recovery is deliberately outside this acceptance slice.
     // Fail loudly if a test accidentally invokes it instead of silently faking it.
     pub async fn put_lfg(

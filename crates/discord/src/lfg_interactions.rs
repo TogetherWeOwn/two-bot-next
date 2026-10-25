@@ -25,6 +25,11 @@ pub enum LfgRequest {
     Close {
         post_id: String,
     },
+    Edit {
+        post_id: String,
+        title: Option<String>,
+        starts_at: Option<String>,
+    },
     Select(LfgSelectAction),
 }
 
@@ -197,6 +202,7 @@ impl LfgInteractions {
                 return Err(LfgError::Invalid("Invalid LFG preview.".into()));
             }
             LfgRequest::Close { post_id }
+            | LfgRequest::Edit { post_id, .. }
             | LfgRequest::Select(
                 LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
             ) => {
@@ -407,6 +413,63 @@ impl LfgInteractions {
                     !fresh,
                 )
             }
+            LfgRequest::Edit {
+                title, starts_at, ..
+            } => {
+                if title.is_none() && starts_at.is_none() {
+                    return Err(LfgError::Invalid(
+                        "Provide title or starts-at to edit.".into(),
+                    ));
+                }
+                let title = title
+                    .as_deref()
+                    .map(lfg::validate_title)
+                    .transpose()
+                    .map_err(|error| LfgError::Invalid(error.to_string()))?;
+                // Use the clock after waiting for the post lock, not admission.
+                let starts_at = starts_at
+                    .as_deref()
+                    .map(|value| {
+                        lfg::normalize_starts_at(
+                            value,
+                            (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                                as i64,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| LfgError::Invalid(error.to_string()))?;
+                let starts_at = match store::edit_lfg_metadata(
+                    &self.pool,
+                    guild_id,
+                    &id,
+                    title.as_deref(),
+                    starts_at.as_deref(),
+                )
+                .await?
+                {
+                    store::LfgEditOutcome::Missing => {
+                        return Err(LfgError::Invalid(
+                            "LFG post is missing in this server.".into(),
+                        ));
+                    }
+                    store::LfgEditOutcome::Closed => {
+                        return Err(LfgError::Invalid(
+                            "LFG post is closed and cannot be edited.".into(),
+                        ));
+                    }
+                    store::LfgEditOutcome::Unchanged { starts_at } => {
+                        guard.commit().await?;
+                        return Ok(format!("LFG unchanged. Starts at {starts_at}."));
+                    }
+                    store::LfgEditOutcome::Updated { starts_at } => starts_at,
+                };
+                (
+                    "lfg.edit",
+                    "updated".into(),
+                    format!("LFG edit saved. Starts at {starts_at}."),
+                    true,
+                )
+            }
             // Preview returns before admission; reaching the store would be a
             // routing defect, so fail closed without touching it.
             LfgRequest::Preview { .. } => {
@@ -513,10 +576,19 @@ impl LfgInteractions {
         let result = if !audited {
             // Store calls committed independently of this lock-only transaction.
             // Do not turn applied state into a bare failure or claim an audit.
-            format!("{reply} Audit could not be recorded; check the saved state before retrying.")
+            if action == "lfg.edit" {
+                format!("{reply} Audit could not be recorded; the visible post could not be refreshed. Check the saved state before retrying.")
+            } else {
+                format!(
+                    "{reply} Audit could not be recorded; check the saved state before retrying."
+                )
+            }
         } else if refresh {
             match self.refresh(executor, guild_id, &id).await {
                 Ok(()) => reply,
+                Err(_) if action == "lfg.edit" => {
+                    format!("{reply} The visible post could not be refreshed.")
+                }
                 Err(_) => {
                     format!("{reply} Message refresh failed; the saved result above still applies.")
                 }

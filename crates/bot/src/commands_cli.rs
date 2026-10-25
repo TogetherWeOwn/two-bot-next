@@ -520,9 +520,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 40 all-gate builtins: 7 core + 1 scorecard + 12 automation
-            // + 9 announcements + 9 moderation mutations + 2 private reads.
-            40
+            // 41 all-gate builtins: 7 core + 1 scorecard + 12 automation
+            // + 10 announcements + 9 moderation mutations + 2 private reads.
+            41
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -535,6 +535,10 @@ mod tests {
         assert!(
             all_on.iter().any(|def| def.name == "giveaway"),
             "giveaway survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "lfg-edit"),
+            "lfg-edit survives the all-on registry"
         );
         assert!(
             all_on.iter().any(|def| def.name == "welcome-preview"),
@@ -550,7 +554,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 61);
+        assert_eq!(with_voice.len(), 62);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -564,6 +568,10 @@ mod tests {
             "giveaway survives the voice registry"
         );
         assert!(
+            with_voice.iter().any(|def| def.name == "lfg-edit"),
+            "lfg-edit survives the voice registry"
+        );
+        assert!(
             with_voice.iter().any(|def| def.name == "welcome-preview"),
             "welcome-preview survives the voice registry"
         );
@@ -575,6 +583,33 @@ mod tests {
             with_voice.iter().any(|def| def.name == "feed-inspect"),
             "feed-inspect survives the voice registry"
         );
+    }
+
+    #[test]
+    fn desired_registry_gates_lfg_edit_only_on_announcements() {
+        for (announcements, other_features, expected_count) in
+            [("0", "0", 0), ("0", "1", 0), ("1", "0", 1), ("1", "1", 1)]
+        {
+            let mut env = vars();
+            env.insert("TWO_ANNOUNCEMENTS".into(), announcements.into());
+            for gate in [
+                "TWO_AUTOMATIONS",
+                "TWO_COMMUNITY_SCORECARD",
+                "TWO_MODERATION",
+            ] {
+                env.insert(gate.into(), other_features.into());
+            }
+            env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+            let definitions = desired_definitions(2222, &env).expect("desired registry assembles");
+            assert_eq!(
+                definitions
+                    .iter()
+                    .filter(|definition| definition.name == "lfg-edit")
+                    .count(),
+                expected_count,
+                "announcements={announcements} other_features={other_features}"
+            );
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 40 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 41 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
@@ -277,13 +277,13 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .collect();
     // 23 legacy restricted rows plus management-only command-inspect,
     // command-disable, command-enable, giveaway and welcome-preview, plus
-    // purge-preview, channel-inspect, lfg-list, feed-inspect and game-mix.
+    // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect and game-mix.
     // Discord defaults never
     // replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        33,
-        "23 legacy restricted rows plus ten Next-only management commands"
+        34,
+        "23 legacy restricted rows plus eleven Next-only management commands"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
@@ -379,11 +379,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 43);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 44);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 40);
+    assert_eq!(commands.len(), 41);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -461,6 +461,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("rsvp-attendance", HandlerId::RsvpAttendance),
         ("lfg", HandlerId::Lfg),
         ("lfg-close", HandlerId::LfgClose),
+        ("lfg-edit", HandlerId::LfgEdit),
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
@@ -468,7 +469,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
     ];
     assert_eq!(
         cases.len(),
-        38,
+        39,
         "all handlers except giveaway and lfg-list covered (each has its own test)"
     );
     for (_, id) in cases {
@@ -493,7 +494,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
     let lfg_list = defs
         .iter()
         .find(|d| d.name == "lfg-list")
-        .expect("lfg-list is published right after lfg-close");
+        .expect("lfg-list is published after lfg-close and lfg-edit");
     assert_eq!(
         lfg_list.description.as_str(),
         "List open game posts in this channel"
@@ -1128,7 +1129,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 41 names, no partial view.
+    // endpoint: one request, all 42 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1139,8 +1140,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        41,
-        "7 core + 22 feature + 9 moderation mutations + 2 reads + 1 custom"
+        42,
+        "7 core + 23 feature + 9 moderation mutations + 2 reads + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1172,7 +1173,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 41, "no partial view");
+    assert_eq!(names.len(), 42, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1193,6 +1194,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-edit",
         "lfg-list",
         "feed-add",
         "feed-list",
