@@ -190,6 +190,56 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
 }
 
 #[test]
+fn schedule_here_exception_rejects_filter_drift_without_loosening_page_or_policy() {
+    assert!(
+        registry_diff(expected_registry()).is_empty(),
+        "unchanged golden control"
+    );
+    for (pointer, value) in [
+        ("/options/1/name", json!("channel")),
+        ("/options/1/type", json!(7)),
+        ("/options/1/required", json!(true)),
+        ("/options/1/description", json!("Different scope")),
+        ("/options/0/min_value", json!(0)),
+        ("/default_member_permissions", json!("0")),
+    ] {
+        let mut registry = expected_registry();
+        let command = registry
+            .as_array_mut()
+            .expect("registry")
+            .iter_mut()
+            .find(|command| command["name"] == "schedule-list")
+            .expect("schedule-list");
+        if pointer == "/options/1/required" {
+            command["options"][1]["required"] = value;
+        } else {
+            *command.pointer_mut(pointer).expect("protected field") = value;
+        }
+        let differences = registry_diff(registry);
+        assert!(
+            differences
+                .iter()
+                .any(|difference| difference.contains("schedule-list")),
+            "missed filter/policy drift at {pointer}: {differences:?}"
+        );
+    }
+    let mut missing = expected_registry();
+    missing
+        .as_array_mut()
+        .expect("registry")
+        .iter_mut()
+        .find(|command| command["name"] == "schedule-list")
+        .expect("schedule-list")["options"]
+        .as_array_mut()
+        .expect("options")
+        .pop();
+    assert!(
+        !registry_diff(missing).is_empty(),
+        "removing here is not an allowed exception"
+    );
+}
+
+#[test]
 fn lfg_preview_option_drift_is_detected() {
     let lfg = || {
         expected_registry()

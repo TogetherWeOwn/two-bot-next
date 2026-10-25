@@ -619,6 +619,25 @@ fn committed_references_match_compiled_metadata() {
 }
 
 #[test]
+fn schedule_here_reference_is_generated_from_optional_boolean_metadata() {
+    let rendered = render_commands();
+    let section = rendered
+        .split("## `/schedule-list`\n")
+        .nth(1)
+        .expect("schedule-list reference")
+        .split("\n## ")
+        .next()
+        .expect("schedule-list section");
+    assert!(section.contains("- Default permissions: ManageGuild (`32`)"));
+    assert!(section.contains("- Available in DMs: false"));
+    assert!(
+        section.contains("| `page` | integer | false | 1 |"),
+        "preserve page metadata: {section}"
+    );
+    assert!(section.contains("| `here` | boolean | false | — | — | — | — | Only schedules in this channel (default: false) |"), "render the additive boolean without channel/guild input: {section}");
+}
+
+#[test]
 fn lfg_preview_option_renders_in_command_reference() {
     let section = render_commands()
         .split("## `/lfg`\n")
