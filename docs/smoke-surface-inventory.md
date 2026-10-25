@@ -9,17 +9,20 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 39 built-ins plus the voice set
-  (60 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 40 compiled built-ins plus the voice set
+  (61 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 6 core + 1 scorecard + 12 automations + 9 announcements +
+Saved inventory: 6 core + 1 scorecard + 12 automations + 9 announcements +
 9 moderation + 2 private reads = **39 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
+The test extends this saved fixture in memory with `/lfg-edit`: **40 compiled
+built-ins**, five covered and 35 deferred. The saved JSON deliberately excludes
+edit; this extension is not a live-publication or smoke-acceptance claim.
 
 ## Covered: the smoke five (one per routing family)
 
@@ -42,7 +45,7 @@ are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
 per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
 type-4 reply on an isolated gate-safe router).
 
-## Deferred: 34 commands with reasons
+## Deferred: 34 saved commands with reasons
 
 Deferred means out of the read-only smoke, not untested: every row below
 is published by the same registry the unit test pins, and most share a

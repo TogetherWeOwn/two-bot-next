@@ -43,6 +43,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("reopen", "docs/parity.md §1 reopen"),
     ("feed-inspect", "docs/parity.md §1 feed-inspect"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("lfg-edit", "docs/parity.md §1 #26 Next-only companion"),
     ("command-disable", "docs/parity.md §1 command-disable"),
     ("command-enable", "docs/parity.md §1 command-enable"),
     ("giveaway", "docs/parity.md §1 giveaway"),
@@ -310,6 +311,29 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Next-only metadata editing reuses LFG's parity row, never the frozen
+    // legacy snapshot. Pin the complete wire shape independently of production.
+    assert!(commands.iter().all(|command| command["name"] != "lfg-edit"));
+    let edit = json!({
+        "name": "lfg-edit",
+        "description": "Update a raid/LFG title or start time",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+             "required": true, "max_length": 128},
+            {"name": "title", "description": "Event or group title", "type": 3,
+             "max_length": 100},
+            {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+             "type": 3}
+        ]
+    });
+    let after_close = commands
+        .iter()
+        .position(|command| command["name"] == "lfg-close")
+        .expect("legacy lfg-close remains published")
+        + 1;
+    commands.insert(after_close, edit);
     // Saved-response lifecycle is intentionally independent of replacement.
     for (offset, name, description) in [
         (
@@ -345,11 +369,12 @@ pub fn expected_registry() -> Value {
              "max_length": 512}
         ]
     });
-    let lfg_close_pos = commands
+    let after_edit = commands
         .iter()
-        .position(|c| c["name"] == "lfg-close")
-        .expect("lfg-close is published");
-    commands.insert(lfg_close_pos + 1, lfg_list);
+        .position(|c| c["name"] == "lfg-edit")
+        .expect("lfg-edit is published")
+        + 1;
+    commands.insert(after_edit, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
     // publish position (index 18, after sticky-remove, the pause/resume
     // lifecycle and the inspect/help/privacy/reopen/welcome-preview inserts above) as the
@@ -799,8 +824,8 @@ pub fn expected_registry() -> Value {
         command["options"] = json!([page]);
     }
     // Next-only saved-relay inspection has no frozen legacy counterpart.
-    // Pin the documented shape independently (docs/commands.md): guild-only,
-    // Manage Server, and exactly one required stable-id string capped at 128.
+    // Pin the documented shape independently: guild-only, Manage Server, and
+    // exactly one required stable-id string capped at 128.
     let feed_inspect_position = commands
         .iter()
         .position(|command| command["name"] == "feed-list")

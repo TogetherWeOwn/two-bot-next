@@ -29,7 +29,7 @@ fn all_on() -> RouterGates {
 }
 
 #[test]
-fn all_30_rows_equal_parity_section1() {
+fn documented_legacy_rows_equal_parity_section1() {
     let section = include_str!("../../../docs/parity.md")
         .split("## 1.")
         .nth(1)
@@ -98,17 +98,20 @@ fn all_30_rows_equal_parity_section1() {
     // `/reopen` picker recovery (row 34), `/purge-preview` (35),
     // `/channel-inspect` (36), `/giveaway` timed entry (row 37),
     // `/lfg-list` current-channel list (row 38), `/feed-inspect` relay detail
-    // (row 39), and pause/resume `/command-disable` and `/command-enable`
-    // (rows 40 and 41), and `/welcome-preview` (row 42). No Next-only row appears in the legacy §1 table above;
+    // (row 39), plus `/lfg-edit` sharing row 26, and pause/resume
+    // `/command-disable` and `/command-enable` (rows 40 and 41),
+    // and `/welcome-preview` (row 42). No Next-only row appears in the legacy §1 table above;
     // the registry-equality test below covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 42);
+    // 43 entries: 42 contiguous parity rows plus the `/lfg-edit` companion
+    // sharing LFG row 26.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 43);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        42
+        43
     );
     assert_eq!(
         COMMAND_PERMISSIONS
@@ -166,6 +169,37 @@ fn all_30_rows_equal_parity_section1() {
 }
 
 #[test]
+fn lfg_edit_is_the_only_companion_of_the_canonical_lfg_parity_row() {
+    let canonical = COMMAND_PERMISSIONS
+        .iter()
+        .find(|row| row.parity_row == 26)
+        .expect("legacy LFG row remains canonical");
+    assert_eq!(canonical.command, "lfg");
+    let edit = command_permission("lfg-edit").expect("Next-only metadata companion");
+    assert_eq!(edit.parity_row, 26);
+    assert_eq!(edit.required_permissions, 1 << 33);
+    assert_eq!(edit.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(edit.policy_hook, None);
+    let mut row26: Vec<_> = COMMAND_PERMISSIONS
+        .iter()
+        .filter(|row| row.parity_row == 26)
+        .map(|row| row.command)
+        .collect();
+    row26.sort_unstable();
+    assert_eq!(row26, ["lfg", "lfg-edit"]);
+    let mut other_rows = HashSet::new();
+    for row in COMMAND_PERMISSIONS
+        .iter()
+        .filter(|row| row.parity_row != 26)
+    {
+        assert!(
+            other_rows.insert(row.parity_row),
+            "duplicate non-LFG parity row"
+        );
+    }
+}
+
+#[test]
 fn next_only_read_permission_rows_do_not_become_mutation_policy_hooks() {
     for (name, number, bits) in [("purge-preview", 35, 8192), ("channel-inspect", 36, 16)] {
         let row = command_permission(name).expect("read has a permission row");
@@ -192,7 +226,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 39);
+    assert_eq!(builtins.len(), 40);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -316,7 +350,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 39, "every retained builtin routes");
+    assert_eq!(routed, 40, "every retained builtin routes");
 }
 
 #[test]

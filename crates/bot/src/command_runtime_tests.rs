@@ -742,7 +742,12 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
         }
         // LFG adapter ownership is composed unconditionally, unlike the
         // activation-fenced publication and invocation checked separately.
-        for handler in [HandlerId::Lfg, HandlerId::LfgClose, HandlerId::LfgList] {
+        for handler in [
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::LfgEdit,
+            HandlerId::LfgList,
+        ] {
             assert_eq!(
                 runtime.router().handler_for(&handler).map(|h| h.id()),
                 Some(handler),
@@ -1577,6 +1582,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "unlock"
                         | "lfg"
                         | "lfg-close"
+                        | "lfg-edit"
                         | "lfg-list"
                         | "schedule"
                         | "schedule-remove"
@@ -2865,6 +2871,12 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
             "Missing id option.",
         ),
         (
+            "lfg-edit",
+            Some(CHANNEL),
+            Permissions::MANAGE_EVENTS,
+            "Missing id option.",
+        ),
+        (
             "sticky",
             None,
             Permissions::MANAGE_GUILD,
@@ -3001,7 +3013,7 @@ async fn lfg_commands_preserve_manage_events_and_disabled_refusals() {
     ] {
         let runtime = runtime_without_db(gates(true, announcements), true, origin.clone());
         runtime.set_identity(1111, 1111);
-        for name in ["lfg", "lfg-close"] {
+        for name in ["lfg", "lfg-close", "lfg-edit"] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
             interaction.member.as_mut().unwrap().permissions = permissions;
             let before = mock.requests().len();
@@ -3057,6 +3069,7 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
         for name in [
             "lfg",
             "lfg-close",
+            "lfg-edit",
             "sticky",
             "sticky-remove",
             "feed-add",
@@ -3159,6 +3172,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             for name in [
                 "lfg",
                 "lfg-close",
+                "lfg-edit",
                 "sticky",
                 "sticky-remove",
                 "feed-add",
@@ -3217,7 +3231,7 @@ async fn foreign_application_interactions_never_reach_a_feature() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     runtime.set_identity(1111, 1111);
-    for name in ["lfg", "lfg-close", "sticky", "feed-add"] {
+    for name in ["lfg", "lfg-close", "lfg-edit", "sticky", "feed-add"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         interaction.application_id = Id::new(9999);
         interaction.member.as_mut().unwrap().permissions =
@@ -4096,6 +4110,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-edit",
         "lfg-list",
         "feed-add",
         "feed-remove",
@@ -4148,6 +4163,8 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
         "feed-inspect",
         "rsvp",
         "lfg",
+        "lfg-close",
+        "lfg-edit",
         "lfg-list",
     ] {
         assert!(
@@ -4249,6 +4266,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
             HandlerId::LfgClose,
+            HandlerId::LfgEdit,
             HandlerId::LfgList,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
@@ -4280,6 +4298,7 @@ fn production_router_matches_composed_production_wiring() {
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
+        router.register(Box::new(Marker(HandlerId::LfgEdit)));
         router.register(Box::new(Marker(HandlerId::LfgList)));
         router
     }
@@ -7313,8 +7332,9 @@ async fn feed_store_failure_replies_generic_and_audits_nothing() {
 // fixed store-failure text. Feed-list and feed-inspect stay unaudited even
 // on failure (legacy list parity): a failed read replies with the same safe
 // text and writes no audit row. A dead pool (the audit write itself
-// impossible) degrades to a warn log plus that same safe reply with no
-// panic and no leaked internals.
+// impossible)
+// degrades to a warn log plus that same safe reply with no panic and no
+// leaked internals.
 
 const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
 

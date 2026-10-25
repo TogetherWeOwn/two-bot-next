@@ -468,6 +468,24 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new("lfg-edit", "Update a raid/LFG title or start time")
+            .permissions(PERM_MANAGE_EVENTS)
+            .options(vec![
+                CommandOption::new(
+                    "id",
+                    "LFG id from the posted signup",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(MAX_RESOURCE_ID_CHARS as u32),
+                CommandOption::new("title", "Event or group title", CommandOptionType::String)
+                    .max_length(MAX_TITLE_CHARS as u32),
+                CommandOption::new(
+                    "starts-at",
+                    "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                    CommandOptionType::String,
+                ),
+            ]),
         CommandDefinition::new("lfg-list", "List open game posts in this channel")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![CommandOption {
@@ -679,6 +697,7 @@ mod tests {
                 "rsvp-attendance",
                 "lfg",
                 "lfg-close",
+                "lfg-edit",
                 "lfg-list",
                 "feed-add",
                 "feed-remove",
@@ -691,8 +710,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 6 core + 1 scorecard + 12 automation + 9 announcements.
-        assert_eq!(merged.len(), 28);
+        // 6 core + 1 scorecard + 12 automation + 10 announcements.
+        assert_eq!(merged.len(), 29);
         assert_eq!(
             &names(&merged)[..7],
             [
@@ -739,6 +758,7 @@ mod tests {
         }
         assert_eq!(is(&ann, "lfg"), manage_events);
         assert_eq!(is(&ann, "lfg-close"), manage_events);
+        assert_eq!(is(&ann, "lfg-edit"), manage_events);
         assert_eq!(is(&ann, "lfg-list"), manage_events);
         for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
@@ -806,6 +826,8 @@ mod tests {
             ("lfg", 0, 100),
             ("lfg", 2, 2339),
             ("lfg-close", 0, 128),
+            ("lfg-edit", 0, 128),
+            ("lfg-edit", 1, 100),
             ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
@@ -859,6 +881,35 @@ mod tests {
                 "{command} event-id bound"
             );
         }
+    }
+
+    #[test]
+    fn lfg_edit_advertises_only_bounded_metadata_options_in_publish_order() {
+        let announcements = announcement_commands();
+        let close = announcements
+            .iter()
+            .position(|command| command.name == "lfg-close")
+            .expect("existing close command");
+        let edit = announcements
+            .get(close + 1)
+            .expect("metadata companion follows close");
+        assert_eq!(
+            serde_json::to_value(edit).expect("command serializes"),
+            serde_json::json!({
+                "name": "lfg-edit",
+                "description": "Update a raid/LFG title or start time",
+                "dm_permission": false,
+                "default_member_permissions": "8589934592",
+                "options": [
+                    {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+                     "required": true, "max_length": 128},
+                    {"name": "title", "description": "Event or group title", "type": 3,
+                     "max_length": 100},
+                    {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                     "type": 3}
+                ]
+            })
+        );
     }
 
     #[test]

@@ -131,6 +131,7 @@ pub enum HandlerId {
     RsvpAttendance,
     Lfg,
     LfgClose,
+    LfgEdit,
     LfgList,
     FeedAdd,
     FeedRemove,
@@ -451,6 +452,7 @@ impl InteractionRouter {
         // LFG management (`InteractionRuntime::with_router`, ungated).
         register(HandlerId::Lfg);
         register(HandlerId::LfgClose);
+        register(HandlerId::LfgEdit);
         register(HandlerId::LfgList);
         router
     }
@@ -725,6 +727,11 @@ impl InteractionRouter {
             },
             "lfg-close" => Row {
                 handler: HandlerId::LfgClose,
+                gate: RowGate::Announcements,
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
+            },
+            "lfg-edit" => Row {
+                handler: HandlerId::LfgEdit,
                 gate: RowGate::Announcements,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
@@ -1009,13 +1016,14 @@ mod tests {
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
             ("lfg-close", HandlerId::LfgClose),
+            ("lfg-edit", HandlerId::LfgEdit),
             ("lfg-list", HandlerId::LfgList),
             ("feed-add", HandlerId::FeedAdd),
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 39, "all 39 handler-owned builtins covered");
+        assert_eq!(cases.len(), 40, "all 40 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1054,6 +1062,7 @@ mod tests {
             HandlerId::AutomationCustom,
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
+            HandlerId::LfgEdit,
             HandlerId::Moderation(ModerationAction::Ban),
             HandlerId::FeedList,
         ] {
@@ -1065,6 +1074,7 @@ mod tests {
             ("schedule", HandlerId::AutomationAdmin),
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
+            ("lfg-edit", HandlerId::LfgEdit),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("feed-list", HandlerId::FeedList),
         ] {
@@ -1103,6 +1113,7 @@ mod tests {
             ("rsvp", RouterRefusal::AnnouncementsDisabled),
             ("rsvp-attendance", RouterRefusal::AnnouncementsDisabled),
             ("lfg", RouterRefusal::AnnouncementsDisabled),
+            ("lfg-edit", RouterRefusal::AnnouncementsDisabled),
             ("feed-list", RouterRefusal::AnnouncementsDisabled),
             ("ban", RouterRefusal::ModerationDisabled),
             ("purge", RouterRefusal::ModerationDisabled),
@@ -1249,6 +1260,25 @@ mod tests {
                 handler: HandlerId::Lfg
             }
         );
+        for (name, handler) in [
+            ("lfg-close", HandlerId::LfgClose),
+            ("lfg-edit", HandlerId::LfgEdit),
+        ] {
+            for permissions in [None, Some(0), Some(8), Some(PERM_MANAGE_GUILD)] {
+                assert_eq!(
+                    r.route_slash(&ctx(name, Some(GUILD), permissions)),
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageEventsRequired
+                    },
+                    "{name} needs resolved ManageEvents"
+                );
+            }
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(PERM_MANAGE_EVENTS))),
+                SlashOutcome::Handled { handler },
+                "{name} accepts exactly ManageEvents"
+            );
+        }
         // Feed without ManageGuild.
         assert_eq!(
             r.route_slash(&ctx("feed-add", Some(GUILD), Some(PERM_MANAGE_EVENTS))),
@@ -1597,9 +1627,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 6 core + 1 scorecard + 12 automation + 9 announcements + 9 moderation
-        // + 2 reads + 1 custom = 40, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 40);
+        // 6 core + 1 scorecard + 12 automation + 10 announcements + 9 moderation
+        // + 2 reads + 1 custom = 41, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 41);
         assert_eq!(
             &names[..7],
             [
@@ -1616,19 +1646,141 @@ mod tests {
         assert_eq!(&names[17..20], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
-        assert_eq!(names[23], "lfg-list");
-        assert_eq!(&names[24..27], ["feed-add", "feed-remove", "feed-list"]);
-        assert_eq!(names[27], "feed-inspect");
+        assert_eq!(names[23], "lfg-edit");
+        assert_eq!(names[24], "lfg-list");
+        assert_eq!(&names[25..28], ["feed-add", "feed-remove", "feed-list"]);
+        assert_eq!(names[28], "feed-inspect");
         assert_eq!(
-            &names[28..37],
+            &names[29..38],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[37..39], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[39], "faq");
+        assert_eq!(&names[38..40], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[40], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
+    }
+
+    #[test]
+    fn metadata_edit_and_saved_response_lifecycle_survive_every_publish_gate_combination() {
+        // Missing either additive feature, or deduping a distinct name, must
+        // fail even when another feature happens to keep the total unchanged.
+        let automation = [
+            "command",
+            "command-remove",
+            "command-list",
+            "command-inspect",
+            "command-disable",
+            "command-enable",
+            "schedule",
+            "schedule-remove",
+            "schedule-list",
+            "sticky",
+            "sticky-remove",
+            "giveaway",
+        ];
+        let announcements = [
+            "rsvp",
+            "rsvp-attendance",
+            "lfg",
+            "lfg-close",
+            "lfg-edit",
+            "lfg-list",
+            "feed-add",
+            "feed-remove",
+            "feed-list",
+            "feed-inspect",
+        ];
+        let moderation = [
+            "ban",
+            "tempban",
+            "kick",
+            "timeout",
+            "warn",
+            "purge",
+            "slowmode",
+            "lockdown",
+            "unlock",
+            "purge-preview",
+            "channel-inspect",
+        ];
+        for mask in 0_u8..64 {
+            let gates = RouterGates {
+                scorecard: mask & 1 != 0,
+                automations: mask & 2 != 0,
+                announcements: mask & 4 != 0,
+                moderation: mask & 8 != 0,
+                voice: mask & 16 != 0,
+                voice_assistant: mask & 32 != 0,
+                ..all_on()
+            };
+            for custom_enabled in [false, true] {
+                let router = InteractionRouter::new(gates);
+                let defs = router
+                    .publish_set(&[CustomCommand {
+                        name: "faq".to_owned(),
+                        description: "FAQ".to_owned(),
+                        enabled: custom_enabled,
+                    }])
+                    .expect("every feature combination assembles");
+                let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
+                let mut expected = vec![
+                    "rank",
+                    "leaderboard",
+                    "help",
+                    "privacy",
+                    "reopen",
+                    "welcome-preview",
+                ];
+                if gates.scorecard {
+                    expected.push("attendance");
+                }
+                if gates.automations {
+                    expected.extend(automation);
+                }
+                if gates.announcements {
+                    expected.extend(announcements);
+                }
+                if gates.moderation {
+                    expected.extend(moderation);
+                }
+                if gates.voice {
+                    expected.extend(
+                        VOICE_NAMES
+                            .iter()
+                            .copied()
+                            .filter(|name| *name != "kick" || !gates.moderation),
+                    );
+                }
+                if gates.automations && custom_enabled {
+                    expected.push("faq");
+                }
+                assert_eq!(names, expected, "mask={mask} custom={custom_enabled}");
+                assert_eq!(
+                    names
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len(),
+                    names.len(),
+                    "distinct commands must never collide: mask={mask} custom={custom_enabled}",
+                );
+                assert!(defs.iter().all(|def| !def.dm_permission));
+                assert!(!names.contains(&"templateassistant"));
+                for (name, enabled, permission) in [
+                    ("command-disable", gates.automations, "32"),
+                    ("command-enable", gates.automations, "32"),
+                    ("lfg-edit", gates.announcements, "8589934592"),
+                ] {
+                    let found = defs.iter().find(|def| def.name == name);
+                    assert_eq!(found.is_some(), enabled, "{name} mask={mask}");
+                    if let Some(def) = found {
+                        assert_eq!(def.default_member_permissions.as_deref(), Some(permission));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1704,6 +1856,7 @@ mod tests {
         for (gate, builtin) in [
             ("moderation", "ban"),
             ("announcements", "lfg"),
+            ("announcements", "lfg-edit"),
             ("scorecard", "attendance"),
         ] {
             let mut gates = all_on();
@@ -1810,7 +1963,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 39);
+        assert_eq!(off.len(), 40);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1820,16 +1973,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 39 builtins keep their order; the 21 voice names that survive
+        // 40 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 60);
-        assert_eq!(on_names[..39], off_names[..]);
+        assert_eq!(on.len(), 61);
+        assert_eq!(on_names[..40], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[39..], expected[..]);
+        assert_eq!(on_names[40..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1890,13 +2043,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 39
+        // Both gates on is the full voice set without the assistant: 40
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 60);
+        assert_eq!(both.len(), 61);
     }
 
     #[test]
