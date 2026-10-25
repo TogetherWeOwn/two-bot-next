@@ -5,7 +5,7 @@
 //! `fixtures/smoke_surface_inventory.json` exactly, in publish order. The
 //! fixture additionally marks the five smoke-covered commands (one per
 //! routing family, matching `crates/discord/tests/top5_reply_fixtures.rs`)
-//! versus the 34 explicitly deferred, with a reason per deferral.
+//! versus the 35 explicitly deferred, with a reason per deferral.
 //!
 //! Offline only: no staging guild, no live Discord, no network, no database.
 
@@ -204,7 +204,7 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
     assert_eq!(covered.len(), 5, "exactly the top five");
-    assert_eq!(deferred.len(), 34, "every non-smoke row deferred");
+    assert_eq!(deferred.len(), 35, "every non-smoke row deferred");
     assert_eq!(covered.len() + deferred.len(), 40, "every row marked");
 
     let mut covered_names: Vec<&str> = covered
