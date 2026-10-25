@@ -14,7 +14,7 @@ pub use real_core::*;
 mod spies;
 pub use spies::{command_runtime, db_log, funnel, scheduled_store};
 #[path = "../../discord/tests/common/mod.rs"]
-mod discord_test_common;
+pub mod discord_test_common;
 #[path = "../src/schedule_runtime.rs"]
 mod subject;
 

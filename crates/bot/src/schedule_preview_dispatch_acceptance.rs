@@ -91,8 +91,8 @@ async fn control_preview_keeps_staff_feature_activation_and_guild_fences() {
         runtime.on_interaction(&input).await;
         let requests = mock.requests();
         mock.shutdown().await;
-        if denied == "foreign-guild" {
-            assert!(requests.is_empty(), "guild fence stays silent");
+        if denied == "foreign-guild" || denied == "dm" {
+            assert!(requests.is_empty(), "guild fence stays silent for {denied}");
             continue;
         }
         assert_eq!(

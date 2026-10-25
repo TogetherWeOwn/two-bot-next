@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/tests/schedule_preview_acceptance.rs",
-      "sha256": "f7bf43438ff648e363da0e0705ff169a093dac46cd9c4d96c0b44a754fb0ce1a",
+      "sha256": "2358c732882a1b057c90fb1c39b9faa587298c743339bf916475793068a98345",
       "tests": 13
     },
     {
@@ -15,7 +15,7 @@
     },
     {
       "path": "crates/bot/src/schedule_preview_dispatch_acceptance.rs",
-      "sha256": "0715cd8765b45b3fa5c8634531da494cab477092bb29520f6e2d6574086472ba",
+      "sha256": "1ce7fd5e0f4f9ff98b847a92147ebc81617373df5f86ad9aaac21e9eebb03cec",
       "tests": 4
     }
   ],
@@ -46,8 +46,13 @@
     "limits": "Store-boundary spies are not a live SQL test. Direct full-dispatch tests use a closed pool; no staging/production database, live Discord or mutable environment is used. No independent cooldown/job-queue API exists in the baseline create handler: its quota/queue boundary is put_scheduled; no claim of testing a separate service is made."
   },
   "verification": {
-    "state": "pending_behavioral_execution",
-    "localCargo": "Three bounded-wrapper attempts refused admission with exit 75: no idle, below-budget slot; no per-worktree fallback. No tests executed; this is NOT RED.",
+    "state": "prior_head_behavioral_red_observed_corrected_head_pending",
+    "priorHead": "7118bafcc2405f15903a87568beffc6fede77465",
+    "priorRun": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40204366852",
+    "priorCoverageJob": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40204366852/job/121202072900",
+    "priorBehavioralResults": "Standalone target: 13 executed, 10 behavior-specific assertion failures, 3 controls passed. Preview fell through to actual create: minted IDs and store/audit/quota calls; concurrent witness captured 4 IDs and 2 writes. Dispatch: 3 intended missing-preview failures plus one incorrect new DM control expectation. Existing strict and absolute-time controls passed.",
+    "testCorrections": "Expose the included shared fixture module publicly to avoid 28 dead-code lint errors without a waiver. Preserve the real runtime's existing silent DM guild fence, rather than requiring a new DM response. No implementation changed and no existing controls were edited.",
+    "localCargo": "Five bounded-wrapper attempts across two runs refused admission with exit 75: no idle, below-budget slot; no per-worktree fallback. No local tests executed; refusal is NOT RED. Prior hosted assertions are real behavior evidence, but do not verify the corrected head.",
     "offline": "Formatting, floor, inventory, secret-debug guard and diff whitespace checks passed. Baseline noncompiling pre-push checklist passed.",
     "contextPack": "Invoked before push; failed during MCP initialization with RuntimeError: MCP server exited. No production callers changed; only test registration is edited.",
     "nextAction": "Observe actual assertion failures and passing controls on this candidate before delivering a final immutable handoff. Builder must not start from unverified or compiler-failing evidence."
