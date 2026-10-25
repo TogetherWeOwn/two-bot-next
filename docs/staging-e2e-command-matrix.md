@@ -55,8 +55,8 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 38 | `/lfg-list` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral current-channel open confirmed posts, at most five whole rows, bounded cursor continuation; no mutations | `AnnouncementsDisabled`, `ManageEventsRequired`, optional `cursor` ≤512 bound to guild/channel/query, invalid or stale page → restart |
 | 28 | `/feed-add` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `kind` rss/youtube/twitch, `source` required |
 | 29 | `/feed-remove` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
-| 39 | `/feed-pause` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row; enabled-to-paused transition refused while pending recovery exists | `AnnouncementsDisabled`, `ManageServerRequired`, exactly one string `id` required |
-| 40 | `/feed-resume` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, exactly one string `id` required |
+| 40 | `/feed-pause` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row; enabled-to-paused transition refused while pending recovery exists | `AnnouncementsDisabled`, `ManageServerRequired`, exactly one string `id` required |
+| 41 | `/feed-resume` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, exactly one string `id` required |
 | 30 | `/feed-list` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay list | `AnnouncementsDisabled`, `ManageServerRequired` |
 | 39 | `/feed-inspect` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay detail with safe source and last attempt | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
 | 3 | `/ban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + REST ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Ban)`, member-moderation policy, `target`/`reason` required |

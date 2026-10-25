@@ -431,7 +431,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "feed-pause",
-            39,
+            40,
             E2eGate::Announcements,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -445,7 +445,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "feed-resume",
-            40,
+            41,
             E2eGate::Announcements,
             PERM_MANAGE_GUILD,
             "ManageGuild",
