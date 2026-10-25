@@ -1011,8 +1011,13 @@ impl CommandRuntime {
                 };
                 // The gateway also delivers these to their feature owners. Yield
                 // before user-slot/lane admission so overload cannot race the
-                // voice or onboarding defer with the shared busy callback.
+                // voice, onboarding preview or reopen defer with the shared
+                // busy callback. Preview picker clicks yield the same way:
+                // onboarding owns their defer and guidance, so a saturated
+                // shared lane must not race it with a competing busy callback.
                 if self.voice_owns_interaction(&interaction)
+                    || crate::onboarding::owns_welcome_preview(&interaction)
+                    || crate::onboarding::is_preview_control(&interaction)
                     || matches!(
                         route_interaction(&self.interactions.router, &interaction, None),
                         RoutedInteraction::Slash {
@@ -1343,6 +1348,11 @@ impl CommandRuntime {
             return;
         };
         let interaction = interaction.as_ref();
+        // The onboarding ingress already owns the preview's receive-relative
+        // ACK and private refusal. Never double-answer it here.
+        if crate::onboarding::owns_welcome_preview(interaction) {
+            return;
+        }
         if ChannelModerationRuntime::accepts(interaction) {
             if let Err(error) = self
                 .channel
@@ -2717,6 +2727,8 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // for it, exactly like the picker components); this registration only
     // advertises the ownership the router outcome names.
     router.register(Box::new(SliceHandler(HandlerId::Reopen)));
+    // Onboarding ingress owns the preview, including its private refusal.
+    router.register(Box::new(SliceHandler(HandlerId::WelcomePreview)));
     router
 }
 

@@ -122,6 +122,7 @@ pub enum HandlerId {
     Help,
     Privacy,
     Reopen,
+    WelcomePreview,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -431,6 +432,7 @@ impl InteractionRouter {
             HandlerId::Help,
             HandlerId::Privacy,
             HandlerId::Reopen,
+            HandlerId::WelcomePreview,
         ] {
             register(id);
         }
@@ -676,6 +678,11 @@ impl InteractionRouter {
                 handler: HandlerId::Reopen,
                 gate: RowGate::Always,
                 permission_refusal: None,
+            },
+            "welcome-preview" => Row {
+                handler: HandlerId::WelcomePreview,
+                gate: RowGate::Always,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             // Scorecard check-in gates `ManageEvents` both in the published
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
@@ -967,6 +974,7 @@ mod tests {
             ("help", HandlerId::Help),
             ("privacy", HandlerId::Privacy),
             ("reopen", HandlerId::Reopen),
+            ("welcome-preview", HandlerId::WelcomePreview),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -1007,7 +1015,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 38, "all 38 handler-owned builtins covered");
+        assert_eq!(cases.len(), 39, "all 39 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1589,36 +1597,37 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 12 automation + 9 announcements + 9 moderation
-        // + 2 reads + 1 custom = 39, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 39);
+        // 6 core + 1 scorecard + 12 automation + 9 announcements + 9 moderation
+        // + 2 reads + 1 custom = 40, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 40);
         assert_eq!(
-            &names[..6],
+            &names[..7],
             [
                 "rank",
                 "leaderboard",
                 "help",
                 "privacy",
                 "reopen",
+                "welcome-preview",
                 "attendance"
             ]
         );
-        assert_eq!(names[9], "command-inspect");
-        assert_eq!(&names[16..19], ["sticky-remove", "giveaway", "rsvp"]);
+        assert_eq!(names[10], "command-inspect");
+        assert_eq!(&names[17..20], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
-        assert_eq!(names[22], "lfg-list");
-        assert_eq!(&names[23..26], ["feed-add", "feed-remove", "feed-list"]);
-        assert_eq!(names[26], "feed-inspect");
+        assert_eq!(names[23], "lfg-list");
+        assert_eq!(&names[24..27], ["feed-add", "feed-remove", "feed-list"]);
+        assert_eq!(names[27], "feed-inspect");
         assert_eq!(
-            &names[27..36],
+            &names[28..37],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[36..38], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[38], "faq");
+        assert_eq!(&names[37..39], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[39], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1633,7 +1642,17 @@ mod tests {
         });
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
+        assert_eq!(
+            names,
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview"
+            ]
+        );
     }
 
     #[test]
@@ -1654,7 +1673,17 @@ mod tests {
         // invocation refuses at dispatch, so publishing burns the ceiling.
         let set = off.publish_set(&[row()]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
+        assert_eq!(
+            names,
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview"
+            ]
+        );
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
             .map(|i| CustomCommand {
@@ -1664,7 +1693,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 5);
+        assert_eq!(set.len(), 6);
     }
 
     #[test]
@@ -1781,7 +1810,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 38);
+        assert_eq!(off.len(), 39);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1791,16 +1820,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 38 builtins keep their order; the 21 voice names that survive
+        // 39 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 59);
-        assert_eq!(on_names[..38], off_names[..]);
+        assert_eq!(on.len(), 60);
+        assert_eq!(on_names[..39], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[38..], expected[..]);
+        assert_eq!(on_names[39..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1861,13 +1890,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 38
+        // Both gates on is the full voice set without the assistant: 39
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 59);
+        assert_eq!(both.len(), 60);
     }
 
     #[test]
