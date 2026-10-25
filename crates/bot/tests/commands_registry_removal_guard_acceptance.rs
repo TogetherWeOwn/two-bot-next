@@ -524,7 +524,7 @@ async fn diff_and_dry_run_report_unrecognized_without_writing() {
         vec!["commands", "diff", "--json"],
         vec!["commands", "publish", "--json"],
     ] {
-        let json_mode = args.iter().any(|arg| *arg == "--json");
+        let json_mode = args.contains(&"--json");
         let mock = MockRest::start(
             vec![ScriptedResponse::json(
                 200,
