@@ -147,18 +147,47 @@ enum Step {
 /// One supervised attempt with the clock injected. Database failures fail
 /// the attempt so the supervisor metrics report them; a failed audit write
 /// is logged, finishes the batch, and then fails the attempt too.
+///
+/// The tick runs two sequential phases sharing one supervisor deadline and
+/// cancellation: scheduled occurrences first, then bounded event reminders.
+/// A completed schedule-store failure stops its batch but still permits the
+/// reminder phase when activation and ownership remain valid. Either phase
+/// failing reports the tick as unhealthy; committed work in either phase is
+/// retained. No detached work, no phase parallelism, no timeout reset.
 pub(crate) async fn tick(
     pool: &PgPool,
     rest: &ActionExecutor,
     guild: &str,
     clock: impl Fn() -> u64 + Send + Sync,
 ) -> Result<(), ErrorClass> {
+    let schedule_error = run_schedule_phase(pool, rest, guild, &clock).await;
+    let reminder_error = remind_event_attendees(pool, rest, guild, &clock)
+        .await
+        .err();
+    match (schedule_error, reminder_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        // Deterministic precedence: the schedule phase ran first. Both store
+        // failures map to the existing Database class today.
+        (Some(schedule), Some(_)) => Err(schedule),
+    }
+}
+
+/// Claim and run due scheduled occurrences, stopping the batch on the first
+/// completed store failure. Returns the phase's failure, if any; a deferred
+/// audit failure also fails the phase without resuming the batch.
+async fn run_schedule_phase(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    clock: &impl Fn() -> u64,
+) -> Option<ErrorClass> {
     let mut audit_failed = false;
     for _ in 0..TICKER_BATCH_LIMIT {
         let now = clock();
         let now_iso = format_iso_ms(now);
         let claim_token = random_id();
-        let claimed = claim_due(
+        let claimed = match claim_due(
             pool,
             guild,
             &now_iso,
@@ -167,7 +196,10 @@ pub(crate) async fn tick(
             &random_nonce(),
         )
         .await
-        .map_err(database)?;
+        {
+            Ok(claimed) => claimed,
+            Err(error) => return Some(database(error)),
+        };
         let Some(row) = claimed.into_iter().next() else {
             break;
         };
@@ -179,17 +211,13 @@ pub(crate) async fn tick(
             now,
             now_iso: &now_iso,
         };
-        match occurrence.run(&mut audit_failed).await? {
-            Step::Next => {}
-            Step::Stop => return Err(ErrorClass::Database),
+        match occurrence.run(&mut audit_failed).await {
+            Ok(Step::Next) => {}
+            Ok(Step::Stop) => return Some(ErrorClass::Database),
+            Err(error) => return Some(error),
         }
     }
-    remind_event_attendees(pool, rest, guild, &clock).await?;
-    if audit_failed {
-        Err(ErrorClass::Database)
-    } else {
-        Ok(())
-    }
+    audit_failed.then_some(ErrorClass::Database)
 }
 
 /// Event reminders share this supervised, activation-fenced ticker, but are
@@ -205,12 +233,12 @@ async fn remind_event_attendees(
 
     for event in due_event_reminders(pool, guild, clock())
         .await
-        .map_err(database)?
+        .map_err(reminder_database)?
     {
         let now = clock();
         if !begin_event_reminder_delivery(pool, guild, &event, now)
             .await
-            .map_err(database)?
+            .map_err(reminder_database)?
         {
             continue;
         }
@@ -244,7 +272,7 @@ async fn remind_event_attendees(
         };
         audit_scheduled(pool, &input, &format_iso_ms(now), &random_id())
             .await
-            .map_err(database)?;
+            .map_err(reminder_database)?;
     }
     Ok(())
 }
@@ -630,6 +658,11 @@ impl Occurrence<'_> {
 
 fn database(error: sqlx::Error) -> ErrorClass {
     tracing::warn!(reason = db_class(&error), "scheduled message store failed");
+    ErrorClass::Database
+}
+
+fn reminder_database(error: sqlx::Error) -> ErrorClass {
+    tracing::warn!(reason = db_class(&error), "event reminder store failed");
     ErrorClass::Database
 }
 
