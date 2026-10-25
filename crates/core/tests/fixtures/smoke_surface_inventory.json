@@ -406,6 +406,16 @@
           "max_value": 525600,
           "max_length": null,
           "choices": []
+        },
+        {
+          "name": "at",
+          "description": "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 64,
+          "choices": []
         }
       ],
       "smoke": "deferred",
