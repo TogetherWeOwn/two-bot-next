@@ -46,7 +46,7 @@ JOB_INVENTORY = {
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
                               "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
-                           "pinned-history-guard"},
+                           "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
@@ -7953,8 +7953,15 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("runs-on", job)
                         self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
                         continue
-                    # Main #183 returned container smoke to the shared pool.
-                    self.assertTrue(runner_allowed(job_id, job["runs-on"]))
+                    if (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
+                        # Artifact-only certification has no host/container dependency.
+                        # Pin this job to hosted isolation, not a generic runner waiver.
+                        self.assertEqual(job["runs-on"], "ubuntu-latest")
+                        self.assertNotIn("services", job)
+                        self.assertNotIn("container", job)
+                    else:
+                        # Main #183 returned container smoke to the shared pool.
+                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
@@ -8375,10 +8382,16 @@ class WorkflowTests(unittest.TestCase):
                         # Derives the deploy ID from today's staging
                         # Deployments, then records this one.
                         expected = {"contents": "read", "deployments": "write"}
+                    elif (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
+                        # Reads the producing run and its immutable diagnostics artifact;
+                        # certification itself has no environment or deploy credentials.
+                        expected = {"contents": "read", "actions": "read"}
+                        self.assertNotIn("environment", job)
+                        self.assertNotIn("secrets", job)
                     elif (name, job_id) == ("deploy-production.yml", "production"):
-                        # Derives the deploy ID from today's production
-                        # Deployments, then records this one.
-                        expected = {"contents": "read", "deployments": "write"}
+                        # Reads immutable staging artifacts, then records this
+                        # independent production Deployment event.
+                        expected = {"contents": "read", "actions": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):

@@ -7,6 +7,7 @@ scripts each answer. Nothing here dispatches the workflow.
 
 import contextlib
 import datetime
+import importlib
 import io
 import json
 import os
@@ -181,8 +182,12 @@ def green():
     }
 
 
-def staging_run(run_id=501, number=5, status="completed", conclusion="success", sha=SHA):
-    return {"id": run_id, "run_number": number, "head_sha": sha, "status": status, "conclusion": conclusion}
+def staging_run(run_id=501, number=5, attempt=2, status="completed", conclusion="success", sha=SHA):
+    # Real deploy-staging workflow_runs always carry run_attempt (int >= 1);
+    # the latest run on a rerun reports attempt 2 while run_number stays
+    # fixed, and the guard forwards it verbatim as staging_attempt.
+    return {"id": run_id, "run_number": number, "run_attempt": attempt,
+            "head_sha": sha, "status": status, "conclusion": conclusion}
 
 
 SNAPSHOT_RUN_ID = 9100
@@ -379,13 +384,15 @@ class StaticGuardTests(unittest.TestCase):
             self.assertTrue(granted, name)
             if name == "production":
                 # Checkout plus the deploy-ID lifecycle: count today's
-                # production Deployments for N, then record this one.
-                self.assertEqual(granted, {"contents": "read", "deployments": "write"})
+                # production Deployments for N, then record this one; plus
+                # read-only runs access to fetch the exact immutable staging
+                # artifact by ID for same-SHA promotion.
+                self.assertEqual(granted, {"contents": "read", "actions": "read", "deployments": "write"})
                 continue
             self.assertEqual(set(granted.values()), {"read"}, name)
         self.assertEqual(
             set(children(children(JOBS["production"][1:], 4)["permissions"][1:], 6)),
-            {"contents", "deployments"},
+            {"contents", "actions", "deployments"},
         )
 
     def test_actions_are_pinned_and_wrangler_matches_staging(self):
@@ -899,7 +906,8 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "false",
                                    "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": ""})
+                                   "auto": "false", "green_at": "",
+                                   "staging_run_id": "501", "staging_attempt": "2"})
         self.assertIn("Takeover: on", summary)
         self.assertIn(SHA, summary)
         self.assertIn("full `ci-ok` verdict", summary)
@@ -1026,10 +1034,12 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertEqual(result[3], [])
         code, outputs, summary, _, _ = self.guard(rollback=VERSION.upper())
         self.assertEqual(code, 0)
+        # Recovery never depends on staging history: both source outputs stay empty.
         self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION,
                                    "restore_image": IMAGE, "takeover": "false",
                                    "allow_unstaged": "false", "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": ""})
+                                   "auto": "false", "green_at": "",
+                                   "staging_run_id": "", "staging_attempt": ""})
         self.assertIn(VERSION, summary)
 
     def test_rollback_needs_the_previous_container_image(self):
@@ -1069,10 +1079,12 @@ class GuardBehaviourTests(unittest.TestCase):
             takeover="true", allow_unstaged="true",
             staging={"total_count": 0, "workflow_runs": []})
         self.assertEqual(code, 0)
+        # The live-SHA waiver re-serves the live build without staging history.
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "true",
                                    "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": ""})
+                                   "auto": "false", "green_at": "",
+                                   "staging_run_id": "", "staging_attempt": ""})
         self.assertIn("operator confirms the SHA is live", summary)
         self.assertIn(("production-readyz", {"url": "https://production.example.test/readyz", "timeout": 10}), calls)
         self.assertFalse(any("deploy-staging" in path for path, _ in calls))
@@ -1343,7 +1355,8 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "false",
                                    "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": ""})
+                                   "auto": "false", "green_at": "",
+                                   "staging_run_id": "501", "staging_attempt": "2"})
         self.assertIn("Approval: automated", summary)
         self.assertIn("deploy-staging run `501`", summary)
         self.assertTrue(any(path.endswith("deploy-staging.yml/runs") and "status" not in q for path, q in calls))
@@ -1375,6 +1388,87 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertRefused(self.guard(auto="true", environment=policy), "restrict deployments to main")
         self.assertRefused(self.guard(auto="true", branches={"branch_policies": [{"name": "*", "type": "branch"}]}),
                            "from main only")
+
+    def test_ordinary_reviewers_forward_the_latest_staging_run_and_attempt(self):
+        # The source guard runs on every ordinary promotion too: the newest
+        # eligible run (by run_number, then id) is forwarded verbatim, and a
+        # rerun's incremented attempt is never flattened to empty or 1.
+        older = staging_run(run_id=500, number=4, attempt=1)
+        runs = {"total_count": 2, "workflow_runs": [older, staging_run()]}
+        code, outputs, _, _, _ = self.guard(**{"staging-all": runs})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["staging_run_id"], "501")
+        self.assertEqual(outputs["staging_attempt"], "2")
+        # Removed drill inputs cannot change the forwarded source either.
+        for spike in ("true", "false"):
+            with self.subTest(spike=spike):
+                code, outputs, _, _, _ = self.guard(
+                    spike=spike, **{"staging-all": runs})
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["staging_run_id"], "501")
+                self.assertEqual(outputs["staging_attempt"], "2")
+
+    def test_ordinary_reviewers_refuse_unless_the_latest_staging_run_is_green(self):
+        # An older success cannot hide a newer failed, still-running, or
+        # current-attempt run on the reviewer path either.
+        cases = {
+            "newer failed run": [staging_run(), staging_run(run_id=502, number=6, conclusion="failure")],
+            "newer in-progress run": [staging_run(), staging_run(run_id=502, number=6,
+                                                                 status="in_progress", conclusion=None)],
+            "current attempt still running": [staging_run(status="in_progress", conclusion=None)],
+        }
+        for name, run_list in cases.items():
+            with self.subTest(name=name):
+                result = self.guard(
+                    **{"staging-all": {"total_count": len(run_list), "workflow_runs": run_list}})
+                self.assertRefused(result, "not a completed success")
+
+    def test_ordinary_reviewers_exclude_verified_proof_runs(self):
+        # A history holding only the dispatch-only rollback proof certifies
+        # nothing; beside a real green run the proof is skipped and the green
+        # run (501/2) is forwarded, with reviewers still required throughout.
+        proof_row = {"id": 500, "run_number": 4, "head_sha": SHA,
+                     "status": "completed", "conclusion": "failure",
+                     "display_title": "staging rollback proof"}
+        proof_current = {**proof_row, "run_attempt": 1, "event": "workflow_dispatch",
+                         "path": ".github/workflows/deploy-staging.yml",
+                         "head_branch": "main", "repository": {"full_name": REPO},
+                         "head_repository": {"full_name": REPO}}
+        proof_jobs = {"total_count": 1, "jobs": [{
+            "run_id": 500, "run_attempt": 1, "head_sha": SHA,
+            "status": "completed", "conclusion": "failure",
+            "steps": [
+                {"name": "Snapshot the pre-deploy rollback state", "conclusion": "success"},
+                {"name": "Deploy to staging", "conclusion": "success"},
+                {"name": "Verify exact new rollout and serving Worker/container readiness",
+                 "conclusion": "success"},
+                {"name": "Gate promotion on REST 5xx error rate", "conclusion": "failure"},
+                {"name": "Auto-roll back Worker version and container image", "conclusion": "success"},
+                {"name": "Upload the rollout evidence", "conclusion": "success"},
+            ]}]}
+
+        def ci_run(path, query):
+            if path == f"repos/{REPO}/actions/runs/500":
+                return proof_current
+            return workflow_run()
+
+        def ci_jobs(path, query):
+            if path == f"repos/{REPO}/actions/runs/500/attempts/1/jobs":
+                return proof_jobs
+            return {"total_count": 2,
+                    "jobs": [workflow_job(name) for name in ("ci-ok", "worker check")]}
+
+        responses = {"ci-run": ci_run, "ci-jobs": ci_jobs}
+        result = self.guard(
+            **responses,
+            **{"staging-all": {"total_count": 1, "workflow_runs": [proof_row]}})
+        self.assertRefused(result, "no certification run")
+        code, outputs, _, _, _ = self.guard(
+            **responses,
+            **{"staging-all": {"total_count": 2, "workflow_runs": [proof_row, staging_run()]}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["staging_run_id"], "501")
+        self.assertEqual(outputs["staging_attempt"], "2")
 
     def test_reviewers_stay_required_unless_auto_approve_is_exactly_true(self):
         environment = {**green()["environment"], "protection_rules": []}
@@ -2693,6 +2787,22 @@ from test_immutable_bot_promotion import (
     ImmutablePromotionProducerTests,
     ImmutablePromotionWorkflowTests,
 )
+
+
+# Run the native adapter suites from CI's existing production-deploy entrypoint.
+# Missing suites must fail closed, not silently reduce acceptance coverage.
+PROMOTION_SUITE_MODULES = (
+    "test_bot_promotion_command_adapter",
+    "test_bot_promotion_copy_adapter",
+    "test_production_promotion_runtime_adapters",
+    "test_promotion_integration_acceptance",
+)
+
+
+def load_tests(loader, tests, pattern):
+    for name in PROMOTION_SUITE_MODULES:
+        tests.addTests(loader.loadTestsFromModule(importlib.import_module(name)))
+    return tests
 
 
 if __name__ == "__main__":
