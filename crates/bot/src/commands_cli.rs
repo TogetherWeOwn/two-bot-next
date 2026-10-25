@@ -512,11 +512,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 35 all-gate builtins (31 plus automations-gated `/giveaway`
-            // and the announcements-gated `/lfg-edit`, `/lfg-list`, and
-            // `/feed-inspect`) plus the moderation-gated reads `/purge-preview`
-            // and `/channel-inspect`; no new feature gate.
-            37
+            // 39 all-gate builtins: 5 core + 1 scorecard + 12 automation
+            // + 10 announcements + 9 moderation mutations + 2 private reads.
+            39
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -540,7 +538,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 58);
+        assert_eq!(with_voice.len(), 60);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"

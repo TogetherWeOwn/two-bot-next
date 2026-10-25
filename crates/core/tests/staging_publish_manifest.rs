@@ -120,8 +120,8 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 37 all-on builtins minus 10 automation-gated commands, including
-    // command-inspect and giveaway; announcements-gated lfg-edit and
+    // 39 all-on builtins minus 12 automation-gated commands, including
+    // command-inspect, pause/resume and giveaway; announcements-gated lfg-edit and
     // feed-inspect still publish, and read-only current-channel discovery
     // lfg-list stays published. The stored dynamic row stays unpublished:
     // every such invocation refuses at dispatch while gated off, so publishing
@@ -152,6 +152,8 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "command-remove",
         "command-list",
         "command-inspect",
+        "command-disable",
+        "command-enable",
         "schedule",
         "schedule-remove",
         "schedule-list",
