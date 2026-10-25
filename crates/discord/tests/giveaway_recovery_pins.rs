@@ -247,18 +247,17 @@ async fn enter(pool: &Pool<Postgres>, mock: &MockRest, id: u64, user: &str, give
 }
 
 async fn force_due(pool: &Pool<Postgres>, giveaway: &str, minutes_ago: i64) {
-    // Integer-interpolated interval: `minutes_ago` is a test constant, never
-    // member input, and distinct offsets order rows for the due scan.
-    let sql = format!(
-        "UPDATE giveaways SET ends_at = now() - interval '{minutes_ago} minutes' \
-         WHERE guild_id = $1 AND id = $2"
-    );
-    sqlx::query(&sql)
-        .bind(GUILD)
-        .bind(giveaway)
-        .execute(pool)
-        .await
-        .expect("force due");
+    // Distinct bound offsets order rows for the due scan.
+    sqlx::query(
+        "UPDATE giveaways SET ends_at = now() - ($3::bigint * interval '1 minute') \
+         WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(GUILD)
+    .bind(giveaway)
+    .bind(minutes_ago)
+    .execute(pool)
+    .await
+    .expect("force due");
 }
 
 struct GiveawayRow {
@@ -363,7 +362,7 @@ async fn member_outage_aborts_the_tick_with_no_draw_row() {
         member_gets >= 2,
         "the outage is retried, not read once and excluded"
     );
-    fixture.close().await.expect("drop test database");
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -436,7 +435,7 @@ async fn single_reroll_on_two_winners_keeps_the_full_set() {
         "the kept winner stays a valid reroll target"
     );
     assert_eq!(third[2].winners.len(), 2);
-    fixture.close().await.expect("drop test database");
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -480,7 +479,7 @@ async fn corrupt_row_holds_its_claim_while_later_rows_draw() {
         giveaway_row(fixture.pool(), &healthy).await.announced,
         "the later-due giveaway still announces"
     );
-    fixture.close().await.expect("drop test database");
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -535,7 +534,7 @@ async fn announce_survives_a_definitively_refused_message_edit() {
         String::from_utf8_lossy(&post.body).contains(&format!("<@{winner}>")),
         "the winners post mentions the winner"
     );
-    fixture.close().await.expect("drop test database");
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -580,5 +579,5 @@ async fn announce_skips_a_pending_entry_message() {
         }),
         "the winners post is delivered for a pending row"
     );
-    fixture.close().await.expect("drop test database");
+    fixture.close().await;
 }
