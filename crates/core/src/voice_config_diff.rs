@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::voice_config::{
@@ -24,6 +25,12 @@ pub const DIFF_HASH_CHARS: usize = 16;
 
 /// Discord's message length limit, applied to the whole preview body.
 pub const PREVIEW_CHAR_LIMIT: usize = 2000;
+
+/// Inclusive UTF-8 serialized-byte budget for a complete import review.
+/// Separate from the upload cap: old values and JSON escaping count too.
+pub const FULL_REVIEW_BYTE_LIMIT: usize = 32 * 1024;
+
+const REVIEW_HINT: &str = "Full review attached; read it before confirming.\n";
 
 /// No single preview line is longer than this many characters.
 const LINE_CHAR_LIMIT: usize = 200;
@@ -39,7 +46,7 @@ const VALUE_CHAR_LIMIT: usize = 80;
 
 /// One keyed entry present on both sides with a different value. `fields`
 /// names the differing fields in declaration order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntryChange<T> {
     pub key: String,
     pub before: T,
@@ -48,7 +55,7 @@ pub struct EntryChange<T> {
 }
 
 /// Added, removed and changed entries of one section, each sorted by key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SectionDiff<T> {
     pub added: Vec<T>,
     pub removed: Vec<T>,
@@ -209,6 +216,91 @@ pub fn diff_content_hash(current: &VoiceConfiguration, candidate: &VoiceConfigur
     digest[..DIFF_HASH_CHARS].to_owned()
 }
 
+/// Why a complete review could not be produced. No uploaded values or
+/// serializer error text are exposed at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullReviewError {
+    TooLarge,
+    Serialization,
+}
+
+/// Serialize complete, unshortened review evidence from the same diff and
+/// hash as the pending preview. Section/key/field names identify changed
+/// paths; added/removed entries and changed before/after entries carry all
+/// values. Skipped channel facts are separate from applicable changes.
+///
+/// The writer owns at most [`FULL_REVIEW_BYTE_LIMIT`] bytes and stops before
+/// a write would exceed it. Failure discards the entire partial document;
+/// callers must refuse confirmation, never serve a truncated review.
+pub fn serialize_full_review(
+    diff: &ConfigDiff,
+    guild_id: &str,
+    hash: &str,
+) -> Result<Vec<u8>, FullReviewError> {
+    #[derive(Serialize)]
+    struct Proposed<'a> {
+        creators: &'a SectionDiff<CreatorConfiguration>,
+        templates: &'a SectionDiff<ChannelTemplates>,
+        aliases: &'a SectionDiff<GameAlias>,
+        lists: &'a SectionDiff<RandomList>,
+        logging: &'a SectionDiff<LoggingConfiguration>,
+        settings: &'a Option<EntryChange<GuildSettings>>,
+    }
+    #[derive(Serialize)]
+    struct Review<'a> {
+        schema: &'static str,
+        guild_id: &'a str,
+        hash: &'a str,
+        change_count: usize,
+        proposed: Proposed<'a>,
+        skipped_unknown_channels: &'a [String],
+    }
+    let review = Review {
+        schema: "voice-config-review.v1",
+        guild_id,
+        hash,
+        change_count: diff.change_count(),
+        proposed: Proposed {
+            creators: &diff.creators,
+            templates: &diff.templates,
+            aliases: &diff.aliases,
+            lists: &diff.lists,
+            logging: &diff.logging,
+            settings: &diff.settings,
+        },
+        skipped_unknown_channels: &diff.skipped_unknown_channels,
+    };
+    let mut writer = ReviewWriter {
+        bytes: Vec::with_capacity(FULL_REVIEW_BYTE_LIMIT),
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut writer, &review) {
+        Ok(()) => Ok(writer.bytes),
+        Err(_) if writer.exceeded => Err(FullReviewError::TooLarge),
+        Err(_) => Err(FullReviewError::Serialization),
+    }
+}
+
+struct ReviewWriter {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl std::io::Write for ReviewWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > FULL_REVIEW_BYTE_LIMIT.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::other("review byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compact ephemeral-message body: a summary line, then at most `max_lines`
 /// entry lines in section order (creators, templates, aliases, lists, logging,
 /// settings, skipped channels) and key order within a section, then `+N more`
@@ -222,6 +314,22 @@ pub fn diff_content_hash(current: &VoiceConfiguration, candidate: &VoiceConfigur
 /// disabled.
 #[must_use]
 pub fn render_preview(diff: &ConfigDiff, max_lines: usize) -> String {
+    render_preview_with_budget(diff, max_lines, PREVIEW_CHAR_LIMIT)
+}
+
+/// Compact preview plus an attachment hint, with room reserved for the hint
+/// inside the same UTF-16 message budget. Only use after a full review exists.
+#[must_use]
+pub fn render_review_preview(diff: &ConfigDiff, max_lines: usize) -> String {
+    let body = render_preview_with_budget(
+        diff,
+        max_lines,
+        PREVIEW_CHAR_LIMIT - message_len(REVIEW_HINT),
+    );
+    format!("{REVIEW_HINT}{body}")
+}
+
+fn render_preview_with_budget(diff: &ConfigDiff, max_lines: usize, budget: usize) -> String {
     if diff.is_empty() {
         return "No changes".to_owned();
     }
@@ -246,7 +354,7 @@ pub fn render_preview(diff: &ConfigDiff, max_lines: usize) -> String {
         counted(diff.change_count(), "change"),
         counted(skipped, "unknown channel"),
     );
-    fit_preview(summary, &lines, max_lines)
+    fit_preview(summary, &lines, max_lines, budget)
 }
 
 /// A keyed configuration entry. Singletons use their section name as the key.
@@ -674,7 +782,7 @@ fn message_len(text: &str) -> usize {
 
 /// Keeps the longest prefix of at most `max_lines` lines that fits the limit
 /// together with a `+N more` trailer for the rest.
-fn fit_preview(summary: String, lines: &[String], max_lines: usize) -> String {
+fn fit_preview(summary: String, lines: &[String], max_lines: usize, budget: usize) -> String {
     let trailer_room = message_len(&format!("\n+{} more", lines.len()));
     let mut body = summary;
     let mut used = message_len(&body);
@@ -686,7 +794,7 @@ fn fit_preview(summary: String, lines: &[String], max_lines: usize) -> String {
         } else {
             0
         };
-        if used + needed + reserve > PREVIEW_CHAR_LIMIT {
+        if used + needed + reserve > budget {
             break;
         }
         body.push('\n');
