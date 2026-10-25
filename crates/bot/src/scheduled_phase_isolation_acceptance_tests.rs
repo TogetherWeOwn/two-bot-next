@@ -4,11 +4,18 @@
 //! The separate test-only module registration is integration scaffolding.
 #![cfg(test)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tokio::sync::watch;
+use tracing::Instrument as _;
 use two_bot_core::{
     format_iso_ms, get_scheduled, put_scheduled, FeatureGates, ScheduledMessageRow, ScheduledWrite,
 };
@@ -139,6 +146,110 @@ async fn run(pool: &PgPool, rest: &ActionExecutor, now: u64) -> Result<(), Error
     tokio::time::timeout(Duration::from_secs(20), tick(pool, rest, GUILD, || now))
         .await
         .expect("bounded tick must terminate")
+}
+
+// Diagnostics attribution: the global capture is shared by every parallel
+// test in this binary, so a byte window alone cannot tell this tick's phase
+// diagnostics from a sibling's fixture SQL or phase lines. Each exercised
+// tick runs inside a span carrying a unique `capture_case`; the capture tags
+// lines emitted while that span is entered, and only tagged lines are
+// scanned. Sibling diagnostics can neither contaminate nor satisfy the scan.
+fn next_capture_case(label: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "phase-isolation-{label}-{}",
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+async fn run_attributed(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    now: u64,
+    case: &str,
+) -> Result<(), ErrorClass> {
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        tick(pool, rest, GUILD, || now).instrument(tracing::info_span!(
+            "phase_isolation_tick",
+            capture_case = case
+        )),
+    )
+    .await
+    .expect("bounded tick must terminate")
+}
+
+fn attributed(capture: &crate::tracing_capture::Capture, start: usize, case: &str) -> String {
+    let marker = format!(" capture_case={case}");
+    capture.text()[start..]
+        .lines()
+        .filter(|line| line.contains(&format!("{marker} ")) || line.ends_with(&marker))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// Positive contamination control: a concurrent sibling span (and an
+// unspanned event) emitting the exact sensitive values and phase words must
+// neither fail this case's content-free scan nor satisfy a case that emitted
+// nothing, while this case's own classified lines stay visible.
+#[tokio::test]
+async fn capture_attribution_ignores_concurrent_sibling_diagnostics() {
+    let capture = crate::tracing_capture::global();
+    let start = capture.text().len();
+    let case = next_capture_case("control");
+    let sibling = next_capture_case("sibling");
+    let mine = async {
+        tracing::warn!(reason = "database", "scheduled message store failed");
+        tokio::task::yield_now().await;
+        tracing::warn!(reason = "database", "event reminder store failed");
+    }
+    .instrument(tracing::info_span!(
+        "phase_isolation_tick",
+        capture_case = case.as_str()
+    ));
+    let poison = async {
+        tracing::warn!(
+            "scheduled reminder database {} {} {} private-phase-store-error-sentinel",
+            PRIVATE_BODY,
+            PRIVATE_NAME,
+            USER
+        );
+        tokio::task::yield_now().await;
+    }
+    .instrument(tracing::info_span!(
+        "phase_isolation_tick",
+        capture_case = sibling.as_str()
+    ));
+    tokio::join!(mine, poison);
+    tracing::warn!("scheduled reminder database {}", PRIVATE_BODY);
+
+    let mine = attributed(capture, start, &case);
+    for phase in ["scheduled", "reminder"] {
+        assert!(
+            mine.lines()
+                .any(|line| line.contains(phase) && line.contains("database")),
+            "this case's classified phase diagnostics stay attributable"
+        );
+    }
+    for sensitive in [
+        PRIVATE_BODY,
+        PRIVATE_NAME,
+        USER,
+        "private-phase-store-error-sentinel",
+    ] {
+        assert!(
+            !mine.contains(sensitive),
+            "concurrent sibling diagnostics must not contaminate this case"
+        );
+    }
+    assert!(
+        attributed(capture, start, &sibling).contains(PRIVATE_BODY),
+        "the sibling poison was really captured, under its own case only"
+    );
+    assert!(
+        attributed(capture, start, "phase-isolation-absent-0").is_empty(),
+        "sibling diagnostics cannot satisfy a case that emitted nothing"
+    );
 }
 
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -298,7 +409,14 @@ async fn completed_schedule_failure(mode: Fault) {
     let mock = rest(response, posted()).await;
     let capture = crate::tracing_capture::global();
     let start = capture.text().len();
-    let result = run(db.pool(), &executor(&mock), NOW).await;
+    let case = next_capture_case(match mode {
+        Fault::Claim => "claim",
+        Fault::Arm => "arm",
+        Fault::Retry => "retry",
+        Fault::PermanentCompletion => "completion",
+        Fault::StopAfterCleanup => "stop-after-cleanup",
+    });
+    let result = run_attributed(db.pool(), &executor(&mock), NOW, &case).await;
     let first = get_scheduled(db.pool(), GUILD, "first")
         .await
         .expect("read first")
@@ -309,7 +427,7 @@ async fn completed_schedule_failure(mode: Fault) {
         .expect("unvisited exists");
     let before = facts(db.pool(), EVENT).await;
     let requests = mock.requests();
-    let log = capture.text()[start..].to_owned();
+    let log = attributed(capture, start, &case);
     // Restore the schedule store, then use an independent pool and executor:
     // no cached error, executor guard or lease can stand in for the fence.
     sqlx::raw_sql("DROP TRIGGER fail_phase_schedule ON scheduled_messages")
@@ -356,6 +474,10 @@ async fn completed_schedule_failure(mode: Fault) {
             Fault::Claim | Fault::Arm => 0,
             _ => 1,
         }
+    );
+    assert!(
+        !log.is_empty(),
+        "capture must attribute some diagnostics to the exercised tick"
     );
     for sensitive in [
         PRIVATE_BODY,
@@ -580,8 +702,9 @@ async fn combined_store_failures_have_stable_classification_and_no_false_receipt
     let mock = rest(posted(), posted()).await;
     let capture = crate::tracing_capture::global();
     let log_start = capture.text().len();
-    let first = run(db.pool(), &executor(&mock), NOW).await;
-    let diagnostics = capture.text()[log_start..].to_lowercase();
+    let case = next_capture_case("combined");
+    let first = run_attributed(db.pool(), &executor(&mock), NOW, &case).await;
+    let diagnostics = attributed(capture, log_start, &case).to_lowercase();
     let before = facts(db.pool(), EVENT).await;
     let next = run(db.pool(), &executor(&mock), NOW + 1).await;
     let after = facts(db.pool(), EVENT).await;
