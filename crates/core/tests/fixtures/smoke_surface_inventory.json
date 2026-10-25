@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 35,
+  "count": 36,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -200,7 +200,7 @@
       "options": [
         {
           "name": "event-occurrence",
-          "description": "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+          "description": "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
           "type": "string",
           "required": true,
           "min_value": null,
@@ -630,12 +630,12 @@
       "options": [
         {
           "name": "event-id",
-          "description": "Discord scheduled event id (number in the event URL), e.g. 12345",
+          "description": "Scheduled event id or pasted event link, e.g. 12345",
           "type": "string",
           "required": true,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 128,
           "choices": []
         },
         {
@@ -667,12 +667,12 @@
       "options": [
         {
           "name": "event-id",
-          "description": "Discord scheduled event id (number in the event URL), e.g. 12345",
+          "description": "Scheduled event id or pasted event link, e.g. 12345",
           "type": "string",
           "required": true,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 128,
           "choices": []
         }
       ],
@@ -861,6 +861,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs seeded feed relays (DB); the no-DB offline rule excludes it."
+    },
+    {
+      "name": "feed-inspect",
+      "description": "Show a saved feed relay's source and last attempt",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Feed id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a live feed id; sequenced after a feed-add, not standalone."
     },
     {
       "name": "ban",
