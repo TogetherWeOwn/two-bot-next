@@ -619,6 +619,36 @@ fn committed_references_match_compiled_metadata() {
 }
 
 #[test]
+fn lfg_preview_option_renders_in_command_reference() {
+    let section = render_commands()
+        .split("## `/lfg`\n")
+        .nth(1)
+        .expect("lfg section renders")
+        .split("\n## ")
+        .next()
+        .expect("lfg section ends")
+        .to_owned();
+    for row in [
+        "| `title` | string | true |",
+        "| `starts-at` | string | true |",
+        "| `roles` | string | true |",
+    ] {
+        assert!(
+            section.contains(row),
+            "existing lfg string option stays rendered: {row}"
+        );
+    }
+    assert!(
+        section.contains("| `preview` | boolean | false | — | — | — | — |"),
+        "preview renders as an optional boolean: {section}"
+    );
+    assert!(
+        section.contains("Privately preview without posting"),
+        "preview description renders: {section}"
+    );
+}
+
+#[test]
 fn rejects_deliberately_stale_documents() {
     for (path, generated) in generated_documents() {
         let stale = format!("{generated}\nDeliberately stale fixture.\n");

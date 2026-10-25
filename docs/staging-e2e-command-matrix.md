@@ -48,8 +48,8 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 20 | `/sticky` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `debounce` 1–300 |
 | 21 | `/sticky-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired` |
 | 37 | `/giveaway` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row; one-click member entry | `AutomationsDisabled`, `ManageServerRequired`, `prize` 1–200 chars, `duration` 1–43200 min, `winners` 1–100 |
-| 24 | `/rsvp` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral `RSVP saved: <status>.` | `AnnouncementsDisabled`, `event-id` required, `status` going/interested/declined |
-| 25 | `/rsvp-attendance` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral RSVP totals | `AnnouncementsDisabled`, `event-id` required |
+| 24 | `/rsvp` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral `RSVP saved: <status>.` (pasted links append the event id) | `AnnouncementsDisabled`, `event-id` required (id or pasted link), `status` going/interested/declined |
+| 25 | `/rsvp-attendance` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral RSVP totals | `AnnouncementsDisabled`, `event-id` required (id or pasted link) |
 | 26 | `/lfg` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral signup post + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `title`/`starts-at`/`roles` required |
 | 27 | `/lfg-close` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `id` required |
 | 38 | `/lfg-list` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral current-channel open confirmed posts, at most five whole rows, bounded cursor continuation; no mutations | `AnnouncementsDisabled`, `ManageEventsRequired`, optional `cursor` ≤512 bound to guild/channel/query, invalid or stale page → restart |
