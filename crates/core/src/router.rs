@@ -1714,6 +1714,8 @@ mod tests {
             "lfg-list",
             "feed-add",
             "feed-remove",
+            "feed-pause",
+            "feed-resume",
             "feed-list",
             "feed-inspect",
         ];
