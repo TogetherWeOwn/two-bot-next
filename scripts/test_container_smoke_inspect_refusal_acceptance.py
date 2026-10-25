@@ -92,6 +92,7 @@ JOB_NAMES = (
     "community_scorecard", "inactivity", "audit_retry",
     "self_role_recovery", "scheduled_messages", "feeds",
     "member_unban_sweep", "retention", "lfg_sweep", "giveaway_countdown",
+    "giveaway_draw",
 )
 
 

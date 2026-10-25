@@ -355,7 +355,7 @@ pub fn expected_registry() -> Value {
     // lifecycle and the inspect/help/privacy/reopen/welcome-preview inserts above) as the
     // exact published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
-        CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+        CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
                 CommandOption::new(
@@ -412,6 +412,70 @@ pub fn expected_registry() -> Value {
                 )
                 .required()
                 .max_length(64)]),
+                CommandOption::new(
+                    "end",
+                    "Draw now, before the deadline",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "pause",
+                    "Pause entry without drawing",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "resume",
+                    "Resume a paused giveaway",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "extend",
+                    "Add minutes to the deadline",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                        .required()
+                        .max_length(64),
+                    CommandOption::new(
+                        "duration-minutes",
+                        "Minutes to add (1–43200)",
+                        CommandOptionType::Integer,
+                    )
+                    .required()
+                    .int_range(1, 43200),
+                ]),
+                CommandOption::new(
+                    "reroll",
+                    "Redraw the winners",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                        .required()
+                        .max_length(64),
+                    CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
+                ]),
             ]),
     )
     .expect("giveaway serializes");

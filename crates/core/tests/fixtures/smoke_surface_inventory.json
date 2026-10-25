@@ -573,7 +573,7 @@
     },
     {
       "name": "giveaway",
-      "description": "Create, list or cancel a giveaway",
+      "description": "Create, draw, reroll or cancel a giveaway",
       "family": "automations",
       "gate": "automations",
       "default_member_permissions": "32",
@@ -679,6 +679,136 @@
               "min_value": null,
               "max_value": null,
               "max_length": 64,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "end",
+          "description": "Draw now, before the deadline",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "pause",
+          "description": "Pause entry without drawing",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "resume",
+          "description": "Resume a paused giveaway",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "extend",
+          "description": "Add minutes to the deadline",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            },
+            {
+              "name": "duration-minutes",
+              "description": "Minutes to add (1–43200)",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 43200,
+              "max_length": null,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "reroll",
+          "description": "Redraw the winners",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            },
+            {
+              "name": "user",
+              "description": "Replace only this winner",
+              "type": "user",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": null,
               "choices": []
             }
           ]
