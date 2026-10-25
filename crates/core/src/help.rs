@@ -220,6 +220,7 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         out.push_str(&names.join(" · "));
         out.push('\n');
         if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
+            out.push_str("Paste the event id or its link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
             out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
         }
     }
@@ -747,9 +748,13 @@ mod tests {
             .publish_set(&[])
             .expect("full set assembles");
         let text = help_text(&defs);
+        // The RSVP note carries a copyable event-link example whose slashes
+        // tokenize as path fragments, not commands; exclude it from the
+        // exact-once command count.
+        let without_example = text.replace("https://discord.com/events/<server-id>/<event-id>", "");
         // Exact slash tokens: a substring count would triple-count `/command`
         // inside `/command-remove` and `/command-list`.
-        let tokens: Vec<&str> = text
+        let tokens: Vec<&str> = without_example
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
             .filter(|t| t.starts_with('/') && t.len() > 1)
             .collect();

@@ -51,7 +51,7 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 Gates (both must hold or the poller parks):
 
 - `TWO_ANNOUNCEMENTS=1` — exact `1` enables; anything else is off.
-  Default off (`crates/core/src/feature_commands.rs:358-395`).
+  Default off (`crates/core/src/feature_commands.rs:360-397`).
 - Boot identity must permit the `announcements` capability
   (`feed_jobs::register_fenced`, the live-identity fence). A mismatched or
   unparseable identity parks the job with
@@ -62,7 +62,7 @@ Gates (both must hold or the poller parks):
   `feed poller parked: invalid feature configuration`
   (`crates/bot/src/feed_jobs.rs:274-284`); the gate error text is
   `TWO_FEED_POLL_SECONDS must be an integer between 60 and 86400`
-  (`crates/core/src/feature_commands.rs:366-369`).
+  (`crates/core/src/feature_commands.rs:368-371`).
 
 Per-feed fetch contract (what a "source is down" means): exact User-Agent
 `Owen/1.0 (+https://two.gg)`, 15-second total deadline across
