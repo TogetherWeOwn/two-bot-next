@@ -1,7 +1,6 @@
 # Documentation map
 
-Sole Markdown manifest, including nested docs and this index.
-Rows: `- [Purpose](relative.md)` under area headings.
+Sole manifest: `- [Purpose](relative.md)` by area.
 
 Run `python3 scripts/check_docs_index.py --json` from repo root.
 Sorted `{missing,stale,oversize}` path arrays: empty = PASS/0; else fix rows/size (exit 1).
@@ -141,6 +140,7 @@ Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions/reasons:
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
+- [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 

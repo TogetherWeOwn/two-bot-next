@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 40,
+  "count": 42,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -1048,6 +1048,52 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Destructive and needs a live feed id; sequenced after a feed-add, not standalone."
+    },
+    {
+      "name": "feed-pause",
+      "description": "Pause a feed relay without deleting its history",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Feed id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a live feed id plus seeded delivery state; sequenced after a feed-add, not standalone."
+    },
+    {
+      "name": "feed-resume",
+      "description": "Resume a paused feed relay",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Feed id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a paused relay (DB lifecycle state); sequenced after feed-pause, not standalone."
     },
     {
       "name": "feed-list",
