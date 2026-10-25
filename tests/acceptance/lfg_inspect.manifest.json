@@ -6,7 +6,7 @@
   "protected": [
     {
       "path": "crates/discord/tests/lfg_inspect_acceptance.rs",
-      "sha256": "1506fea74fca711d3fb99d59e938cbb3eea041c2db1b7f0562cf6fcd89d92b2e"
+      "sha256": "9b68ecbe280f81566326181b10d3af54f01fec501cc3f2b728aa23b08e217696"
     }
   ],
   "interface": {
