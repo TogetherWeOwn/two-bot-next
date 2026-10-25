@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 60.
+Built-in commands: 61.
 
 ## `/access`
 
@@ -46,6 +46,7 @@ Set who can create voice rooms and use room commands
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `show` | subcommand | false | — | — | — | — | Show the current voice-room access settings |
+| `show page` | integer | false | 1 | — | — | — | Page of access settings to show (starts at 1) |
 | `creation` | subcommand | false | — | — | — | — | Turn temporary room creation on or off |
 | `creation enabled` | boolean | true | — | — | — | — | On allows new rooms, off stops them (existing rooms keep working) |
 | `role` | subcommand | false | — | — | — | — | Set or clear the role required to use room commands |
@@ -622,7 +623,9 @@ Show voice-room status, health and creator channels
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of creator channels to show (starts at 1) |
 
 ## `/slowmode`
 
@@ -739,3 +742,12 @@ Record a warning for a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/welcome-preview`
+
+Privately preview the current welcome for a synthetic newcomer. No delivery.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.

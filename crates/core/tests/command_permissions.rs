@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use two_bot_core::command_permissions::{
     command_permission, CommandSurface, PolicyHook, COMMAND_PERMISSIONS,
 };
+use two_bot_core::commands::PERM_MANAGE_GUILD;
 use two_bot_core::{
     CustomCommand, HandlerId, InteractionRouter, ModerationAction, RouterGates, SlashContext,
     SlashOutcome,
@@ -98,25 +99,27 @@ fn documented_legacy_rows_equal_parity_section1() {
     // `/channel-inspect` (36), `/giveaway` timed entry (row 37),
     // `/lfg-list` current-channel list (row 38), `/feed-inspect` relay detail
     // (row 39), plus `/lfg-edit` sharing row 26, and pause/resume
-    // `/command-disable` and `/command-enable` (rows 40 and 41).
-    // No Next-only row appears in the legacy §1 table above;
+    // `/command-disable` and `/command-enable` (rows 40 and 41),
+    // and `/welcome-preview` (row 42). No Next-only row appears in the legacy §1 table above;
     // the registry-equality test below covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 42);
+    // 43 entries: 42 contiguous parity rows plus the `/lfg-edit` companion
+    // sharing LFG row 26.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 43);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        42
+        43
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=41).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=41"
+        (1..=42).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=42"
     );
     for (name, parity_row, required_permissions) in
         [("command-inspect", 33, 1 << 5), ("lfg-list", 38, 1 << 33)]
@@ -157,6 +160,12 @@ fn documented_legacy_rows_equal_parity_section1() {
         assert_eq!(row.surface, CommandSurface::BuiltinSlash, "{name}");
         assert_eq!(row.policy_hook, None, "{name}");
     }
+    let preview =
+        command_permission("welcome-preview").expect("welcome-preview has a permission row");
+    assert_eq!(preview.parity_row, 42);
+    assert_eq!(preview.required_permissions, PERM_MANAGE_GUILD);
+    assert_eq!(preview.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(preview.policy_hook, None);
 }
 
 #[test]
@@ -217,7 +226,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 39);
+    assert_eq!(builtins.len(), 40);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -341,7 +350,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 39, "every retained builtin routes");
+    assert_eq!(routed, 40, "every retained builtin routes");
 }
 
 #[test]

@@ -456,8 +456,8 @@ pub use self_roles::{
     reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
     self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
     ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
-    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
-    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    PlanRejection, ResolvedRole, RoleOperation, SafeRefusal, SelfRoleConfigError, SelfRoleGates,
+    SelfRoleOption, SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
     SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{
