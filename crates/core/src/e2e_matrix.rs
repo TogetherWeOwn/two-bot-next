@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 37 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 38 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -253,7 +253,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "command-disable",
-            39,
+            40,
             E2eGate::Automations,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -267,7 +267,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "command-enable",
-            40,
+            41,
             E2eGate::Automations,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -367,10 +367,10 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Rsvp",
-            "Ephemeral `RSVP saved: <status>.` confirmation.",
+            "Ephemeral `RSVP saved: <status>.` confirmation (pasted links append the event id).",
             &[
                 "Gate:AnnouncementsDisabled",
-                "Valid:event-id:required",
+                "Valid:event-id:required,max128",
                 "Valid:status:going|interested|declined",
             ],
         ),
@@ -382,7 +382,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Everyone",
             "RsvpAttendance",
             "Ephemeral RSVP totals for the scheduled event.",
-            &["Gate:AnnouncementsDisabled", "Valid:event-id:required"],
+            &["Gate:AnnouncementsDisabled", "Valid:event-id:required,max128"],
         ),
         row(
             "lfg",
@@ -466,6 +466,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "FeedList",
             "Ephemeral guild-scoped relay list.",
             &["Gate:AnnouncementsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "feed-inspect",
+            39,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedInspect",
+            "Ephemeral guild-scoped relay detail with safe source and last attempt; absent and invalid ids refuse distinctly without mutation.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
         ),
         row(
             "ban",

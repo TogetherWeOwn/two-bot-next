@@ -11,7 +11,7 @@
 //!   (`automationCommandData`) — all eight `ManageGuild`-gated.
 //! - announcements (#24–#30): `src/announcements/discord.ts`
 //!   (`announcementCommandData`) — `/rsvp` + RSVP totals open to everyone,
-//!   `/lfg` pair `ManageEvents`, `/feed-*` trio `ManageGuild`.
+//!   `/lfg` pair `ManageEvents`, `/feed-*` quartet `ManageGuild`.
 //! - scorecard (#12): `src/analytics/communityAttendance.ts`
 //!   (`COMMUNITY_ATTENDANCE_COMMAND`) — keeps the `attendance` name.
 //!
@@ -35,8 +35,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, EVENT_REFERENCE_MAX_CHARS,
+    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 use super::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_INSPECT_ARGUMENT_UNITS, MAX_TEMPLATE_CHARS,
@@ -58,7 +58,7 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
     .options(vec![
         CommandOption::new(
             "event-occurrence",
-            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+            "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
             CommandOptionType::String,
         )
         .required()
@@ -168,7 +168,7 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
         ]),
-        // Next-only saved-response lifecycle (parity rows 39-40): pause and
+        // Next-only saved-response lifecycle (parity rows 40-41): pause and
         // resume one definition without deleting it. Published immediately
         // after `command-inspect`; automation-gated and `ManageGuild`-gated
         // like the other admin commands. Reserved builtin names, never
@@ -316,17 +316,18 @@ pub fn giveaway_command() -> CommandDefinition {
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.
 ///
 /// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` management requires
-/// `ManageEvents`; `/feed-*` trio requires `ManageGuild`. All guild-only.
+/// `ManageEvents`; `/feed-*` quartet requires `ManageGuild`. All guild-only.
 #[must_use]
 pub fn announcement_commands() -> Vec<CommandDefinition> {
     vec![
         CommandDefinition::new("rsvp", "RSVP to a Discord scheduled event").options(vec![
             CommandOption::new(
                 "event-id",
-                "Discord scheduled event id (number in the event URL), e.g. 12345",
+                "Scheduled event id or pasted event link, e.g. 12345",
                 CommandOptionType::String,
             )
-            .required(),
+            .required()
+            .max_length(EVENT_REFERENCE_MAX_CHARS as u32),
             CommandOption::new("status", "Your response", CommandOptionType::String)
                 .required()
                 .choices(vec![
@@ -352,10 +353,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         )
         .options(vec![CommandOption::new(
             "event-id",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
             CommandOptionType::String,
         )
-        .required()]),
+        .required()
+        .max_length(EVENT_REFERENCE_MAX_CHARS as u32)]),
         CommandDefinition::new("lfg", "Post a raid/LFG signup with role slots")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![
@@ -375,6 +377,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 )
                 .required()
                 .max_length(MAX_ROLE_SPEC_CHARS as u32),
+                CommandOption::new(
+                    "preview",
+                    "Privately preview without posting",
+                    CommandOptionType::Boolean,
+                ),
             ]),
         CommandDefinition::new("lfg-close", "Close a raid/LFG signup")
             .permissions(PERM_MANAGE_EVENTS)
@@ -443,6 +450,18 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
+        CommandDefinition::new(
+            "feed-inspect",
+            "Show a saved feed relay's source and last attempt",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "id",
+            "Feed id",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
     ]
 }
 
@@ -588,6 +607,7 @@ mod tests {
                 "feed-add",
                 "feed-remove",
                 "feed-list",
+                "feed-inspect",
             ]
         );
     }
@@ -595,8 +615,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 12 automation + 8 announcement.
-        assert_eq!(merged.len(), 26);
+        // 5 core + 1 scorecard + 12 automation + 9 announcements.
+        assert_eq!(merged.len(), 27);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -643,7 +663,7 @@ mod tests {
         assert_eq!(is(&ann, "lfg"), manage_events);
         assert_eq!(is(&ann, "lfg-close"), manage_events);
         assert_eq!(is(&ann, "lfg-list"), manage_events);
-        for name in ["feed-add", "feed-remove", "feed-list"] {
+        for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
         }
         // Open to everyone: no permission gate.
@@ -712,6 +732,9 @@ mod tests {
             ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
+            ("feed-inspect", 0, 128),
+            ("rsvp", 0, 128),
+            ("rsvp-attendance", 0, 128),
         ] {
             assert_eq!(
                 get(&ann, command).options[option].max_length,
@@ -750,6 +773,15 @@ mod tests {
             score.options[0].max_length,
             Some(OCCURRENCE_ID_MAX_CHARS as u32)
         );
+        // event-id advertises the shared pasted-reference bound (pinned
+        // literal: a const change must update docs/parity.md and commands.md).
+        for command in ["rsvp", "rsvp-attendance"] {
+            assert_eq!(
+                get(&ann, command).options[0].max_length,
+                Some(EVENT_REFERENCE_MAX_CHARS as u32),
+                "{command} event-id bound"
+            );
+        }
     }
 
     #[test]

@@ -87,7 +87,7 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options_strict, feed_list_page_request,
+    actor_id, ephemeral, feed_add_options_strict, feed_id_option, feed_list_page_request,
     feed_remove_option_strict, help_command_selector, new_id, router_with_commands,
     sticky_options_strict, CommandRuntime, FeedListPage, RegistrySyncError,
 };
@@ -659,7 +659,8 @@ fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRun
 async fn activation_boot_publishes_only_permitted_capabilities() {
     use two_bot_core::{
         activation::LiveCapability, announcement_commands, automation_commands,
-        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId,
+        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId, SlashContext,
+        SlashOutcome,
     };
     const STAGING: u64 = 1545644954272137297;
     const LIVE: u64 = 326474832151838730;
@@ -715,13 +716,34 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
                 definition.name
             );
         }
+        let prefixed = token.starts_with("Bot ");
+        assert_eq!(
+            names.contains(&"lfg-list"),
+            staging,
+            "lfg-list publication, guild={guild}, app={app}, prefixed={prefixed}"
+        );
         for handler in [
             HandlerId::AutomationAdmin,
+            HandlerId::Giveaway,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::FeedInspect,
         ] {
-            assert_eq!(runtime.router().handler_for(&handler).is_some(), staging);
+            assert_eq!(
+                runtime.router().handler_for(&handler).is_some(),
+                staging,
+                "conditional {handler:?} registration, guild={guild}, app={app}, prefixed={prefixed}"
+            );
+        }
+        // LFG adapter ownership is composed unconditionally, unlike the
+        // activation-fenced publication and invocation checked separately.
+        for handler in [HandlerId::Lfg, HandlerId::LfgClose, HandlerId::LfgList] {
+            assert_eq!(
+                runtime.router().handler_for(&handler).map(|h| h.id()),
+                Some(handler),
+                "LFG ownership {handler:?}, guild={guild}, app={app}, prefixed={prefixed}"
+            );
         }
         assert_eq!(
             runtime
@@ -743,6 +765,81 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
             let msg = message(4444, CHANNEL, false, Some(guild));
             assert_eq!(runtime.on_message(&msg).await, ActivityOutcome::None);
             assert_eq!(mock.requests().len(), 1, "no sticky side effect");
+        }
+        for interaction_guild in [Some(guild), Some(9999), None] {
+            for permissions in [
+                Some(Permissions::MANAGE_EVENTS),
+                Some(Permissions::MANAGE_GUILD),
+                Some(Permissions::empty()),
+                None,
+            ] {
+                let expected = if interaction_guild != Some(guild) {
+                    SlashOutcome::Ignore
+                } else if !staging {
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::AnnouncementsDisabled,
+                    }
+                } else if permissions == Some(Permissions::MANAGE_EVENTS) {
+                    SlashOutcome::Handled {
+                        handler: HandlerId::LfgList,
+                    }
+                } else {
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageEventsRequired,
+                    }
+                };
+                let context = format!(
+                    "lfg-list guild={guild}, app={app}, prefixed={prefixed}, \
+                     interaction_guild={interaction_guild:?}, permissions={permissions:?}"
+                );
+                assert_eq!(
+                    runtime.router().route_slash(&SlashContext {
+                        name: "lfg-list",
+                        guild_id: interaction_guild,
+                        actor_permissions: permissions.map(|p| p.bits()),
+                        custom_row: None,
+                    }),
+                    expected,
+                    "{context}"
+                );
+                if matches!(expected, SlashOutcome::Handled { .. }) {
+                    // Positive routing control only: do not execute the DB read.
+                    continue;
+                }
+                let mut interaction = slash("lfg-list", Some(CHANNEL), Vec::new());
+                interaction.application_id = Id::new(app);
+                interaction.guild_id = interaction_guild.map(Id::new);
+                interaction.member.as_mut().unwrap().permissions = permissions;
+                let before = mock.requests().len();
+                tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
+                    .await
+                    .unwrap_or_else(|_| panic!("refusal must precede DB execution: {context}"));
+                let requests = mock.requests();
+                match expected {
+                    SlashOutcome::Ignore => {
+                        assert_eq!(requests.len(), before, "silent guild fence: {context}");
+                    }
+                    SlashOutcome::Refuse { refusal } => {
+                        assert_eq!(
+                            requests.len(),
+                            before + 1,
+                            "one refusal only; no lookup, defer, edit or effects: {context}"
+                        );
+                        let callback = &requests[before];
+                        assert_eq!(callback.method, "POST", "{context}");
+                        assert_eq!(
+                            callback.path, "/api/v10/interactions/7/sticky-test-token/callback",
+                            "{context}"
+                        );
+                        let reply: serde_json::Value =
+                            serde_json::from_slice(&callback.body).unwrap();
+                        assert_eq!(reply["type"], 4, "immediate refusal: {context}");
+                        assert_eq!(reply["data"]["flags"], 64, "ephemeral: {context}");
+                        assert_eq!(reply["data"]["content"], refusal.message(), "{context}");
+                    }
+                    other => panic!("unexpected negative control {other:?}: {context}"),
+                }
+            }
         }
         mock.shutdown().await;
     }
@@ -1443,6 +1540,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-add"
                         | "feed-remove"
                         | "feed-list"
+                        | "feed-inspect"
                         | "purge"
                         | "purge-preview"
                         | "channel-inspect"
@@ -3245,6 +3343,28 @@ fn feed_add_options_strict_refuses_wrong_types_duplicates_and_missing_options() 
 }
 
 #[test]
+fn feed_id_option_extracts_id_for_inspect() {
+    // `/feed-remove` decodes strictly via `feed_remove_option_strict`; the
+    // lenient helper serves `/feed-inspect` only.
+    let name = "feed-inspect";
+    let interaction = slash(
+        name,
+        Some(CHANNEL),
+        vec![option(
+            "id",
+            CommandOptionValue::String("feed-1".to_owned()),
+        )],
+    );
+    assert_eq!(
+        feed_id_option(&interaction),
+        Some("feed-1".to_owned()),
+        "{name} decodes its id"
+    );
+    let missing = slash(name, Some(CHANNEL), Vec::new());
+    assert_eq!(feed_id_option(&missing), None, "{name} id may be absent");
+}
+
+#[test]
 fn feed_remove_option_strict_decodes_valid_and_ignores_unknown_names() {
     let interaction = slash(
         "feed-remove",
@@ -3509,19 +3629,19 @@ fn schedule_remove_and_page_strict_decode_exact_values() {
 async fn feed_commands_refuse_ephemerally_while_announcements_off() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     // announcements OFF in the router gates → the shared router refuses all
-    // three feed commands; the runtime answers through the shared executor.
+    // four feed commands; the runtime answers through the shared executor.
     let runtime = runtime_without_db(gates(true, false), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list"] {
+    for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
         runtime
             .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
             .await;
     }
     let requests = mock.requests();
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 3, "one ephemeral refusal per command");
+    assert_eq!(callbacks.len(), 4, "one ephemeral refusal per command");
     assert_eq!(
         requests.len(),
-        3,
+        4,
         "no defer, no edit, no publish: {requests:?}"
     );
     for callback in &callbacks {
@@ -3564,7 +3684,7 @@ async fn feed_add_without_manage_server_is_refused() {
 async fn feed_commands_from_other_guilds_are_silent() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list"] {
+    for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
@@ -3946,9 +4066,11 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-list",
         "feed-add",
         "feed-remove",
         "feed-list",
+        "feed-inspect",
     ] {
         assert!(
             names.contains(&expected),
@@ -3989,7 +4111,15 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
             "published set is missing {expected}"
         );
     }
-    for withheld in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+    for withheld in [
+        "feed-add",
+        "feed-remove",
+        "feed-list",
+        "feed-inspect",
+        "rsvp",
+        "lfg",
+        "lfg-list",
+    ] {
         assert!(
             !names.contains(&withheld),
             "gated-off {withheld} must not publish"
@@ -4092,6 +4222,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::FeedInspect,
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
         ];
@@ -4157,6 +4288,14 @@ fn production_router_matches_composed_production_wiring() {
                                 router.handler_for(&HandlerId::Giveaway).map(|h| h.id()),
                                 automations.then_some(HandlerId::Giveaway),
                                 "{name} giveaway registration follows automations \
+                                 (scorecard={scorecard} automations={automations} \
+                                 announcements={announcements} moderation={moderation} \
+                                 member={member_present})"
+                            );
+                            assert_eq!(
+                                router.handler_for(&HandlerId::FeedInspect).map(|h| h.id()),
+                                announcements.then_some(HandlerId::FeedInspect),
+                                "{name} feed-inspect registration follows announcements \
                                  (scorecard={scorecard} automations={automations} \
                                  announcements={announcements} moderation={moderation} \
                                  member={member_present})"
@@ -4247,7 +4386,15 @@ async fn resumed_boot_synchronizes_current_gates_once_without_ready() {
         for name in ["rank", "leaderboard", "sticky", "sticky-remove"] {
             assert!(names.contains(&name), "resumed registry is complete");
         }
-        for name in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-list",
+            "feed-inspect",
+            "rsvp",
+            "lfg",
+            "lfg-list",
+        ] {
             assert_eq!(
                 names.contains(&name),
                 announcements,
@@ -7132,11 +7279,11 @@ async fn feed_store_failure_replies_generic_and_audits_nothing() {
 // Postgres message, which can carry statement or fixture detail).
 // `target_key` names the attempted relay: the fresh attempt id for adds,
 // the user-supplied id for removes. The user reply stays the existing
-// fixed store-failure text. Feed-list stays unaudited even on failure
-// (legacy parity): a failed list replies with the same safe text and
-// writes no audit row. A dead pool (the audit write itself impossible)
-// degrades to a warn log plus that same safe reply with no panic and no
-// leaked internals.
+// fixed store-failure text. Feed-list and feed-inspect stay unaudited even
+// on failure (legacy list parity): a failed read replies with the same safe
+// text and writes no audit row. A dead pool (the audit write itself
+// impossible) degrades to a warn log plus that same safe reply with no
+// panic and no leaked internals.
 
 const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
 
@@ -7286,6 +7433,14 @@ fn feed_add_interaction() -> Interaction {
 fn feed_remove_interaction(id: &str) -> Interaction {
     slash(
         "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::String(id.to_owned()))],
+    )
+}
+
+fn feed_inspect_interaction(id: &str) -> Interaction {
+    slash(
+        "feed-inspect",
         Some(CHANNEL),
         vec![option("id", CommandOptionValue::String(id.to_owned()))],
     )
@@ -7485,6 +7640,142 @@ async fn feed_list_store_failure_writes_no_audit_row() {
     db.close().await;
 }
 
+/// Inspect is a pure guild-scoped read: the saved relay renders with exact
+/// id, kind, destination, enabled state, safe source and last attempt, while
+/// configuration and audit stay untouched. `deferred_reply` pins the
+/// ephemeral defer (type 5, flags 64) plus the mention-safe completion.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_shows_saved_relay_detail_without_mutation() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-own", "rss").await;
+    db.seed_feed("9999", "feed-foreign", "twitch").await;
+    let rows_before = db.feed_rows().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-own"))
+        .await;
+
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("inspect content");
+    assert!(content.contains("`feed-own`"), "exact id: {content}");
+    assert!(content.contains("rss"), "kind stays visible: {content}");
+    assert!(
+        content.contains(&format!("<#{CHANNEL_S}>")),
+        "destination stays visible: {content}"
+    );
+    assert!(
+        content.contains("enabled"),
+        "enabled state stays visible: {content}"
+    );
+    assert!(
+        content.contains("example.com"),
+        "safe source host stays visible: {content}"
+    );
+    assert!(
+        content.to_ascii_lowercase().contains("attempt"),
+        "last attempt stays visible: {content}"
+    );
+    assert!(
+        !content.contains("feed-foreign"),
+        "other guild's relay never leaks: {content}"
+    );
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "inspect leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Absent and foreign-guild ids share one refusal: the guild-scoped read
+/// finds nothing either way, and the copy must not oracle foreign relays.
+/// Invalid ids and store failures refuse distinctly (see below).
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_absent_and_foreign_ids_refuse_without_mutation() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-own", "rss").await;
+    db.seed_feed("9999", "feed-foreign", "twitch").await;
+    let rows_before = db.feed_rows().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    for id in ["feed-missing", "feed-foreign"] {
+        runtime.on_interaction(&feed_inspect_interaction(id)).await;
+    }
+
+    let contents = patch_contents(&mock);
+    assert_eq!(contents.len(), 2, "one completion per invocation");
+    for content in &contents {
+        assert_eq!(content, "No feed relay with that id.");
+    }
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "refused inspect leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "refused inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Invalid ids refuse at plan time, before any store read: with the table
+/// dropped, every read would fail, so the invalid-id copy proves no read.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_invalid_id_refuses_before_any_store_read() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("bad id"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], "Invalid feed id.");
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "an invalid inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Inspect stays unaudited even when its read fails — the same safe reply
+/// as the other feed commands, and still no audit row.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_store_failure_writes_no_audit_row() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-own"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], FEED_STORE_FAILURE_REPLY);
+    assert!(
+        feed_audit_rows(&db).await.is_empty(),
+        "a failed inspect writes no audit row"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "a failed inspect writes no feed audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
 /// Dead-pool control: with a closed pool, the audit write is impossible by
 /// construction, so every feed command must still emit a warn for the
 /// operator and finish with the fixed safe reply — no panic, no hang, no
@@ -7516,11 +7807,14 @@ async fn feed_store_failures_on_dead_pool_warn_and_reply_safely() {
     runtime
         .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
         .await;
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-xyz"))
+        .await;
 
-    let replies = feed_store_failure_replies(&mock, 3);
+    let replies = feed_store_failure_replies(&mock, 4);
     assert_eq!(
         replies,
-        vec![FEED_STORE_FAILURE_REPLY.to_owned(); 3],
+        vec![FEED_STORE_FAILURE_REPLY.to_owned(); 4],
         "dead pool degrades every feed command to the safe reply"
     );
     for reply in &replies {

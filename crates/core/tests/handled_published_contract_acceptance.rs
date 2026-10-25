@@ -108,9 +108,13 @@ fn help_lists_only_handled_commands() {
     let defs = router.publish_set(&[]).expect("full set assembles");
     let text = help_text(&defs);
     let voice = voice_names();
+    // The RSVP note carries a copyable event-link example whose slashes
+    // tokenize as path fragments, not commands; exclude it from the handled
+    // check.
+    let without_example = text.replace("https://discord.com/events/<server-id>/<event-id>", "");
     // Exact slash tokens (same tokenizer as the help unit tests: a substring
     // count would triple-count `/command` inside `/command-remove`).
-    let tokens: Vec<&str> = text
+    let tokens: Vec<&str> = without_example
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
         .filter(|t| t.starts_with('/') && t.len() > 1)
         .collect();
@@ -131,7 +135,7 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 36 parity and Next-only builtins plus the
+/// Registry compatibility: all 37 parity and Next-only builtins plus the
 /// separate lfg-list discovery case route to their handlers;
 /// templateassistant stays unpublished.
 #[test]
@@ -180,10 +184,11 @@ fn parity_builtins_route_to_their_handlers() {
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
+        ("feed-inspect", HandlerId::FeedInspect),
     ];
     assert_eq!(
         cases.len(),
-        36,
+        37,
         "all builtins except the separate lfg-list case covered"
     );
     for (name, handler) in cases {
@@ -248,5 +253,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 37, "contract covers the 37 built-in commands");
+    assert_eq!(matrix.len(), 38, "contract covers the 38 built-in commands");
 }

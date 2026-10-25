@@ -110,7 +110,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Feed relays",
         requires: Some("Manage Server"),
-        commands: &["feed-add", "feed-remove", "feed-list"],
+        commands: &["feed-add", "feed-remove", "feed-list", "feed-inspect"],
         anchor: None,
     },
     HelpGroup {
@@ -216,6 +216,7 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         out.push_str(&names.join(" · "));
         out.push('\n');
         if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
+            out.push_str("Paste the event id or its link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
             out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
         }
     }
@@ -743,9 +744,13 @@ mod tests {
             .publish_set(&[])
             .expect("full set assembles");
         let text = help_text(&defs);
+        // The RSVP note carries a copyable event-link example whose slashes
+        // tokenize as path fragments, not commands; exclude it from the
+        // exact-once command count.
+        let without_example = text.replace("https://discord.com/events/<server-id>/<event-id>", "");
         // Exact slash tokens: a substring count would triple-count `/command`
         // inside `/command-remove` and `/command-list`.
-        let tokens: Vec<&str> = text
+        let tokens: Vec<&str> = without_example
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
             .filter(|t| t.starts_with('/') && t.len() > 1)
             .collect();
@@ -758,13 +763,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 37 non-voice commands (5 core + 21 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, pause/resume, giveaway, lfg-list, purge-preview
-        // and channel-inspect, plus 21 additional voice commands (voice `kick`
-        // loses first-wins to moderation `/kick`).
-        // `/templateassistant` stays unpublished until its slice lands:
-        // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (58 live)"));
+        // 38 non-voice commands (5 core + 22 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, pause/resume, giveaway, lfg-list, feed-inspect,
+        // purge-preview and channel-inspect, plus 21 additional voice commands (voice
+        // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
+        // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (59 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -890,11 +894,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 37 non-voice names, including inspection, reopen, pause/resume,
-        // giveaway, lfg-list, purge-preview and channel-inspect, plus 21 additional
-        // voice names (voice `kick` shares the Kick group).
+        // 38 non-voice names, including inspection, reopen, pause/resume,
+        // giveaway, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
+        // 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 58);
+        assert_eq!(grouped.len(), 59);
         for name in [
             "rank",
             "leaderboard",
@@ -915,6 +919,7 @@ mod tests {
             "lfg-close",
             "lfg-list",
             "feed-add",
+            "feed-inspect",
             "ban",
             "tempban",
             "kick",
