@@ -696,7 +696,12 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
         }
         // LFG adapter ownership is composed unconditionally, unlike the
         // activation-fenced publication and invocation checked separately.
-        for handler in [HandlerId::Lfg, HandlerId::LfgClose, HandlerId::LfgList] {
+        for handler in [
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::LfgEdit,
+            HandlerId::LfgList,
+        ] {
             assert_eq!(
                 runtime.router().handler_for(&handler).map(|h| h.id()),
                 Some(handler),
