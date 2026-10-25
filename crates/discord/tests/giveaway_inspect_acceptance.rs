@@ -408,6 +408,14 @@ async fn unknown_foreign_and_other_channel_ids_share_one_private_miss_before_cou
                 .expect("draw-read tripwire");
             let hidden = inspect(pool, id_options("inspect", ID), 9030).await;
             let unknown = inspect(pool, id_options("inspect", "7999"), 9031).await;
+            // Renaming preserves the foreign key. Remove the fixture's child
+            // rows before its parent so the foreign-only case reaches its oracle.
+            sqlx::query("DELETE FROM inspect_blocked_entries WHERE guild_id=$1 AND giveaway_id=$2")
+                .bind(GUILD)
+                .bind(ID)
+                .execute(pool)
+                .await
+                .expect("remove hidden fixture entries");
             sqlx::query("DELETE FROM giveaways WHERE guild_id=$1 AND id=$2")
                 .bind(GUILD)
                 .bind(ID)
