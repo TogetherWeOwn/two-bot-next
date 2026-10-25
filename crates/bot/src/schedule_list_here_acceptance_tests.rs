@@ -153,6 +153,130 @@ fn scoped(text: &str) {
     );
 }
 
+// Page indicators drive traversal only. Independently seeded ids, complete row
+// literals and SQL receipts below prove that packing cannot lose or invent rows.
+async fn packed_pages(
+    pool: &PgPool,
+    here: Option<bool>,
+    channel: u64,
+    hidden: bool,
+) -> (Vec<String>, i64) {
+    let first = reply(
+        &dispatch(
+            pool.clone(),
+            interaction(here, Some(1), Some(channel)),
+            true,
+        )
+        .await,
+    );
+    let first_total = schedule_list_page_indicator(&first)
+        .expect("localized 25-row window announces packed pages")
+        .1;
+    assert!((2..=25).contains(&first_total), "bounded first window");
+    let mut texts = vec![first];
+    for page in 2..=first_total {
+        texts.push(reply(
+            &dispatch(
+                pool.clone(),
+                interaction(here, Some(page), Some(channel)),
+                true,
+            )
+            .await,
+        ));
+    }
+    if hidden {
+        let first_hidden = first_total + 1;
+        let text = reply(
+            &dispatch(
+                pool.clone(),
+                interaction(here, Some(first_hidden), Some(channel)),
+                true,
+            )
+            .await,
+        );
+        let total = schedule_list_page_indicator(&text)
+            .expect("full hidden window announces global packed pages")
+            .1;
+        assert!(
+            (first_hidden..=first_total + 25).contains(&total),
+            "bounded second window"
+        );
+        texts.push(text);
+        for page in first_hidden + 1..=total {
+            texts.push(reply(
+                &dispatch(
+                    pool.clone(),
+                    interaction(here, Some(page), Some(channel)),
+                    true,
+                )
+                .await,
+            ));
+        }
+    }
+    (texts, first_total)
+}
+
+fn assert_complete_row(line: &str, id: &str, channel: u64, n: usize) {
+    let interval = if n.is_multiple_of(3) {
+        " every 90m"
+    } else {
+        ""
+    };
+    let status = if n % 5 == 4 {
+        " (disabled)".to_owned()
+    } else {
+        format!(
+            " <t:{}:F>. The 15s ticker and delivery may be delayed.",
+            1_893_456_000 + (n / 2) * 60
+        )
+    };
+    assert_eq!(
+        line,
+        format!(
+            "`{id}` `<#{channel}>` 2030-01-01T{:02}:{:02}:00.000Z{interval}{status}",
+            n / 120,
+            (n / 2) % 60
+        ),
+        "complete copyable row, including current localized due/uncertainty for enabled rows"
+    );
+}
+
+fn assert_window_pages(texts: &[String], first_total: i64) {
+    let total = texts.len() as i64;
+    for (index, text) in texts.iter().enumerate() {
+        let page = index as i64 + 1;
+        assert_eq!(
+            schedule_list_page_indicator(text),
+            Some((
+                page,
+                if page <= first_total {
+                    first_total
+                } else {
+                    total
+                }
+            )),
+            "first-window and global hidden-window numbering: {text}"
+        );
+        assert!(!ids(text).is_empty(), "packed pages contain whole rows");
+    }
+    assert!(
+        texts[first_total as usize - 1]
+            .contains(&format!("Continued on page {}.", first_total + 1)),
+        "terminal first-window page reaches the hidden window"
+    );
+    assert!(
+        texts[first_total as usize - 1].contains("(truncated, 27 more)"),
+        "matching count, not the number of unrendered packed rows"
+    );
+    assert!(
+        texts
+            .last()
+            .expect("hidden page")
+            .contains("(truncated, 2 more)"),
+        "only rows beyond the bounded second window remain"
+    );
+}
+
 // Observe executed SQLx receipts rather than a side-effecting view expression:
 // PostgreSQL may evaluate a VOLATILE view column before the caller's outer
 // ORDER BY/LIMIT. These receipts report the actual statement and rows returned
@@ -220,7 +344,12 @@ async fn schedule_here_omitted_false_and_existing_pages_are_byte_identical() {
         "false is exactly the omitted guild list"
     );
     assert_eq!(text[0], text[1]);
-    assert_eq!(text[0], "`row-000` `<#3333>` 2030-01-01T00:00:00.000Z every 90m\n`row-001` `<#4444>` 2030-01-01T00:00:00.000Z");
+    assert_eq!(
+        text[0],
+        "`row-000` `<#3333>` 2030-01-01T00:00:00.000Z every 90m <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
+         `row-001` `<#4444>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.",
+        "omitted/false retain current localized due times and uncertainty, not the retired ISO-only output"
+    );
     assert_eq!(text[2], "Page must be at least 1.");
     assert_eq!(text[3], "Page must be at least 1.");
     assert_eq!(
@@ -445,6 +574,68 @@ async fn schedule_here_preserves_permission_feature_and_guild_fences() {
 }
 
 #[tokio::test]
+async fn schedule_here_existing_guild_packed_windows_preserve_enriched_rows() {
+    let db = database().await;
+    for n in (0..52).rev() {
+        seed(db.pool(), GUILD_S, CHANNEL_S, n, false).await;
+    }
+    seed(db.pool(), "9999", CHANNEL_S, 150, false).await;
+    let before = state(db.pool(), false).await;
+    let mut walks = Vec::new();
+    for here in [None, Some(false)] {
+        let (texts, first_total) = packed_pages(db.pool(), here, CHANNEL, true).await;
+        let total = texts.len() as i64;
+        let mut refusals = Vec::new();
+        for page in [total + 1, i64::MAX] {
+            refusals.push(reply(
+                &dispatch(
+                    db.pool().clone(),
+                    interaction(here, Some(page), Some(CHANNEL)),
+                    true,
+                )
+                .await,
+            ));
+        }
+        walks.push((texts, first_total, refusals));
+    }
+    let after = state(db.pool(), false).await;
+    db.close()
+        .await
+        .expect("drop unchanged packed-page control");
+    assert_eq!(before, after);
+    assert_eq!(
+        walks[0], walks[1],
+        "false is the current omitted packed list"
+    );
+    for (texts, first_total, refusals) in walks {
+        assert_window_pages(&texts, first_total);
+        for (pages, range) in [
+            (&texts[..first_total as usize], 0..25),
+            (&texts[first_total as usize..], 25..50),
+        ] {
+            assert_eq!(
+                pages.iter().flat_map(|text| ids(text)).collect::<Vec<_>>(),
+                range.map(|n| format!("row-{n:03}")).collect::<Vec<_>>()
+            );
+        }
+        for (n, line) in texts
+            .iter()
+            .flat_map(|text| schedule_list_row_lines(text))
+            .enumerate()
+        {
+            assert_complete_row(line, &format!("row-{n:03}"), CHANNEL, n);
+        }
+        for text in refusals {
+            assert!(ids(&text).is_empty());
+            assert!(
+                text.contains("out of range") && text.contains(&format!("{} page(s)", texts.len())),
+                "combined packed-page range stays honest: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn schedule_here_filters_sql_before_cap_offset_count_and_packing() {
     let db = database().await;
     // 30 earlier unrelated rows must not consume any of the matching cap.
@@ -468,9 +659,11 @@ async fn schedule_here_filters_sql_before_cap_offset_count_and_packing() {
     expected.reverse();
     seed(db.pool(), "9999", CHANNEL_S, 150, false).await;
     let before = state(db.pool(), false).await;
-    let mut replies = Vec::new();
-    for page in [1, 2, 3, i64::MAX] {
-        replies.push(
+    let (texts, first_total) = packed_pages(db.pool(), Some(true), CHANNEL, true).await;
+    let total = texts.len() as i64;
+    let mut refusals = Vec::new();
+    for page in [total + 1, i64::MAX] {
+        refusals.push(
             dispatch(
                 db.pool().clone(),
                 interaction(Some(true), Some(page), Some(CHANNEL)),
@@ -485,36 +678,43 @@ async fn schedule_here_filters_sql_before_cap_offset_count_and_packing() {
         before, after,
         "successful filtered reads cannot audit or touch schedules"
     );
-    let text: Vec<_> = replies.iter().map(|r| reply(r)).collect();
+    let boundary = first_total as usize;
     assert_eq!(
-        ids(&text[0]),
+        texts[..boundary]
+            .iter()
+            .flat_map(|text| ids(text))
+            .collect::<Vec<_>>(),
         expected[..25],
-        "first window is 25 matching rows after unrelated prefix"
+        "all packed first-window pages expose 25 matching rows after unrelated prefix"
     );
     assert_eq!(
-        ids(&text[1]),
+        texts[boundary..]
+            .iter()
+            .flat_map(|text| ids(text))
+            .collect::<Vec<_>>(),
         expected[25..50],
-        "OFFSET skips matching rows, not guild rows"
+        "OFFSET skips matching rows, not guild rows; global continuation loses none"
     );
-    assert!(
-        text[0].contains("(truncated, 27 more)"),
-        "count uses same guild/channel predicate: {}",
-        text[0]
-    );
-    assert!(
-        text[1].contains("(truncated, 2 more)"),
-        "hidden-window remainder uses matching count: {}",
-        text[1]
-    );
-    for text in &text[2..] {
-        assert!(ids(text).is_empty());
-        assert!(
-            text.contains("out of range") && text.contains("2 page(s)"),
-            "preserve bounded two-window pager: {text}"
-        );
-    }
-    for text in &text {
+    assert_window_pages(&texts, first_total);
+    for text in &texts {
         scoped(text);
+        for line in schedule_list_row_lines(text) {
+            let id = schedule_list_row_id(line);
+            let index = expected
+                .iter()
+                .position(|want| want == id)
+                .expect("matching id");
+            assert_complete_row(line, id, CHANNEL, 30 + index * 2);
+        }
+    }
+    for requests in &refusals {
+        let text = reply(requests);
+        assert!(ids(&text).is_empty());
+        assert!(
+            text.contains("out of range") && text.contains(&format!("{total} page(s)")),
+            "preserve the actual combined packed-page range: {text}"
+        );
+        scoped(&text);
     }
 }
 
@@ -538,13 +738,33 @@ async fn schedule_here_executed_store_reads_share_sql_scope_and_bounds() {
     );
     // Capture the awaited public service boundary: the gateway case above
     // separately covers detached dispatch, whose task has its own subscriber.
-    let (_, receipts) = Queries::capture(async {
+    let ((first_total, total), receipts) = Queries::capture(async {
         runtime
             .on_interaction(&interaction(Some(true), Some(1), Some(CHANNEL)))
             .await;
-        runtime
-            .on_interaction(&interaction(Some(true), Some(2), Some(CHANNEL)))
-            .await;
+        let first = reply(&mock.requests());
+        let first_total = schedule_list_page_indicator(&first)
+            .expect("packed first window")
+            .1;
+        assert!((2..=25).contains(&first_total));
+        // Page 2 can still be inside the first fetch. Walk to the actual
+        // first hidden page so the SQL capture must include OFFSET.
+        for page in 2..=first_total + 1 {
+            runtime
+                .on_interaction(&interaction(Some(true), Some(page), Some(CHANNEL)))
+                .await;
+        }
+        let contents = schedule_list_reply_contents(&mock, first_total as usize + 1);
+        let total = schedule_list_page_indicator(contents.last().expect("hidden reply"))
+            .expect("packed hidden window")
+            .1;
+        assert!((first_total + 1..=first_total + 25).contains(&total));
+        for page in first_total + 2..=total {
+            runtime
+                .on_interaction(&interaction(Some(true), Some(page), Some(CHANNEL)))
+                .await;
+        }
+        (first_total, total)
     })
     .await;
     let requests = mock.requests();
@@ -553,22 +773,22 @@ async fn schedule_here_executed_store_reads_share_sql_scope_and_bounds() {
     let after = state(db.pool(), false).await;
     db.close().await.expect("drop executed-SQL fixture");
     assert_eq!(before, after);
-    let contents = requests
-        .iter()
-        .filter(|request| request.method == "PATCH")
-        .map(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).expect("completion")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(contents.len(), 2);
-    assert_eq!(
-        ids(contents[0]["content"].as_str().expect("page one")).len(),
-        25
-    );
-    assert_eq!(
-        ids(contents[1]["content"].as_str().expect("page two")).len(),
-        25
-    );
+    assert_eq!(requests.len(), total as usize * 2);
+    let contents: Vec<_> = requests.chunks_exact(2).map(reply).collect();
+    assert_window_pages(&contents, first_total);
+    for (pages, range) in [
+        (&contents[..first_total as usize], 0..25),
+        (&contents[first_total as usize..], 25..50),
+    ] {
+        assert_eq!(
+            pages.iter().flat_map(|text| ids(text)).collect::<Vec<_>>(),
+            range.map(|n| format!("row-{n:03}")).collect::<Vec<_>>(),
+            "fetch cap applies across packed pages, not to each rendered reply"
+        );
+    }
+    for text in &contents {
+        scoped(text);
+    }
     let reads: Vec<_> = receipts
         .iter()
         .filter(|query| query.normalized().contains("from scheduled_messages"))
@@ -628,36 +848,24 @@ async fn schedule_here_packs_whole_long_rows_with_stable_tied_ids() {
         seed(db.pool(), GUILD_S, OTHER_CHANNEL, n, true).await;
     }
     let before = state(db.pool(), false).await;
-    let first = dispatch(
+    let (texts, total) = packed_pages(db.pool(), Some(true), long_channel, false).await;
+    let out_of_range = dispatch(
         db.pool().clone(),
-        interaction(Some(true), Some(1), Some(long_channel)),
+        interaction(Some(true), Some(total + 1), Some(long_channel)),
         true,
     )
     .await;
-    // The full 25-row fixture needs at most three whole-row packed pages.
-    // Gather before assertions so intentionally RED tests still drop the DB.
-    let mut rest = Vec::new();
-    for page in 2..=3 {
-        rest.push(
-            dispatch(
-                db.pool().clone(),
-                interaction(Some(true), Some(page), Some(long_channel)),
-                true,
-            )
-            .await,
-        );
-    }
     let after = state(db.pool(), false).await;
     db.close().await.expect("drop whole-row packing fixture");
     assert_eq!(before, after);
-    let first = reply(&first);
-    scoped(&first);
-    let (current, total) =
-        schedule_list_page_indicator(&first).expect("long rows need packed pages");
-    assert_eq!(current, 1);
-    assert!((2..=3).contains(&total));
-    let mut texts = vec![first];
-    texts.extend(rest.iter().take(total as usize - 1).map(|r| reply(r)));
+    assert_eq!(texts.len(), total as usize);
+    let out_of_range = reply(&out_of_range);
+    scoped(&out_of_range);
+    assert!(ids(&out_of_range).is_empty());
+    assert!(
+        out_of_range.contains("out of range") && out_of_range.contains(&format!("{total} page(s)")),
+        "range follows actual whole-row packing: {out_of_range}"
+    );
     let mut found = Vec::new();
     for (page, text) in texts.iter().enumerate() {
         scoped(text);
@@ -681,6 +889,7 @@ async fn schedule_here_packs_whole_long_rows_with_stable_tied_ids() {
             );
             assert_eq!(line.contains(" every 90m"), n.is_multiple_of(3));
             assert_eq!(line.contains(" (disabled)"), n % 5 == 4);
+            assert_complete_row(line, id, long_channel, n);
             found.push(id.to_owned());
         }
     }
@@ -716,24 +925,19 @@ async fn fail_selects(pool: &PgPool, count: bool) {
         .expect("install read fault view");
 }
 
-#[tokio::test]
-async fn schedule_here_count_outage_never_claims_completeness_or_false_range() {
+async fn count_outage(here: Option<bool>) {
     let db = database().await;
     for n in (0..27).rev() {
         seed(db.pool(), GUILD_S, CHANNEL_S, n, false).await;
     }
     seed(db.pool(), GUILD_S, OTHER_CHANNEL, 30, false).await;
     let before = state(db.pool(), false).await;
+    let (_, first_total) = packed_pages(db.pool(), here, CHANNEL, false).await;
     fail_selects(db.pool(), true).await;
-    let first = dispatch(
-        db.pool().clone(),
-        interaction(Some(true), Some(1), Some(CHANNEL)),
-        true,
-    )
-    .await;
+    let (texts, fault_total) = packed_pages(db.pool(), here, CHANNEL, false).await;
     let deep = dispatch(
         db.pool().clone(),
-        interaction(Some(true), Some(2), Some(CHANNEL)),
+        interaction(here, Some(first_total + 1), Some(CHANNEL)),
         true,
     )
     .await;
@@ -743,50 +947,93 @@ async fn schedule_here_count_outage_never_claims_completeness_or_false_range() {
         before.0, after.0,
         "failed reads preserve schedule/delivery state"
     );
-    let first = reply(&first);
-    let deep = reply(&deep);
-    scoped(&first);
-    assert_eq!(ids(&first).len(), 25);
-    assert!(
-        first.contains("(truncated)"),
-        "unknown count is explicitly incomplete: {first}"
-    );
-    assert!(!first.contains("27 more") && !first.contains("28 more"));
+    assert_eq!(fault_total, first_total, "same whole-row first window");
     assert_eq!(
-        deep, SCHEDULE_STORE_FAILURE_REPLY,
-        "count outage is not a fabricated out-of-range page"
+        texts.iter().flat_map(|text| ids(text)).collect::<Vec<_>>(),
+        (0..25).map(|n| format!("row-{n:03}")).collect::<Vec<_>>(),
+        "25 fetched rows span every packed first-window page despite unknown count"
+    );
+    for (index, text) in texts.iter().enumerate() {
+        if here == Some(true) {
+            scoped(text);
+        }
+        assert_eq!(
+            schedule_list_page_indicator(text),
+            Some((index as i64 + 1, first_total))
+        );
+        assert!(
+            !text.contains(" more)"),
+            "failed count must not invent a numeric remainder: {text}"
+        );
+        for line in schedule_list_row_lines(text) {
+            let id = schedule_list_row_id(line);
+            let n = id
+                .strip_prefix("row-")
+                .expect("seeded id")
+                .parse()
+                .expect("index");
+            assert_complete_row(line, id, CHANNEL, n);
+        }
+    }
+    assert!(
+        texts
+            .last()
+            .expect("terminal first-window page")
+            .contains("(truncated)"),
+        "unknown count is explicitly incomplete on the terminal packed page"
+    );
+    assert_eq!(
+        reply(&deep),
+        SCHEDULE_STORE_FAILURE_REPLY,
+        "count outage past all packed first-window pages is not a fabricated out-of-range page"
     );
     assert_eq!(after.1.len(), 1, "preserve existing deep-refusal audit");
 }
 
 #[tokio::test]
-async fn schedule_here_hidden_window_outage_fails_closed_without_delivery_writes() {
-    let db = database().await;
-    for n in (0..27).rev() {
-        seed(db.pool(), GUILD_S, CHANNEL_S, n, false).await;
+async fn schedule_here_count_outage_never_claims_completeness_or_false_range() {
+    count_outage(Some(true)).await;
+}
+
+#[tokio::test]
+async fn schedule_here_existing_guild_count_outage_uses_actual_hidden_page() {
+    // This corrected paging oracle must pass independently of the new filter.
+    for here in [None, Some(false)] {
+        count_outage(here).await;
     }
-    seed(db.pool(), GUILD_S, OTHER_CHANNEL, 30, false).await;
-    let before = state(db.pool(), false).await;
-    fail_selects(db.pool(), false).await;
-    let deep = dispatch(
-        db.pool().clone(),
-        interaction(Some(true), Some(2), Some(CHANNEL)),
-        true,
-    )
-    .await;
-    let after = state(db.pool(), true).await;
-    db.close().await.expect("drop window-outage fixture");
-    assert_eq!(before.0, after.0);
-    assert_eq!(
-        reply(&deep),
-        SCHEDULE_STORE_FAILURE_REPLY,
-        "window outage is not empty or out-of-range"
-    );
-    assert_eq!(after.1.len(), 1);
-    let audit: serde_json::Value = serde_json::from_str(&after.1[0]).expect("audit snapshot");
-    assert_eq!(audit["action"], "scheduled.list");
-    assert_eq!(audit["outcome"], "rejected");
-    assert_eq!(audit["actor_id"], "88");
+}
+
+#[tokio::test]
+async fn schedule_here_hidden_window_outage_fails_closed_without_delivery_writes() {
+    for here in [None, Some(false), Some(true)] {
+        let db = database().await;
+        for n in (0..27).rev() {
+            seed(db.pool(), GUILD_S, CHANNEL_S, n, false).await;
+        }
+        seed(db.pool(), GUILD_S, OTHER_CHANNEL, 30, false).await;
+        let before = state(db.pool(), false).await;
+        let (_, first_total) = packed_pages(db.pool(), here, CHANNEL, false).await;
+        fail_selects(db.pool(), false).await;
+        let deep = dispatch(
+            db.pool().clone(),
+            interaction(here, Some(first_total + 1), Some(CHANNEL)),
+            true,
+        )
+        .await;
+        let after = state(db.pool(), true).await;
+        db.close().await.expect("drop window-outage fixture");
+        assert_eq!(before.0, after.0);
+        assert_eq!(
+            reply(&deep),
+            SCHEDULE_STORE_FAILURE_REPLY,
+            "actual OFFSET window outage is not empty or out-of-range"
+        );
+        assert_eq!(after.1.len(), 1);
+        let audit: serde_json::Value = serde_json::from_str(&after.1[0]).expect("audit snapshot");
+        assert_eq!(audit["action"], "scheduled.list");
+        assert_eq!(audit["outcome"], "rejected");
+        assert_eq!(audit["actor_id"], "88");
+    }
 }
 
 #[tokio::test]
