@@ -120,6 +120,44 @@ fn service(mode: PanelMode) -> SelfRoleService {
     .unwrap()
 }
 
+#[tokio::test]
+async fn admission_terminal_rejection_never_reports_unresolved() {
+    let service = service(PanelMode::Select);
+    let panel = &gates(PanelMode::Select).panels[0];
+    for code in ["unsafe_live_roles", "disallowed_role_permission", "unknown"] {
+        let result = service
+            .handle_admission(Ok(Admission::Rejected(code)), panel, "fixture-event")
+            .await;
+        assert_eq!(result, SelfRoleResult::Rejected, "code={code}");
+        for color in [false, true] {
+            let reply = result.reply(color);
+            assert_eq!(reply, "This role selection could not be applied. Try again later, or contact a server admin to check this panel.");
+            assert!(!reply.contains("unresolved"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn admission_unavailable_evidence_never_reports_terminal_rejection() {
+    let service = service(PanelMode::Select);
+    let panel = &gates(PanelMode::Select).panels[0];
+    for error in [
+        RuntimeError::InvalidSnapshot,
+        RuntimeError::Store(StoreErrorKind::Database),
+        RuntimeError::Store(StoreErrorKind::Timeout),
+    ] {
+        let result = service
+            .handle_admission(Err(error), panel, "fixture-event")
+            .await;
+        assert_eq!(result, SelfRoleResult::Pending);
+        for color in [false, true] {
+            let reply = result.reply(color);
+            assert_eq!(reply, "This role selection is unresolved; no successful change has been confirmed. Please wait a moment and try again; if it keeps failing, contact a server admin.");
+            assert!(!reply.contains("could not be applied"));
+        }
+    }
+}
+
 /// A valid stored catalogue with a distinct panel id, proving the live row
 /// wins over (rather than merges into) the boot catalogue.
 fn live_catalogue() -> serde_json::Value {
@@ -510,12 +548,23 @@ fn every_result_reply_pins_its_exact_text_in_both_color_modes() {
         );
         assert_eq!(
             SelfRoleResult::Rejected.reply(color),
-            "This role selection could not be applied.",
+            "This role selection could not be applied. Try again later, or contact a server admin to check this panel.",
             "color={color}"
         );
+        for refusal in [
+            SafeRefusal::MissingManageRoles,
+            SafeRefusal::MissingRole,
+            SafeRefusal::RoleHierarchy,
+        ] {
+            assert_eq!(
+                SelfRoleResult::Refused(refusal).reply(color),
+                refusal.reply(),
+                "color={color}"
+            );
+        }
         assert_eq!(
             SelfRoleResult::Pending.reply(color),
-            "This role selection is unresolved; no successful change has been confirmed.",
+            "This role selection is unresolved; no successful change has been confirmed. Please wait a moment and try again; if it keeps failing, contact a server admin.",
             "color={color}"
         );
     }
