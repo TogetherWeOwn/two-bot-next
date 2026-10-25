@@ -1215,6 +1215,72 @@ pub struct DispatchFailure {
     pub public_message: &'static str,
 }
 
+/// A definitive pre-mutation refusal with a bounded, member-safe explanation.
+/// Each reply opens with the validator's vetted `public_message` sentence; a
+/// unit test pins that they stay in step.
+/// Every other validation failure (unsafe permissions, drifted masks, unknown
+/// or unverifiable state) stays generic so no diagnostic can reach a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeRefusal {
+    MissingManageRoles,
+    MissingRole,
+    RoleHierarchy,
+}
+
+impl SafeRefusal {
+    /// Stable audit code, identical to the validator's [`DispatchFailure::code`].
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MissingManageRoles => "missing_manage_roles",
+            Self::MissingRole => "missing_role",
+            Self::RoleHierarchy => "role_hierarchy",
+        }
+    }
+
+    /// Closed whitelist: any other code, including an unknown one, is `None`.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::MissingManageRoles,
+            Self::MissingRole,
+            Self::RoleHierarchy,
+        ]
+        .into_iter()
+        .find(|refusal| refusal.code() == code)
+    }
+
+    /// Ephemeral reply: the vetted reason, a contact-admin step for the member
+    /// and what an admin can change. Static text only; nothing from Discord,
+    /// the store or the panel is interpolated.
+    #[must_use]
+    pub const fn reply(self) -> &'static str {
+        match self {
+            Self::MissingManageRoles => concat!(
+                "I cannot manage roles in this server. Please contact a server admin. ",
+                "Admins: grant the bot the Manage Roles permission."
+            ),
+            Self::MissingRole => concat!(
+                "That role no longer exists. Please contact a server admin. ",
+                "Admins: update or replace the missing role on this panel."
+            ),
+            Self::RoleHierarchy => concat!(
+                "I cannot manage that role because the role hierarchy is wrong. ",
+                "Please contact a server admin. Admins: move the bot's role above ",
+                "the role on this panel; managed integration roles cannot be changed this way."
+            ),
+        }
+    }
+}
+
+impl DispatchFailure {
+    /// The member-explainable category, when this failure has one.
+    #[must_use]
+    pub fn safe_refusal(&self) -> Option<SafeRefusal> {
+        SafeRefusal::from_code(self.code)
+    }
+}
+
 /// Validate a planned mutation against live Discord state before any role
 /// call: bot capability, role existence and safety, deployment-mask drift,
 /// color presence, and role hierarchy (legacy `validateSelfRoleDispatch`).
@@ -1814,6 +1880,52 @@ mod tests {
             validate_self_role_dispatch(&check(&panel, &roles, &ids)).map(|f| f.code),
             Some("missing_role")
         );
+    }
+
+    #[test]
+    fn safe_refusal_is_a_closed_set_with_vetted_next_actions() {
+        let panel = panel();
+        let ids = [ROLE_A.to_owned()];
+        let none: Vec<DispatchRole> = vec![];
+        let mut hierarchy = vec![dispatch_role(ROLE_A)];
+        hierarchy[0].position = 10;
+        let ok = vec![dispatch_role(ROLE_A)];
+        let mut no_manage = check(&panel, &ok, &ids);
+        no_manage.bot_has_manage_roles = false;
+        for (failure, expected) in [
+            (
+                validate_self_role_dispatch(&no_manage),
+                SafeRefusal::MissingManageRoles,
+            ),
+            (
+                validate_self_role_dispatch(&check(&panel, &none, &ids)),
+                SafeRefusal::MissingRole,
+            ),
+            (
+                validate_self_role_dispatch(&check(&panel, &hierarchy, &ids)),
+                SafeRefusal::RoleHierarchy,
+            ),
+        ] {
+            let failure = failure.expect("refused");
+            assert_eq!(failure.safe_refusal(), Some(expected));
+            assert_eq!(expected.code(), failure.code);
+            // The vetted sentence leads the reply; the next action follows it.
+            let public = failure.public_message.split(" Staff").next().unwrap();
+            assert!(expected.reply().starts_with(public), "{}", expected.reply());
+            assert!(expected.reply().contains("contact a server admin"));
+            assert!(expected.reply().len() < 300);
+        }
+        // Everything else (and any unknown code) stays generic.
+        for code in [
+            "unsafe_live_roles",
+            "disallowed_role_permission",
+            "role_permissions_changed",
+            "everyone_role",
+            "bot_member",
+            "",
+        ] {
+            assert_eq!(SafeRefusal::from_code(code), None, "{code}");
+        }
     }
 
     #[test]

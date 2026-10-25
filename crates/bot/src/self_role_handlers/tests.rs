@@ -510,12 +510,23 @@ fn every_result_reply_pins_its_exact_text_in_both_color_modes() {
         );
         assert_eq!(
             SelfRoleResult::Rejected.reply(color),
-            "This role selection could not be applied.",
+            "This role selection could not be applied. Try again later, or contact a server admin to check this panel.",
             "color={color}"
         );
+        for refusal in [
+            SafeRefusal::MissingManageRoles,
+            SafeRefusal::MissingRole,
+            SafeRefusal::RoleHierarchy,
+        ] {
+            assert_eq!(
+                SelfRoleResult::Refused(refusal).reply(color),
+                refusal.reply(),
+                "color={color}"
+            );
+        }
         assert_eq!(
             SelfRoleResult::Pending.reply(color),
-            "This role selection is unresolved; no successful change has been confirmed.",
+            "This role selection is unresolved; no successful change has been confirmed. Please wait a moment and try again; if it keeps failing, contact a server admin.",
             "color={color}"
         );
     }

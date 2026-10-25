@@ -18,7 +18,7 @@ use std::{
 use tracing::warn;
 use two_bot_core::self_roles::{
     event_order_from_snowflake, plan_select_delta, plan_self_role_change, PanelMode, PlanRejection,
-    RoleOperation, SelfRolePanel, SelfRolePlan, SettledOutcome,
+    RoleOperation, SafeRefusal, SelfRolePanel, SelfRolePlan, SettledOutcome,
 };
 use two_bot_cutover::self_role_store::{
     AuditEffects, EventClaim, ExchangeIntent, ExchangeReceipt, ExchangeTicket, PanelClaim,
@@ -1502,11 +1502,12 @@ impl SelfRoleRuntime {
             .iter()
             .map(|option| option.role_id.clone())
             .collect();
-        if snapshot
-            .validate(&request.guild_id, panel, &offered)
-            .is_some()
-        {
-            return Ok(Err("unsafe_live_roles"));
+        if let Some(failure) = snapshot.validate(&request.guild_id, panel, &offered) {
+            // Only the closed, member-explainable categories keep their code;
+            // every other failure stays the opaque generic one.
+            return Ok(Err(failure
+                .safe_refusal()
+                .map_or("unsafe_live_roles", SafeRefusal::code)));
         }
         // Seed only from a verifiable exclusive selection, never from new
         // uncommitted input. A malformed/multiple initial selection stays unknown.
