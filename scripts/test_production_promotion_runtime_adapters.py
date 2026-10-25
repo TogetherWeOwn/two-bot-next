@@ -7,7 +7,11 @@ implementation:
   promoted image has converged under the exact current production Worker
   version and target application version, with the Worker re-read after
   image convergence. The proof binds the original admitted receipt and an
-  independent canonical production deployment event.
+  independent canonical production deployment event. Identity-only preflight
+  must unblock cold starts; either completed singleton counter-lag shape needs
+  two consecutive exact live /health + /readyz confirmations. A predeploy
+  snapshot authorizes polling only its exact old rollout/image, never a newer
+  foreign rollout. The legacy no-URL strict-convergence path stays covered.
 * ``readyz`` with ``--artifact`` — the verdict must come from the actual
   ``/health`` AND ``/readyz`` response headers (exact
   ``x-two-worker-version``), while the build stamps compared are the
@@ -35,7 +39,9 @@ import os
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -413,6 +419,370 @@ class ServingTests(unittest.TestCase):
                 code, message, proof, _, _ = self.run_serving(
                     routes, deploy_id=deploy_id)
                 self.assert_refused_without_proof(code, message, proof)
+
+
+RUNTIME_URL = "https://production.example.invalid"
+OLD_IMAGE = PROD_REPO + "@" + OTHER_DIGEST
+
+
+def runtime_answer(*, status=200, version=PROD_VERSION, report=None,
+                   duplicate=False, dictionary=False):
+    headers = {"x-two-worker-version": version} if dictionary else Message()
+    if not dictionary:
+        if version is not None:
+            headers.add_header("x-two-worker-version", version)
+        if duplicate:
+            headers.add_header("x-two-worker-version", version)
+    body = {"build_revision": SHA, "build_id": BUILD, "deploy_id": STAMP,
+            "components": [["gateway", "ready"]]}
+    if report:
+        body.update(report)
+    return status, headers, json.dumps(body).encode()
+
+
+class RuntimeControlPlane(FakeControlPlane):
+    """Only external GETs are replaced; serving/readyz/shape checks stay real."""
+
+    def __init__(self, routes, calls, samples):
+        super().__init__(routes, calls)
+        self.samples = samples
+        self.runtime_calls = []
+        self.sample_index = 0
+        self.seen = set()
+
+    def request(self, url, authenticated=False):
+        if authenticated or url not in (RUNTIME_URL + "/health", RUNTIME_URL + "/readyz"):
+            raise AssertionError("unexpected runtime request: " + url)
+        endpoint = url.rsplit("/", 1)[-1]
+        if endpoint in self.seen or len(self.seen) == 2:
+            self.sample_index += 1
+            self.seen.clear()
+        self.seen.add(endpoint)
+        self.runtime_calls.append((self.sample_index, endpoint))
+        self.calls.append(url)
+        sample = self.samples[min(self.sample_index, len(self.samples) - 1)]
+        response = sample.get(endpoint, runtime_answer())
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class ColdAndLagServingTests(unittest.TestCase):
+    # Reuse fixture creation and external network guards, not any verdict.
+    setUp = ServingTests.setUp
+    live_routes = ServingTests.live_routes
+
+    def attempt(self, row=None, *, preflight=False, url=RUNTIME_URL,
+                samples=None, routes=None, snapshot=None, cli=False):
+        self.out.unlink(missing_ok=True)
+        routes = routes or self.live_routes(row or converged_row(ROLL_ID, PROD_IMAGE))
+        clock = FakeClock()
+        calls = []
+        plane = RuntimeControlPlane(routes, calls, samples or [{}])
+        args = SimpleNamespace(sha=SHA, deploy_id=EVENT,
+                               artifact=str(self.artifact),
+                               expected_worker_version=PROD_VERSION,
+                               out=str(self.out), preflight=preflight,
+                               url=url, snapshot=None)
+        if snapshot is not None:
+            path = self.root / "predeploy-snapshot.json"
+            path.write_text(json.dumps(snapshot))
+            args.snapshot = str(path)
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                                           "CLOUDFLARE_API_TOKEN": TOKEN}),
+              mock.patch.object(rollback.base, "Client", return_value=plane),
+              mock.patch("time.monotonic", clock.now),
+              mock.patch("time.sleep", clock.sleep),
+              contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+            if cli:
+                argv = ["serving", "--sha", SHA, "--deploy-id", EVENT,
+                        "--artifact", str(self.artifact),
+                        "--expected-worker-version", PROD_VERSION, "--out", str(self.out)]
+                if preflight:
+                    argv.append("--preflight")
+                if url:
+                    argv += ["--url", url]
+                if args.snapshot:
+                    argv += ["--snapshot", args.snapshot]
+                try:
+                    code = production_deploy.main(argv)
+                except SystemExit as exc:
+                    code = exc.code
+            else:
+                # Direct API proves behavioral RED even before CLI flags exist.
+                code = production_deploy.serving(args)
+        proof = json.loads(self.out.read_text()) if self.out.exists() else None
+        return code, output.getvalue(), proof, plane, clock
+
+    def lag_row(self, active=0, healthy=1):
+        row = converged_row(ROLL_ID, PROD_IMAGE)
+        row["health"]["instances"].update(active=active, healthy=healthy)
+        return row
+
+    def assert_refused(self, result):
+        code, message, proof, _, _ = result
+        self.assertEqual(code, 1, message)
+        self.assertTrue(message.startswith("serving: promoted production "), message)
+        self.assertNotIn("unrecognized arguments", message)
+        self.assertIsNone(proof)
+
+    def test_preflight_accepts_owned_cold_identity_without_start_or_runtime_probe(self):
+        cold = self.lag_row(active=0, healthy=0)
+        code, message, proof, plane, _ = self.attempt(cold, preflight=True, url=None)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(proof["phase"], "identity")
+        self.assertEqual(proof["production_image"], PROD_IMAGE)
+        self.assertEqual(proof["worker_version"], PROD_VERSION)
+        self.assertEqual(proof["receipt"], admitted_receipt())
+        self.assertEqual(plane.runtime_calls, [], "identity must not start or probe a cold container")
+
+    def test_preflight_cli_publishes_the_identity_handoff(self):
+        code, message, proof, plane, _ = self.attempt(
+            self.lag_row(active=0, healthy=0), preflight=True, url=None, cli=True)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(proof["phase"], "identity")
+        self.assertEqual(plane.runtime_calls, [])
+
+    def test_preflight_still_refuses_wrong_worker_rollout_and_application(self):
+        cases = [self.live_routes(converged_row(ROLL_ID, OLD_IMAGE)),
+                 self.live_routes(converged_row(ROLL_ID, PROD_IMAGE), versions=[OTHER_VERSION]),
+                 self.live_routes(converged_row(ROLL_ID, PROD_IMAGE), app_image=OLD_IMAGE),
+                 self.live_routes(converged_row(ROLL_ID, PROD_IMAGE), app_version=TARGET_VERSION + 1)]
+        for routes in cases:
+            with self.subTest(routes=list(routes)):
+                result = self.attempt(routes=routes, preflight=True, url=None)
+                self.assert_refused(result)
+                self.assertEqual(result[3].runtime_calls, [])
+
+    def test_both_lag_shapes_need_two_exact_live_health_and_readyz_confirmations(self):
+        for active, healthy in ((0, 1), (1, 0)):
+            for dictionary in (False, True):
+                with self.subTest(active=active, healthy=healthy, dictionary=dictionary):
+                    sample = {endpoint: runtime_answer(dictionary=dictionary)
+                              for endpoint in ("health", "readyz")}
+                    code, message, proof, plane, clock = self.attempt(
+                        self.lag_row(active, healthy), samples=[sample])
+                    self.assertEqual(code, 0, message)
+                    self.assertEqual(proof["production_image"], PROD_IMAGE)
+                    self.assertEqual(proof["worker_version"], PROD_VERSION)
+                    self.assertEqual(proof["production_deploy_id"], EVENT)
+                    self.assertEqual(proof["receipt"]["build"], admitted_receipt()["build"])
+                    for endpoint in ("health", "readyz"):
+                        observations = {sample for sample, name in plane.runtime_calls
+                                        if name == endpoint}
+                        self.assertGreaterEqual(len(observations), 2)
+                    self.assertTrue(clock.sleeps, "one live sample cannot establish a streak")
+                    final_runtime = max(index for index, path in enumerate(plane.calls)
+                                        if path.startswith(RUNTIME_URL + "/"))
+                    worker_reads = [index for index, path in enumerate(plane.calls)
+                                    if path == f"/workers/scripts/{PROD_WORKER}/deployments"]
+                    self.assertGreater(max(worker_reads), final_runtime,
+                                       "Worker identity must be re-read after runtime convergence")
+
+    def test_final_cli_accepts_url_and_predeploy_snapshot(self):
+        code, message, proof, _, _ = self.attempt(
+            self.lag_row(), snapshot=self.snapshot(), cli=True)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(proof["production_image"], PROD_IMAGE)
+
+    def test_without_url_lag_never_replaces_strict_convergence(self):
+        for active, healthy in ((0, 1), (1, 0)):
+            with self.subTest(active=active, healthy=healthy):
+                result = self.attempt(self.lag_row(active, healthy), url=None)
+                self.assert_refused(result)
+                self.assertEqual(result[3].runtime_calls, [])
+
+    def test_failed_runtime_confirmation_resets_lag_streak(self):
+        bad_samples = [
+            {"readyz": runtime_answer(status=503)},
+            {"readyz": runtime_answer(report={"components": [["gateway", "down"]]})},
+            {"health": runtime_answer(status=503)},
+        ]
+        for bad in bad_samples:
+            with self.subTest(bad=bad):
+                code, message, proof, plane, _ = self.attempt(
+                    self.lag_row(), samples=[{}, bad, {}, {}])
+                self.assertEqual(code, 0, message)
+                self.assertIsNotNone(proof)
+                self.assertGreaterEqual(max(index for index, _ in plane.runtime_calls), 3,
+                                        "pass, miss, pass must not certify; two fresh passes are required")
+
+    def test_persistent_runtime_mismatches_cannot_certify_either_lag_shape(self):
+        cases = {
+            "readyz-503": {"readyz": runtime_answer(status=503)},
+            "health-503": {"health": runtime_answer(status=503)},
+            "parked-gateway": {"readyz": runtime_answer(report={"components": [["gateway", "down"]]})},
+            "missing-gateway": {"readyz": runtime_answer(report={"components": []})},
+            "other-component-only": {"readyz": runtime_answer(report={"components": [["db", "ready"]]})},
+            "wrong-revision": {"readyz": runtime_answer(report={"build_revision": "f" * 40})},
+            "production-build-id": {"readyz": runtime_answer(report={"build_id": "900-1"})},
+            "production-event-id": {"readyz": runtime_answer(report={"deploy_id": EVENT})},
+            "missing-build-stamp": {"readyz": runtime_answer(report={"build_id": None})},
+            "wrong-readyz-worker": {"readyz": runtime_answer(version=OTHER_VERSION)},
+            "wrong-health-worker": {"health": runtime_answer(version=OTHER_VERSION)},
+            "missing-readyz-version": {"readyz": runtime_answer(version=None)},
+            "missing-health-version": {"health": runtime_answer(version=None)},
+            "duplicate-readyz-version": {"readyz": runtime_answer(duplicate=True)},
+            "duplicate-health-version": {"health": runtime_answer(duplicate=True)},
+            "transport-failure": {"readyz": base.GateError("runtime_transport_failure")},
+        }
+        for active, healthy in ((0, 1), (1, 0)):
+            for name, sample in cases.items():
+                with self.subTest(shape=(active, healthy), failure=name):
+                    self.assert_refused(self.attempt(self.lag_row(active, healthy), samples=[sample]))
+
+    def test_lag_does_not_relax_rollout_progress_or_instance_schema(self):
+        mutations = [
+            ("health", "instances", "active", True),
+            ("health", "instances", "active", "0"),
+            ("health", "instances", "healthy", -1),
+            ("health", "instances", "failed", 1),
+            ("health", "instances", "starting", 1),
+            ("health", "instances", "scheduling", 1),
+            ("health", "instances", "scheduling", None),
+            ("progress", "updated_instances", 0),
+            ("progress", "total_instances", 2),
+            ("progress", "total_steps", 2),
+            ("progress", "current_step", 2),
+            ("steps", [{"status": "in_progress"}]),
+            ("status", "progressing"),
+            ("status", "replaced"),
+            ("status", "failed"),
+        ]
+        for path in mutations:
+            with self.subTest(path=path):
+                row = self.lag_row()
+                holder = row
+                for key in path[:-2]:
+                    holder = holder[key]
+                holder[path[-2]] = path[-1]
+                self.assert_refused(self.attempt(row))
+
+    def test_current_application_image_and_version_must_match_even_with_live_readyz(self):
+        for image, version in ((OLD_IMAGE, TARGET_VERSION), (PROD_IMAGE, TARGET_VERSION + 1)):
+            with self.subTest(image=image, version=version):
+                routes = self.live_routes(self.lag_row(), app_image=image, app_version=version)
+                self.assert_refused(self.attempt(routes=routes))
+
+    def test_worker_change_after_live_probes_refuses_the_old_version(self):
+        routes = self.live_routes(self.lag_row())
+        reads = [0]
+
+        def deployment():
+            reads[0] += 1
+            return deployments_answer(PROD_VERSION if reads[0] < 3 else OTHER_VERSION)
+
+        routes[f"/workers/scripts/{PROD_WORKER}/deployments"] = deployment
+        self.assert_refused(self.attempt(routes=routes))
+
+    def snapshot(self):
+        return {"has_previous": True, "worker": PROD_WORKER, "application": PROD_APP,
+                "application_id": APP_ID, "namespace_id": NAMESPACE,
+                "serving_version": OTHER_VERSION, "serving_sha": "f" * 40,
+                "provenance_complete": True, "serving_rollout_id": "roll-old",
+                "serving_image": OLD_IMAGE, "recorded_at": 1000.0}
+
+    def rollout_sequence(self, listings):
+        reads = [0]
+        desired = converged_row(ROLL_ID, PROD_IMAGE, created=NEWER_CREATED)
+        old = converged_row("roll-old", OLD_IMAGE)
+        routes = self.live_routes(desired)
+
+        def listing():
+            index = min(reads[0], len(listings) - 1)
+            reads[0] += 1
+            return copy.deepcopy(listings[index])
+
+        routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = listing
+        routes[f"/containers/applications/{APP_ID}/rollouts/roll-old"] = lambda: copy.deepcopy(old)
+        return routes, reads, desired, old
+
+    def test_empty_rollout_list_waits_for_the_intended_rollout(self):
+        desired = converged_row(ROLL_ID, PROD_IMAGE, created=NEWER_CREATED)
+        routes, reads, _, _ = self.rollout_sequence([[], [desired]])
+        code, message, proof, _, clock = self.attempt(routes=routes)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(proof["rollout_id"], ROLL_ID)
+        self.assertGreaterEqual(reads[0], 2)
+        self.assertTrue(clock.sleeps)
+
+    def test_only_snapshotted_old_rollout_can_poll_before_the_new_image(self):
+        desired = converged_row(ROLL_ID, PROD_IMAGE, created=NEWER_CREATED)
+        old = converged_row("roll-old", OLD_IMAGE)
+        for preflight in (False, True):
+            with self.subTest(preflight=preflight):
+                routes, reads, _, _ = self.rollout_sequence([[], [old], [desired]])
+                code, message, proof, _, clock = self.attempt(
+                    routes=routes, snapshot=self.snapshot(), preflight=preflight,
+                    url=None if preflight else RUNTIME_URL)
+                self.assertEqual(code, 0, message)
+                self.assertEqual(proof["rollout_id"], ROLL_ID)
+                self.assertGreaterEqual(reads[0], 3)
+                self.assertGreaterEqual(len(clock.sleeps), 2)
+
+    def test_no_snapshot_does_not_authorize_waiting_on_a_foreign_image(self):
+        old = converged_row("roll-old", OLD_IMAGE)
+        routes, reads, _, _ = self.rollout_sequence([[old]])
+        result = self.attempt(routes=routes)
+        self.assert_refused(result)
+        self.assertEqual(reads[0], 1)
+        self.assertEqual(result[4].sleeps, [])
+
+    def test_wrong_rollout_id_or_wrong_image_is_not_the_snapshotted_baseline(self):
+        for snapshot in (dict(self.snapshot(), serving_rollout_id="different-old"),
+                         dict(self.snapshot(), serving_image=PROD_REPO + "@sha256:" + "e" * 64)):
+            with self.subTest(snapshot=snapshot):
+                old = converged_row("roll-old", OLD_IMAGE)
+                routes, reads, _, _ = self.rollout_sequence([[old]])
+                result = self.attempt(routes=routes, snapshot=snapshot)
+                self.assert_refused(result)
+                self.assertEqual(reads[0], 1)
+                self.assertEqual(result[4].sleeps, [])
+
+    def test_newer_foreign_rollout_never_polls_even_when_old_baseline_is_known(self):
+        old = converged_row("roll-old", OLD_IMAGE)
+        foreign = converged_row("roll-foreign", OLD_IMAGE, created=NEWER_CREATED)
+        routes, reads, _, _ = self.rollout_sequence([[old, foreign]])
+        routes[f"/containers/applications/{APP_ID}/rollouts/roll-foreign"] = lambda: foreign
+        result = self.attempt(routes=routes, snapshot=self.snapshot())
+        self.assert_refused(result)
+        self.assertEqual(reads[0], 1)
+        self.assertEqual(result[4].sleeps, [])
+
+    def test_first_deploy_snapshot_without_previous_rollout_remains_valid(self):
+        snapshot = {"has_previous": False, "worker": PROD_WORKER, "application": PROD_APP}
+        code, message, proof, _, _ = self.attempt(snapshot=snapshot)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(proof["production_image"], PROD_IMAGE)
+
+    def test_snapshot_without_previous_deployment_cannot_authorize_foreign_image_polling(self):
+        snapshot = {"has_previous": False, "worker": PROD_WORKER, "application": PROD_APP}
+        old = converged_row("roll-old", OLD_IMAGE)
+        routes, reads, _, _ = self.rollout_sequence([[old]])
+        result = self.attempt(routes=routes, snapshot=snapshot)
+        self.assert_refused(result)
+        self.assertEqual(reads[0], 1)
+        self.assertEqual(result[4].sleeps, [])
+
+    def test_snapshot_must_bind_the_worker_application_and_application_id(self):
+        for key, value in (("worker", "two-bot-next-staging"),
+                           ("application", "two-bot-next-twobotcontainer-staging"),
+                           ("application_id", "app-foreign")):
+            with self.subTest(key=key):
+                snapshot = dict(self.snapshot(), **{key: value})
+                self.assert_refused(self.attempt(snapshot=snapshot))
+
+    def test_empty_or_only_old_listing_times_out_with_fixed_refusal(self):
+        old = converged_row("roll-old", OLD_IMAGE)
+        for listing in ([], [old]):
+            with self.subTest(listing=listing):
+                routes, reads, _, _ = self.rollout_sequence([listing])
+                result = self.attempt(routes=routes, snapshot=self.snapshot())
+                self.assert_refused(result)
+                self.assertGreater(reads[0], 1)
+                self.assertIn("identity refused", result[1])
+                self.assertIn("image did not converge", result[1])
 
 
 def header_file(root, name, version=PROD_VERSION):

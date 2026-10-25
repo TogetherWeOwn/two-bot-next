@@ -29,6 +29,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bot_promotion
@@ -228,6 +229,197 @@ class CommandAdapterTest(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         unrelated.kill()
                         unrelated.wait(timeout=5)
+
+
+class _SmallCapGitHub(bot_promotion._GhApiGitHub):
+    """Test-only small caps/timeouts; production defaults stay untouched."""
+
+    TIMEOUT_SECONDS = 2
+    MAX_JSON_BYTES = 1024
+    MAX_ZIP_BYTES = 1024
+
+
+JSON_RUN_ROUTE = "repos/TogetherWeOwn/two-bot-next/actions/runs/123"
+ZIP_ROUTE = "repos/TogetherWeOwn/two-bot-next/actions/artifacts/456/zip"
+
+
+def write_fake_gh(directory, body):
+    return write_fake(directory, "gh", body)
+
+
+@contextlib.contextmanager
+def fake_gh_on_path(directory):
+    # The child never receives the run's broker or provider credentials.
+    clean = {"PATH": directory + os.pathsep + os.environ.get("PATH", ""),
+             "HOME": directory, "LANG": "C.UTF-8"}
+    with mock.patch.dict(os.environ, clean, clear=True):
+        yield
+
+
+def run_gh_guarded(func):
+    """Run a native _GhApiGitHub call under the SIGALRM outer watchdog."""
+    def _expired(signum, frame):
+        raise AssertionError(
+            "managed github read did not settle within outer watchdog "
+            f"{OUTER_WATCHDOG}s (hang)"
+        )
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.alarm(OUTER_WATCHDOG)
+    try:
+        return func()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+class GhApiGitHubNativeTest(unittest.TestCase):
+    """Native bot_promotion._GhApiGitHub wiring through a local fake gh.
+
+    Real ``_GhApiGitHub.get_json``/``get_bytes`` with a ``gh`` executable
+    faked on PATH (bounded local Python child, no broker/network). Only
+    PATH and the small test-specific class caps/timeouts above are patched;
+    ``_run``/``_command`` are never stubbed. Breaks caught: ``cap=cap``
+    replaced with a huge cap (over-cap tests succeed instead of refusing),
+    and omitted timeout forwarding (timeout tests exceed the small class
+    timeout and hit the outer watchdog).
+    """
+
+    def test_get_json_positive_small_local_gh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(
+                tmp, "import sys; sys.stdout.buffer.write(b'{\"ok\":true}')\n"
+            )
+            with fake_gh_on_path(tmp):
+                out = run_gh_guarded(
+                    lambda: _SmallCapGitHub().get_json(JSON_RUN_ROUTE)
+                )
+            self.assertEqual(out, {"ok": True})
+
+    def test_get_bytes_positive_small_local_gh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(
+                tmp, "import sys; sys.stdout.buffer.write(b'zip-ok-123')\n"
+            )
+            with fake_gh_on_path(tmp):
+                out = run_gh_guarded(
+                    lambda: _SmallCapGitHub().get_bytes(ZIP_ROUTE)
+                )
+            self.assertEqual(out, b"zip-ok-123")
+
+    def test_get_json_over_cap_refuses_during_reading(self):
+        # Valid JSON (~5 KiB) over the 1 KiB test cap but far under any
+        # huge cap: cap=cap -> huge cap would parse and return it.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(
+                tmp,
+                "import sys; sys.stdout.buffer.write(b'{\"data\":\"' "
+                "+ b'A' * 5000 + b'\"}')\n",
+            )
+            with fake_gh_on_path(tmp):
+                start = time.monotonic()
+                with self.assertRaises(PromotionError) as ctx:
+                    run_gh_guarded(
+                        lambda: _SmallCapGitHub().get_json(JSON_RUN_ROUTE)
+                    )
+                elapsed = time.monotonic() - start
+            self.assertIn("output over cap", str(ctx.exception))
+            self.assertNotIn("timed out", str(ctx.exception))
+            self.assertLess(elapsed, 10, "over-cap must fire during reading")
+
+    def test_get_bytes_over_cap_refuses_during_reading(self):
+        # Bounded 8 KiB burst over the 1 KiB test cap, far under a huge cap.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(
+                tmp, "import sys; sys.stdout.buffer.write(b'B' * 8192)\n"
+            )
+            with fake_gh_on_path(tmp):
+                start = time.monotonic()
+                with self.assertRaises(PromotionError) as ctx:
+                    run_gh_guarded(
+                        lambda: _SmallCapGitHub().get_bytes(ZIP_ROUTE)
+                    )
+                elapsed = time.monotonic() - start
+            self.assertIn("output over cap", str(ctx.exception))
+            self.assertNotIn("timed out", str(ctx.exception))
+            self.assertLess(elapsed, 10, "over-cap must fire during reading")
+
+    def test_get_json_timeout_forwards_class_timeout(self):
+        # TIMEOUT_SECONDS=2: omitting timeout forwarding (default 60)
+        # would hang past 10s into the outer watchdog instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(tmp, "import time; time.sleep(30)\n")
+            with fake_gh_on_path(tmp):
+                start = time.monotonic()
+                with self.assertRaises(PromotionError) as ctx:
+                    run_gh_guarded(
+                        lambda: _SmallCapGitHub().get_json(JSON_RUN_ROUTE)
+                    )
+                elapsed = time.monotonic() - start
+            self.assertIn("timed out", str(ctx.exception))
+            self.assertLess(elapsed, 10, "class timeout must be forwarded")
+
+    def test_get_bytes_timeout_forwards_class_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(tmp, "import time; time.sleep(30)\n")
+            with fake_gh_on_path(tmp):
+                start = time.monotonic()
+                with self.assertRaises(PromotionError) as ctx:
+                    run_gh_guarded(
+                        lambda: _SmallCapGitHub().get_bytes(ZIP_ROUTE)
+                    )
+                elapsed = time.monotonic() - start
+            self.assertIn("timed out", str(ctx.exception))
+            self.assertLess(elapsed, 10, "class timeout must be forwarded")
+
+    def test_get_json_nonzero_refuses_fixed_vocabulary_no_leak(self):
+        sentinel = "gh-json-secret-" + "q" * 12
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(
+                tmp,
+                "import sys; "
+                f"sys.stderr.write({sentinel!r}); "
+                "sys.stdout.buffer.write(b'json-body-bytes'); "
+                "sys.exit(3)\n",
+            )
+            with fake_gh_on_path(tmp):
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                    with self.assertRaises(PromotionError) as ctx:
+                        run_gh_guarded(
+                            lambda: _SmallCapGitHub().get_json(JSON_RUN_ROUTE)
+                        )
+            message = str(ctx.exception)
+            self.assertIn("refused", message)
+            self.assertNotIn("json-body-bytes", message)
+            self.assertNotIn(sentinel, message)
+            self.assertNotIn(sentinel, out_buf.getvalue())
+            self.assertNotIn(sentinel, err_buf.getvalue())
+            self.assertNotIn("json-body-bytes", out_buf.getvalue())
+
+    def test_get_bytes_nonzero_refuses_fixed_vocabulary_no_leak(self):
+        sentinel = "gh-bytes-secret-" + "r" * 12
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fake_gh(
+                tmp,
+                "import sys; "
+                f"sys.stderr.write({sentinel!r}); "
+                "sys.stdout.buffer.write(b'bytes-body-bytes'); "
+                "sys.exit(1)\n",
+            )
+            with fake_gh_on_path(tmp):
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                    with self.assertRaises(PromotionError) as ctx:
+                        run_gh_guarded(
+                            lambda: _SmallCapGitHub().get_bytes(ZIP_ROUTE)
+                        )
+            message = str(ctx.exception)
+            self.assertIn("refused", message)
+            self.assertNotIn("bytes-body-bytes", message)
+            self.assertNotIn(sentinel, message)
+            self.assertNotIn(sentinel, out_buf.getvalue())
+            self.assertNotIn(sentinel, err_buf.getvalue())
+            self.assertNotIn("bytes-body-bytes", out_buf.getvalue())
 
 
 if __name__ == "__main__":

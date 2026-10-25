@@ -164,13 +164,31 @@ case "$base" in
       excerpt) echo "excerpt (stub)"; exit 0 ;;
       serving)
         out=""
+        preflight=false
+        runtime_url=""
         prev=""
         for arg in "$@"; do
           if [ "$prev" = "--out" ]; then out="$arg"; fi
+          if [ "$prev" = "--url" ]; then runtime_url="$arg"; fi
+          if [ "$arg" = "--preflight" ]; then preflight=true; fi
           prev="$arg"
         done
+        # Takeover transfers ownership without starting the singleton. Only
+        # /health in the real readiness shell can warm this external double.
+        if [ "${COLD_START_REQUIRED:-0}" = "1" ] && [ "$preflight" != "true" ]; then
+          if [ ! -f "$FAKE_LOG_DIR/container-started" ]; then
+            echo 'cold container: convergence requested before first /health' >&2
+            exit 1
+          fi
+          if [ "$runtime_url" != "$PRODUCTION_URL" ]; then
+            echo 'final serving proof needs the runtime URL' >&2
+            exit 1
+          fi
+        fi
+        phase=convergence
+        if [ "$preflight" = "true" ]; then phase=identity; fi
         mkdir -p "$(dirname "$out")"
-        printf '{"production_image":"%s","worker_version":"%s"}' "$PROD_IMAGE" "$NEW_VERSION" > "$out"
+        printf '{"production_image":"%s","worker_version":"%s","phase":"%s"}' "$PROD_IMAGE" "$NEW_VERSION" "$phase" > "$out"
         exit "${SERVING_EXIT:-0}" ;;
       render)
         out=""
@@ -228,6 +246,8 @@ body="${line#*|}"
 if [ -n "$out" ]; then printf '%s' "$body" > "$out"; fi
 if [ -n "$hdr" ]; then printf 'HTTP/1.1 200 OK\r\nX-Stub: fake\r\n\r\n' > "$hdr"; fi
 printf 'url=%s\n' "$url" >> "$FAKE_LOG_DIR/curl-urls.log"
+"$REAL_PYTHON" -c 'import json,os,sys; open(os.environ["FAKE_LOG_DIR"]+"/calls.jsonl","a").write(json.dumps({"cmd":"curl","url":sys.argv[1]})+"\n")' "$url"
+case "$url" in */health) touch "$FAKE_LOG_DIR/container-started" ;; esac
 printf '%s\n' "$code"
 """
 
@@ -795,6 +815,62 @@ class ImageConvergenceTests(WorkflowFilesTests):
             condition = step.get("if", "")
             self.assertIn("env.MODE == 'deploy'", condition)
             self.assertIn("env.ALLOW_UNSTAGED != 'true'", condition)
+
+    def test_cold_takeover_reaches_health_before_final_convergence(self):
+        # Removing --preflight deadlocks the actual inline shell before its
+        # first /health; omitting --url from the final call loses lag proof.
+        job = self.production["jobs"]["production"]
+        _, identity = find_step_by_name(job, "Verify the promoted production Worker and image")
+        _, gate = find_step_by_name(job, "Gate on stable /health + /readyz gateway-ready")
+        _, final = find_step_by_name(job, "Recheck the promoted image after the stable readiness window")
+        box = Sandbox(self)
+        snapshot = box.runner_temp / "production-rollback-snapshot.json"
+        snapshot.write_text("{}", encoding="utf-8")
+        box.queue_curl([("200", PASS_BODY), ("200", PASS_BODY)] * 19)
+        box.queue_readyz([0] * 19)
+        result = box.run("\n".join(map(run_of, (identity, gate, final))), extra_env={
+            "SHA": SHA, "DEPLOY_ID": DEPLOY_ID, "NEW_VERSION": NEW_VERSION,
+            "MODE": "deploy", "ALLOW_UNSTAGED": "false",
+            "COLD_START_REQUIRED": "1",
+            "PRODUCTION_URL": "https://prod.example.invalid",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(box.curl_urls()), 38)
+        calls = [json.loads(line) for line in
+                 (box.log / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        serving = [(index, call["argv"]) for index, call in enumerate(calls)
+                   if call["cmd"] == "python3" and "serving" in call["argv"]]
+        health = [index for index, call in enumerate(calls)
+                  if call["cmd"] == "curl" and call["url"].endswith("/health")]
+        self.assertEqual(len(serving), 2)
+        self.assertLess(serving[0][0], min(health))
+        self.assertLess(max(health), serving[1][0])
+        self.assertIn("--preflight", serving[0][1])
+        self.assertNotIn("--preflight", serving[1][1])
+        self.assertNotIn("--url", serving[0][1])
+        self.assertEqual(serving[1][1][serving[1][1].index("--url") + 1],
+                         "https://prod.example.invalid")
+        for _, argv in serving:
+            self.assertIn("--snapshot", argv)
+            self.assertEqual(argv[argv.index("--snapshot") + 1], str(snapshot))
+        proof = json.loads((box.runner_temp / "production-promotion-evidence.json").read_text())
+        self.assertEqual(proof["phase"], "convergence")
+
+    def test_initial_serving_handoff_is_identity_not_convergence(self):
+        _, identity = find_step_by_name(
+            self.production["jobs"]["production"], "Verify the promoted production Worker and image")
+        box = Sandbox(self)
+        result = box.run(run_of(identity), extra_env={
+            "SHA": SHA, "DEPLOY_ID": DEPLOY_ID, "NEW_VERSION": NEW_VERSION,
+            "PRODUCTION_URL": "https://prod.example.invalid",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        proof = json.loads((box.runner_temp / "production-promotion-evidence.json").read_text())
+        self.assertEqual(proof["phase"], "identity",
+                         "the first call may verify identity, not claim a cold instance is ready")
+        self.assertEqual(proof["worker_version"], NEW_VERSION)
+        self.assertEqual(proof["production_image"], PROD_IMAGE)
+        self.assertEqual(box.curl_urls(), [])
 
     def test_serving_failure_fails_closed(self):
         _, serving = find_step_by_name(
