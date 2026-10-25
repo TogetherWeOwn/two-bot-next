@@ -1,0 +1,39 @@
+{
+  "schema": "protected-acceptance/v1",
+  "repository": "TogetherWeOwn/two-bot-next",
+  "baseline_sha": "0b8f8c6427859a606c4be710224dc68649fabe00",
+  "branch": "test/giveaway-inspect-acceptance",
+  "protected_paths": [
+    {
+      "path": "crates/discord/tests/giveaway_inspect_acceptance.rs",
+      "sha256": "f79a35cbf67a5f35e71404b7106c2100a738e2ac5b9b30af55739a6f9e869b38",
+      "test_count": 18
+    }
+  ],
+  "contract": {
+    "entrypoint": "/giveaway inspect id:<saved-id>",
+    "scope": "Private staff saved-state inspection in the invoking channel; static entry requirements, not per-member eligibility.",
+    "guards": ["existing configured guild", "existing automations feature", "Manage Guild", "saved guild and invoking channel before supplemental reads"],
+    "detail": ["stable ID", "bounded prize", "authorized saved channel/message reference", "saved lifecycle", "localized deadline", "entry and configured winner counts", "static requirements", "drawn is not announcement-confirmed"],
+    "entry_requirements": "One compact Requirements: line, consistent across public entry creation and private detail. Everyone when unrestricted; otherwise inert role IDs and minimum account/server ages.",
+    "no_effects": ["entry admission or budgets", "draw/reroll", "claim/refresh", "applied audit", "public send/edit", "member/channel/profile reads", "scheduled work"],
+    "privacy": ["indistinguishable unknown/foreign/other-channel miss", "no pre-draw nonce or claim capability", "no entry roster or member timestamps", "no raw provider/SQL errors", "mentions suppressed", "at most 2000 UTF-16 units"]
+  },
+  "commands": {
+    "focused_controller": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_inspect_acceptance -- --test-threads=1 --nocapture",
+    "focused_hosted_ci": "cargo test -p two-bot-discord --features db --locked --test giveaway_inspect_acceptance -- --test-threads=1 --nocapture",
+    "offline_new_behavior": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_inspect_acceptance registry_offers_explicit_inspect_without_losing_existing_verbs -- --exact --nocapture",
+    "baseline_controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_inspect_acceptance unchanged_ -- --test-threads=1 --nocapture",
+    "retained_timed_draw_controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_timed_draw_acceptance -- --test-threads=1 --nocapture"
+  },
+  "verification_at_publication": {
+    "valid_behavior_red": null,
+    "reason": "Pending executable evidence. Controller compilation was refused with exit 75: no idle, below-budget slot; no fallback was used. Refusal is not RED.",
+    "passed": ["cargo fmt", "secret-debug guard and 23 self-tests", "Docker dependency shape", "80 cache fixture tests", "soak checklist and 49 self-tests", "voice corpus and 22 validator tests", "docs index", "floor guard", "test inventory"],
+    "not_executed": ["focused Rust acceptance target", "retained Rust runtime controls", "workspace Rust tests", "workspace clippy"]
+  },
+  "expected_baseline_red": ["inspect mode absent from published command", "valid inspect returns invalid options instead of saved detail or unavailable", "entry posts omit static requirements"],
+  "controls": ["configured-guild refusal versus foreign-guild silence", "strict malformed-option rejection", "guild-scoped saved get/count", "existing create/entry/list/end/reroll behavior", "existing command verbs and Manage Guild default permission"],
+  "handoff": "Builder incorporates the immutable published commit and manifest-listed file byte-for-byte. Only the Test Author corrects defective oracles. Do not merge a deliberately red tests-only PR. The combined implementation PR must pass all tests and exact-head independent review.",
+  "limits": ["Shared InteractionRuntime and GiveawayRuntime path, not binary-private gateway execution proof", "DB cases require the guarded disposable bootstrap and fail if absent", "No production/staging reads or activation", "No new migration, grants, host scripts, hooks or timers", "Formatter consistency is observed at response boundaries, not enforced by source-text matching"]
+}
