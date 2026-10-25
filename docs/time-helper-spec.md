@@ -207,6 +207,7 @@ A future build must turn the matrix below into adapter/converter tests, and
 register any new test target in existing CI. No live messages or DB needed.
 
 ```sh
+set -e
 python3 - <<'PY'
 from datetime import datetime, timezone
 from pathlib import Path
@@ -256,13 +257,23 @@ Visual localized rendering remains unverified until approved staging acceptance.
 
 ## 7. Exact-spec intent gate; no automatic build
 
-Before any build card: record the exact accepted file commit and SHA-256, review
-revision, and an explicit choice **no-build**, **help-only**, or **helper** from
-the CEO's intent review with the community host. An author cannot self-approve.
-Default if unresolved at the 2026-10-31 review: retain no-build, no activation;
-expiry is not consent to a build. Help-only and helper need separate bounded
-scope acceptance. The review record must capture actual host intent, not
-mistake roadmap priority, code review or a merged design for demand/alignment.
+Keep two independent records:
+
+1. **Design/no-build acceptance:** bind the exact file commit, SHA-256 and review
+   revision. Acceptance may retain manual HammerTime/no-build without attesting
+   that a community host was consulted. It authorizes no implementation.
+2. **Factual host alignment:** actual community-host intent is **not recorded**
+   in this proposal. Record an authorized host's intent source, date and chosen
+   alternative separately; a design acceptance cannot manufacture that evidence.
+
+Before any build card, require both exact-spec scope acceptance and the CEO's
+intent review with the community host, selecting **help-only** or **helper**.
+An author cannot self-approve. Those alternatives need separate bounded scope
+acceptance; retaining **no-build** does not satisfy either build prerequisite.
+Default if unresolved at the 2026-10-31 review: retain manual HammerTime/no-build,
+no activation; expiry is not consent. Roadmap priority, code review and a merged
+design are not demand/alignment. No help/helper implementation, build card,
+spend or publication is authorized by design/no-build acceptance alone.
 
 This proposal changes no security boundary; **no CISO approval is claimed or
 required for the docs-only change**. If the chosen design later introduces a
