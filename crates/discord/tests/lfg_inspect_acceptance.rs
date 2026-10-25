@@ -120,10 +120,10 @@ fn member(role: usize, ordinal: usize) -> String {
 
 async fn seed_roster(pool: &sqlx::PgPool) {
     seed_post(pool, POST, GUILD, CHANNEL).await;
-    // Reverse insertion and tied positions expose the key tie-break; no creation quota is exercised.
+    // Reverse insertion exposes ordering; saved positions are unique by schema.
     sqlx::query(
         "INSERT INTO lfg_roles (lfg_id,role_key,label,slots,position)
-        SELECT $1,'r'||lpad(n::text,2,'0'),'RosterRole'||lpad(n::text,2,'0'),99,n/2
+        SELECT $1,'r'||lpad(n::text,2,'0'),'RosterRole'||lpad(n::text,2,'0'),99,n
         FROM generate_series(0,19) AS n ORDER BY n DESC",
     )
     .bind(POST)
@@ -329,7 +329,8 @@ async fn summaries_reach_every_role_with_truthful_counts_without_public_truncati
                 !public.contains("RosterRole19"),
                 "fixture must demonstrate public-post truncation"
             );
-            let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+            let mock =
+                MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
             let rt = runtime(pool.clone(), &mock, gates());
             let mut seen = Vec::new();
             let mut ended = false;
@@ -409,7 +410,8 @@ async fn every_selected_role_roster_is_reachable_once_in_join_time_and_id_order(
     with_database(|pool| {
         Box::pin(async move {
             seed_roster(pool).await;
-            let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+            let mock =
+                MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
             let rt = runtime(pool.clone(), &mock, gates());
             for role in 0..20 {
                 let mut seen = Vec::new();
@@ -480,7 +482,7 @@ async fn closed_empty_and_never_confirmed_posts_remain_honest_saved_inspections(
             .bind(POST).execute(pool).await.expect("empty role fixture");
         sqlx::query("UPDATE lfg_posts SET status='closed',closed_at=now(),message_id=NULL WHERE id=$1")
             .bind(POST).execute(pool).await.expect("closed unconfirmed fixture");
-        let mock = MockRest::start(vec![],ScriptedResponse::status(204)).await;
+        let mock = MockRest::start(vec![],ScriptedResponse::json(200,json!({"id":"8000"}))).await;
         let rt = runtime(pool.clone(),&mock,gates());
         let summary = read(&rt,&mock,pool,inspect(40_001,POST,None,None)).await;
         for part in [POST,"Saved raid title","Empty role","0/3","3 remaining","closed"] { assert!(summary.content.contains(part),"missing {part}: {}",summary.content); }
@@ -527,7 +529,8 @@ async fn hostile_labels_and_maximum_unicode_rows_are_inert_and_not_cut_in_half()
             .execute(pool)
             .await
             .expect("hostile saved title and message");
-            let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+            let mock =
+                MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
             let rt = runtime(pool.clone(), &mock, gates());
             let mut seen = Vec::new();
             for page in 1..=21 {
@@ -580,7 +583,7 @@ async fn hostile_labels_and_maximum_unicode_rows_are_inert_and_not_cut_in_half()
 #[tokio::test]
 async fn exact_utf16_id_boundaries_and_default_page_are_accepted_without_shortening_ids() {
     with_database(|pool| Box::pin(async move {
-        let mock = MockRest::start(vec![],ScriptedResponse::status(204)).await;
+        let mock = MockRest::start(vec![],ScriptedResponse::json(200,json!({"id":"8000"}))).await;
         let rt = runtime(pool.clone(),&mock,gates());
         for (n,id) in ["a".repeat(128),"🦀".repeat(64)].iter().enumerate() {
             seed_post(pool,id,GUILD,CHANNEL).await;
@@ -599,7 +602,7 @@ async fn exact_utf16_id_boundaries_and_default_page_are_accepted_without_shorten
 #[tokio::test]
 async fn malformed_duplicate_and_unbounded_options_refuse_before_storage() {
     let pool = closed_pool().await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
     let rt = runtime(pool, &mock, gates());
     let valid_id = json!({"type":3,"name":"id","value":POST});
     let mut invalid = vec![
@@ -667,7 +670,7 @@ async fn malformed_duplicate_and_unbounded_options_refuse_before_storage() {
 #[tokio::test]
 async fn authority_feature_and_guild_fences_precede_a_failed_store() {
     let pool = closed_pool().await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
     let rt = runtime(pool.clone(), &mock, gates());
     for id in [43_001, 43_002] {
         let reply = handle(
@@ -716,7 +719,7 @@ async fn authority_feature_and_guild_fences_precede_a_failed_store() {
 
 #[tokio::test]
 async fn store_outage_is_not_empty_missing_or_a_discord_history_fallback() {
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
     let rt = runtime(closed_pool().await, &mock, gates());
     let reply = handle(&rt, &mock, &inspect(44_001, POST, None, None)).await;
     assert_private(&reply);
@@ -783,7 +786,8 @@ async fn unknown_foreign_and_other_channel_ids_share_one_private_miss_before_ros
                 .expect("empty read still observed");
             assert!(read_spy_called(pool).await);
             reset_read_spy(pool).await;
-            let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+            let mock =
+                MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
             let rt = runtime(pool.clone(), &mock, gates());
             let mut misses = Vec::new();
             for (n, id) in ["unknown", "other-guild", "other-channel"]
@@ -857,7 +861,8 @@ async fn permissions_are_rechecked_after_a_successful_page_and_failed_ack_reads_
         Box::pin(async move {
             seed_roster(pool).await;
             install_read_spy(pool).await;
-            let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+            let mock =
+                MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
             let rt = runtime(pool.clone(), &mock, gates());
             let allowed = handle(&rt, &mock, &inspect(46_001, POST, Some(1), Some(1))).await;
             assert_private(&allowed);
@@ -947,11 +952,71 @@ async fn published_inspection_is_bounded_staff_only_and_discoverable_in_compiled
 }
 
 #[tokio::test]
+async fn control_roster_fixture_is_complete_and_observes_real_reads() {
+    with_database(|pool| {
+        Box::pin(async move {
+            seed_roster(pool).await;
+            let post = lfg_store::get_lfg(pool, GUILD, POST)
+                .await
+                .expect("saved post")
+                .expect("post exists");
+            let roles = lfg_store::list_lfg_roles(pool, POST).await.expect("roles");
+            let signups = lfg_store::list_lfg_signups(pool, POST)
+                .await
+                .expect("signups");
+            assert_eq!(roles.len(), 20);
+            assert_eq!(signups.len(), 369);
+            for (n, role) in roles.iter().enumerate() {
+                assert_eq!(role.role_key, format!("r{n:02}"));
+                assert_eq!(role.position, n);
+                assert_eq!(
+                    signups
+                        .iter()
+                        .filter(|signup| signup.role_key == role.role_key)
+                        .count(),
+                    filled(n)
+                );
+            }
+            let public = lfg::lfg_content(&post, &roles, &signups);
+            assert!(public.encode_utf16().count() <= 2000);
+            assert!(!public.contains("RosterRole19"));
+            let before = snapshot(pool).await;
+            install_read_spy(pool).await;
+            assert!(!read_spy_called(pool).await);
+            lfg_store::list_lfg_roles(pool, POST)
+                .await
+                .expect("populated role read");
+            assert!(read_spy_called(pool).await);
+            reset_read_spy(pool).await;
+            assert!(lfg_store::list_lfg_signups(pool, "unknown")
+                .await
+                .expect("empty signup read")
+                .is_empty());
+            assert!(read_spy_called(pool).await);
+            for statement in [
+                "DROP VIEW lfg_roles",
+                "DROP VIEW lfg_signups",
+                "ALTER TABLE inspection_roles_fixture RENAME TO lfg_roles",
+                "ALTER TABLE inspection_signups_fixture RENAME TO lfg_signups",
+            ] {
+                sqlx::query(statement)
+                    .execute(pool)
+                    .await
+                    .expect("restore fixture names");
+            }
+            assert_eq!(before, snapshot(pool).await);
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn control_existing_preview_remains_pure_and_existing_list_still_works() {
     with_database(|pool| {
         Box::pin(async move {
             seed_post(pool, POST, GUILD, CHANNEL).await;
-            let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+            let mock =
+                MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"8000"}))).await;
             let rt = runtime(pool.clone(), &mock, gates());
             let list = read(&rt, &mock, pool, invocation(47_001, "lfg-list", vec![])).await;
             assert!(list.content.contains(POST) && list.content.contains("Saved raid title"));

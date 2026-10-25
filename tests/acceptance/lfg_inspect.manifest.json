@@ -6,7 +6,7 @@
   "protected": [
     {
       "path": "crates/discord/tests/lfg_inspect_acceptance.rs",
-      "sha256": "9b68ecbe280f81566326181b10d3af54f01fec501cc3f2b728aa23b08e217696"
+      "sha256": "fd9e1a56bf3aa97f242234b1533b27b20d39a1fce2fd318443529e2732efbb46"
     }
   ],
   "interface": {
@@ -20,25 +20,27 @@
   },
   "commands": {
     "focused": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_inspect_acceptance -- --test-threads=1",
-    "green_control": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_inspect_acceptance control_existing_preview_remains_pure_and_existing_list_still_works -- --exact --test-threads=1",
+    "green_control": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_inspect_acceptance control_ -- --test-threads=1",
     "unchanged_controls": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_list_acceptance --test lfg_edit_acceptance -- --test-threads=1",
     "format": "cargo fmt --all -- --check",
     "inventory": "python3 scripts/ci/check-test-inventory.py"
   },
   "database": "TWO_TEST_DATABASE_URL is mandatory and must pass TestDatabase disposable-service guard; missing configuration fails, never silently skips",
   "oracle_controls": [
-    "reverse insertion and tied positions/join times expose deterministic tie-breaks",
+    "reverse insertion with schema-valid unique positions exposes stable role order; tied join times expose member ID ordering",
     "369 saved signups make the public post omit later roles",
     "MVCC snapshots include posts, roles, signups and announcement audit rows",
-    "disposable sequence spy observes both populated and empty real roster queries before checking hidden-ID refusals",
+    "independent fixture control verifies 20 roles, 369 signups and real populated/empty roster read probes before any missing-feature assertion",
     "real REST transcript permits only the private acknowledgement and original-reply edit",
     "existing preview/list positive control; ordinary signup/edit/close controls remain live after inspection is implemented"
   ],
   "verification": {
-    "state": "pending-hosted-execution",
-    "local_focused": "two admission refusals, exit 75; not behavioral RED and not a compiler result",
-    "required_evidence": "target compiles; only missing-inspection behavior tests fail; positive and unchanged controls pass",
-    "test_count": 13
+    "state": "pending-corrected-execution",
+    "previous_candidate": "a33cbdb159e601530c5217d52ddfb8ffe5cccc18",
+    "previous_ci": "40217044504: compile succeeded; five invalid tied-position seeds and one HTTP 204 preview control failed; not valid RED. Unchanged edit 33/33 and list 20/20 passed in coverage job 121240383648.",
+    "local_focused": "two further admission refusals, exit 75; not behavioral RED and not a compiler result",
+    "required_evidence": "target compiles; twelve missing-inspection behavior tests fail; both control_ tests and unchanged controls pass",
+    "test_count": 14
   },
-  "next_action": "Confirm behavioral RED before releasing the builder. Incorporate this exact acceptance commit without editing protected files; ship one combined GREEN implementation PR. Return defective oracles for a bounded Test Author correction."
+  "next_action": "Verify this corrected branch before releasing the builder. Incorporate the verified exact acceptance commit without editing protected files; ship one combined GREEN implementation PR. Return defective oracles for a bounded Test Author correction."
 }
