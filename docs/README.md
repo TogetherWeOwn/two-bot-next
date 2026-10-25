@@ -1,10 +1,10 @@
 # Documentation map
 
-Sole Markdown-doc manifest (nested/index too): `- [Purpose](relative.md)` by area.
+Sole manifest: `- [Purpose](relative.md)` by area.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
 Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
-Otherwise exit 1: repair missing/stale rows or split oversized docs.
+Else exit 1: fix rows or split oversized docs.
 Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
 Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
 and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
@@ -138,6 +138,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Event role (design only)](event-role-spec.md)
 - [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
