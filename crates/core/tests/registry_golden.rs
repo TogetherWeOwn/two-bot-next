@@ -217,6 +217,90 @@ fn schedule_here_exception_rejects_filter_drift_without_loosening_page_or_policy
 }
 
 #[test]
+fn lfg_preview_option_drift_is_detected() {
+    let lfg = || {
+        expected_registry()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "lfg")
+            .expect("lfg is published")
+            .clone()
+    };
+    let base = lfg();
+    let options = base["options"].as_array().expect("lfg options");
+    assert_eq!(options.len(), 4, "title, starts-at, roles, then preview");
+    assert_eq!(options[3]["name"], json!("preview"));
+    assert_eq!(
+        options[3]["description"],
+        json!("Privately preview without posting")
+    );
+    assert_eq!(options[3]["type"], json!(5));
+    assert!(
+        options[3].get("required").is_none_or(Value::is_null)
+            || options[3]["required"] == json!(false),
+        "preview stays optional"
+    );
+
+    // Deleting preview drops the private-preview surface.
+    let mut deleted = expected_registry();
+    let command = deleted
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|command| command["name"] == "lfg")
+        .unwrap();
+    command
+        .as_object_mut()
+        .unwrap()
+        .get_mut("options")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .retain(|option| option["name"] != "preview");
+    let differences = registry_diff(deleted);
+    assert!(!differences.is_empty(), "missed lfg preview deletion");
+    assert!(
+        differences.join("\n").contains("preview"),
+        "diff must name the deleted option: {differences:?}"
+    );
+
+    // Retyping preview stops Discord from rendering the toggle.
+    let mut retyped = expected_registry();
+    let command = retyped
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|command| command["name"] == "lfg")
+        .unwrap();
+    *command
+        .pointer_mut("/options/3/type")
+        .expect("preview type exists") = json!(3);
+    let differences = registry_diff(retyped);
+    assert!(!differences.is_empty(), "missed lfg preview retype");
+    assert!(
+        differences.join("\n").contains("type"),
+        "diff must identify the changed field: {differences:?}"
+    );
+
+    // Making preview required breaks existing saved invocations.
+    let mut required = expected_registry();
+    let command = required
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|command| command["name"] == "lfg")
+        .unwrap();
+    command["options"][3]["required"] = json!(true);
+    let differences = registry_diff(required);
+    assert!(!differences.is_empty(), "missed lfg preview required flip");
+    assert!(
+        differences.join("\n").contains("required"),
+        "diff must identify the changed field: {differences:?}"
+    );
+}
+
+#[test]
 fn api_defaults_are_equivalent_but_non_default_values_are_not_discarded() {
     let mut actual = expected_registry();
     for command in actual.as_array_mut().unwrap() {

@@ -10,6 +10,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::hotpath_settings_test_support::queries::{assert_fetch_bound, Queries, Query};
 use two_bot_testsupport::TestDatabase;
 
 const OTHER_CHANNEL: &str = "4444";
@@ -152,38 +153,38 @@ fn scoped(text: &str) {
     );
 }
 
-// A projection observer, not an in-memory store double. The real SQL must
-// exclude other guild/channel rows BEFORE decoding them. Each list statement
-// may materialize at most 25 bodies. COUNT does not evaluate a body projection.
-// This detects unbounded fetch-then-filter implementations as well as capped
-// guild reads. It does not constrain the planner's physical index/scan choice.
-async fn observe_store(pool: &PgPool) {
-    for ddl in [
-        "CREATE TABLE here_reads (tx bigint PRIMARY KEY, bodies integer NOT NULL)",
-        "CREATE FUNCTION here_body(g text, c text, b text) RETURNS text AS $$
-         DECLARE seen integer;
-         BEGIN
-           IF g <> '2222' OR c <> '3333' THEN
-             RAISE EXCEPTION 'unscoped schedule row materialized';
-           END IF;
-           INSERT INTO here_reads VALUES (txid_current(), 1)
-             ON CONFLICT (tx) DO UPDATE SET bodies = here_reads.bodies + 1
-             RETURNING bodies INTO seen;
-           IF seen > 25 THEN RAISE EXCEPTION 'unbounded schedule window'; END IF;
-           RETURN b;
-         END; $$ LANGUAGE plpgsql VOLATILE",
-        "ALTER TABLE scheduled_messages RENAME TO here_schedule_base",
-        "CREATE VIEW scheduled_messages AS
-         SELECT id, guild_id, channel_id, here_body(guild_id, channel_id, body) AS body,
-          next_run_at, interval_seconds, enabled, last_run_at, last_message_id,
-          created_by, created_at, updated_by, updated_at, claim_token, claimed_at,
-          occurrence_nonce, delivery_uncertain FROM here_schedule_base",
-    ] {
-        sqlx::query(ddl)
-            .execute(pool)
-            .await
-            .expect("install real-store projection observer");
+// Observe executed SQLx receipts rather than a side-effecting view expression:
+// PostgreSQL may evaluate a VOLATILE view column before the caller's outer
+// ORDER BY/LIMIT. These receipts report the actual statement and rows returned
+// to the store, so they can prove both scope and the materialized-row cap.
+fn assert_scoped_schedule_reads(receipts: &[Query]) {
+    let reads: Vec<_> = receipts
+        .iter()
+        .filter(|query| query.normalized().contains("from scheduled_messages"))
+        .collect();
+    assert!(
+        !reads.is_empty(),
+        "no executed-query receipt for the schedule read"
+    );
+    for query in reads {
+        let sql = query.normalized();
+        let predicate = sql
+            .split_once(" where ")
+            .expect("guild-scoped SQL WHERE")
+            .1
+            .split(" order by ")
+            .next()
+            .expect("predicate");
+        assert!(
+            predicate.contains("guild_id") && predicate.contains("channel_id"),
+            "both filters belong in executed SQL: {sql}"
+        );
     }
+    assert_fetch_bound(
+        receipts,
+        |query| query.contains("from scheduled_messages"),
+        25,
+    );
 }
 
 #[tokio::test]
@@ -467,7 +468,6 @@ async fn schedule_here_filters_sql_before_cap_offset_count_and_packing() {
     expected.reverse();
     seed(db.pool(), "9999", CHANNEL_S, 150, false).await;
     let before = state(db.pool(), false).await;
-    observe_store(db.pool()).await;
     let mut replies = Vec::new();
     for page in [1, 2, 3, i64::MAX] {
         replies.push(
@@ -479,7 +479,7 @@ async fn schedule_here_filters_sql_before_cap_offset_count_and_packing() {
             .await,
         );
     }
-    let after = state(db.pool(), true).await;
+    let after = state(db.pool(), false).await;
     db.close().await.expect("drop interleaved SQL fixture");
     assert_eq!(
         before, after,
@@ -520,8 +520,6 @@ async fn schedule_here_filters_sql_before_cap_offset_count_and_packing() {
 
 #[tokio::test]
 async fn schedule_here_executed_store_reads_share_sql_scope_and_bounds() {
-    use crate::hotpath_settings_test_support::queries::Queries;
-
     let db = database().await;
     for n in 0..52 {
         seed(db.pool(), GUILD_S, CHANNEL_S, n, false).await;
@@ -798,20 +796,60 @@ async fn schedule_here_store_observer_rejects_unscoped_and_unbounded_controls() 
         seed(db.pool(), GUILD_S, CHANNEL_S, n, false).await;
     }
     seed(db.pool(), GUILD_S, OTHER_CHANNEL, 30, false).await;
-    observe_store(db.pool()).await;
-    let scoped: Vec<(String,)> = sqlx::query_as("SELECT body FROM scheduled_messages WHERE guild_id = '2222' AND channel_id = '3333' ORDER BY next_run_at, id LIMIT 25")
-        .fetch_all(db.pool()).await.expect("bounded matching projection control");
-    let unbounded = sqlx::query(
-        "SELECT body FROM scheduled_messages WHERE guild_id = '2222' AND channel_id = '3333'",
+
+    let (scoped, scoped_receipts) = Queries::capture(
+        sqlx::query(
+            "SELECT id, body FROM scheduled_messages \
+             WHERE guild_id = '2222' AND channel_id = '3333' \
+             ORDER BY next_run_at, id LIMIT 25",
+        )
+        .fetch_all(db.pool()),
     )
-    .fetch_all(db.pool())
     .await;
-    let wrong_channel = sqlx::query("SELECT body FROM scheduled_messages WHERE guild_id = '2222' AND channel_id = '4444' LIMIT 1").fetch_all(db.pool()).await;
+    assert_eq!(
+        scoped.expect("bounded matching projection control").len(),
+        25
+    );
+    assert_scoped_schedule_reads(&scoped_receipts);
+
+    let (unbounded, unbounded_receipts) = Queries::capture(
+        sqlx::query(
+            "SELECT id, body FROM scheduled_messages \
+             WHERE guild_id = '2222' AND channel_id = '3333' \
+             ORDER BY next_run_at, id",
+        )
+        .fetch_all(db.pool()),
+    )
+    .await;
+    assert_eq!(
+        unbounded
+            .expect("unbounded projection control executes")
+            .len(),
+        26
+    );
+
+    let (guild_only, guild_only_receipts) = Queries::capture(
+        sqlx::query(
+            "SELECT id, body FROM scheduled_messages \
+             WHERE guild_id = '2222' ORDER BY next_run_at, id LIMIT 25",
+        )
+        .fetch_all(db.pool()),
+    )
+    .await;
+    assert_eq!(
+        guild_only
+            .expect("guild-only projection control executes")
+            .len(),
+        25
+    );
     db.close().await.expect("drop observer controls");
-    assert_eq!(scoped.len(), 25);
-    assert!(unbounded.is_err(), "observer must catch all-row fetches");
+
     assert!(
-        wrong_channel.is_err(),
+        std::panic::catch_unwind(|| assert_scoped_schedule_reads(&unbounded_receipts)).is_err(),
+        "observer must catch all-row fetches"
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_scoped_schedule_reads(&guild_only_receipts)).is_err(),
         "observer must catch in-memory channel filtering"
     );
 }

@@ -98,6 +98,7 @@ pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
 pub mod lfg;
+pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
@@ -407,13 +408,13 @@ pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
     checkin_idempotency_key, checkin_metadata_json, checkin_occurrence_full_text,
     checkin_recorded_text, checkin_source, checkin_source_event_id, is_snowflake,
-    parse_attendance_occurrence, partition_rsvps, require_manage_events, rsvp_event_full_text,
-    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
-    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
-    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
-    AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION, CHECKIN_AUDIT_OUTCOME_RECORDED,
-    MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT, MAX_RSVP_WRITES_PER_USER_PER_MINUTE,
-    RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+    normalize_event_link, parse_attendance_occurrence, partition_rsvps, require_manage_events,
+    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text, rsvp_saved_text_with_event,
+    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceOccurrence,
+    AttendanceProof, CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals,
+    RsvpTransition, ATTENDANCE_EVENT_TYPE, AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION,
+    CHECKIN_AUDIT_OUTCOME_RECORDED, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
 };
 pub use rsvp_conversion::{
     assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
