@@ -14,7 +14,7 @@ pub(super) async fn state(pool: &PgPool) -> Value {
         "SELECT jsonb_build_object(
           'schedules', (SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY id), '[]'::jsonb) FROM scheduled_messages s),
           'audits', (SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY id), '[]'::jsonb) FROM automation_audit_log a),
-          'commands', (SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY id), '[]'::jsonb) FROM automation_commands c))",
+          'commands', (SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY c.guild_id, c.name), '[]'::jsonb) FROM automation_commands c))",
     )
     .fetch_one(pool)
     .await
