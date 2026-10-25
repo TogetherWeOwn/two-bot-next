@@ -2,10 +2,10 @@
 
 Sole manifest: `- [Purpose](relative.md)` by area.
 
-Check: `python3 scripts/check_docs_index.py --json` from the repo root.
-Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
-Else exit 1: fix rows or split oversized docs.
-Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
+Repo root: `python3 scripts/check_docs_index.py --json`.
+Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
+else exit 1, repair rows/split docs. Bad/duplicate rows use
+`docs/README.md:<line>` in `stale`.
 Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
 and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
 
@@ -124,6 +124,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
+- [Relay move (design only)](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Staff game mix report](game-activity-report.md)
