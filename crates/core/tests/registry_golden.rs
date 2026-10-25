@@ -118,6 +118,13 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("leaderboard", "/description", json!("Changed copy")),
         ("leaderboard", "/dm_permission", json!(true)),
         ("leaderboard", "/type", json!(2)),
+        ("game-mix", "/default_member_permissions", json!("8")),
+        ("game-mix", "/dm_permission", json!(true)),
+        (
+            "game-mix",
+            "/options",
+            json!([{"name": "guild", "type": 3}]),
+        ),
         ("giveaway", "/default_member_permissions", json!("0")),
         ("giveaway", "/dm_permission", json!(true)),
         ("giveaway", "/description", json!("Changed copy")),

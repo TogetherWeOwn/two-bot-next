@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 63.
+Built-in commands: 64.
 
 ## `/access`
 
@@ -273,6 +273,15 @@ Resume a paused feed relay
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | Feed id |
+
+## `/game-mix`
+
+Show this server's aggregate game activity.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.
 
 ## `/giveaway`
 

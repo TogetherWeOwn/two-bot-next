@@ -1,5 +1,5 @@
 {
-  "comment": "Role x route x expected-outcome table for the slash-command authorization boundary (InteractionRouter::route_slash with every feature gate on) plus the member-moderation policy table (assert_moderation_allowed). Permission bits are literal Discord values on purpose: they must not be derived from the production constants they check. Administrator (8) has no exception, matching the legacy resolved-bit check in docs/parity.md section 1.",
+  "comment": "Role x route x expected-outcome table for the slash-command authorization boundary (InteractionRouter::route_slash with every feature gate on) plus the member-moderation policy table (assert_moderation_allowed). Permission bits are literal Discord values on purpose: they must not be derived from the production constants they check. Administrator (8) is accepted for game-mix only; legacy commands retain their resolved-bit checks in docs/parity.md section 1.",
   "guild_id": 2222,
   "roles": {
     "everyone": 0,
@@ -20,6 +20,7 @@
     {"name": "privacy", "allow": "*"},
     {"name": "reopen", "allow": "*"},
     {"name": "welcome-preview", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "game-mix", "allow": ["manage_guild", "administrator_only", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "rsvp", "allow": "*"},
     {"name": "rsvp-attendance", "allow": "*"},
     {"name": "ban", "allow": ["ban_members", "all_bits"], "deny": "ModerationPermission(Ban)"},

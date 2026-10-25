@@ -1513,6 +1513,7 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
+            "game-mix" => Some(HandlerId::GameMix),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1549,6 +1550,43 @@ impl CommandRuntime {
             "privacy" => {
                 crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
                     .await;
+            }
+            "game-mix" => {
+                let guild_id = self.guild_id.to_string();
+                // The CLI requires an explicit live-guild opt-in. This
+                // optionless Discord read has no rollout approval mechanism.
+                if guild_id == two_bot_core::backup::guild_config::LIVE_GUILD_ID {
+                    self.finish(interaction, "Game activity reports are not enabled for the live guild. This command does not authorize production reporting.").await;
+                    return;
+                }
+                match two_bot_core::game_activity_store::read_guild_aggregates(
+                    &self.pool, &guild_id,
+                )
+                .await
+                {
+                    Ok(rows) => {
+                        self.finish(
+                            interaction,
+                            two_bot_core::game_activity::render_game_activity_discord_report(
+                                self.guild_id,
+                                &rows,
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(two_bot_core::game_activity_store::GameActivityStoreError::Db(err)) => {
+                        warn!(
+                            msg = "game_mix_aggregate_read_failed",
+                            reason = db_class(&err),
+                            "game-mix aggregate read failed",
+                        );
+                        self.finish(
+                            interaction,
+                            "Game activity is unavailable right now. Please try again shortly.",
+                        )
+                        .await;
+                    }
+                }
             }
             "giveaway" => self.giveaways.command(interaction).await,
             "sticky" => self.sticky_set(interaction).await,
@@ -2891,6 +2929,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     router.register(Box::new(SliceHandler(HandlerId::Reopen)));
     // Onboarding ingress owns the preview, including its private refusal.
     router.register(Box::new(SliceHandler(HandlerId::WelcomePreview)));
+    router.register(Box::new(SliceHandler(HandlerId::GameMix)));
     router
 }
 

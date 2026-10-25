@@ -192,6 +192,18 @@ ceiling moves to 18 MiB, leaving about 1 MiB of headroom above the measured
 head; revisit if the binary approaches it. The 112 MiB image ceiling is
 unchanged (43.43 MiB measured on the same build).
 
+On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
+`cc07f31436` measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over the
+ceiling, in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
+The staff game-mix slice head (`6a412c6a86`) measured 17,862,000 bytes
+(17.03 MiB), 36,208 over, in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40040240318/job/120711266282),
+with no new dependencies and the same minimal release profile (opt-level=z,
+lto, strip). The budget is therefore rebumped to 18 MiB, leaving about 1 MiB
+of headroom above the measured heads; revisit if the binary approaches it.
+The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
+
 This branch's automation-only head separately measured 15,769,872 bytes
 (15.04 MiB) before the event-executor merge. The current binary ceiling is
 18 MiB following the 2026-10-24 calibration above; each combined exact-head

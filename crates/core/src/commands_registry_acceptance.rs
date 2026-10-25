@@ -4,17 +4,18 @@
 #[test]
 fn core_commands_match_legacy_names() {
     let core = core_commands();
-    assert_eq!(core.len(), 6);
+    assert_eq!(core.len(), 7);
     assert_eq!(core[0].name, "rank");
     assert_eq!(core[1].name, "leaderboard");
     assert_eq!(core[2].name, "help");
     assert_eq!(core[3].name, "privacy");
     assert_eq!(core[4].name, "reopen");
     assert_eq!(core[5].name, "welcome-preview");
+    assert_eq!(core[6].name, "game-mix");
     // Guild-only, DM off (legacy `setDMPermission(false)`).
     assert!(core.iter().all(|c| !c.dm_permission));
     // `rank` and `help` have optional selectors, `reopen` a required one;
-    // `leaderboard` and the Next-only `welcome-preview` take none.
+    // `leaderboard` and the Next-only `welcome-preview` and `game-mix` take none.
     // Help stays open to everyone and names are not frozen to builtin choices.
     assert_eq!(core[0].options.len(), 1);
     assert_eq!(core[0].options[0].kind, 6);
@@ -70,6 +71,13 @@ fn core_commands_match_legacy_names() {
     assert!(core[5].options.is_empty());
     assert_eq!(
         core[5].default_member_permissions,
+        Some(PERM_MANAGE_GUILD.to_string())
+    );
+    // The Next-only `game-mix` staff report takes no options and is gated
+    // on Manage Server.
+    assert!(core[6].options.is_empty());
+    assert_eq!(
+        core[6].default_member_permissions,
         Some(PERM_MANAGE_GUILD.to_string())
     );
 }

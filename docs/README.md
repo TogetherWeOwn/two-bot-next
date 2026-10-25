@@ -1,8 +1,7 @@
 # Documentation map
 
-Link labels are one-line purposes; this is the sole discovery manifest.
-Rows use `- [Purpose](relative.md)` under area headings, including this index.
-Add a row with every new Markdown doc, including nested docs.
+Sole purpose/link manifest for every Markdown doc, including nested docs and this index.
+Rows: `- [Purpose](relative.md)` under area headings.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
 Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
@@ -127,11 +126,12 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Feed domain](feeds-port.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
-- [Game activity report](game-activity-report.md)
+- [Staff game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
+- [Session-change notices (design only)](event-change-notices-spec.md)
 - [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
 - [Private agenda (design only)](event-agenda-spec.md)

@@ -5,7 +5,7 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 42 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 43 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
@@ -276,17 +276,25 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
         .collect();
     // 23 legacy restricted rows plus management-only command-inspect,
-    // welcome-preview, command-disable, command-enable and giveaway, plus purge-preview,
-    // channel-inspect, lfg-edit, lfg-list and feed-inspect. Discord defaults never
+    // command-disable, command-enable, giveaway and welcome-preview, plus
+    // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect and game-mix.
+    // Discord defaults never
     // replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        35,
-        "23 legacy restricted rows plus ten Next-only management commands"
+        36,
+        "23 legacy restricted rows plus thirteen Next-only management commands"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
-            for permissions in [None, Some(0), Some(!row.required_permissions)] {
+            // game-mix alone accepts Administrator as an alternative, so its
+            // hostile complement must lack both staff bits to remain denied.
+            let missing_bits = if row.command == "game-mix" {
+                !(32 | 8)
+            } else {
+                !row.required_permissions
+            };
+            for permissions in [None, Some(0), Some(missing_bits)] {
                 // Discord delivered a real ApplicationCommand despite the picker
                 // defaults; bot permissions must not authorize the invoker.
                 let mut interaction = slash(row.command, permissions);
@@ -353,9 +361,14 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         // The slash helper builds member permissions via
         // Permissions::from_bits_truncate, so unknown high bits never reach
         // the audit path; pin the truncated decimal, not the raw !bits.
+        let missing_bits = if row.command == "game-mix" {
+            !(32 | 8)
+        } else {
+            !row.required_permissions
+        };
         assert_eq!(
             events[2]["actor_permissions"],
-            Permissions::from_bits_truncate(!row.required_permissions)
+            Permissions::from_bits_truncate(missing_bits)
                 .bits()
                 .to_string()
         );
@@ -366,11 +379,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 45);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 46);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 42);
+    assert_eq!(commands.len(), 43);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -414,6 +427,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("privacy", HandlerId::Privacy),
         ("reopen", HandlerId::Reopen),
         ("welcome-preview", HandlerId::WelcomePreview),
+        ("game-mix", HandlerId::GameMix),
         ("ban", HandlerId::Moderation(ModerationAction::Ban)),
         ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
         ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -457,7 +471,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
     ];
     assert_eq!(
         cases.len(),
-        40,
+        41,
         "all handlers except giveaway and lfg-list covered (each has its own test)"
     );
     for (_, id) in cases {
@@ -1117,7 +1131,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 43 names, no partial view.
+    // endpoint: one request, all 44 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1128,8 +1142,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        43,
-        "6 core + 25 feature + 9 moderation mutations + 2 reads + 1 custom"
+        44,
+        "7 core + 25 feature + 9 moderation mutations + 2 reads + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1161,7 +1175,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 43, "no partial view");
+    assert_eq!(names.len(), 44, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1169,6 +1183,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         "privacy",
         "reopen",
         "welcome-preview",
+        "game-mix",
         "attendance",
         "command",
         "command-inspect",

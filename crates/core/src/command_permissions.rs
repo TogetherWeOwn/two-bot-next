@@ -47,6 +47,10 @@ impl CommandPermission {
     #[must_use]
     pub fn allows(self, actor_permissions: Option<u64>) -> bool {
         self.required_permissions == 0
+            // This Next-only staff read follows /export's Administrator OR
+            // Manage Guild contract. Preserve every legacy command's mask.
+            || (self.command == "game-mix"
+                && actor_permissions.is_some_and(|bits| bits & 8 != 0))
             || actor_permissions
                 .is_some_and(|bits| bits & self.required_permissions == self.required_permissions)
     }
@@ -82,11 +86,12 @@ use PolicyHook::{
 /// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
 /// timed entry (parity row 37), channel LFG discovery (parity row 38),
 /// the Next-only `/feed-inspect` relay detail (parity row 39), pause/resume
-/// `/command-disable` and `/command-enable` (parity rows 40 and 41), and
-/// the `/welcome-preview` admin preview (parity row 42), and the feed lifecycle pair
-/// `/feed-pause` (43) and `/feed-resume` (44).
-/// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 45] = [
+/// `/command-disable` and `/command-enable` (parity rows 40 and 41),
+/// `/welcome-preview` admin preview (parity row 42), staff aggregate
+/// `/game-mix` (43), and feed lifecycle `/feed-pause` (44) and
+/// `/feed-resume` (45). Only `/game-mix` admits Administrator
+/// alone; legacy masks are unchanged.
+pub const COMMAND_PERMISSIONS: [CommandPermission; 46] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -94,6 +99,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 45] = [
     row(34, "reopen", BuiltinSlash, 0, None),
     row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(42, "welcome-preview", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(43, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",
@@ -178,8 +184,8 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 45] = [
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(39, "feed-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(43, "feed-pause", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(44, "feed-resume", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(44, "feed-pause", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(45, "feed-resume", BuiltinSlash, PERM_MANAGE_GUILD, None),
 ];
 
 /// Only retained builtins participate in slash-name lookup. The dropped and
