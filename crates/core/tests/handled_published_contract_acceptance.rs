@@ -135,7 +135,7 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 38 parity and Next-only builtins plus the
+/// Registry compatibility: all 40 parity and Next-only builtins plus the
 /// separate lfg-list discovery case route to their handlers;
 /// templateassistant stays unpublished.
 #[test]
@@ -186,10 +186,12 @@ fn parity_builtins_route_to_their_handlers() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
         ("feed-inspect", HandlerId::FeedInspect),
+        ("feed-pause", HandlerId::FeedPause),
+        ("feed-resume", HandlerId::FeedResume),
     ];
     assert_eq!(
         cases.len(),
-        38,
+        40,
         "all builtins except the separate lfg-list case covered"
     );
     for (name, handler) in cases {
@@ -254,14 +256,14 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 40, "contract covers the 40 built-in commands");
+    assert_eq!(matrix.len(), 42, "contract covers the 42 built-in commands");
     assert_eq!(
         matrix
             .iter()
             .filter(|row| row.command != "welcome-preview")
             .count(),
-        39,
-        "contract covers the 39 non-preview built-in commands"
+        41,
+        "contract covers the 41 non-preview built-in commands"
     );
     assert!(
         matrix
