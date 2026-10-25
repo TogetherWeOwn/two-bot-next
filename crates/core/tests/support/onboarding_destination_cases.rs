@@ -53,6 +53,7 @@ pub fn invalid(key: &str) -> Vec<Value> {
         json!("0"),
         json!("-1"),
         json!("18446744073709551616"),
+        json!(18_446_744_073_709_551_616.0_f64),
         json!("1e3"),
         json!("42.0"),
         json!("4 2"),

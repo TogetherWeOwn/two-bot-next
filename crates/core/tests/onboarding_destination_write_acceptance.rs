@@ -93,12 +93,19 @@ fn refusal_is_typed_key_only_and_explains_repair_or_delete_to_fallback() {
                 | WriteRefusal::Unknown(_)
                 | WriteRefusal::MissingActor
                 | WriteRefusal::NullCharacter
-                | WriteRefusal::InvalidGateValue(_)
-                | WriteRefusal::InvalidCooldownValue(_)
-                | WriteRefusal::InvalidPanelsValue(_)
-                | WriteRefusal::InvalidCorrectionCycles(_)
-                | WriteRefusal::InvalidInactivityDays(_)
         ));
+        for unrelated in [
+            WriteRefusal::InvalidGateValue(key.into()),
+            WriteRefusal::InvalidCooldownValue(key.into()),
+            WriteRefusal::InvalidPanelsValue(key.into()),
+            WriteRefusal::InvalidCorrectionCycles(key.into()),
+            WriteRefusal::InvalidInactivityDays(key.into()),
+        ] {
+            assert_ne!(
+                std::mem::discriminant(&first),
+                std::mem::discriminant(&unrelated)
+            );
+        }
         assert_eq!(
             first, second,
             "refusal must depend on the allowlisted key only"

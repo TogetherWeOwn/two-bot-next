@@ -6,11 +6,11 @@
   "protected_files": [
     {
       "path": "crates/core/tests/support/onboarding_destination_cases.rs",
-      "sha256": "f653fe6944f75c5bcf352a025421592a95978071447cf0906a2b148a665ae4de"
+      "sha256": "de5dba76a55df4530a616d2313f660e4d50a1d1f7eb0ca8c7a82a4f372a2eef7"
     },
     {
       "path": "crates/core/tests/onboarding_destination_write_acceptance.rs",
-      "sha256": "a303caba5029fbd7ec258a2d7091964ca4d940f4a6a91d82800682834e4bbf25"
+      "sha256": "108f6c5720fa52a2b2045340ba0d8846aa3ebd7dc492132108f8ea004851e313"
     },
     {
       "path": "crates/discord/tests/onboarding_destination_reader_acceptance.rs",
