@@ -120,7 +120,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Ready check](lfg-ready-check-spec.md)
 - [Backup-host handoff](lfg-backup-host-spec.md)
 - [LFG reuse (design only)](lfg-reuse-spec.md)
-- [LFG thread (design)](lfg-thread-spec.md)
+- [LFG thread spec](lfg-thread-spec.md)
 - [LFG voice room (design only)](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
