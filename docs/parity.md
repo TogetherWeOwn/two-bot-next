@@ -66,11 +66,12 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 42 rows (39 retained builtins — the 27 legacy ones plus the Next-only
-`/help`, `/privacy`, `/command-inspect`, `/reopen`, `/command-disable`,
-`/command-enable`, `/purge-preview`, `/channel-inspect`, `/giveaway`, `/lfg-list`,
-`/feed-inspect` and `/game-mix` — the dropped rota command, custom slash commands,
-and prefix triggers). The router checks the invoking interaction's resolved
+all 43 rows (40 retained builtins — the 27 legacy ones plus the Next-only
+`/help`, `/privacy`, `/command-inspect`, `/reopen`, `/welcome-preview`,
+`/command-disable`, `/command-enable`, `/purge-preview`, `/channel-inspect`,
+`/giveaway`, `/lfg-list`, `/feed-inspect` and `/game-mix` — the dropped rota
+command, custom slash commands, and prefix triggers). The router checks the
+invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
 and a metadata-only `command_permission_denied` tracing audit event (command,
@@ -101,6 +102,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `timeout` | docs/parity.md §1 #6 duration ceiling | Advertise only `max_value` 2419200 on `duration_seconds`, matching Discord's 28-day cap; every other field stays legacy-identical. |
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
 | `help` | docs/parity.md §1 help | Add the Next-only `/help` discovery command (no legacy counterpart): always published, open to everyone, guild-only. It takes one optional string `command` selector (`max_length` 32); omitted, it answers from the live publish set with grouped permission hints, and a name explains that confirmed command. |
+| `welcome-preview` | docs/parity.md §1 welcome preview | Add the Next-only `/welcome-preview` admin command: always published, guild-only, Manage Server (32), zero options. Private configuration preview through the live welcome renderer for the fixed roleless fixture `765432109876543210`; no delivery or real-member resolution. See [the operator guide](onboarding-operator-guide.md#private-welcome-preview). |
 | `privacy` | docs/parity.md §1 privacy | Add the Next-only `/privacy` member self-serve (no legacy counterpart): always published, open to everyone and guild-only. It includes analytics `opt-out` / `opt-in` / `status` plus deletion `delete` / `deletion-status` / `deletion-receipt`; the two read subcommands take a request id only. The subject is always the authenticated invoker (no target option). The opt-out audit actor remains the fixed `member:self-serve` label, never a subject ID. |
 | `reopen` | docs/parity.md §1 reopen | Add the Next-only `/reopen` self-service picker recovery (no legacy counterpart): always published, open to everyone and guild-only. It takes one required `kind` choice (`games` / `session`) and opens the invoker's existing picker in a private menu with zero role, channel or funnel writes. The subject is always the authenticated invoker (no target option). |
 | `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` states the trusted occurrence rule (event id, event link or `{event_id}:{label}`; bare slugs refuse) with an example. Options and permissions stay legacy-identical except for its separately listed `max_length` bound. |

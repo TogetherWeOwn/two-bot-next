@@ -499,10 +499,14 @@ mod tests {
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
         let default = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(default.len(), 6);
+        assert_eq!(default.len(), 7);
         assert!(
             default.iter().any(|def| def.name == "reopen"),
             "reopen is core-always in the default registry"
+        );
+        assert!(
+            default.iter().any(|def| def.name == "welcome-preview"),
+            "welcome-preview is core-always in the default registry"
         );
         assert!(
             default.iter().any(|def| def.name == "game-mix"),
@@ -516,9 +520,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 39 all-gate builtins: 6 core + 1 scorecard + 12 automation
+            // 40 all-gate builtins: 7 core + 1 scorecard + 12 automation
             // + 9 announcements + 9 moderation mutations + 2 private reads.
-            39
+            40
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -533,6 +537,10 @@ mod tests {
             "giveaway survives the all-on registry"
         );
         assert!(
+            all_on.iter().any(|def| def.name == "welcome-preview"),
+            "welcome-preview survives the all-on registry"
+        );
+        assert!(
             all_on.iter().any(|def| def.name == "lfg-list"),
             "lfg-list survives the all-on registry"
         );
@@ -542,7 +550,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 60);
+        assert_eq!(with_voice.len(), 61);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -554,6 +562,10 @@ mod tests {
         assert!(
             with_voice.iter().any(|def| def.name == "giveaway"),
             "giveaway survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "welcome-preview"),
+            "welcome-preview survives the voice registry"
         );
         assert!(
             with_voice.iter().any(|def| def.name == "lfg-list"),

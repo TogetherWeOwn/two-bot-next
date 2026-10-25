@@ -85,17 +85,19 @@ use PolicyHook::{
 /// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
 /// timed entry (parity row 37), channel LFG discovery (parity row 38),
 /// the Next-only `/feed-inspect` relay detail (parity row 39), pause/resume
-/// `/command-disable` and `/command-enable` (parity rows 40 and 41), and staff
-/// aggregate `/game-mix` (parity row 42). Only `/game-mix` admits Administrator
+/// `/command-disable` and `/command-enable` (parity rows 40 and 41),
+/// `/welcome-preview` admin preview (parity row 42), and staff aggregate
+/// `/game-mix` (parity row 43). Only `/game-mix` admits Administrator
 /// alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 42] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 43] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
     row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(42, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(42, "welcome-preview", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(43, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",

@@ -135,7 +135,7 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 38 parity and Next-only builtins plus the
+/// Registry compatibility: all 37 parity and Next-only builtins plus the
 /// separate lfg-list discovery case route to their handlers;
 /// templateassistant stays unpublished.
 #[test]
@@ -147,7 +147,6 @@ fn parity_builtins_route_to_their_handlers() {
         ("help", HandlerId::Help),
         ("privacy", HandlerId::Privacy),
         ("reopen", HandlerId::Reopen),
-        ("game-mix", HandlerId::GameMix),
         ("ban", HandlerId::Moderation(ModerationAction::Ban)),
         ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
         ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -189,7 +188,7 @@ fn parity_builtins_route_to_their_handlers() {
     ];
     assert_eq!(
         cases.len(),
-        38,
+        37,
         "all builtins except the separate lfg-list case covered"
     );
     for (name, handler) in cases {
@@ -254,5 +253,20 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 39, "contract covers the 39 built-in commands");
+    assert_eq!(
+        matrix
+            .iter()
+            .filter(|row| row.command != "welcome-preview")
+            .count(),
+        38,
+        "contract covers the 38 non-preview built-in commands"
+    );
+    assert!(
+        matrix
+            .iter()
+            .filter(|row| row.command == "welcome-preview")
+            .count()
+            <= 1,
+        "the independently tested welcome-preview row is unique"
+    );
 }

@@ -46,6 +46,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command-disable", "docs/parity.md §1 command-disable"),
     ("command-enable", "docs/parity.md §1 command-enable"),
     ("giveaway", "docs/parity.md §1 giveaway"),
+    ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
     ("lfg-list", "docs/parity.md §1 lfg-list"),
@@ -274,10 +275,19 @@ pub fn expected_registry() -> Value {
     )
     .expect("reopen serializes");
     commands.insert(4, reopen);
-    // Next-only private staff aggregate, immediately after reopen. Keep the
+    let welcome_preview = serde_json::to_value(
+        CommandDefinition::new(
+            "welcome-preview",
+            "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+        )
+        .permissions(32),
+    )
+    .expect("welcome preview serializes");
+    commands.insert(5, welcome_preview);
+    // Next-only private staff aggregate, immediately after welcome-preview. Keep the
     // legacy snapshot frozen and pin the whole additive definition literally.
     commands.insert(
-        5,
+        6,
         json!({
             "name": "game-mix",
             "description": "Show this server's aggregate game activity.",
@@ -353,8 +363,8 @@ pub fn expected_registry() -> Value {
         .expect("lfg-close is published");
     commands.insert(lfg_close_pos + 1, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 18, immediately after sticky-remove, with the
-    // game-mix, pause/resume and inspect/help/privacy/reopen inserts above)
+    // publish position (index 19, immediately after sticky-remove, with
+    // game-mix, welcome-preview, pause/resume and inspection inserts above)
     // as the exact published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
         CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
@@ -417,7 +427,7 @@ pub fn expected_registry() -> Value {
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(18, giveaway);
+    commands.insert(19, giveaway);
     // Next-only read surfaces follow the nine historical mutations. Literal
     // payloads keep the frozen snapshot intact and compare every read field.
     let after_unlock = commands

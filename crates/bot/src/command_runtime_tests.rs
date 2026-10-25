@@ -913,6 +913,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                     "help",
                     "privacy",
                     "reopen",
+                    "welcome-preview",
                     "game-mix"
                 ],
                 "unrelated core commands remain; uncleared surfaces are replaced"
@@ -1036,6 +1037,7 @@ async fn activation_boot_from_env_fixture() {
                 "help",
                 "privacy",
                 "reopen",
+                "welcome-preview",
                 "game-mix"
             ]
         );
@@ -1591,6 +1593,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "privacy"
                         | "giveaway"
                         | "reopen"
+                        | "welcome-preview",
                         | "game-mix"
                 )
             })
@@ -1602,6 +1605,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"privacy"));
         assert!(!unwired.contains(&"lfg-list"));
         assert!(!unwired.contains(&"reopen"));
+        assert!(!unwired.contains(&"welcome-preview"));
         assert!(!unwired.contains(&"game-mix"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
@@ -4251,6 +4255,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Help,
             HandlerId::Privacy,
             HandlerId::Reopen,
+            HandlerId::WelcomePreview,
             HandlerId::GameMix,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,

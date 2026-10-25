@@ -66,6 +66,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Welcome preview",
+        requires: Some("Manage Server"),
+        commands: &["welcome-preview"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Community check-in",
         requires: Some("Manage Events"),
         commands: &["attendance"],
@@ -769,12 +775,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 39 non-voice commands (6 core + 22 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, pause/resume, giveaway, lfg-list, feed-inspect,
+        // 40 non-voice commands (7 core + 22 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-list, feed-inspect,
         // purge-preview and channel-inspect, plus 21 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (60 live)"));
+        assert!(text.contains("**Server commands** (61 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -830,7 +836,7 @@ mod tests {
         });
         let defs = off.publish_set(&[]).expect("core-only set");
         let text = help_text(&defs);
-        assert!(text.contains("**Server commands** (6 live)"));
+        assert!(text.contains("**Server commands** (7 live)"));
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
@@ -900,17 +906,18 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 39 non-voice names, including inspection, reopen, pause/resume,
+        // 40 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
         // 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 60);
+        assert_eq!(grouped.len(), 61);
         for name in [
             "rank",
             "leaderboard",
             "help",
             "privacy",
             "reopen",
+            "welcome-preview",
             "game-mix",
             "attendance",
             "command",
