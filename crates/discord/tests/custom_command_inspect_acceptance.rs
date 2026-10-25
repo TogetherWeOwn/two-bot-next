@@ -47,6 +47,9 @@ use two_bot_testsupport::TestDatabase;
 const MANAGEMENT: &str = "command-inspect";
 const TOKEN: &str = "inspect-acceptance-fixture";
 
+#[path = "support/custom_command_draft_acceptance.rs"]
+mod draft_acceptance;
+
 fn gates(enabled: bool) -> RouterGates {
     RouterGates {
         configured_guild: Some(2222),
@@ -287,14 +290,28 @@ fn inspect_is_a_guild_only_management_command_with_three_bounded_views() {
             .dm_permission
     );
     let options = definition["options"].as_array().expect("options");
-    assert_eq!(options.len(), 3, "one workflow, no enable/disable policy");
+    assert_eq!(
+        options.len(),
+        4,
+        "one workflow with exclusive saved/draft input"
+    );
     let name = options
         .iter()
         .find(|value| value["name"] == "name")
         .unwrap();
     assert_eq!(name["type"], 3);
-    assert_eq!(name["required"], true);
+    assert_ne!(
+        name["required"], true,
+        "draft input must not require a saved name"
+    );
     assert_eq!(name["max_length"], 32);
+    let draft = options
+        .iter()
+        .find(|value| value["name"] == "draft")
+        .expect("discover unsaved preview on the existing inspection surface");
+    assert_eq!(draft["type"], 3);
+    assert_ne!(draft["required"], true);
+    assert_eq!(draft["max_length"], 2000);
     let view = options
         .iter()
         .find(|value| value["name"] == "view")
