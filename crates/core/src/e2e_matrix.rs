@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 32 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 34 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -339,10 +339,10 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Rsvp",
-            "Ephemeral `RSVP saved: <status>.` confirmation.",
+            "Ephemeral `RSVP saved: <status>.` confirmation (pasted links append the event id).",
             &[
                 "Gate:AnnouncementsDisabled",
-                "Valid:event-id:required",
+                "Valid:event-id:required,max128",
                 "Valid:status:going|interested|declined",
             ],
         ),
@@ -354,7 +354,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Everyone",
             "RsvpAttendance",
             "Ephemeral RSVP totals for the scheduled event.",
-            &["Gate:AnnouncementsDisabled", "Valid:event-id:required"],
+            &["Gate:AnnouncementsDisabled", "Valid:event-id:required,max128"],
         ),
         row(
             "lfg",
@@ -384,6 +384,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:AnnouncementsDisabled",
                 "Perm:ManageEventsRequired",
                 "Valid:id:required",
+            ],
+        ),
+        row(
+            "lfg-list",
+            38,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgList",
+            "Ephemeral current-channel open confirmed-post list; at most five whole rows and bounded cursor continuation, no mutations.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:cursor:optional,bound-to-guild-and-channel,max-512",
             ],
         ),
         row(
