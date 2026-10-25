@@ -1,12 +1,11 @@
 # Documentation map
 
-All Markdown docs, including this index.
-Under area headings: `- [Purpose](relative.md)`.
+Sole manifest: `- [Purpose](relative.md)` by area.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
-Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
-Else exit 1: fix rows or split oversized docs.
-Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
+Output: `{missing,stale,oversize}`, sorted paths; empty = PASS (exit 0).
+Else exit 1: fix rows or split large docs.
+Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
 Budgets: index <12,000 bytes; others ≤65,536. Legacy exceptions and reasons:
 `LARGE_DOCS` in `scripts/check_docs_index.py`.
 
@@ -142,6 +141,7 @@ Budgets: index <12,000 bytes; others ≤65,536. Legacy exceptions and reasons:
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
+- [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 
