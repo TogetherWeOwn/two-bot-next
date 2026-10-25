@@ -1006,6 +1006,59 @@ async fn unannounced_sweep_lists_drawn_until_marked() -> Result<(), sqlx::Error>
 }
 
 #[tokio::test]
+async fn insert_reroll_draw_reopens_the_unannounced_marker_atomically() -> Result<(), sqlx::Error> {
+    let Some(fixture) =
+        connect("insert_reroll_draw_reopens_the_unannounced_marker_atomically").await
+    else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_reroll_reopen_01", at(3_600))).await?;
+    assert!(store::claim_specific(
+        &pool,
+        GUILD,
+        "gw_reroll_reopen_01",
+        at(100),
+        at(0),
+        "claim-reopen"
+    )
+    .await?
+    .is_some());
+    assert!(store::complete_draw(
+        &pool,
+        &new_draw("gw_reroll_reopen_01", 0, None, SEED_0),
+        "claim-reopen",
+        at(101)
+    )
+    .await?
+    .is_some());
+    assert!(store::mark_announced(&pool, GUILD, "gw_reroll_reopen_01", at(102)).await?);
+    assert!(
+        store::list_unannounced(&pool, GUILD, 25).await?.is_empty(),
+        "a marked row leaves the sweep"
+    );
+    let reroll = store::insert_reroll_draw(
+        &pool,
+        &new_draw("gw_reroll_reopen_01", 1, Some("full"), SEED_1),
+    )
+    .await?;
+    assert_eq!(reroll.draw_no, 1);
+    let pending = store::list_unannounced(&pool, GUILD, 25).await?;
+    assert_eq!(
+        pending.len(),
+        1,
+        "the reroll round rejoins the sweep before any announce runs, \
+         so a crash after the insert can never lose it behind round 0's stamp"
+    );
+    assert_eq!(pending[0].id, "gw_reroll_reopen_01");
+    let draws = store::get_draws(&pool, GUILD, "gw_reroll_reopen_01").await?;
+    assert_eq!(draws.len(), 2, "reroll appends; the first row is intact");
+    assert_eq!(draws[0].draw_no, 0);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
 async fn draw_and_reroll_audits_carry_round_ids_idempotently() -> Result<(), sqlx::Error> {
     let Some(fixture) = connect("draw_and_reroll_audits_carry_round_ids_idempotently").await else {
         return Ok(());
