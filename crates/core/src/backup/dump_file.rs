@@ -296,7 +296,7 @@ pub const V14_ADDED_TABLES: &[&str] =
 /// giveaway definitions, entries and draw rounds.
 pub const V15_ADDED_TABLES: &[&str] = &["giveaways", "giveaway_entries", "giveaway_draws"];
 
-/// Voice configuration revision and actor history (0465), first archived in v16.
+/// Voice configuration revision and actor history (0467), first archived in v16.
 /// Released v15 archives retain the giveaway requirements but may omit the
 /// voice audit. Restoring them clears the destination audit trail.
 pub const V16_ADDED_TABLES: &[&str] = &["voice_settings_audit"];
@@ -1227,7 +1227,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
     // the token registry (0456/0457), the event voice pair (0455),
     // the starboard tables (0458/0459), the giveaways (0460/0461) and
-    // the voice audit (0465).
+    // the voice audit (0467).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()

@@ -288,6 +288,31 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   ```
 
   A staging apply-check stays a rollout step, not a test gate.
+- The stored actor/staging exclusion live-apply pins run fully offline too
+  (in-memory `live_channel` plus the real pipeline seam, no database):
+
+  ```sh
+  python3 scripts/cargo_cache.py run -- test -p two-bot-core --test community_exclusion_live_keys_acceptance
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test community_exclusion_pipeline_acceptance
+  ```
+
+- The gateway and attendance regressions call the shared production overlay,
+  real settings poll and migrated disposable fact store. Voice, member joins
+  and rules acceptance must observe replacement, empty and deleted exclusions
+  without an intervening message, including alternating guilds on one pipeline.
+  Five independent overlay controls cover all exclusion keys. Attendance uses
+  the production command composition in both direct and ordered completion;
+  a poll after acknowledgement must affect the check-in classification while
+  preserving membership/event validation, host-check-in proof and audit rows.
+  The ordered gateway also refreshes member removals before ending voice facts.
+  Both bot runtime constructors install the same execution-time provider; the
+  classifier version stays deployment-only.
+
+  ```sh
+  TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+    python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot gateway::live_exclusions_acceptance_tests:: -- --test-threads=1
+  ```
+
 - The production-call-site regressions in `community_live_tick_tests.rs`
   additionally require the disposable test database. Each uses a child process
   to register the real settings poll, publish committed overrides and run the

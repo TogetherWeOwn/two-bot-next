@@ -35,7 +35,7 @@ use two_bot_core::{
         schedule_list_line, schedule_list_overflow_for_count, schedule_list_overflow_line,
         schedule_list_page, schedule_list_page_out_of_range_text,
         schedule_list_page_underflow_text, schedule_list_pages, schedule_list_pages_global,
-        validate_schedule, ScheduleInput,
+        validate_schedule, validate_schedule_at, ScheduleInput, IN_MINUTES_MIN,
     },
     scheduled_store::{
         audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
@@ -64,6 +64,8 @@ const NO_CHANNEL_REPLY: &str = "This command only works in a channel.";
 /// `/schedule`: validate → upsert → audit → ephemeral confirmation.
 /// Validation failures still audit (`rejected`): the id is minted before
 /// validation, exactly like legacy, so the trail names the attempted row.
+/// Malformed options refuse before any store read or audit via
+/// [`schedule_options_strict`]: no row, no audit, one private correction.
 pub(crate) async fn schedule_create(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -74,14 +76,31 @@ pub(crate) async fn schedule_create(
         finish(executor, interaction, NO_CHANNEL_REPLY).await;
         return;
     };
+    let (body, in_minutes, every_minutes) = match schedule_options_strict(interaction) {
+        Ok(decoded) => decoded,
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
+    let now = now_millis();
+    let absolute_due = match schedule_absolute_due(interaction, in_minutes, every_minutes, now) {
+        Ok(due) => due,
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     let actor = actor_id(interaction);
-    let (body, in_minutes, every_minutes) = schedule_options(interaction);
     let id = new_id();
-    let now_iso = format_iso_ms(now_millis());
+    let now_iso = format_iso_ms(now);
 
+    // The relative validator owns the unchanged body/mention and interval
+    // checks. An already validated absolute one-shot supplies its minimum
+    // delay only to select that branch; its due instant never uses the delay.
     let validated = match validate_schedule(&ScheduleInput {
         body: body.as_deref().unwrap_or_default(),
-        in_minutes,
+        in_minutes: absolute_due.map(|_| IN_MINUTES_MIN).or(in_minutes),
         every_minutes,
     }) {
         Ok(validated) => validated,
@@ -124,7 +143,9 @@ pub(crate) async fn schedule_create(
             return;
         }
     };
-    let next_run_at = format_iso_ms(next_run_at_ms(now_millis(), validated.delay_minutes));
+    let is_absolute = absolute_due.is_some();
+    let next_run_at =
+        format_iso_ms(absolute_due.unwrap_or_else(|| next_run_at_ms(now, validated.delay_minutes)));
     // Whole minutes by construction (`every-minutes * 60`), so this inverts
     // exactly; the confirm helper renders the recurring shape from it.
     let every_m = validated.interval_seconds.map(|s| s / 60);
@@ -168,7 +189,7 @@ pub(crate) async fn schedule_create(
             finish(
                 executor,
                 interaction,
-                schedule_confirm_text(created, &id, every_m, &next_run_at),
+                schedule_confirmation(created, &id, every_m, &next_run_at, is_absolute),
             )
             .await;
         }
@@ -231,14 +252,21 @@ pub(crate) async fn schedule_create(
 /// `/schedule-remove`: prefix-resolve the id → guild-scoped delete →
 /// `scheduled.delete` audit (`ok` / `absent`) → ephemeral confirmation.
 /// Zero or ambiguous prefix matches refuse with the shared no-unique-match
-/// text and mutate nothing.
+/// text and mutate nothing. Malformed `id` options refuse before any store
+/// read or audit via [`schedule_remove_option_strict`].
 pub(crate) async fn schedule_remove(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
     guild_id: &str,
     interaction: &Interaction,
 ) {
-    let prefix = schedule_remove_option(interaction).unwrap_or_default();
+    let prefix = match schedule_remove_option_strict(interaction) {
+        Ok(prefix) => prefix.unwrap_or_default(),
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     if prefix.is_empty() {
         finish(executor, interaction, no_unique_match_text(&prefix)).await;
         return;
@@ -297,7 +325,12 @@ pub(crate) async fn schedule_remove(
                 &now_iso,
             )
             .await;
-            finish(executor, interaction, schedule_cancelled_text()).await;
+            finish(
+                executor,
+                interaction,
+                format!("{} Schedule `{id}`.", schedule_cancelled_text()),
+            )
+            .await;
         }
         Ok(false) => {
             // Resolved but already gone (raced delete): legacy's `absent`.
@@ -353,7 +386,13 @@ pub(crate) async fn schedule_list(
     guild_id: &str,
     interaction: &Interaction,
 ) {
-    let page = schedule_list_page_option(interaction).unwrap_or(1);
+    let page = match schedule_list_page_option_strict(interaction) {
+        Ok(page) => page.unwrap_or(1),
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     if page < 1 {
         finish(executor, interaction, schedule_list_page_underflow_text()).await;
         return;
@@ -364,7 +403,7 @@ pub(crate) async fn schedule_list(
             let mut lines: Vec<String> = rows
                 .iter()
                 .map(|row| {
-                    schedule_list_line(
+                    schedule_list_line_localized(
                         &row.id,
                         &row.channel_id,
                         &row.next_run_at,
@@ -420,7 +459,7 @@ pub(crate) async fn schedule_list(
                                 let mut hidden_lines: Vec<String> = hidden
                                     .iter()
                                     .map(|row| {
-                                        schedule_list_line(
+                                        schedule_list_line_localized(
                                             &row.id,
                                             &row.channel_id,
                                             &row.next_run_at,
@@ -553,6 +592,85 @@ pub(crate) async fn schedule_list(
     }
 }
 
+/// Localize only a validated stored instant; a corrupt legacy row must not
+/// panic or invent a due time. Enrichment happens before whole-row packing.
+fn schedule_delivery_hint(next_run_at: &str) -> String {
+    let localized =
+        time::OffsetDateTime::parse(next_run_at, &time::format_description::well_known::Rfc3339)
+            .map(|due| format!(" <t:{}:F>.", due.unix_timestamp()))
+            .unwrap_or_default();
+    format!("{localized} The 15s ticker and delivery may be delayed.")
+}
+
+fn schedule_confirmation(
+    created: bool,
+    id: &str,
+    every_minutes: Option<i64>,
+    next_run_at: &str,
+    include_delivery_hint: bool,
+) -> String {
+    let mut text = schedule_confirm_text(created, id, every_minutes, next_run_at);
+    if include_delivery_hint {
+        text.push_str(&schedule_delivery_hint(next_run_at));
+    }
+    text
+}
+
+fn schedule_list_line_localized(
+    id: &str,
+    channel_id: &str,
+    next_run_at: &str,
+    interval_seconds: Option<i64>,
+    enabled: bool,
+) -> String {
+    let mut line = schedule_list_line(id, channel_id, next_run_at, interval_seconds, enabled);
+    if enabled {
+        line.push_str(&schedule_delivery_hint(next_run_at));
+    }
+    line
+}
+
+/// Decode and validate the optional absolute instant before any store or audit
+/// effect. Legacy relative/recurring validation remains in `validate_schedule`.
+fn schedule_absolute_due(
+    interaction: &Interaction,
+    in_minutes: Option<i64>,
+    every_minutes: Option<i64>,
+    now_ms: u64,
+) -> Result<Option<u64>, String> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(None);
+    };
+    let mut options = data.options.iter().filter(|option| option.name == "at");
+    let Some(option) = options.next() else {
+        return Ok(None);
+    };
+    if options.next().is_some() {
+        return Err(
+            "Duplicate at option. Supply one RFC3339 timestamp with Z or a numeric offset."
+                .to_owned(),
+        );
+    }
+    let CommandOptionValue::String(at) = &option.value else {
+        return Err(
+            "Invalid at option. Supply an RFC3339 string timestamp with Z or a numeric offset."
+                .to_owned(),
+        );
+    };
+    if in_minutes.is_some() {
+        return Err(
+            "Choose either at or in-minutes, not both. Use at for a one-off RFC3339 time."
+                .to_owned(),
+        );
+    }
+    if every_minutes.is_some() {
+        return Err("The at option is one-off only; do not combine it with every-minutes. Use in-minutes with every-minutes for recurring schedules.".to_owned());
+    }
+    validate_schedule_at(at, now_ms)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 /// Current epoch millis, clamped non-negative for the ISO formatter.
 fn now_millis() -> u64 {
     now_millis_for_test().max(0) as u64
@@ -617,12 +735,19 @@ async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: i
     }
 }
 
+/// Decoded `/schedule` options: `body` (required string) + `in-minutes` /
+/// `every-minutes` (optional integers). Missing values decode to `None`.
+type ScheduleCreateOptions = (Option<String>, Option<i64>, Option<i64>);
+
 /// Extract `/schedule`'s options: `body` (required string) + `in-minutes` /
 /// `every-minutes` (optional integers). Missing values decode to `None`;
 /// validation owns the refusal text.
-pub(crate) fn schedule_options(
-    interaction: &Interaction,
-) -> (Option<String>, Option<i64>, Option<i64>) {
+///
+/// Lenient legacy shape: wrong-typed and duplicated options are ignored or
+/// last-wins. Test-only: handlers use [`schedule_options_strict`] instead,
+/// and the pinned unit tests keep this compiling and GREEN.
+#[cfg(test)]
+pub(crate) fn schedule_options(interaction: &Interaction) -> ScheduleCreateOptions {
     let mut body = None;
     let mut in_minutes = None;
     let mut every_minutes = None;
@@ -644,6 +769,11 @@ pub(crate) fn schedule_options(
 
 /// `/schedule-remove`'s optional `id` option; absent and empty values are
 /// refused before resolution, so they can never delete a schedule.
+///
+/// Lenient legacy shape: wrong-typed values decode to absent and duplicates
+/// are first-wins. Test-only: handlers use [`schedule_remove_option_strict`]
+/// instead, and the pinned unit tests keep this compiling and GREEN.
+#[cfg(test)]
 pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String> {
     let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
         return None;
@@ -656,17 +786,127 @@ pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String
         })
 }
 
-/// `/schedule-list`'s optional 1-based `page` option; absent means page 1.
-/// A mismatched wire type decodes to absent (page 1) rather than refusing,
-/// so existing invocations keep working.
-pub(crate) fn schedule_list_page_option(interaction: &Interaction) -> Option<i64> {
+/// Refusal literals for malformed schedule options. Each names the offending
+/// option and carries a copyable corrected invocation, echoes no user input
+/// (mention-safe), and stays far under Discord's 2,000-unit cap (bounded).
+/// Handlers reply with these before any store read or audit write.
+const SCHEDULE_INVALID_BODY: &str =
+    "Invalid body option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_DUPLICATE_BODY: &str =
+    "Duplicate body option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_INVALID_IN_MINUTES: &str =
+    "Invalid in-minutes option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_DUPLICATE_IN_MINUTES: &str =
+    "Duplicate in-minutes option. Use /schedule body:<text> in-minutes:<minutes>.";
+const SCHEDULE_INVALID_EVERY_MINUTES: &str =
+    "Invalid every-minutes option. Use /schedule body:<text> every-minutes:<minutes>.";
+const SCHEDULE_DUPLICATE_EVERY_MINUTES: &str =
+    "Duplicate every-minutes option. Use /schedule body:<text> every-minutes:<minutes>.";
+const SCHEDULE_REMOVE_INVALID_ID: &str =
+    "Invalid id option. Use /schedule-remove id:<schedule-id>.";
+const SCHEDULE_REMOVE_DUPLICATE_ID: &str =
+    "Duplicate id option. Use /schedule-remove id:<schedule-id>.";
+const SCHEDULE_LIST_INVALID_PAGE: &str =
+    "Invalid page option. Use /schedule-list page:<number> with a whole number from 1.";
+const SCHEDULE_LIST_DUPLICATE_PAGE: &str =
+    "Duplicate page option. Use /schedule-list page:<number> with a whole number from 1.";
+
+/// Strictly decode `/schedule`'s options. A present option with the wrong
+/// wire type, or an option name sent twice, refuses with the literal naming
+/// that option; name-count wins over type-check, and `body` wins over
+/// `in-minutes` wins over `every-minutes`. Missing options decode to `None`
+/// (validation owns those refusals) and unknown names stay ignored, so valid
+/// invocations decode byte-identically to the lenient `schedule_options`.
+pub(crate) fn schedule_options_strict(
+    interaction: &Interaction,
+) -> Result<ScheduleCreateOptions, &'static str> {
     let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
-        return None;
+        return Ok((None, None, None));
     };
-    data.options
-        .iter()
-        .find_map(|option| match (option.name.as_str(), &option.value) {
-            ("page", CommandOptionValue::Integer(value)) => Some(*value),
-            _ => None,
-        })
+    let mut bodies: Vec<&CommandOptionValue> = Vec::new();
+    let mut in_minutes_opts: Vec<&CommandOptionValue> = Vec::new();
+    let mut every_minutes_opts: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        match option.name.as_str() {
+            "body" => bodies.push(&option.value),
+            "in-minutes" => in_minutes_opts.push(&option.value),
+            "every-minutes" => every_minutes_opts.push(&option.value),
+            _ => {}
+        }
+    }
+    if bodies.len() > 1 {
+        return Err(SCHEDULE_DUPLICATE_BODY);
+    }
+    if in_minutes_opts.len() > 1 {
+        return Err(SCHEDULE_DUPLICATE_IN_MINUTES);
+    }
+    if every_minutes_opts.len() > 1 {
+        return Err(SCHEDULE_DUPLICATE_EVERY_MINUTES);
+    }
+    let body = match bodies.first() {
+        None => None,
+        Some(CommandOptionValue::String(value)) => Some((*value).clone()),
+        Some(_) => return Err(SCHEDULE_INVALID_BODY),
+    };
+    let in_minutes = match in_minutes_opts.first() {
+        None => None,
+        Some(CommandOptionValue::Integer(value)) => Some(*value),
+        Some(_) => return Err(SCHEDULE_INVALID_IN_MINUTES),
+    };
+    let every_minutes = match every_minutes_opts.first() {
+        None => None,
+        Some(CommandOptionValue::Integer(value)) => Some(*value),
+        Some(_) => return Err(SCHEDULE_INVALID_EVERY_MINUTES),
+    };
+    Ok((body, in_minutes, every_minutes))
+}
+
+/// Strictly decode `/schedule-remove`'s `id` option. A wrong wire type or a
+/// duplicated name refuses; missing decodes to `None` (the empty-guard owns
+/// that refusal) and unknown names stay ignored.
+pub(crate) fn schedule_remove_option_strict(
+    interaction: &Interaction,
+) -> Result<Option<String>, &'static str> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(None);
+    };
+    let mut ids: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        if option.name.as_str() == "id" {
+            ids.push(&option.value);
+        }
+    }
+    if ids.len() > 1 {
+        return Err(SCHEDULE_REMOVE_DUPLICATE_ID);
+    }
+    match ids.first() {
+        None => Ok(None),
+        Some(CommandOptionValue::String(value)) => Ok(Some((*value).clone())),
+        Some(_) => Err(SCHEDULE_REMOVE_INVALID_ID),
+    }
+}
+
+/// Strictly decode `/schedule-list`'s `page` option. A wrong wire type or a
+/// duplicated name refuses; missing decodes to `None` (page 1) and unknown
+/// names stay ignored.
+pub(crate) fn schedule_list_page_option_strict(
+    interaction: &Interaction,
+) -> Result<Option<i64>, &'static str> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(None);
+    };
+    let mut pages: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        if option.name.as_str() == "page" {
+            pages.push(&option.value);
+        }
+    }
+    if pages.len() > 1 {
+        return Err(SCHEDULE_LIST_DUPLICATE_PAGE);
+    }
+    match pages.first() {
+        None => Ok(None),
+        Some(CommandOptionValue::Integer(value)) => Ok(Some(*value)),
+        Some(_) => Err(SCHEDULE_LIST_INVALID_PAGE),
+    }
 }

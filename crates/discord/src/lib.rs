@@ -23,6 +23,8 @@ mod drop_poison_test_serial;
 pub mod executor;
 mod executor_metrics;
 pub mod funnel_invites;
+#[cfg(feature = "db")]
+pub mod giveaway;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{
@@ -41,6 +43,8 @@ pub mod internal_member_moderation;
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
+#[cfg(feature = "db")]
+mod lfg_list;
 pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;
@@ -61,8 +65,8 @@ pub mod voice_rooms;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{
-    CommunityFactsError, DeferredCommunityFacts, LevelingRuntime, OrderedLevelingPipeline,
-    RulesAcceptedWrite,
+    AwardRequest, CommunityFactsError, DeferredCommunityFacts, LevelingRuntime,
+    LevelingRuntimeError, OrderedLevelingPipeline, RulesAcceptedWrite,
 };
 
 pub use adapter::event_to_core;
@@ -74,9 +78,9 @@ pub use executor::{
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{
-    command_to_twilight, deferred_response, dispatch_interaction, help_response, publish_commands,
-    refusal_response, response_for_slash, route_interaction, text_response, DispatchOptions,
-    InteractionReplyTransport, RoutedInteraction,
+    command_to_twilight, deferred_response, dispatch_interaction, help_detail_response,
+    help_response, publish_commands, refusal_response, response_for_slash, route_interaction,
+    text_response, DispatchOptions, InteractionReplyTransport, RoutedInteraction,
 };
 pub use internal_events::{event_status_name, scheduled_event_body, EventActionError, EventCall};
 pub use pipeline::{

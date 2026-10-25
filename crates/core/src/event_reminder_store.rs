@@ -26,11 +26,15 @@ pub struct EventReminder {
     pub starts_at: String,
     pub channel_id: String,
     pub attendees: Vec<String>,
+    /// Exact eligible total, not the overflow sentinel in the capped array.
+    pub attendee_count: i64,
 }
 
 /// Only scheduled future events in this guild with attendees and a channel.
-/// Both the candidate batch and each attendee read are bounded, even for rows
-/// that bypassed RSVP admission. Completed fences never starve later events.
+/// The candidate batch and attendee array are bounded, even for rows that
+/// bypassed RSVP admission. A guild/event-scoped scalar count covers the full
+/// eligible roster without loading its members. Completed fences never starve
+/// later events.
 pub async fn due_event_reminders(
     pool: &PgPool,
     guild: &str,
@@ -41,7 +45,10 @@ pub async fn due_event_reminders(
                 ARRAY(SELECT r.user_id FROM event_rsvps r
                       WHERE r.guild_id = e.guild_id AND r.event_id = e.event_id
                         AND r.status IN ('going', 'interested')
-                      ORDER BY r.user_id LIMIT $5) AS attendees
+                      ORDER BY r.user_id LIMIT $5) AS attendees,
+                (SELECT count(*) FROM event_rsvps r
+                  WHERE r.guild_id = e.guild_id AND r.event_id = e.event_id
+                    AND r.status IN ('going', 'interested')) AS attendee_count
            FROM scheduled_events e
           WHERE e.guild_id = $1 AND e.status = 'scheduled'
             AND e.channel_id IS NOT NULL AND e.starts_at > $2 AND e.starts_at <= $3
@@ -91,6 +98,9 @@ pub async fn begin_event_reminder_delivery(
                        WHERE r.guild_id = e.guild_id AND r.event_id = e.event_id
                          AND r.status IN ('going', 'interested')
                        ORDER BY r.user_id LIMIT $10) = $9
+            AND (SELECT count(*) FROM event_rsvps r
+                  WHERE r.guild_id = e.guild_id AND r.event_id = e.event_id
+                    AND r.status IN ('going', 'interested')) = $11
             AND (SELECT count(*) FROM automation_audit_log
                   WHERE guild_id = $1 AND action = 'rsvp.reminder_attempt') < $8
          ON CONFLICT (id) DO NOTHING",
@@ -105,6 +115,7 @@ pub async fn begin_event_reminder_delivery(
     .bind(DELIVERY_CAP)
     .bind(&event.attendees)
     .bind(MAX_RSVPS_PER_EVENT + 1)
+    .bind(event.attendee_count)
     .execute(&mut *tx)
     .await?;
     let admitted = inserted.rows_affected() == 1;

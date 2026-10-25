@@ -15,6 +15,7 @@
 - [Secret inventory: names only](#secret-inventory-names-only)
 - [Legacy review and deliberately unported operations](#legacy-review-and-deliberately-unported-operations)
 - [Keep the runbook honest](#keep-the-runbook-honest)
+- [Giveaways](#giveaways)
 
 **Alert anchors**
 
@@ -2232,7 +2233,9 @@ disarms the drill by redeploy.
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
    --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
-   Dispatches bypass the hold, so arm and disarm work while it is armed.
+   Explicit arm/disarm dispatches bypass the hold. Error-rate rollback proofs,
+   including the daily automated dispatch, honor it and fail without deploying
+   while it is armed; do not clear the hold for a proof.
    The arm run stays red by design: the history guard fails it after a green
    deploy and synthetic so the pin never reads as staging history for the
    head. Read the deploy and synthetic steps, not the run color.
@@ -2802,8 +2805,8 @@ authorization, then repeat health/readiness/log observations. Confirm only one
 gateway session and record version, image, first ready time and remaining
 limitations. None of these examples were a live rollback drill.
 
-**Staging drill.** The manual `staging-rollback-drill` workflow (dispatch from
-`main`, input `target_version`) runs this procedure end to end in the protected
+**Staging drill.** The manual Worker-only option of `staging-rollback-drill`
+(dispatch from `main`, input `target_version`) runs this procedure end to end in the protected
 `staging` environment: fence, one unforced Cloudflare deployment of the target
 with `code_update_strategy: immediate`, epoch-checked takeover, a 2 s
 `/readyz` + `/health` poll, then the same sequence back to the original version.
@@ -2813,7 +2816,9 @@ refuses an unknown or never-deployed id). The job summary and evidence file hold
 the fence, rollback, takeover and first-ready times, the time-to-ready against
 the workflow's 60 s budget, probe counts, the container image digest and
 instance counts. This workflow interval is not an outage-start recovery
-measurement and cannot prove B2's under-60-second recovery criterion.
+measurement and cannot prove B2's under-60-second recovery criterion. An empty
+`target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
+which also runs on a daily schedule and verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
@@ -3620,3 +3625,39 @@ command existence, **not authorization, successful deployment, backup custody,
 Discord effects, or a live rollback**. Required exact-head merge gates remain
 `ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB test
 lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.
+
+## Giveaways
+
+`/giveaway create|list|cancel|end|pause|resume|extend|reroll` requires Manage
+Server; entry buttons are open to human members with per-interaction role and
+age checks. Limits: prize 1–200 characters, duration 1–43200 minutes,
+winners 1–100, 10 active giveaways per guild, 1000 entrants each (one paced
+membership re-check per entrant must fit the 300 s draw run). Entry
+attempts have a bounded process-local 10/minute member budget, and successful
+entries share a durable 10/minute guild/member budget across giveaways and
+restarts. Duplicates collapse to one row. `gw:<id>` carries only the opaque
+id; the server resolves guild, message, deadline, status, requirements and
+capacity.
+
+The giveaway row is recorded before its message posts. If sending or the
+message-id attachment fails, never blindly re-post: inspect the channel for
+a delivered message and cancel the recorded id if needed. An unconfirmed
+definition holds an active slot and takes no entries.
+
+`giveaway_countdown` ticks every 15 seconds; durable claims permit at most
+one cosmetic refresh at each 1h, 10min, 1min and ending-soon threshold
+through the shared REST pacing guard. Count edits are best-effort; the
+entry row stays authoritative when a display edit fails.
+
+`giveaway_draw` ticks every 15 seconds: it claims due giveaways under a
+10-minute lease, re-validates eligibility from fresh membership reads, runs
+the pure draw, commits one draw row and flips to drawn, then announces (edit
+the giveaway message, post the winners with seed and revealed nonce, mark
+announced). Drawn-but-unannounced rows re-announce from the stored row and
+never re-draw; a stale claim with a stored draw skips to announce. Pause
+excludes a giveaway from the due scan; resume extends the deadline by the
+paused span. Rerolls append a new draw round and leave history intact. No
+winner DMs: deferred until a DM send path exists. Staging smoke: create,
+enter from two test members, verify two rows plus ephemeral replies, end,
+verify the draw row plus winners post, reroll, verify a second round, then
+cancel a fresh giveaway and verify a later entry is refused.

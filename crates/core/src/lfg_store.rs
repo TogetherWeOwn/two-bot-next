@@ -137,6 +137,71 @@ pub async fn put_lfg(
     Ok(())
 }
 
+/// Result of a metadata-only edit. Refusals and no-ops never rewrite a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LfgEditOutcome {
+    Missing,
+    Closed,
+    Unchanged { starts_at: String },
+    Updated { starts_at: String },
+}
+
+/// Edit validated metadata without upserting a post or touching roles/signups.
+/// The domain lock orders this with signup/close; the row lock also prevents a
+/// concurrent lifecycle writer from being overwritten. Omitted timestamps keep
+/// their original database precision rather than round-tripping through millis.
+pub async fn edit_lfg_metadata(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    id: &str,
+    title: Option<&str>,
+    starts_at: Option<&str>,
+) -> Result<LfgEditOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("lfg:{guild_id}:{id}"))
+        .execute(&mut *tx)
+        .await?;
+    let row: Option<(String, time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT status, starts_at FROM lfg_posts WHERE guild_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, old_starts_at)) = row else {
+        tx.commit().await?;
+        return Ok(LfgEditOutcome::Missing);
+    };
+    if status != "open" {
+        tx.commit().await?;
+        return Ok(LfgEditOutcome::Closed);
+    }
+    let updated: Option<time::OffsetDateTime> = sqlx::query_scalar(
+        "UPDATE lfg_posts
+         SET title = COALESCE($3, title), starts_at = COALESCE($4::timestamptz, starts_at)
+         WHERE guild_id = $1 AND id = $2 AND status = 'open'
+           AND (($3::text IS NOT NULL AND title IS DISTINCT FROM $3)
+             OR ($4::timestamptz IS NOT NULL AND starts_at IS DISTINCT FROM $4::timestamptz))
+         RETURNING starts_at",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .bind(title)
+    .bind(starts_at)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(match updated {
+        Some(starts_at) => LfgEditOutcome::Updated {
+            starts_at: iso_millis_utc(starts_at),
+        },
+        None => LfgEditOutcome::Unchanged {
+            starts_at: iso_millis_utc(old_starts_at),
+        },
+    })
+}
+
 /// Save an accepted message without replacing roles, signups or a concurrent close.
 pub async fn save_lfg_message_id(
     pool: &sqlx::PgPool,
@@ -217,6 +282,51 @@ pub async fn get_lfg(
         },
     )
     .transpose()
+}
+
+/// Read one current-channel keyset page, plus one lookahead, without loading
+/// signup/role/member data or taking any mutation/delivery locks. Today's LFG
+/// policy has no start-time expiry: past open confirmed posts remain eligible.
+/// Every visibility/identity predicate is applied in SQL before LIMIT.
+pub async fn list_lfg_channel(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    channel_id: &str,
+    after: Option<&crate::lfg_list::ListCursor>,
+) -> Result<Vec<crate::lfg_list::ListPost>, sqlx::Error> {
+    type ListRow = (String, String, String, Option<i64>, time::OffsetDateTime);
+    let rows: Vec<ListRow> = sqlx::query_as(
+        "SELECT id, title, message_id,
+                CASE WHEN isfinite(starts_at)
+                     THEN trunc(extract(epoch FROM starts_at))::bigint END,
+                created_at
+         FROM lfg_posts
+         WHERE guild_id = $1 AND channel_id = $2 AND status = 'open'
+           AND message_id ~ '^[1-9][0-9]{0,19}$'
+           AND (length(message_id) < 20 OR message_id COLLATE \"C\" <= $5)
+           AND isfinite(created_at)
+           AND ($3::timestamptz IS NULL OR (created_at, id) > ($3, $4))
+         ORDER BY created_at ASC, id ASC LIMIT 6",
+    )
+    .bind(guild_id)
+    .bind(channel_id)
+    .bind(after.map(|cursor| cursor.created_at))
+    .bind(after.map(|cursor| cursor.id.as_str()))
+    .bind(u64::MAX.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, title, message_id, starts_at, created_at)| crate::lfg_list::ListPost {
+                id,
+                title,
+                message_id,
+                starts_at,
+                created_at,
+            },
+        )
+        .collect())
 }
 
 /// Delete a post (cascades to roles + signups). Legacy `deleteLfg`: the
@@ -302,12 +412,15 @@ pub async fn signup_lfg(
         .bind(format!("lfg:{guild_id}:{id}"))
         .execute(&mut *tx)
         .await?;
-    let post: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM lfg_posts WHERE guild_id = $1 AND id = $2")
-            .bind(guild_id)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let post: Option<(String,)> = sqlx::query_as(
+        "SELECT CASE WHEN starts_at <= $3::timestamptz THEN 'closed' ELSE status END
+             FROM lfg_posts WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .bind(joined_at)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some((status,)) = post else {
         tx.commit().await?;
         return Ok(SignupOutcome::Missing);

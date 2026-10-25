@@ -54,7 +54,9 @@ use twilight_model::{
 };
 use two_bot_core::voice_presence::MemberPresence;
 use two_bot_core::{
-    evaluate_permissions as evaluate_health, metrics, now_iso,
+    evaluate_permissions as evaluate_health,
+    message_safety::{text_len, CONTENT_LIMIT},
+    metrics, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
@@ -11439,8 +11441,40 @@ pub fn setup_member_panel(halted: bool, needs_attention: bool) -> SetupPanel {
     }
 }
 
-#[must_use]
-pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
+/// Budget for an admin `/setup` description: the transport bound minus the
+/// `**Voice rooms**\n` reply prefix the handler adds, so paging budgets
+/// before sending instead of relying on the final safety clip.
+const SETUP_DESCRIPTION_BOUND: usize = CONTENT_LIMIT - "**Voice rooms**\n".len();
+
+/// One admin `/setup` creator row. Rows sort by channel id at pack time;
+/// this only renders.
+fn setup_creator_row(creator: &CreatorChannel) -> String {
+    let position = match creator.position {
+        RoomPosition::Above => "above",
+        RoomPosition::Below => "below",
+    };
+    format!("- <#{}>: new rooms {position}", creator.channel_id)
+}
+
+/// Sorted creator rows for the admin view (channel id ascending, stable).
+/// A failed creator read shows no rows: the error line below says so, and a
+/// partial list must not pose as the complete set.
+fn setup_sorted_rows(summary: &SetupSummary) -> Vec<String> {
+    if summary.store_error.is_some() {
+        return Vec::new();
+    }
+    let mut creators: Vec<&CreatorChannel> = summary.creators.iter().collect();
+    creators.sort_by_key(|creator| creator.channel_id);
+    creators
+        .iter()
+        .map(|creator| setup_creator_row(creator))
+        .collect()
+}
+
+/// Fixed description lines above the creator rows: status, store error, and
+/// the empty-list line or creator header. `row_total` is the full sorted row
+/// count, so the header stays truthful on every page.
+fn setup_prefix_lines(summary: &SetupSummary, row_total: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if summary.halted {
         lines.push(
@@ -11455,22 +11489,18 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
         lines.push(format!(
             "Could not load creator channels ({error}); the worker state below is current."
         ));
-    }
-    if summary.creators.is_empty() {
-        if summary.store_error.is_none() {
-            lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
-        }
+    } else if row_total == 0 {
+        lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
     } else {
-        lines.push(format!("Creator channels ({})", summary.creators.len()));
-        for creator in &summary.creators {
-            let position = match creator.position {
-                RoomPosition::Above => "above",
-                RoomPosition::Below => "below",
-            };
-            lines.push(format!("- <#{}>: new rooms {position}", creator.channel_id));
-        }
+        lines.push(format!("Creator channels ({row_total})"));
     }
-    lines.push(format!("Tracked rooms: {}.", summary.tracked_rooms));
+    lines
+}
+
+/// Fixed description lines below the creator rows: room count and the newest
+/// failures. Rendered on every page so health never hides behind pagination.
+fn setup_suffix_lines(summary: &SetupSummary) -> Vec<String> {
+    let mut lines = vec![format!("Tracked rooms: {}.", summary.tracked_rooms)];
     if summary.failures.is_empty() {
         lines.push("No recent failures.".to_owned());
     } else {
@@ -11479,10 +11509,146 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
             lines.push(format!("- {failure}"));
         }
     }
+    lines
+}
+
+/// Worst-case navigation cost: page numbers fit the creator count's digits.
+fn setup_page_chrome(row_total: usize) -> usize {
+    if row_total <= 1 {
+        return 0;
+    }
+    let wide = "9".repeat(row_total.to_string().len());
+    text_len(&format!("Page {wide} of {wide}"))
+        + 1
+        + text_len(&format!("Next page: /setup page:{wide}"))
+        + 1
+}
+
+/// Keep the fixed status and diagnostic lines within budget too. Prefer the
+/// unchanged single-page view when it fits; otherwise reserve navigation and
+/// one complete creator row before admitting whole diagnostic lines. Health
+/// findings come first from the caller; omitted diagnostics are counted,
+/// never clipped through an ID or mention token.
+fn setup_page_lines(summary: &SetupSummary, rows: &[String]) -> (Vec<String>, Vec<String>) {
+    let prefix = setup_prefix_lines(summary, rows.len());
+    let mut suffix = setup_suffix_lines(summary);
+    let units = |lines: &[String]| lines.iter().map(|line| text_len(line) + 1).sum::<usize>();
+    if units(&prefix) + units(&suffix) + units(rows) <= SETUP_DESCRIPTION_BOUND + 1 {
+        return (prefix, suffix);
+    }
+    let row = rows.iter().map(|row| text_len(row) + 1).max().unwrap_or(0);
+    let budget = SETUP_DESCRIPTION_BOUND
+        .saturating_sub(units(&prefix) + row + setup_page_chrome(rows.len()));
+    if !summary.failures.is_empty() {
+        loop {
+            let omitted = summary.failures.len().saturating_sub(suffix.len() - 2);
+            let notice = format!("Additional failure details not shown: {omitted}.");
+            let notice_units = if omitted > 0 {
+                text_len(&notice) + 1
+            } else {
+                0
+            };
+            if units(&suffix) + notice_units <= budget || suffix.len() == 2 {
+                if omitted > 0 {
+                    suffix.push(notice);
+                }
+                break;
+            }
+            suffix.pop();
+        }
+    }
+    (prefix, suffix)
+}
+
+/// Greedy row ranges that fit [`SETUP_DESCRIPTION_BOUND`] with worst-case
+/// page chrome reserved. Empty when there are no rows; otherwise every page
+/// holds at least one row, so packing always makes progress.
+fn setup_row_pages(summary: &SetupSummary) -> Vec<(usize, usize)> {
+    let rows = setup_sorted_rows(summary);
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let (prefix, suffix) = setup_page_lines(summary, &rows);
+    // Each line plus its joining newline; the one extra newline this counts
+    // keeps every estimate conservative, never over the bound.
+    let fixed: usize = prefix
+        .iter()
+        .chain(suffix.iter())
+        .map(|line| text_len(line) + 1)
+        .sum();
+    let all_rows: usize = rows.iter().map(|row| text_len(row) + 1).sum();
+    if fixed + all_rows <= SETUP_DESCRIPTION_BOUND + 1 {
+        return vec![(0, rows.len())];
+    }
+    let capacity = SETUP_DESCRIPTION_BOUND
+        .saturating_sub(fixed + setup_page_chrome(rows.len()))
+        .max(1);
+    let mut pages = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, row) in rows.iter().enumerate() {
+        let need = text_len(row) + 1;
+        if index > start && used + need > capacity {
+            pages.push((start, index));
+            start = index;
+            used = 0;
+        }
+        used += need;
+    }
+    pages.push((start, rows.len()));
+    pages
+}
+
+/// Page count for the admin `/setup` view: 1 when there are no creator rows
+/// (empty or failed read), otherwise the greedy bounded pack.
+#[must_use]
+pub fn setup_page_total(summary: &SetupSummary) -> usize {
+    setup_row_pages(summary).len().max(1)
+}
+
+/// Render admin `/setup` page `page` (1-based). Out-of-range pages clamp to
+/// the nearest page; callers that must refuse past-end input check
+/// [`setup_page_total`] first. A fitting single-page view keeps its diagnostic
+/// lines unchanged; oversized diagnostics omit whole tail lines with a count.
+/// Page metadata and the next-page hint appear only with multiple pages.
+#[must_use]
+pub fn setup_panel_page(summary: &SetupSummary, page: usize) -> SetupPanel {
+    let rows = setup_sorted_rows(summary);
+    let pages = setup_row_pages(summary);
+    let total = pages.len().max(1);
+    let page = page.clamp(1, total);
+    let (mut lines, suffix) = setup_page_lines(summary, &rows);
+    if let Some((start, end)) = pages.get(page - 1) {
+        lines.extend(rows[*start..*end].iter().cloned());
+    }
+    lines.extend(suffix);
+    if total > 1 {
+        lines.push(format!("Page {page} of {total}"));
+        if page < total {
+            lines.push(format!("Next page: /setup page:{}", page + 1));
+        }
+    }
     SetupPanel {
         title: "Voice rooms".to_owned(),
         description: lines.join("\n"),
     }
+}
+
+#[must_use]
+pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
+    setup_panel_page(summary, 1)
+}
+
+/// Short refusal for a malformed `/setup` page: names the remedy and a valid
+/// start, serves no rows.
+fn setup_page_refusal() -> String {
+    "Unknown page. Use /setup page:1 to see the first page.".to_owned()
+}
+
+/// Short refusal past the last `/setup` page: same shape, plus the real total.
+fn setup_past_end_refusal(total: usize) -> String {
+    let pages = if total == 1 { "page" } else { "pages" };
+    format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
 }
 
 /// Voice definitions for the guild command merge, gated on `TWO_VOICE=1`.
@@ -11821,7 +11987,9 @@ pub enum VoiceCommand {
     Create {
         name: String,
     },
-    Setup,
+    Setup {
+        page: PageArg,
+    },
     Ping,
     Invite,
     TextChannels {
@@ -11904,11 +12072,63 @@ pub enum LoggingAction {
     Invalid,
 }
 
+/// Decoded `page` option for the `/setup` and `/access show` read paths.
+/// `Missing` behaves as page 1; `Invalid` (zero, negative, overflowing,
+/// wrong-typed or duplicated) refuses without touching the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageArg {
+    Missing,
+    Page(usize),
+    Invalid,
+}
+
+impl PageArg {
+    /// 1-based page number, or `None` for [`PageArg::Invalid`].
+    #[must_use]
+    pub fn number(self) -> Option<usize> {
+        match self {
+            Self::Missing => Some(1),
+            Self::Page(number) => Some(number),
+            Self::Invalid => None,
+        }
+    }
+}
+
+/// Strictly decode the optional `page` option: exactly one Integer of at
+/// least 1. Duplicates and every non-integer shape refuse, as do zero,
+/// negatives and values that cannot index a page. Huge but well-typed
+/// integers stay `Page` and refuse past-end at dispatch with the real total.
+/// Unrelated options are ignored.
+fn decode_page(options: &[CommandDataOption]) -> PageArg {
+    let mut seen: Option<PageArg> = None;
+    for option in options {
+        if option.name != "page" {
+            continue;
+        }
+        if seen.is_some() {
+            return PageArg::Invalid;
+        }
+        seen = Some(match &option.value {
+            CommandOptionValue::Integer(number) => match usize::try_from(*number) {
+                Ok(number) if number >= 1 => PageArg::Page(number),
+                _ => PageArg::Invalid,
+            },
+            _ => PageArg::Invalid,
+        });
+    }
+    match seen {
+        Some(page) => page,
+        None => PageArg::Missing,
+    }
+}
+
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
 /// is answered, never silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessAction {
-    Show,
+    Show {
+        page: PageArg,
+    },
     Creation(bool),
     RequiredRole(Option<Snowflake>),
     Restrict {
@@ -11970,7 +12190,9 @@ fn parse_voice_command_with_registry(
                 .unwrap_or_default();
             Some(VoiceCommand::Create { name })
         }
-        "setup" => Some(VoiceCommand::Setup),
+        "setup" => Some(VoiceCommand::Setup {
+            page: decode_page(&command.options),
+        }),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
         "textchannels" => {
@@ -12417,7 +12639,9 @@ fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
             _ => None,
         });
     match sub.name.as_str() {
-        "show" => AccessAction::Show,
+        "show" => AccessAction::Show {
+            page: decode_page(args),
+        },
         "creation" => args
             .iter()
             .find(|option| option.name == "enabled")
@@ -12457,7 +12681,7 @@ impl VoiceCommand {
     fn name(&self) -> &'static str {
         match self {
             Self::Create { .. } => "create",
-            Self::Setup => "setup",
+            Self::Setup { .. } => "setup",
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::TextChannels { .. } => "textchannels",
@@ -12896,9 +13120,9 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
-/// Render the controls for `/access show` and as the confirmation after a change.
-fn access_summary(controls: &AccessControls) -> String {
-    let mut lines = vec![
+/// Creation and required-role context, rendered on every `/access show` page.
+fn access_context_lines(controls: &AccessControls) -> Vec<String> {
+    vec![
         format!(
             "Room creation: {}",
             if controls.room_creation_enabled {
@@ -12911,25 +13135,227 @@ fn access_summary(controls: &AccessControls) -> String {
             Some(role) => format!("Required role: <@&{role}>"),
             None => "Required role: none".to_owned(),
         },
-    ];
+    ]
+}
+
+/// One restriction row, roles in stored order. An empty role list fails
+/// closed (`admins only`). The command name is mention-neutralized so a
+/// stored key can never page a mass mention.
+fn access_row(command: &str, roles: &[Snowflake]) -> String {
+    let who = if roles.is_empty() {
+        "admins only".to_owned()
+    } else {
+        roles
+            .iter()
+            .map(|role| format!("<@&{role}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    format!("- /{safe}: {who}")
+}
+
+/// Render units for one restriction: the whole row when it fits `capacity`,
+/// else explicitly labeled deterministic continuation segments
+/// (`- /cmd (part i of k): ...`), roles in stored order, never splitting a
+/// mention token. Empty roles never split: the whole row is short.
+fn access_row_units(command: &str, roles: &[Snowflake], capacity: usize) -> Vec<String> {
+    let whole = access_row(command, roles);
+    if roles.is_empty() || text_len(&whole) <= capacity {
+        return vec![whole];
+    }
+    // Worst-case segment label over every segment (a segment holds at least
+    // one role, so the segment count never exceeds the role count).
+    let wide = "9".repeat(roles.len().to_string().len().max(1));
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    let label = |index: usize, total: usize| format!("- /{safe} (part {index} of {total}): ");
+    let worst_label = text_len(&format!("- /{safe} (part {wide} of {wide}): "));
+    let segment_capacity = capacity.saturating_sub(worst_label).max(1);
+    let mut segments: Vec<Vec<Snowflake>> = vec![Vec::new()];
+    let mut used = 0;
+    for role in roles {
+        let mention = format!("<@&{role}>");
+        let need = text_len(&mention) + 1;
+        let current_is_empty = segments.last().is_some_and(Vec::is_empty);
+        if !current_is_empty && used + need > segment_capacity {
+            segments.push(Vec::new());
+            used = 0;
+        }
+        if let Some(current) = segments.last_mut() {
+            current.push(*role);
+        }
+        used += need;
+    }
+    let total = segments.len().max(1);
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let mentions = segment
+                .iter()
+                .map(|role| format!("<@&{role}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{}{mentions}", label(index + 1, total))
+        })
+        .collect()
+}
+
+/// Row budget for `/access show`: a fitting whole reply needs no navigation.
+/// Otherwise reserve fixed context and worst-case page chrome (the page count
+/// never exceeds the unit count, and every page number fits its digits).
+fn access_page_capacity(controls: &AccessControls) -> usize {
+    let fixed: usize = access_context_lines(controls)
+        .iter()
+        .map(|line| text_len(line) + 1)
+        .sum::<usize>()
+        + text_len("Restricted commands:")
+        + 1;
+    // Check the complete legacy reply before reserving navigation: chrome
+    // that will never be shown must not split a fitting restriction row.
+    let whole_rows: usize = controls
+        .command_roles
+        .iter()
+        .map(|(command, roles)| text_len(&access_row(command, roles)) + 1)
+        .sum();
+    if fixed + whole_rows <= CONTENT_LIMIT + 1 {
+        return CONTENT_LIMIT + 1 - fixed;
+    }
+    let upper = (controls.command_roles.len()
+        + controls.command_roles.values().map(Vec::len).sum::<usize>())
+    .max(1);
+    let wide = "9".repeat(upper.to_string().len());
+    let chrome = text_len(&format!("Page {wide} of {wide}"))
+        + 1
+        + text_len(&format!("Next page: /access show page:{wide}"))
+        + 1;
+    CONTENT_LIMIT.saturating_sub(fixed + chrome).max(1)
+}
+
+/// All restriction render units in command-name ascending order
+/// (`command_roles` is a `BTreeMap`, so iteration already sorts).
+fn access_units(controls: &AccessControls, capacity: usize) -> Vec<String> {
+    let mut units = Vec::new();
+    for (command, roles) in &controls.command_roles {
+        units.extend(access_row_units(command, roles, capacity));
+    }
+    units
+}
+
+/// Greedy unit ranges that fit [`CONTENT_LIMIT`] with worst-case page chrome
+/// reserved. Empty when there are no restrictions; otherwise every page
+/// holds at least one unit, so packing always makes progress.
+fn access_show_pages(controls: &AccessControls) -> Vec<(usize, usize)> {
+    let capacity = access_page_capacity(controls);
+    let units = access_units(controls, capacity);
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let fixed: usize = access_context_lines(controls)
+        .iter()
+        .map(|line| text_len(line) + 1)
+        .sum::<usize>()
+        + text_len("Restricted commands:")
+        + 1;
+    let all_units: usize = units.iter().map(|unit| text_len(unit) + 1).sum();
+    if fixed + all_units <= CONTENT_LIMIT + 1 {
+        return vec![(0, units.len())];
+    }
+    let mut pages = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, unit) in units.iter().enumerate() {
+        let need = text_len(unit) + 1;
+        if index > start && used + need > capacity {
+            pages.push((start, index));
+            start = index;
+            used = 0;
+        }
+        used += need;
+    }
+    pages.push((start, units.len()));
+    pages
+}
+
+/// Page count for `/access show`: 1 when there are no restrictions,
+/// otherwise the greedy bounded pack.
+fn access_show_total(controls: &AccessControls) -> usize {
+    access_show_pages(controls).len().max(1)
+}
+
+/// Render `/access show` page `page` (1-based). Out-of-range pages clamp to
+/// the nearest page; callers that must refuse past-end input check
+/// [`access_show_total`] first. Single-page output is byte-identical to the
+/// legacy summary; page metadata and the next-page hint appear only when
+/// there is more than one page.
+fn access_show_page(controls: &AccessControls, page: usize) -> String {
+    let capacity = access_page_capacity(controls);
+    let units = access_units(controls, capacity);
+    let pages = access_show_pages(controls);
+    let total = pages.len().max(1);
+    let page = page.clamp(1, total);
+    let mut lines = access_context_lines(controls);
     if controls.command_roles.is_empty() {
         lines.push("Restricted commands: none".to_owned());
     } else {
         lines.push("Restricted commands:".to_owned());
-        for (command, roles) in &controls.command_roles {
-            let who = if roles.is_empty() {
-                "admins only".to_owned()
-            } else {
-                roles
-                    .iter()
-                    .map(|role| format!("<@&{role}>"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            lines.push(format!("- /{command}: {who}"));
+        if let Some((start, end)) = pages.get(page - 1) {
+            lines.extend(units[*start..*end].iter().cloned());
+        }
+    }
+    if total > 1 {
+        lines.push(format!("Page {page} of {total}"));
+        if page < total {
+            lines.push(format!("Next page: /access show page:{}", page + 1));
         }
     }
     lines.join("\n")
+}
+
+/// Short refusal for a malformed `/access show` page: names the remedy and a
+/// valid start, serves no rows and leaks no role mentions.
+fn access_page_refusal() -> String {
+    "Unknown page. Use /access show page:1 to see the first page.".to_owned()
+}
+
+/// Short refusal past the last `/access show` page: same shape, plus the
+/// real total.
+fn access_past_end_refusal(total: usize) -> String {
+    let pages = if total == 1 { "page" } else { "pages" };
+    format!(
+        "Unknown page. /access show has {total} {pages}; use /access show page:1 to start over."
+    )
+}
+
+/// Short truthful post-save confirmations: what changed plus a pointer at
+/// the paged read view. Never the full restriction list.
+fn access_creation_ack(enabled: bool) -> String {
+    let state = if enabled {
+        "on"
+    } else {
+        "off (existing rooms and commands keep working)"
+    };
+    format!("Saved.\nRoom creation: {state}\nSee /access show page:1 for the current settings.")
+}
+
+fn access_required_role_ack(role: Option<Snowflake>) -> String {
+    let line = match role {
+        Some(role) => format!("Required role: <@&{role}>"),
+        None => "Required role: none".to_owned(),
+    };
+    format!("Saved.\n{line}\nSee /access show page:1 for the current settings.")
+}
+
+fn access_restrict_ack(command: &str, roles: &[Snowflake]) -> String {
+    format!(
+        "Saved.\n{}\nSee /access show page:1 for the current settings.",
+        access_row(command, roles)
+    )
+}
+
+fn access_unrestrict_ack(command: &str) -> String {
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    format!("Saved.\n`{safe}` is no longer restricted.\nSee /access show page:1 for the current settings.")
 }
 
 /// Apply one `/access` action: read, change, validate, save, then hand the
@@ -12941,6 +13367,15 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
+    // A malformed read page refuses before any store touch: no read cost,
+    // no save, no actor/config/audit mutation.
+    let show_page_invalid = matches!(
+        &action,
+        AccessAction::Show { page } if page.number().is_none()
+    );
+    if show_page_invalid {
+        return access_page_refusal();
+    }
     let mut controls = match store.access_controls(guild_id).await {
         Ok(controls) => controls,
         Err(error) => {
@@ -12949,34 +13384,51 @@ async fn execute_access<S: RoomPersistence>(
                 .to_owned();
         }
     };
-    match action {
-        AccessAction::Show => return access_summary(&controls),
+    let ack = match action {
+        AccessAction::Show { page } => {
+            let Some(number) = page.number() else {
+                return access_page_refusal();
+            };
+            let total = access_show_total(&controls);
+            if number > total {
+                return access_past_end_refusal(total);
+            }
+            return access_show_page(&controls, number);
+        }
         AccessAction::Invalid => {
             return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
                 .to_owned()
         }
-        AccessAction::Creation(enabled) => controls.room_creation_enabled = enabled,
-        AccessAction::RequiredRole(role) => controls.required_role = role,
+        AccessAction::Creation(enabled) => {
+            controls.room_creation_enabled = enabled;
+            access_creation_ack(enabled)
+        }
+        AccessAction::RequiredRole(role) => {
+            controls.required_role = role;
+            access_required_role_ack(role)
+        }
         AccessAction::Restrict { command, roles } => {
             if !is_voice_command(&command) {
                 return format!("/{command} is not a voice-room command, so nothing was changed.");
             }
+            let ack = access_restrict_ack(&command, &roles);
             controls.command_roles.insert(command, roles);
+            ack
         }
         AccessAction::Unrestrict(command) => {
             if controls.command_roles.remove(&command).is_none() {
                 return format!("/{command} has no role restriction, so nothing was changed.");
             }
+            access_unrestrict_ack(&command)
         }
-    }
+    };
     if validate_access_controls(&controls).is_err() {
         return "Those settings are not valid, so nothing was changed.".to_owned();
     }
     match store.save_access_controls(guild_id, &controls).await {
         Ok(()) => {
-            let summary = access_summary(&controls);
             on_saved(controls);
-            format!("Saved.\n{summary}")
+            ack
         }
         Err(error) => {
             log_admin_store_failure("access_save", guild_id, error);
@@ -13139,6 +13591,30 @@ where
     S: RoomPersistence + Send + 'static,
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
+{
+    // Keep the command state machine shared across initial-response capture and
+    // deferred completion; only this small adapter depends on the callback type.
+    let reply: VoiceReply<'_> = Box::new(move |response| Box::pin(reply(response)));
+    handle_voice_interaction_shared(runtime, interaction, invite_code, inventory, names, reply)
+        .await
+}
+
+type VoiceReply<'a> = Box<
+    dyn FnOnce(InteractionResponse) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + 'a,
+>;
+
+#[inline(never)]
+async fn handle_voice_interaction_shared<S, H>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    invite_code: Option<&str>,
+    inventory: Option<&GuildInventory>,
+    names: &NameDirectory,
+    reply: VoiceReply<'_>,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
 {
     let Some(guild_id) = interaction_guild(interaction) else {
         return false;
@@ -13305,41 +13781,57 @@ where
             }
             true
         }
-        VoiceCommand::Setup => {
+        VoiceCommand::Setup { page } => {
             let permissions = runtime.guild_permissions(interaction);
             let status = runtime.worker_status(guild_id).await;
-            let panel = if is_voice_admin(permissions) {
-                let (store, _) = runtime.make_pair();
-                let (creators, store_error) = match store.creators(guild_id).await {
-                    Ok(creators) => (creators, None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
-                };
-                setup_panel(&SetupSummary {
-                    guild_id,
-                    creators,
-                    tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                    // Current health findings first: they are live, failures are history.
-                    failures: status.as_ref().map_or_else(Vec::new, |status| {
-                        status
-                            .health
-                            .iter()
-                            .chain(status.failures.iter())
-                            .cloned()
-                            .collect()
-                    }),
-                    halted: status.as_ref().is_some_and(|status| status.halted),
-                    store_error,
-                })
-            } else {
+            if !is_voice_admin(permissions) {
                 // No store read for a member: the generic view needs none, and
                 // an open command should not cost a query per invocation.
-                setup_member_panel(
+                // Forged `page` input never enters the admin/store path.
+                let panel = setup_member_panel(
                     status.as_ref().is_some_and(|status| status.halted),
                     status.as_ref().is_some_and(|status| {
                         !status.health.is_empty() || !status.failures.is_empty()
                     }),
-                )
+                );
+                reply(ephemeral_response(&format!(
+                    "**{}**\n{}",
+                    panel.title, panel.description
+                )))
+                .await;
+                return true;
+            }
+            let Some(page_number) = page.number() else {
+                reply(ephemeral_response(&setup_page_refusal())).await;
+                return true;
             };
+            let (store, _) = runtime.make_pair();
+            let (creators, store_error) = match store.creators(guild_id).await {
+                Ok(creators) => (creators, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
+            let summary = SetupSummary {
+                guild_id,
+                creators,
+                tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
+                // Current health findings first: they are live, failures are history.
+                failures: status.as_ref().map_or_else(Vec::new, |status| {
+                    status
+                        .health
+                        .iter()
+                        .chain(status.failures.iter())
+                        .cloned()
+                        .collect()
+                }),
+                halted: status.as_ref().is_some_and(|status| status.halted),
+                store_error,
+            };
+            let total = setup_page_total(&summary);
+            if page_number > total {
+                reply(ephemeral_response(&setup_past_end_refusal(total))).await;
+                return true;
+            }
+            let panel = setup_panel_page(&summary, page_number);
             reply(ephemeral_response(&format!(
                 "**{}**\n{}",
                 panel.title, panel.description

@@ -163,6 +163,52 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
     }
 }
 
+/// One immediate ephemeral detail reply for `/help command:name` (or its
+/// unknown-name correction). Short detail stays in content; longer detail
+/// moves to one embed description, truncated with an explicit notice past
+/// Discord's description ceiling. The executor sanitizer stays the final
+/// mention/length backstop.
+#[must_use]
+pub fn help_detail_response(detail: String) -> InteractionResponse {
+    if two_bot_core::message_safety::text_len(&detail)
+        <= two_bot_core::message_safety::CONTENT_LIMIT
+    {
+        return text_response(InteractionReply::new(detail, true));
+    }
+    let mut description = detail;
+    if two_bot_core::message_safety::text_len(&description)
+        > two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT
+    {
+        description = two_bot_core::message_safety::truncate(
+            &description,
+            two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT - 64,
+        ) + "…(detail truncated for display.)";
+    }
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            allowed_mentions: Some(Default::default()),
+            embeds: Some(vec![Embed {
+                author: None,
+                color: None,
+                description: Some(description),
+                fields: Vec::new(),
+                footer: None,
+                image: None,
+                kind: "rich".to_owned(),
+                provider: None,
+                thumbnail: None,
+                timestamp: None,
+                title: None,
+                url: None,
+                video: None,
+            }]),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
 #[must_use]
 pub fn deferred_response(ephemeral: bool) -> InteractionResponse {
     InteractionResponse {
@@ -184,6 +230,40 @@ pub fn refusal_response(refusal: RouterRefusal) -> InteractionResponse {
     text_response(InteractionReply::new(refusal.message(), true))
 }
 
+/// Wrong-type `preview` refusal, in the feed/sticky strict-decode style: name
+/// the option and show a copyable corrected invocation.
+#[cfg(feature = "db")]
+const LFG_INVALID_PREVIEW: &str = "Invalid preview. Use /lfg title:<title> starts-at:<iso-8601> roles:<role:Label:count> preview:true.";
+/// Duplicated `preview` refusal, same style as [`LFG_INVALID_PREVIEW`].
+#[cfg(feature = "db")]
+const LFG_DUPLICATE_PREVIEW: &str = "Duplicate preview. Use /lfg title:<title> starts-at:<iso-8601> roles:<role:Label:count> preview:true.";
+
+/// Strict `/lfg` `preview` decode: omitted means post, boolean `true`
+/// previews, anything else refuses before any store or channel effect.
+/// Duplicates win over wrong types, matching the feed/sticky/schedule
+/// strict decoders; unknown options stay ignored.
+#[cfg(feature = "db")]
+fn decode_lfg_preview(
+    options: &[twilight_model::application::interaction::application_command::CommandDataOption],
+) -> Result<bool, crate::lfg_interactions::LfgError> {
+    use twilight_model::application::interaction::application_command::CommandOptionValue;
+    let mut found = options.iter().filter(|option| option.name == "preview");
+    let Some(first) = found.next() else {
+        return Ok(false);
+    };
+    if found.next().is_some() {
+        return Err(crate::lfg_interactions::LfgError::Invalid(
+            LFG_DUPLICATE_PREVIEW.into(),
+        ));
+    }
+    match &first.value {
+        CommandOptionValue::Boolean(preview) => Ok(*preview),
+        _ => Err(crate::lfg_interactions::LfgError::Invalid(
+            LFG_INVALID_PREVIEW.into(),
+        )),
+    }
+}
+
 #[must_use]
 pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse> {
     match outcome {
@@ -197,9 +277,10 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
 }
 
 /// Shared execution runtime: route once, acknowledge promptly, then run the
-/// registered feature (RSVP/attendance totals and host check-in, LFG, and the
-/// other wired slices) through the shared REST executor. Unsupported features
-/// remain owned by their integration slices, not by a second dispatcher.
+/// registered feature (RSVP/attendance totals and host check-in, LFG,
+/// giveaways, and the other wired slices) through the shared REST executor.
+/// Unsupported features remain owned by their integration slices, not by a
+/// second dispatcher.
 #[cfg(feature = "db")]
 #[derive(Debug)]
 pub struct InteractionRuntime {
@@ -210,7 +291,9 @@ pub struct InteractionRuntime {
     pub pool: sqlx::Pool<sqlx::Postgres>,
     pub executor: crate::ActionExecutor,
     pub classifier: two_bot_core::ClassifierConfig,
+    classifier_provider: Option<std::sync::Arc<dyn crate::rsvp::ClassifierProvider>>,
     lfg: crate::lfg_interactions::LfgInteractions,
+    giveaway: crate::giveaway::GiveawayRuntime,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
 }
@@ -240,7 +323,10 @@ impl InteractionRuntime {
             &routed,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Handled {
-                    handler: two_bot_core::HandlerId::Lfg | two_bot_core::HandlerId::LfgClose,
+                    handler: two_bot_core::HandlerId::Lfg
+                        | two_bot_core::HandlerId::LfgClose
+                        | two_bot_core::HandlerId::LfgEdit
+                        | two_bot_core::HandlerId::LfgList,
                 },
                 ..
             } | RoutedInteraction::Component {
@@ -251,6 +337,22 @@ impl InteractionRuntime {
             }
         ) {
             return self.handle_routed(interaction, routed).await;
+        }
+        if matches!(
+            &routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: two_bot_core::HandlerId::Giveaway,
+                },
+                ..
+            } | RoutedInteraction::Component {
+                outcome: two_bot_core::ComponentOutcome::Handled {
+                    handler: two_bot_core::ComponentHandler::GiveawayEntry,
+                },
+                ..
+            }
+        ) {
+            return self.handle_giveaway(interaction, routed).await;
         }
         // A refusal for a non-RSVP command (LFG permission or feature gates)
         // must still be answered. The RSVP path ignores those names, so it
@@ -270,10 +372,58 @@ impl InteractionRuntime {
             &self.router,
             &self.pool,
             &self.executor,
-            &self.classifier,
+            self.classifier_provider(),
             interaction,
         )
         .await
+    }
+
+    /// Run one routed giveaway interaction: defer ephemerally, then execute
+    /// the slash command or the entry button through the shared giveaway
+    /// runtime. A failed defer owns the interaction without running, exactly
+    /// like the bot dispatch path.
+    async fn handle_giveaway(
+        &self,
+        interaction: &Interaction,
+        routed: RoutedInteraction,
+    ) -> Result<bool, crate::DiscordError> {
+        if self
+            .executor
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &deferred_response(true),
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!(interaction_id = %interaction.id, "giveaway defer failed; details withheld");
+            return Ok(true);
+        }
+        match routed {
+            RoutedInteraction::Slash { .. } => self.giveaway.command(interaction).await,
+            RoutedInteraction::Component { custom_id, .. } => {
+                self.giveaway.enter(interaction, &custom_id).await;
+            }
+            RoutedInteraction::Modal { .. } | RoutedInteraction::Ignore => {}
+        }
+        Ok(true)
+    }
+
+    /// One giveaway due-scan tick over the configured guild: draw what is due
+    /// and re-announce what is drawn but unannounced. No configured guild
+    /// means no work. Inherent and zero-argument by contract: the timed-draw
+    /// acceptance calls this unqualified, shadowing its baseline adapter.
+    pub async fn tick_giveaways(
+        &self,
+    ) -> Result<crate::giveaway::GiveawayTickSummary, crate::giveaway::GiveawayJobError> {
+        let Some(guild) = self.router.gates().configured_guild else {
+            return Ok(crate::giveaway::GiveawayTickSummary {
+                drawn: 0,
+                announced: 0,
+            });
+        };
+        self.giveaway.tick(&guild.to_string()).await
     }
 
     /// True when this interaction can reach RSVP admission: the same
@@ -337,7 +487,7 @@ impl InteractionRuntime {
             prepared,
             &self.pool,
             &self.executor,
-            &self.classifier,
+            self.classifier_provider(),
         )
         .await
     }
@@ -399,15 +549,35 @@ impl InteractionRuntime {
         }
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgEdit)));
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgList)));
         Self {
             router: std::sync::Arc::new(router),
             pool: pool.clone(),
-            executor,
+            executor: executor.clone(),
             classifier,
-            lfg: crate::lfg_interactions::LfgInteractions::new(pool),
+            classifier_provider: None,
+            lfg: crate::lfg_interactions::LfgInteractions::new(pool.clone()),
+            giveaway: crate::giveaway::GiveawayRuntime::new(pool.clone(), executor.clone()),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Both direct and ordered attendance execution resolve this provider after
+    /// acknowledgement and live membership checks. Other features are unchanged.
+    pub fn with_classifier_provider(
+        mut self,
+        provider: std::sync::Arc<dyn crate::rsvp::ClassifierProvider>,
+    ) -> Self {
+        self.classifier_provider = Some(provider);
+        self
+    }
+
+    fn classifier_provider(&self) -> &dyn crate::rsvp::ClassifierProvider {
+        self.classifier_provider
+            .as_deref()
+            .unwrap_or(&self.classifier)
     }
 
     pub fn set_bot_user_id(&self, id: u64) {
@@ -470,6 +640,45 @@ impl InteractionRuntime {
         self.bot_user_id().await
     }
 
+    /// A read-only lookup has a one-second budget, leaving time for the
+    /// immediate ephemeral callback within Discord's three-second window.
+    async fn handle_lfg_list(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<bool, crate::DiscordError> {
+        use twilight_model::application::interaction::application_command::CommandOptionValue;
+        let channel_id = crate::channel_moderation::invoking_channel_id(interaction);
+        let (Some(guild), Some(channel_id), Some(InteractionData::ApplicationCommand(data))) =
+            (interaction.guild_id, channel_id, interaction.data.as_ref())
+        else {
+            return Ok(false);
+        };
+        let cursor = match data.options.iter().find(|option| option.name == "cursor") {
+            Some(option) => match &option.value {
+                CommandOptionValue::String(value) => Ok(Some(value.as_str())),
+                _ => Err(two_bot_core::lfg_list::INVALID_PAGE),
+            },
+            None => Ok(None),
+        };
+        let reply = match cursor {
+            Ok(cursor) => tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                crate::lfg_list::list(&self.pool, &guild.to_string(), &channel_id, cursor),
+            )
+            .await
+            .unwrap_or_else(|_| two_bot_core::lfg_list::UNAVAILABLE.into()),
+            Err(reply) => reply.into(),
+        };
+        self.executor
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &text_response(InteractionReply::new(reply, true)),
+            )
+            .await?;
+        Ok(true)
+    }
+
     /// Execute an outcome from this runtime's shared router without routing twice.
     pub async fn handle_routed(
         &self,
@@ -488,6 +697,13 @@ impl InteractionRuntime {
         use two_bot_core::{ComponentHandler, HandlerId};
         let request = match routed {
             RoutedInteraction::Slash {
+                outcome:
+                    SlashOutcome::Handled {
+                        handler: HandlerId::LfgList,
+                    },
+                ..
+            } => return self.handle_lfg_list(interaction).await,
+            RoutedInteraction::Slash {
                 outcome: SlashOutcome::Refuse { refusal },
                 ..
             } => {
@@ -503,7 +719,7 @@ impl InteractionRuntime {
             RoutedInteraction::Slash {
                 outcome:
                     SlashOutcome::Handled {
-                        handler: HandlerId::Lfg | HandlerId::LfgClose,
+                        handler: HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit,
                     },
                 ..
             } => {
@@ -522,16 +738,49 @@ impl InteractionRuntime {
                         .ok_or_else(|| LfgError::Invalid(format!("Missing {name} option.")))
                 };
                 if data.name == "lfg" {
-                    option("title").and_then(|title| {
-                        Ok(LfgRequest::Create {
-                            title,
-                            starts_at: option("starts-at")?,
-                            roles: option("roles")?,
-                            channel_id: interaction
-                                .channel
-                                .as_ref()
-                                .map(|c| c.id.to_string())
-                                .ok_or_else(|| LfgError::Invalid("Missing channel.".into()))?,
+                    // Combinators, not `?`: this arm evaluates to a request
+                    // result, while the function returns a dispatch result.
+                    decode_lfg_preview(&data.options).and_then(|preview| {
+                        option("title").and_then(|title| {
+                            let starts_at = option("starts-at")?;
+                            let roles = option("roles")?;
+                            if preview {
+                                Ok(LfgRequest::Preview {
+                                    title,
+                                    starts_at,
+                                    roles,
+                                })
+                            } else {
+                                Ok(LfgRequest::Create {
+                                    title,
+                                    starts_at,
+                                    roles,
+                                    channel_id: interaction
+                                        .channel
+                                        .as_ref()
+                                        .map(|c| c.id.to_string())
+                                        .ok_or_else(|| {
+                                            LfgError::Invalid("Missing channel.".into())
+                                        })?,
+                                })
+                            }
+                        })
+                    })
+                } else if data.name == "lfg-edit" {
+                    let optional = |name: &str| -> Result<Option<String>, LfgError> {
+                        match data.options.iter().find(|option| option.name == name) {
+                            None => Ok(None),
+                            Some(option) => match &option.value {
+                                CommandOptionValue::String(value) => Ok(Some(value.clone())),
+                                _ => Err(LfgError::Invalid(format!("{name} must be text."))),
+                            },
+                        }
+                    };
+                    option("id").and_then(|post_id| {
+                        Ok(LfgRequest::Edit {
+                            post_id,
+                            title: optional("title")?,
+                            starts_at: optional("starts-at")?,
                         })
                     })
                 } else {
@@ -843,7 +1092,7 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
         kind,
         max_length: opt.max_length.and_then(|m| u16::try_from(m).ok()),
         max_value: opt.max_value.map(CommandOptionValue::Integer),
-        min_length: None,
+        min_length: opt.min_length.and_then(|m| u16::try_from(m).ok()),
         min_value: opt.min_value.map(CommandOptionValue::Integer),
         name: opt.name.clone(),
         name_localizations: None,
@@ -953,7 +1202,12 @@ mod help_response_tests {
                 .as_str()
                 .expect("embed description");
             assert_eq!(description, text, "no truncation at the REST boundary");
-            let tokens: Vec<_> = description
+            // The RSVP note carries a copyable event-link example whose
+            // slashes tokenize as path fragments, not commands; exclude it
+            // from the exact-once command count.
+            let without_example =
+                description.replace("https://discord.com/events/<server-id>/<event-id>", "");
+            let tokens: Vec<_> = without_example
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
                 .filter(|token| token.starts_with('/') && token.len() > 1)
                 .collect();
@@ -963,5 +1217,93 @@ mod help_response_tests {
                 assert_eq!(tokens.iter().filter(|name| **name == token).count(), 1);
             }
         }
+    }
+
+    #[test]
+    fn short_detail_stays_in_ephemeral_content() {
+        let detail = "/rank — Show your XP, level and server rank.\nUsage: /rank [member]\n";
+        let wire =
+            serde_json::to_value(help_detail_response(detail.to_owned())).expect("serializes");
+        assert_eq!(wire["type"], 4);
+        assert_eq!(wire["data"]["flags"], 64);
+        assert_eq!(
+            wire["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(wire["data"]["content"], detail);
+        assert!(wire["data"]["embeds"].is_null());
+    }
+
+    #[test]
+    fn wide_rendered_detail_preserves_its_complete_notice_through_the_adapter() {
+        use two_bot_core::commands::{CommandChoice, CommandOption, CommandOptionType};
+
+        let options = (0..25)
+            .map(|n| {
+                CommandOption::new(
+                    &format!("option{n:02}"),
+                    &format!("Argument {n:02}"),
+                    CommandOptionType::String,
+                )
+                .choices(
+                    (0..25)
+                        .map(|c| CommandChoice {
+                            name: format!("Label {c:02} {}", "😀".repeat(40)),
+                            value: format!("value_{c:02}"),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let detail = CommandDefinition::new("maximum", "Valid wide definition")
+            .options(options)
+            .help_detail_text();
+        assert!(text_len(&detail) > CONTENT_LIMIT, "exercise the embed path");
+        assert!(
+            text_len(&detail) <= EMBED_DESCRIPTION_LIMIT,
+            "the renderer must fit without the adapter's fallback"
+        );
+        assert!(detail.ends_with("\n…(detail truncated; /help lists every confirmed command.)\n"));
+        let response = help_detail_response(detail.clone());
+        let safe =
+            crate::message_safety::interaction_response(&response).expect("sanitized detail reply");
+        for reply in [response, safe] {
+            let wire = serde_json::to_value(reply).expect("serializes");
+            assert_eq!(wire["type"], 4);
+            assert_eq!(wire["data"]["flags"], 64);
+            assert_eq!(
+                wire["data"]["allowed_mentions"]["parse"],
+                serde_json::json!([])
+            );
+            assert!(wire["data"]["content"].is_null());
+            assert_eq!(wire["data"]["embeds"].as_array().expect("embeds").len(), 1);
+            assert_eq!(wire["data"]["embeds"][0]["description"], detail);
+        }
+    }
+
+    #[test]
+    fn overlong_detail_moves_to_a_bounded_embed_description() {
+        let detail = "x".repeat(EMBED_DESCRIPTION_LIMIT + 500);
+        let wire = serde_json::to_value(help_detail_response(detail)).expect("serializes");
+        assert!(wire["data"]["content"].is_null());
+        let description = wire["data"]["embeds"][0]["description"]
+            .as_str()
+            .expect("embed description");
+        assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(description.contains("truncated"));
+    }
+
+    #[test]
+    fn declared_min_length_reaches_the_publish_boundary() {
+        let option = two_bot_core::commands::CommandOption::new(
+            "label",
+            "Short text",
+            two_bot_core::commands::CommandOptionType::String,
+        )
+        .min_length(2)
+        .max_length(37);
+        let wire = serde_json::to_value(option_to_twilight(&option)).expect("serializes");
+        assert_eq!(wire["min_length"], 2);
+        assert_eq!(wire["max_length"], 37);
     }
 }

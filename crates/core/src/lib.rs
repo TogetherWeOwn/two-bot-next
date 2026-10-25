@@ -98,6 +98,7 @@ pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
 pub mod lfg;
+pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
@@ -276,19 +277,19 @@ pub use funnel::{
 pub use giveaway::{
     adjudicate_eligibility, draw, draw_seed, eligible_hash, extend_deadline_ms, is_due,
     mint_draw_nonce, parse_requirements, parse_reroll_kind, reroll_kind_single, resume_deadline_ms,
-    single_reroll_pool, transition, validate_duration_seconds, validate_new_giveaway,
-    validate_prize, validate_winners_count, Eligibility, GiveawayError, GiveawayEvent,
-    GiveawayRequirements, GiveawayStatus, MemberStanding, NewGiveawayInput, RerollKind,
-    ValidatedGiveaway, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS, EXTEND_MAX_SECONDS,
+    single_reroll_keep, single_reroll_pool, transition, validate_duration_seconds,
+    validate_new_giveaway, validate_prize, validate_winners_count, Eligibility, GiveawayError,
+    GiveawayEvent, GiveawayRequirements, GiveawayStatus, MemberStanding, NewGiveawayInput,
+    RerollKind, ValidatedGiveaway, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS, EXTEND_MAX_SECONDS,
     EXTEND_MIN_SECONDS, FIRST_DRAW_NO, PRIZE_MAX_CHARS, PRIZE_MIN_CHARS, REQUIREMENT_MAX_AGE_DAYS,
     REROLL_KIND_FULL, WINNERS_MAX, WINNERS_MIN,
 };
 #[cfg(feature = "db")]
 pub use giveaway_store::{
     claim_due_giveaway, complete_draw, create_giveaway, delete_giveaway, get_draws, get_giveaway,
-    insert_draw, latest_draw_no, list_entries, mark_announced, mark_drawn, release_claim,
-    set_giveaway_status, upsert_entry, GiveawayDrawRow, GiveawayEntryRow, GiveawayRow, NewDraw,
-    NewGiveaway,
+    insert_draw, insert_reroll_draw, latest_draw_no, list_entries, mark_announced, mark_drawn,
+    release_claim, set_giveaway_status, upsert_entry, GiveawayDrawRow, GiveawayEntryRow,
+    GiveawayRow, NewDraw, NewGiveaway,
 };
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,
@@ -407,13 +408,13 @@ pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
     checkin_idempotency_key, checkin_metadata_json, checkin_occurrence_full_text,
     checkin_recorded_text, checkin_source, checkin_source_event_id, is_snowflake,
-    parse_attendance_occurrence, partition_rsvps, require_manage_events, rsvp_event_full_text,
-    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
-    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
-    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
-    AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION, CHECKIN_AUDIT_OUTCOME_RECORDED,
-    MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT, MAX_RSVP_WRITES_PER_USER_PER_MINUTE,
-    RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+    normalize_event_link, parse_attendance_occurrence, partition_rsvps, require_manage_events,
+    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text, rsvp_saved_text_with_event,
+    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceOccurrence,
+    AttendanceProof, CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals,
+    RsvpTransition, ATTENDANCE_EVENT_TYPE, AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION,
+    CHECKIN_AUDIT_OUTCOME_RECORDED, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
 };
 pub use rsvp_conversion::{
     assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
@@ -455,8 +456,8 @@ pub use self_roles::{
     reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
     self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
     ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
-    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
-    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    PlanRejection, ResolvedRole, RoleOperation, SafeRefusal, SelfRoleConfigError, SelfRoleGates,
+    SelfRoleOption, SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
     SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{

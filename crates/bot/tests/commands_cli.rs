@@ -65,21 +65,32 @@ fn matching_registry() -> Value {
     let mut wire = compiled_registry();
     let commands = wire.as_array_mut().unwrap();
     for (index, command) in commands.iter_mut().enumerate() {
+        // The server echoes the writable permission gate; only everyone-commands
+        // come back null. Forcing null on a gated command would fake drift.
+        let gated = command
+            .get("default_member_permissions")
+            .is_some_and(|value| !value.is_null());
         let object = command.as_object_mut().unwrap();
         object.insert("id".into(), json!((8000 + index).to_string()));
         object.insert("application_id".into(), json!(APP_ID.to_string()));
         object.insert("guild_id".into(), json!(GUILD_ID.to_string()));
         object.insert("version".into(), json!("9876"));
         object.insert("nsfw".into(), json!(false));
-        object.insert("default_member_permissions".into(), Value::Null);
+        if !gated {
+            object.insert("default_member_permissions".into(), Value::Null);
+        }
         object.insert("name_localizations".into(), json!({}));
         object.insert("description_localizations".into(), json!({}));
         object.entry("options").or_insert(json!([]));
         for option in command["options"].as_array_mut().unwrap() {
             let object = option.as_object_mut().unwrap();
-            object.insert("required".into(), json!(false));
+            // The server echoes back required flags and fixed choices: only
+            // fill in Discord's defaults where the compiled option omits
+            // them, so a required choice option (like `/reopen kind`)
+            // still matches its own echo.
+            object.entry("required").or_insert(json!(false));
             object.insert("autocomplete".into(), json!(false));
-            object.insert("choices".into(), json!([]));
+            object.entry("choices").or_insert(json!([]));
             object.insert("name_localizations".into(), json!({}));
             object.insert("description_localizations".into(), json!({}));
         }
@@ -128,6 +139,8 @@ async fn diff_and_publish_default_to_get_only_without_opening_a_database() {
             "+ 1/rank",
             "+ 1/leaderboard",
             "+ 1/help",
+            "+ 1/reopen",
+            "+ 1/welcome-preview",
             "Dry run: no commands written.",
         ] {
             assert!(

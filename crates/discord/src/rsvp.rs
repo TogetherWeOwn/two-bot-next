@@ -11,17 +11,30 @@ use twilight_model::{
 use two_bot_core::{
     attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
     checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
-    compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
-    put_rsvp_with_audit, record_checkin_with_audit, require_manage_events, rsvp_event_full_text,
-    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
-    AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
-    RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
+    compensate_rsvp_write, list_rsvps, normalize_event_link, now_iso, parse_attendance_occurrence,
+    partition_rsvps, put_rsvp_with_audit, record_checkin_with_audit, require_manage_events,
+    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text, rsvp_saved_text_with_event,
+    validate_event_id, validate_occurrence_id, AttendanceProof, CheckinWrite, ClassifierConfig,
+    ClassifyInput, HandlerId, InteractionRouter, RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError,
+    SlashOutcome,
 };
 
 use crate::{
     executor::{ActionExecutor, DiscordError},
     interactions::{response_for_slash, route_interaction, RoutedInteraction},
 };
+
+/// Resolves attendance classification immediately before the fact write, not
+/// when an interaction is acknowledged. Static callers can pass their config.
+pub trait ClassifierProvider: std::fmt::Debug + Send + Sync {
+    fn config_for_guild(&self, guild_id: &str) -> ClassifierConfig;
+}
+
+impl ClassifierProvider for ClassifierConfig {
+    fn config_for_guild(&self, _guild_id: &str) -> ClassifierConfig {
+        self.clone()
+    }
+}
 
 /// Acknowledgement is separate from ordered effects: the gateway prepares
 /// queued commands immediately, then completes them in dispatch order. The
@@ -124,7 +137,7 @@ pub async fn complete_rsvp_interaction(
     prepared: PreparedRsvp,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
 ) -> Result<bool, DiscordError> {
     let Some((handler, interaction)) = prepared.deferred else {
         return Ok(prepared.handled);
@@ -148,7 +161,7 @@ pub async fn handle_rsvp_interaction(
     router: &InteractionRouter,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
     interaction: &Interaction,
 ) -> Result<bool, DiscordError> {
     let prepared = prepare_rsvp_interaction(router, executor, interaction.clone()).await?;
@@ -261,7 +274,7 @@ async fn execute(
     handler: HandlerId,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
     interaction: &Interaction,
 ) -> Result<String, String> {
     // Fail closed: only the RSVP handlers execute here. A foreign handler id
@@ -281,23 +294,40 @@ async fn execute(
         .guild_id
         .ok_or("This command requires a guild.")?
         .to_string();
-    let string_option = |name: &str| -> Result<&str, String> {
-        data.options
-            .iter()
-            .find_map(|option| {
-                if option.name == name {
-                    if let CommandOptionValue::String(value) = &option.value {
-                        return Some(value.as_str());
-                    }
+    // Strict option decoding: exactly one option per name, at the expected
+    // type. A duplicated or mistyped option refuses with the existing
+    // missing/invalid text before any lookup or write — silently taking the
+    // first string match would let a forged duplicate smuggle a value past
+    // the member's visible picker state.
+    let single_option = |name: &str| -> Result<&CommandOptionValue, String> {
+        let mut found: Option<&CommandOptionValue> = None;
+        for option in &data.options {
+            if option.name == name {
+                if found.is_some() {
+                    return Err(format!("Missing or invalid {name} option."));
                 }
-                None
-            })
-            .ok_or_else(|| format!("Missing or invalid {name} option."))
+                found = Some(&option.value);
+            }
+        }
+        found.ok_or_else(|| format!("Missing or invalid {name} option."))
+    };
+    let string_option = |name: &str| -> Result<&str, String> {
+        match single_option(name)? {
+            CommandOptionValue::String(value) => Ok(value.as_str()),
+            _ => Err(format!("Missing or invalid {name} option.")),
+        }
     };
     match handler {
         HandlerId::Rsvp | HandlerId::RsvpAttendance => {
-            let event_id =
-                validate_event_id(string_option("event-id")?).map_err(|e| e.to_string())?;
+            // A pasted event link normalizes to its numeric id; anything else
+            // falls through to the existing id validation, which refuses
+            // malformed input with the legacy error before any lookup or write.
+            let raw_reference = string_option("event-id")?;
+            let (reference, pasted_link) = match normalize_event_link(raw_reference, &guild_id) {
+                Some(event_id) => (event_id, true),
+                None => (raw_reference.to_owned(), false),
+            };
+            let event_id = validate_event_id(&reference).map_err(|e| e.to_string())?;
             // Legacy totals read persisted responses even after cancellation or
             // deletion; only an RSVP mutation requires live-event validation.
             if handler == HandlerId::RsvpAttendance {
@@ -416,7 +446,13 @@ async fn execute(
                 }
                 return Err(refusal);
             }
-            Ok(rsvp_saved_text(status))
+            // Pasted links confirm with the stable numeric identity they
+            // normalized to; raw ids keep the legacy sentence byte-identical.
+            Ok(if pasted_link {
+                rsvp_saved_text_with_event(status, &record.event_id)
+            } else {
+                rsvp_saved_text(status)
+            })
         }
         HandlerId::ScorecardAttendance => {
             // RA-02: Manage Events first, for every host check-in including
@@ -431,24 +467,22 @@ async fn execute(
                     .map_or(0, |p| p.bits()),
             )
             .map_err(|e| e.to_string())?;
-            let occurrence = validate_occurrence_id(string_option("event-occurrence")?)
-                .map_err(|e| e.to_string())?;
+            // A pasted event link normalizes to its bare numeric id; anything
+            // else falls through to the existing occurrence parsing, which
+            // refuses bare slugs and malformed input before any network or
+            // store work.
+            let raw_occurrence = string_option("event-occurrence")?;
+            let reference = normalize_event_link(raw_occurrence, &guild_id)
+                .unwrap_or_else(|| raw_occurrence.to_owned());
+            let occurrence = validate_occurrence_id(&reference).map_err(|e| e.to_string())?;
             // Trusted guild-scoped occurrence form (RA-02): a bare event id or
             // `{event_id}:{label}`. Bare slugs refuse here, before any network
             // or store work.
             let resolved = parse_attendance_occurrence(&occurrence).map_err(|e| e.to_string())?;
-            let member_id = data
-                .options
-                .iter()
-                .find_map(|option| {
-                    if option.name == "member" {
-                        if let CommandOptionValue::User(id) = option.value {
-                            return Some(id);
-                        }
-                    }
-                    None
-                })
-                .ok_or("Missing or invalid member option.")?;
+            let member_id = match single_option("member")? {
+                CommandOptionValue::User(id) => *id,
+                _ => return Err("Missing or invalid member option.".to_owned()),
+            };
             // Discord resolves the selected User; fail closed before any
             // network rather than looking up a forged id.
             let user_known = data
@@ -491,7 +525,8 @@ async fn execute(
                     Membership::Current => {}
                     Membership::Absent => {
                         return Err(
-                            "You must still belong to this server to record attendance.".to_owned()
+                            "You must still be a member of this server to record attendance."
+                                .to_owned(),
                         );
                     }
                     Membership::Unavailable => {
@@ -526,8 +561,9 @@ async fn execute(
                     .as_bool()
                     .ok_or("Unable to verify attendance member.")?,
             };
+            let config = classifier.config_for_guild(&guild_id);
             let verdict = classify(
-                classifier,
+                &config,
                 &ClassifyInput {
                     guild_id: guild_id.clone(),
                     actor_id: member_id_str.clone(),

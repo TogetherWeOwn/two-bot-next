@@ -14,8 +14,21 @@ pub enum LfgRequest {
         roles: String,
         channel_id: String,
     },
+    /// Private `/lfg preview:true` render: validated and rendered with the
+    /// same framework-free core as [`LfgRequest::Create`], but answered
+    /// before admission with no pool, identity, audit or channel effect.
+    Preview {
+        title: String,
+        starts_at: String,
+        roles: String,
+    },
     Close {
         post_id: String,
+    },
+    Edit {
+        post_id: String,
+        title: Option<String>,
+        starts_at: Option<String>,
     },
     Select(LfgSelectAction),
 }
@@ -40,7 +53,7 @@ pub enum LfgError {
     CoolingDown,
 }
 
-/// LFG executions allowed to hold a pool connection at once, per process.
+/// LFG executions allowed to hold a pool connection at once, per service.
 ///
 /// Each execution keeps its advisory-lock transaction open across paced REST
 /// and takes one more connection for every store call. With the production
@@ -56,6 +69,13 @@ pub const LFG_MAX_IN_FLIGHT: usize = 1;
 /// [`LfgError::Busy`] instead of queueing, so a burst of sign-ups cannot fill
 /// the lane and starve unrelated commands.
 pub const LFG_MAX_WAITING: usize = 8;
+
+/// Lifecycle policy: stop signups at start, close after a 15-minute grace,
+/// and reconcile unrecorded deliveries after five minutes. A tick never
+/// examines more than 20 candidates, even if its caller requests more.
+pub const LFG_EXPIRY_GRACE: time::Duration = time::Duration::minutes(15);
+pub const LFG_ORPHAN_AGE: time::Duration = time::Duration::minutes(5);
+pub const LFG_SWEEP_MAX_ROWS: usize = 20;
 
 /// Store-backed feature service. The shared interaction runtime owns routing and replies.
 #[derive(Debug)]
@@ -157,9 +177,32 @@ impl LfgInteractions {
         interaction_id: u64,
         bot_user_id: u64,
     ) -> Result<String, LfgError> {
+        // Preview answers before identity derivation, queue admission, locks,
+        // SQL, audit or channel effects: pure validation plus the creation
+        // body renderer, with no store dependency at all.
+        if let LfgRequest::Preview {
+            title,
+            starts_at,
+            roles,
+        } = &request
+        {
+            let now = time::OffsetDateTime::now_utc();
+            return lfg::preview_lfg_content(
+                title,
+                starts_at,
+                roles,
+                (now.unix_timestamp_nanos() / 1_000_000) as i64,
+            )
+            .map_err(LfgError::Invalid);
+        }
         let id = match &request {
             LfgRequest::Create { .. } => format!("lfg-{interaction_id}"),
+            // Preview returns above, before any persisted identity exists.
+            LfgRequest::Preview { .. } => {
+                return Err(LfgError::Invalid("Invalid LFG preview.".into()));
+            }
             LfgRequest::Close { post_id }
+            | LfgRequest::Edit { post_id, .. }
             | LfgRequest::Select(
                 LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
             ) => {
@@ -175,8 +218,6 @@ impl LfgInteractions {
         // channel refresh. Leave and close must remain usable for recovery.
         self.admit_signup(&request, guild_id, actor_id, interaction_id)
             .await?;
-        let now = time::OffsetDateTime::now_utc();
-        let at = lfg::iso_millis_utc(now);
         // Cap pool use before taking a connection: blocked lock waiters must not
         // starve the lock holder or the gateway checkpoint writer. The queue is
         // bounded too, so waiters cannot fill the shared interaction lane.
@@ -228,6 +269,10 @@ impl LfgInteractions {
         } else {
             None
         };
+        // Queue/lock waits may cross the start time. Judge a new signup at
+        // execution, not at arrival; a saved interaction receipt still wins.
+        let now = time::OffsetDateTime::now_utc();
+        let at = lfg::iso_millis_utc(now);
         let (action, outcome, reply, refresh) = match request {
             LfgRequest::Create {
                 title,
@@ -260,6 +305,36 @@ impl LfgInteractions {
                     created_at: at.clone(),
                     closed_at: None,
                 });
+                // A closed row is a replay fence, never permission to resend.
+                // Still recover an accepted message so a closed post does not
+                // retain stale signup controls after an uncertain delivery.
+                if post.status != LfgStatus::Open {
+                    if post.message_id.is_none() && bot_user_id != 0 {
+                        if let Some(message_id) = executor
+                            .recover_message_by_nonce(
+                                &post.channel_id,
+                                &lfg::lfg_nonce(&id),
+                                bot_user_id,
+                            )
+                            .await
+                            .map_err(|_| LfgError::Uncertain)?
+                        {
+                            store::save_lfg_message_id(&self.pool, guild_id, &id, &message_id)
+                                .await?;
+                        }
+                    }
+                    let reply = "This LFG is already closed; create a new post with /lfg.";
+                    // A prior recovery may have saved the ID before its edit
+                    // failed. Retry that edit too, without changing the result.
+                    let reply = match self.refresh(executor, guild_id, &id).await {
+                        Ok(()) => reply.into(),
+                        Err(_) => format!(
+                            "{reply} Message refresh failed; the saved result above still applies."
+                        ),
+                    };
+                    guard.commit().await?;
+                    return Ok(reply);
+                }
                 if fresh {
                     store::put_lfg(&self.pool, &post, &roles, true).await?;
                 }
@@ -295,7 +370,23 @@ impl LfgInteractions {
                                             "accepted message missing id".into(),
                                         )
                                     });
-                                    if error.is_safe_pre_mutation() {
+                                    let recovered = if error.is_safe_pre_mutation() {
+                                        None
+                                    } else {
+                                        executor
+                                            .recover_message_by_nonce(
+                                                &post.channel_id,
+                                                &nonce,
+                                                bot_user_id,
+                                            )
+                                            .await
+                                            .map_err(|_| LfgError::Uncertain)?
+                                    };
+                                    if let Some(id) = recovered {
+                                        id
+                                    } else {
+                                        // Both definitive no-send paths share cleanup;
+                                        // unreadable recovery still retains the row.
                                         store::delete_lfg(&self.pool, guild_id, &id).await?;
                                         self.audit(
                                             guild_id,
@@ -309,31 +400,6 @@ impl LfgInteractions {
                                         .await?;
                                         return Err(error.into());
                                     }
-                                    match executor
-                                        .recover_message_by_nonce(
-                                            &post.channel_id,
-                                            &nonce,
-                                            bot_user_id,
-                                        )
-                                        .await
-                                    {
-                                        Ok(Some(id)) => id,
-                                        Ok(None) => {
-                                            store::delete_lfg(&self.pool, guild_id, &id).await?;
-                                            self.audit(
-                                                guild_id,
-                                                actor_id,
-                                                interaction_id,
-                                                &id,
-                                                "lfg.create",
-                                                "failed",
-                                                &at,
-                                            )
-                                            .await?;
-                                            return Err(error.into());
-                                        }
-                                        Err(_) => return Err(LfgError::Uncertain),
-                                    }
                                 }
                             }
                         }
@@ -346,6 +412,68 @@ impl LfgInteractions {
                     lfg::created_reply(&id),
                     !fresh,
                 )
+            }
+            LfgRequest::Edit {
+                title, starts_at, ..
+            } => {
+                if title.is_none() && starts_at.is_none() {
+                    return Err(LfgError::Invalid(
+                        "Provide title or starts-at to edit.".into(),
+                    ));
+                }
+                let title = title
+                    .as_deref()
+                    .map(lfg::validate_title)
+                    .transpose()
+                    .map_err(|error| LfgError::Invalid(error.to_string()))?;
+                // Use the clock after waiting for the post lock, not admission.
+                let starts_at = starts_at
+                    .as_deref()
+                    .map(|value| {
+                        lfg::normalize_starts_at(
+                            value,
+                            (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                                as i64,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| LfgError::Invalid(error.to_string()))?;
+                let starts_at = match store::edit_lfg_metadata(
+                    &self.pool,
+                    guild_id,
+                    &id,
+                    title.as_deref(),
+                    starts_at.as_deref(),
+                )
+                .await?
+                {
+                    store::LfgEditOutcome::Missing => {
+                        return Err(LfgError::Invalid(
+                            "LFG post is missing in this server.".into(),
+                        ));
+                    }
+                    store::LfgEditOutcome::Closed => {
+                        return Err(LfgError::Invalid(
+                            "LFG post is closed and cannot be edited.".into(),
+                        ));
+                    }
+                    store::LfgEditOutcome::Unchanged { starts_at } => {
+                        guard.commit().await?;
+                        return Ok(format!("LFG unchanged. Starts at {starts_at}."));
+                    }
+                    store::LfgEditOutcome::Updated { starts_at } => starts_at,
+                };
+                (
+                    "lfg.edit",
+                    "updated".into(),
+                    format!("LFG edit saved. Starts at {starts_at}."),
+                    true,
+                )
+            }
+            // Preview returns before admission; reaching the store would be a
+            // routing defect, so fail closed without touching it.
+            LfgRequest::Preview { .. } => {
+                return Err(LfgError::Invalid("Invalid LFG preview.".into()));
             }
             LfgRequest::Close { .. } => {
                 let closed = store::close_lfg(&self.pool, guild_id, &id, &at).await?;
@@ -364,12 +492,30 @@ impl LfgInteractions {
             LfgRequest::Select(LfgSelectAction::Signup { role_key, .. }) => {
                 let outcome = match replay_outcome.as_ref() {
                     Some(outcome) => outcome.clone(),
-                    None => store::signup_lfg(&self.pool, guild_id, &id, &role_key, actor_id, &at)
-                        .await?
-                        .as_str()
-                        .to_owned(),
+                    None => {
+                        let post = store::get_lfg(&self.pool, guild_id, &id).await?;
+                        if post.as_ref().is_some_and(|post| {
+                            time::OffsetDateTime::parse(
+                                &post.starts_at,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .is_ok_and(|starts_at| starts_at <= now)
+                        }) {
+                            "started".to_owned()
+                        } else {
+                            store::signup_lfg(&self.pool, guild_id, &id, &role_key, actor_id, &at)
+                                .await?
+                                .as_str()
+                                .to_owned()
+                        }
+                    }
                 };
-                let reply = format!("LFG {outcome}.");
+                let reply = if outcome == "started" {
+                    "This LFG has already started; ask an organizer to create a new post with /lfg."
+                        .to_owned()
+                } else {
+                    format!("LFG {outcome}.")
+                };
                 ("lfg.signup", outcome, reply, true)
             }
             LfgRequest::Select(LfgSelectAction::Leave { .. }) => {
@@ -430,17 +576,142 @@ impl LfgInteractions {
         let result = if !audited {
             // Store calls committed independently of this lock-only transaction.
             // Do not turn applied state into a bare failure or claim an audit.
-            format!("{reply} Audit could not be recorded; check the saved state before retrying.")
+            if action == "lfg.edit" {
+                format!("{reply} Audit could not be recorded; the visible post could not be refreshed. Check the saved state before retrying.")
+            } else {
+                format!(
+                    "{reply} Audit could not be recorded; check the saved state before retrying."
+                )
+            }
         } else if refresh {
             match self.refresh(executor, guild_id, &id).await {
                 Ok(()) => reply,
-                Err(_) => format!("{reply} Message refresh failed; the saved state is unchanged."),
+                Err(_) if action == "lfg.edit" => {
+                    format!("{reply} The visible post could not be refreshed.")
+                }
+                Err(_) => {
+                    format!("{reply} Message refresh failed; the saved result above still applies.")
+                }
             }
         } else {
             reply
         };
         guard.commit().await?;
         Ok(result)
+    }
+
+    /// Process a bounded lifecycle batch for one configured guild. The jobs
+    /// supervisor is the only production caller; row-local failures are logged
+    /// without aborting later rows. The count includes failed row attempts.
+    pub async fn sweep_lifecycle(
+        &self,
+        executor: &ActionExecutor,
+        guild_id: &str,
+        bot_user_id: u64,
+        now: time::OffsetDateTime,
+        limit: usize,
+    ) -> Result<usize, LfgError> {
+        let limit = limit.min(LFG_SWEEP_MAX_ROWS);
+        if limit == 0 {
+            return Ok(0);
+        }
+        // Never treat an unresolved identity as evidence that a nonce is absent.
+        if bot_user_id == 0 {
+            return Err(LfgError::Uncertain);
+        }
+        let expired_before = now.saturating_sub(LFG_EXPIRY_GRACE);
+        let orphan_before = now.saturating_sub(LFG_ORPHAN_AGE);
+        let candidates: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM lfg_posts WHERE guild_id = $1 AND status = 'open'
+             AND (starts_at <= $2 OR (message_id IS NULL AND created_at <= $3))
+             ORDER BY created_at, id LIMIT $4",
+        )
+        .bind(guild_id)
+        .bind(expired_before)
+        .bind(orphan_before)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut processed = 0;
+        for (id,) in candidates {
+            match self
+                .sweep_lifecycle_row(executor, guild_id, bot_user_id, now, &id)
+                .await
+            {
+                Ok(true) => processed += 1,
+                Ok(false) => {}
+                Err(_) => {
+                    processed += 1;
+                    // Never log raw SQL/REST errors or member-controlled text.
+                    lifecycle_warning("lfg lifecycle row failed; continuing bounded batch");
+                }
+            }
+        }
+        tracing::info!(processed, "lfg lifecycle batch completed");
+        Ok(processed)
+    }
+
+    async fn sweep_lifecycle_row(
+        &self,
+        executor: &ActionExecutor,
+        guild_id: &str,
+        bot_user_id: u64,
+        now: time::OffsetDateTime,
+        id: &str,
+    ) -> Result<bool, LfgError> {
+        let _admitted = self.admit().await?;
+        let mut guard = self.pool.begin().await?;
+        // Same lock as interaction refresh. A contended row is left for the
+        // next tick rather than holding the batch behind a live interaction.
+        let locked: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("lfg-runtime:{guild_id}:{id}"))
+                .fetch_one(&mut *guard)
+                .await?;
+        if !locked {
+            return Ok(false);
+        }
+        let Some(post) = store::get_lfg(&self.pool, guild_id, id).await? else {
+            return Ok(false);
+        };
+        if post.status != LfgStatus::Open {
+            return Ok(false);
+        }
+        let parse = |at: &str| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| LfgError::Invalid("Invalid saved LFG timestamp.".into()))
+        };
+        let expired = parse(&post.starts_at)? <= now.saturating_sub(LFG_EXPIRY_GRACE);
+        let orphan = post.message_id.is_none()
+            && parse(&post.created_at)? <= now.saturating_sub(LFG_ORPHAN_AGE);
+        if !expired && !orphan {
+            return Ok(false);
+        }
+        let mut unrecovered = false;
+        if post.message_id.is_none() {
+            match executor
+                .recover_message_by_nonce(&post.channel_id, &lfg::lfg_nonce(id), bot_user_id)
+                .await
+            {
+                Ok(Some(message_id)) => {
+                    store::save_lfg_message_id(&self.pool, guild_id, id, &message_id).await?;
+                }
+                Ok(None) => unrecovered = true,
+                Err(_) => {
+                    // Keep the durable row, but release its open-post capacity.
+                    // An unreadable channel is never permission to resend.
+                    unrecovered = true;
+                    lifecycle_warning("lfg orphan recovery unreadable; closing retained row");
+                }
+            }
+        }
+        if expired || unrecovered {
+            store::close_lfg(&self.pool, guild_id, id, &lfg::iso_millis_utc(now)).await?;
+        }
+        // A recovered expired post must also lose its signup controls.
+        self.refresh(executor, guild_id, id).await?;
+        guard.commit().await?;
+        Ok(true)
     }
 
     async fn refresh(
@@ -503,6 +774,11 @@ impl LfgInteractions {
         .await?;
         Ok(())
     }
+}
+
+// One callsite for both constant warnings keeps tracing metadata shared.
+fn lifecycle_warning(message: &'static str) {
+    tracing::warn!(message = message);
 }
 
 /// Versioned, length-delimited request binding. Hashing keeps the audit reason

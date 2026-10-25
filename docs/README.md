@@ -1,12 +1,10 @@
 # Documentation map
 
-Link labels are one-line purposes; this is the sole discovery manifest.
-Rows use `- [Purpose](relative.md)` under area headings, including this index.
-Add a row with every new Markdown doc, including nested docs.
+Sole manifest: `- [Purpose](relative.md)` by area.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
 Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
-Otherwise exit 1: repair missing/stale rows or split oversized docs.
+Else exit 1: fix rows or split oversized docs.
 Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
 Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
 and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
@@ -19,11 +17,11 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Settings reference](configuration.md)
 - [Parity ledger](parity.md)
 - [Containment boundaries](containment.md)
-- [Prototype measurements](s2-prototype.md)
+- [Prototype metrics](s2-prototype.md)
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
 - [Read-only MCP tools](mcp.md)
-- [Admin token registry contract](admin-registry.md)
+- [Admin token registry](admin-registry.md)
 
 ## Operations and observability
 
@@ -34,6 +32,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Startup diagnostics](startup-diagnostics.md)
 - [Gateway recovery](gateway-recovery.md)
 - [Gateway failure rules](gateway-failure-classification.md)
+- [Deferred capture poison](deferred-capture-poison.md)
 - [Backups and restores](backup.md)
 - [Backfill procedure](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
@@ -42,15 +41,15 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Passive gradual promote](gradual-promote-caller.md)
 - [Logging contract](logging.md)
 - [Log/cardinality limits](log-volume-guard.md)
-- [Gateway event catalog](observability-event-catalog.md)
+- [Event catalog](observability-event-catalog.md)
 - [Pool gauge ownership](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
-- [Keepalive-gap spec](keepalive-gap-detector.md)
-- [Gateway alert queries](worker-gateway-failure-alerts.md)
-- [EventSub health queries](eventsub-subscription-health-queries.md)
-- [October 1 tabletop](incident-tabletop-2026-10-01.md)
-- [October 6 tabletop](incident-tabletop-2026-10-06.md)
-- [Gateway incident review](production-incident-2026-10-15-postmortem.md)
+- [Keepalive-gap](keepalive-gap-detector.md)
+- [Gateway alerts](worker-gateway-failure-alerts.md)
+- [EventSub health](eventsub-subscription-health-queries.md)
+- [Oct 1 tabletop](incident-tabletop-2026-10-01.md)
+- [Oct 6 tabletop](incident-tabletop-2026-10-06.md)
+- [Incident](production-incident-2026-10-15-postmortem.md)
 - [Ops audit reads](ops-control.md)
 
 ## Storage and internal actions
@@ -95,7 +94,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Channel access tests](channel-access-acceptance.md)
 - [Channel locking tests](channel-lockdown-acceptance.md)
 - [Channel runtime](channel-moderation-runtime.md)
-- [Channel lane recovery](channel-lane-reconciliation.md)
+- [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
 - [Moderation disable gate](moderation-disable-preflight.md)
 - [Hierarchy refusal order](moderation-hierarchy-order.md)
@@ -103,30 +102,48 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
+- [Response page proposal](dashboard-custom-responses-spec.md)
+- [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
+- [Onboarding page (design only)](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
+- [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
 - [Snapshot edges](community-snapshot-edges.md)
-- [Member journey tests](member-journey-parity.md)
-- [Onboarding operations](onboarding-operator-guide.md)
+- [Member journey](member-journey-parity.md)
+- [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
+- [Ready check](lfg-ready-check-spec.md)
+- [Backup-host handoff](lfg-backup-host-spec.md)
+- [LFG reuse](lfg-reuse-spec.md)
+- [LFG thread](lfg-thread-spec.md)
+- [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
-- [Game activity report](game-activity-report.md)
+- [Staff game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
-- [Scheduled queue order](schedule-queue-order.md)
-- [Scheduled skip tests](scheduled-events-skip-acceptance.md)
-- [Scheduled event reminders](event-reminders.md)
+- [Queue order](schedule-queue-order.md)
+- [Scheduled skips](scheduled-events-skip-acceptance.md)
+- [Event reminders](event-reminders.md)
+- [Notice proposal](event-change-notices-spec.md)
+- [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
+- [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
+- [Private agenda (design only)](event-agenda-spec.md)
+- [Calendar handoff (design only)](event-calendar-handoff-spec.md)
+- [Event role (design only)](event-role-spec.md)
+- [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
-- [Ticket lifecycle observability](ticket-lifecycle-observability.md)
-- [Community suggestions triage spec](suggestions-triage-box.md)
+- [Claim release design](ticket-claim-release-spec.md)
+- [Ticket lifecycle](ticket-lifecycle-observability.md)
+- [Suggestions triage](suggestions-triage-box.md)
 
 ## Voice
 
@@ -141,7 +158,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Access corpus](voice-access-golden.md)
 - [Vote-kick decisions](voice-vote-kick-core.md)
 - [Vote cooldown tests](voice-vote-cooldown-acceptance.md)
-- [Vote cooldown readiness](voice-vote-kick-cooldown-checklist.md)
+- [Vote cooldown](voice-vote-kick-cooldown-checklist.md)
 - [Template composition](voice-template-core.md)
 - [Template styling](voice-style-core.md)
 - [Template conditions](voice-conditions-core.md)
@@ -154,7 +171,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Game aliases and nick](voice-alias-core.md)
 - [Channel-info resolution](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
-- [Creator default tests](voice-creator-defaults-acceptance.md)
+- [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
 - [Permission health](voice-permission-health-core.md)
 - [Placement/numbering](voice-placement-core.md)
@@ -179,7 +196,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Cutover rehearsal](voice-cutover-rehearsal.md)
 - [Rollback triggers](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
-- [Freeze readback receipt](voice-t5-freeze-readback-receipt.md)
+- [Freeze readback](voice-t5-freeze-readback-receipt.md)
 - [Publish diff form](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
@@ -197,7 +214,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Migration claim](staging-migrate-claim.md)
 - [Rollout acceptance](staging-rollout-gate.md)
 - [Slash smoke](staging-slash-smoke.md)
-- [Voice event verification](staging-voice-event-verification.md)
+- [Voice event checks](staging-voice-event-verification.md)
 - [Smoke response table](smoke-expected-responses.md)
 - [Smoke record form](smoke-run-record.md)
 - [Smoke surface inventory](smoke-surface-inventory.md)
@@ -241,7 +258,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [CI speed rollout](ci-speed-rollout.md)
 - [Weekly delivery metrics](dora-metrics.md)
 - [Docs-only queue timing](ci-docs-only-queue-note.md)
-- [Bounded subprocess checks](bounded-subprocess-checks.md)
+- [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
 - [Load-sensitive fixtures](load-sensitive-test-fixtures.md)
