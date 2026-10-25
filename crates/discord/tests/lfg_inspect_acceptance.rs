@@ -115,10 +115,7 @@ fn filled(role: usize) -> usize {
 }
 
 fn member(role: usize, ordinal: usize) -> String {
-    format!(
-        "{}",
-        70_000_000_000_000_000_u64 + role as u64 * 1000 + ordinal as u64
-    )
+    (70_000_000_000_000_000_u64 + role as u64 * 1000 + ordinal as u64).to_string()
 }
 
 async fn seed_roster(pool: &sqlx::PgPool) {
