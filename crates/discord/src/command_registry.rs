@@ -73,15 +73,21 @@ impl RegistryDiff {
             self.changed.len()
         );
         for (name, command) in &self.added {
-            let _ = writeln!(out, "+ {name}: {command}");
+            let _ = writeln!(out, "+ {}: {command}", name.escape_debug());
         }
         for (name, command) in &self.removed {
-            let _ = writeln!(out, "- {name}: {command}");
+            let _ = writeln!(out, "- {}: {command}", name.escape_debug());
         }
         for (name, fields) in &self.changed {
-            let _ = writeln!(out, "~ {name}");
+            let _ = writeln!(out, "~ {}", name.escape_debug());
             for field in fields {
-                let _ = writeln!(out, "  {}: {} -> {}", field.path, field.before, field.after);
+                let _ = writeln!(
+                    out,
+                    "  {}: {} -> {}",
+                    field.path.escape_debug(),
+                    field.before,
+                    field.after
+                );
             }
         }
         if self.is_empty() {
@@ -89,6 +95,12 @@ impl RegistryDiff {
         }
         out
     }
+}
+
+/// Stable identity shared by canonicalization and pre-publication checks.
+#[must_use]
+pub fn command_identity(command: &Command) -> String {
+    format!("{}/{}", u8::from(command.kind), command.name)
 }
 
 /// Server IDs/versions and global-only settings cannot cause guild drift.
@@ -113,8 +125,10 @@ pub fn registry_snapshot(commands: &[Command]) -> Result<RegistrySnapshot, serde
         }
         let value = normalize(value);
         // Command names are unique within their type, not across all types.
-        let key = format!("{}/{}", value["type"], command.name);
-        normalized.insert(key, value);
+        let key = command_identity(command);
+        if command.name.is_empty() || normalized.insert(key, value).is_some() {
+            return Err(serde_json::Error::custom("ambiguous command identity"));
+        }
     }
     let bytes = serde_json::to_vec(&normalized)?;
     let hash = hex::encode(Sha256::digest(bytes));
