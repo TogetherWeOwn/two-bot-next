@@ -135,9 +135,9 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 40 parity and Next-only builtins plus the
+/// Registry compatibility: all 41 parity and Next-only builtins below plus the
 /// separate lfg-list discovery case route to their handlers;
-/// templateassistant stays unpublished.
+/// welcome-preview is covered independently; templateassistant stays unpublished.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
     let router = InteractionRouter::new(parity_gates());
@@ -147,6 +147,7 @@ fn parity_builtins_route_to_their_handlers() {
         ("help", HandlerId::Help),
         ("privacy", HandlerId::Privacy),
         ("reopen", HandlerId::Reopen),
+        ("game-mix", HandlerId::GameMix),
         ("ban", HandlerId::Moderation(ModerationAction::Ban)),
         ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
         ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -191,8 +192,8 @@ fn parity_builtins_route_to_their_handlers() {
     ];
     assert_eq!(
         cases.len(),
-        40,
-        "all builtins except the separate lfg-list case covered"
+        41,
+        "all builtins except the separate lfg-list and welcome-preview cases covered"
     );
     for (name, handler) in cases {
         assert_eq!(
@@ -256,14 +257,14 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 42, "contract covers the 42 built-in commands");
+    assert_eq!(matrix.len(), 43, "contract covers the 43 built-in commands");
     assert_eq!(
         matrix
             .iter()
             .filter(|row| row.command != "welcome-preview")
             .count(),
-        41,
-        "contract covers the 41 non-preview built-in commands"
+        42,
+        "contract covers the 42 non-preview built-in commands"
     );
     assert!(
         matrix

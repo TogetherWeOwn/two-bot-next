@@ -353,7 +353,7 @@ async fn admission_fresh_reads_recovery_and_both_lease_renewals() -> TestResult 
         })
         .connect_with(options)
         .await?;
-    let result = exercise(&pool).await;
+    let result = Box::pin(exercise(&pool)).await;
     pool.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
@@ -432,40 +432,48 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
-    stale_catalogue_admission_is_ignored_before_rest(pool).await?;
-    processing_superseded_before_preparation(pool).await?;
-    terminal_restart_repairs_committed_target(pool).await?;
-    terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;
-    terminal_restart_preserves_inherited_pending(pool).await?;
-    terminal_restart_cancellation_preserves_journal(pool).await?;
-    terminal_partial_repair_exchange_outcomes(pool).await?;
-    processing_receipts_survive_generation_transfer(pool).await?;
-    repeated_processing_tickets_preserve_pending(pool).await?;
-    terminal_late_response_after_independent_transfer(pool).await?;
-    terminal_pacing_loss_is_definite_no_send(pool).await?;
-    terminal_post_journal_wait_is_definite_no_send(pool).await?;
-    mixed_terminal_processing_sweep_and_dry_run(pool).await?;
-    supervised_processing_recovery(pool).await?;
-    bounded_processing_sweep(pool).await?;
-    durable_processing_recovery_without_redelivery(pool).await?;
-    shared_reaction_dispatch_and_disabled_gate(pool).await?;
-    shared_component_orchestration(pool).await?;
-    dry_run_audits_without_mutation_or_target_publication(pool).await?;
-    execution_and_compensation(pool).await?;
-    stale_inflight_repairs_committed_target(pool).await?;
-    stale_handoff_preserves_unknown_and_refuses_other_owners(pool).await?;
-    service_continues_unknown_work_without_redelivery(pool).await?;
-    interrupted_exchange_cannot_settle(pool).await?;
-    unknown_target_is_not_empty(pool).await?;
-    dry_run_refuses_recovered_mutation(pool).await?;
-    recovery_and_renewal(pool).await?;
-    empty_select_recovery(pool).await?;
-    reaction_partial_and_duplicate(pool).await?;
-    exclusive_lane_before_reads(pool).await?;
-    lost_panel_lane_release_is_logged(pool).await?;
-    zero_row_receipt_completion_is_unmatched_receipt(pool).await?;
-    settlement_timeout_note_and_ambiguous_class(pool).await?;
-    timeout_note_store_failure_stays_non_fatal(pool).await?;
+    // Heap-pin each fixture step so the aggregate future and its poll frame stay
+    // bounded on the default test-thread stack. Execution remains sequential.
+    Box::pin(stale_catalogue_admission_is_ignored_before_rest(pool)).await?;
+    Box::pin(processing_superseded_before_preparation(pool)).await?;
+    Box::pin(terminal_restart_repairs_committed_target(pool)).await?;
+    Box::pin(terminal_restart_refuses_unknown_or_uninitialized_target(
+        pool,
+    ))
+    .await?;
+    Box::pin(terminal_restart_preserves_inherited_pending(pool)).await?;
+    Box::pin(terminal_restart_cancellation_preserves_journal(pool)).await?;
+    Box::pin(terminal_partial_repair_exchange_outcomes(pool)).await?;
+    Box::pin(processing_receipts_survive_generation_transfer(pool)).await?;
+    Box::pin(repeated_processing_tickets_preserve_pending(pool)).await?;
+    Box::pin(terminal_late_response_after_independent_transfer(pool)).await?;
+    Box::pin(terminal_pacing_loss_is_definite_no_send(pool)).await?;
+    Box::pin(terminal_post_journal_wait_is_definite_no_send(pool)).await?;
+    Box::pin(mixed_terminal_processing_sweep_and_dry_run(pool)).await?;
+    Box::pin(supervised_processing_recovery(pool)).await?;
+    Box::pin(bounded_processing_sweep(pool)).await?;
+    Box::pin(durable_processing_recovery_without_redelivery(pool)).await?;
+    Box::pin(shared_reaction_dispatch_and_disabled_gate(pool)).await?;
+    Box::pin(shared_component_orchestration(pool)).await?;
+    Box::pin(dry_run_audits_without_mutation_or_target_publication(pool)).await?;
+    Box::pin(execution_and_compensation(pool)).await?;
+    Box::pin(stale_inflight_repairs_committed_target(pool)).await?;
+    Box::pin(stale_handoff_preserves_unknown_and_refuses_other_owners(
+        pool,
+    ))
+    .await?;
+    Box::pin(service_continues_unknown_work_without_redelivery(pool)).await?;
+    Box::pin(interrupted_exchange_cannot_settle(pool)).await?;
+    Box::pin(unknown_target_is_not_empty(pool)).await?;
+    Box::pin(dry_run_refuses_recovered_mutation(pool)).await?;
+    Box::pin(recovery_and_renewal(pool)).await?;
+    Box::pin(empty_select_recovery(pool)).await?;
+    Box::pin(reaction_partial_and_duplicate(pool)).await?;
+    Box::pin(exclusive_lane_before_reads(pool)).await?;
+    Box::pin(lost_panel_lane_release_is_logged(pool)).await?;
+    Box::pin(zero_row_receipt_completion_is_unmatched_receipt(pool)).await?;
+    Box::pin(settlement_timeout_note_and_ambiguous_class(pool)).await?;
+    Box::pin(timeout_note_store_failure_stays_non_fatal(pool)).await?;
     Ok(())
 }
 
