@@ -558,6 +558,163 @@ async fn replayed_confirm_applies_once_with_review() {
     assert_eq!(*shared.lock().unwrap(), incoming);
 }
 
+/// Each adjacent fixture adds exactly one unescaped ASCII byte to a list
+/// choice. Keys, change count, and hash width stay fixed, so full serialization
+/// grows one byte at a time without depending on JSON vs plain-text layout.
+fn serialized_cap_fixture(padding: usize) -> VoiceConfiguration {
+    const CHOICES: usize = 1000;
+    assert!(padding <= 98 * CHOICES);
+    let mut config = empty_config();
+    for list in 0..10 {
+        let choices = (0..100)
+            .map(|choice| {
+                let index = list * 100 + choice;
+                let extra = padding / CHOICES + usize::from(index < padding % CHOICES);
+                format!("{choice:02}{}", "x".repeat(extra))
+            })
+            .collect();
+        config.lists.push(config_codec::RandomList {
+            name: format!("list-{list:02}"),
+            choices,
+        });
+    }
+    config
+}
+
+async fn serialized_cap_response(padding: usize) -> InteractionResponse {
+    let trace = Trace::default();
+    let incoming = serialized_cap_fixture(padding);
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    assert!(bytes.len() < MAX_IMPORT_BYTES, "not the upload cap");
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("preview or truthful cap refusal");
+    assert_ephemeral(&response);
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+    if attachments_of(&response).is_some() {
+        preview_buttons(&response);
+        assert!(!runtime.pending_imports.lock().unwrap().is_empty());
+    } else {
+        assert_no_buttons(&response);
+        assert!(runtime.pending_imports.lock().unwrap().is_empty());
+    }
+    response
+}
+
+/// Catch a cap applied to character count, a truncated artifact, or an
+/// exclusive off-by-one boundary. Discover the admission edge through real
+/// dispatch, then require the refusal to advertise that exact byte limit.
+/// This leaves the serializer format and conservative cap value to the Builder.
+#[tokio::test]
+async fn serialized_review_cap_accepts_exact_bytes_and_refuses_one_over() {
+    let small = serialized_cap_response(0).await;
+    let small_bytes = attachment_of(&small).file.len();
+    assert!(small_bytes <= ARTIFACT_CAP_CEILING);
+    let large = serialized_cap_response(98_000).await;
+    assert!(
+        attachments_of(&large).is_none(),
+        "complete data exceeds 64 KiB"
+    );
+
+    let mut low = 0;
+    let mut high = 98_000;
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        let response = serialized_cap_response(middle).await;
+        if attachments_of(&response).is_some() {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    assert!(low > 0, "the review budget accommodates a small full diff");
+    let exact = serialized_cap_response(low).await;
+    let previous = serialized_cap_response(low - 1).await;
+    let exact_attachment = attachment_of(&exact);
+    let exact_bytes = exact_attachment.file.len();
+    assert_eq!(exact_bytes, attachment_of(&previous).file.len() + 1);
+    assert_eq!(
+        exact_bytes,
+        small_bytes + low,
+        "no clipped values or size-dependent layout"
+    );
+    assert!(exact_bytes <= ARTIFACT_CAP_CEILING);
+
+    let incoming = serialized_cap_fixture(low);
+    let body = String::from_utf8(exact_attachment.file).expect("UTF-8 review");
+    for list in &incoming.lists {
+        assert!(body.contains(&list.name));
+        for choice in &list.choices {
+            assert!(body.contains(choice), "complete value at the byte boundary");
+        }
+    }
+
+    // Adjacent admitted inputs differ by one serialized ASCII byte, not one
+    // Unicode scalar or one input-document byte of whitespace.
+    let over = serialized_cap_response(high).await;
+    assert!(attachments_of(&over).is_none());
+    let text = response_text(&over);
+    let lower = text.to_lowercase();
+    assert!(lower.contains("reduce") || lower.contains("smaller") || lower.contains("too large"));
+    assert!(lower.contains("retry") || lower.contains("again") || lower.contains("split"));
+    assert!(text.contains("Nothing was changed"));
+    let numbers: Vec<_> = text.split(|c: char| !c.is_ascii_digit()).collect();
+    assert!(
+        numbers.contains(&exact_bytes.to_string().as_str()),
+        "refusal reports the exact serialized-byte budget: {text:?}"
+    );
+}
+
+/// A serializer that emits only added values would pass the many-alias test.
+/// Pin complete old/new values and removals through the actual attachment.
+#[tokio::test]
+async fn artifact_includes_complete_changed_and_removed_values() {
+    let trace = Trace::default();
+    let mut current = full_config();
+    current.aliases = vec![
+        config_codec::GameAlias {
+            game: "changed-game".to_owned(),
+            alias: format!("{}🚀", "before-".repeat(13)),
+        },
+        config_codec::GameAlias {
+            game: "removed-game".to_owned(),
+            alias: "removed-value".to_owned(),
+        },
+    ];
+    let old_value = current.aliases[0].alias.clone();
+    let mut incoming = current.clone();
+    incoming.aliases.truncate(1);
+    incoming.aliases[0].alias = format!("{}🎮", "after-".repeat(15));
+    let new_value = incoming.aliases[0].alias.clone();
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), current.clone(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let body = String::from_utf8(attachment_of(&preview).file).expect("UTF-8 review");
+    for value in [
+        "changed-game",
+        &old_value,
+        &new_value,
+        "removed-game",
+        "removed-value",
+    ] {
+        assert!(
+            body.contains(value),
+            "artifact omits complete value {value:?}"
+        );
+    }
+    assert_ephemeral(&preview);
+    assert_mentions_disabled(&preview);
+    assert_eq!(*shared.lock().unwrap(), current);
+    assert!(!applied(&trace));
+}
+
 // --- Unchanged controls ---------------------------------------------------
 // These pass on the baseline and must stay green after the Builder lands.
 
@@ -643,6 +800,58 @@ async fn absent_uploader_refuses_import() {
     let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
     let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+}
+
+#[tokio::test]
+async fn foreign_upload_guild_refuses_without_review_or_pending_state() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.guild_id = (GUILD + 1).to_string();
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("guild mismatch refusal");
+    assert_no_buttons(&response);
+    assert!(attachments_of(&response).is_none());
+    assert_ephemeral(&response);
+    assert!(runtime.pending_imports.lock().unwrap().is_empty());
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn absent_or_foreign_interaction_guild_cannot_consume_preview() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    for guild in [None, Some(Id::new(GUILD + 1))] {
+        let mut confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+        confirm.guild_id = guild;
+        let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+        // The dispatcher may ignore a guildless/unowned interaction. If it
+        // responds, it must not expose the bound review or actionable buttons.
+        if let Some(response) = response {
+            assert_no_buttons(&response);
+            assert!(attachments_of(&response).is_none());
+        }
+        assert_eq!(*shared.lock().unwrap(), empty_config());
+        assert!(!applied(&trace));
+        assert!(!runtime.pending_imports.lock().unwrap().is_empty());
+    }
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(
+        response_text(&response.expect("bound uploader applies")).starts_with("Import applied:")
+    );
+    assert_eq!(applied_count(&trace), 1);
     assert_eq!(*shared.lock().unwrap(), full_config());
 }
 
