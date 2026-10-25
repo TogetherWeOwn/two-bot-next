@@ -79,16 +79,19 @@ use PolicyHook::{
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), the private moderation reads
 /// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
-/// timed entry (parity row 37), channel LFG discovery (parity row 38), and
-/// the Next-only `/feed-inspect` relay detail (parity row 39).
+/// timed entry (parity row 37), channel LFG discovery (parity row 38),
+/// the Next-only `/feed-inspect` relay detail (parity row 39), pause/resume
+/// `/command-disable` and `/command-enable` (parity rows 40 and 41), and
+/// the `/welcome-preview` admin preview (parity row 42).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 42] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
     row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(42, "welcome-preview", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",
@@ -154,6 +157,8 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
     row(15, "command-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(16, "command-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(40, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(41, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),

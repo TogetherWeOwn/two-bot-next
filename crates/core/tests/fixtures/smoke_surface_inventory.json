@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 36,
+  "count": 39,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -191,6 +191,18 @@
       "deferral_reason": "Next-only self-service picker recovery with no legacy counterpart; the defer-first menu open and zero-mutation contract are pinned by the onboarding disposable-database acceptance tests rather than the live smoke five."
     },
     {
+      "name": "welcome-preview",
+      "description": "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private fixture rendering, pinned against a real-join render and zero writes with a disposable database rather than the live smoke five."
+    },
+    {
       "name": "attendance",
       "description": "Check in a verified human attendee for a scheduled event (scorecard)",
       "family": "scorecard",
@@ -368,6 +380,52 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Read-only but needs a named DB-backed custom row to inspect, which the no-DB offline rule excludes; covered by the disposable-database acceptance instead."
+    },
+    {
+      "name": "command-disable",
+      "description": "Pause a saved custom command without deleting it",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Saved command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke."
+    },
+    {
+      "name": "command-enable",
+      "description": "Resume a saved custom command",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Saved command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke."
     },
     {
       "name": "schedule",

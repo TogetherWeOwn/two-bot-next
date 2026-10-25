@@ -110,13 +110,12 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 36 all-on builtins minus 10 automation-gated commands, including
-    // command-inspect and giveaway; announcements-gated feed-inspect still
-    // publishes and read-only current-channel discovery lfg-list stays
-    // published. The stored dynamic row stays unpublished: every such
-    // invocation refuses at dispatch while gated off, so publishing would
-    // burn the ceiling.
-    assert_eq!(names.len(), 26, "automations-off staging set: {names:?}");
+    // 39 all-on builtins minus 12 automation-gated commands, including
+    // command-inspect, pause/resume and giveaway. Feed-inspect remains
+    // announcements-gated, while the stored dynamic row stays unpublished:
+    // every such invocation refuses at dispatch while gated off, so publishing
+    // would burn the ceiling.
+    assert_eq!(names.len(), 27, "automations-off staging set: {names:?}");
     assert!(
         names.iter().any(|name| name == "lfg-list"),
         "read-only current-channel discovery stays published while automations are off"
@@ -124,6 +123,10 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
     assert!(
         names.iter().any(|name| name == "reopen"),
         "reopen is core-always and survives automations-off: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "welcome-preview"),
+        "welcome-preview is core-always and survives automations-off: {names:?}"
     );
     assert!(
         names.iter().any(|name| name == "feed-inspect"),
@@ -138,6 +141,8 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "command-remove",
         "command-list",
         "command-inspect",
+        "command-disable",
+        "command-enable",
         "schedule",
         "schedule-remove",
         "schedule-list",

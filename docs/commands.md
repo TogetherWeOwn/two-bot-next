@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 57.
+Built-in commands: 60.
 
 ## `/access`
 
@@ -46,6 +46,7 @@ Set who can create voice rooms and use room commands
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `show` | subcommand | false | — | — | — | — | Show the current voice-room access settings |
+| `show page` | integer | false | 1 | — | — | — | Page of access settings to show (starts at 1) |
 | `creation` | subcommand | false | — | — | — | — | Turn temporary room creation on or off |
 | `creation enabled` | boolean | true | — | — | — | — | On allows new rooms, off stops them (existing rooms keep working) |
 | `role` | subcommand | false | — | — | — | — | Set or clear the role required to use room commands |
@@ -116,6 +117,28 @@ Define or replace a custom command
 | `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
 | `description` | string | false | — | — | 100 | — | Shown in the command picker |
 | `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
+
+## `/command-disable`
+
+Pause a saved custom command without deleting it
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+
+## `/command-enable`
+
+Resume a saved custom command
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
 
 ## `/command-inspect`
 
@@ -599,7 +622,9 @@ Show voice-room status, health and creator channels
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of creator channels to show (starts at 1) |
 
 ## `/slowmode`
 
@@ -716,3 +741,12 @@ Record a warning for a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/welcome-preview`
+
+Privately preview the current welcome for a synthetic newcomer. No delivery.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.
