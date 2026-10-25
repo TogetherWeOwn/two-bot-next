@@ -305,6 +305,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 >>> assert len(rows) == len({r["id"] for r in rows}) == 12
 >>> assert {r["state"] for r in m["other_states"]} == {"restart_only", "stored_unwired_for_slash", "env_only", "absent", "in_flight_not_merged", "activation_denied_for_live"}
 >>> assert all(all(e in m["evidence"] for e in r.get("evidence", []) + r.get("reader", [])) for r in rows)
+>>> assert all(g in {"FC-W1", "FC-W2", "FC-W3"} for r in rows for g in r.get("gate", []))
 >>> assert all(e["contains"] in pathlib.Path(e["path"]).read_text().splitlines()[e["line"]-1] for e in m["evidence"].values())
 >>> verbs = pathlib.Path("crates/core/src/internal_actions.rs").read_text().split("pub const IMPLEMENTED_ACTIONS", 1)[1].split("\n];", 1)[0]
 >>> assert not any(v.startswith("feed") for v in re.findall(r'"([a-z_.]+)"', verbs))
