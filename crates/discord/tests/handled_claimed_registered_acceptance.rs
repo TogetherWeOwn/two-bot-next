@@ -66,7 +66,7 @@ impl InteractionHandler for Stub {
 /// - `router_with_commands` (`command_runtime.rs`): channel handlers while
 ///   `moderation`, sticky `AutomationAdmin` + custom commands while
 ///   `automations`, feeds while `announcements`, rank/leaderboard/help/
-///   privacy always. The channel and custom registrations below call the
+///   privacy/game-mix always. The channel and custom registrations below call the
 ///   real public functions; the rest are marker ids, as in production.
 /// - `CommandRuntime::build` member verbs (`command_runtime.rs`): the five
 ///   member moderation ids while a member consumer exists.
@@ -104,6 +104,7 @@ impl ProductionRegistrations for InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::GameMix,
         ] {
             router.register(Box::new(Stub(id)));
         }
@@ -187,6 +188,7 @@ fn ctx(name: &str, custom_row: Option<bool>) -> SlashContext<'_> {
 fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
     match name {
         "privacy" => Some(HandlerId::Privacy),
+        "game-mix" => Some(HandlerId::GameMix),
         "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
             Some(HandlerId::AutomationAdmin)
         }
