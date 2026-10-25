@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
         matrix_names, published_names,
         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
     );
-    assert_eq!(matrix.len(), 40, "contract covers the 40 built-in commands");
+    assert_eq!(matrix.len(), 41, "contract covers the 41 built-in commands");
 }
 
 #[test]
@@ -94,6 +94,7 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "privacy",
             "reopen",
             "welcome-preview",
+            "game-mix",
         ]
         .contains(&row.command)
         {

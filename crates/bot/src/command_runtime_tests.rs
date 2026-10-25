@@ -42,6 +42,14 @@ mod custom_command_toggle_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
 
+#[path = "game_mix_acceptance_tests.rs"]
+mod game_mix_acceptance_tests;
+#[path = "game_mix_content_acceptance_tests.rs"]
+mod game_mix_content_acceptance_tests;
+// Builder-owned: pins the classified store-failure warn the protected
+// modules cannot cover without Test Author edits.
+#[path = "game_mix_store_error_log_tests.rs"]
+mod game_mix_store_error_log_tests;
 #[path = "giveaway_admission_edge_acceptance_tests.rs"]
 mod giveaway_admission_edge_acceptance_tests;
 #[path = "giveaway_countdown_edge_acceptance_tests.rs"]
@@ -914,7 +922,8 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                     "help",
                     "privacy",
                     "reopen",
-                    "welcome-preview"
+                    "welcome-preview",
+                    "game-mix"
                 ],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
@@ -1037,7 +1046,8 @@ async fn activation_boot_from_env_fixture() {
                 "help",
                 "privacy",
                 "reopen",
-                "welcome-preview"
+                "welcome-preview",
+                "game-mix"
             ]
         );
         assert!(!runtime.router().gates().moderation);
@@ -1594,6 +1604,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "giveaway"
                         | "reopen"
                         | "welcome-preview"
+                        | "game-mix"
                 )
             })
             .collect();
@@ -1605,6 +1616,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"lfg-list"));
         assert!(!unwired.contains(&"reopen"));
         assert!(!unwired.contains(&"welcome-preview"));
+        assert!(!unwired.contains(&"game-mix"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -4231,7 +4243,14 @@ async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
             );
         }
         // The non-voice registry is untouched either way.
-        for expected in ["rank", "leaderboard", "sticky", "rsvp", "feed-list"] {
+        for expected in [
+            "rank",
+            "leaderboard",
+            "game-mix",
+            "sticky",
+            "rsvp",
+            "feed-list",
+        ] {
             assert!(names.contains(&expected), "{expected} must still publish");
         }
         mock.shutdown().await;
@@ -4258,6 +4277,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Privacy,
             HandlerId::Reopen,
             HandlerId::WelcomePreview,
+            HandlerId::GameMix,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,

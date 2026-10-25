@@ -100,26 +100,26 @@ fn documented_legacy_rows_equal_parity_section1() {
     // `/lfg-list` current-channel list (row 38), `/feed-inspect` relay detail
     // (row 39), plus `/lfg-edit` sharing row 26, and pause/resume
     // `/command-disable` and `/command-enable` (rows 40 and 41),
-    // and `/welcome-preview` (row 42). No Next-only row appears in the legacy §1 table above;
-    // the registry-equality test below covers every published builtin instead.
-    // 43 entries: 42 contiguous parity rows plus the `/lfg-edit` companion
-    // sharing LFG row 26.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 43);
+    // `/welcome-preview` (row 42), and staff aggregate `/game-mix` (row 43).
+    // The registry-equality test below covers every published builtin.
+    // 44 entries: 43 contiguous parity rows plus the `/lfg-edit` companion
+    // sharing LFG row 26; Next-only commands are absent from the legacy table.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 44);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        43
+        44
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=42).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=42"
+        (1..=43).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=43"
     );
     for (name, parity_row, required_permissions) in
         [("command-inspect", 33, 1 << 5), ("lfg-list", 38, 1 << 33)]
@@ -153,6 +153,11 @@ fn documented_legacy_rows_equal_parity_section1() {
     assert_eq!(feed_inspect.required_permissions, 32, "ManageGuild bit");
     assert_eq!(feed_inspect.surface, CommandSurface::BuiltinSlash);
     assert_eq!(feed_inspect.policy_hook, None);
+    let game_mix = command_permission("game-mix").expect("game-mix has a permission row");
+    assert_eq!(game_mix.parity_row, 43);
+    assert_eq!(game_mix.required_permissions, 32, "ManageGuild bit");
+    assert_eq!(game_mix.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(game_mix.policy_hook, None);
     for (name, parity_row) in [("command-disable", 40), ("command-enable", 41)] {
         let row = command_permission(name).expect("lifecycle command has a permission row");
         assert_eq!(row.parity_row, parity_row, "{name}");
@@ -226,7 +231,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 40);
+    assert_eq!(builtins.len(), 41);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -271,9 +276,19 @@ fn every_retained_command_rechecks_resolved_permissions_before_returning_a_handl
             // Even a same-named enabled custom row cannot bypass a builtin.
             custom_row: Some(true),
         };
-        for permissions in [None, Some(0), Some(1 << 3), Some(!row.required_permissions)] {
+        for permissions in [
+            None,
+            Some(0),
+            Some(1 << 3),
+            Some(!row.required_permissions),
+            Some(!(row.required_permissions | (1 << 3))),
+        ] {
             let outcome = router.route_slash(&ctx(permissions));
-            if row.required_permissions == 0 {
+            // Only game-mix accepts Administrator without its advertised bit;
+            // every legacy command retains the same exact-bit runtime check.
+            let game_mix_admin =
+                row.command == "game-mix" && permissions.is_some_and(|bits| bits & (1 << 3) != 0);
+            if row.required_permissions == 0 || game_mix_admin {
                 assert!(
                     matches!(outcome, SlashOutcome::Handled { .. }),
                     "{}: {outcome:?}",
@@ -350,7 +365,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 40, "every retained builtin routes");
+    assert_eq!(routed, 41, "every retained builtin routes");
 }
 
 #[test]

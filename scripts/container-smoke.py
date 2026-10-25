@@ -72,6 +72,15 @@ IMAGE_MAX_BYTES = 112 * MIB
 # e07140dd repairs) measures 17,854,776 bytes (17.03 MiB) in hosted CI
 # (run 40094727805), 28,984 over 17 MiB. 18 MiB stands on merged-tree
 # evidence with no new dependencies and no release-profile change.
+# On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
+# cc07f31436 measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over, in
+# [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
+# The staff game-mix slice head (6a412c6a86) measured 17,862,000 bytes
+# (17.03 MiB), 36,208 over, in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40040240318/job/120711266282),
+# with no new dependencies and the same minimal release profile (opt-level=z,
+# lto, strip). The binary ceiling moves to 18 MiB, leaving about 1 MiB of
+# headroom above the measured heads; revisit if the binary approaches it.
+# The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
 BINARY_MAX_BYTES = 18 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a

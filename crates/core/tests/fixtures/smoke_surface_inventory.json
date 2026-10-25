@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 39,
+  "count": 40,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -201,6 +201,18 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only private fixture rendering, pinned against a real-join render and zero writes with a disposable database rather than the live smoke five."
+    },
+    {
+      "name": "game-mix",
+      "description": "Show this server's aggregate game activity.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private staff aggregate; seeded game activity and failure cases are pinned by disposable-database gateway acceptance, outside the live smoke five."
     },
     {
       "name": "attendance",

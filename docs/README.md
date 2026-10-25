@@ -1,7 +1,6 @@
 # Documentation map
 
-Sole discovery manifest: add a purpose link for every Markdown doc, including
-this index and nested docs, under its area: `- [Purpose](relative.md)`.
+Sole Markdown-doc manifest (nested/index too): `- [Purpose](relative.md)` by area.
 
 Check: `python3 scripts/check_docs_index.py --json` from the repo root.
 Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
@@ -126,11 +125,12 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Feed domain](feeds-port.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
-- [Game activity report](game-activity-report.md)
+- [Staff game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
+- [Session-change notices (design only)](event-change-notices-spec.md)
 - [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
 - [Private agenda (design only)](event-agenda-spec.md)

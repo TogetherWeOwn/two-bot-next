@@ -1,12 +1,40 @@
-# Game-activity aggregate report: operator guide
+# Game-activity aggregate report: staff and operator guide
 
-On-demand, read-only per-game aggregate report for one guild: total play
-time, in-voice overlap and session counts as one JSON object on stdout.
-It answers "what did this guild play, and how much of it was in voice?"
-without exposing any per-member data. There is no scheduling, no CSV
-output and no Discord surfacing; for the pipeline behind the numbers see
-the `game_activity` module docs (`crates/core/src/game_activity.rs`) and
-the [privacy analytics note](privacy.md#what-is-stored).
+On-demand, read-only per-game aggregates for one guild: total play time,
+in-voice overlap and session counts. Staff can use `/game-mix` privately
+in Discord; operators can print the existing CLI JSON on stdout.
+Both answer "what did this guild play, and how much of it was in voice?"
+without exposing per-member data. No scheduling or CSV/file export is added.
+For the pipeline behind the numbers see the `game_activity` module docs
+(`crates/core/src/game_activity.rs`) and the
+[privacy analytics note](privacy.md#what-is-stored).
+
+## In Discord: `/game-mix`
+
+- No options. Published with DMs disabled and **Manage Server** (Manage Guild)
+  as its default permission. The runtime also requires Manage Guild or
+  Administrator; overriding picker visibility cannot bypass that check.
+- Only the invoking, configured guild is read. Missing/foreign guilds are
+  ignored before any handler or query. No guild ID can be supplied.
+- **The live guild is refused before reading.** This command has no equivalent
+  to `--allow-live-guild`: staff permission or a configured production identity
+  is not rollout approval. This slice does not activate production reporting.
+- Every answer is private (ephemeral), with mentions disabled. It is one JSON
+  fenced block, using the CLI keys below, capped at ten games and 2000 UTF-16
+  units. Order and numeric totals match the CLI. Hostile labels are made inert;
+  labels are shortened to 24 UTF-16 units only when needed to fit the complete
+  JSON, with an explicit note. `truncated` is true when rows or labels are cut. No per-member fields appear.
+- Empty storage returns `rows: []`, `truncated: false` and
+  `no game activity recorded for this guild`. It is a valid result, not an error.
+  A store failure returns private **try again** guidance, with no JSON or
+  fabricated totals. It does not migrate or create a missing table.
+- Reads use the same guild aggregate reader and report ordering as the CLI,
+  never live presence/member lookups. There are no DMs, channel posts, audit
+  writes, exports or changes to the collector. Totals can lag the hourly flush
+  and reflect retention/opt-outs, not a new reporting window.
+
+The remaining invocation, environment and stdout sections describe the CLI;
+its 100-row cap, live-guild opt-in and pinned output shape are unchanged.
 
 ## When to run it
 
