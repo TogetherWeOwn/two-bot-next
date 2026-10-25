@@ -122,6 +122,8 @@ jobs:
       soak_seconds: ${{ steps.guard.outputs.soak_seconds }}
       auto: ${{ steps.guard.outputs.auto }}
       green_at: ${{ steps.guard.outputs.green_at }}
+      staging_run_id: ${{ steps.guard.outputs.staging_run_id }}
+      staging_attempt: ${{ steps.guard.outputs.staging_attempt }}
     steps:
       - name: Refuse unverified SHA or unprotected Environment
         id: guard
@@ -502,8 +504,8 @@ jobs:
               if not staged.get("total_count"):
                   refuse(f"deploy-staging has no successful run on {sha}")
           staging_run = None
-          if auto_approve and needs_staging:
-              # Automated approval needs the LATEST staging deploy of this SHA to be
+          if needs_staging:
+              # Immutable promotion needs the LATEST staging deploy of this SHA to be
               # green: an older success cannot hide a newer failed or running deploy.
               staging_runs = collection(
                   f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "deploy-staging runs on the SHA",
@@ -801,7 +803,9 @@ jobs:
               out.write(f"sha={sha}\nmode={mode}\nversion={version}\nrestore_image={image}\n"
                         f"takeover={takeover}\nallow_unstaged={allow_unstaged}\n"
                         f"skip={skip}\nsoak_seconds={soak_seconds}\n"
-                        f"auto={'true' if auto else 'false'}\ngreen_at={green_at_out}\n")
+                        f"auto={'true' if auto else 'false'}\ngreen_at={green_at_out}\n"
+                        f"staging_run_id={staging_run['id'] if staging_run else ''}\n"
+                        f"staging_attempt={staging_run.get('run_attempt', '') if staging_run else ''}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(
                   f"### Production {mode} guard passed\n\n"
@@ -1255,6 +1259,7 @@ jobs:
     environment: production
     permissions:
       contents: read
+      actions: read # fetch the exact immutable staging artifact by ID
       deployments: write # derive the deploy ID from today's production Deployments, then record this one
     env:
       SHA: ${{ needs.guard.outputs.sha }}
@@ -1358,7 +1363,7 @@ jobs:
           python3 ../tooling/scripts/worker_container_rollback.py snapshot \
             --variant production \
             --out "$RUNNER_TEMP/production-rollback-snapshot.json"
-          python3 -c 'import json; print(json.dumps(json.load(open("'$RUNNER_TEMP'/production-rollback-snapshot.json")), sort_keys=True))'
+          python3 -c 'import json,os; print(json.dumps(json.load(open(os.environ["RUNNER_TEMP"]+"/production-rollback-snapshot.json")), sort_keys=True))'
       - name: Upload the rollback snapshot
         if: always() && env.MODE == 'deploy' && steps.snapshot.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1368,21 +1373,52 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
-      # Build identity, as deploy-staging stamps it: the image gets
-      # BOT_BUILD_REVISION (the guarded SHA), BOT_BUILD_ID (run id and
-      # attempt) and BOT_DEPLOY_ID (the compute step's `YYYY.MM.DD.N+sha7`)
-      # through `image_vars`, which /readyz then reports. The SHA is
-      # the guard's, not GITHUB_SHA: a dispatch runs on main's head, which may
-      # be newer than the commit being deployed.
+      # Ordinary promotion consumes only the bytes certified by the exact
+      # guarded staging attempt. Recovery remains independent of artifacts.
+      - name: Admit the immutable staging artifact before production mutation
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          STAGING_RUN_ID: ${{ needs.guard.outputs.staging_run_id }}
+          STAGING_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/bot_promotion.py admit --sha "$SHA" \
+            --run-id "$STAGING_RUN_ID" --attempt "$STAGING_ATTEMPT" \
+            --account-id "$CLOUDFLARE_ACCOUNT_ID" --out "$RUNNER_TEMP/bot-promotion"
+      # The production event ID is recorded separately. Promoted Rust bytes
+      # retain their original staging build/deploy stamps; only the explicitly
+      # authorized live-SHA recovery path builds a fresh image.
       - name: Render the production deploy config with build identity
         if: env.MODE == 'deploy'
         run: | # zizmor: ignore[github-env] fixed RUNNER_TEMP path only; no trigger, input or API data reaches GITHUB_ENV here
           set -euo pipefail
           config="$RUNNER_TEMP/production-deploy.json"
+          artifact_arg=()
+          if [ "$ALLOW_UNSTAGED" != "true" ]; then
+            artifact_arg=(--artifact "$RUNNER_TEMP/bot-promotion/admitted.json")
+          fi
           python3 ../tooling/scripts/production_deploy.py render \
             --config wrangler.toml --out "$config" \
             --sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
-            --deploy-id "$DEPLOY_ID"
+            --deploy-id "$DEPLOY_ID" "${artifact_arg[@]}"
+          if [ "$ALLOW_UNSTAGED" = "true" ]; then
+            # Recovery uses its own source, never an artifact or certification.
+            # Package it before the shared no-bundle deployment step.
+            npx --no-install wrangler deploy --config "$config" --env production \
+              --dry-run --containers-rollout=none --outdir "$RUNNER_TEMP/recovery-modules"
+            python3 - "$config" "$RUNNER_TEMP/recovery-modules" <<'PY'
+          import json, pathlib, sys
+          sys.path.insert(0, "../tooling/scripts")
+          from bot_promotion import configure_bundle
+          path = pathlib.Path(sys.argv[1])
+          config = json.loads(path.read_text())
+          configure_bundle(config, pathlib.Path(sys.argv[2]), "index.js")
+          path.write_text(json.dumps(config) + "\n")
+          PY
+          fi
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
       - name: Deploy to production
         id: deploy
@@ -1396,7 +1432,7 @@ jobs:
           # The guard proved this output is 40 hex; the message ties the
           # Worker version to its commit in `wrangler versions list`. The
           # rendered config carries the build identity the gate checks.
-          command: deploy --config ${{ env.PRODUCTION_DEPLOY_CONFIG }} --env production --message ${{ needs.guard.outputs.sha }}
+          command: deploy --config ${{ env.PRODUCTION_DEPLOY_CONFIG }} --env production --message ${{ needs.guard.outputs.sha }} --no-bundle
       # A Worker-version rollback alone leaves the new container image
       # serving, so a rollback restores BOTH the named Worker version and
       # the named container image, with takeover and the stable gate, in one
@@ -1546,6 +1582,16 @@ jobs:
             ''|*[!0-9]*) echo "::error::takeover needs the numeric epoch read in the previous step"; exit 1 ;;
           esac
           node ../tooling/wrangler/scripts/production-ownership-control.mjs takeover "$epoch"
+      - name: Verify the promoted production Worker and image
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/production_deploy.py serving --sha "$SHA" --deploy-id "$DEPLOY_ID" \
+            --artifact "$RUNNER_TEMP/bot-promotion/admitted.json" \
+            --expected-worker-version "$NEW_VERSION" --out "$RUNNER_TEMP/production-promotion-evidence.json"
       # Same contract as staging, plus the build identity and stability:
       # /health must be 200, which proves the Container/DO bindings are wired.
       # /readyz must answer 200 with gateway=ready and this run's build
@@ -1584,15 +1630,25 @@ jobs:
           if [ -n "${DEPLOY_ID:-}" ] && grep -q '^ARG BOT_DEPLOY_ID' ../Dockerfile; then
             deploy_id_arg=(--deploy-id "$DEPLOY_ID")
           fi
+          health_headers=()
+          readyz_headers=()
+          if [ "$MODE" = "deploy" ] && [ "${ALLOW_UNSTAGED:-}" = "false" ]; then
+            health_headers=(-D "$RUNNER_TEMP/production-health.headers")
+            readyz_headers=(-D "$RUNNER_TEMP/production-readyz.headers")
+            image="$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/production-promotion-evidence.json"))["production_image"])')"
+            deploy_id_arg+=(--artifact "$RUNNER_TEMP/bot-promotion/admitted.json"
+              --expected-worker-version "$NEW_VERSION" --image "$image"
+              --headers "$RUNNER_TEMP/production-readyz.headers" --health-headers "$RUNNER_TEMP/production-health.headers")
+          fi
           poll() {
             # Match production_deploy.py's 64 KiB cap. A failed transfer can
             # still report 200 with a valid prefix: never grade that as a pass.
-            hcode=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" -o "$health" -w '%{http_code}' "$url/health") || hcode=000
+            hcode=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" "${health_headers[@]}" -o "$health" -w '%{http_code}' "$url/health") || hcode=000
             if [ "$hcode" != "200" ]; then
               state="/health -> $hcode"
               return 1
             fi
-            code=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz") || code=000
+            code=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" "${readyz_headers[@]}" -o "$readyz" -w '%{http_code}' "$url/readyz") || code=000
             # The verdict follows the script's exit code; `state` carries its
             # fixed-vocabulary reason either way.
             if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "${deploy_id_arg[@]}" 2>&1); then
@@ -1641,6 +1697,17 @@ jobs:
             sleep 10
           done
           echo "- /health 200, /readyz 200 with gateway ready, stable 18/18 polls ($first_state)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Recheck the promoted image after the stable readiness window
+        id: promotion_recheck
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/production_deploy.py serving --sha "$SHA" --deploy-id "$DEPLOY_ID" \
+            --artifact "$RUNNER_TEMP/bot-promotion/admitted.json" \
+            --expected-worker-version "$NEW_VERSION" --out "$RUNNER_TEMP/production-promotion-evidence.json"
       # REST 5xx error-rate promotion gate, staging parity: judges the same
       # evaluatePromotionGate() verdict over live production /ops/metrics, so
       # a 5xx burst fails this stage and the auto-rollback step below
@@ -1717,6 +1784,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GATE_OUTCOME: ${{ steps.gate.outcome }}
           ERROR_GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
+          PROMOTION_OUTCOME: ${{ steps.promotion_recheck.outcome }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
         run: |
@@ -1725,6 +1793,10 @@ jobs:
           if [ "$GATE_OUTCOME" = "success" ] && [ "$ERROR_GATE_OUTCOME" != "failure" ] \
               && [ "$ERROR_GATE_OUTCOME" != "cancelled" ]; then
             status=success
+          fi
+          if [ "$MODE" = "deploy" ] && [ "$ALLOW_UNSTAGED" != "true" ] \
+              && [ "$PROMOTION_OUTCOME" != "success" ]; then
+            status=failure
           fi
           rollback=()
           if [ "$MODE" = "rollback" ]; then
@@ -1777,3 +1849,12 @@ jobs:
               sys.exit(1)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"- Takeover confirmed: `{expected}` still serves 100% after the owned probes\n")
+      - name: Upload immutable production promotion evidence
+        if: success() && env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && steps.promotion_recheck.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-promotion-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-promotion-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

@@ -82,8 +82,9 @@ staged commit change nothing the Worker or container serves.
 After the reviewer approves (or the automated approval passes), the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;
-2. renders the build-identity config and runs
-   `wrangler deploy --config <rendered> --env production --message <sha>`;
+2. admits the exact certified staging artifact, preserves its container digest
+   in the production image repository, renders production-only bindings and runs
+   `wrangler deploy --config <rendered> --env production --message <sha> --no-bundle`;
 3. writes the SHA and the old and new Worker version IDs to the run summary;
 4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
    [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
@@ -304,7 +305,44 @@ until the next automatic deploy. Never repeat that drill on production.
 
 ## Build identity and the `/readyz` gate
 
-A deploy stamps its image the way `deploy-staging` does. The rendered Wrangler
+Ordinary promotion does **not** rebuild a SHA. Staging bundles the Worker once,
+serves those saved modules with `--no-bundle`, and builds the stamped container
+once. After deploy/readiness, voice synthetic and the pinned-history guard all
+pass, `certify-promotion` uploads `bot-promotion-<run id>-<attempt>`. Fault drills,
+rollback proofs and an opted-out voice gate never certify. The diagnostic
+`staging-rollout-evidence` upload stays independent and still runs on failure.
+
+The certificate contains only a closed version-1 receipt and `modules/`: source
+repository/SHA/run/attempt, original compiled stamps, verified staging Worker and
+rollout identities, image digest, compatibility settings and each module's path,
+size and SHA-256. No generated environment config, sessions, diagnostics or
+secrets enter it. Intake refuses duplicate JSON keys, unsafe paths/symlinks,
+unknown fields/types and extra/missing or mismatched modules. Limits: 64 KiB
+receipt, 32 modules, 8 MiB per member and 16 MiB expanded module bytes.
+
+Production independently verifies the current successful main staging run and
+attempt, exact workflow/repository and immutable artifact ID/archive digest. It
+rechecks the source attempt immediately before copying. Missing, expired,
+ambiguous or incompatible artifacts fail **before any production mutation**;
+there is no rebuild fallback. Docker pulls/tags/pushes the admitted digest into
+the existing production image repository using Wrangler's normal short-lived
+registry login, then verifies both RepoDigests and the remote manifest digest.
+A changed digest or foreign account/repository publishes no admission. Rollback
+image provenance remains production-local; staging image references are not
+accepted as production rollback receipts.
+
+`production_deploy.py render --artifact` combines the admitted modules and
+production-local digest with the checked-out **production** TOML/bindings only.
+It removes image build inputs, disables rebundling and refuses compatibility
+drift. Production has its own Worker UUID and Deployment event ID, while the
+binary keeps the exact original staging `build_revision`, `build_id` and
+`deploy_id`. The readiness gate judges those admitted stamps plus the new exact
+serving Worker headers; GET-only control-plane checks bind the converged image
+and Worker before and after the stable readiness window. A different same-SHA
+build still refuses. The production event ID is not restamped into the image.
+
+Rollback and explicitly authorized live-SHA recovery remain independent of
+artifact retention. Only live-SHA recovery builds a fresh image. Its rendered
 config sets `image_vars` on the production container: `BOT_BUILD_REVISION` is
 the guarded 40-character lowercase hexadecimal SHA, `BOT_BUILD_ID` is
 `<run id>-<run attempt>`: exactly two non-empty decimal components, each at most
@@ -321,28 +359,30 @@ checks the staging ownership receipt, which production does not use. Ownership
 takeover runs as the P2–P4 steps in
 [Production ownership takeover](#production-ownership-takeover-p2p4) below.
 `scripts/production_deploy.py
-render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
-because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
-single production container. Nothing else changes, and
-`scripts/test-deploy-production.py` pins that diff. The lockfile's Wrangler
+render` reads the checked-in `wrangler/wrangler.toml`. With `--artifact` it
+verifies the saved module inventory and renders immutable inputs as described
+above. The legacy recovery invocation makes source/build paths absolute and
+sets `image_vars` on the single production container; existing protected tests
+still pin that legacy diff. The lockfile's Wrangler
 (4.151.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
-The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
-mode it passes an answer only when its JSON `build_revision` equals the
-guarded SHA, its `build_id` equals this run's `<run id>-<run
-attempt>`, **and** its `deploy_id` equals this run's deploy ID: the build ID
-and deploy ID prove the new container serves, not a previous
-build of the same SHA still draining. Rollback mode checks the revision
+The gate polls `/readyz` every 10 seconds for up to 30 attempts. In ordinary
+deploy mode the expected build/deploy IDs are the original admitted staging
+stamps, not the new production event's IDs. For live-SHA recovery only, it passes
+an answer when its JSON `build_revision` equals the guarded SHA, its `build_id`
+equals this run's `<run id>-<run attempt>`, **and** its `deploy_id` equals this
+run's deploy ID: the build ID and deploy ID prove the intended container serves,
+not a previous build of the same SHA still draining. Rollback mode checks the revision
 only, because the serving version was built by an older run.
 
 | `/readyz` answer | Result |
 |---|---|
-| 200 with gateway `ready`, revision is the SHA, `build_id` and `deploy_id` are this run's (deploy) or any stamped values (rollback), held for 18 consecutive polls (~3 min) | Pass: gateway ready and stable |
+| 200 with gateway `ready`, revision is the SHA, `build_id` and `deploy_id` match the admitted artifact (ordinary deploy), this run (live-SHA recovery), or any stamped values (rollback), held for 18 consecutive polls (~3 min) | Pass: gateway ready and stable |
 | 503 with the SHA and passing build/deploy ids (same rule) | Keep polling, then fail (auto-rollback only after a takeover; see below): a parked gateway never certifies a build |
 | 200 with gateway `starting` or `down` | Keep polling, then fail (auto-rollback only after a takeover; see below) |
 | 503 `{"error":"ownership_fenced"}` with no build fields | Keep polling; fail at the end. The fence releases at cutover step 3.5, so the identity match is established only after the takeover |
-| Revision is the SHA but `build_id` or `deploy_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
+| Revision is the SHA but `build_id` or `deploy_id` differs from the precisely admitted artifact (or this recovery run) | Keep polling; fail at the end: the previous container still serves this SHA |
 | `build_revision` is another SHA | Keep polling; fail at the end |
 | `build_revision` and `build_id` are both `unknown` (not stamped) | Deploy: keep polling; fail at the end. Rollback: recorded as a pre-stamp version, not a failure, but only on 200 with gateway `ready`; otherwise keep polling, then fail |
 | `build_revision` is `unknown` and `build_id` is not | Keep polling; fail at the end |
@@ -478,12 +518,15 @@ job's own run included) that carry none. The lanes serialize deploys, so the
 count cannot race. A malformed ID, or an ID naming another commit, refuses
 before anything is rendered or snapshotted.
 
-The ID is stamped into the image as `BOT_DEPLOY_ID` next to the revision and
-build ID, compiled into the binary, and reported on `/readyz` as `deploy_id`
+The staging deployment ID is stamped into the image as `BOT_DEPLOY_ID` next to the
+revision and build ID, compiled into the binary, and reported on `/readyz` as `deploy_id`
 (which the gates judge) and on the always-200 `/version` endpoint as
 `{"deploy_id", "sha", "build_id"}` (which judges nothing, so deploy records
-can read what serves without judging readiness). The Worker proxies
-`/version` like `/readyz`. A build from before stamping reports `unknown`;
+can read what serves without judging readiness). Ordinary production promotion
+retains that original stamp: its newly computed production event ID appears in
+the GitHub Deployment record, not in the unchanged binary. Live-SHA recovery
+builds/stamps its own ID. The Worker proxies `/version` like `/readyz`.
+A build from before stamping reports `unknown`;
 rollback mode ignores the reported ID because the restored build carries its
 original stamped ID. Deploy mode likewise judges the legacy
 revision/build-ID shape for a guarded SHA whose Dockerfile predates the
