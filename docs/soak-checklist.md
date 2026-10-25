@@ -158,8 +158,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-16: 17 — `/schedule`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule body:soak-once in-minutes:1; also create body:soak-repeat every-minutes:60; try neither option and below-minimum intervals.
-- **Expected:** Valid messages are queued for invoking channel, one-shot fires once; invalid cadence rejected; recurring schedule removed after evidence.
+- **Action:** On staging only, invoke /schedule body:soak-once in-minutes:1 and body:soak-repeat every-minutes:60. Create future at times in Z and a numeric offset naming the same instant; list/remove their IDs. Try malformed/no-offset/past/out-of-horizon at, at plus in-minutes/every-minutes, neither timing and below-minimum intervals. Through the approved restart contract, verify a not-yet-due and an already delivered one-off.
+- **Expected:** Offset-equivalent inputs persist the same canonical UTC millisecond instant; set/list show that instant, localized time, stable ID and uncertain delivery timing. Every invalid time/conflict has zero schedule/audit/channel effects. Relative and recurring semantics, body safety and quota remain intact; restart retains the due instant without a second occurrence. No exact-second SLO. Remove fixture schedules after evidence.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-17: 18 — `/schedule-remove`
