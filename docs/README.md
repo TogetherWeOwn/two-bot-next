@@ -1,13 +1,13 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)`.
 
-Check: `python3 scripts/check_docs_index.py --json` from the repo root.
-Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
-Else exit 1: fix rows or split oversized docs.
-Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Run `python3 scripts/check_docs_index.py --json` at repo root.
+Output: `{missing,stale,oversize}` sorted arrays; empty = PASS (exit 0).
+Exit 1: fix rows or split large docs.
+Invalid/duplicate rows use `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Legacy exceptions/reasons:
+`scripts/check_docs_index.py` (`LARGE_DOCS`), no second catalog.
 
 ## References and architecture
 
@@ -108,6 +108,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
+- [Giveaway self-check design](giveaway-self-check-spec.md)
 - [Community jobs](community-jobs.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey](member-journey-parity.md)
