@@ -226,6 +226,32 @@ pub async fn put_command<'c>(
     Ok(())
 }
 
+/// Flip one definition's enabled flag, preserving every other column. The
+/// caller holds the guild lifecycle lock and audits the transition in the
+/// same transaction, so a failed audit rolls the flip back.
+pub async fn set_command_enabled<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+    name: &str,
+    enabled: bool,
+    updated_by: &str,
+    updated_at_iso: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE automation_commands
+         SET enabled = $3, updated_by = $4, updated_at = $5::text::timestamptz
+         WHERE guild_id = $1 AND name = $2",
+    )
+    .bind(guild_id)
+    .bind(name)
+    .bind(enabled)
+    .bind(updated_by)
+    .bind(updated_at_iso)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Delete one definition; true when a row went away.
 pub async fn delete_command<'c>(
     executor: impl Executor<'c, Database = Postgres>,

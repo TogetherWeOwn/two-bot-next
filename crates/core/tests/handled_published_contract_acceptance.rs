@@ -135,10 +135,9 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 35 shared parity and Next-only builtins,
-/// including both Next-only inspection commands, `/reopen` picker recovery
-/// and `/giveaway` timed entry, plus the separate lfg-list discovery case
-/// route to their handlers; templateassistant stays unpublished.
+/// Registry compatibility: all 37 parity and Next-only builtins plus the
+/// separate lfg-list discovery case route to their handlers;
+/// templateassistant stays unpublished.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
     let router = InteractionRouter::new(parity_gates());
@@ -170,6 +169,8 @@ fn parity_builtins_route_to_their_handlers() {
         ("command-remove", HandlerId::AutomationAdmin),
         ("command-list", HandlerId::AutomationAdmin),
         ("command-inspect", HandlerId::AutomationAdmin),
+        ("command-disable", HandlerId::AutomationAdmin),
+        ("command-enable", HandlerId::AutomationAdmin),
         ("schedule", HandlerId::AutomationAdmin),
         ("schedule-remove", HandlerId::AutomationAdmin),
         ("schedule-list", HandlerId::AutomationAdmin),
@@ -187,8 +188,8 @@ fn parity_builtins_route_to_their_handlers() {
     ];
     assert_eq!(
         cases.len(),
-        35,
-        "all 35 shared builtins covered (feed-inspect included; lfg-list is separate)"
+        37,
+        "all builtins except the separate lfg-list case covered"
     );
     for (name, handler) in cases {
         assert_eq!(
@@ -257,8 +258,8 @@ fn e2e_matrix_still_matches_the_publish_set() {
             .iter()
             .filter(|row| row.command != "welcome-preview")
             .count(),
-        36,
-        "contract covers the 36 non-preview built-in commands"
+        38,
+        "contract covers the 38 non-preview built-in commands"
     );
     assert!(
         matrix

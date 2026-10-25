@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 37 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 39 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -123,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 37-row contract in publish order (core, scorecard, automation,
+/// The 39-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -184,7 +184,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "welcome-preview",
-            40,
+            42,
             E2eGate::Always,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -260,6 +260,34 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Valid:name:required",
                 "Valid:view:choices",
                 "Valid:arguments:utf16<=500",
+            ],
+        ),
+        row(
+            "command-disable",
+            40,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then ephemeral confirmation after the saved definition is paused plus one audit row; a repeated pause is an explicit no-op without republish.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+            ],
+        ),
+        row(
+            "command-enable",
+            41,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then ephemeral confirmation after the saved definition is resumed plus one audit row; a repeated resume is an explicit no-op without republish.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
             ],
         ),
         row(
