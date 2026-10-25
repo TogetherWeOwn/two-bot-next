@@ -48,6 +48,8 @@ mod giveaway_countdown_edge_acceptance_tests;
 mod giveaway_create_entry_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
 mod schedule_absolute_acceptance;
+#[path = "schedule_absolute_correction_tests.rs"]
+mod schedule_absolute_correction_tests;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
 
@@ -8633,7 +8635,7 @@ async fn schedule_list_far_over_cap_walks_hidden_rows_and_names_remaining_overfl
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_under_cap_renders_canonical_and_localized_due_times() {
+async fn schedule_list_under_cap_preserves_rows_with_localized_due_and_uncertainty() {
     let db = TestDb::new().await;
     db.seed_schedule_row(
         GUILD_S,
@@ -8653,6 +8655,7 @@ async fn schedule_list_under_cap_renders_canonical_and_localized_due_times() {
         false,
     )
     .await;
+    let before = schedule_absolute_correction_tests::state(&db.pool).await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
     runtime
@@ -8661,18 +8664,17 @@ async fn schedule_list_under_cap_renders_canonical_and_localized_due_times() {
 
     // deferred_reply() already asserts the ephemeral defer (flags 64).
     let json = mock.deferred_reply();
-    let expected = concat!(
-        "`once` `<#3333>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. ",
-        "The 15s ticker and delivery may be delayed.\n",
-        "`paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled) ",
-        "<t:1894710600:F>. The 15s ticker and delivery may be delayed.\n",
-        "`weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m ",
-        "<t:1896321906:F>. The 15s ticker and delivery may be delayed."
-    );
     assert_eq!(
         json["content"],
-        expected,
-        "under-cap rows retain their canonical due time while adding a localized time and delivery uncertainty"
+        "`once` `<#3333>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
+         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled) <t:1894710600:F>. The 15s ticker and delivery may be delayed.\n\
+         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m <t:1896321906:F>. The 15s ticker and delivery may be delayed.",
+        "list retains ordered complete rows, intervals and disabled state, with localized due times and delivery uncertainty"
+    );
+    assert_eq!(
+        schedule_absolute_correction_tests::state(&db.pool).await,
+        before,
+        "listing cannot change schedules, audits or commands"
     );
     assert!(
         db.schedule_audits().await.is_empty(),

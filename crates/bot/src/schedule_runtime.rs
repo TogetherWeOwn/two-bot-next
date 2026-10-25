@@ -610,9 +610,6 @@ fn schedule_confirmation(
     include_delivery_hint: bool,
 ) -> String {
     let mut text = schedule_confirm_text(created, id, every_minutes, next_run_at);
-    if every_minutes.is_some() {
-        text.push_str(&format!(" First due at {next_run_at}."));
-    }
     if include_delivery_hint {
         text.push_str(&schedule_delivery_hint(next_run_at));
     }
