@@ -5,12 +5,12 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 34 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 36 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
 //!    `twilight_http` bulk-set endpoint against the mock Discord double in
-//!    `common`: one request, all 35 names, guild-only, permission bits as
+//!    `common`: one request, all 37 names, guild-only, permission bits as
 //!    decimal strings. The REST executor ([TOG-10076]) owns the production
 //!    call; this proves the payload it will send.
 //!
@@ -276,12 +276,12 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
         .collect();
     // 23 legacy restricted rows plus management-only command-inspect and
-    // giveaway, plus purge-preview and channel-inspect. Discord defaults
-    // never replace any runtime permission gate.
+    // giveaway, plus purge-preview, channel-inspect, lfg-list and feed-inspect.
+    // Discord defaults never replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        27,
-        "25 prior restricted builtins plus purge-preview and channel-inspect"
+        29,
+        "23 legacy restricted rows plus command-inspect, giveaway, lfg-list, purge-preview, channel-inspect and feed-inspect"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
@@ -365,11 +365,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 37);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 39);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 34);
+    assert_eq!(commands.len(), 36);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -446,11 +446,12 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
+        ("feed-inspect", HandlerId::FeedInspect),
     ];
     assert_eq!(
         cases.len(),
-        33,
-        "all 33 non-giveaway handlers covered (reopen included; giveaway has its own test)"
+        34,
+        "all 34 shared handlers covered (reopen and feed-inspect included; giveaway and lfg-list have their own tests)"
     );
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
@@ -467,6 +468,25 @@ fn every_section1_row_routes_to_its_registered_handler() {
             "/{name} has its registered stub",
         );
     }
+    // Next-only `/lfg-list`: name-based so the baseline still compiles before
+    // the production `HandlerId::LfgList` arm lands. Resolves the handler from
+    // the publish registry when available instead of naming the enum.
+    let defs = router.publish_set(&[]).expect("publish set assembles");
+    let lfg_list = defs
+        .iter()
+        .find(|d| d.name == "lfg-list")
+        .expect("lfg-list is published right after lfg-close");
+    assert_eq!(
+        lfg_list.description.as_str(),
+        "List open game posts in this channel"
+    );
+    assert!(
+        matches!(
+            slash_outcome(&router, "lfg-list"),
+            SlashOutcome::Handled { .. }
+        ),
+        "/lfg-list must route to its handler"
+    );
 }
 
 /// The Next-only `/giveaway` timed entry routes to its registered handler.
@@ -1090,7 +1110,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 35 names, no partial view.
+    // endpoint: one request, all 37 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1101,8 +1121,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        35,
-        "5 core + 18 feature + 9 moderation mutations + 2 reads + 1 custom"
+        37,
+        "5 core + 20 feature + 9 moderation mutations + 2 reads + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1134,7 +1154,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 35, "no partial view");
+    assert_eq!(names.len(), 37, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1150,8 +1170,10 @@ async fn publish_sends_the_complete_merged_set_once() {
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-list",
         "feed-add",
         "feed-list",
+        "feed-inspect",
         "ban",
         "purge",
         "lockdown",

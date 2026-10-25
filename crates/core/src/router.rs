@@ -130,9 +130,11 @@ pub enum HandlerId {
     RsvpAttendance,
     Lfg,
     LfgClose,
+    LfgList,
     FeedAdd,
     FeedRemove,
     FeedList,
+    FeedInspect,
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
@@ -413,6 +415,7 @@ impl InteractionRouter {
                 HandlerId::FeedAdd,
                 HandlerId::FeedRemove,
                 HandlerId::FeedList,
+                HandlerId::FeedInspect,
                 HandlerId::Rsvp,
                 HandlerId::RsvpAttendance,
             ] {
@@ -443,9 +446,10 @@ impl InteractionRouter {
                 register(HandlerId::Moderation(action));
             }
         }
-        // LFG pair (`InteractionRuntime::with_router`, ungated).
+        // LFG management (`InteractionRuntime::with_router`, ungated).
         register(HandlerId::Lfg);
         register(HandlerId::LfgClose);
+        register(HandlerId::LfgList);
         router
     }
 
@@ -716,6 +720,11 @@ impl InteractionRouter {
                 gate: RowGate::Announcements,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
+            "lfg-list" => Row {
+                handler: HandlerId::LfgList,
+                gate: RowGate::Announcements,
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
+            },
             "feed-add" => Row {
                 handler: HandlerId::FeedAdd,
                 gate: RowGate::Announcements,
@@ -728,6 +737,11 @@ impl InteractionRouter {
             },
             "feed-list" => Row {
                 handler: HandlerId::FeedList,
+                gate: RowGate::Announcements,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
+            },
+            "feed-inspect" => Row {
+                handler: HandlerId::FeedInspect,
                 gate: RowGate::Announcements,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
@@ -984,11 +998,13 @@ mod tests {
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
             ("lfg-close", HandlerId::LfgClose),
+            ("lfg-list", HandlerId::LfgList),
             ("feed-add", HandlerId::FeedAdd),
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
+            ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 34, "all 34 handler-owned builtins covered");
+        assert_eq!(cases.len(), 36, "all 36 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1570,9 +1586,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 10 automation + 7 announcement + 9 moderation
-        // + 2 reads + 1 custom = 35, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 35);
+        // 5 core + 1 scorecard + 10 automation + 9 announcement + 9 moderation
+        // + 2 reads + 1 custom = 37, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 37);
         assert_eq!(
             &names[..6],
             [
@@ -1588,15 +1604,18 @@ mod tests {
         assert_eq!(&names[14..17], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
+        assert_eq!(names[20], "lfg-list");
+        assert_eq!(&names[21..24], ["feed-add", "feed-remove", "feed-list"]);
+        assert_eq!(names[24], "feed-inspect");
         assert_eq!(
-            &names[23..32],
+            &names[25..34],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[32..34], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[34], "faq");
+        assert_eq!(&names[34..36], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[36], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1759,7 +1778,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 34);
+        assert_eq!(off.len(), 36);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1769,16 +1788,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 34 builtins keep their order; the 21 voice names that survive
+        // 36 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 55);
-        assert_eq!(on_names[..34], off_names[..]);
+        assert_eq!(on.len(), 57);
+        assert_eq!(on_names[..36], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[34..], expected[..]);
+        assert_eq!(on_names[36..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1839,13 +1858,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 34
+        // Both gates on is the full voice set without the assistant: 36
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 55);
+        assert_eq!(both.len(), 57);
     }
 
     #[test]

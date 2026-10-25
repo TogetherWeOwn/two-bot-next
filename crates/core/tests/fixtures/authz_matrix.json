@@ -35,6 +35,7 @@
     {"name": "attendance", "allow": ["manage_events", "all_bits"], "deny": "ManageEventsRequired"},
     {"name": "lfg", "allow": ["manage_events", "all_bits"], "deny": "ManageEventsRequired"},
     {"name": "lfg-close", "allow": ["manage_events", "all_bits"], "deny": "ManageEventsRequired"},
+    {"name": "lfg-list", "allow": ["manage_events", "all_bits"], "deny": "ManageEventsRequired"},
     {"name": "command", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "command-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "command-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
@@ -47,7 +48,8 @@
     {"name": "giveaway", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-add", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
-    {"name": "feed-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"}
+    {"name": "feed-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "feed-inspect", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"}
   ],
   "context_cases": [
     {
