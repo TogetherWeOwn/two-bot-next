@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/onboarding_game_role_preview_acceptance_tests.rs",
-      "sha256": "8035bc1c925fba5790fc6a8df8799e8e9a39de6d9ab42bc65ad8dc26ab76a2b4",
+      "sha256": "8d7efd1fa9fd820996c65c9358abe313aa21cbe01c9a2b0e6de4856f4c36239b",
       "tests": 16
     }
   ],

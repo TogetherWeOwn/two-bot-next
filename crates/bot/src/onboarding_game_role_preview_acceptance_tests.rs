@@ -383,9 +383,12 @@ async fn submit(
         "onboarding must own the preview interaction at ingress"
     );
     let start = mock.requests().len();
-    let (result, queries) =
-        Queries::capture(runtime.handle(OnboardingJob::Interaction(Box::new(interaction)), NOW))
-            .await;
+    let (result, queries) = Queries::capture(
+        runtime
+            .handle(OnboardingJob::Interaction(Box::new(interaction)), NOW)
+            .boxed(),
+    )
+    .await;
     result.expect("private onboarding operation finishes");
     no_effects(mock, pool, start).await;
     for query in queries {
@@ -541,7 +544,8 @@ async fn run_case(case: Case) {
     let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
         .expect("guarded disposable database");
-    let result = AssertUnwindSafe(exercise(case, db.pool()))
+    // Keep the combined case future off the small default test-thread stack.
+    let result = AssertUnwindSafe(Box::pin(exercise(case, db.pool())))
         .catch_unwind()
         .await;
     db.close()
@@ -619,6 +623,7 @@ async fn exercise(case: Case, pool: &PgPool) {
                 ))),
                 NOW,
             )
+            .boxed()
             .await
             .unwrap();
         let writes: HashSet<_> = mock
@@ -900,6 +905,7 @@ async fn exercise(case: Case, pool: &PgPool) {
                 );
                 runtime
                     .handle(OnboardingJob::Interaction(Box::new(interaction)), NOW)
+                    .boxed()
                     .await
                     .unwrap();
                 assert_eq!(
@@ -938,6 +944,7 @@ async fn exercise(case: Case, pool: &PgPool) {
                     ))),
                     NOW + 1,
                 )
+                .boxed()
                 .await
                 .unwrap();
             let requests = mock.requests();
@@ -975,6 +982,7 @@ async fn exercise(case: Case, pool: &PgPool) {
                     OnboardingJob::Interaction(Box::new(preview_select(&id, 3, &["horror"], 460))),
                     NOW,
                 )
+                .boxed()
                 .await
                 .unwrap();
             no_effects(&mock, pool, start).await;
