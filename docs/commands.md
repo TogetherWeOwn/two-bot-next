@@ -46,6 +46,7 @@ Set who can create voice rooms and use room commands
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `show` | subcommand | false | — | — | — | — | Show the current voice-room access settings |
+| `show page` | integer | false | 1 | — | — | — | Page of access settings to show (starts at 1) |
 | `creation` | subcommand | false | — | — | — | — | Turn temporary room creation on or off |
 | `creation enabled` | boolean | true | — | — | — | — | On allows new rooms, off stops them (existing rooms keep working) |
 | `role` | subcommand | false | — | — | — | — | Set or clear the role required to use room commands |
@@ -609,7 +610,9 @@ Show voice-room status, health and creator channels
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of creator channels to show (starts at 1) |
 
 ## `/slowmode`
 
