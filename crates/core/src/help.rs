@@ -114,6 +114,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "feed-pause",
             "feed-resume",
             "feed-list",
+            "feed-inspect",
         ],
         anchor: None,
     },
@@ -767,13 +768,14 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 37 non-voice commands (5 core + 21 feature + 9 moderation + 2 reads),
+        // 38 non-voice commands (5 core + 22 feature + 9 moderation + 2 reads),
         // including inspection, reopen, giveaway, lfg-list, feed-pause,
-        // feed-resume, purge-preview and channel-inspect, plus 21 additional
-        // voice commands (voice `kick` loses first-wins to moderation `/kick`).
+        // feed-resume, feed-inspect, purge-preview and channel-inspect, plus 21
+        // additional voice commands (voice `kick` loses first-wins to moderation
+        // `/kick`).
         // `/templateassistant` stays unpublished until its slice lands:
         // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (58 live)"));
+        assert!(text.contains("**Server commands** (59 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -899,11 +901,12 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 37 non-voice names, including inspection, reopen, giveaway,
-        // lfg-list, feed-pause, feed-resume, purge-preview and channel-inspect,
-        // plus 21 additional voice names (voice `kick` shares the Kick group).
+        // 38 non-voice names, including inspection, reopen, giveaway,
+        // lfg-list, feed-pause, feed-resume, feed-inspect, purge-preview and
+        // channel-inspect, plus 21 additional voice names (voice `kick` shares
+        // the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 58);
+        assert_eq!(grouped.len(), 59);
         for name in [
             "rank",
             "leaderboard",
@@ -922,6 +925,7 @@ mod tests {
             "lfg-close",
             "lfg-list",
             "feed-add",
+            "feed-inspect",
             "ban",
             "tempban",
             "kick",

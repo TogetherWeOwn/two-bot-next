@@ -1413,13 +1413,37 @@ fn page_ids(reply: &str) -> Vec<&str> {
 }
 
 #[test]
-fn feed_list_page_short_list_keeps_exact_legacy_reply() {
+fn feed_list_page_short_list_keeps_legacy_rows_with_attempt_and_inspect_hint() {
     let feeds = middle_relays(3);
     let reply = feed_list_page(&feeds, 1);
-    assert_eq!(reply, feed_list_text(&feeds));
+    // Rows keep their exact legacy frame (id, kind, channel, full source)
+    // plus the shared last-attempt phrase; the reply ends with the inspect
+    // hint and no `Page n of total` footer.
+    let mut lines = reply.lines();
+    for feed in &feeds {
+        let frame = format!(
+            "`{}` rss enabled → <#{}> {}",
+            feed.id, feed.channel_id, feed.source
+        );
+        let line = lines.next().expect("one line per relay");
+        assert!(
+            line.starts_with(&frame),
+            "row keeps its legacy frame: {line}"
+        );
+        assert!(
+            line[frame.len()..].to_ascii_lowercase().contains("attempt"),
+            "row carries the attempt phrase: {line}"
+        );
+    }
+    assert_eq!(lines.next(), Some(FEED_LIST_INSPECT_HINT));
+    assert_eq!(lines.next(), None, "no trailing lines: {reply}");
     assert!(
         !reply.contains("Page "),
         "single page carries no footer: {reply}"
+    );
+    assert!(
+        reply.encode_utf16().count() <= 2000,
+        "short reply stays bounded: {reply}"
     );
 }
 

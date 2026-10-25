@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
         matrix_names, published_names,
         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
     );
-    assert_eq!(matrix.len(), 37, "contract covers the 37 built-in commands");
+    assert_eq!(matrix.len(), 38, "contract covers the 38 built-in commands");
 }
 
 #[test]
@@ -75,6 +75,11 @@ fn matrix_gates_and_permissions_match_the_registry() {
         assert_eq!(
             table.required_permissions, row.required_permissions,
             "/{} permission row drifted from the permission table",
+            row.command
+        );
+        assert_eq!(
+            row.parity_row, table.parity_row,
+            "/{} parity row drifted from the permission table",
             row.command
         );
         assert!(
@@ -113,6 +118,7 @@ fn matrix_gates_and_permissions_match_the_registry() {
                 "feed-pause",
                 "feed-resume",
                 "feed-list",
+                "feed-inspect",
             ]
             .contains(&row.command)
             {

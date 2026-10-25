@@ -1,9 +1,9 @@
 # Feed supervisor operator guide
 
 How to run feed delivery (`/feed-add`, `/feed-list`, `/feed-remove`,
-`/feed-pause`, `/feed-resume` and the managed poller). This is the operator view.
-The port record (`docs/feeds-port.md`) remains the domain/store contract; this
-guide does not restate it.
+`/feed-pause`, `/feed-resume`, `/feed-inspect` plus the managed poller). This is
+the operator view. The port record (`docs/feeds-port.md`) remains the
+domain/store contract; this guide does not restate it.
 
 Out of scope: code changes and dashboard queries. Cadence hot-reload is
 shipped behavior (see [Fetch cadence](#fetch-cadence)): a stored interval
@@ -11,16 +11,17 @@ change reschedules the next run without a restart.
 
 ## Source configuration
 
-Five slash commands, all guild-only, all requiring ManageGuild (`32`), none
+Six slash commands, all guild-only, all requiring ManageGuild (`32`), none
 available in DMs (`docs/commands.md`):
 
 | Command | Options | Notes |
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
-| `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation; short lists keep the exact legacy single reply (`crates/core/src/feeds.rs`). Every row labels its own `enabled`/`paused` state. |
-| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` Guild-scoped delete. |
+| `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation. Every row labels its own `enabled`/`paused` state, carries its last-attempt phrase, and every reply points at `/feed-inspect` (`crates/core/src/feeds.rs`). |
+| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs`). Guild-scoped delete. |
 | `/feed-pause` | `id` (required string, max 128 chars) | Pauses one relay without deleting its history: URL, destination, seen-item state and delivery evidence are preserved. Replies ``Feed relay paused: `<id>`.``, ``Feed relay is already paused: `<id>`.``, `No feed relay with that id.`, or — when an enabled relay has a delivery still pending recovery — `Feed relay kept enabled: deliveries are still pending recovery. Retry after recovery settles.` (relay stays enabled; already-admitted work is not cancelled). |
 | `/feed-resume` | `id` (required string, max 128 chars) | Resumes one paused relay with its history intact. Replies ``Feed relay resumed: `<id>`.``, ``Feed relay is already enabled: `<id>`.``, or `No feed relay with that id.` Catch-up keeps the existing 20-posts-per-pass budget; accepted items are never reposted. |
+| `/feed-inspect` | `id` (required string, max 128 chars) | Ephemeral detail for one saved relay: id, kind, destination, enabled state, redacted source and last attempted poll. Pure read, no audit row. The attempt is attempt evidence only, never a health verdict (`crates/core/src/feeds.rs`). |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 
@@ -288,8 +289,10 @@ not part of feed operation.
    `/feed-add kind:rss source:https://example.com/feed.xml`.
    Expect the relay id in the confirmation reply; copy it.
 2. Run `/feed-list` in the same guild. Expect a line
-   `` `<id>` rss → <#<channel>> https://example.com/feed.xml ``
-   (sources shrink to fit at capacity; every relay id stays listed).
+   `` `<id>` rss → <#<channel>> https://example.com/feed.xml `` followed by
+   its last-attempt phrase (sources shrink to fit at capacity; every relay
+   id stays listed). Run `/feed-inspect id:<id>` for the saved source and
+   last-attempt detail without touching the relay.
 3. Wait one poll interval (default 300 s; configured via
    `TWO_FEED_POLL_SECONDS`). Adding a relay does not fetch the source —
    the first delivery happens on the next pass.

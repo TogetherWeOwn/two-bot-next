@@ -50,7 +50,8 @@
     {"name": "feed-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-pause", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-resume", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
-    {"name": "feed-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"}
+    {"name": "feed-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "feed-inspect", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"}
   ],
   "context_cases": [
     {

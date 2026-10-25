@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 37 built-ins plus the voice set
-  (58 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 38 built-ins plus the voice set
+  (59 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 5 core + 1 scorecard + 10 automations + 10 announcements +
-9 moderation + 2 private reads = **37 built-ins**. Machine-readable mirror:
+Counts: 5 core + 1 scorecard + 10 automations + 11 announcements +
+9 moderation + 2 private reads = **38 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
@@ -72,6 +72,7 @@ handler family with a covered command.
 | `/feed-pause` | announcements | Needs a live feed id plus seeded delivery state; sequenced after a feed-add, not standalone. |
 | `/feed-resume` | announcements | Needs a paused relay (DB lifecycle state); sequenced after feed-pause, not standalone. |
 | `/feed-list` | announcements | Needs seeded feed relays (DB); the no-DB rule excludes it. |
+| `/feed-inspect` | announcements | Needs a live feed id; sequenced after a feed-add, not standalone. |
 | `/tempban` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/kick` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/timeout` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |

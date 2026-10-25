@@ -79,11 +79,12 @@ use PolicyHook::{
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), the private moderation reads
 /// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
-/// timed entry (parity row 37), channel LFG discovery (parity row 38),
-/// and the Next-only feed lifecycle pair `/feed-pause` (parity row 39)
-/// and `/feed-resume` (parity row 40).
+/// timed entry (parity row 37), channel LFG discovery (parity row 38), the
+/// Next-only `/feed-inspect` relay detail (parity row 39), and the Next-only
+/// feed lifecycle pair `/feed-pause` (parity row 40) and `/feed-resume`
+/// (parity row 41).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 40] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 41] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -170,8 +171,9 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 40] = [
     row(28, "feed-add", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(39, "feed-pause", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(40, "feed-resume", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(39, "feed-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(40, "feed-pause", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(41, "feed-resume", BuiltinSlash, PERM_MANAGE_GUILD, None),
 ];
 
 /// Only retained builtins participate in slash-name lookup. The dropped and

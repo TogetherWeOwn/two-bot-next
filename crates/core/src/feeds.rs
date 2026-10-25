@@ -94,6 +94,9 @@ pub enum FeedCommand {
     Remove {
         id: String,
     },
+    Inspect {
+        id: String,
+    },
     List,
     Pause {
         id: String,
@@ -107,6 +110,7 @@ pub enum FeedCommand {
 pub enum FeedCommandPlan {
     Add(FeedRelay),
     Remove { guild_id: String, id: String },
+    Inspect { guild_id: String, id: String },
     List { guild_id: String },
     Pause { guild_id: String, id: String },
     Resume { guild_id: String, id: String },
@@ -151,6 +155,13 @@ pub fn plan_command(
         FeedCommand::Remove { id } => {
             validate_id(&id)?;
             Ok(FeedCommandPlan::Remove {
+                guild_id: context.guild_id.into(),
+                id,
+            })
+        }
+        FeedCommand::Inspect { id } => {
+            validate_id(&id)?;
+            Ok(FeedCommandPlan::Inspect {
                 guild_id: context.guild_id.into(),
                 id,
             })
@@ -323,6 +334,293 @@ fn feed_list_row_distinguishing(feed: &FeedRelay, source_budget: usize) -> Strin
     )
 }
 
+/// Latest credible `last_checked_at` in milliseconds (9999-12-31T23:59:59Z).
+/// The poller advances the stored stamp after every poll attempt, including
+/// failed fetches, so the value is attempt evidence — never a health, success,
+/// fetch or delivery signal. Negative and far-future stamps are legacy
+/// corruption, not poll times: they render as unknown, never panic and never
+/// claim success.
+const MAX_ATTEMPT_MS: i64 = 253_402_300_799_000;
+
+fn valid_attempt_ms(stamp: i64) -> bool {
+    (0..=MAX_ATTEMPT_MS).contains(&stamp)
+}
+
+/// Shared last-attempt phrase for the inspect detail and list rows. Every
+/// shape names the attempt: never-attempted relays say never, valid stamps
+/// render as Discord-localized relative time, and invalid legacy stamps read
+/// as unknown. No shape may use a success label (see the inspect acceptance
+/// contract): a failed fetch advances the stored timestamp.
+fn attempt_phrase(last_checked_at: Option<i64>) -> String {
+    match last_checked_at {
+        None => "Last attempt: never".to_owned(),
+        Some(stamp) if valid_attempt_ms(stamp) => {
+            format!("Last attempt: <t:{}:R>", stamp / 1000)
+        }
+        Some(_) => "Last attempt: unknown".to_owned(),
+    }
+}
+
+/// Query parameters whose values are credentials until proven otherwise.
+/// Match decoded names case-insensitively, including compound names such as
+/// `accessToken` and `clientSecret`; `channel_id` and `format` survive.
+/// Names survive redaction — only values are replaced — so the admin still
+/// sees which secret-bearing parameter a relay carries.
+fn is_credential_query_param(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "pass",
+        "key",
+        "auth",
+        "credential",
+        "signature",
+        "sig",
+        "private",
+        "bearer",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+/// Markdown-structure characters escaped inside untrusted source segments.
+/// Dots, slashes and dashes stay literal for readability; the host bypasses
+/// this entirely so safe host identity stays copyable.
+fn escape_source_segment(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '`' | '*' | '_' | '~' | '[' | ']' | '(' | ')' | '<' | '>'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Replace embedded `http(s)://` runs inside an untrusted segment — a hostile
+/// path or query value smuggling a second link (often paired with masked-link
+/// markdown). Returns the replacement plus whether anything was removed.
+fn strip_embedded_links(segment: &str) -> (String, bool) {
+    let bytes = segment.as_bytes();
+    let mut out = String::with_capacity(segment.len());
+    let mut index = 0;
+    let mut removed = false;
+    while index < bytes.len() {
+        let rest = &segment[index..];
+        let lower = rest.as_bytes();
+        let is_embedded = lower.len() >= 7
+            && (lower[..7].eq_ignore_ascii_case(b"http://")
+                || (lower.len() >= 8 && lower[..8].eq_ignore_ascii_case(b"https://")));
+        if !is_embedded {
+            let ch = rest.chars().next().unwrap_or_default();
+            out.push(ch);
+            index += ch.len_utf8().max(1);
+            continue;
+        }
+        removed = true;
+        out.push_str("[embedded link removed]");
+        // Consume to whitespace, backtick or end; the run is hostile either way.
+        let mut end = index;
+        for ch in rest.chars() {
+            if ch.is_whitespace() || ch == '`' {
+                break;
+            }
+            end += ch.len_utf8();
+        }
+        index = if end == index { index + 1 } else { end };
+    }
+    (out, removed)
+}
+
+/// One untrusted source segment (path, query name or value, opaque source):
+/// mentions neutralized, embedded links removed, hostile markdown escaped.
+/// Idempotent on the mention pass so truncation can re-run neutralization.
+fn sanitize_source_segment(segment: &str) -> (String, bool) {
+    let neutralized = crate::message_safety::neutralize_mentions(segment);
+    let (stripped, removed) = strip_embedded_links(&neutralized);
+    (escape_source_segment(&stripped), removed)
+}
+
+/// Rebuild one raw query string with credential-like values redacted. Names
+/// survive (escaped); only values are replaced, so relays stay
+/// distinguishable by their non-secret parameters.
+fn redact_source_query(raw: &str, reasons: &mut Vec<&'static str>) -> String {
+    let mut query = String::new();
+    // Some origins (Rack/Rails, Perl CGI) treat `;` as a pair separator too;
+    // splitting only on `&` would leave a credential pair hidden inside a
+    // safe-looking value. Preserve the original separator in the projection.
+    for chunk in raw.split_inclusive(['&', ';']) {
+        let (pair, separator) = if let Some(stripped) = chunk.strip_suffix('&') {
+            (stripped, "&")
+        } else if let Some(stripped) = chunk.strip_suffix(';') {
+            (stripped, ";")
+        } else {
+            (chunk, "")
+        };
+        let (name, value) = pair
+            .split_once('=')
+            .map_or((pair, None), |(n, v)| (n, Some(v)));
+        let (safe_name, name_had_link) = sanitize_source_segment(name);
+        if name_had_link {
+            push_redaction_reason(reasons, "embedded link");
+        }
+        query.push_str(&safe_name);
+        if let Some(raw_value) = value {
+            query.push('=');
+            // Decode only for classification; keep the original name
+            // and non-secret value spelling in the safe projection.
+            let decoded_name = url::form_urlencoded::parse(pair.as_bytes())
+                .next()
+                .map(|(name, _)| name)
+                .unwrap_or_default();
+            if is_credential_query_param(&decoded_name) {
+                push_redaction_reason(reasons, "secret query values");
+                query.push_str("[redacted]");
+            } else {
+                let (safe_value, value_had_link) = sanitize_source_segment(raw_value);
+                if value_had_link {
+                    push_redaction_reason(reasons, "embedded link");
+                }
+                query.push_str(&safe_value);
+            }
+        }
+        query.push_str(separator);
+    }
+    query
+}
+
+fn push_redaction_reason(reasons: &mut Vec<&'static str>, reason: &'static str) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+/// Bounded safe projection of an untrusted stored source plus whether anything
+/// was redacted and why. Userinfo, fragments and credential-like query values
+/// never survive; the host, port, scheme, path and non-secret query identity
+/// do, in escaped form, so relays stay distinguishable. Sources that do not
+/// parse as absolute URLs (bare channel ids, legacy garbage) render through
+/// the same sanitize-and-truncate pipeline as opaque text.
+///
+/// Truncation is tail-biased (head…tail): prefix truncation would collapse
+/// every same-host relay to an identical head and hide the distinguishing
+/// query tail.
+fn safe_source_projection(source: &str, budget: usize) -> (String, Vec<&'static str>) {
+    let mut reasons: Vec<&'static str> = Vec::new();
+    let parsed = url::Url::parse(source.trim())
+        .ok()
+        .filter(|url| url.host_str().is_some());
+    let Some(url) = parsed else {
+        let (sanitized, had_link) = sanitize_source_segment(source.trim());
+        if had_link {
+            push_redaction_reason(&mut reasons, "embedded link");
+        }
+        return (truncate_safe_source(&sanitized, budget), reasons);
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        push_redaction_reason(&mut reasons, "login");
+    }
+    if url.fragment().is_some() {
+        push_redaction_reason(&mut reasons, "fragment");
+    }
+    let (safe_path, path_had_link) = sanitize_source_segment(url.path());
+    if path_had_link {
+        push_redaction_reason(&mut reasons, "embedded link");
+    }
+    // `host_str` already includes the brackets around an IPv6 literal.
+    let host = url.host_str().unwrap_or_default();
+    let mut projection = format!("{}://{host}", url.scheme());
+    if let Some(port) = url.port() {
+        projection.push_str(&format!(":{port}"));
+    }
+    projection.push_str(&safe_path);
+    if let Some(raw_query) = url.query() {
+        let safe_query = redact_source_query(raw_query, &mut reasons);
+        if !safe_query.is_empty() {
+            projection.push('?');
+            projection.push_str(&safe_query);
+        }
+    }
+    // Neutralize once more after truncation: elision can only cut, never join,
+    // but the pass is idempotent and keeps the guarantee local.
+    let truncated = truncate_safe_source(&projection, budget);
+    (
+        crate::message_safety::neutralize_mentions(&truncated),
+        reasons,
+    )
+}
+
+/// Tail-biased truncation for a sanitized source projection: a recognizable
+/// head plus the distinguishing tail, joined by an explicit `…`. Astral
+/// scalars are never split.
+fn truncate_safe_source(value: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    if value.encode_utf16().count() <= budget {
+        return value.to_string();
+    }
+    if budget == 1 {
+        return "…".to_string();
+    }
+    let remaining = budget - 1;
+    let head_units = remaining / 3;
+    let tail_units = remaining - head_units;
+    format!(
+        "{}…{}",
+        truncate_utf16(value, head_units),
+        truncate_utf16_tail(value, tail_units)
+    )
+}
+
+/// Source budget inside the inspect detail: the fixed identity, attempt and
+/// disclaimer lines stay near ~400 units, so 1400 keeps the whole bounded
+/// reply under Discord's 2,000-unit cap with slack for the redaction notice.
+const MAX_INSPECT_SOURCE_UNITS: usize = 1400;
+
+impl FeedRelay {
+    /// Bounded private detail for one saved relay: exact id, kind,
+    /// destination, enabled state, safe source and last attempted poll. The
+    /// attempt is attempt evidence only — a saved source is not proof of
+    /// current remote availability, and the copy says so.
+    pub fn inspect_text(&self) -> String {
+        let (source, reasons) = safe_source_projection(&self.source, MAX_INSPECT_SOURCE_UNITS);
+        let mut lines = vec![
+            format!("Feed relay `{}`", self.id),
+            format!(
+                "Kind: {} · Channel: <#{}> · State: {}",
+                self.kind.as_str(),
+                self.channel_id,
+                if self.enabled {
+                    "enabled"
+                } else {
+                    "disabled (paused)"
+                }
+            ),
+            attempt_phrase(self.last_checked_at),
+            format!("Source: {source}"),
+        ];
+        if !reasons.is_empty() {
+            lines.push(format!("(redacted: {})", reasons.join(", ")));
+        }
+        lines.push(
+            "Saved relays show the last attempt only; they do not prove the source is reachable now."
+                .to_owned(),
+        );
+        // Defensive: the per-part budgets already bound this, but legacy rows
+        // are untrusted and the reply must never exceed the cap. The id leads,
+        // so a clamp can only cost trailing context, never identity.
+        truncate_utf16(&lines.join("\n"), DISCORD_MESSAGE_CONTENT_LIMIT)
+    }
+}
+
 pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
     if feeds.is_empty() {
         return "No feed relays configured.".into();
@@ -412,25 +710,63 @@ impl FeedRelay {
             .iter()
             .map(|feed| feed_list_page_row(feed, content_budget))
             .collect();
-        let mut pages: Vec<String> = Vec::new();
-        let mut current = String::new();
-        let mut current_units = 0usize;
-        for row in &rendered {
-            let row_units = row.encode_utf16().count();
-            if !current.is_empty() && current_units + 1 + row_units > content_budget {
-                pages.push(std::mem::take(&mut current));
-                current_units = 0;
-            }
-            if !current.is_empty() {
-                current.push('\n');
-                current_units += 1;
-            }
-            current.push_str(row);
-            current_units += row_units;
-        }
-        pages.push(current);
-        pages
+        pack_page_bodies(&rendered, content_budget)
     }
+
+    /// Pack whole relay rows like [`FeedRelay::list_pages`], with each row
+    /// carrying the shared last-attempt phrase. The attempt suffix reserves
+    /// its own units before the row renders, so rows (and their exact ids)
+    /// still fit the budget; when the suffix alone would eat the budget, the
+    /// legacy row wins and the id stays reachable without the attempt.
+    pub fn list_pages_with_attempt(rows: &[FeedRelay], content_budget: usize) -> Vec<String> {
+        if rows.is_empty() {
+            return vec![feed_list_text(rows)];
+        }
+        let rendered: Vec<String> = rows
+            .iter()
+            .map(|feed| feed_list_page_row_with_attempt(feed, content_budget))
+            .collect();
+        pack_page_bodies(&rendered, content_budget)
+    }
+}
+
+/// Pack pre-rendered whole rows into page bodies in input order. Rows are
+/// never split and never dropped; callers reserve footer overhead up front.
+fn pack_page_bodies(rendered: &[String], content_budget: usize) -> Vec<String> {
+    let mut pages: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_units = 0usize;
+    for row in rendered {
+        let row_units = row.encode_utf16().count();
+        if !current.is_empty() && current_units + 1 + row_units > content_budget {
+            pages.push(std::mem::take(&mut current));
+            current_units = 0;
+        }
+        if !current.is_empty() {
+            current.push('\n');
+            current_units += 1;
+        }
+        current.push_str(row);
+        current_units += row_units;
+    }
+    pages.push(current);
+    pages
+}
+
+/// One attempt-suffixed page-body row: the legacy row frame (exact id, kind,
+/// channel mention, source) plus the shared [`attempt_phrase`], so list
+/// pages and the inspect detail speak the same attempt vocabulary. The id
+/// stays first, so a suffix can never hide it.
+fn feed_list_page_row_with_attempt(feed: &FeedRelay, content_budget: usize) -> String {
+    let suffix = format!(" · {}", attempt_phrase(feed.last_checked_at));
+    let suffix_units = suffix.encode_utf16().count();
+    let Some(row_budget) = content_budget.checked_sub(suffix_units) else {
+        return feed_list_page_row(feed, content_budget);
+    };
+    if row_budget == 0 {
+        return feed_list_page_row(feed, content_budget);
+    }
+    format!("{}{suffix}", feed_list_page_row(feed, row_budget))
 }
 
 /// One page-body row: the exact 128-unit legacy rendering when it fits the
@@ -462,14 +798,23 @@ fn feed_list_page_row(feed: &FeedRelay, content_budget: usize) -> String {
     feed_list_row_distinguishing(feed, content_budget - frame_units)
 }
 
+/// Hint appended to single-page lists and baked into the multi-page footer,
+/// so the stable-ID inspect operation stays discoverable from every list.
+/// Uses the same attempt vocabulary as the rows: the detail shows the last
+/// attempt, not a health verdict.
+pub const FEED_LIST_INSPECT_HINT: &str =
+    "Run /feed-inspect id:<relay-id> for source and last-attempt detail.";
+
 /// Full `/feed-list` reply for one 1-based page over already-fetched rows.
 ///
 /// The bounded guild read stays the caller's; this composes bodies from
-/// [`FeedRelay::list_pages`] after reserving footer overhead, so every reply
-/// including navigation fits Discord's 2,000 UTF-16 units. A single page
-/// keeps the exact legacy bytes with no footer; every page of a multi-page
-/// list ends with [`feed_list_page_footer`]. Nonpositive and out-of-range
-/// pages refuse shortly with usable navigation and list no rows.
+/// [`FeedRelay::list_pages_with_attempt`] after reserving footer overhead, so
+/// every reply including navigation fits Discord's 2,000 UTF-16 units. Rows
+/// keep their legacy frame (exact id, kind, channel, source) plus the shared
+/// last-attempt phrase. A single page ends with the inspect hint and no
+/// `Page n of total` footer; every page of a multi-page list ends with
+/// [`feed_list_page_footer`], which carries the same hint. Nonpositive and
+/// out-of-range pages refuse shortly with usable navigation and list no rows.
 #[must_use]
 pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
     if page < 1 {
@@ -488,12 +833,12 @@ pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
     // shrink the page count. Accept fewer bodies than guessed instead of
     // looping: the reserved overhead upper-bounds the actual footer (its
     // length only grows with the total), and a single body packed under
-    // budget fits without one. The guess only ever increases and is bounded
+    // budget fits with its hint. The guess only ever increases and is bounded
     // by one page per row, so this always terminates.
     let mut total_guess: usize = 1;
     loop {
         let overhead = if total_guess <= 1 {
-            0
+            FEED_LIST_INSPECT_HINT.encode_utf16().count() + 1 // joining newline
         } else {
             feed_list_page_footer(total_guess as i64, total_guess as i64)
                 .encode_utf16()
@@ -501,14 +846,14 @@ pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
                 + 1 // joining newline
         };
         let budget = DISCORD_MESSAGE_CONTENT_LIMIT.saturating_sub(overhead);
-        let bodies = FeedRelay::list_pages(feeds, budget);
+        let bodies = FeedRelay::list_pages_with_attempt(feeds, budget);
         if bodies.len() <= total_guess {
             let total = bodies.len() as i64;
             if page > total {
                 return feed_list_page_out_of_range_text(page, total);
             }
             if bodies.len() == 1 {
-                return bodies[0].clone();
+                return format!("{}\n{FEED_LIST_INSPECT_HINT}", bodies[0]);
             }
             return format!(
                 "{}\n{}",
@@ -521,11 +866,14 @@ pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
     }
 }
 
-/// `Page n of total` footer with usable navigation for multi-page lists.
-/// Stays off single-page replies so short lists keep their legacy shape.
+/// `Page n of total` footer with usable navigation for multi-page lists,
+/// plus the inspect hint so per-relay detail stays one command away.
+/// Stays off single-page replies, which carry the hint on its own line.
 #[must_use]
 pub fn feed_list_page_footer(current: i64, total: i64) -> String {
-    format!("Page {current} of {total}. Run /feed-list page:<number> for another page.")
+    format!(
+        "Page {current} of {total}. Run /feed-list page:<number> for another page. {FEED_LIST_INSPECT_HINT}"
+    )
 }
 
 /// `/feed-list` refusal for `page < 1` (Discord's registry minimum is 1,

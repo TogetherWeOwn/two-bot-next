@@ -16,8 +16,10 @@
 //!   legacy order pinned below: claim → post → record → delete previous →
 //!   audit, with `post_failed`/orphan cleanup on the failure edges).
 //! - feed relays (`/feed-add`, `/feed-remove`, `/feed-pause`, `/feed-resume`,
-//!   `/feed-list`; TOG-10085 domain and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
-//!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//!   `/feed-list`, `/feed-inspect`; TOG-10085 domain and store): plan →
+//!   guild-scoped CRUD → `announcements_audit_log` row → ephemeral completion.
+//!   The generated relay/audit ids replace legacy `randomUUID()`. List and
+//!   inspect are pure reads and write no audit row.
 //! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
 //!   router authorization → ephemeral defer → durable claim/lane → REST effect →
 //!   atomic result/audit → original-response edit. Ambiguity retains the lane.
@@ -1507,6 +1509,7 @@ impl CommandRuntime {
             "feed-pause" => Some(HandlerId::FeedPause),
             "feed-resume" => Some(HandlerId::FeedResume),
             "feed-list" => Some(HandlerId::FeedList),
+            "feed-inspect" => Some(HandlerId::FeedInspect),
             // Member verbs are owned only while the consumer exists; without
             // it they keep the immediate, non-deferred unavailable reply.
             "ban" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Ban)),
@@ -1542,6 +1545,7 @@ impl CommandRuntime {
             "feed-pause" => self.feed_pause(interaction).await,
             "feed-resume" => self.feed_resume(interaction).await,
             "feed-list" => self.feed_list(interaction).await,
+            "feed-inspect" => self.feed_inspect(interaction).await,
             "schedule" => {
                 crate::schedule_runtime::schedule_create(
                     &self.pool,
@@ -2296,6 +2300,42 @@ impl CommandRuntime {
         }
     }
 
+    /// `/feed-inspect`: decode `id` → plan → one bounded guild-scoped read →
+    /// ephemeral detail. A pure read: no fetch, schedule change, relay
+    /// mutation, audit write, claim renewal or delivery reset on any path,
+    /// including store failure (legacy list parity). Absent, invalid-id and
+    /// store-failure replies stay distinct; the raw source never reaches logs.
+    async fn feed_inspect(&self, interaction: &Interaction) {
+        // Inspect does not bind to the invoking channel; `channel_id` is only
+        // context the planner ignores for this command.
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        let command = FeedCommand::Inspect {
+            id: feed_id_option(interaction).unwrap_or_default(),
+        };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Inspect { guild_id, id }) => {
+                let reply = match list_feeds(&self.pool, &guild_id, false).await {
+                    Ok(feeds) => feeds
+                        .iter()
+                        .find(|feed| feed.id == id)
+                        .map(|feed| feed.inspect_text())
+                        .unwrap_or_else(|| feed_removed_text(false).to_owned()),
+                    Err(err) => {
+                        warn!(reason = feed_store_class(&err), "feed inspect failed");
+                        FEED_STORE_FAILURE_REPLY.to_owned()
+                    }
+                };
+                self.finish(interaction, reply).await;
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-inspect planned to a non-inspect variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
     /// One bounded guild-scoped relay read rendered as the requested page.
     /// A failed read keeps the fixed safe reply and writes no audit row.
     async fn list_feed_page(&self, guild_id: &str, page: i64) -> String {
@@ -2720,6 +2760,23 @@ fn feed_id_option_strict(
     }
 }
 
+/// `/feed-inspect`'s `id` option; `None` plans against an empty id, which
+/// `validate_id` rejects with `InvalidId` and inspect's distinct recovery
+/// copy (`/feed-remove` decodes strictly via [`feed_remove_option_strict`]).
+pub(crate) fn feed_id_option(interaction: &Interaction) -> Option<String> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return None;
+    };
+    data.options
+        .iter()
+        .find_map(|option| match (option.name.as_str(), &option.value) {
+            ("id", CommandOptionValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+}
+
 /// `/help`'s optional `command` selector. Omitted means the grouped index.
 /// A present option with a non-string wire value is malformed and decodes
 /// to an empty selector, which answers the unknown-name correction rather
@@ -2790,6 +2847,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
             HandlerId::FeedPause,
             HandlerId::FeedResume,
             HandlerId::FeedList,
+            HandlerId::FeedInspect,
             // The ordered RSVP surface executes these ids; registration
             // documents the ownership the router outcome names.
             HandlerId::Rsvp,
