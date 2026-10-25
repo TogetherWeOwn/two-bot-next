@@ -693,6 +693,8 @@ mod tests {
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
             ("feed-inspect", 0, 128),
+            ("rsvp", 0, 128),
+            ("rsvp-attendance", 0, 128),
         ] {
             assert_eq!(
                 get(&ann, command).options[option].max_length,
@@ -731,6 +733,15 @@ mod tests {
             score.options[0].max_length,
             Some(OCCURRENCE_ID_MAX_CHARS as u32)
         );
+        // event-id advertises the shared pasted-reference bound (pinned
+        // literal: a const change must update docs/parity.md and commands.md).
+        for command in ["rsvp", "rsvp-attendance"] {
+            assert_eq!(
+                get(&ann, command).options[0].max_length,
+                Some(EVENT_REFERENCE_MAX_CHARS as u32),
+                "{command} event-id bound"
+            );
+        }
     }
 
     #[test]
