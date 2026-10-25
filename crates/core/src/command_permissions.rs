@@ -79,17 +79,18 @@ use PolicyHook::{
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), the private moderation reads
 /// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
-/// timed entry (parity row 37), channel LFG discovery (row 38), and the
-/// `/welcome-preview` admin preview (row 39).
+/// timed entry (parity row 37), channel LFG discovery (row 38), the
+/// Next-only `/feed-inspect` relay detail (row 39), and the
+/// `/welcome-preview` admin preview (row 40).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 40] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
     row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(39, "welcome-preview", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(40, "welcome-preview", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",
@@ -170,6 +171,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
     row(28, "feed-add", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(39, "feed-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
 ];
 
 /// Only retained builtins participate in slash-name lookup. The dropped and

@@ -49,7 +49,7 @@ import; DMs, notifications, calendar; spend; live pilots.
 Inspected repository head: `89b26ae050ffba9fb409622ffd54d31cdc79e7fc`.
 
 - `/lfg` takes three required options, `title` (max 100), `starts-at` and `roles`
-  (`crates/core/src/feature_commands.rs:268-287`), gated by Manage Events.
+  (`crates/core/src/feature_commands.rs:270-289`), gated by Manage Events.
   There is **no create preview**: `/lfg` validates and posts in one step
   (`crates/discord/src/lfg_interactions.rs:241-260`).
 - Validation to preserve verbatim: title trimmed with ECMAScript whitespace, 1-100

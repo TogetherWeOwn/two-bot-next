@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 36 built-ins plus the voice set
-  (57 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 37 built-ins plus the voice set
+  (58 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 6 core + 1 scorecard + 10 automations + 8 announcements +
-9 moderation + 2 private reads = **36 built-ins**. Machine-readable mirror:
+Counts: 6 core + 1 scorecard + 10 automations + 9 announcements +
+9 moderation + 2 private reads = **37 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
@@ -42,7 +42,7 @@ are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
 per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
 type-4 reply on an isolated gate-safe router).
 
-## Deferred: 29 commands with reasons
+## Deferred: 32 commands with reasons
 
 Deferred means out of the read-only smoke, not untested: every row below
 is published by the same registry the unit test pins, and most share a
@@ -71,6 +71,7 @@ handler family with a covered command.
 | `/feed-add` | announcements | Triggers external fetch plus channel relay writes; the offline rule excludes network effects. |
 | `/feed-remove` | announcements | Destructive and needs a live feed id; sequenced after a feed-add, not standalone. |
 | `/feed-list` | announcements | Needs seeded feed relays (DB); the no-DB rule excludes it. |
+| `/feed-inspect` | announcements | Needs a live feed id; sequenced after a feed-add, not standalone. |
 | `/tempban` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/kick` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/timeout` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |

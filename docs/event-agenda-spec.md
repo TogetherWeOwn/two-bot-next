@@ -32,16 +32,16 @@ failed read is never rendered as an empty agenda.
 
 Inspected repository head: `0e904ee2f6cd17d5aa54fa35b2730154791ee1d3`.
 
-- `crates/core/src/rsvp.rs:38-48,94-113` has Going/Interested/Declined and
-  snowflake event identity; `:446-448` caps **1,000 rows/event** and **20
+- `crates/core/src/rsvp.rs:38-48,103-163` has Going/Interested/Declined and
+  snowflake event identity; `:506-508` caps **1,000 rows/event** and **20
   writes/member/guild/UTC minute**. `crates/cutover/migrations/0160_rsvp.sql:24-34`
   keys `event_rsvps` by `(guild_id,event_id,user_id)` with one secondary index
   on `(guild_id,event_id,status)`. There is **no per-member index**.
 - `crates/core/src/rsvp_store.rs:234-258` lists one event's RSVPs; every other
   reader is per-event or per-row. No per-member cross-event reader exists.
-- `crates/discord/src/rsvp.rs:303-336` renders per-event totals plus the
+- `crates/discord/src/rsvp.rs:307-351` renders per-event totals plus the
   invoking member's saved response and Discord-localized saved time, ephemeral,
-  historical, with no live GET. `crates/core/src/feature_commands.rs:259` and
+  historical, with no live GET. `crates/core/src/feature_commands.rs:260` and
   `crates/core/src/router.rs:661,932` publish `rsvp-attendance` behind
   Announcements; `crates/core/src/help.rs:199-200` states live availability is
   not checked. The write path checks live membership before event lookup.

@@ -516,9 +516,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 36 builtins: 6 core, 1 scorecard, 10 automations,
-            // 8 announcements, 9 moderation mutations and 2 private reads.
-            36
+            // 37 builtins: 6 core, 1 scorecard, 10 automations,
+            // 9 announcements, 9 moderation mutations and 2 private reads.
+            37
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -532,9 +532,17 @@ mod tests {
             all_on.iter().any(|def| def.name == "welcome-preview"),
             "welcome-preview survives the all-on registry"
         );
+        assert!(
+            all_on.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the all-on registry"
+        );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 57);
+        assert_eq!(with_voice.len(), 58);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -546,6 +554,14 @@ mod tests {
         assert!(
             with_voice.iter().any(|def| def.name == "welcome-preview"),
             "welcome-preview survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the voice registry"
         );
     }
 
