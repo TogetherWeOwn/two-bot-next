@@ -286,20 +286,23 @@ def response_version(path):
 def serving(args):
     """GET-only control-plane proof of the production-local promoted image."""
     import worker_container_rollback as rollback
-    from bot_promotion import load_admitted
+    from bot_promotion import PRODUCTION_APP, REGISTRY_HOST, load_admitted
 
     try:
         admitted = load_admitted(args.artifact, args.sha)
         if not is_deploy_id_shape(args.deploy_id) or parse_deploy_id(args.deploy_id)[2] != args.sha[:7]:
             raise ValueError("invalid production event ID")
         image = admitted["production_image"]
+        account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        expected_image = f"{REGISTRY_HOST}/{account}/{PRODUCTION_APP}@{admitted['receipt']['container']['digest']}"
+        if not account or image != expected_image:
+            raise ValueError("production image account mismatch")
         if (not isinstance(args.expected_worker_version, str)
                 or rollback.VERSION_ID.fullmatch(args.expected_worker_version) is None
                 or args.expected_worker_version == admitted["receipt"]["staging"]["worker_version"]):
             raise ValueError("invalid production version")
         deadline = time.monotonic() + 600
-        client = rollback.base.Client(os.environ.get("CLOUDFLARE_ACCOUNT_ID"),
-                                      os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
+        client = rollback.base.Client(account, os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
         while time.monotonic() < deadline:
             version = rollback.serving_version(client, rollback.WORKERS["production"])
             if version != args.expected_worker_version:
