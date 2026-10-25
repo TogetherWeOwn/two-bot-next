@@ -761,13 +761,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 37 non-voice commands (5 core + 21 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, giveaway, lfg-edit, lfg-list,
-        // feed-inspect, purge-preview and channel-inspect, plus 21 additional
-        // voice commands (voice `kick` loses first-wins to moderation `/kick`).
-        // `/templateassistant` stays unpublished until its slice lands:
-        // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (58 live)"));
+        // 39 non-voice commands (5 core + 23 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
+        // purge-preview and channel-inspect, plus 21 additional voice commands (voice
+        // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
+        // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (60 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -893,11 +892,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 37 non-voice names, including inspection, reopen, giveaway,
-        // lfg-edit, lfg-list, feed-inspect, purge-preview and channel-inspect,
-        // plus 21 additional voice names (voice `kick` shares the Kick group).
+        // 39 non-voice names, including inspection, reopen, pause/resume,
+        // giveaway, lfg-edit, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
+        // 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 58);
+        assert_eq!(grouped.len(), 60);
         for name in [
             "rank",
             "leaderboard",
@@ -906,6 +905,8 @@ mod tests {
             "reopen",
             "attendance",
             "command",
+            "command-disable",
+            "command-enable",
             "command-inspect",
             "schedule-list",
             "sticky-remove",

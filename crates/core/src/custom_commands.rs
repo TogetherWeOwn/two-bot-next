@@ -1486,6 +1486,88 @@ mod tests {
     }
 
     #[test]
+    fn toggle_decision_flips_audit_and_resync_and_nothing_else_does() {
+        let mut paused = stored("faq");
+        paused.enabled = false;
+        for (row, enabled, outcome, resync) in [
+            (None, true, ToggleOutcome::Missing, false),
+            (None, false, ToggleOutcome::Missing, false),
+            (Some(&paused), false, ToggleOutcome::Unchanged, false),
+            (Some(&stored("faq")), true, ToggleOutcome::Unchanged, false),
+            (Some(&paused), true, ToggleOutcome::Changed, true),
+            (Some(&stored("faq")), false, ToggleOutcome::Changed, true),
+        ] {
+            let d = adjudicate_toggle(GUILD, ACTOR, "faq", row, enabled);
+            assert_eq!(d.outcome, outcome, "enabled={enabled}");
+            assert_eq!(d.enabled, enabled);
+            assert_eq!(d.resync_registry, resync);
+            assert_eq!(d.audit.is_some(), resync, "only flips audit");
+        }
+        let d = adjudicate_toggle(GUILD, ACTOR, "faq", Some(&paused), true);
+        assert_eq!(
+            d.audit.expect("changed toggle audits"),
+            AuditRecord {
+                guild_id: GUILD.to_owned(),
+                actor_id: Some(ACTOR.to_owned()),
+                action: "command.enable".to_owned(),
+                target_key: Some("faq".to_owned()),
+                outcome: "ok".to_owned(),
+                reason: None,
+            }
+        );
+        let d = adjudicate_toggle(GUILD, ACTOR, "faq", Some(&stored("faq")), false);
+        let audit = d.audit.expect("changed toggle audits");
+        assert_eq!(audit.action, "command.disable");
+        assert_eq!(audit.outcome, "ok");
+    }
+
+    #[test]
+    fn toggle_enable_revalidates_the_stored_definition() {
+        let reserved = reserved_command_names();
+        let dispatch = builtin_command_names();
+        let mut valid = stored("faq");
+        valid.text_trigger = Some("!faq".to_owned());
+        valid.enabled = false;
+        assert!(validate_toggle_enable(&valid, &reserved, &dispatch).is_ok());
+        // A slash-only row has no trigger to collide.
+        let mut slash_only = valid.clone();
+        slash_only.text_trigger = None;
+        assert!(validate_toggle_enable(&slash_only, &reserved, &dispatch).is_ok());
+        // Reserved names stay reserved, like writes.
+        for name in ["help", "command", "command-enable", "setup"] {
+            let mut row = valid.clone();
+            row.name = name.to_owned();
+            assert_eq!(
+                validate_toggle_enable(&row, &reserved, &dispatch),
+                Err(CommandError::ReservedName(name.to_owned())),
+                "{name} refused"
+            );
+        }
+        // Invalid stored content refuses without reactivating.
+        let mut broken = valid.clone();
+        broken.template = "Unknown {args}".to_owned();
+        assert!(matches!(
+            validate_toggle_enable(&broken, &reserved, &dispatch),
+            Err(CommandError::InvalidTemplate(_))
+        ));
+        // A builtin-named trigger can never fire, so it must not resume.
+        for trigger in ["!rank", "!ban"] {
+            let mut row = valid.clone();
+            row.text_trigger = Some(trigger.to_owned());
+            assert_eq!(
+                validate_toggle_enable(&row, &reserved, &dispatch),
+                Err(CommandError::ReservedTextTrigger(trigger.to_owned())),
+                "{trigger} refused"
+            );
+        }
+        // A grandfathered voice-named trigger still fires while voice is
+        // off, so dispatch — not the write set — judges triggers.
+        let mut voice_trigger = valid.clone();
+        voice_trigger.text_trigger = Some("!setup".to_owned());
+        assert!(validate_toggle_enable(&voice_trigger, &reserved, &dispatch).is_ok());
+    }
+
+    #[test]
     fn rejected_and_absent_audits_bound_untrusted_names() {
         let name = "😀".repeat(MAX_COMMAND_NAME_CHARS + 17);
         let expected = "😀".repeat(MAX_COMMAND_NAME_CHARS);
@@ -1503,7 +1585,7 @@ mod tests {
     fn successful_audits_expecting_target(
         name: &str,
         target: &str,
-    ) -> [(&'static str, AuditRecord, AuditRecord); 5] {
+    ) -> [(&'static str, AuditRecord, AuditRecord); 7] {
         let expect = |action: &str, outcome: &str, reason: Option<&str>| AuditRecord {
             guild_id: GUILD.to_owned(),
             actor_id: Some(ACTOR.to_owned()),
@@ -1537,6 +1619,16 @@ mod tests {
                 "run failed",
                 AuditRecord::run(GUILD, ACTOR, name, false, Some("delivery_failed")),
                 expect("command.run", "failed", Some("delivery_failed")),
+            ),
+            (
+                "toggle enable",
+                AuditRecord::toggle(GUILD, ACTOR, name, true),
+                expect("command.enable", "ok", None),
+            ),
+            (
+                "toggle disable",
+                AuditRecord::toggle(GUILD, ACTOR, name, false),
+                expect("command.disable", "ok", None),
             ),
         ]
     }
