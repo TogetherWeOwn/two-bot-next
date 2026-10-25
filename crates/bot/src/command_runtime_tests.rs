@@ -1593,7 +1593,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "privacy"
                         | "giveaway"
                         | "reopen"
-                        | "welcome-preview",
+                        | "welcome-preview"
                         | "game-mix"
                 )
             })
