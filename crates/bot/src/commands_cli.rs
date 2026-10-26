@@ -3,7 +3,11 @@
 // Operator CLI intentionally emits diff/publish reports and help to stdout.
 #![allow(clippy::print_stdout)]
 
-use std::collections::HashMap;
+mod report;
+
+use std::collections::{HashMap, HashSet};
+
+use report::{Report, REGISTRY_OWNER_ACTION, REQUEST_ACTION};
 use std::sync::Arc;
 
 use two_bot_core::commands::CommandDefinition;
@@ -17,8 +21,8 @@ use two_bot_discord::executor::DiscordError;
 use two_bot_discord::{publish_commands, ActionExecutor};
 
 pub const USAGE: &str = "\
-  two-bot commands diff [--guild-id ID] [--application-id ID] [--allow-live-guild]
-  two-bot commands publish [--apply] [--guild-id ID] [--application-id ID] [--allow-live-guild]
+  two-bot commands diff [--json] [--guild-id ID] [--application-id ID] [--allow-live-guild]
+  two-bot commands publish [--apply] [--json] [--guild-id ID] [--application-id ID] [--allow-live-guild]
       Fetch and compare the guild command list against the compiled, feature-gated
       builtins. Both commands are read-only unless publish receives --apply.
       Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot
@@ -72,9 +76,14 @@ fn parse(args: &[String], vars: &HashMap<String, String>) -> Result<Options, Str
     let mut application = vars.get("DISCORD_APPLICATION_ID").cloned();
     let mut apply = false;
     let mut allow_live = false;
+    let mut seen = HashSet::new();
     let mut i = 1;
     while i < args.len() {
+        if !seen.insert(args[i].as_str()) {
+            return Err("duplicate commands option".into());
+        }
         match args[i].as_str() {
+            "--json" => {}
             "--apply" if verb == "publish" => apply = true,
             "--allow-live-guild" => allow_live = true,
             "--guild-id" | "--application-id" => {
@@ -90,7 +99,7 @@ fn parse(args: &[String], vars: &HashMap<String, String>) -> Result<Options, Str
                     application = Some(value.clone());
                 }
             }
-            other => return Err(format!("unknown commands option {other:?}\n{USAGE}")),
+            _ => return Err(format!("unknown commands option\n{USAGE}")),
         }
         i += 1;
     }
@@ -171,58 +180,120 @@ async fn executor(token: &str, vars: &HashMap<String, String>) -> Result<ActionE
     ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
 }
 
+fn configuration_failure(json: bool, error: &str) -> i32 {
+    if json {
+        println!("{}", serde_json::json!(Report::failure(
+            "configuration_error",
+            "Check command usage, guild acknowledgement, feature gates and secret bindings; no registry request was sent.",
+        )));
+    } else {
+        eprintln!("{error}");
+    }
+    2
+}
+
+fn render_removals(report: &Report) {
+    for removal in &report.removals {
+        println!(
+            "removal {}: {}/{} (id={})",
+            removal.removal_class,
+            removal.kind,
+            removal.name,
+            removal.id.as_deref().unwrap_or("unknown")
+        );
+    }
+    if report.removals_truncated {
+        println!("Removal report truncated; classification covered all removals.");
+    }
+}
+
 pub async fn dispatch(args: &[String]) -> i32 {
+    let json = args.iter().any(|arg| arg == "--json");
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        if json {
+            return configuration_failure(true, "--help cannot be combined with --json");
+        }
         print!("{USAGE}");
         return 0;
     }
     let vars: HashMap<String, String> = std::env::vars().collect();
     let options = match parse(args, &vars) {
         Ok(options) => options,
-        Err(error) => {
-            eprintln!("{error}");
-            return 2;
-        }
+        Err(error) => return configuration_failure(json, &error),
     };
     let defs = match desired_definitions(options.guild, &vars) {
         Ok(defs) => defs,
-        Err(error) => {
-            eprintln!("{error}");
-            return 2;
-        }
+        Err(error) => return configuration_failure(json, &error),
     };
     let executor = match executor(vars.get("DISCORD_TOKEN").map_or("", String::as_str), &vars).await
     {
         Ok(executor) => executor,
         Err(error) => {
-            eprintln!("cannot configure command REST client: {error}");
-            return 2;
+            return configuration_failure(
+                json,
+                &format!("cannot configure command REST client: {error}"),
+            )
         }
     };
-    match executor
-        .sync_guild_commands(
+    let mut report = Report::failure("registry_request_failed", REQUEST_ACTION);
+    let result = executor
+        .sync_guild_commands_checked(
             options.application,
             options.guild,
             &publish_commands(&defs),
             options.apply,
+            |current, diff| {
+                report = Report::snapshot(current, diff);
+                if options.apply
+                    && diff.current_hash != diff.compiled_hash
+                    && report.has_unrecognized_removals
+                {
+                    report.reject("unrecognized_command_removal", REGISTRY_OWNER_ACTION);
+                    return Err(DiscordError::Rejected(
+                        "unrecognized command removal".into(),
+                    ));
+                }
+                Ok(())
+            },
         )
-        .await
-    {
+        .await;
+    match result {
         Ok((diff, applied)) => {
-            print!("{}", diff.render());
-            if applied {
-                println!("Published full guild registry.");
-            } else if options.apply {
-                println!("Skipped PUT: registry hash matches.");
+            report.applied = applied;
+            if json {
+                println!("{}", serde_json::json!(report));
             } else {
-                println!(
-                    "Dry run: no commands written. Use commands publish --apply to overwrite."
-                );
+                print!("{}", report::human_diff(&diff));
+                render_removals(&report);
+                if applied {
+                    println!("Published full guild registry.");
+                } else if options.apply {
+                    println!("Skipped PUT: registry hash matches.");
+                } else {
+                    println!(
+                        "Dry run: no commands written. Use commands publish --apply to overwrite."
+                    );
+                }
+                if report.has_unrecognized_removals {
+                    println!("{REGISTRY_OWNER_ACTION}");
+                }
             }
             0
         }
         Err(_) => {
-            eprintln!("command registry request failed; no successful publication claimed");
+            if report.ok {
+                report.reject("registry_request_failed", REQUEST_ACTION);
+            }
+            if json {
+                println!("{}", serde_json::json!(report));
+            } else if report.has_unrecognized_removals {
+                render_removals(&report);
+                eprintln!(
+                    "Refusing unrecognized command removal; no PUT sent. {REGISTRY_OWNER_ACTION}"
+                );
+            } else {
+                eprintln!("command registry request failed; no successful publication claimed");
+            }
             1
         }
     }

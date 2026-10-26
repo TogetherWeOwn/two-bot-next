@@ -3412,9 +3412,28 @@ impl ActionExecutor {
         commands: &[twilight_model::application::command::Command],
         apply: bool,
     ) -> Result<(crate::command_registry::RegistryDiff, bool), DiscordError> {
+        self.sync_guild_commands_checked(application_id, guild_id, commands, apply, |_, _| Ok(()))
+            .await
+    }
+
+    /// Inspect the exact read snapshot and its diff before any PUT. A rejected
+    /// check leaves both Discord and the cached identity snapshot untouched.
+    /// This is not CAS: another writer can change Discord after this read.
+    pub async fn sync_guild_commands_checked(
+        &self,
+        application_id: u64,
+        guild_id: u64,
+        commands: &[twilight_model::application::command::Command],
+        apply: bool,
+        check: impl FnOnce(
+            &[twilight_model::application::command::Command],
+            &crate::command_registry::RegistryDiff,
+        ) -> Result<(), DiscordError>,
+    ) -> Result<(crate::command_registry::RegistryDiff, bool), DiscordError> {
         let current = self.guild_commands(application_id, guild_id).await?;
         let diff = crate::command_registry::diff_commands(&current, commands)
             .map_err(|_| DiscordError::Rejected("cannot canonicalize command registry".into()))?;
+        check(&current, &diff)?;
         let publish = apply && diff.current_hash != diff.compiled_hash;
         if publish {
             self.publish_guild_commands(application_id, guild_id, commands)
