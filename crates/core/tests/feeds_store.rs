@@ -174,6 +174,9 @@ fn post(feed: &FeedRelay, key: &str) -> FeedPost {
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb; CI runs explicitly"]
+// The recovery refusal is matched with `{ .. }` so this pin stays valid
+// whether the variant is a unit or carries a typed evidence payload.
+#[allow(clippy::unneeded_struct_pattern)]
 async fn feed_crud_audit_scope_and_timestamp_roundtrip() {
     let (pool, schema) = setup().await;
     let feed = relay();

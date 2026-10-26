@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/feed_pending_evidence_acceptance_tests.rs",
-      "sha256": "a4806cafdea12ce458290a3c009207719c83546470e494b7e912dabc6c74a2cf",
+      "sha256": "348cabd05dc14b6f2e34ab8987a2f0e3a2ad44ea8f5a0e5261f91fefc8b0a89f",
       "tests": 10
     },
     {
@@ -16,12 +16,12 @@
     },
     {
       "path": "crates/bot/src/feed_jobs_tests.rs",
-      "sha256": "c2e4f866b03137279571b42986e09e8069306d52ef117b897a2f9be6ef71cee4",
+      "sha256": "d68781bdb95cd9eadc3cd227815fbe58c7d38e98590551d5e01bbd6a63145395",
       "change": "Match recovery refusal independent of unit versus payload variant shape; preserve the existing admission/removal race assertions"
     },
     {
       "path": "crates/core/tests/feeds_store.rs",
-      "sha256": "ce8658088b74acc48331edf96fe946261336a9038cd1f2a89504b4211f6a64e5",
+      "sha256": "db5c829a0d5c4d02515624cb9e896fbcc627549ac3de1b4fd28113fa984c33fa",
       "change": "Keep the existing store refusal assertion compatible with a typed recovery payload, without changing its semantic expectation"
     }
   ],

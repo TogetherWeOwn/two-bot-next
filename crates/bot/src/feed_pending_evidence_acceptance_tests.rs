@@ -317,15 +317,26 @@ async fn count_snapshot_includes_claim_admitted_ahead_of_each_lifecycle_fence_wa
             after["relays"], before["relays"],
             "refusal cannot change the relay or its high-water"
         );
-        assert_eq!(after["deliveries"].as_array().unwrap().len(), 2);
+        let deliveries = after["deliveries"].as_array().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        // Snapshot rows are ordered by item_key, not insertion order; match
+        // each row by its key instead of its position.
+        let seed_key = before["deliveries"][0]["item_key"].clone();
+        let seed_after = deliveries
+            .iter()
+            .find(|row| row["item_key"] == seed_key)
+            .expect("seeded claim row survives the refusal");
         assert_eq!(
-            after["deliveries"][0], before["deliveries"][0],
+            *seed_after, before["deliveries"][0],
             "existing claim is not renewed or reconciled"
         );
-        assert_eq!(after["deliveries"][1]["item_key"], post.item_key);
-        assert_eq!(after["deliveries"][1]["nonce"], post.nonce);
-        assert_eq!(after["deliveries"][1]["claim_token"], "queued-claim");
-        assert_eq!(after["deliveries"][1]["state"], "pending");
+        let admitted_row = deliveries
+            .iter()
+            .find(|row| row["item_key"] == post.item_key)
+            .expect("admitted claim row is recorded");
+        assert_eq!(admitted_row["nonce"], post.nonce);
+        assert_eq!(admitted_row["claim_token"], "queued-claim");
+        assert_eq!(admitted_row["state"], "pending");
         refusal_evidence(&reply, operation, &relay.id, 2);
     }
 }

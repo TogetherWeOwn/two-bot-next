@@ -2061,6 +2061,9 @@ async fn wait_for_advisory_waiters(
 
 #[tokio::test]
 #[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+// The recovery refusal is matched with `{ .. }` so this pin stays valid
+// whether the variant is a unit or carries a typed evidence payload.
+#[allow(clippy::unneeded_struct_pattern)]
 async fn fresh_claim_waits_before_pending_removal_is_refused() {
     let db = fixture().await;
     let relay = feed("contended-claim-first");
