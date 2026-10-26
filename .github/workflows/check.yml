@@ -3163,6 +3163,16 @@ jobs:
       - name: Verify production deploy guards
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-deploy-production.py
+      - name: Verify immutable bot promotion intake (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_immutable_bot_promotion.py -v
+      - name: Verify immutable promotion subprocess bounds (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_bot_promotion_command_adapter.py -v
+      - name: Verify immutable promotion image copy (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_bot_promotion_copy_adapter.py -v
+      - name: Verify immutable promotion runtime identity (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_production_promotion_runtime_adapters.py -v
+      - name: Verify immutable promotion saved bundles (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_promotion_integration_acceptance.py -v
       # Always runs, even on docs/asset-only fast-pass: the offline suite
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
