@@ -1238,9 +1238,12 @@ async fn logging_malformed_neither_discloses_nor_consumes_a_corrected_attempt() 
         "level",
         vec![str_opt("level", "full"), str_opt("level", "off")],
     )];
-    for failure in refused_logging(malformed.clone(), "level", true).await {
-        panic!("poisoned read: {failure}");
-    }
+    let failures = refused_logging(malformed.clone(), "level", true).await;
+    assert!(
+        failures.is_empty(),
+        "poisoned read: {}",
+        failures.join("\n")
+    );
 
     // Malformed, corrected, malformed on one runtime: only the corrected write
     // lands, immediately, and the refusal is stable.
