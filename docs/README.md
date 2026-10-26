@@ -6,8 +6,8 @@ Repo root: `python3 scripts/check_docs_index.py --json`.
 Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
 else exit 1, repair rows/split docs. Bad/duplicate rows use
 `docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Legacy exceptions/reasons:
+`scripts/check_docs_index.py` (`LARGE_DOCS`), no second catalog.
 
 ## References and architecture
 
@@ -133,12 +133,13 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [Notice proposal](event-change-notices-spec.md)
-- [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
-- [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
-- [Private agenda (design only)](event-agenda-spec.md)
-- [Calendar handoff (design only)](event-calendar-handoff-spec.md)
-- [Event role (design only)](event-role-spec.md)
-- [Event recap (design only)](event-recap-spec.md)
+- [Reminder baseline/stop](event-reminder-preferences-spec.md)
+- [Seats/waitlist proposal](rsvp-capacity-spec.md)
+- [RSVP cutoff proposal](rsvp-registration-cutoff-spec.md)
+- [Private agenda proposal](event-agenda-spec.md)
+- [Calendar handoff proposal](event-calendar-handoff-spec.md)
+- [Event role proposal](event-role-spec.md)
+- [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
