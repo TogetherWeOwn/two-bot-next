@@ -841,7 +841,7 @@ async fn permission_gate_foreign_guild_and_failed_ack_never_execute_management()
         PERM_MANAGE_GUILD,
         payload("cancel", options("cancel")),
     );
-    foreign.guild_id = Some(9999.into());
+    foreign.guild_id = Some(twilight_model::id::Id::new(9999));
     let before = fixture.rest.requests().len();
     assert!(!fixture
         .runtime
