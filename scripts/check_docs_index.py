@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check docs/README.md discovery and byte budgets, without network or writes.
+"""Check docs/README.md discovery and byte budgets, without network.
 
 Run with --json for {missing,stale,oversize}: sorted arrays of repo-relative
 paths. Invalid/duplicate index rows appear in stale as docs/README.md:<line>.
@@ -8,6 +8,12 @@ Uppercase .MD files are missing until renamed to lowercase .md targets.
 Exit 0 means all arrays are empty; exit 1 means repair the named index rows or
 split the oversized doc. --root selects a scratch checkout for mutation tests.
 Purposes live only in the index's link labels, never in a second manifest.
+
+The index merges with the union driver (.gitattributes), so parallel row
+insertions combine instead of conflicting. --dedupe is the only write mode:
+it removes the exact-duplicate lines union can leave behind, then reports
+exactly like a check run. It never reorders lines and never picks between
+rows that share a target with different labels; those stay stale here.
 """
 
 import argparse
@@ -77,12 +83,63 @@ def check(root=ROOT, large_docs=LARGE_DOCS):
     return {"missing": sorted(missing), "stale": sorted(stale), "oversize": sorted(oversize)}
 
 
+def dedupe_text(text):
+    """Canonical index text after a union merge: first occurrence wins.
+
+    Exact-duplicate non-blank lines drop out, blank runs collapse to one
+    blank line, and the result ends with exactly one newline (empty stays
+    empty). Lines are never reordered or rewritten beyond that.
+    """
+    seen = set()
+    kept = []
+    for line in text.splitlines():
+        if not line.strip():
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        kept.append(line)
+    while kept and kept[-1] == "":
+        kept.pop()
+    return "\n".join(kept) + "\n" if kept else ""
+
+
+def dedupe(root=ROOT):
+    """Rewrite docs/README.md under root deduped; return True if it changed.
+
+    A missing (or non-file) index is a no-op, and UnicodeDecodeError
+    propagates without any write, so the caller falls through to the normal
+    fail-closed check report in both cases.
+    """
+    index = root / "docs" / "README.md"
+    if not index.is_file():
+        return False
+    text = index.read_text(encoding="utf-8")
+    cleaned = dedupe_text(text)
+    if cleaned == text:
+        return False
+    index.write_text(cleaned, encoding="utf-8")
+    return True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="emit only the stable JSON report")
+    parser.add_argument("--dedupe", action="store_true",
+                        help="remove exact-duplicate index lines left by a union merge, then check")
     parser.add_argument("--root", type=Path, default=ROOT, help="repository root (default: script checkout)")
     args = parser.parse_args(argv)
+    changed = False
+    if args.dedupe:
+        try:
+            changed = dedupe(args.root)
+        except (FileNotFoundError, UnicodeDecodeError):
+            changed = False
     report = check(args.root)
+    if changed and not args.json:
+        print("deduped: docs/README.md")
     if args.json:
         print(json.dumps(report, sort_keys=True))
     elif any(report.values()):
