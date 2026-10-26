@@ -21,11 +21,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
-
-import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATED = "docs/generated/commands.md"
@@ -44,6 +43,13 @@ def load_script(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_workflow(path):
+    # PyYAML belongs to offline policy checks, not the real-binary runtime suite.
+    import yaml
+
+    return yaml.load(path.read_text(), Loader=yaml.BaseLoader)
 
 
 def logical_lines(script):
@@ -66,6 +72,40 @@ def compiles_reference_consumers(line):
 
 
 class GeneratedCommandReferencePolicy(unittest.TestCase):
+    def test_runtime_entry_needs_only_stdlib(self):
+        probe = r'''
+import importlib.util
+import runpy
+import sys
+import unittest
+from unittest import mock
+
+assert importlib.util.find_spec("yaml") is None, "probe must exclude optional PyYAML"
+sys.argv = [sys.argv[1], "--reference-test-binary", "/fixture-reference",
+            "--generator-binary", "/fixture-generator"]
+# Inspect CLI dispatch without pretending to execute the real Rust binaries.
+with mock.patch.object(unittest.TextTestRunner, "run") as run:
+    run.return_value.wasSuccessful.return_value = True
+    try:
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    except SystemExit as exit:
+        assert exit.code == 0, exit.code
+    else:
+        raise AssertionError("runtime entry must report its result")
+    run.assert_called_once()
+    suite = run.call_args.args[0]
+    assert suite.countTestCases() == 3
+    assert {test._testMethodName for test in suite} == {
+        "test_absent_reference_is_rejected_then_generation_is_deterministic",
+        "test_stale_and_incorrect_bytes_fail_without_repair",
+        "test_configuration_drift_cannot_be_silently_regenerated",
+    }
+'''
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", probe, str(Path(__file__).resolve())],
+            capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_consumer_census_covers_standalone_coverage_and_filtered_bot_tests(self):
         for command in (
             'cov_run "$COV" llvm-cov --workspace --lib --bins --tests',
@@ -138,7 +178,7 @@ class GeneratedCommandReferencePolicy(unittest.TestCase):
     def test_every_ci_test_compile_has_prior_explicit_generation(self):
         consumers = []
         for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
-            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            workflow = load_workflow(path)
             for job_id, job in workflow.get("jobs", {}).items():
                 generators = []
                 for step in job.get("steps", []):
@@ -159,8 +199,7 @@ class GeneratedCommandReferencePolicy(unittest.TestCase):
             self.assertTrue(any(label.startswith(workflow + ":") for label in consumers))
 
     def test_ci_runs_real_generator_and_read_only_checker_mutation_battery(self):
-        workflow = yaml.load((ROOT / ".github/workflows/check.yml").read_text(),
-                             Loader=yaml.BaseLoader)
+        workflow = load_workflow(ROOT / ".github/workflows/check.yml")
         direct = [step for job in workflow["jobs"].values() for step in job.get("steps", [])
                   if all(token in step.get("run", "") for token in (
                       "scripts/ci/test_generated_command_reference.py",
@@ -192,8 +231,7 @@ class GeneratedCommandReferencePolicy(unittest.TestCase):
                         self.assertEqual(invocation[invocation.index(flag) + 1], executable)
 
     def test_ci_uploads_inspectable_generated_reference(self):
-        workflow = yaml.load((ROOT / ".github/workflows/check.yml").read_text(),
-                             Loader=yaml.BaseLoader)
+        workflow = load_workflow(ROOT / ".github/workflows/check.yml")
         uploads = []
         for job in workflow["jobs"].values():
             generated = False
