@@ -183,7 +183,7 @@ mod tests {
             .collect();
         for definition in definitions {
             let current = publish_commands(&[definition]);
-            let diff = diff_commands(&current, &[]).unwrap();
+            let diff = diff_commands(&current, &[]).expect("fixture removal diff");
             let report = Report::snapshot(&current, &diff);
             assert!(!report.has_unrecognized_removals);
             assert_eq!(report.removals[0].removal_class, "known_builtin");
@@ -191,7 +191,7 @@ mod tests {
         let mut context_menu = command("help");
         context_menu.kind = 2.into();
         for current in [vec![context_menu], vec![command("templateassistant")]] {
-            let diff = diff_commands(&current, &[]).unwrap();
+            let diff = diff_commands(&current, &[]).expect("fixture removal diff");
             assert!(Report::snapshot(&current, &diff).has_unrecognized_removals);
         }
     }
@@ -209,7 +209,8 @@ mod tests {
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect();
-        let desired = super::super::desired_definitions(2222, &vars).unwrap();
+        let desired =
+            super::super::desired_definitions(2222, &vars).expect("all-enabled fixture registry");
         let desired: HashSet<_> = publish_commands(&desired)
             .iter()
             .map(command_identity)
@@ -224,7 +225,7 @@ mod tests {
     #[test]
     fn desired_custom_identity_is_not_a_removal() {
         let current = vec![command("zz-custom")];
-        let diff = diff_commands(&current, &current).unwrap();
+        let diff = diff_commands(&current, &current).expect("matching fixture diff");
         let report = Report::snapshot(&current, &diff);
         assert!(!report.has_unrecognized_removals);
         assert!(report.removals.is_empty());
@@ -237,14 +238,19 @@ mod tests {
             .map(|index| command(&format!("aa-{index:03}-{}", "🦀".repeat(400))))
             .collect();
         current.push(command("zz-last"));
-        let diff = diff_commands(&current, &[]).unwrap();
+        let diff = diff_commands(&current, &[]).expect("fixture removal diff");
         let report = Report::snapshot(&current, &diff);
         assert_eq!(report.removed_count, Some(101));
         assert_eq!(report.removals.len(), 100);
         assert!(report.removals_truncated);
         assert!(report.has_unrecognized_removals);
         assert!(report.removals.iter().all(|r| r.name_truncated));
-        assert!(serde_json::to_vec(&report).unwrap().len() < 65_536);
+        assert!(
+            serde_json::to_vec(&report)
+                .expect("serialize fixture report")
+                .len()
+                < 65_536
+        );
         let rendered = human_diff(&diff);
         assert!(rendered.chars().count() < 16_500);
         assert!(rendered.contains("diff truncated"));
@@ -253,7 +259,7 @@ mod tests {
     #[test]
     fn labels_neutralize_mentions_and_terminal_controls_without_changing_classification() {
         let current = vec![command("@everyone\n\u{1b}[31m")];
-        let diff = diff_commands(&current, &[]).unwrap();
+        let diff = diff_commands(&current, &[]).expect("fixture removal diff");
         let report = Report::snapshot(&current, &diff);
         assert!(report.has_unrecognized_removals);
         assert!(!report.removals[0].name.contains(['@', '\n', '\u{1b}']));
