@@ -245,17 +245,7 @@ pub fn render_game_activity_discord_report(guild_id: u64, rows: &[GuildGameAggre
     if let Some(rendered) = report["rows"].as_array_mut() {
         for row in rendered {
             if let Some(game) = row["game"].as_str() {
-                let single_line: String = game
-                    .chars()
-                    .map(|ch| match ch {
-                        '<' => '＜',
-                        '`' => '｀',
-                        ch if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => ' ',
-                        ch => ch,
-                    })
-                    .collect();
-                row["game"] =
-                    serde_json::json!(crate::message_safety::neutralize_mentions(&single_line));
+                row["game"] = serde_json::json!(discord_label(game));
             }
         }
     }
@@ -288,6 +278,257 @@ pub fn render_game_activity_discord_report(guild_id: u64, rows: &[GuildGameAggre
     }
     report["truncated"] = serde_json::json!(true);
     format!("```json\n{report}\n```{note}\nLong game names were shortened to fit Discord's limit.")
+}
+
+/// Rows per page in the selectable Discord browse view.
+pub const GAME_MIX_PAGE_ROWS: usize = 10;
+
+/// Highest selectable browse page. The published option and the runtime
+/// decoder share this bound, so an out-of-range selector is corrected
+/// before any storage read.
+pub const GAME_MIX_MAX_PAGE: i64 = 10_000;
+
+/// Which accumulated total orders the browse view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameMixBrowseSort {
+    /// Accumulated play time, highest first (the legacy order).
+    Play,
+    /// Overlapping in-voice time, highest first.
+    Voice,
+}
+
+impl GameMixBrowseSort {
+    fn label(self) -> &'static str {
+        match self {
+            GameMixBrowseSort::Play => "play",
+            GameMixBrowseSort::Voice => "voice",
+        }
+    }
+}
+
+/// How one browse page is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameMixBrowseFormat {
+    /// The CLI JSON row shape in one fenced block.
+    Json,
+    /// Readable lines with whole-second durations.
+    Summary,
+}
+
+/// Result of rendering one selectable browse page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameMixBrowseView {
+    /// Complete private reply text within Discord's content limit.
+    Page(String),
+    /// The requested page is past the saved games; the caller answers a
+    /// correction naming the real page bound, not an empty success.
+    OutOfRange {
+        /// Total saved games for the guild.
+        total: usize,
+        /// Pages available at [`GAME_MIX_PAGE_ROWS`] rows each (at least 1).
+        pages: usize,
+    },
+}
+
+fn discord_label(game: &str) -> String {
+    let single_line: String = game
+        .chars()
+        .map(|ch| match ch {
+            '<' => '＜',
+            '`' => '｀',
+            ch if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => ' ',
+            ch => ch,
+        })
+        .collect();
+    crate::message_safety::neutralize_mentions(&single_line)
+}
+
+fn sorted_scoped_rows<'a>(
+    guild_id: &str,
+    rows: &'a [GuildGameAggregate],
+    sort: GameMixBrowseSort,
+) -> Vec<&'a GuildGameAggregate> {
+    let mut scoped: Vec<&GuildGameAggregate> =
+        rows.iter().filter(|row| row.guild_id == guild_id).collect();
+    scoped.sort_by(|a, b| {
+        let (primary_a, primary_b, secondary_a, secondary_b) = match sort {
+            GameMixBrowseSort::Play => (
+                a.total_play_ms,
+                b.total_play_ms,
+                a.in_voice_ms,
+                b.in_voice_ms,
+            ),
+            GameMixBrowseSort::Voice => (
+                a.in_voice_ms,
+                b.in_voice_ms,
+                a.total_play_ms,
+                b.total_play_ms,
+            ),
+        };
+        primary_b
+            .cmp(&primary_a)
+            .then_with(|| secondary_b.cmp(&secondary_a))
+            // `Option<&str>` order is `None` before any `Some`, then
+            // lexicographic: untitled first among full ties, titles asc.
+            .then_with(|| a.game.as_deref().cmp(&b.game.as_deref()))
+            .then_with(|| b.session_count.cmp(&a.session_count))
+    });
+    scoped
+}
+
+fn shorten_label(label: &str, cap: Option<usize>) -> (String, bool) {
+    match cap {
+        Some(cap) if crate::message_safety::text_len(label) > cap => (
+            format!(
+                "{}…",
+                crate::message_safety::truncate(label, cap.saturating_sub(1))
+            ),
+            true,
+        ),
+        _ => (label.to_owned(), false),
+    }
+}
+
+/// Whole-second duration with explicit accumulated hours (never wraps at
+/// 24 hours). Sub-second remainders round down; the summary says so.
+fn format_duration_ms(ms: i64) -> String {
+    let seconds = ms.div_euclid(1_000);
+    let hours = seconds.div_euclid(3_600);
+    let minutes = seconds.rem_euclid(3_600) / 60;
+    let seconds = seconds.rem_euclid(60);
+    format!("{hours}h {minutes}m {seconds}s")
+}
+
+/// One selectable page of the private Discord browse view.
+///
+/// Every guild aggregate is reachable: pages are deterministic slices of
+/// one fully sorted snapshot (selected total desc, the other total desc,
+/// then game title asc), [`GAME_MIX_PAGE_ROWS`] rows each except the last.
+/// Labels are neutralized and, only when the complete reply would exceed
+/// Discord's limit, shortened before serialization with an explicit note;
+/// whole rows are never dropped to fit and JSON is never clipped.
+#[must_use]
+pub fn render_game_activity_discord_browse(
+    guild_id: u64,
+    rows: &[GuildGameAggregate],
+    page: usize,
+    sort: GameMixBrowseSort,
+    format: GameMixBrowseFormat,
+) -> GameMixBrowseView {
+    let guild_id = guild_id.to_string();
+    let scoped = sorted_scoped_rows(&guild_id, rows, sort);
+    let total = scoped.len();
+    let pages = total.div_ceil(GAME_MIX_PAGE_ROWS).max(1);
+    if page < 1 || page > pages {
+        return GameMixBrowseView::OutOfRange { total, pages };
+    }
+    let start = (page - 1) * GAME_MIX_PAGE_ROWS;
+    let page_rows: Vec<&GuildGameAggregate> = scoped
+        .iter()
+        .skip(start)
+        .take(GAME_MIX_PAGE_ROWS)
+        .copied()
+        .collect();
+    // Bound labels BEFORE serializing, shrinking the cap until the whole
+    // reply (header, rows, notes) fits; ten minimal rows always fit.
+    for cap in [None, Some(24), Some(16), Some(10), Some(6)] {
+        let content =
+            browse_page_text(&guild_id, &page_rows, total, page, pages, sort, format, cap);
+        if crate::message_safety::text_len(&content) <= crate::message_safety::CONTENT_LIMIT {
+            return GameMixBrowseView::Page(content);
+        }
+    }
+    GameMixBrowseView::Page(browse_page_text(
+        &guild_id,
+        &page_rows,
+        total,
+        page,
+        pages,
+        sort,
+        format,
+        Some(6),
+    ))
+}
+
+fn browse_page_text(
+    guild_id: &str,
+    page_rows: &[&GuildGameAggregate],
+    total: usize,
+    page: usize,
+    pages: usize,
+    sort: GameMixBrowseSort,
+    format: GameMixBrowseFormat,
+    cap: Option<usize>,
+) -> String {
+    let mut shortened = false;
+    let mut labels: Vec<String> = Vec::with_capacity(page_rows.len());
+    for row in page_rows {
+        let label = discord_label(
+            row.game
+                .as_deref()
+                .unwrap_or(GAME_ACTIVITY_UNTITLED_PLACEHOLDER),
+        );
+        let (label, was_shortened) = shorten_label(&label, cap);
+        shortened |= was_shortened;
+        labels.push(label);
+    }
+    let shortened_note = if shortened {
+        "\nLong game names were shortened to fit Discord's limit."
+    } else {
+        ""
+    };
+    match format {
+        GameMixBrowseFormat::Json => {
+            let rendered: Vec<serde_json::Value> = page_rows
+                .iter()
+                .zip(&labels)
+                .map(|(row, label)| {
+                    serde_json::json!({
+                        "game": label,
+                        "total_play_ms": row.total_play_ms,
+                        "in_voice_ms": row.in_voice_ms,
+                        "session_count": row.session_count,
+                    })
+                })
+                .collect();
+            let mut value = serde_json::json!({
+                "guild_id": guild_id,
+                "rows": rendered,
+                "truncated": shortened,
+            });
+            if total == 0 {
+                value["hint"] = serde_json::json!("no game activity recorded for this guild");
+            }
+            format!(
+                "Game activity page {page} of {pages}, sorted by {} time ({total} saved games).\n```json\n{value}\n```{shortened_note}",
+                sort.label()
+            )
+        }
+        GameMixBrowseFormat::Summary => {
+            let mut text = format!(
+                "Game activity summary — page {page} of {pages}, sorted by {} time ({total} saved games).",
+                sort.label()
+            );
+            if page_rows.is_empty() {
+                text.push_str("\nNo game activity recorded for this guild yet.");
+            }
+            for (row, label) in page_rows.iter().zip(&labels) {
+                text.push_str(&format!(
+                    "\n- {label} — play {} · in voice {} · {} sessions",
+                    format_duration_ms(row.total_play_ms),
+                    format_duration_ms(row.in_voice_ms),
+                    row.session_count,
+                ));
+            }
+            text.push_str(
+                "\nPlay time is accumulated across everyone who played; in-voice time is \
+                 the part of that play spent in voice, so the two overlap. \
+                 Durations use whole seconds, rounded down.",
+            );
+            text.push_str(shortened_note);
+            text
+        }
+    }
 }
 
 fn bounded(text: &str) -> Option<String> {
