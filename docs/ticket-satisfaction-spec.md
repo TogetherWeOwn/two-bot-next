@@ -68,16 +68,16 @@ current Closed. [Private queue #1731](https://github.com/TogetherWeOwn/two-bot-n
 was open at inspection, not a shipped reporting seam. Recheck their accepted
 contracts before any future build; none is a design dependency or authorization.
 
-| Close path or adjacent event | Prompt / rating eligibility under B |
-| --- | --- |
-| Current staff Close | Enrolled new ticket becomes eligible only after confirmed Closed; optional invitation as §3. Failure/recovery before that yields no prompt |
-| Opener “release” / resolution request | No prompt: it is not Close and grants no close authority. If staff subsequently closes, use the same terminal receipt exactly once |
-| Claimant self-release / reassignment | No prompt, no score/attribution change; not resolution |
-| Proposed inactivity soft-close | No prompt: inactivity is not resolution and soft-close is not terminal Closed. Keep-open/resume does not enroll another survey |
-| Later staff Close after soft-close | Same terminal staff-close rule, tagged with prior inactivity context, never a second survey |
-| Any future accepted terminal auto-close or opener Close | Not authorized by this spec. Its separate contract must emit the same fenced terminal receipt and retain close-source classification; no special bypass. Until accepted, refuse this source |
-| Failed/uncertain deletion, missing channel without terminal proof, erasure | No prompt; never infer success from a 404, reservation release or transcript presence |
-| Reopen, if separately introduced | §5 invalidates invitation and submitted contribution; never re-rate the same ticket |
+| Close path or adjacent event | Source / availability at inspection | Prompt / rating eligibility under B |
+| --- | --- | --- |
+| Staff Close | Current source | Enrolled new ticket becomes eligible only after confirmed Closed; optional invitation as §3. Failure/recovery before that yields no prompt |
+| Opener “release” / resolution request | Proposal #1779, not implemented | No prompt: it is not Close and grants no close authority. If staff subsequently closes, use the same terminal receipt exactly once |
+| Claimant self-release / reassignment | Adjacent design, not a current release action | No prompt, no score/attribution change; not resolution |
+| Inactivity soft-close | Proposal #1783, not implemented | No prompt: inactivity is not resolution and soft-close is not terminal Closed. Keep-open/resume does not enroll another survey |
+| Later staff Close after soft-close | Conditional composition with #1783 | Same terminal staff-close rule, tagged with prior inactivity context, never a second survey |
+| Terminal auto-close or opener Close | Future; not authorized here | Its separate accepted contract must emit the same fenced terminal receipt and retain close-source classification; no special bypass. Until accepted, refuse this source |
+| Failed/uncertain deletion, missing channel without terminal proof, erasure | Current safety/maintenance paths | No prompt; never infer success from a generic 404, reservation release or transcript presence |
+| Completed-ticket reopen | Future; not implemented | §5 invalidates invitation and submitted contribution; never re-rate the same ticket |
 
 ## 3. Conditional B: private opener flow
 
@@ -114,8 +114,9 @@ whichever is earlier. No retained drafts, prefilled comment history or attachmen
 
 An opener may explicitly request **one DM invitation for this ticket while Open**.
 Separate private consent, off by default; guild opt-in alone is not consent.
-That saved consent carries across Close only for this enrollment/window; no
-post-close DM opt-in or re-consent. A private **Cancel invitation** control in the
+Consent is saved while Open; **send admission happens after qualified Close**
+within §4's 24-hour limit. Saved consent carries across Close only for this
+enrollment/window; no post-close DM opt-in or re-consent. A private **Cancel invitation** control in the
 feedback view withdraws it; serialized before send admission, withdrawal wins.
 Collection opt-out overrides all consent; guild/opener DM disable and Discord
 refusal suppress delivery only. Self-service never enables delivery.
@@ -206,7 +207,7 @@ Never alter close tokens, capture transaction, cleanup recovery or active admiss
 | Two submissions race | One wins under unique constraint/ticket serialization; other gets `ALREADY_RATED`, never last-write-wins |
 | Same operation retry / changed body | Return bounded receipt only, never repeat DML/quota/DM or echo old comment. Reused key does not attest changed content; require fresh authorized read for truth |
 | Commit timeout / reply loss | `SAVE_UNCONFIRMED` until reconciliation by the same operation; confirmed stored commit remains saved even if reply failed |
-| Future reopen before or after rating | Serialize with submission: invalidate invite, remove score/comment/response contribution, mark enrollment permanently invalid for this ticket; no second eligibility or re-rate. If Submit wins first, reopen still removes it |
+| Future reopen before or after rating | Serialize with submission: invalidate invite, remove score/comment/response contribution, mark enrollment invalid for this ticket until Open+90 days (then age refuses); no second eligibility or re-rate. If Submit wins first, reopen still removes it |
 | Submission-window expiry | No new submit/invite; retained authorized receipts/reports/withdrawal still work until retention expiry |
 | Retention expiry, feedback opt-out, erasure, feature disable | Block reads/submissions/sends immediately. Disable does not erase or extend retained rows; opt-out/erasure remove contributions as §7; no queued replay on re-enable |
 | Claim/release/reassignment racing with rating | Claim is not rating ownership or responder attribution; no invitation or score changes. Parent-ticket erasure still cascades |
