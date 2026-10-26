@@ -475,7 +475,8 @@ mod database {
     async fn pre_repair_migrators(chain: &str, shipped: i64) -> (Migrator, Migrator) {
         // Apply unrelated predecessors too: a refusal must roll back the repair,
         // not accidentally compare history across a successful earlier migration.
-        let first_repair = super::forward_registry_files(chain, shipped)
+        let registry_files = super::forward_registry_files(chain, shipped);
+        let first_repair = registry_files
             .first()
             .expect("forward registry repair exists")
             .file_name()
@@ -487,11 +488,32 @@ mod database {
             .expect("repair version")
             .parse::<i64>()
             .expect("numeric repair version");
-        let latest = migrator(chain).await;
+        let registry_versions: Vec<i64> = registry_files
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .expect("registry filename")
+                    .to_str()
+                    .expect("UTF-8 registry filename")
+                    .split('_')
+                    .next()
+                    .expect("registry version")
+                    .parse::<i64>()
+                    .expect("numeric registry version")
+            })
+            .collect();
+        let full = migrator(chain).await;
         let prefix = Migrator::with_migrations(
-            latest
-                .iter()
+            full.iter()
                 .filter(|m| m.version < first_repair)
+                .cloned()
+                .collect(),
+        );
+        // Only registry repairs after the prefix: unrelated forward schema
+        // evolution must not masquerade as helper residue or catalog drift.
+        let latest = Migrator::with_migrations(
+            full.iter()
+                .filter(|m| m.version < first_repair || registry_versions.contains(&m.version))
                 .cloned()
                 .collect(),
         );
