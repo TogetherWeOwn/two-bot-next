@@ -88,6 +88,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Channel access tests](channel-access-acceptance.md)
 - [Channel locking tests](channel-lockdown-acceptance.md)
 - [Timed lockdown: no build](time-boxed-lockdown-decision.md)
+- [Timed slowmode: no build](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
