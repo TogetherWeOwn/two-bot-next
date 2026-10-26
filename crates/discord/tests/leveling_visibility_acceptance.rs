@@ -70,16 +70,53 @@ async fn snapshot(pool: &PgPool) -> Vec<String> {
     // Whole row values, not just counts: consuming cooldown/reward state or changing
     // an existing XP projection must fail even when the row count stays constant.
     let mut rows = Vec::new();
-    for table in [
-        "member_levels",
-        "member_season_xp",
-        "xp_awards",
-        "xp_cooldowns",
-        "level_role_rewards",
+    for (table, values) in [
+        (
+            "member_levels",
+            sqlx::query_scalar::<_, String>(
+                "SELECT row_to_json(t)::text FROM member_levels t ORDER BY row_to_json(t)::text",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        ),
+        (
+            "member_season_xp",
+            sqlx::query_scalar::<_, String>(
+                "SELECT row_to_json(t)::text FROM member_season_xp t ORDER BY row_to_json(t)::text",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        ),
+        (
+            "xp_awards",
+            sqlx::query_scalar::<_, String>(
+                "SELECT row_to_json(t)::text FROM xp_awards t ORDER BY row_to_json(t)::text",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        ),
+        (
+            "xp_cooldowns",
+            sqlx::query_scalar::<_, String>(
+                "SELECT row_to_json(t)::text FROM xp_cooldowns t ORDER BY row_to_json(t)::text",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        ),
+        (
+            "level_role_rewards",
+            sqlx::query_scalar::<_, String>(
+                "SELECT row_to_json(t)::text FROM level_role_rewards t ORDER BY row_to_json(t)::text",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        ),
     ] {
-        let query =
-            format!("SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text");
-        let values: Vec<String> = sqlx::query_scalar(&query).fetch_all(pool).await.unwrap();
         rows.push(format!("{table}:{values:?}"));
     }
     rows
@@ -212,6 +249,27 @@ fn content(reply: &Value) -> &str {
 
 fn contains_number(text: &str, number: &str) -> bool {
     text.replace(',', "").contains(number)
+}
+
+#[tokio::test]
+async fn unchanged_default_reads_keep_rank_privacy_season_order_and_zero_effects() {
+    let f = Fixture::new().await;
+    let rank = f.invoke("rank", json!([]), A, AT).await;
+    let board = f.invoke("leaderboard", json!([]), A, AT).await;
+    let replies = f.finish().await;
+    assert!(rank.unwrap() && board.unwrap());
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["ack"]["data"]["flags"], 64);
+    assert!(content(&replies[0]).contains("#2"));
+    assert!(contains_number(content(&replies[0]), "1234"));
+    assert_ne!(replies[1]["ack"]["data"]["flags"], 64);
+    let text = content(&replies[1]);
+    assert!(text.contains("2026-Q4") && text.contains("partial: early-season XP not counted"));
+    let rows: Vec<_> = text.lines().filter(|line| line.contains("<@")).collect();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].contains(&A.to_string()) && rows[0].contains("900 XP"));
+    assert!(rows[1].contains(&B.to_string()) && rows[1].contains("100 XP"));
+    assert!(!text.contains(&(A + 90).to_string()));
 }
 
 #[tokio::test]
