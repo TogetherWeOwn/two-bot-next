@@ -552,14 +552,31 @@ async fn control_manage_channels_and_current_guild_creator_fences_remain() {
         harness.unchanged(&before);
         assert!(response_text(&response).contains("/create"));
     }
-    for guild in [None, Some(Id::new(GUILD + 1))] {
+    // No guild: the existing dispatch contract is to not own the
+    // interaction at all (no reply, no write), not a private refusal.
+    {
         let mut harness = Harness::new(configured_creator(true), None, None);
         let before = harness.rows.lock().unwrap().clone();
         let mut interaction = textchannels_interaction(
             options(vec![reset("reset-name", true)]),
             Some(Permissions::MANAGE_CHANNELS),
         );
-        interaction.guild_id = guild;
+        interaction.guild_id = None;
+        let (owned, response) = handle_capture(&harness.runtime, &interaction).await;
+        assert!(!owned, "DM interactions must stay unowned");
+        assert!(response.is_none());
+        harness.unchanged(&before);
+    }
+    // A different guild has no live authority facts here, so it fails
+    // closed with a private refusal and no write.
+    {
+        let mut harness = Harness::new(configured_creator(true), None, None);
+        let before = harness.rows.lock().unwrap().clone();
+        let mut interaction = textchannels_interaction(
+            options(vec![reset("reset-name", true)]),
+            Some(Permissions::MANAGE_CHANNELS),
+        );
+        interaction.guild_id = Some(Id::new(GUILD + 1));
         harness.send_interaction(interaction).await;
         harness.unchanged(&before);
     }
@@ -597,6 +614,19 @@ async fn control_read_and_write_failures_do_not_save_or_notify() {
     }
 }
 
+/// A configured name/viewer role queues more join work than the plain
+/// fixture drains. Run the worker to a genuinely idle queue (bounded)
+/// so "no pending mutation" measures the reset, not leftover join work.
+async fn drain_worker(worker: &mut GuildRoomWorker<Store, Http>, now: &mut u64) {
+    for _ in 0..32 {
+        if !worker.dispatch_one(*now).await {
+            return;
+        }
+        *now += 1;
+    }
+    panic!("worker did not reach an idle queue");
+}
+
 #[tokio::test]
 async fn control_existing_companion_fixture_has_no_pending_live_mutation() {
     let (live, store, http, _) = companion_fixture();
@@ -614,6 +644,7 @@ async fn control_existing_companion_fixture_has_no_pending_live_mutation() {
         worker.companions[&500].settings.viewer_role_id,
         Some(EXTRA_ROLE)
     );
+    drain_worker(&mut worker, &mut now).await;
     assert!(
         !worker.dispatch_one(now).await,
         "snapshot fixture must start idle"
@@ -647,6 +678,7 @@ async fn saved_reset_notification_preserves_existing_companion_but_changes_futur
         .expect("load worker");
     let mut now = 0;
     join_with_companion(&mut worker, MEMBER, &mut now).await;
+    drain_worker(&mut worker, &mut now).await;
     let existing = worker.companions[&500].clone();
     assert_eq!(existing.settings.configured_name.as_deref(), Some("Lounge"));
     assert_eq!(existing.settings.viewer_role_id, Some(EXTRA_ROLE));
