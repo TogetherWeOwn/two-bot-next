@@ -1,10 +1,8 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)`.
 
-`python3 scripts/check_docs_index.py --json` at root.
-Empty `{missing,stale,oversize}` = PASS; else exit 1: fix rows/split docs.
-Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰¤65,536 (`LARGE_DOCS`).
+`python3 scripts/check_docs_index.py --json` (repo root): empty `{missing,stale,oversize}` = PASS, else exit 1 (fix rows/split docs). Bad/duplicate rows: `docs/README.md:<line>` in `stale`. Index <12,000; others â‰¤65,536 except `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -99,9 +97,10 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
-- [Response page proposal](dashboard-custom-responses-spec.md)
+- [Response page](dashboard-custom-responses-spec.md)
 - [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
+- [Self-role panels](dashboard-self-roles-spec.md)
 - [Onboarding page proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
@@ -112,6 +111,7 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
+- [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
@@ -121,8 +121,8 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
-- [Private sample proposal](feed-preview-spec.md)
-- [Relay move proposal](feed-move-spec.md)
+- [Private sample](feed-preview-spec.md)
+- [Relay move](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Game mix report](game-activity-report.md)
@@ -131,16 +131,17 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
-- [Notice proposal](event-change-notices-spec.md)
-- [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
-- [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
-- [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
-- [RSVP cutoff proposal](rsvp-registration-cutoff-spec.md)
-- [Private agenda proposal](event-agenda-spec.md)
-- [Calendar handoff proposal](event-calendar-handoff-spec.md)
-- [Event role proposal](event-role-spec.md)
+- [Notice](event-change-notices-spec.md)
+- [Reminder prefs](event-reminder-preferences-spec.md)
+- [RSVP seats/waitlist](rsvp-capacity-spec.md)
+- [RSVP withdrawal](rsvp-withdrawal-spec.md)
+- [RSVP cutoff](rsvp-registration-cutoff-spec.md)
+- [Agenda](event-agenda-spec.md)
+- [Calendar handoff](event-calendar-handoff-spec.md)
+- [Event role](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Sticky config proposal](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
@@ -150,7 +151,7 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 
 ## Voice
 
-- [Room specification](voice-rooms.md)
+- [Room spec](voice-rooms.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -172,7 +173,7 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
 - [Game aliases and nick](voice-alias-core.md)
-- [Channel-info resolution](voice-channelinfo-core.md)
+- [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
@@ -180,7 +181,7 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [Placement/numbering](voice-placement-core.md)
 - [Companion text domain](voice-text-channel-core.md)
 - [Companion lifecycle](voice-companion-lifecycle.md)
-- [Join-request lifecycle](voice-join-request-lifecycle.md)
+- [Join lifecycle](voice-join-request-lifecycle.md)
 - [Logging resolution](voice-logging-core.md)
 - [Name filtering](voice-name-filter-core.md)
 - [Name panel and modal](voice-name-panel.md)
@@ -200,7 +201,7 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [Rollback triggers](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
 - [Freeze readback](voice-t5-freeze-readback-receipt.md)
-- [Publish diff form](voice/publish-diff-record-template.md)
+- [Publish diff](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
@@ -264,7 +265,7 @@ Bad/duplicate rows: `docs/README.md:<line>` in `stale`; index <12,000; others â‰
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
-- [Load-sensitive fixtures](load-sensitive-test-fixtures.md)
+- [Load fixtures](load-sensitive-test-fixtures.md)
 - [Parser properties](property-tests.md)
 - [Pipeline benchmark](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)
