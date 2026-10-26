@@ -132,7 +132,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
-- [Event RSVP proposal](dashboard-event-rsvp-spec.md)
+- [RSVP proposal](dashboard-event-rsvp-spec.md)
 - [Notice proposal](event-change-notices-spec.md)
 - [Reminder proposal](event-reminder-preferences-spec.md)
 - [Seat proposal](rsvp-capacity-spec.md)
