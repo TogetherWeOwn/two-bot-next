@@ -182,6 +182,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
+- [Copy proposal](voice-creator-copy-spec.md)
 - [Permission overrides](voice-permissions-core.md)
 - [Permission health](voice-permission-health-core.md)
 - [Placement/numbering](voice-placement-core.md)
