@@ -17,7 +17,7 @@ use twilight_model::{
 use two_bot_core::{
     classify,
     community_store::{
-        member_join_fact, member_join_metadata, message_fact, record_fact, rules_accepted_fact,
+        member_join_fact, member_join_metadata, message_fact, rules_accepted_fact,
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
@@ -290,6 +290,70 @@ struct CommunityFactsState {
     pending: Vec<FactWrite>,
     rules: Vec<RulesAcceptedWrite>,
     joins: Vec<MemberJoinWrite>,
+    /// Capture was armed at least once. A never-armed buffer is disabled
+    /// capture (its drain discards, like `NoopFacts`); once armed, a drain
+    /// with no pool retains every queued fact instead of discarding it.
+    capture_armed: bool,
+    /// Cumulative oldest-first evictions from bounded drain requeues, one
+    /// counter per family, in (pending, rules, joins) order.
+    dropped_pending: u64,
+    dropped_rules: u64,
+    dropped_joins: u64,
+}
+
+/// Per-family cap for facts requeued by a failed or cancelled drain. It
+/// mirrors the game-activity requeue precedent's 8,192 bound: past the cap
+/// the oldest facts are evicted and counted, never silently dropped and
+/// never at another family's expense.
+const MAX_QUEUED_FACTS_PER_FAMILY: usize = 8_192;
+
+/// Put `unwritten` facts back ahead of the facts already in `queue`
+/// (arrivals captured while the drain was writing), evicting the oldest
+/// past [`MAX_QUEUED_FACTS_PER_FAMILY`] and counting every eviction in
+/// `dropped`. Exactly at the cap nothing is evicted.
+fn requeue_family<T>(queue: &mut Vec<T>, mut unwritten: Vec<T>, dropped: &mut u64) {
+    unwritten.append(queue);
+    let overflow = unwritten.len().saturating_sub(MAX_QUEUED_FACTS_PER_FAMILY);
+    if overflow > 0 {
+        unwritten.drain(..overflow);
+        *dropped += overflow as u64;
+    }
+    *queue = unwritten;
+}
+
+/// The batch one drain took from the buffer, with per-family counts of the
+/// writes the store acknowledged. Dropping the guard while `complete` is
+/// false — the store error path and a caller timeout dropping the drain
+/// future alike — requeues exactly the unacknowledged suffix of each
+/// family, so acknowledged facts (including `Ok(false)` duplicates) are
+/// never recorded twice. Never panics and never holds the buffer mutex
+/// over an await; a poisoned buffer keeps its latch and the suffix with it.
+struct DrainRequeue {
+    state: Arc<Mutex<CommunityFactsState>>,
+    pending: Vec<FactWrite>,
+    rules: Vec<RulesAcceptedWrite>,
+    joins: Vec<MemberJoinWrite>,
+    pending_done: usize,
+    rules_done: usize,
+    joins_done: usize,
+    complete: bool,
+}
+
+impl Drop for DrainRequeue {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let pending = self.pending.split_off(self.pending_done);
+        requeue_family(&mut state.pending, pending, &mut state.dropped_pending);
+        let rules = self.rules.split_off(self.rules_done);
+        requeue_family(&mut state.rules, rules, &mut state.dropped_rules);
+        let joins = self.joins.split_off(self.joins_done);
+        requeue_family(&mut state.joins, joins, &mut state.dropped_joins);
+    }
 }
 
 /// One buffered gate-clearing: owned inputs for a later async
@@ -333,11 +397,21 @@ pub struct MemberJoinWrite {
 /// Voice and message facts classify at record time and are dropped while
 /// unarmed (no pool), so a staging-gated rollout captures exactly while it
 /// scores. Gate-clearings and joins buffer raw even while unarmed — they are
-/// tiny, classified at drain with the same boot config, and the unarmed drain
-/// drops them — so funnel replay tests can assert the buffer without a
-/// database. Either way, disabled (no pool) persists nothing, exactly like
-/// [`two_bot_core::NoopFacts`]. A move's end+start pair buffers two rows for
+/// tiny, classified at drain with the same boot config — so funnel replay
+/// tests can assert the buffer without a database. A never-armed (disabled)
+/// drain drops them, persisting nothing, exactly like
+/// [`two_bot_core::NoopFacts`]; once capture has been armed, a drain with no
+/// pool retains them instead. A move's end+start pair buffers two rows for
 /// one frame.
+///
+/// Loss window: once armed, a failed or cancelled (caller-timeout) drain
+/// requeues every unwritten fact ahead of newer arrivals, so a transient
+/// store outage loses nothing; the queues are memory-only, so facts still
+/// buffered at process exit, or behind a poisoned mutex, are lost, and a
+/// requeue past 8,192 facts in one family evicts that family's oldest
+/// facts, counted by [`DeferredCommunityFacts::dropped_counts`]. A write the
+/// store committed but never acknowledged is retried on the next drain and
+/// deduped by its idempotency key.
 #[derive(Debug, Clone, Default)]
 pub struct DeferredCommunityFacts(Arc<Mutex<CommunityFactsState>>);
 
@@ -368,6 +442,7 @@ impl DeferredCommunityFacts {
         let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         state.pool = Some(pool);
         state.config = config;
+        state.capture_armed = true;
         Ok(())
     }
 
@@ -440,80 +515,120 @@ impl DeferredCommunityFacts {
         Ok(state.joins.len())
     }
 
+    /// Cumulative facts evicted by bounded drain requeues, in (pending,
+    /// rules, joins) order. Successful and empty drains never reset the
+    /// counters. A poisoned buffer refuses typed, never a false zero.
+    pub fn dropped_counts(&self) -> Result<(u64, u64, u64), CommunityFactsError> {
+        let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok((
+            state.dropped_pending,
+            state.dropped_rules,
+            state.dropped_joins,
+        ))
+    }
+
     /// Persist every buffered fact. Returns the inserted count; a duplicate
     /// delivery returns `false` from the store and is not counted twice. A
     /// poisoned buffer refuses typed before any store work and keeps every
     /// family queued: never a partial batch, never a false zero.
+    ///
+    /// On the first store error — or when the caller drops this future, as
+    /// the gateway checkpoint deadline does — every fact the store has not
+    /// acknowledged, across all three families, returns to the front of its
+    /// queue ahead of arrivals captured meanwhile (bounded per family,
+    /// evictions counted by [`Self::dropped_counts`]), so the next drain
+    /// retries exactly the unwritten suffix and never re-records an
+    /// acknowledged write. With no pool, a
+    /// never-armed buffer discards its raw gate-clearings and joins like
+    /// disabled capture always has, while an armed buffer keeps every
+    /// queued fact for a later drain; both return zero.
     pub async fn drain(&self) -> Result<usize, CommunityFactsError> {
-        let (pool, config, pending, rules, joins) = {
+        let (pool, config, mut guard) = {
             let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
-            (
-                state.pool.clone(),
-                state.config.clone(),
-                std::mem::take(&mut state.pending),
-                std::mem::take(&mut state.rules),
-                std::mem::take(&mut state.joins),
-            )
-        };
-        let Some(pool) = pool else {
-            return Ok(0);
+            let Some(pool) = state.pool.clone() else {
+                if !state.capture_armed {
+                    state.pending.clear();
+                    state.rules.clear();
+                    state.joins.clear();
+                }
+                return Ok(0);
+            };
+            let guard = DrainRequeue {
+                state: Arc::clone(&self.0),
+                pending: std::mem::take(&mut state.pending),
+                rules: std::mem::take(&mut state.rules),
+                joins: std::mem::take(&mut state.joins),
+                pending_done: 0,
+                rules_done: 0,
+                joins_done: 0,
+                complete: false,
+            };
+            (pool, state.config.clone(), guard)
         };
         let mut inserted = 0;
-        for write in &pending {
+        for write in &guard.pending {
             if record_fact(&pool, write).await? {
                 inserted += 1;
             }
+            guard.pending_done += 1;
         }
-        for write in &rules {
-            let input = ClassifyInput {
-                guild_id: write.guild_id.to_string(),
-                actor_id: write.member_id.to_string(),
-                is_bot: write.is_bot,
-                webhook_id: None,
-                is_staff_automation: false,
-                is_raid: false,
-                is_staging: false,
-                is_test: false,
+        for write in &guard.rules {
+            let fact = {
+                let input = ClassifyInput {
+                    guild_id: write.guild_id.to_string(),
+                    actor_id: write.member_id.to_string(),
+                    is_bot: write.is_bot,
+                    webhook_id: None,
+                    is_staff_automation: false,
+                    is_raid: false,
+                    is_staging: false,
+                    is_test: false,
+                };
+                let verdict = classify(&config, &input);
+                rules_accepted_fact(
+                    &input.guild_id,
+                    &input,
+                    &write.occurred_at,
+                    &write.source_event_id,
+                    &write.source,
+                    verdict,
+                    None,
+                )
             };
-            let verdict = classify(&config, &input);
-            let fact = rules_accepted_fact(
-                &input.guild_id,
-                &input,
-                &write.occurred_at,
-                &write.source_event_id,
-                &write.source,
-                verdict,
-                None,
-            );
             if record_fact(&pool, &fact).await? {
                 inserted += 1;
             }
+            guard.rules_done += 1;
         }
-        for write in &joins {
-            let input = ClassifyInput {
-                guild_id: write.guild_id.to_string(),
-                actor_id: write.member_id.to_string(),
-                is_bot: write.is_bot,
-                webhook_id: None,
-                is_staff_automation: false,
-                is_raid: false,
-                is_staging: false,
-                is_test: false,
+        for write in &guard.joins {
+            let fact = {
+                let input = ClassifyInput {
+                    guild_id: write.guild_id.to_string(),
+                    actor_id: write.member_id.to_string(),
+                    is_bot: write.is_bot,
+                    webhook_id: None,
+                    is_staff_automation: false,
+                    is_raid: false,
+                    is_staging: false,
+                    is_test: false,
+                };
+                let verdict = classify(&config, &input);
+                member_join_fact(
+                    &input.guild_id,
+                    &input,
+                    &write.occurred_at,
+                    &write.source_event_id,
+                    &write.source,
+                    verdict,
+                    member_join_metadata(write.inviter_id),
+                )
             };
-            let verdict = classify(&config, &input);
-            let fact = member_join_fact(
-                &input.guild_id,
-                &input,
-                &write.occurred_at,
-                &write.source_event_id,
-                &write.source,
-                verdict,
-                member_join_metadata(write.inviter_id),
-            );
             if record_fact(&pool, &fact).await? {
                 inserted += 1;
             }
+            guard.joins_done += 1;
         }
+        guard.complete = true;
         Ok(inserted)
     }
 }
@@ -1590,6 +1705,26 @@ mod tests {
     }
 
     #[test]
+    fn requeue_family_prepends_caps_and_counts_evictions() {
+        // Unwritten work goes ahead of arrivals; exactly at the cap
+        // nothing is evicted and the counter stays put.
+        let mut queue: Vec<u64> = (0..(MAX_QUEUED_FACTS_PER_FAMILY as u64 - 2)).collect();
+        let mut dropped = 0;
+        requeue_family(&mut queue, vec![20_001, 20_002], &mut dropped);
+        assert_eq!(queue.len(), MAX_QUEUED_FACTS_PER_FAMILY);
+        assert_eq!(queue[..2], [20_001, 20_002]);
+        assert_eq!(dropped, 0);
+
+        // Past the cap the oldest (the requeued prefix) is evicted and
+        // every eviction is counted cumulatively.
+        let mut queue: Vec<u64> = (0..MAX_QUEUED_FACTS_PER_FAMILY as u64).collect();
+        requeue_family(&mut queue, vec![20_001, 20_002], &mut dropped);
+        assert_eq!(queue.len(), MAX_QUEUED_FACTS_PER_FAMILY);
+        assert_eq!(queue[0], 0);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
     fn poison_displays_carry_the_stable_reason_and_action() {
         // The reason-code constants, the gateway failure line and the
         // recovery doc all carry these literals verbatim; a rename must
@@ -1626,3 +1761,12 @@ mod deferred_capture_poison_acceptance;
 #[cfg(feature = "test-support")]
 #[path = "../tests/support/deferred_worker_poison.rs"]
 pub mod deferred_worker_poison;
+
+#[cfg(test)]
+#[path = "../tests/support/community_facts_requeue.rs"]
+mod community_facts_requeue_acceptance;
+
+#[cfg(test)]
+use community_facts_requeue_acceptance::record_fact;
+#[cfg(not(test))]
+use two_bot_core::community_store::record_fact;
