@@ -186,7 +186,7 @@ fn malformed() -> Vec<(String, Vec<CommandDataOption>)> {
 
 struct Harness {
     mock: MockRest,
-    runtime: CommandRuntime,
+    runtime: Arc<CommandRuntime>,
 }
 
 impl Harness {
@@ -305,8 +305,9 @@ async fn snapshot(pool: &PgPool) -> Vec<String> {
         "retention_deletion_requests",
     ] {
         let query = format!("SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text FROM {table} t");
+        // Audit: `table` comes from the fixed allowlist above, never user input.
         rows.push(
-            sqlx::query_scalar(&query)
+            sqlx::query_scalar(sqlx::AssertSqlSafe(query))
                 .fetch_one(pool)
                 .await
                 .expect("complete relation snapshot"),
