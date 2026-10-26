@@ -147,7 +147,12 @@ claim at this generation. B therefore needs a durable pending-offer record.
 Proposed additive contract, **not DDL to execute**:
 
 - One pending offer per ticket at a time. A second offer while one is pending
-  refuses; cancel, refuse, expiry or accept must settle the first.
+  is denied with `offer_pending`; cancel, refuse, expiry or accept must settle
+  the first. Expiry settles lazily: an offer with `expires_at <= database time`
+  is treated as expired everywhere -- it does not count as pending, cannot be
+  accepted, refused or cancelled (those return stale), and a new offer marks it
+  expired in the same transaction that commits the new pending row. No live
+  `pending` row can therefore wedge the slot, including after silent expiry.
 - Offer row (names illustrative): random 128-bit `offer_id` (32 lowercase
   hex), `guild_id`, `ticket_id` FK to tickets with cascade, `offered_by`
   (claimant at offer time), `offered_to` (named recipient), expected
@@ -182,9 +187,10 @@ against database time. Conditional predicates repeat these checks; accept SETs
 **only** `claimed_by = offered_to` (the trigger advances the revision) and
 marks the offer accepted; insert §5 audit on the **same
 connection/transaction**, then commit from RETURNING witness. Only a confirmed
-commit returns saved. Zero affected rows is stale/refused, never a retry with
-newer state. No Discord I/O or advisory-lock wait is held inside the
-transaction.
+commit returns saved. Zero affected rows is stale on the accept path (or
+denied with `offer_pending` on the offer path when a live pending row won the
+race), never a retry with newer state. No Discord I/O or advisory-lock wait is
+held inside the transaction.
 
 Race outcomes (revision 7 at offer time):
 
@@ -214,8 +220,9 @@ Race outcomes (revision 7 at offer time):
   read never auto-mutates it.
 - Cancel: the offeror cancels a pending offer before accept commits;
   assignment unchanged; a late accept is stale. Cancel after a terminal state
-  is a no-op.
-- Unclaimed ticket: offer refuses because there is nothing to hand off; the
+  is a no-op; cancel of a lazily expired offer returns stale, since expiry
+  already settled it.
+- Unclaimed ticket: offer is denied because there is nothing to hand off; the
   colleague uses the normal claim path.
 
 Bounded follow-up admission: allocate unused migration numbers per
@@ -238,6 +245,7 @@ offers. If this cannot fit a bounded reviewed follow-up, choose A.
 | `no_op / cancelled / none` | "Offer cancelled. The claim is unchanged." Offeror side; late accept is stale |
 | `stale / offer_changed / refresh_private_preview` | "This handoff is out of date. No change was made. Refresh before continuing." Covers expiry, revision advance, duplicate and terminal state; never names the other party's new state |
 | `denied / not_participant_or_staff / ask_authorized_staff` | "Only the current staff claimant can offer, and only the named staff recipient can accept." No assignment details |
+| `denied / offer_pending / cancel_or_await_settlement` | "An offer is already pending for this ticket. Cancel it or wait for it to settle." First offer intact; nothing terminal |
 | `unavailable / context_unavailable / verify_access` | "Handoff is unavailable here. No change was saved." Collapses absent/foreign/unproven context and the dark-generation gate; reveals no IDs |
 | `unavailable / store_unavailable / retry_private_preview` | "Handoff could not be saved. Refresh and try again." Proven pre-commit failure/rollback only |
 | `unavailable / commit_unknown / inspect_current_assignment` | "The handoff result is unconfirmed. Check current assignment before trying again." Never asserts rollback or success |
@@ -311,13 +319,14 @@ row.
 | nonstaff_accept | B loses staff before accept -> denied, A@7, pending row left for expiry/cancel |
 | foreign_guild | g2/DM/application mismatch -> unavailable, no IDs or writes |
 | wrong_binding | Foreign channel/message/private recipient, or C accepts B's offer -> unavailable/denied, unchanged |
-| unclaimed_offer | Offer on NULL@8 -> refused with no control/audit; B uses the normal claim path |
+| pending_visibility | With A->B pending: A and B `pending` reads show that row privately; third staffer C reads -> no rows, learns nothing; no writes anywhere |
+| unclaimed_offer | Offer on NULL@8 -> denied, no row/control/audit; B uses the normal claim path |
 | refuse | B refuses -> no_op, A@7, offer terminal refused, no audit row |
 | cancel | A cancels pending -> no_op, unchanged, terminal cancelled |
 | cancel_after_accept | Accept commits B@8; late cancel -> stale no-op, B@8 unchanged |
-| expiry | Offer expires at exact DB deadline; late accept -> stale, A@7 unchanged |
+| expiry | Offer expires at exact DB deadline; late accept -> stale, A@7 unchanged, slot freed for re-offer |
 | duplicate_accept | Two connections read pending; barrier; submit both -> one saved, one stale, one audit |
-| concurrent_offer | Pending offer to B; A offers to C -> refused, first offer intact; cancel then re-offer allowed |
+| concurrent_offer | Pending offer to B; A offers to C -> denied/offer_pending, first offer intact; cancel, settle or expiry then re-offer allowed |
 | close_first | Barrier; close commits closing@8 before accept -> stale, closing unchanged, offer unusable |
 | accept_first | Accept commits B@8 before authorized close -> saved then closing@9, transcript path unchanged |
 | same_actor_aba | Hold accept for A@7; release commits NULL@8, A reclaims @9; deliver held accept -> stale, A@9 |
@@ -354,7 +363,7 @@ reply failures and the shared Discord double. No live tests here.
 >>> text = pathlib.Path("docs/ticket-claim-handoff-spec.md").read_text()
 >>> rows = text.split("| Case |", 1)[1].split("\n\n", 1)[0].splitlines()[2:]
 >>> cases = [row.split("|")[1].strip() for row in rows]
->>> assert len(cases) == len(set(cases)) == 30
+>>> assert len(cases) == len(set(cases)) == 31
 >>> assert {"offer_accept", "refuse", "expiry", "close_first", "same_actor_aba", "duplicate_accept", "restart_after", "erasure"} <= set(cases)
 >>> # Abstract witness arithmetic, not a runtime or database implementation.
 >>> offered, accepted = 7, 7 + 1
@@ -368,7 +377,7 @@ reply failures and the shared Discord double. No live tests here.
 >>> assert not {"actor_id", "content", "token"} & sample.keys()
 >>> result = {"schema": "tickets.handoff.design-check.v1", "cases": len(cases), "outcome": "checked", "reason": "offline_oracle_only", "next_action": "request_exact_spec_intent_alignment"}
 >>> print(json.dumps(result, sort_keys=True))
-{"cases": 30, "next_action": "request_exact_spec_intent_alignment", "outcome": "checked", "reason": "offline_oracle_only", "schema": "tickets.handoff.design-check.v1"}
+{"cases": 31, "next_action": "request_exact_spec_intent_alignment", "outcome": "checked", "reason": "offline_oracle_only", "schema": "tickets.handoff.design-check.v1"}
 
 ```
 
@@ -394,7 +403,7 @@ not host alignment; no implementation, protected acceptance or build cards
 before both records. Any material spec edit needs a new hash-bound request,
 not carried approval.
 
-By 2026-11-02, measure **30/30 fixture outcomes explicitly accepted or
+By 2026-11-02, measure **31/31 fixture outcomes explicitly accepted or
 revised, CEO/host disposition recorded, and incremental value over
 self-release plus queue proven or B deferred/killed**. No demand/engagement
 success is claimed. At expiry, default A (no build); unanswered intent never
