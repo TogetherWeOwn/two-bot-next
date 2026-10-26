@@ -142,10 +142,10 @@ check validates their presence, not runtime effects.
 
 | Stable ID / control | Validator (today, then proposed) | Permission | Store | Audit | Consumers |
 | --- | --- | --- | --- | --- | --- |
-| `PV-K1` / presence toggle | Today: Rust bool plus snowflake guild check only. Proposed: strict JSON boolean, opaque `expected_version` CAS equality, server-derived admin actor, trusted session-guild match before signing | Proposed Manage Server, checked server-side on reads and writes | `guild_analytics_settings.presence_enabled`, upsert plus `updated_at`; no null/unset (row delete would reset all three families) | None today; W1 append-only toggle-change audit | `presence_update` drops, gateway batch snapshot, game-activity flush drain; next write per transaction |
+| `PV-K1` / presence toggle | Today: Rust bool plus snowflake guild check only. Proposed: strict JSON boolean, opaque `expected_version` CAS equality, server-derived admin actor, trusted session-guild match before signing; read via the separate signed toggle-read response below (guild configuration only, no member ID) | Proposed Manage Server, checked server-side on reads and writes | `guild_analytics_settings.presence_enabled`, upsert plus `updated_at`; no null/unset (row delete would reset all three families) | None today; W1 append-only toggle-change audit | `presence_update` drops, gateway batch snapshot, game-activity flush drain; next write per transaction |
 | `PV-K2` / activity toggle | Same as `PV-K1` | Same as `PV-K1` | `guild_analytics_settings.activity_enabled`, same no-unset rule | None today; W1 audit | `first/second/third_message`, community `message_created`, family-routed touches; next write per transaction |
 | `PV-K3` / voice toggle | Same as `PV-K1` | Same as `PV-K1` | `guild_analytics_settings.voice_enabled`, same no-unset rule | None today; W1 audit | Voice sessions, community voice facts, game `in_voice_ms` zeroing; next write per transaction |
-| `PV-P1` / opt-out posture aggregate | Guild allowlist plus count-only projection; any row-shaped read refuses | Proposed Manage Server, read-only | `COUNT(*)` over `privacy_opt_outs` for the pinned guild; never rows | None (reads); no per-member access log in the browser | Dashboard card only |
+| `PV-P1` / opt-out posture aggregate | Guild allowlist plus count-only projection for this aggregate action; any row-shaped aggregate read refuses | Proposed Manage Server, read-only | `COUNT(*)` over `privacy_opt_outs` for the pinned guild = retained suppression pairs/tombstones (may include former or erased members; not a current-member count); never rows | None (reads); no per-member access log in the browser | Dashboard card only |
 | `PV-P2` / purge receipt aggregate | Same count-only projection plus capped per-day histogram | Proposed Manage Server, read-only | `COUNT(*)` over `privacy_opt_out_audit` for the pinned guild; actor labels never leave the boundary | None (reads) | Dashboard card only |
 | `PV-P3` / toggle-change audit view | Absent: no table, no viewer | None until W1 | Absent until W1 defines it | The audit itself is the deliverable | Dashboard shows own-action confirmations only until then |
 
@@ -169,10 +169,19 @@ available to this admin; IDs are never rendered.
 
 ### View and change
 
-- After W2/W3 the page reads the three stored toggle states (or the missing-row
-  state) plus the two aggregate counts through signed count-only actions.
-  `source=store` means **stored override**, `source=inherited_default_on` means
-  **no row; all families on**. Never display a guessed value as current.
+- After W2/W3 the page reads toggle state and aggregate counts through two
+  separately routed signed actions, never one widened read: (a) a signed
+  **toggle-read** action (guild configuration only, no member ID) returning per
+  key `{key,source,stored_enabled,effective_enabled,expected_version}` — stored
+  row: `source=store`, `stored_enabled` is the boolean and equals
+  `effective_enabled`; missing row: `source=inherited_default_on`,
+  `stored_enabled=null`, `effective_enabled=true`, `expected_version` is the
+  absent-row token W1 defines; and (b) signed **count-only aggregate** actions
+  for `PV-P1`/`PV-P2` returning counts only. The row-shaped-read refusal applies
+  to (b) and to every member-bearing table; it does not forbid (a), which carries
+  no member row, ID or actor label. `source=store` means **stored override**,
+  `source=inherited_default_on` means **no row; all families on**. Never display
+  a guessed value as current.
 - Toggle rows stay read-only until W1; then one-row saves, not an invented
   atomic three-key action. No publish, purge, pause-service or restart button.
 - There is no unset/delete control: deleting the row would silently reset all
@@ -271,8 +280,9 @@ The dashboard cannot claim capture stopped while any write path is live:
    are unchanged. Joins, leaves, safety and moderation rows, anonymous counters
    and the other families still persist."
 3. Missing row: "Using inherited defaults: all families on. No stored override."
-4. Aggregates: "`N` guild members currently suppress analytics persistence in
-   this guild." Never a per-member list, link or export.
+4. Aggregates: "`N` suppression records retained for this guild. Retained
+   records can include former or erased members, so this is not a count of
+   current members." Never a per-member list, link or export.
 5. Scope truthfulness beyond this page is owned separately; link that
    disposition instead of inventing scope claims here.
 
@@ -283,7 +293,12 @@ toggle booleans, missing-row state, two aggregate counts, capped per-day
 histogram bars, and own-action confirmations. Never subject IDs, member lists,
 actor labels, guild IDs, row contents or request internals.
 
-Agent result shape (proposed, not a new endpoint):
+Agent result shapes (proposed, not new endpoints), kept distinct so neither is
+widened to serve the other: toggle-read
+`{schema,source_sha,guild_id,request_id,toggles:[{key,source,stored_enabled,effective_enabled,expected_version}],reason,retryable,next_action}`;
+aggregate-read
+`{schema,source_sha,guild_id,request_id,aggregates:[{id,count}],reason,retryable,next_action}`
+(counts only, no boolean or row fields); write/reason results keep
 `{schema,source_sha,guild_id,key,expected_version,request_id,reason,retryable,next_action}`.
 `guild_id` is the deployment-pinned guild, never a member selector; `member_id`
 must not appear in any dashboard request, response, log line or preview. No
@@ -317,7 +332,7 @@ not runtime effects. Classification `never_per_member` has no control to send.
     {"id":"PV-S3","state":"suppression_only_residual","column":null,"reason":"cutover_touch_mark_bot_backfill_and_prompt_guards_carry_no_family_signal","evidence":["E-RESIDUAL-TOUCH","E-RESIDUAL-MARK","E-ONBOARDING","E-INACTIVITY"]},
     {"id":"PV-S4","state":"env_only","column":null,"reason":"deployment_guild_identity_pinned_server_side_never_shown_or_sent","evidence":["E-RECEIVER-PIN","E-VERBS"]},
     {"id":"PV-S5","state":"absent","column":null,"reason":"no_signed_privacy_verb_no_web_view_no_toggle_audit_table","evidence":["E-VERBS","E-WEBV1","E-WEBREADER","E-ROLES-OPT","E-WRITE"]},
-    {"id":"PV-S6","state":"never_per_member","column":null,"reason":"no_member_controls_lists_exports_or_deletion_surface_ever","evidence":["E-SUPPRESSION","E-RECEIPTS","E-SELF-SERVE"]}
+    {"id":"PV-S6","state":"never_per_member","column":null,"reason":"dashboard_has_no_member_controls_lists_exports_or_deletion_surface_ever","evidence":["E-SUPPRESSION","E-RECEIPTS","E-SELF-SERVE"]}
   ],
   "evidence": {
     "E-READ":{"path":"crates/cutover/src/privacy.rs","line":319,"contains":"pub async fn analytics_settings"},
@@ -368,8 +383,9 @@ not runtime effects. Classification `never_per_member` has no control to send.
 }
 ```
 
-Agent result shape (proposed, not a new endpoint):
-`{schema,source_sha,guild_id,key,expected_version,request_id,reason,retryable,next_action}`.
+Agent result shapes are as defined above: toggle-read carries
+`toggles:[{key,source,stored_enabled,effective_enabled,expected_version}]`,
+aggregate-read carries counts only, and neither carries `member_id`.
 No value-bearing logs; previews may show only the admin's private configuration
 draft. A source/hash mismatch requires re-inventory, not optimistic editing.
 
@@ -381,7 +397,7 @@ draft. A source/hash mismatch requires re-inventory, not optimistic editing.
 | `PV-F04` | Opt-out interplay: toggle during capture (old write before commit persists, new write drops), stale revision against a concurrent save, opt-out purge racing a disabled family, suppression surviving every toggle state. Pin zero toggle-driven suppression changes. |
 | `PV-F05` | Replay same key/body: one change/audit; different body under key: refusal. After a later save, replay old success returns the current token; fresh read required. Side-read failure/terminal commit ambiguity: COMMIT_UNKNOWN, not success. |
 | `PV-F06` | Foreign guild B: web blocks before signing, zero requests; a B row in fixture cannot affect A runtime. Independently pin the receiver's staging guild behavior, not an invented body-guild denial. |
-| `PV-F07` | Missing-row default: a fresh guild reads inherited-default-on and every family persists; the first write creates the row. |
+| `PV-F07` | Missing-row default: a fresh guild reads inherited-default-on and every family persists; the first write creates the row. The toggle-read response marks each key `source=inherited_default_on`, `stored_enabled=null`, `effective_enabled=true`. |
 | `PV-F08` | No row-delete reset: setting all three true is not a delete; dashboard delete is forbidden; prove no three-key side effect from any single-toggle action. |
 | `PV-F09` | Failed read, runtime unavailable, unparsable stored row: retain correct last-good/default behavior per consumer; UI stale/read-only with observation time, never applied. |
 | `PV-F10` | PII absence: every dashboard response, log line, preview and error is scanned for planted member-ID fixtures; counts match exactly and zero IDs appear. Receipt actor labels never reach the browser. |
@@ -418,7 +434,10 @@ require re-inventory, not a waiver.
 >>> assert {r["column"] for r in rows} == cols == {"presence_enabled", "activity_enabled", "voice_enabled"}
 >>> assert len(rows) == len({r["id"] for r in rows}) == 3
 >>> assert all(r["class"] == "dedicated_table" and r["state"] == "read_only_blocked" for r in rows)
->>> assert all("PV-W1" in r["gate"] and "PV-W3" in r["gate"] for r in rows)
+>>> assert all(set(r["gate"]) == {"PV-W1", "PV-W2", "PV-W3"} for r in rows)
+>>> assert "guild members " + "currently suppress" not in doc
+>>> assert "suppression records " + "retained" in doc
+>>> assert "stored_" + "enabled" in doc and "effective_" + "enabled" in doc
 >>> assert all(r["apply"] == "next_write_per_transaction" for r in rows)
 >>> mig = pathlib.Path("crates/cutover/migrations/0433_privacy_opt_out.sql").read_text()
 >>> assert all(r["column"] in mig for r in rows)
@@ -451,7 +470,7 @@ require re-inventory, not a waiver.
 | ID | Recommendation, not a build card or API |
 | --- | --- |
 | `PV-W1` | Add a CAS toggle writer with server-derived actor and append-only audit. Fail closed on stale tokens; never expose the raw table to the web. The dashboard writes only through this writer. |
-| `PV-W2` | Add a PII-safe aggregate read path (signed count-only actions or a reviewed count-only projection meeting the verify-read bar). Counts only; member IDs and actor labels never leave the boundary. No direct table or view grants. |
+| `PV-W2` | Add two separately routed PII-safe read paths: a signed toggle-read action returning only the per-key toggle state defined above (guild configuration; boolean/null plus missing-row source), and signed count-only aggregate actions (or a reviewed count-only projection meeting the verify-read bar) for `PV-P1`/`PV-P2`. Counts only on the aggregate path; member IDs and actor labels never leave either boundary. No direct table or view grants. |
 | `PV-W3` | Before any page read, prove web private-admin/guild checks, signer, guild fence and session revocation against the pinned deployment guild. If no trusted read evidence is available, keep unknown-state copy or no-build. |
 | `PV-W4` | Hand scope truthfulness to its separate owner with this inventory attached: residual seams, lag bounds and copy rules above. The dashboard links that disposition; it never invents scope claims. |
 
@@ -462,7 +481,7 @@ Cut-ready future slices (each one day or less, none started by this spec):
 | `PV-S1` aggregate posture read | Signed count-only actions return exact counts on a disposable DB with planted member IDs; every response/log passes the PV-F10 scan |
 | `PV-S2` CAS writer plus audit | Service-level CAS writer with actor and append-only audit passes PV-F01–F03 and PV-F05 on disposable DB; no web involved |
 | `PV-S3` web guards proof | Private-admin checks, guild fence and signer pass PV-F06 and PV-F12 against the pinned guild; no values leak to unauthorized sessions |
-| `PV-S4` read-only posture page | Toggles plus aggregates render with saved-vs-live/unknown states and pass PV-F07, PV-F09 and PV-F11; no edit control exists |
+| `PV-S4` read-only posture page | Toggle-read state plus count-only aggregates render with saved-vs-live/unknown states and pass PV-F07, PV-F09 and PV-F11; no edit control exists |
 | `PV-S5` single-family edit | One toggle edits with two-step confirm, dry-run and CAS retry, passing PV-F03–F05 and PV-F08; other families stay read-only |
 | `PV-S6` residual disclosure | Page copy and runbook link cover every residual and lag bound; PV-F04 interplay fixtures pass on disposable DB |
 
