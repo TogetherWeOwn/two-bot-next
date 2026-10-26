@@ -134,14 +134,17 @@ permission data than the mutation it previews.
    that succeeded. (This narrows the *preview flow* only; it changes nothing
    about which channels direct `/lockdown` accepts today.)
 3. **Render and arm.** Compute the section 4 diff from that single snapshot,
-   write the section 6 preview audit row, store one pending entry keyed by
-   `(guild, channel, actor, digest)`, and reply ephemerally with the diff plus
-   **Confirm lockdown** / **Cancel** buttons
+   write the section 6 preview audit row, and reply ephemerally with the diff
+   plus **Confirm lockdown** / **Cancel** buttons
    (`lockdown-preview:confirm:<actor>:<digest32>` /
    `lockdown-preview:cancel:<actor>:<digest32>`, each ≤100 characters).
-   If the audit insert fails, render nothing and store nothing.
-4. **Cancel** removes the pending entry and the buttons; it writes no audit row
-   and no mutation. Expiry and process restart are equivalent to cancel.
+   A pending entry keyed by `(guild, channel, actor, digest)` is stored only
+   when the reply carries a Confirm button (armed previews); replies without
+   Confirm (step 6) store nothing and consume none of the section 5 pending
+   cap. If the audit insert fails, render nothing and store nothing.
+4. **Cancel** removes the pending entry when one exists, and the buttons; it
+   writes no audit row and no mutation. Expiry and process restart are
+   equivalent to cancel.
 5. **Confirm** consumes the pending entry on first press (consume-once; any
    second press, foreign press, forged digest or post-restart press gets the
    collapsed `PREVIEW_EXPIRED` reply). It then re-runs router adjudication,
@@ -154,7 +157,9 @@ permission data than the mutation it previews.
 6. **Already locked.** If the live `@everyone` overwrite already denies all
    five bits (planned write equals current masks), the preview renders,
    is audited, states that nothing would change, and carries **no** Confirm
-   button. A moderator who deliberately wants the existing repeated-lockdown
+   button and stores **no** pending entry, so unarmed previews can never
+   exhaust the 64-entry cap. A moderator who deliberately wants the existing
+   repeated-lockdown
    behaviour uses `/lockdown`, whose seed-preservation rules are unchanged
    ([`channel-lockdown-acceptance.md`](channel-lockdown-acceptance.md) item 4).
 7. **Partial locks.** If some but not all five bits are denied (legacy
@@ -234,6 +239,13 @@ planned allow/deny, saved-lockdown present flag, saved recovery generation
 (or `""`), roles sorted by id as `[id, position, permissions & INTEREST]`, and
 overwrites sorted by `(type, id)` as `[type, id, allow & INTEREST, deny & INTEREST]`,
 where `INTEREST = LOCKDOWN_BITS | VIEW_CHANNEL (1024) | ADMINISTRATOR (8)`.
+Canonical bytes are the UTF-8 encoding of that array with compact separators
+and non-ASCII escaped (`\uXXXX`, astral planes as surrogate pairs) — exactly
+Python `json.dumps(snapshot, separators=(",", ":"),
+ensure_ascii=True).encode()`. Strings are not Unicode-normalized: the reason
+is digested exactly as trimmed, so composed and decomposed spellings are
+distinct inputs. A Rust implementation must reproduce these exact bytes, not
+merely an equal parse.
 The full digest is computed and compared in memory; buttons carry only its
 first 32 hex characters as the pending lookup key. Timestamps are not digested;
 expiry lives in the pending entry. The digest is not logged, audited or used
@@ -267,10 +279,11 @@ existing `finish`/retain semantics byte-for-byte; confirm never resends.
 **Bounds (all proposed constants).**
 
 - Pending TTL **300 seconds** from preview reply; `now >= expires` refuses.
-- At most **1** outstanding preview per `(guild, channel, actor)`; a new preview
-  invalidates that actor's previous digest for that channel. At most **64**
-  pending entries process-wide; at cap, refuse `PREVIEW_BUSY` (never evict a
-  live entry). Expired entries are swept lazily on insert/take.
+- At most **1** outstanding armed preview per `(guild, channel, actor)`; a new
+  armed preview invalidates that actor's previous digest for that channel.
+  Unarmed previews (no Confirm) create no entry and invalidate none. At most
+  **64** pending entries process-wide; at cap, refuse `PREVIEW_BUSY` (never
+  evict a live entry). Expired entries are swept lazily on insert/take.
 - Rate: at most **10 previews per actor / 10 minutes** and **30 per guild /
   10 minutes**, charged after router+validation and **before** any Discord read,
   so refused-for-rate costs zero GETs. Counters are in-memory in the channel
@@ -282,9 +295,10 @@ existing `finish`/retain semantics byte-for-byte; confirm never resends.
   ≤1 saved-lockdown SELECT. The existing mutation `prepare` adds its own GET;
   B adds no other reads and no retries of reads beyond the executor's existing
   single paced attempt.
-- Pending retention: digest, prior/planned masks, saved-generation string,
-  counts used for audit metadata, expiry, and the trimmed reason (≤512 UTF-16
-  units) — in memory only, never logged, gone on consume/cancel/expiry/restart.
+- Pending retention: preview interaction id, digest, prior/planned masks,
+  saved-generation string, counts used for audit metadata, expiry, and the
+  trimmed reason (≤512 UTF-16 units) — in memory only, never logged, gone on
+  consume/cancel/expiry/restart.
 
 ## 6. Audit of previews
 
@@ -293,9 +307,11 @@ differs in kind: it discloses the channel's full overwrite structure and role
 projections to one moderator and it arms a permission **mutation**. An
 unaudited armed preview would make "who staged this lockdown, and was the
 executed write the previewed one?" unanswerable. B therefore audits previews
-while keeping the metadata discipline of the existing ledger
+while keeping the metadata discipline of the existing ledger for preview rows
 (`ChannelAuditRow.metadata_json` is bounded numbers only,
-`crates/core/src/channel_moderation_store.rs:15-31`):
+`crates/core/src/channel_moderation_store.rs:15-31`; the one correlation id on
+confirmed-execution rows follows the ledger's existing string-`request_id`
+precedent, next paragraph but one):
 
 | Event | Audit effect (action stays `moderation.lockdown`) |
 | --- | --- |
@@ -303,7 +319,18 @@ while keeping the metadata discipline of the existing ledger
 | Router/validation refusal, read failure, `TOO_COMPLEX`, rate refusal | No row (nothing disclosed), mirroring the reads branch; the rate limiter still charged where section 5 says so |
 | Cancel, expiry, restart loss, duplicate/foreign press | No row |
 | Confirm → stale | One row, outcome `refused`, metadata `{"stale_preview":1}`. If that insert fails the refusal still stands (no mutation is at risk); log the fixed `channel_refusal_audit_failed` token as the missing-context path does |
-| Confirm → executed or refused in the mutation path | The existing lockdown audit row only (real reason, existing outcomes/metadata). No digest, mask or role id is added to it; preview↔execution correlation is actor+channel+time adjacency, stated as such |
+| Confirm → executed or refused in the mutation path | The existing lockdown audit row (real reason, existing outcomes), with `preview_request_id` added to its metadata (next paragraph). No digest, mask or role id is added |
+
+`preview_request_id` is the confirmed preview's interaction id as a decimal
+string — the same value the preview row stores as `request_id` and
+`idempotency_key`. It is the preview↔execution correlation key; actor,
+channel and time adjacency is secondary context, never the key, because a new
+preview can render and audit after confirm consumes the pending entry but
+before the execution row lands. The value is bounded (at most 20 ASCII
+digits), non-sensitive, and follows the ledger's existing `{"stage": "claim",
+"request_id": "83"}` precedent while keeping snowflakes as strings, never
+integers (`crates/core/src/audit.rs:87-88`). Direct `/lockdown` rows keep
+their existing empty metadata.
 
 Previews take no idempotency claim, no channel lane and no lease, and do not
 increment moderation-enforcement metrics (reads today do not; a preview
@@ -363,7 +390,7 @@ live guild). Every row also asserts zero unexpected Discord writes:
 | `LP-03` | A lockdown bit set in both allow and deny → renders `allow+deny -> deny`; planned masks still from `plan_lockdown` |
 | `LP-04` | One role overwrite allows `SEND_MESSAGES`; one member overwrite allows a thread bit → role named as keeper; member counted (1), never identified; counts complete |
 | `LP-05` | Role with base `ADMINISTRATOR`; `@everyone` view denied → admin keeps usable send; non-admin roles show `cannot send already` where view gates them |
-| `LP-06` | All five bits already denied → audited preview, **no Confirm button**; partial legacy lock (send-only deny) → remaining four bits diffed, Confirm present |
+| `LP-06` | All five bits already denied → audited preview, **no Confirm button**, no pending entry (unarmed previews never cause `PREVIEW_BUSY`); partial legacy lock (send-only deny) → remaining four bits diffed, Confirm present |
 | `LP-07` | Saved seed present but live send deny removed (and vice versa) → both facts rendered separately; digest covers generation, so a mid-flight seed change is stale |
 | `LP-08` | Between preview and confirm: `@everyone` lock bit change → `STALE_PREVIEW`; zero claim/lane/seed/PUT; exactly one `stale_preview` audit row |
 | `LP-09` | Between preview and confirm: only a role base bit, role position, member-overwrite allow, or unrelated `@everyone` `VIEW_CHANNEL` changes → still `STALE_PREVIEW` (full-snapshot digest) |
@@ -371,15 +398,15 @@ live guild). Every row also asserts zero unexpected Discord writes:
 | `LP-11` | Confirm at `now == expires` → refused; at `expires - 1s` with unchanged snapshot → executes |
 | `LP-12` | Malformed masks, missing/duplicate `@everyone` role, duplicate overwrite row, guild/type mismatch (thread, voice, forum, category), saved-record guild mismatch, missing `permission_overwrites`, one failed read → `UNAVAILABLE`/`UNSUPPORTED_CHANNEL`; no partial render, no audit row |
 | `LP-13` | 11 keeper roles → 10 named + `(+1 more …)`; 101 overwrites or 251 roles → `TOO_COMPLEX`, no render; longest render ≤1,900 UTF-16 units with counts intact |
-| `LP-14` | Audit trail: render ⇒ exactly 1 `lockdown_preview` row (numbers-only metadata, empty reason), 0 claims/lanes/seeds/metric samples; audit insert failure ⇒ no render, no pending; executed confirm ⇒ exactly the 1 existing lockdown row added |
+| `LP-14` | Audit trail: render ⇒ exactly 1 `lockdown_preview` row (numbers-only metadata, empty reason), 0 claims/lanes/seeds/metric samples; audit insert failure ⇒ no render, no pending; executed confirm ⇒ exactly 1 lockdown row added, whose `preview_request_id` equals the confirmed preview's interaction id even when another preview renders before the execution row lands |
 | `LP-15` | 11th preview by one actor inside 10 min ⇒ refused with **zero** Discord GETs; 65th live pending ⇒ `PREVIEW_BUSY`, earlier entries intact; second preview same actor+channel kills the first digest |
 | `LP-16` | Lane held by an in-flight channel action at confirm ⇒ existing uncertain reply, pending consumed, no PUT; PUT 403 ⇒ existing no-effect finish; PUT 5xx ⇒ claim/lane retained, no resend |
 | `LP-17` | Blank / 513-unit reason, extra option ⇒ refused before reads; category-parent channel renders parent id + sync-not-evaluated line and reads no second channel |
 
 **Offline oracle.** The doctest below fixes the bit arithmetic, the projection
-ordering, digest sensitivity and the two boundary equalities (expiry, custom-id
-length). It proves nothing about Discord, SQL or the runtime; the future Rust
-planner must reproduce these results. From the repository root:
+ordering, digest sensitivity and serialization, and the two boundary equalities
+(expiry, custom-id length). It proves nothing about Discord, SQL or the runtime;
+the future Rust planner must reproduce these results. From the repository root:
 
 ```sh
 python3 -m doctest -v docs/lockdown-preview-spec.md
@@ -388,7 +415,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ```
 
 ```pycon
->>> import hashlib, json, pathlib, re
+>>> import hashlib, json, pathlib, re, unicodedata
 >>> SEND, REACT, PUB, PRIV, TSEND = 1<<11, 1<<6, 1<<35, 1<<36, 1<<38
 >>> VIEW, ADMIN = 1<<10, 1<<3
 >>> LOCK = SEND | REACT | PUB | PRIV | TSEND
@@ -423,6 +450,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 >>> assert digest(stale_role) != digest(snap)                        # LP-09 sensitivity
 >>> stale_unrelated = json.loads(json.dumps(snap)); stale_unrelated[8] = str(VIEW)
 >>> assert digest(stale_unrelated) != digest(snap)                   # LP-09 full masks
+>>> # non-ASCII reason: escaped ASCII bytes, UTF-8, deterministic; no normalization
+>>> uni = json.loads(json.dumps(snap)); uni[6] = "raid 🛡️"
+>>> raw = json.dumps(uni, separators=(",", ":")).encode()
+>>> assert raw.decode("ascii") and "🛡️".encode() not in raw
+>>> assert digest(uni) != digest(snap) and digest(uni) == digest(json.loads(json.dumps(uni)))
+>>> nfc, nfd = "café", unicodedata.normalize("NFD", "café")
+>>> ra = json.loads(json.dumps(snap)); ra[6] = nfc
+>>> rb = json.loads(json.dumps(snap)); rb[6] = nfd
+>>> assert nfc != nfd and digest(ra) != digest(rb)
 >>> # expiry equality refuses (LP-11); button id bound (section 3 step 3)
 >>> expires = 1_800_000_300
 >>> assert (expires >= expires) and not (expires - 1 >= expires)
@@ -448,8 +484,9 @@ protected-test work exists:
 3. The packet must separately accept, change or reject: B over A/C/D/E; the
    same-`ManageChannels` disclosure basis; one new slash command plus one
    component path reusing the existing mutation pipeline; the new roles/
-   snapshot reads failing closed; numbers-only preview audit rows in the
-   shared ledger; 300-second in-memory retention of the pending reason;
+   snapshot reads failing closed; numbers-only preview audit rows plus one
+   `preview_request_id` on confirmed execution rows in the shared ledger;
+   300-second in-memory retention of the pending reason and preview id;
    single-role projection labelling (never member truth); unverified ephemeral
    message retention on Discord's side; direct `/lockdown` remaining
    unpreviewed. No generic "preview approved".
