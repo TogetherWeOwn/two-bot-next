@@ -135,7 +135,7 @@ Cloudflare deployment request, hands ownership to it, times the first `/readyz`
 The deployment request never sends `force`, so a target whose secrets changed
 since it was deployed is refused; Wrangler's non-interactive rollback would
 answer yes to that prompt. The request sets `code_update_strategy` to
-`immediate` because Wrangler 4.151's default is `deferred` with a 300 s maximum
+`immediate` because Wrangler 4.152's default is `deferred` with a 300 s maximum
 delay, which would keep the old Durable Object code serving for up to five
 minutes. A 401/403 stops the run and skips the restore; it never retries with
 another credential. Recovery then is a `deploy-staging` dispatch with

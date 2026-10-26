@@ -63,7 +63,7 @@ use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
 };
 use super::moderation::{ModerationAction, ModerationGates};
-use super::onboarding::{GAME_SELECT_ID, SESSION_SELECT_ID};
+use super::onboarding::{GAME_PREVIEW_SELECT_ID, GAME_SELECT_ID, SESSION_SELECT_ID};
 use super::voice_rooms::voice_commands;
 
 /// Names of the voice command set, computed once: the router consults them on
@@ -807,7 +807,7 @@ impl InteractionRouter {
     /// Route one message component by `custom_id` (exact ids, then prefixes).
     #[must_use]
     pub fn route_component(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
-        let handler = if custom_id == GAME_SELECT_ID {
+        let handler = if custom_id == GAME_SELECT_ID || custom_id == GAME_PREVIEW_SELECT_ID {
             if !self.gates.onboarding_picker || !self.guild_ok(guild_id) {
                 return ComponentOutcome::Ignore;
             }
@@ -1543,6 +1543,12 @@ mod tests {
         let r = router();
         assert_eq!(
             r.route_component(GAME_SELECT_ID, Some(GUILD)),
+            ComponentOutcome::Handled {
+                handler: ComponentHandler::GamePicker
+            }
+        );
+        assert_eq!(
+            r.route_component(GAME_PREVIEW_SELECT_ID, Some(GUILD)),
             ComponentOutcome::Handled {
                 handler: ComponentHandler::GamePicker
             }
