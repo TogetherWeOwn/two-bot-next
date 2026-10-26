@@ -1,9 +1,10 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
-No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
+Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
+Empty `{missing,stale,oversize}` = 0; else 1.
+Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
-## References and architecture
+## References
 
 - [Find a doc](README.md)
 - [Framework](adr/0001-discord-framework.md)
@@ -17,7 +18,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [MCP tools](mcp.md)
 - [Token registry](admin-registry.md)
 
-## Operations and observability
+## Operations
 
 - [Ops runbook](runbook.md)
 - [Triage](runbook-observability.md)
@@ -85,13 +86,13 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Automod expiry tests](automod-repeat-expiry.md)
 - [Attribution corpus](classifier-golden.md)
 - [Attribution PII tests](classifier-pii-absence.md)
-- [Channel access tests](channel-access-acceptance.md)
-- [Channel locking tests](channel-lockdown-acceptance.md)
+- [Channel access](channel-access-acceptance.md)
+- [Channel locking](channel-lockdown-acceptance.md)
 - [Timed lockdown: no build](time-boxed-lockdown-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
-- [Moderation disable gate](moderation-disable-preflight.md)
+- [Disable gate](moderation-disable-preflight.md)
 - [Hierarchy order](moderation-hierarchy-order.md)
 - [Moderation MAC tests](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
@@ -103,13 +104,15 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Self-role panels](dashboard-self-roles-spec.md)
 - [Onboarding proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
-- [Settings refresh tests](settings-catalog-acceptance.md)
+- [Settings refresh](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
+- [Giveaways](giveaways.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey](member-journey-parity.md)
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
+- [Rejoin roles](persistent-game-roles-spec.md)
 - [Leveling domain](leveling-port.md)
 - [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG](lfg-port.md)
@@ -148,6 +151,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Giveaway proposal](dashboard-giveaway-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
+- [Priority](ticket-priority-spec.md)
 - [Opener copy](ticket-opener-copy-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
