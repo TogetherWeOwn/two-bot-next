@@ -37,7 +37,7 @@ scope. Silence is **unknown**, never absence or a reason to remove a signup.
 
 ## 2. Source map: observed baseline, not future capabilities
 
-Inspected source: `d2a4274c6462595fa723ea33167fa1e233f406db`. Source inspection
+Inspected source: `5db6ecccd7c67202ecea6d76f9ae65ceab2e3654`. Source inspection
 only; no deployment, message, live member list or database was inspected.
 
 | Seam | Evidence and limit |
@@ -47,10 +47,10 @@ only; no deployment, message, live member list or database was inspected.
 | Quiet hours do not exist | The [reminder-preference proposal](event-reminder-preferences-spec.md) withdrew per-member quiet hours: do not implement. There is no quiet-hours store, schedule or enforcement to interoperate with; see section 4 |
 | LFG identity/storage | [Schema](../crates/cutover/migrations/0170_lfg.sql#L12-L42): ID, guild, channel, nullable message, start, open/closed, creator, roles (slots 1-99), signups. No reminder flag, notice preference or cancellation cause |
 | Signup/leave | [Signup](../crates/core/src/lfg_store.rs#L503-L580) is one advisory-locked transaction; [leave](../crates/core/src/lfg_store.rs#L583-L590) deletes separately; [signups list in join order](../crates/core/src/lfg_store.rs#L477-L497). Signup/leave need no elevated permission; see [LFG domain](lfg-port.md) |
-| Post roster is public | [`lfg_content:449`](../crates/core/src/lfg.rs#L439-L458) renders signup identities on the post. A reminder names nobody new, but must still not copy the roster into audits or new stores |
+| Post roster is public | [`lfg_body_text`](../crates/core/src/lfg.rs#L537-L559) renders signup identities on the post. A reminder names nobody new, but must still not copy the roster into audits or new stores |
 | Edit authority | [Router](../crates/core/src/router.rs#L734-L753): LFG commands sit behind the announcements gate with Manage Events required. Creator identity alone is **not** management authority |
 | Mention suppression | [POST builder](../crates/discord/src/executor.rs#L3140-L3187) and [refresh builder](../crates/discord/src/executor.rs#L2938-L2977) suppress mentions independently; rendered mentions do not ping under the closed allowed-mentions policy |
-| Past-start sweep | [`lfg_sweep`](../crates/bot/src/lfg_jobs.rs#L14-L28) runs every 60 s under the announcements gate and closes posts [15 min past start](../crates/discord/src/lfg_interactions.rs#L81-L83), sharing [<=20 rows](../crates/discord/src/lfg_interactions.rs#L677-L727) per visit with closed-message refresh repairs. Those retries edit only the saved closed message; they do not authorize reminder POSTs. Close is shared expiry/orphan state, not cancellation proof |
+| Past-start sweep | [`lfg_sweep`](../crates/bot/src/lfg_jobs.rs#L14-L35) runs every 60 s under the announcements gate and closes posts [15 min past start](../crates/discord/src/lfg_interactions.rs#L78-L83), sharing [<=20 rows](../crates/discord/src/lfg_interactions.rs#L677-L727) per visit with closed-message refresh repairs. Those retries edit only the saved closed message; they do not authorize reminder POSTs. Close is shared expiry/orphan state, not cancellation proof |
 | Opt-out scope | [Privacy](privacy.md) member opt-out is analytics-only; reminder SQL reads no preference store. Leaving a signup is the only current per-post exclusion |
 | Existing erasure | [Manifest](../crates/cutover/src/member_erasure_plan.json#L19-L32) removes creator-owned posts and signup identities; new retained identifiers need their own disposition, not an assumed exception |
 
