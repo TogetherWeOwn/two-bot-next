@@ -1,13 +1,12 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)` by area.
 
 Repo root: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
-else exit 1, repair rows/split docs. Bad/duplicate rows use
-`docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0), else exit 1.
+Repair rows/split docs; bad/duplicate rows cite `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes.
+Exceptions: `scripts/check_docs_index.py` (`LARGE_DOCS`).
 
 ## References and architecture
 
@@ -93,6 +92,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Attribution PII tests](classifier-pii-absence.md)
 - [Channel access tests](channel-access-acceptance.md)
 - [Channel locking tests](channel-lockdown-acceptance.md)
+- [Timed lockdown: no build](time-boxed-lockdown-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
