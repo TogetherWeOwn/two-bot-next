@@ -1,7 +1,7 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
-No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
+Rows: `- [Purpose](relative.md)`. Check: `python3 scripts/check_docs_index.py --json`.
+All arrays empty = PASS (0), else 1. Index <12,000 B; docs <=65,536 except LARGE_DOCS.
 
 ## References and architecture
 
@@ -108,6 +108,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Community jobs](community-jobs.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey](member-journey-parity.md)
+- [Referral standing](invites-referral-standing-spec.md)
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
