@@ -37,7 +37,7 @@ scope. Silence is **unknown**, never absence or a reason to remove a signup.
 
 ## 2. Source map: observed baseline, not future capabilities
 
-Inspected source: `8b53ffb84181df3265707196f9b0afca855d2b14`. Source inspection
+Inspected source: `9f128e759a25fd1655e71c0b57511609025bcb43`. Source inspection
 only; no deployment, message, live member list or database was inspected.
 
 | Seam | Evidence and limit |
@@ -46,11 +46,11 @@ only; no deployment, message, live member list or database was inspected.
 | Event-reminder sibling | [Tick](../crates/bot/src/scheduled_jobs.rs#L157-L177) runs schedules then [reminders](../crates/bot/src/scheduled_jobs.rs#L226-L278): fixed [15-minute lead](../crates/core/src/event_reminder_store.rs#L16-L16), [<=2 events/tick](../crates/core/src/event_reminder_store.rs#L18-L18), permanent [`event:reminder:<guild>:<event>` fence](../crates/core/src/event_reminder_store.rs#L76-L124) with NULL actor, [10,000 attempts/guild](../crates/core/src/event_reminder_store.rs#L20-L20). Attempt precedes rendering/POST; results are separate |
 | Quiet hours do not exist | The [reminder-preference proposal](event-reminder-preferences-spec.md) withdrew per-member quiet hours: do not implement. There is no quiet-hours store, schedule or enforcement to interoperate with; see section 4 |
 | LFG identity/storage | [Schema](../crates/cutover/migrations/0170_lfg.sql#L12-L42): ID, guild, channel, nullable message, start, open/closed, creator, roles (slots 1-99), signups. No reminder flag, notice preference or cancellation cause |
-| Signup/leave | [Signup](../crates/core/src/lfg_store.rs#L402-L480) is one advisory-locked transaction; [leave](../crates/core/src/lfg_store.rs#L482-L492) deletes separately; [signups list in join order](../crates/core/src/lfg_store.rs#L376-L396). Signup/leave need no elevated permission; see [LFG domain](lfg-port.md) |
+| Signup/leave | [Signup](../crates/core/src/lfg_store.rs#L487-L564) is one advisory-locked transaction; [leave](../crates/core/src/lfg_store.rs#L567-L574) deletes separately; [signups list in join order](../crates/core/src/lfg_store.rs#L461-L481). Signup/leave need no elevated permission; see [LFG domain](lfg-port.md) |
 | Post roster is public | [`lfg_content:449`](../crates/core/src/lfg.rs#L439-L458) renders signup identities on the post. A reminder names nobody new, but must still not copy the roster into audits or new stores |
 | Edit authority | [Router](../crates/core/src/router.rs#L734-L753): LFG commands sit behind the announcements gate with Manage Events required. Creator identity alone is **not** management authority |
 | Mention suppression | [POST](../crates/discord/src/executor.rs#L2841-L2899) and [refresh](../crates/discord/src/executor.rs#L2928-L2944) suppress mentions independently; rendered mentions do not ping under the closed allowed-mentions policy |
-| Past-start sweep | [`lfg_sweep`](../crates/bot/src/lfg_jobs.rs#L14-L28) runs every 60 s under the announcements gate and closes posts [15 min past start](../crates/discord/src/lfg_interactions.rs#L76-L78), [<=20 rows](../crates/discord/src/lfg_interactions.rs#L606-L623) per visit. Close is shared expiry/orphan state, not cancellation proof |
+| Past-start sweep | [`lfg_sweep`](../crates/bot/src/lfg_jobs.rs#L14-L28) runs every 60 s under the announcements gate and closes posts [15 min past start](../crates/discord/src/lfg_interactions.rs#L81-L83), [<=20 rows](../crates/discord/src/lfg_interactions.rs#L673-L719) per visit. Close is shared expiry/orphan state, not cancellation proof |
 | Opt-out scope | [Privacy](privacy.md) member opt-out is analytics-only; reminder SQL reads no preference store. Leaving a signup is the only current per-post exclusion |
 | Existing erasure | [Manifest](../crates/cutover/src/member_erasure_plan.json#L19-L32) removes creator-owned posts and signup identities; new retained identifiers need their own disposition, not an assumed exception |
 
@@ -69,7 +69,8 @@ available command.
   simply moves its window; a move after admission never creates a second fire.
 - **Audience:** current signups at admission time. Read a candidate snapshot,
   then revalidate the full ordered roster inside admission (event-reminder
-  pattern: bounded `user_id`-ordered array equality plus exact count; sibling
+  pattern: `user_id`-ordered array equality plus exact count, bounded to the
+  maximum accepted roster of 20 roles × 99 slots = 1,980 signups; sibling
   order, not LFG join order). A join or leave between the candidate read and
   admission changes the roster, so that admission attempt refuses with zero
   POST and the post stays undecided; the next regular tick re-snapshots from
@@ -88,8 +89,11 @@ available command.
   If individual exclusion or per-recipient authorization proof is required,
   reject B and keep A.
 - **Organizer authority:** per-post opt-in at creation, **default off**, stored
-  as post policy. Changing it later requires current channel-resolved Manage
-  Events; unknown/disabled policy means **no send**. Existing announcements
+  as post policy. The policy is fixed at creation: this proposal adds no
+  operation to change or revoke it later, and any future change operation
+  would require current channel-resolved Manage Events plus its own design.
+  If consent disposition requires revocability before fire, design that
+  operation first or keep A. Unknown/disabled policy means **no send**. Existing announcements
   enablement is guild routing consent, not this purpose's consent. The policy
   persists with the post like the post itself: organizer departure does not
   cancel it, but destination access is revalidated at every admission (section
@@ -125,8 +129,11 @@ lifetime, hard caps below. No time-of-day suppression, timezone collection or
 daily rule is created. If a host later requires time-of-day suppression, that
 needs its own accepted design; do not smuggle it into this one.
 
-Proposed hard bounds for B: <=1 reminder per post lifetime, <=2 posts per tick,
-<=6 per guild per rolling hour. Unknown/refused post-admission attempts consume
+Proposed hard bounds for B: <=1 reminder per post lifetime, <=6 per guild
+per rolling hour, and one shared per-tick reminder admission allowance: the
+existing event-reminder phase and this LFG phase together admit at most 2
+per tick, event reminders keeping their current priority, so an LFG post
+admits only from unused allowance (never 2 + 2 in one tick). Unknown/refused post-admission attempts consume
 quota. No delayed catch-up, retry queue or automatic send after restart. At
 most 10,000 retained reminder decisions per guild under a dedicated action
 name; at capacity stop rather than recycle replay guards. Caps are part of
@@ -172,9 +179,10 @@ transport retries for this effect. `sent` means Discord accepted, not read.
 
 Bounded scheduler cost: reuse the existing supervised tick (same pattern as
 the event-reminder phase) or the 60-second `lfg_sweep` visit; no new timer,
-task or queue. Per tick: one bounded candidate query plus at most two
-admission transactions, each comparing a bounded ordered user-ID array plus an
-exact count. No per-signup fanout, no roster materialization beyond the bound,
+task or queue. Per tick: one bounded candidate query plus admission
+transactions only within the shared allowance above (combined with the
+event-reminder phase, at most two per tick), each comparing a bounded ordered
+user-ID array plus an exact count. No per-signup fanout, no roster materialization beyond the bound,
 no lock held across Discord HTTP. Existing tick budgets, sweep row limits and
 LFG message budgets are unchanged.
 
@@ -259,9 +267,9 @@ effect counts.
 | M06 no quiet-hours rule | No time-of-day suppression, timezone store or daily schedule exists; quiet is behavioral bounds only |
 | M07 restart / duplicate workers | Retained fence returns saved decision; <=1 wire attempt per post lifetime; no automatic startup send |
 | M08 double-fire prevention | Same key retry returns saved outcome; no second admission, POST or re-arm after sent/failed/uncertain |
-| M09 per-post / per-guild caps | Exact limits and one-over: <=1/post, <=2/tick, <=6/guild/hour; terminal attempts consume quota |
+| M09 per-post / per-guild caps | Exact limits and one-over: <=1/post, <=6/guild/hour, shared <=2/tick across event-reminder and LFG admissions combined; terminal attempts consume quota |
 | M10 permission loss | Lost bot view/read/send, foreign channel, deleted source or changed binding refuses; no fallback destination |
-| M11 organizer policy | Default off refuses; opt-in needs Manage Events; unknown policy refuses; signup cannot enable |
+| M11 organizer policy | Default off refuses; opt-in needs Manage Events; unknown policy refuses; signup cannot enable; policy fixed at creation (no later change/revoke operation exists in this proposal) |
 | M12 opt-out / leave | Leave removes future eligibility; no member mute exists; channel visibility to leavers is disclosed |
 | M13 DM / mention refusal | No DM, mention, roster, count, title or thread even when requested; fixed format only |
 | M14 roster privacy | No signup IDs, roster, title or content in audits/diagnostics; denied responses redact IDs |
