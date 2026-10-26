@@ -179,7 +179,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Reopen",
-            "Deferred ephemeral reply; a fresh games or session menu edit for the invoker only, built from current roles and current configured picks with zero role, channel or funnel writes. Disabled kinds, malformed invocations and failed lookups get a private no-effect guidance edit instead of a menu.",
+            "Deferred ephemeral reply; a fresh games or session menu edit for the invoker only, built from current roles and current configured picks with zero role, channel or funnel writes. Games menus carry a second no-change preview select alongside the apply route. Disabled kinds, malformed invocations and failed lookups get a private no-effect guidance edit instead of a menu.",
             &["Valid:kind:required,games|session"],
         ),
         row(

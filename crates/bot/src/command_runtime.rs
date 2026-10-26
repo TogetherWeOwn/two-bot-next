@@ -84,9 +84,9 @@ use two_bot_core::{
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
-        activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
-        sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
-        RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
+        activity_eligible, decide_activity, sticky_removed_reply, sticky_set_reply, store,
+        ActivityDecision, ActivityOutcome, PutSticky, RemoveOutcome, StickyAudit,
+        StickyAuditAction, StickyAuditOutcome, StickySetup,
     },
     tickets::TicketAction,
     ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
@@ -1955,7 +1955,9 @@ impl CommandRuntime {
     /// row already exists — the read only names the audit action). A store
     /// failure audits that same refusal shape with the `db_class` token.
     /// Malformed options refuse before any store read or audit via
-    /// [`sticky_options_strict`]: no row, no audit, one private correction.
+    /// [`sticky_preview_option`] and [`sticky_options_strict`]: no row, no audit,
+    /// one private correction. Preview validates and renders before all store
+    /// access, including rejected-input auditing; it never enters delivery.
     async fn sticky_set(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1963,6 +1965,13 @@ impl CommandRuntime {
             return;
         };
         let actor_id = actor_id(interaction);
+        let preview = match sticky_preview_option(interaction) {
+            Ok(preview) => preview,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
         let (body, debounce_option) = match sticky_options_strict(interaction) {
             Ok(decoded) => decoded,
             Err(refusal) => {
@@ -1971,9 +1980,17 @@ impl CommandRuntime {
             }
         };
 
-        let debounce = match validate_body(&body).and_then(|()| normalize_debounce(debounce_option))
-        {
-            Ok(debounce) => debounce,
+        let setup = StickySetup::validate(&body, debounce_option);
+        if preview {
+            let reply = match setup {
+                Ok(setup) => setup.preview_reply(),
+                Err(err) => err.to_string(),
+            };
+            self.finish(interaction, reply).await;
+            return;
+        }
+        let setup = match setup {
+            Ok(setup) => setup,
             Err(err) => {
                 let existed = store::get_sticky(&self.pool, &guild_id, &channel_id)
                     .await
@@ -2003,8 +2020,8 @@ impl CommandRuntime {
             &PutSticky {
                 guild_id: &guild_id,
                 channel_id: &channel_id,
-                body: &body,
-                debounce_seconds: debounce,
+                body: setup.body,
+                debounce_seconds: setup.debounce_seconds,
                 enabled: true,
                 actor_id: &actor_id,
                 now_ms: now_millis_for_test(),
@@ -2026,7 +2043,8 @@ impl CommandRuntime {
                     None,
                 )
                 .await;
-                let reply = sticky_set_reply(&channel_id, debounce_option.map(|_| debounce));
+                let reply =
+                    sticky_set_reply(&channel_id, debounce_option.map(|_| setup.debounce_seconds));
                 self.finish(interaction, reply).await;
             }
             Err(err) => {
@@ -3112,11 +3130,35 @@ const STICKY_INVALID_DEBOUNCE: &str =
 const STICKY_DUPLICATE_DEBOUNCE: &str =
     "Duplicate debounce. Use /sticky body:<text> debounce:<seconds>.";
 
+/// Guard the complete setup option namespace before decoding body/debounce.
+/// Unknown names (including misspelled preview flags) must never silently save.
+/// Keep the existing body/debounce decoder and its refusal precedence unchanged.
+fn sticky_preview_option(interaction: &Interaction) -> Result<bool, &'static str> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Err(STICKY_MISSING_BODY);
+    };
+    let mut preview = None;
+    for option in &data.options {
+        match option.name.as_str() {
+            "body" | "debounce" => {}
+            "preview" => match (&option.value, preview) {
+                (CommandOptionValue::Boolean(value), None) => preview = Some(*value),
+                _ => return Err("Invalid preview. Use /sticky body:<text> [debounce:<seconds>] preview:true or preview:false; supply preview only once."),
+            },
+            _ => return Err("Unknown option. Use /sticky body:<text> [debounce:<seconds>] [preview:true|false]."),
+        }
+    }
+    Ok(preview.unwrap_or(false))
+}
+
 /// Strictly decode `/sticky`'s options: `body` must appear exactly once with
 /// a string value, while `debounce` stays optional (an omitted option means
 /// the default quiet window). Duplicates win over wrong types win over a
-/// missing `body`, and `body` wins over `debounce` within a phase; unknown
-/// names stay ignored. A non-command interaction carries no options, so it
+/// missing `body`, and `body` wins over `debounce` within a phase. This helper
+/// decodes only these two fields; [`sticky_preview_option`] must run first to
+/// reject unknown names and malformed preview flags. A non-command interaction
 /// refuses as a missing `body`. Present-but-empty and out-of-range values
 /// still decode (validation owns those refusals), so valid invocations
 /// decode byte-identically to before.
