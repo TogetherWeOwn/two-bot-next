@@ -708,11 +708,27 @@ impl InteractionRouter {
             },
             "command" | "command-remove" | "command-list" | "command-inspect"
             | "command-disable" | "command-enable" | "schedule" | "schedule-remove"
-            | "schedule-retime" | "schedule-list" | "sticky" | "sticky-remove" => Row {
+            | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
+            // Retime refuses outside the configured guild instead of staying
+            // silent like its automation siblings: staff fixing a deadline
+            // from a DM or the wrong guild get private guidance, matching
+            // the command's always-answer miss contract.
+            "schedule-retime" => {
+                if !self.guild_ok(guild_id) {
+                    return Some(SlashOutcome::Refuse {
+                        refusal: RouterRefusal::GuildRestricted,
+                    });
+                }
+                Row {
+                    handler: HandlerId::AutomationAdmin,
+                    gate: RowGate::Automations,
+                    permission_refusal: Some(RouterRefusal::ManageServerRequired),
+                }
+            }
             "giveaway" => Row {
                 handler: HandlerId::Giveaway,
                 gate: RowGate::Automations,

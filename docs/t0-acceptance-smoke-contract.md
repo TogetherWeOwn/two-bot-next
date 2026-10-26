@@ -100,6 +100,9 @@ Permission-gate proof (`lfg`/`ban` refuse at 0, route with the bit):
 Guild fence: foreign/missing guild is `Ignore` except moderation, which
 answers `GuildRestricted`:
 `crates/discord/tests/top5_reply_fixtures.rs:372-424`.
+`schedule-retime` likewise refuses with `GuildRestricted` instead of staying
+silent (`crates/core/src/router.rs`
+`schedule_retime_cannot_borrow_custom_or_wrong_guild_authority`).
 
 ## 4. Post-425 denial copy
 
