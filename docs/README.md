@@ -1,7 +1,8 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
-No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
+Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
+Empty `{missing,stale,oversize}` = 0; else 1.
+Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References
 
@@ -148,6 +149,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Sticky config](dashboard-sticky-config-spec.md)
 - [Ticket config](dashboard-ticket-config-spec.md)
 - [Private subject](ticket-subject-spec.md)
+- [Priority](ticket-priority-spec.md)
 - [Opener copy](ticket-opener-copy-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
