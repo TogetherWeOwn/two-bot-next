@@ -166,7 +166,10 @@ async fn cold_textchannels_replies_warming_up_without_side_effects() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let interaction = voice_interaction(
-        Some(command_data("textchannels", Vec::new())),
+        Some(command_data(
+            "textchannels",
+            vec![channel_option("channel", CREATOR)],
+        )),
         Some(Permissions::MANAGE_CHANNELS),
         true,
     );

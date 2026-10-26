@@ -11632,7 +11632,7 @@ fn setup_past_end_refusal(total: usize) -> String {
     format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
 }
 
-/// Private correction for an ambiguous setup option: names the option and a
+/// Private correction for a malformed setup option: names the option and a
 /// copyable invocation. Static per (command, field): no payload bytes, store
 /// errors or mentions can leak into it.
 fn setup_shape_correction(command: &str, field: &str) -> String {
@@ -11651,7 +11651,7 @@ fn setup_shape_correction(command: &str, field: &str) -> String {
         _ => "channel: #voice-creator",
     };
     format!(
-        "That `/{command}` call has an ambiguous `{field}` option: send each option once, \
+        "That `/{command}` call has a problem with its `{field}` option: send it exactly once, \
          with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
     )
 }
@@ -12028,9 +12028,10 @@ pub enum VoiceCommand {
     },
     /// A setup command (`/create`, `/textchannels`, `/position`, `/group`,
     /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
-    /// an ambiguous option shape: a known option sent twice or with the wrong
-    /// wire type. Answered with a private correction before guild authority,
-    /// role gates and every read or effect.
+    /// a malformed option shape: a known option sent twice, with the wrong
+    /// wire type, or (for `/textchannels`) the required `channel` missing.
+    /// Answered with a private correction before guild authority, role gates
+    /// and every read or effect.
     SetupShapeInvalid {
         command: &'static str,
         field: &'static str,
@@ -12160,8 +12161,9 @@ impl SetupOptionKind {
 }
 
 /// Known options of one setup command as `(name, expected wire type)`.
-/// Unknown names stay ignored; only these refuse when duplicated or
-/// mistyped. `None` for commands without a strict shape.
+/// Unknown names stay ignored; only these refuse when duplicated, mistyped,
+/// or (for the [`setup_shape_required`] option) missing. `None` for commands
+/// without a strict shape.
 fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
     match command {
         "create" => Some(&[("name", SetupOptionKind::String)]),
@@ -12197,11 +12199,23 @@ fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOpt
     }
 }
 
+/// The one registration-required option of a strict-shape command:
+/// `/textchannels` requires `channel`; its other options stay optional so
+/// omission keeps the stored value.
+fn setup_shape_required(command: &str) -> Option<&'static str> {
+    match command {
+        "textchannels" => Some("channel"),
+        _ => None,
+    }
+}
+
 /// Strictly decode one setup command's option shape: each known option at
-/// most once and with its registered wire type. Returns the first ambiguous
-/// known option in payload order. Unknown names (even duplicated, even with
-/// nested known names beneath them) stay ignored, and value validation stays
-/// in the handlers, so omission semantics are unchanged.
+/// most once and with its registered wire type, and the required option
+/// present. Returns the first malformed known option in payload order, or
+/// the required option when it is the only fault. Unknown names (even
+/// duplicated, even with nested known names beneath them) stay ignored, and
+/// value validation stays in the handlers, so omission semantics are
+/// unchanged.
 fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&'static str> {
     let fields = setup_shape_fields(command)?;
     let mut seen: Vec<&'static str> = Vec::new();
@@ -12215,7 +12229,10 @@ fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&
         }
         seen.push(name);
     }
-    None
+    match setup_shape_required(command) {
+        Some(required) if !seen.contains(&required) => Some(required),
+        _ => None,
+    }
 }
 
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
