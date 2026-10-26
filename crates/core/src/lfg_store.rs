@@ -202,6 +202,91 @@ pub async fn edit_lfg_metadata(
     })
 }
 
+/// Capacity-only edit result. Refusals and equal targets perform no writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LfgSeatEditOutcome {
+    Missing,
+    Closed,
+    Started,
+    MissingRole,
+    InvalidSeats,
+    Shrink,
+    Unchanged,
+    Updated,
+}
+
+/// Increase one existing role in place, with its required audit in the same
+/// transaction. Never round-trip post timestamps or replace role/signup rows.
+/// Lock order matches metadata/signup/close: post advisory, post row, role row.
+pub async fn increase_lfg_seats(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    id: &str,
+    role_key: &str,
+    seats: u8,
+    audit: &crate::rsvp::RsvpAudit,
+) -> Result<LfgSeatEditOutcome, sqlx::Error> {
+    if seats == 0 || seats > super::lfg::MAX_ROLE_SLOTS {
+        return Ok(LfgSeatEditOutcome::InvalidSeats);
+    }
+    if !super::lfg::valid_role_key(role_key) {
+        return Ok(LfgSeatEditOutcome::MissingRole);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("lfg:{guild_id}:{id}"))
+        .execute(&mut *tx)
+        .await?;
+    let row: Option<(String, time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT status, starts_at FROM lfg_posts WHERE guild_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, starts_at)) = row else {
+        return Ok(LfgSeatEditOutcome::Missing);
+    };
+    if status != "open" {
+        return Ok(LfgSeatEditOutcome::Closed);
+    }
+    let slots: Option<i32> = sqlx::query_scalar(
+        "SELECT slots FROM lfg_roles WHERE lfg_id = $1 AND role_key = $2 FOR UPDATE",
+    )
+    .bind(id)
+    .bind(role_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // Read the clock after every lock wait, including the role row. Transaction
+    // start time can predate admission and must not authorize a late edit.
+    if starts_at <= time::OffsetDateTime::now_utc() {
+        return Ok(LfgSeatEditOutcome::Started);
+    }
+    let Some(slots) = slots else {
+        return Ok(LfgSeatEditOutcome::MissingRole);
+    };
+    match i32::from(seats).cmp(&slots) {
+        std::cmp::Ordering::Less => return Ok(LfgSeatEditOutcome::Shrink),
+        std::cmp::Ordering::Equal => return Ok(LfgSeatEditOutcome::Unchanged),
+        std::cmp::Ordering::Greater => {}
+    }
+    sqlx::query("UPDATE lfg_roles SET slots = $3 WHERE lfg_id = $1 AND role_key = $2")
+        .bind(id)
+        .bind(role_key)
+        .bind(i32::from(seats))
+        .execute(&mut *tx)
+        .await?;
+    // An audit collision is not evidence for this mutation. Roll back instead
+    // of committing a capacity change without its own truthful result.
+    if !crate::rsvp_store::insert_audit_row(&mut *tx, audit).await? {
+        return Err(sqlx::Error::Protocol(
+            "LFG seat audit identity conflict".into(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(LfgSeatEditOutcome::Updated)
+}
+
 /// Save an accepted message without replacing roles, signups or a concurrent
 /// close. Binding a message to an already-closed row for the first time also
 /// re-arms close-refresh repair in the same statement: the saved message may

@@ -30,6 +30,11 @@ pub enum LfgRequest {
         title: Option<String>,
         starts_at: Option<String>,
     },
+    EditSeats {
+        post_id: String,
+        role_key: String,
+        seats: u8,
+    },
     Select(LfgSelectAction),
 }
 
@@ -203,6 +208,7 @@ impl LfgInteractions {
             }
             LfgRequest::Close { post_id }
             | LfgRequest::Edit { post_id, .. }
+            | LfgRequest::EditSeats { post_id, .. }
             | LfgRequest::Select(
                 LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
             ) => {
@@ -273,6 +279,7 @@ impl LfgInteractions {
         // execution, not at arrival; a saved interaction receipt still wins.
         let now = time::OffsetDateTime::now_utc();
         let at = lfg::iso_millis_utc(now);
+        let seat_edit = matches!(&request, LfgRequest::EditSeats { .. });
         let (action, outcome, reply, refresh) = match request {
             LfgRequest::Create {
                 title,
@@ -470,6 +477,62 @@ impl LfgInteractions {
                     true,
                 )
             }
+            LfgRequest::EditSeats {
+                role_key, seats, ..
+            } => {
+                let audit = RsvpAudit {
+                    id: format!("lfg:seats:{interaction_id}:{}", now.unix_timestamp_nanos()),
+                    guild_id: guild_id.into(),
+                    actor_id: Some(actor_id.into()),
+                    action: "lfg.edit.seats".into(),
+                    target_key: Some(id.clone()),
+                    outcome: "increased".into(),
+                    reason: None,
+                    created_at: at.clone(),
+                };
+                // Storage failures roll back the capacity transaction, so no
+                // seat count changed. Surface Database here; the runtime
+                // renders seat-edit storage failures without success language.
+                let result =
+                    store::increase_lfg_seats(&self.pool, guild_id, &id, &role_key, seats, &audit)
+                        .await?;
+                let refusal = match result {
+                    store::LfgSeatEditOutcome::Missing => {
+                        Some("LFG post is missing in this server.")
+                    }
+                    store::LfgSeatEditOutcome::Closed => {
+                        Some("LFG post is closed and cannot be edited.")
+                    }
+                    store::LfgSeatEditOutcome::Started => {
+                        Some("This LFG has already started; seats cannot be edited.")
+                    }
+                    store::LfgSeatEditOutcome::MissingRole => {
+                        Some("LFG role is missing; use an existing signup role key.")
+                    }
+                    store::LfgSeatEditOutcome::InvalidSeats => {
+                        Some("Seats must be an integer from 1-99.")
+                    }
+                    store::LfgSeatEditOutcome::Shrink => {
+                        Some("Seats can only increase; check the current capacity before retrying.")
+                    }
+                    store::LfgSeatEditOutcome::Unchanged => {
+                        guard.commit().await?;
+                        return Ok(
+                            "LFG seats unchanged; the role already has that capacity.".into()
+                        );
+                    }
+                    store::LfgSeatEditOutcome::Updated => None,
+                };
+                if let Some(refusal) = refusal {
+                    return Err(LfgError::Invalid(refusal.into()));
+                }
+                (
+                    "lfg.edit.seats",
+                    "increased".into(),
+                    format!("LFG seats saved. The role now has {seats} seats."),
+                    true,
+                )
+            }
             // Preview returns before admission; reaching the store would be a
             // routing defect, so fail closed without touching it.
             LfgRequest::Preview { .. } => {
@@ -532,7 +595,8 @@ impl LfgInteractions {
                 ("lfg.leave", outcome, reply, true)
             }
         };
-        let audited = if replay_outcome.is_some() {
+        // Seat edits commit their required audit atomically with capacity.
+        let audited = if replay_outcome.is_some() || seat_edit {
             true
         } else {
             let audit = if let Some(identity) = select_identity {
@@ -586,6 +650,9 @@ impl LfgInteractions {
         } else if refresh {
             match self.refresh(executor, guild_id, &id).await {
                 Ok(()) => reply,
+                Err(_) if seat_edit => {
+                    format!("{reply} The visible post could not be refreshed. Check the saved state before retrying; an equal seat target is a no-op, not a refresh retry.")
+                }
                 Err(_) if action == "lfg.edit" => {
                     format!("{reply} The visible post could not be refreshed.")
                 }
