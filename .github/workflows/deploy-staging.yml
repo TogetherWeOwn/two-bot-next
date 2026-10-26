@@ -449,7 +449,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
-          wranglerVersion: "4.151.0"
+          wranglerVersion: "4.152.0"
           # --message stamps the version's immutable workers/message
           # annotation with the deployed commit, the SHA member of the
           # rollback provenance receipt the next snapshot records (as
