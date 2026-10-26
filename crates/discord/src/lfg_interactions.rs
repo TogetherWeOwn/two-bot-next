@@ -490,28 +490,12 @@ impl LfgInteractions {
                     reason: None,
                     created_at: at.clone(),
                 };
-                let result = match store::increase_lfg_seats(
-                    &self.pool, guild_id, &id, &role_key, seats, &audit,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        // The capacity transaction rolls back on any storage
-                        // failure, so no seat count changed. Refuse without
-                        // success language; the generic copy mentions saved
-                        // state and would mislead here.
-                        tracing::warn!(
-                            interaction_id = interaction_id.to_string(),
-                            error = %error,
-                            "LFG seat increase failed; details withheld"
-                        );
-                        return Err(LfgError::Invalid(
-                            "LFG seat increase failed; capacity unchanged. Retry the increase."
-                                .into(),
-                        ));
-                    }
-                };
+                // Storage failures roll back the capacity transaction, so no
+                // seat count changed. Surface Database here; the runtime
+                // renders seat-edit storage failures without success language.
+                let result =
+                    store::increase_lfg_seats(&self.pool, guild_id, &id, &role_key, seats, &audit)
+                        .await?;
                 let refusal = match result {
                     store::LfgSeatEditOutcome::Missing => {
                         Some("LFG post is missing in this server.")

@@ -922,6 +922,7 @@ impl InteractionRuntime {
                 &deferred,
             )
             .await?;
+        let seat_edit_request = matches!(&request, Ok(LfgRequest::EditSeats { .. }));
         let result = match request {
             Ok(request) => {
                 // Only create/nonce recovery needs the bot identity. Signup
@@ -953,6 +954,18 @@ impl InteractionRuntime {
             )) => quota.to_string(),
             Err(LfgError::Uncertain) => {
                 "LFG post acceptance is uncertain; saved state retained for nonce recovery.".into()
+            }
+            // A seat increase rolls back its own transaction on storage
+            // failure, but a later lock-release failure can surface after the
+            // increase committed. Refuse without success language and without
+            // claiming either outcome; the generic copy mentions saved state
+            // and would mislead when nothing was saved.
+            Err(LfgError::Database(_)) if seat_edit_request => {
+                tracing::warn!(
+                    interaction_id = interaction.id.get().to_string(),
+                    "LFG seat increase failed; details withheld"
+                );
+                "LFG seat increase failed; check the current capacity before retrying.".into()
             }
             Err(_) => {
                 tracing::warn!(
