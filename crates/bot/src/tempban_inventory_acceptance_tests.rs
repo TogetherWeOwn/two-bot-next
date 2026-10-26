@@ -837,3 +837,63 @@ async fn hostile_full_work_ids_are_safe_and_readonly_pool_still_returns_saved_ro
     readonly.close().await;
     db.close().await.expect("fixture teardown");
 }
+
+/// Protected publication contract: the inventory must be discoverable as a
+/// private staff moderation command with bounded page selectors. Lives in the
+/// unit-test module (not `crates/core/tests/`) so hosted CI observes it in the
+/// same lib/bins step as the runtime tests; the workspace integration step is
+/// skipped while any unit test is RED by design.
+#[test]
+fn tempban_inventory_is_a_private_staff_moderation_command_with_bounded_pages() {
+    let definitions = two_bot_core::moderation::moderation_commands();
+    let definition = definitions
+        .iter()
+        .find(|definition| definition.name == "tempban-list")
+        .expect("saved temporary-ban expiry inventory must be discoverable as /tempban-list");
+    assert!(!definition.dm_permission, "guild-only inventory");
+    assert_eq!(
+        definition.default_member_permissions,
+        Some(two_bot_core::commands::PERM_BAN_MEMBERS.to_string()),
+        "Ban Members, not self/member or generic server-management authority"
+    );
+    assert_eq!(definition.options.len(), 1, "page only; no action selector");
+    let page = &definition.options[0];
+    assert_eq!(page.name, "page");
+    assert_eq!(
+        page.kind,
+        two_bot_core::commands::CommandOptionType::Integer.as_u8()
+    );
+    assert_ne!(page.required, Some(true), "omitted page selects page one");
+    assert_eq!(page.min_value, Some(1));
+    assert_eq!(page.max_value, Some(10_000));
+    assert!(page.options.is_empty(), "no nested mutation surface");
+    let help = definition.help_detail_text().to_lowercase();
+    assert!(help.contains("page"), "help explains published paging");
+    assert!(
+        help.contains("saved") && (help.contains("expiry") || help.contains("expir")),
+        "discovery describes saved expiry work, not observed unbans"
+    );
+}
+
+#[test]
+fn existing_tempban_mutation_definition_remains_a_positive_control() {
+    let definitions = two_bot_core::moderation::moderation_commands();
+    let definition = definitions
+        .iter()
+        .find(|definition| definition.name == "tempban")
+        .expect("existing tempban mutation is retained");
+    assert_eq!(
+        definition.default_member_permissions,
+        Some(two_bot_core::commands::PERM_BAN_MEMBERS.to_string())
+    );
+    assert!(!definition.dm_permission);
+    for name in ["target", "duration_seconds", "reason"] {
+        assert!(
+            definition
+                .options
+                .iter()
+                .any(|option| option.name == name && option.required == Some(true)),
+            "existing required input {name} remains"
+        );
+    }
+}
