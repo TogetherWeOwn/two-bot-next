@@ -53,14 +53,27 @@ fn forward_lines(reader: impl Read + Send + 'static, lines: mpsc::Sender<String>
     });
 }
 
-#[test]
-fn eventsub_reconcile_startup_pass_runs_from_the_entrypoint() {
-    // The gate is open but no callback is configured, so the startup pass
-    // refuses before any Helix call. That refusal log is the proof the
-    // entrypoint spawned the reconcile task.
+fn reserve_eventsub_bind() -> String {
     let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
     let bind = reserved.local_addr().unwrap().to_string();
     drop(reserved);
+    bind
+}
+
+/// A failed eventsub bind is the only retryable early exit: the
+/// reserve/drop/rebind handoff is racy at full parallelism and another test
+/// process can claim the port before the child binds it, so the child exits
+/// with `receiver_bind_failed` before the reconcile task spawns. Any other
+/// early exit is a genuine regression and panics at once.
+fn is_eventsub_bind_failure(logs: &str) -> bool {
+    logs.contains("receiver_bind_failed")
+}
+
+/// One eventsub-reconcile attempt: spawn the entrypoint with the given bind
+/// and wait for the startup pass to log its config refusal. Returns `None`
+/// when the child failed to bind (retryable); panics on a timeout or any
+/// other early exit so genuine regressions never become a retried pass.
+fn eventsub_reconcile_once(bind: &str) -> Option<()> {
     let mut child = command("127.0.0.1:0")
         .env("DISCORD_TOKEN", "INVALID")
         .env("GUILD_ID", "123")
@@ -82,14 +95,79 @@ fn eventsub_reconcile_startup_pass_runs_from_the_entrypoint() {
             Ok(line) => {
                 if line.contains("eventsub_reconcile") && line.contains("reconcile_config_invalid")
                 {
-                    return;
+                    return Some(());
                 }
                 logs.push_str(&line);
                 logs.push('\n');
             }
-            Err(_) => panic!("startup reconcile pass never logged its refusal; child logs: {logs}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "startup reconcile pass never logged its refusal within 10s; child logs: {logs}"
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Both forwarder threads ended at pipe EOF, so every line the
+                // child wrote is already in `logs`.
+                if is_eventsub_bind_failure(&logs) {
+                    return None;
+                }
+                panic!("bot exited before the startup pass logged its refusal; child logs: {logs}");
+            }
         }
     }
+}
+
+fn assert_eventsub_reconcile_with_binds(next_bind: &mut dyn FnMut() -> String) {
+    const ATTEMPTS: u8 = 3;
+    for attempt in 1..=ATTEMPTS {
+        if eventsub_reconcile_once(&next_bind()).is_some() {
+            return;
+        }
+        assert!(
+            attempt < ATTEMPTS,
+            "eventsub bind failed on its last allowed attempt"
+        );
+        // Bind failure: the port was stolen under parallel load. The exited
+        // child is reaped on drop; the next attempt reserves a fresh bind.
+    }
+}
+
+#[test]
+fn eventsub_reconcile_startup_pass_runs_from_the_entrypoint() {
+    // The gate is open but no callback is configured, so the startup pass
+    // refuses before any Helix call. That refusal log is the proof the
+    // entrypoint spawned the reconcile task.
+    assert_eventsub_reconcile_with_binds(&mut reserve_eventsub_bind);
+}
+
+#[test]
+fn eventsub_stolen_bind_retries_with_fresh_port() {
+    // Deterministically steal the first attempt's bind: with no retry this
+    // test fails (bind failure panics instead of retrying), pinning the loop.
+    let held = TcpListener::bind("127.0.0.1:0").expect("hold test port");
+    let held_bind = held.local_addr().unwrap().to_string();
+    let calls = std::cell::Cell::new(0u8);
+    let mut provider = || {
+        let n = calls.get() + 1;
+        calls.set(n);
+        if n == 1 {
+            held_bind.clone()
+        } else {
+            reserve_eventsub_bind()
+        }
+    };
+    assert_eventsub_reconcile_with_binds(&mut provider);
+    assert!(
+        calls.get() >= 2,
+        "stolen-bind test never took its second attempt"
+    );
+}
+
+#[test]
+fn eventsub_retry_gates_only_on_receiver_bind_failure() {
+    assert!(is_eventsub_bind_failure(
+        "error_class=\"receiver_bind_failed\" error_class=\"eventsub startup refused\""
+    ));
+    assert!(!is_eventsub_bind_failure("database initialization failed"));
+    assert!(!is_eventsub_bind_failure(""));
 }
 
 #[test]
