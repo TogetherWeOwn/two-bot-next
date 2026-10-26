@@ -2,6 +2,9 @@
 //! raw slash inputs go through CommandRuntime and the real disposable DB store.
 #![cfg(test)]
 
+#[path = "feed_pending_evidence_acceptance_tests.rs"]
+mod pending_evidence_acceptance_tests;
+
 use super::*;
 use serde_json::Value;
 use tokio::sync::Notify;

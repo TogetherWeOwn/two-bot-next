@@ -53,6 +53,25 @@ uncertain-send fence as relative schedules. Restart does not recalculate the
 instant. Completed one-offs remain disabled; an uncertain send remains fenced
 through backup/restore rather than blindly posting again.
 
+## Preview a proposed post
+
+`/schedule` accepts an optional `preview` boolean. With `preview:true` the
+handler runs the same body, mention, interval and absolute-time validation as
+create, then answers privately with the proposed body, the invoking channel,
+the first due instant in canonical UTC plus a Discord-local timestamp, and the
+one-off versus recurring shape — labelled `Preview — not scheduled`. The reply
+says outright that a later create revalidates timing and availability; it names
+no saved id, links no message and promises no delivery.
+
+A preview is read-only by construction: valid and invalid previews return
+before minting a persistent id, reading or writing the store, auditing,
+taking quota, or sending anything to the channel. Rendering the body never
+executes it — hostile input renders as inert, mention-safe data within the
+2,000-unit reply cap. A duplicated or wrong-typed `preview` value refuses with
+a private correction, never a write. Omitted or false keeps create behavior,
+including its rejection audits, unchanged. Staff, guild, feature and
+activation fences apply before any of this runs.
+
 ## Queue model
 
 The store keeps `next_run_at` as `TEXT` in the `format_iso_ms` shape
