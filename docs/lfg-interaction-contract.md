@@ -66,10 +66,48 @@ Discord, including tuple preservation, concurrent select/leave/close orderings,
 no-op/refusal effects, hostile text and post-commit failures. This does not claim
 staging usage or activate the feature in production.
 
+### Increase one role's seats
+
+`/lfg-edit id:<id> role:<existing role key> seats:<absolute total>` uses the
+same configured-guild, announcements and **Manage Events** gates on every
+interaction. The selector is the stable signup key (for example `tank`), not its
+label or a Discord role ID. Supply `role` and `seats` together, without `title`
+or `starts-at`; metadata edits remain a separate mode of the same command.
+Unknown, duplicate, mistyped, unpaired or mixed-mode options refuse before any
+mutation. Keys use the existing 1–32 ASCII letter/digit/underscore/hyphen bound;
+seats must be a strict integer from 1 to 99, not a delta.
+
+Only an open post whose start is still in the future can change. A dedicated
+transaction takes the shared signup/close advisory lock, the guild-fenced post
+row lock, then the selected role row lock. After waiting, it checks the current
+capacity and execution-time clock. A smaller target refuses, including a stale
+request behind a newer increase. An equal target returns `LFG seats unchanged`
+with no row rewrite, audit append or channel refresh, including a replayed
+successful target. A larger target updates only that role's `slots` in place.
+Post metadata, lifecycle, role identities/labels/order, message identity and
+all signups with their original join times remain untouched.
+
+Each saved increase commits one bounded `lfg.edit.seats` / `increased` audit in
+the same transaction. An audit insert failure or identity collision rolls back
+the capacity update. No refusal or no-op writes an audit. The runtime retains
+the per-post lock through one mention-suppressed PATCH to the existing message;
+it never creates a new public message or pings members. The private receipt
+says `LFG seats saved`. If the PATCH fails, it still says saved, then explains
+that the visible post could not be refreshed. Check saved state before retrying:
+an equal target remains a no-op, not a refresh retry. No claim of exactly-once
+Discord delivery or automatic refresh recovery is made.
+
+`crates/core/tests/lfg_seat_edit_catalog_acceptance.rs` pins publication/help.
+`crates/discord/tests/lfg_seat_edit_acceptance.rs` covers router/store/REST
+behavior, tuple preservation, private replies, stale targets and actual lock
+contention with signup, close and metadata edits in disposable fixtures. These
+are hermetic checks, not production or staging activation evidence.
+
 ## Applied state is not an audited success
 
-LFG store mutations commit independently of the runtime's advisory-lock
-transaction. If a signup, leave or close succeeds but its audit append fails,
+Except for the atomic seat/audit transaction above, LFG store mutations commit
+independently of the runtime's advisory-lock transaction. If a signup, leave or
+close succeeds but its audit append fails,
 the service returns the actual outcome followed by:
 
 > Audit could not be recorded; check the saved state before retrying.
@@ -90,6 +128,34 @@ Audit loss is not atomic rollback or exactly-once delivery. Without a saved
 audit row there is no durable replay receipt; inspect saved state before
 retrying. Likewise, this change does not address a crash between the store
 commit and audit append. It adds no migration or separate replay store.
+
+## Closed-post refresh repair
+
+Closing a post commits the closed row before its Discord PATCH runs. When
+that edit fails (a 403, a timeout, a restart), the close transition leaves a
+durable repair intent behind instead of losing it: the lifecycle sweep keeps
+retrying the exact saved guild/channel/message under the existing runtime
+lock and send-admission fences, with durable backoff (10 minutes after the
+first failed repair, doubling per failure and capped at 6 hours). Repair
+candidates share the sweep's 20-row cap and per-tick budget, so one stuck row
+cannot starve expiry work. A confirmed
+edit settles the intent, as does a definitive Unknown Message outcome
+(Discord code 10008); a bare 404 without that code stays retryable. The
+repair never recreates a message, sends, deletes or reopens, and historical
+closed rows are never reclassified as pending.
+
+Each terminal attempt logs a content-free `outcome` (`repaired`,
+`settled_missing`, `retry_scheduled`) with an `error_class` in fixed
+vocabulary (`unknown_message`, `rejected`, `timeout`, `unavailable`,
+`rate_limited`, `admission_blocked`, `guard_*`). No member text, SQL or
+remote bodies appear. A `retry_scheduled` line needs no action: the next
+eligible tick retries on its own. Pending state lives on the closed row
+(`close_refresh_pending`, `close_refresh_attempts`, `close_refresh_next_at`)
+and clears only on a confirmed edit, a definitive Unknown Message outcome,
+a closed post with no saved message to repair, or erasure of the row itself.
+If a closed post first gains its saved message later (recovered from channel
+history), saving the identifier re-arms the same repair intent, so stale
+controls on the late-bound message keep a durable retry.
 
 ## Bind a receipt to its request
 

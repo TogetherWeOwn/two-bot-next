@@ -9,6 +9,7 @@ extern crate self as two_bot_core;
 extern crate two_bot_core as real_core;
 
 pub use real_core::{automation_quota, commands, lfg, rsvp};
+pub use two_bot_discord::CloseRefreshEdit;
 
 #[path = "../src/automation_admission.rs"]
 mod automation_admission;

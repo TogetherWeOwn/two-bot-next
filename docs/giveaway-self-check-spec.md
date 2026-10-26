@@ -45,7 +45,7 @@ Source facts, not production verification:
   failure aborts. Do not claim Discord checks are atomic with the transaction.
 - `crates/core/src/router.rs:716-720,838-842`: `/giveaway` is administrative
   (Manage Server); `gw:` entry components have a separate member path.
-- `crates/discord/src/onboarding_permissions.rs:23-101,157-206`: existing
+- `crates/discord/src/onboarding_permissions.rs:23-108,164-213`: existing
   `MemberAccess` reads guild/roles/self member and checks a channel. It does not
   expose joined-at/human proof, require text-channel history access, or supply
   this proposal's five-second aggregate budget. Unmodified reuse is insufficient.
