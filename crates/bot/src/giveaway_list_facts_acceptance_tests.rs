@@ -732,7 +732,14 @@ async fn authority_and_activation_controls_refuse_without_disclosure_or_effects(
             _ => unreachable!("finite gate matrix"),
         }
         runtime.on_interaction(&interaction).await;
-        let text = replies(&mock, &interaction).join("\n");
+        let text = if matches!(case, "absent-guild" | "foreign-guild") {
+            // Preserve the existing non-moderation Ignore fence: replying
+            // here would widen the configured-guild invocation contract.
+            assert!(mock.requests().is_empty(), "{case}: Ignore stays silent");
+            String::new()
+        } else {
+            replies(&mock, &interaction).join("\n")
+        };
         assert_read_only(db.pool(), &before).await;
         mock.shutdown().await;
         db.close().await.expect("drop owned database");
