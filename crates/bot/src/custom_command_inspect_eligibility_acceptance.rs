@@ -196,10 +196,10 @@ fn assert_saved_and_eligibility(content: &str, enabled: bool) -> String {
         "summary must not run or reveal the template body"
     );
     for claim in [
-        "will run",
-        "will execute",
-        "registration synchronized",
-        "registration synced",
+        "execution: guaranteed",
+        "delivery: guaranteed",
+        "registration: synchronized",
+        "registration: synced",
     ] {
         assert!(
             !lower.contains(claim),
