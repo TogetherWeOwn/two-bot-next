@@ -902,17 +902,34 @@ pub async fn pause_giveaway(
     giveaway_id: &str,
     paused_at: OffsetDateTime,
 ) -> Result<bool, sqlx::Error> {
-    let paused = sqlx::query(
+    pause_audited(pool, guild_id, giveaway_id, None, paused_at).await
+}
+
+/// Pause with an actor fact in the same transaction. `None` attributes a
+/// store-only system operation; staff commands supply the authenticated actor.
+pub async fn pause_audited(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    actor: Option<&str>,
+    paused_at: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<GiveawayRow> = sqlx::query_as(
         "UPDATE giveaways SET status = 'paused', paused_at = $3, updated_at = $3
-          WHERE guild_id = $1 AND id = $2 AND status = 'open' AND claim_token IS NULL",
+          WHERE guild_id = $1 AND id = $2 AND status = 'open' AND claim_token IS NULL
+          RETURNING *",
     )
     .bind(guild_id)
     .bind(giveaway_id)
     .bind(paused_at)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    Ok(paused == 1)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = &row {
+        surface_audit(&mut tx, row, actor, "giveaway.pause", "ok").await?;
+    }
+    tx.commit().await?;
+    Ok(row.is_some())
 }
 
 /// Resume a paused giveaway: the deadline moves forward by the paused span
@@ -925,6 +942,17 @@ pub async fn resume_giveaway(
     pool: &Pool<Postgres>,
     guild_id: &str,
     giveaway_id: &str,
+    now: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>, sqlx::Error> {
+    resume_audited(pool, guild_id, giveaway_id, None, now).await
+}
+
+/// Resume with an actor fact committed atomically with the locked deadline math.
+pub async fn resume_audited(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    actor: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<Option<OffsetDateTime>, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -946,16 +974,17 @@ pub async fn resume_giveaway(
     let Ok(ends_at) = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000) else {
         return Ok(None);
     };
-    sqlx::query(
+    let updated: GiveawayRow = sqlx::query_as(
         "UPDATE giveaways SET status = 'open', ends_at = $3, paused_at = NULL, updated_at = $4
-          WHERE guild_id = $1 AND id = $2 AND status = 'paused'",
+          WHERE guild_id = $1 AND id = $2 AND status = 'paused' RETURNING *",
     )
     .bind(guild_id)
     .bind(giveaway_id)
     .bind(ends_at)
     .bind(now)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+    surface_audit(&mut tx, &updated, actor, "giveaway.resume", "ok").await?;
     tx.commit().await?;
     Ok(Some(ends_at))
 }
@@ -971,6 +1000,18 @@ pub async fn extend_giveaway(
     guild_id: &str,
     giveaway_id: &str,
     extra_seconds: i64,
+    now: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>, sqlx::Error> {
+    extend_audited(pool, guild_id, giveaway_id, extra_seconds, None, now).await
+}
+
+/// Extend with a distinct actor fact for each committed deadline addition.
+pub async fn extend_audited(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    extra_seconds: i64,
+    actor: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<Option<OffsetDateTime>, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -993,15 +1034,16 @@ pub async fn extend_giveaway(
     let Ok(ends_at) = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000) else {
         return Ok(None);
     };
-    sqlx::query(
-        "UPDATE giveaways SET ends_at = $3, updated_at = $4 WHERE guild_id = $1 AND id = $2",
+    let updated: GiveawayRow = sqlx::query_as(
+        "UPDATE giveaways SET ends_at = $3, updated_at = $4 WHERE guild_id = $1 AND id = $2 RETURNING *",
     )
     .bind(guild_id)
     .bind(giveaway_id)
     .bind(ends_at)
     .bind(now)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+    surface_audit(&mut tx, &updated, actor, "giveaway.extend", "ok").await?;
     tx.commit().await?;
     Ok(Some(ends_at))
 }
@@ -1026,8 +1068,18 @@ async fn surface_audit(
     action: &str,
     outcome: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut id = format!("{action}:{}:{}", row.guild_id, row.id);
+    // These transitions may legitimately recur, even at the same timestamp.
+    // A per-write suffix is not a durable interaction replay key. Keep create
+    // and cancel identities unchanged, and never suppress an audit conflict.
+    if matches!(
+        action,
+        "giveaway.pause" | "giveaway.resume" | "giveaway.extend"
+    ) {
+        id.push_str(&format!(":{:032x}", rand::random::<u128>()));
+    }
     sqlx::query("INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-        .bind(format!("{action}:{}:{}", row.guild_id, row.id)).bind(&row.guild_id).bind(actor)
+        .bind(id).bind(&row.guild_id).bind(actor)
         .bind(action).bind(&row.id).bind(outcome).bind(row.updated_at).execute(&mut **tx).await?;
     Ok(())
 }
