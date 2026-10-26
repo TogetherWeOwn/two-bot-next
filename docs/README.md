@@ -6,7 +6,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 ## References and architecture
 
 - [Find a doc](README.md)
-- [Framework choice](adr/0001-discord-framework.md)
+- [Framework](adr/0001-discord-framework.md)
 - [Commands](commands.md)
 - [Settings](configuration.md)
 - [Parity ledger](parity.md)
@@ -19,7 +19,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 
 ## Operations and observability
 
-- [Operations and alerts](runbook.md)
+- [Operations](runbook.md)
 - [Observability triage](runbook-observability.md)
 - [Metrics catalog](metrics.md)
 - [Readiness monitoring](container-readiness.md)
@@ -31,12 +31,12 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Backfill procedure](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
-- [Release architecture](releases.md)
+- [Releases](releases.md)
 - [Gradual promote](gradual-promote-caller.md)
-- [Logging contract](logging.md)
+- [Logging](logging.md)
 - [Log volume guard](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
-- [Pool gauge ownership](pool-gauge-ownership.md)
+- [Pool gauge](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
 - [Keepalive-gap](keepalive-gap-detector.md)
 - [Gateway alerts](worker-gateway-failure-alerts.md)
@@ -48,15 +48,15 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 
 ## Storage and internal actions
 
-- [Event-store wiring](event-store.md)
+- [Event store](event-store.md)
 - [Database roles](database-roles.md)
 - [Database TLS](database-tls.md)
-- [Migration checksums](migrations.md)
+- [Migrations](migrations.md)
 - [Legacy data copy](legacy-copy.md)
 - [Legacy verify](legacy-verify.md)
 - [Store cutover gates](store-cutover.md)
 - [Member erasure](privacy.md)
-- [Membership chronology](membership-contract.md)
+- [Membership](membership-contract.md)
 - [Send admission](discord-send-admission.md)
 - [REST guard](rest-guard.md)
 - [Audit domain](audit-core.md)
