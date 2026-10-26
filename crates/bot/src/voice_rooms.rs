@@ -12167,7 +12167,7 @@ pub enum LoggingAction {
     Invalid,
 }
 
-/// Decoded `page` option for the `/setup` and `/access show` read paths.
+/// Decoded `page` option for `/setup`, `/access show` and `/voice-orphans`.
 /// `Missing` behaves as page 1; `Invalid` (zero, negative, overflowing,
 /// wrong-typed or duplicated) refuses without touching the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
