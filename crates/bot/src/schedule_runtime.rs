@@ -39,10 +39,10 @@ use two_bot_core::{
         validate_schedule, validate_schedule_at, ScheduleInput, IN_MINUTES_MIN,
     },
     scheduled_store::{
-        audit_scheduled, count_scheduled_scoped, delete_scheduled, get_scheduled,
-        list_scheduled_scoped, list_scheduled_window_scoped, put_scheduled,
-        resolve_scheduled_id as resolve_scheduled_id_store, ScheduledAuditInput, ScheduledWrite,
-        SCHEDULE_LIST_CAP,
+        audit_scheduled, count_scheduled, count_scheduled_scoped, delete_scheduled, get_scheduled,
+        list_scheduled, list_scheduled_scoped, list_scheduled_window, list_scheduled_window_scoped,
+        put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, ScheduledAuditInput,
+        ScheduledWrite, SCHEDULE_LIST_CAP,
     },
 };
 use two_bot_discord::ActionExecutor;
@@ -478,7 +478,11 @@ pub(crate) async fn schedule_list(
         finish(executor, interaction, refusal).await;
         return;
     }
-    match list_scheduled_scoped(pool, guild_id, channel_id.as_deref()).await {
+    let listed = match channel_id.as_deref() {
+        Some(channel_id) => list_scheduled_scoped(pool, guild_id, Some(channel_id)).await,
+        None => list_scheduled(pool, guild_id).await,
+    };
+    match listed {
         Ok(mut rows) => {
             rows.sort_by(|a, b| (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id)));
             let mut lines: Vec<String> = rows
@@ -504,16 +508,21 @@ pub(crate) async fn schedule_list(
             // and render exactly as before.
             if rows.len() as i64 == SCHEDULE_LIST_CAP {
                 let mut count_failure_class: Option<&str> = None;
-                let total_opt =
-                    match count_scheduled_scoped(pool, guild_id, channel_id.as_deref()).await {
-                        Ok(total) => Some(total),
-                        Err(err) => {
-                            let class = db_class(&err);
-                            tracing::warn!(reason = class, "schedule list count failed");
-                            count_failure_class = Some(class);
-                            None
-                        }
-                    };
+                let counted = match channel_id.as_deref() {
+                    Some(channel_id) => {
+                        count_scheduled_scoped(pool, guild_id, Some(channel_id)).await
+                    }
+                    None => count_scheduled(pool, guild_id).await,
+                };
+                let total_opt = match counted {
+                    Ok(total) => Some(total),
+                    Err(err) => {
+                        let class = db_class(&err);
+                        tracing::warn!(reason = class, "schedule list count failed");
+                        count_failure_class = Some(class);
+                        None
+                    }
+                };
                 if let Some(overflow) =
                     schedule_list_overflow_for_count(total_opt, SCHEDULE_LIST_CAP)
                 {
@@ -534,15 +543,28 @@ pub(crate) async fn schedule_list(
                     };
                     let first_total = first_pages.len() as i64;
                     if page > first_total {
-                        match list_scheduled_window_scoped(
-                            pool,
-                            guild_id,
-                            channel_id.as_deref(),
-                            SCHEDULE_LIST_CAP,
-                            SCHEDULE_LIST_CAP,
-                        )
-                        .await
-                        {
+                        let window = match channel_id.as_deref() {
+                            Some(channel_id) => {
+                                list_scheduled_window_scoped(
+                                    pool,
+                                    guild_id,
+                                    Some(channel_id),
+                                    SCHEDULE_LIST_CAP,
+                                    SCHEDULE_LIST_CAP,
+                                )
+                                .await
+                            }
+                            None => {
+                                list_scheduled_window(
+                                    pool,
+                                    guild_id,
+                                    SCHEDULE_LIST_CAP,
+                                    SCHEDULE_LIST_CAP,
+                                )
+                                .await
+                            }
+                        };
+                        match window {
                             Ok(mut hidden) => {
                                 hidden.sort_by(|a, b| {
                                     (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id))
