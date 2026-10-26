@@ -1,25 +1,21 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`.
-
-`python3 scripts/check_docs_index.py --json` (repo root):
-PASS = empty `{missing,stale,oversize}`, else exit 1.
-Bad rows in `stale`: `docs/README.md:<line>`.
-This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
+Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
+No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
 
 ## References and architecture
 
 - [Find a doc](README.md)
 - [Framework choice](adr/0001-discord-framework.md)
-- [Command reference](commands.md)
-- [Settings reference](configuration.md)
+- [Commands](commands.md)
+- [Settings](configuration.md)
 - [Parity ledger](parity.md)
-- [Containment boundaries](containment.md)
+- [Containment](containment.md)
 - [Prototype metrics](s2-prototype.md)
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
-- [Read-only MCP tools](mcp.md)
-- [Admin token registry](admin-registry.md)
+- [MCP tools](mcp.md)
+- [Token registry](admin-registry.md)
 
 ## Operations and observability
 
@@ -36,9 +32,9 @@ This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
 - [Release architecture](releases.md)
-- [Passive gradual promote](gradual-promote-caller.md)
+- [Gradual promote](gradual-promote-caller.md)
 - [Logging contract](logging.md)
-- [Log/cardinality limits](log-volume-guard.md)
+- [Log volume guard](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
 - [Pool gauge ownership](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
@@ -57,11 +53,11 @@ This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
 - [Database TLS](database-tls.md)
 - [Migration checksums](migrations.md)
 - [Legacy data copy](legacy-copy.md)
-- [Legacy data comparison](legacy-verify.md)
+- [Legacy verify](legacy-verify.md)
 - [Store cutover gates](store-cutover.md)
 - [Member erasure](privacy.md)
 - [Membership chronology](membership-contract.md)
-- [Durable send admission](discord-send-admission.md)
+- [Send admission](discord-send-admission.md)
 - [REST guard](rest-guard.md)
 - [Audit domain](audit-core.md)
 - [Audit mirror](audit-service.md)
@@ -81,7 +77,7 @@ This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
 - [Command publication](command-publish.md)
 - [Command restoration](command-restoration.md)
 - [Reply lifecycle](interaction-replies.md)
-- [Prefix trigger gates](prefix-gate-matrix.md)
+- [Prefix gates](prefix-gate-matrix.md)
 - [Actor admission](automation-admission.md)
 - [Automod operations](automod-operator-guide.md)
 - [Automod runtime](automod-runtime.md)
@@ -95,7 +91,7 @@ This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
 - [Moderation disable gate](moderation-disable-preflight.md)
-- [Hierarchy refusal order](moderation-hierarchy-order.md)
+- [Hierarchy order](moderation-hierarchy-order.md)
 - [Moderation MAC tests](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
@@ -143,12 +139,14 @@ This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
 - [Calendar handoff](event-calendar-handoff-spec.md)
 - [Event role](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
+- [Native publish](event-native-publish-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Sticky config proposal](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
+- [Resolution signal](ticket-resolution-request-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 
@@ -187,7 +185,7 @@ This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
 - [Join lifecycle](voice-join-request-lifecycle.md)
 - [Logging resolution](voice-logging-core.md)
 - [Name filtering](voice-name-filter-core.md)
-- [Name panel/modal](voice-name-panel.md)
+- [Name panel](voice-name-panel.md)
 - [Rename coalescing](voice-rename-coalescer-core.md)
 - [Rename pipeline](voice-rename-pipeline.md)
 - [Ping/invite](voice-utilities-core.md)
@@ -212,7 +210,7 @@ This file <12,000 B; others ≤65,536 B (`LARGE_DOCS` excepted).
 - [Soak lifecycle](staging-soak.md)
 - [Soak coverage plan](soak-checklist.md)
 - [Soak entry gates](soak-entry-gates.md)
-- [Expected/processed evidence](evidence-route.md)
+- [Evidence route](evidence-route.md)
 - [Expected-join tests](expected-joins-acceptance.md)
 - [E2E matrix](staging-e2e-command-matrix.md)
 - [E2E record](staging-e2e-run-record.md)

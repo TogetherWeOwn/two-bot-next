@@ -32,7 +32,7 @@ unwanted bot volume, not more bot engagement. No spend or live experiment follow
 ## 2. Observed baseline and limits
 
 Original inspection baseline: `c3af7333df80a766f5d4c229506a3bce53680828`.
-Current-source links rechecked at `1441cbef76a1c8237a3a91a8944e2d25b66c4ce4`;
+Current-source links rechecked at `5e870a8251b3382c7b2f7f72c97f785a6710238e`;
 not deployment verification. See [feed operations](feed-supervisor.md) and
 [domain/store contract](feeds-port.md). The model exposes a parsed title and URL,
 not a filter policy. Existing parsing, URL safety, message bounds, 20 POST-attempt

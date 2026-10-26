@@ -160,7 +160,7 @@
     },
     {
       "name": "reopen",
-      "description": "Reopen your games or session picker in a private menu.",
+      "description": "Reopen your games or session picker in a private menu; games includes a no-change preview.",
       "family": "core",
       "gate": "always",
       "default_member_permissions": null,
@@ -348,7 +348,7 @@
     },
     {
       "name": "command-inspect",
-      "description": "Inspect or privately preview a saved custom command",
+      "description": "Inspect a saved command or privately preview an unsaved draft",
       "family": "automations",
       "gate": "automations",
       "default_member_permissions": "32",
@@ -356,9 +356,9 @@
       "options": [
         {
           "name": "name",
-          "description": "Saved command name, a-z 0-9 _ -",
+          "description": "Saved command name, a-z 0-9 _ - (choose name or draft)",
           "type": "string",
-          "required": true,
+          "required": false,
           "min_value": null,
           "max_value": null,
           "max_length": 32,
@@ -366,7 +366,7 @@
         },
         {
           "name": "view",
-          "description": "Private view (summary by default)",
+          "description": "Private view (saved: summary by default; draft: preview only)",
           "type": "string",
           "required": false,
           "min_value": null,
@@ -386,6 +386,16 @@
           "min_value": null,
           "max_value": null,
           "max_length": 500,
+          "choices": []
+        },
+        {
+          "name": "draft",
+          "description": "Proposed template to preview without saving (choose name or draft)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 2000,
           "choices": []
         }
       ],
