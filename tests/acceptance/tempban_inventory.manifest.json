@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only acceptance for privately inspecting saved temporary-ban expiry work. This branch is not a product implementation and must not merge while intentionally RED.",
+  "sourceBaseline": "92d85042527b756062bfc9e19c8d77aed0cee0b3",
+  "executionBase": "5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
+  "branch": "test/tempban-expiry-inventory-acceptance",
+  "protectedFiles": [
+    {"path": "crates/bot/src/tempban_inventory_acceptance_tests.rs", "sha256": "b70b7b712671905b6a3e4322cbd1a50ca4a11acc44e216cf5a365bc416e992a6", "tests": 7},
+    {"path": "crates/core/tests/tempban_inventory_contract.rs", "sha256": "440ec257baed7e027c7764dd120b08bf07601e2466bdcfb1ab6d56692b896b55", "tests": 2}
+  ],
+  "registration": {
+    "path": "crates/bot/src/command_runtime_tests.rs",
+    "module": "tempban_inventory_acceptance_tests",
+    "change": "Two-line test-only module registration. Preserve unrelated registrations when integrating; only the two new test files are hash-protected."
+  },
+  "commands": {
+    "publication": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test tempban_inventory_contract -- --nocapture",
+    "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot tempban_inventory_acceptance_tests -- --nocapture --test-threads=1",
+    "unbanControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test moderation_tempban_path --test unban_sweep_bounds_acceptance -- --nocapture --test-threads=1",
+    "authorityControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot member_dispatch_authority_acceptance -- --nocapture --test-threads=1",
+    "workspace": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test --workspace --features two-bot-core/db --locked",
+    "format": "cargo fmt --all -- --check",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref 5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
+    "inventory": "python3 scripts/ci/check-test-inventory.py"
+  },
+  "contract": {
+    "command": "/tempban-list [page:1..10000]; default page one; ten complete rows per page except the final page. Read-only ephemeral Ban Members-class moderation command, not a new self/member lookup or reconciliation verb.",
+    "states": "pending due/future, staged expiry associated with a prepared ban, running, quarantined and a pending row with dispatch_uncertain. Preserve their distinctions; terminal done/cancelled/superseded history excluded. Standalone prepared permanent-ban intents without a saved expiry are outside this inventory.",
+    "order": "Saved execute_at ascending, then stable member/work identity; tests accept either lexical direction across the opposing member/work tie fixture but reject permuted insertion order. Publish the chosen tie key. Complete work and member IDs remain associated on each row.",
+    "privacy": "Current server-side actor authority, configured guild/moderation gates, no member-self authority, private reply/defer completion, suppressed mentions, complete finite content <=2000 UTF-16 units, no reasons/claim capability/raw errors/foreign guild data. Saved/due does not prove Discord unban; running is not completion.",
+    "spies": "Real router/runtime/executor/store; route-aware loopback authority fixture. SQLx executed-query receipts require scoped ordered LIMIT queries and <=11 returned rows including lookahead; malformed selectors and rejected authority require no expiry/ban reads. Full snapshots of five moderation ledgers plus nontransactional statement-write probes catch attempted claims/sweeps/repairs/audits, including zero-row or rolled-back writes. An independent read-only pool must still serve inventory. REST allows authority GETs and the one private interaction answer only, never bans lookup or guild mutations.",
+    "coverage": "All actual saved-work states, foreign and terminal rows, 24-row three-page fixture with ties and permuted insertion, default/repeat page identity controls, page 0/-1/10001/i64::MAX, string/bool/nested/duplicate/unknown/action selectors, inclusive 10000, stale ordinary/missing/cold actor, guild/DM/moderation/missing actor fences, empty vs out-of-range vs closed-pool query failure, hostile work identity and withheld hostile reasons.",
+    "limits": "This is not a concurrency-snapshot promise or a live Discord/database test. The upper-bound page test validates decode/read behavior on a small fixture, not a 100000-row load test. Query receipts bound materialized rows, not PostgreSQL scan cost. Existing sweep/mutation tests are not changed. No schema, runtime source, activation, policy, permission or CI changes."
+  },
+  "database": {
+    "guard": "two_bot_testsupport::TestDatabase with current cutover migrations; each test owns its disposable database and explicitly closes it.",
+    "missingEnvironment": "Fails fixture setup; never count missing DB, compile failure or cache refusal as behavioral RED.",
+    "ciRoute": "check.yml workspace lib/bins step runs the registered runtime tests with TWO_TEST_DATABASE_URL; workspace integration step discovers tempban_inventory_contract. No ignored tests or bespoke CI route."
+  },
+  "verification": {
+    "localCompiled": "NOT RUN: publication, runtime and workspace wrapper attempts were refused before Cargo, each exit 75: no idle, below-budget slot; no per-worktree fallback.",
+    "behavioralRed": "UNVERIFIED pending hosted exact-head run. No assertion failure, GREEN control or compile success is claimed.",
+    "offline": "cargo fmt --all -- --check, git diff --check, floor guard, test inventory, secret Debug guard (including 23 self-tests), and docs index passed before publication.",
+    "baselineCompatibility": "git diff sourceBaseline..executionBase for member_runtime.rs, member_moderation_store.rs and moderation.rs was empty. This static check is not compiled verification."
+  },
+  "handoff": "Builder must consume these exact protected bytes unchanged in the single product PR after Test Author records actual behavior-specific RED and unchanged controls on the task. Hash manifest itself is not self-hashed; its SHA-256 and immutable commit are recorded in the task handoff. Do not merge this intentionally failing branch alone."
+}
