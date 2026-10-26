@@ -131,3 +131,30 @@ fn summary_durations_use_accumulated_hours_without_wrapping() {
     assert!(text.contains("2501999792h 59m 0s"), "{text}");
     assert!(text.contains("overlap"), "{text}");
 }
+
+#[test]
+fn summary_wraps_hostile_labels_in_inline_code() {
+    let rows = vec![aggregate("[click](https://evil.example) `x`", 60_000, 0)];
+    let GameMixBrowseView::Page(text) = render_game_activity_discord_browse(
+        GUILD,
+        &rows,
+        1,
+        GameMixBrowseSort::Play,
+        GameMixBrowseFormat::Summary,
+    ) else {
+        panic!("expected a summary page");
+    };
+    assert!(
+        text.contains("- `[click](https://evil.example)"),
+        "masked-link label must sit inside inline code: {text}"
+    );
+    assert!(
+        text.contains("` — play"),
+        "inline code must close before the durations: {text}"
+    );
+    assert_eq!(
+        text.matches('`').count(),
+        2,
+        "label backticks are neutralised so only the wrapper pair remains: {text}"
+    );
+}

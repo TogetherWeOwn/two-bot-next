@@ -511,8 +511,11 @@ fn browse_page_text(
                 text.push_str("\nNo game activity recorded for this guild yet.");
             }
             for (row, label) in page_rows.iter().zip(&labels) {
+                // Inline-code the member-controlled label so Markdown in it
+                // (for example a masked link) renders inert; `discord_label`
+                // already mapped any backtick in it, so it cannot close this.
                 text.push_str(&format!(
-                    "\n- {label} — play {} · in voice {} · {} sessions",
+                    "\n- `{label}` — play {} · in voice {} · {} sessions",
                     format_duration_ms(row.total_play_ms),
                     format_duration_ms(row.in_voice_ms),
                     row.session_count,
