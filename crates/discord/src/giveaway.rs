@@ -1594,6 +1594,43 @@ mod tests {
         assert!(detail.contains("Status: open (saved)"));
     }
 
+    /// Removing any single escape alternative must expose active markdown and
+    /// fail its literal-output case, including on both saved-prize surfaces.
+    #[test]
+    fn prize_markdown_escape_alternatives_stay_inert() {
+        for (prize, expected) in [
+            (r"\", r"\\"),
+            ("`", r"\`"),
+            ("*", r"\*"),
+            ("_", r"\_"),
+            ("~", r"\~"),
+            ("|", r"\|"),
+            ("[", r"\["),
+            ("]", r"\]"),
+            ("(", r"\("),
+            (")", r"\)"),
+            ("<", r"\<"),
+            (">", r"\>"),
+            ("`code`", r"\`code\`"),
+            ("**bold**", r"\*\*bold\*\*"),
+            ("__underline__", r"\_\_underline\_\_"),
+            ("~~strike~~", r"\~\~strike\~\~"),
+            ("||spoiler||", r"\|\|spoiler\|\|"),
+            ("[win](prize)", r"\[win\]\(prize\)"),
+            ("<https://example.com>", r"\<https://example.com\>"),
+            (r"\`code\`", r"\\\`code\\\`"),
+            ("Plain café 🎁 - + . ! #", "Plain café 🎁 - + . ! #"),
+        ] {
+            for bound in [giveaway::PRIZE_MAX_CHARS, DETAIL_PRIZE_CHARS] {
+                assert_eq!(inline_prize(prize, bound), expected, "prize: {prize:?}");
+            }
+            let row = saved_row(prize, serde_json::json!({}));
+            assert!(render(&row, 3).starts_with(&format!("Giveaway: {expected}\n")));
+            assert!(render_detail(&row, 3)
+                .starts_with(&format!("Saved giveaway `gw-unit`: {expected}\n")));
+        }
+    }
+
     /// The role summary is bounded: ten inert ids, then an exact omission
     /// count, with the remaining detail framing intact.
     #[test]
