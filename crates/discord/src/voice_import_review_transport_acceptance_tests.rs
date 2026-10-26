@@ -16,9 +16,9 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
 use twilight_model::{
     channel::message::{
         component::{ActionRow, Button, ButtonStyle},
