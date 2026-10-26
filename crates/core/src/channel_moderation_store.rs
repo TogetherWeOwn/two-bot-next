@@ -244,22 +244,84 @@ impl ChannelModerationStore {
         {
             return Ok(Some((locked_at, None)));
         }
-        // Let Postgres normalize the validated RFC3339 timestamp: the TEXT seed
-        // retains nanoseconds while timestamptz audit rows round to microseconds.
-        let actor = sqlx::query_scalar(
+        let actor = Self::select_lockdown_setter(
+            &self.pool,
+            &record.guild_id,
+            &record.channel_id,
+            &record.reason,
+            &locked_at,
+        )
+        .await?;
+        Ok(Some((locked_at, actor)))
+    }
+
+    /// Bounded guild inventory projection for the private saved-recovery read.
+    /// One guild-scoped `LIMIT` query in deterministic numeric channel order;
+    /// capability columns are never selected. The caller filters by gateway
+    /// visibility evidence and paginates the visible rows, so this overscan
+    /// bound covers hidden-plus-visible rows rather than page offsets.
+    pub async fn list_lockdown_inventory(
+        &self,
+        guild_id: &str,
+        limit: i64,
+    ) -> Result<Vec<super::channel_moderation::LockdownInventoryRow>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT channel_id, reason, locked_at FROM moderation_lockdowns
+              WHERE guild_id = $1 ORDER BY LENGTH(channel_id), channel_id ASC LIMIT $2",
+        )
+        .bind(guild_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| super::channel_moderation::LockdownInventoryRow {
+                channel_id: row.get("channel_id"),
+                reason: row.get("reason"),
+                locked_at: row.get("locked_at"),
+            })
+            .collect())
+    }
+
+    /// Setter attribution for one inventoried row. Known only when a
+    /// successful lockdown audit matches the saved time and reason, exactly
+    /// like [`Self::get_lockdown_details`]; callers pass only RFC3339-valid
+    /// instants and treat anything else as unknown without querying.
+    pub async fn get_inventory_setter(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        reason: &str,
+        locked_at: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        Self::select_lockdown_setter(&self.pool, guild_id, channel_id, reason, locked_at).await
+    }
+
+    /// Shared setter predicate: a successful lockdown audit matching saved
+    /// time and reason. An older cycle or a refused attempt is not
+    /// attribution. Let Postgres normalize the validated RFC3339 timestamp:
+    /// the TEXT seed retains nanoseconds while timestamptz audit rows round
+    /// to microseconds.
+    async fn select_lockdown_setter(
+        pool: &PgPool,
+        guild_id: &str,
+        channel_id: &str,
+        reason: &str,
+        locked_at: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar(
             "SELECT actor_id FROM moderation_audit
               WHERE guild_id = $1 AND channel_id = $2
                 AND action = 'moderation.lockdown' AND outcome = 'locked_down'
                 AND reason = $3 AND created_at = $4::text::timestamptz
               ORDER BY created_at DESC, request_id DESC LIMIT 1",
         )
-        .bind(&record.guild_id)
-        .bind(&record.channel_id)
-        .bind(&record.reason)
-        .bind(&locked_at)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(Some((locked_at, actor)))
+        .bind(guild_id)
+        .bind(channel_id)
+        .bind(reason)
+        .bind(locked_at)
+        .fetch_optional(pool)
+        .await
     }
 
     /// Delete recovery state only after Discord accepted the exact

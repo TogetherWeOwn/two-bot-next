@@ -1,7 +1,7 @@
 # Channel moderation runtime integration
 
 `/purge`, `/slowmode`, `/lockdown` and `/unlock` share the channel moderation
-runtime with the private `/purge-preview` and `/channel-inspect` reads. `TWO_MODERATION` remains default-off. This change does not activate
+runtime with the private `/purge-preview`, `/channel-inspect` and `/lockdown-records` reads. `TWO_MODERATION` remains default-off. This change does not activate
 a live guild; verification uses synthetic interactions, loopback REST/gateway
 doubles, and isolated test-service schemas, never production/staging credentials.
 
@@ -73,16 +73,27 @@ change between sampling and execution. It never echoes message content.
 saved lockdown presence via `get_lockdown`, not proof of the live overwrite.
 A missing recovery record is `none`, not a store error. A saved reason is capped
 at 512 characters and shown verbatim only in the staff-private response, with
-all mentions disabled. The stored RFC3339 timestamp supplies its calendar date;
-only a successful lockdown audit matching guild, channel, reason and saved time
-supplies the setter. Unknown or mismatched metadata is explicitly `unknown`.
+all mentions disabled. The stored RFC3339 instant renders in full, shared with
+the inventory so two locks on the same date stay distinguishable; malformed
+legacy timestamps render `unknown`. Only a successful lockdown audit matching
+guild, channel, reason and saved time supplies the setter. Unknown or mismatched
+metadata is explicitly `unknown`.
 Live slowmode comes from a validated same-guild text/announcement channel GET;
 missing/zero delay is `off`. A failed live read preserves the saved half and
 shows `unknown` with retry guidance. Slowmode setter/time are unknown because
 those facts are not durably stored. Store failures and channel-identity
 mismatches refuse privately without exposing stored facts.
 
-Both reads use the shared ephemeral defer/original-response edit lifecycle.
+`/lockdown-records [page:1..100]` requires Manage Channels and lists saved
+recovery records the actor may view: one bounded guild-scoped `LIMIT` query in
+stable channel order, filtered by cached gateway visibility evidence (missing
+or cold facts fail closed and never disclose hidden channels, reasons or
+setters), then stateless pages of ten complete channel ids with full saved
+instants, known/unknown setters and short inert reasons. Empty, unavailable,
+cold-authority and out-of-range pages are distinct; hidden rows never change
+totals, continuation or text. The inventory never fetches live overwrites.
+
+All three reads use the shared ephemeral defer/original-response edit lifecycle.
 They take no audit reason and branch **before** audit, idempotency, claim or
 channel-lane admission, including refusals. They perform only SELECT/Discord
 GET operations apart from the private response itself. No channel/message,

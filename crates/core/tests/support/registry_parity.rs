@@ -55,6 +55,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("lockdown-records", "docs/parity.md §1 lockdown-records"),
     ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
@@ -623,6 +624,17 @@ pub fn expected_registry() -> Value {
             "name": "channel-inspect",
             "description": "Privately inspect saved lockdown and live slowmode",
             "options": [],
+            "dm_permission": false,
+            "default_member_permissions": "16"
+        }),
+    );
+    commands.insert(
+        after_unlock + 2,
+        json!({
+            "name": "lockdown-records",
+            "description": "Privately list saved lockdown recovery records",
+            "options": [{"name": "page", "description": "Records page to show (1-100)",
+                "type": 4, "min_value": 1, "max_value": 100}],
             "dm_permission": false,
             "default_member_permissions": "16"
         }),

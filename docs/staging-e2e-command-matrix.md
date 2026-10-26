@@ -9,9 +9,9 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 43 built-in slash commands (core + scorecard + automation +
+Scope: 44 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 64). No guild was
+the voice set; with the voice gates on it renders 65). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -75,17 +75,18 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 11 | `/unlock` | `TWO_MODERATION` | ManageChannels | Ephemeral outcome + send restore | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Unlock)`, `reason` required ≤512 |
 | 35 | `/purge-preview` | `TWO_MODERATION` | ManageMessages (8192) | Deferred ephemeral sampled counts, candidate time span and exclusions; no delete, audit, claim or lane writes; explicitly sampling, not a guarantee | `GuildRestricted`, `ModerationDisabled`, `PurgePreviewPermission`, only required `count` 1–100; no reason |
 | 36 | `/channel-inspect` | `TWO_MODERATION` | ManageChannels (16) | Deferred ephemeral saved lockdown and live slowmode; absent lockdown is none, unavailable metadata is unknown; no config, audit, claim or lane writes | `GuildRestricted`, `ModerationDisabled`, `ChannelInspectPermission`, no options |
+| 46 | `/lockdown-records` | `TWO_MODERATION` | ManageChannels (16) | Deferred ephemeral saved-recovery inventory over visible channels only; hidden, cold and foreign rows never disclose counts; no live overwrite reads, config, audit, claim or lane writes | `GuildRestricted`, `ModerationDisabled`, `LockdownRecordsPermission`, optional `page` 1–100 |
 
 Member-moderation policy order (ban, tempban, kick, timeout, warn):
 permission → target present → self-target → owner/Owen/bot/staff protection →
 bot hierarchy → actor hierarchy. Audit `reason` is trimmed, non-empty, ≤512
-UTF-16 units on every mutating moderation row. The two private reads take no
+UTF-16 units on every mutating moderation row. The three private reads take no
 reason and write no audit record. Failed reads stay private with retry guidance;
 unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 43-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 44-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

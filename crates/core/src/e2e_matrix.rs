@@ -123,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 43-row contract in publish order (core, scorecard, automation,
+/// The 44-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -725,6 +725,22 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:ModerationDisabled",
                 "Perm:ChannelInspectPermission",
                 "Valid:options:none",
+            ],
+        ),
+        row(
+            "lockdown-records",
+            46,
+            E2eGate::Moderation,
+            PERM_MANAGE_CHANNELS,
+            "ManageChannels",
+            "LockdownRecords",
+            "Deferred ephemeral saved-recovery inventory over visible channels only; hidden, cold and foreign rows never disclose counts; no live overwrite reads, config, audit, claim or lane writes.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:LockdownRecordsPermission",
+                "Valid:page:optional,1..=100",
+                "Valid:options:page-only",
             ],
         ),
     ]

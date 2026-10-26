@@ -1,9 +1,12 @@
 //! Channel handlers after shared-router adjudication. All HTTP uses ActionExecutor;
 //! the durable store owns replay, channel exclusion and exact overwrite recovery.
 
+use std::sync::{Arc, OnceLock};
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use twilight_cache_inmemory::InMemoryCache;
 use twilight_model::{
     application::interaction::{
         application_command::{CommandData, CommandOptionValue},
@@ -43,7 +46,11 @@ pub fn register_channel_handlers(router: &mut InteractionRouter) {
     {
         router.register(Box::new(ChannelHandler(HandlerId::Moderation(action))));
     }
-    for handler in [HandlerId::PurgePreview, HandlerId::ChannelInspect] {
+    for handler in [
+        HandlerId::PurgePreview,
+        HandlerId::ChannelInspect,
+        HandlerId::LockdownRecords,
+    ] {
         router.register(Box::new(ChannelHandler(handler)));
     }
 }
@@ -92,6 +99,12 @@ pub enum ChannelResponseError {
 pub struct ChannelModerationRuntime {
     store: ChannelModerationStore,
     executor: ActionExecutor,
+    /// Shared live gateway cache for the saved-recovery inventory's
+    /// per-channel visibility evidence. Set once: the builder form for
+    /// tests, the `&self` form after boot once the gateway pipeline owns
+    /// its cache. Absent while unset, and the inventory refuses rather
+    /// than guessing visibility.
+    recovery_visibility: Arc<OnceLock<Arc<InMemoryCache>>>,
 }
 
 struct Request {
@@ -134,7 +147,28 @@ struct Prepared {
 impl ChannelModerationRuntime {
     #[must_use]
     pub fn new(store: ChannelModerationStore, executor: ActionExecutor) -> Self {
-        Self { store, executor }
+        Self {
+            store,
+            executor,
+            recovery_visibility: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Attach the shared gateway cache the saved-recovery inventory reads
+    /// per-channel visibility evidence from. Builder form for tests;
+    /// production attaches the same cache the gateway pipeline updates.
+    /// First write wins; a late caller can never swap the evidence source.
+    #[must_use]
+    pub fn with_recovery_visibility_cache(self, cache: Arc<InMemoryCache>) -> Self {
+        let _ = self.recovery_visibility.set(cache);
+        self
+    }
+
+    /// Attach the shared gateway cache after boot, once the pipeline owns
+    /// it. Same first-wins source as
+    /// [`Self::with_recovery_visibility_cache`].
+    pub fn set_recovery_visibility_cache(&self, cache: Arc<InMemoryCache>) {
+        let _ = self.recovery_visibility.set(cache);
     }
 
     /// Ownership only, never authorization. The shared router still adjudicates
@@ -185,7 +219,8 @@ impl ChannelModerationRuntime {
             Ok(Some(reply)) => reply.text.as_str(),
             _ => "The channel action requires reconciliation; do not repeat it.",
         };
-        let edit = if matches!(&result, Ok(Some(reply)) if reply.outcome == "channel_inspect") {
+        let edit = if matches!(&result, Ok(Some(reply)) if reply.outcome == "channel_inspect" || reply.outcome == "lockdown_records")
+        {
             // Staff must see their bounded saved reason verbatim. The shared
             // private-view edit still disables all allowed_mentions explicitly.
             self.executor

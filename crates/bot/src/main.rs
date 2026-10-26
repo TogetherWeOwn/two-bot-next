@@ -707,6 +707,12 @@ async fn run(cli_args: &[String]) {
                                 )
                             })?,
                     );
+                    // The saved-recovery inventory reads per-channel
+                    // visibility from the same live cache the shard runner
+                    // updates; without it the inventory refuses.
+                    if let Some(runtime) = runtime.as_ref() {
+                        runtime.set_recovery_visibility_cache(pipeline.cache_shared());
+                    }
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.

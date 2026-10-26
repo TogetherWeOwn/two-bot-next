@@ -165,6 +165,7 @@ fn parity_builtins_route_to_their_handlers() {
         ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
         ("purge-preview", HandlerId::PurgePreview),
         ("channel-inspect", HandlerId::ChannelInspect),
+        ("lockdown-records", HandlerId::LockdownRecords),
         ("attendance", HandlerId::ScorecardAttendance),
         ("command", HandlerId::AutomationAdmin),
         ("command-remove", HandlerId::AutomationAdmin),
@@ -192,7 +193,7 @@ fn parity_builtins_route_to_their_handlers() {
     ];
     assert_eq!(
         cases.len(),
-        41,
+        42,
         "all builtins except the separate lfg-list and welcome-preview cases covered"
     );
     for (name, handler) in cases {
@@ -257,14 +258,14 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 43, "contract covers the 43 built-in commands");
+    assert_eq!(matrix.len(), 44, "contract covers the 44 built-in commands");
     assert_eq!(
         matrix
             .iter()
             .filter(|row| row.command != "welcome-preview")
             .count(),
-        42,
-        "contract covers the 42 non-preview built-in commands"
+        43,
+        "contract covers the 43 non-preview built-in commands"
     );
     assert!(
         matrix

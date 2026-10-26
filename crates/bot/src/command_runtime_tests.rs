@@ -1599,6 +1599,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "purge"
                         | "purge-preview"
                         | "channel-inspect"
+                        | "lockdown-records"
                         | "slowmode"
                         | "lockdown"
                         | "unlock"
@@ -4324,6 +4325,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedInspect,
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
+            HandlerId::LockdownRecords,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids

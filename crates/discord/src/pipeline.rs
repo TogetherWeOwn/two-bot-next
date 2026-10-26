@@ -442,7 +442,10 @@ pub struct Pipeline<
     C = NoClassification,
     P = PipelineSnapshots,
 > {
-    cache: InMemoryCache,
+    /// Shared live gateway cache: the shard runner updates it in
+    /// `handle()`, and long-lived runtimes (the saved-recovery inventory's
+    /// visibility evidence) hold a clone via [`Self::cache_shared`].
+    cache: Arc<InMemoryCache>,
     handlers: FunnelHandlers<S, L, F>,
     invites: InviteTracker<P>,
     invite_source: I,
@@ -517,9 +520,11 @@ impl<
         snapshots: P,
     ) -> Self {
         Self {
-            cache: InMemoryCache::builder()
-                .resource_types(cache_resource_types())
-                .build(),
+            cache: Arc::new(
+                InMemoryCache::builder()
+                    .resource_types(cache_resource_types())
+                    .build(),
+            ),
             handlers: FunnelHandlers::new(store, leveling, facts),
             invites: InviteTracker::new(snapshots),
             invite_source,
@@ -567,7 +572,15 @@ impl<
     /// Access the cache (shard runner updates, tests seed).
     #[must_use]
     pub fn cache(&self) -> &InMemoryCache {
-        &self.cache
+        self.cache.as_ref()
+    }
+
+    /// Share the live cache with a long-lived runtime. The saved-recovery
+    /// inventory reads per-channel visibility evidence from this handle;
+    /// the shard runner keeps updating the same allocation.
+    #[must_use]
+    pub fn cache_shared(&self) -> Arc<InMemoryCache> {
+        self.cache.clone()
     }
 
     /// Access the invite source (replay tests queue scripted snapshots).

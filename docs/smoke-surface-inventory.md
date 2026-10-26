@@ -16,12 +16,12 @@ verdicts in `docs/smoke-run-record.md`.
   core → scorecard → automations → announcements → moderation.
 
 Saved inventory: 7 core + 1 scorecard + 12 automations + 11 announcements +
-9 moderation + 2 private reads = **42 built-ins**. Machine-readable mirror:
+9 moderation + 3 private reads = **43 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
-The test extends this saved fixture in memory with `/lfg-edit`: **43 compiled
-built-ins**, five covered and 38 deferred. The saved JSON deliberately excludes
+The test extends this saved fixture in memory with `/lfg-edit`: **44 compiled
+built-ins**, five covered and 39 deferred. The saved JSON deliberately excludes
 edit; this extension is not a live-publication or smoke-acceptance claim.
 
 ## Covered: the smoke five (one per routing family)
@@ -90,6 +90,7 @@ handler family with a covered command.
 | `/unlock` | moderation | Channel-state mutation; excluded from the read-only smoke. |
 | `/purge-preview` | moderation | Next-only private read with no legacy counterpart; the sampled preview is pinned by the offline preview/inspect acceptance tests rather than the live smoke five. |
 | `/channel-inspect` | moderation | Next-only private read with no legacy counterpart; the restriction snapshot is pinned by the offline preview/inspect acceptance tests rather than the live smoke five. |
+| `/lockdown-records` | moderation | Next-only private read with no legacy counterpart; the saved-recovery inventory is pinned by the offline inventory acceptance tests rather than the live smoke five. |
 
 ## How the live-guild pass uses this inventory
 

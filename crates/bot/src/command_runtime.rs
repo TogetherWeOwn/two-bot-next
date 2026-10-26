@@ -58,6 +58,7 @@ use crate::member_runtime::MemberRuntime;
 use crate::self_role_handlers::SelfRoleService;
 use sqlx::{Pool, Postgres};
 use tracing::warn;
+use twilight_cache_inmemory::InMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
     application::interaction::{application_command::CommandOptionValue, Interaction},
@@ -728,6 +729,14 @@ impl CommandRuntime {
     /// pacing lane, one governed admission for both surfaces.
     pub fn executor(&self) -> ActionExecutor {
         self.executor.clone()
+    }
+
+    /// Attach the live gateway cache to the channel slice after boot, once
+    /// the gateway pipeline owns it. The saved-recovery inventory reads
+    /// per-channel visibility evidence from this handle; without it the
+    /// inventory refuses rather than guessing visibility.
+    pub fn set_recovery_visibility_cache(&self, cache: Arc<InMemoryCache>) {
+        self.channel.set_recovery_visibility_cache(cache);
     }
 
     fn spawn(

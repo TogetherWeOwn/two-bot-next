@@ -208,10 +208,12 @@ pub use automod::{
 };
 pub use channel_moderation::{
     message_created_ms, moderation_result_text, plan_lockdown, plan_purge, plan_unlock,
-    require_channel_reason, validate_purge_count, validate_slowmode_seconds, BoundsError,
-    ChannelModerationVerb, ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord,
-    LockdownSeed, MaskError, PurgePlan, PurgeReport, PurgeStopReason, UnlockError, UnlockPlan,
-    LOCKDOWN_BITS, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, SEND_MESSAGES_BIT,
+    require_channel_reason, validate_inventory_page, validate_purge_count,
+    validate_slowmode_seconds, BoundsError, ChannelModerationVerb, ChannelOutcome,
+    EveryoneOverwrite, LockdownInventoryRow, LockdownPlan, LockdownRecord, LockdownSeed, MaskError,
+    PurgePlan, PurgeReport, PurgeStopReason, UnlockError, UnlockPlan, LOCKDOWN_BITS,
+    MAX_PURGE_COUNT, MAX_RECORDS_PAGE, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, MIN_RECORDS_PAGE,
+    SEND_MESSAGES_BIT,
 };
 #[cfg(feature = "db")]
 pub use channel_moderation_store::{

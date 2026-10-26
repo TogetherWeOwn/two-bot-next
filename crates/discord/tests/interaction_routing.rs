@@ -5,7 +5,7 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 43 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 44 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
@@ -277,13 +277,13 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .collect();
     // 23 legacy restricted rows plus management-only command-inspect,
     // command-disable, command-enable, giveaway and welcome-preview, plus
-    // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect and game-mix.
+    // purge-preview, channel-inspect, lockdown-records, lfg-edit, lfg-list, feed-inspect and game-mix.
     // Discord defaults never
     // replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        36,
-        "23 legacy restricted rows plus thirteen Next-only management commands"
+        37,
+        "23 legacy restricted rows plus fourteen Next-only management commands"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
@@ -379,11 +379,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 46);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 47);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 43);
+    assert_eq!(commands.len(), 44);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -445,6 +445,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
         ("purge-preview", HandlerId::PurgePreview),
         ("channel-inspect", HandlerId::ChannelInspect),
+        ("lockdown-records", HandlerId::LockdownRecords),
         ("attendance", HandlerId::ScorecardAttendance),
         ("command", HandlerId::AutomationAdmin),
         ("command-remove", HandlerId::AutomationAdmin),
@@ -1175,7 +1176,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 44, "no partial view");
+    assert_eq!(names.len(), 45, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1209,6 +1210,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         "unlock",
         "purge-preview",
         "channel-inspect",
+        "lockdown-records",
         "faq",
     ] {
         assert!(names.contains(&expected), "{expected} published");

@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 64.
+Built-in commands: 65.
 
 ## `/access`
 
@@ -471,6 +471,17 @@ Prevent @everyone from sending messages
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/lockdown-records`
+
+Privately list saved lockdown recovery records
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | 100 | — | — | Records page to show (1-100) |
 
 ## `/logging`
 

@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 42,
+  "count": 43,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -1573,6 +1573,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only private read; covered by offline preview/inspect acceptance, outside the unchanged top-five live smoke."
+    },
+    {
+      "name": "lockdown-records",
+      "description": "Privately list saved lockdown recovery records",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "16",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "page",
+          "description": "Records page to show (1-100)",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": 100,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private read; covered by offline inventory acceptance, outside the unchanged top-five live smoke."
     }
   ]
 }

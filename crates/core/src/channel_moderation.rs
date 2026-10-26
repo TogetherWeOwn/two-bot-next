@@ -10,6 +10,10 @@ use super::moderation::{require_moderation_reason, ModerationAction, ReasonError
 
 pub const MIN_PURGE_COUNT: u64 = 1;
 pub const MAX_PURGE_COUNT: u64 = 100;
+/// Saved-recovery inventory pages: the command definition and the runtime
+/// validator share this bound, so an advertised page always executes.
+pub const MIN_RECORDS_PAGE: u64 = 1;
+pub const MAX_RECORDS_PAGE: u64 = 100;
 pub const MAX_SLOWMODE_SECONDS: u64 = 21_600;
 pub const SEND_MESSAGES_BIT: u64 = 2048;
 /// Discord permission bits that let a member keep talking in a channel without
@@ -166,6 +170,20 @@ pub fn plan_purge(ids: &[u64], now_ms: u64) -> PurgePlan {
 }
 
 /// Zero disables slowmode; both ends of the range are inclusive.
+/// Validate the saved-recovery inventory's optional `page`: omitted selects
+/// page one at the call site, so `None` refuses here and the caller maps
+/// absence before calling.
+pub fn validate_inventory_page(page: Option<u64>) -> Result<u64, BoundsError> {
+    match page {
+        Some(n) if (MIN_RECORDS_PAGE..=MAX_RECORDS_PAGE).contains(&n) => Ok(n),
+        _ => Err(BoundsError {
+            field: "page",
+            min: MIN_RECORDS_PAGE,
+            max: MAX_RECORDS_PAGE,
+        }),
+    }
+}
+
 pub fn validate_slowmode_seconds(seconds: Option<u64>) -> Result<u64, BoundsError> {
     match seconds {
         Some(n) if n <= MAX_SLOWMODE_SECONDS => Ok(n),
@@ -213,6 +231,17 @@ pub struct LockdownRecord {
     /// fence only the request ledger, not this recovery row); this token
     /// fences only the cleanup half. Wiring follow-up: TOG-10174.
     pub recovery_generation: String,
+}
+
+/// One saved recovery row projected by the private guild inventory read.
+/// Display fields only: capability-adjacent columns (overwrite masks,
+/// existence flags, recovery generations) are never selected, so they
+/// cannot leak into inventory output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockdownInventoryRow {
+    pub channel_id: String,
+    pub reason: String,
+    pub locked_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +408,23 @@ mod tests {
                     field: "count",
                     min: 1,
                     max: 100
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_page_bounds_match_the_advertised_range() {
+        for good in [MIN_RECORDS_PAGE, 50, MAX_RECORDS_PAGE] {
+            assert_eq!(validate_inventory_page(Some(good)), Ok(good));
+        }
+        for bad in [None, Some(0), Some(MAX_RECORDS_PAGE + 1), Some(u64::MAX)] {
+            assert_eq!(
+                validate_inventory_page(bad),
+                Err(BoundsError {
+                    field: "page",
+                    min: MIN_RECORDS_PAGE,
+                    max: MAX_RECORDS_PAGE
                 })
             );
         }

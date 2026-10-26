@@ -574,6 +574,7 @@ mod tests {
                 ("timeout", "duration_seconds", 60, Some(2_419_200), true),
                 ("purge", "count", 1, Some(100), true),
                 ("purge-preview", "count", 1, Some(100), true),
+                ("lockdown-records", "page", 1, Some(100), false),
                 ("slowmode", "seconds", 0, Some(21_600), true),
                 ("schedule", "in-minutes", 1, Some(525_600), false),
                 ("schedule", "every-minutes", 60, Some(525_600), false),
@@ -599,7 +600,7 @@ mod tests {
                 // still requires one.
                 if !matches!(
                     definition.name.as_str(),
-                    "purge-preview" | "channel-inspect"
+                    "purge-preview" | "channel-inspect" | "lockdown-records"
                 ) {
                     let reason = definition
                         .options

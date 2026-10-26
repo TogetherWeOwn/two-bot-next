@@ -34,8 +34,9 @@
 //!   race disclaimer `not a guarantee`. Message bodies are NEVER echoed.
 //! * Inspect text tokens (exact, lowercase): `lockdown: active` /
 //!   `lockdown: none` (from the existing store getter), `reason: <stored>`
-//!   verbatim when active, `set at: YYYY-MM-DD` (calendar date from the stored
-//!   `locked_at`) or `set at: unknown`, `set by: <actor id>` (latest
+//!   verbatim when active, `set at: <full stored RFC3339 instant>` (shared
+//!   with the saved-recovery inventory so same-date locks stay
+//!   distinguishable) or `set at: unknown`, `set by: <actor id>` (latest
 //!   `moderation.lockdown` audit row for the channel) or `set by: unknown`,
 //!   and `slowmode: <n>s` / `slowmode: off` (0 or missing) /
 //!   `slowmode: unknown` (live channel read failed; the inspect still succeeds

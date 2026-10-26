@@ -223,6 +223,20 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
             "Privately inspect saved lockdown and live slowmode",
         )
         .permissions(PERM_MANAGE_CHANNELS),
+        CommandDefinition::new(
+            "lockdown-records",
+            "Privately list saved lockdown recovery records",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![CommandOption::new(
+            "page",
+            "Records page to show (1-100)",
+            CommandOptionType::Integer,
+        )
+        .int_range(
+            super::channel_moderation::MIN_RECORDS_PAGE as i64,
+            super::channel_moderation::MAX_RECORDS_PAGE as i64,
+        )]),
     ]
 }
 
@@ -625,6 +639,7 @@ mod tests {
                 "unlock",
                 "purge-preview",
                 "channel-inspect",
+                "lockdown-records",
             ]
         );
         assert_eq!(ModerationAction::ALL.len(), 9, "reads are not mutations");
@@ -637,8 +652,8 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 7 core + 25 slice-2 + 9 moderation mutations + 2 private reads.
-        assert_eq!(merged.len(), 43);
+        // 7 core + 25 slice-2 + 9 moderation mutations + 3 private reads.
+        assert_eq!(merged.len(), 44);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             &names[..8],
@@ -682,7 +697,8 @@ mod tests {
                 "lockdown",
                 "unlock",
                 "purge-preview",
-                "channel-inspect"
+                "channel-inspect",
+                "lockdown-records"
             ]
         );
         assert!(merged.iter().all(|d| !d.dm_permission));
@@ -813,7 +829,23 @@ mod tests {
                 "default_member_permissions": "16"
             })
         );
-        assert_eq!(json.as_array().expect("array").len(), 11);
+        assert_eq!(
+            json[11],
+            serde_json::json!({
+                "name": "lockdown-records",
+                "description": "Privately list saved lockdown recovery records",
+                "options": [{
+                    "name": "page",
+                    "description": "Records page to show (1-100)",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 100
+                }],
+                "dm_permission": false,
+                "default_member_permissions": "16"
+            })
+        );
+        assert_eq!(json.as_array().expect("array").len(), 12);
     }
 
     #[test]

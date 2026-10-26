@@ -182,6 +182,10 @@ fn all_refusals() -> Vec<(RouterRefusal, String)> {
             RouterRefusal::ChannelInspectPermission,
             "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
         ),
+        (
+            RouterRefusal::LockdownRecordsPermission,
+            "You need the Manage Channels permission to use /lockdown-records. Ask a server moderator or admin to grant it.".to_owned(),
+        ),
     ];
     for action in ModerationAction::ALL {
         rows.push((
@@ -211,6 +215,7 @@ fn refusal_name(refusal: RouterRefusal) -> &'static str {
         RouterRefusal::ModerationPermission(_) => "moderation-permission",
         RouterRefusal::PurgePreviewPermission => "purge-preview-permission",
         RouterRefusal::ChannelInspectPermission => "channel-inspect-permission",
+        RouterRefusal::LockdownRecordsPermission => "lockdown-records-permission",
     }
 }
 

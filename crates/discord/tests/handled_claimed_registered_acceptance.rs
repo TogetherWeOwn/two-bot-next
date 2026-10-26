@@ -210,7 +210,9 @@ fn is_channel_claim(name: &str, handler: HandlerId) -> bool {
         !a.targets_member() && a.command_name() == name && handler == HandlerId::Moderation(a)
     }) || matches!(
         (name, handler),
-        ("purge-preview", HandlerId::PurgePreview) | ("channel-inspect", HandlerId::ChannelInspect)
+        ("purge-preview", HandlerId::PurgePreview)
+            | ("channel-inspect", HandlerId::ChannelInspect)
+            | ("lockdown-records", HandlerId::LockdownRecords)
     )
 }
 

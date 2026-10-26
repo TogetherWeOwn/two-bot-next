@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Independent tests-only saved lockdown recovery inventory handoff. Never merge deliberately RED acceptance tests without the implementation.",
+  "repository": "TogetherWeOwn/two-bot-next",
+  "branch": "test/lockdown-recovery-inventory",
+  "specBaseline": "92d85042527b756062bfc9e19c8d77aed0cee0b3",
+  "executionBaseline": "5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
+  "baselineCompatibility": "The execution baseline is a descendant of the spec baseline. The moderation runtime, read module, store, command definitions and router have identical Git blobs at both baselines.",
+  "protectedFiles": [
+    {
+      "path": "crates/core/tests/lockdown_recovery_inventory_contract.rs",
+      "sha256": "016a0d102fc8b8daf1df88b25c1b1e1507321128a6fc7e7f74b8b7d47e0cc834",
+      "tests": 4
+    },
+    {
+      "path": "crates/discord/tests/lockdown_recovery_inventory_acceptance.rs",
+      "sha256": "62588d5ee84f8f8f639c897dcd6d71e7449a0e20f5041df047968c6f0d5cc31a",
+      "tests": 13
+    }
+  ],
+  "registration": "Both are ordinary Cargo integration targets, automatically discovered by the existing workspace --test '*' CI step. The bot dependency enables discord/db in that graph. Explicit standalone runtime runs MUST use --features db; zero tests without that feature are not evidence. No CI or source file is changed by this handoff.",
+  "commands": {
+    "registry": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test lockdown_recovery_inventory_contract -- --nocapture --test-threads=1",
+    "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lockdown_recovery_inventory_acceptance -- --nocapture --test-threads=1",
+    "existingPlannerAndSetterControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test channel_lockdown_acceptance --test channel_moderation_lockdown_details -- --test-threads=1",
+    "existingRuntimeControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test channel_moderation_preview_inspect_acceptance --test channel_moderation_runtime -- --include-ignored --test-threads=1",
+    "registryReferencePublishControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test registry_golden --test reference_docs --test staging_publish_manifest --test handled_published_contract_acceptance",
+    "discordPublicationControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test registry_golden --test command_registry_sync",
+    "workspace": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test --workspace --locked"
+  },
+  "database": {
+    "guard": "two_bot_testsupport::TestDatabase creates and closes one disposable database per DB test; no staging, production or application DATABASE_URL.",
+    "missingEnvironment": "Database-dependent cases fail explicitly rather than silently skipping.",
+    "databaseFreeRuntimeCases": [
+      "inventory_is_owned_by_existing_read_runtime",
+      "control_current_channel_read_and_manual_mutations_remain_owned",
+      "control_explicit_legacy_adapter_preserves_existing_runtime_ownership",
+      "authorization_and_invalid_pages_deny_before_sensitive_reads_or_http"
+    ]
+  },
+  "contract": {
+    "entry": "Existing moderation read family: /lockdown-records, optional bounded positive integer page, outcome lockdown_records, ephemeral defer/edit. Manage Channels and existing moderation/guild activation gates. No audit-reason argument.",
+    "visibility": "Builder supplies an inherent ChannelModerationRuntime::with_recovery_visibility_cache(Arc<twilight_cache_inmemory::InMemoryCache>) method and wires the same gateway cache in production. A test-only compatibility trait leaves the old runtime executable, not implemented. Effective actor ViewChannel comes from complete cached guild/member/role/channel evidence using existing permission precedence; Manage Channels is not Administrator. Missing facts fail closed, without fetching live overwrites or accepting a caller-provided visibility allowlist. A genuinely new security boundary still requires its own disposition before widening.",
+    "projection": "Complete authorized channel IDs, full saved instant, known/unknown setter, bounded inert reason, explicit saved recovery evidence rather than live/effective lockdown status, and current-channel /channel-inspect next action. No recovery masks or generations.",
+    "pages": "Ascending stable channel IDs, deterministic equal-time ties, at most ten rows per page, complete reachability across the 31-row fixture, stateless default page one, <=2000 UTF-16 units per response. Hidden/cold/foreign rows, including 40 leading cold IDs, do not change visible text, page continuation or totals. Empty, visibility unavailable, query failure and out-of-range pages are distinct.",
+    "sql": "The runtime executes actual guild-scoped ordered LIMIT queries, observed at the SQLx boundary. The observer has a real-store positive control, so an empty/silent observer cannot certify bounds or deny-before-read. Full recovery/audit/idempotency/lane snapshots and query receipts detect cleanup, claim/release or applied-audit writes.",
+    "time": "Two same-date offset-bearing saved instants remain distinct. Current-channel inspect uses the same full saved-time display. Malformed legacy times/setter IDs remain unknown. Equivalent RFC3339 offset/UTC or complete Discord instant tokens are accepted.",
+    "effects": "Inventory executes no live overwrite reads or channel/message HTTP mutations. Respond performs exactly one ephemeral defer and one original edit with empty allowed_mentions; rejected defer performs no SQL read or later HTTP. Authorization/invalid input fails before sensitive reads. No replay claim, lane claim/release, row cleanup, unlock, timer, recovery consumption or mutation audit is authorized.",
+    "controls": "Existing current-channel inspect/purge-preview and lockdown/unlock/slowmode definitions, permissions and runtime ownership remain protected controls. Run the unchanged planner, setter-provenance and moderation runtime targets to preserve manual unlock/exact recovery behavior. Builder owns generated-reference and complete-registry conformance via the existing canonical generators, not a second registry."
+  },
+  "executionEvidence": {
+    "localCargo": "Three attempted bounded Cargo commands were refused with exit 75: no idle, below-budget slot; no per-worktree fallback. No Rust test execution or baseline RED is claimed by this manifest.",
+    "localNoncompiling": "Formatting, floor guard, test inventory, docs index, secret-debug guards, Docker dependency fixtures, cargo-cache Python fixtures, soak-checklist fixtures and voice-template fixtures passed before publication.",
+    "remaining": "Hosted or admitted bounded-pool compilation and behavior-specific baseline RED, with unchanged controls, are required before the build dependency is released. Record exact immutable test head and run/job evidence in the native task handoff document."
+  },
+  "handoff": "Builder consumes the immutable handoff SHA and this path/hash manifest in their own workspace, preserving their harness branch. Never edit either protected test file. Return defective-oracle corrections to the Test Author. Builder owns implementation, generated references, all GREEN checks, independent same-head review and squash auto-merge."
+}

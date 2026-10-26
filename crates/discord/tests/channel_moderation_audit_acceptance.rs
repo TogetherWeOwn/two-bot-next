@@ -364,6 +364,24 @@ impl ChannelModerationStore {
         panic!("lockdown metadata reads are outside this offline acceptance slice")
     }
 
+    pub async fn list_lockdown_inventory(
+        &self,
+        _guild_id: &str,
+        _limit: i64,
+    ) -> Result<Vec<real_core::channel_moderation::LockdownInventoryRow>, Error> {
+        panic!("saved-recovery inventory reads are outside this offline acceptance slice")
+    }
+
+    pub async fn get_inventory_setter(
+        &self,
+        _guild_id: &str,
+        _channel_id: &str,
+        _reason: &str,
+        _locked_at: &str,
+    ) -> Result<Option<String>, Error> {
+        panic!("saved-recovery inventory reads are outside this offline acceptance slice")
+    }
+
     pub async fn record_lockdown(
         &self,
         channel_id: &str,
