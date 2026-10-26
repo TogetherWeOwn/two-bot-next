@@ -37,6 +37,17 @@ const CONFIG_KEYS: &[&str] = &[
     "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
 ];
 
+/// Discord permission bits for preview manageability. Administrator still
+/// respects hierarchy for roles; it only satisfies the permission half.
+const PREVIEW_MANAGE_ROLES: u64 = 1 << 28;
+const PREVIEW_ADMINISTRATOR: u64 = 1 << 3;
+
+const PREVIEW_TOO_MANY_REPLY: &str = "Preview — roles not changed. That proposal has too many choices (limit 10). Nothing was changed. Please open /reopen games again and choose up to 10.";
+const PREVIEW_UNKNOWN_REPLY: &str = "Preview — roles not changed. I couldn't recognize some of those choices (unknown or no longer available). Nothing was changed. Please open /reopen games again and choose from the current menu.";
+const PREVIEW_UNAVAILABLE_REPLY: &str = "Preview — roles not changed. I couldn't load your current roles right now (unavailable). Nothing was changed. Please open /reopen games again and retry.";
+const PREVIEW_CATALOG_CHANGED_REPLY: &str = "Preview — roles not changed. One of those game roles is no longer available (the catalog changed). Nothing was changed. Please open /reopen games again and choose from the current menu.";
+const PREVIEW_DISALLOWED_REPLY: &str = "Preview — roles not changed. I can't apply one of those roles (missing Manage Roles permission or hierarchy). Nothing was changed. Please ask a server admin, then open /reopen games again.";
+
 /// Values own pre-pipeline state: cache updates/removals cannot erase the
 /// pending transition or joined-at used by the asynchronous feature worker.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -466,6 +477,19 @@ impl OnboardingRuntime {
                 )
                 .await;
         }
+        // A no-effect game preview never claims uncertain applied changes.
+        if matches!(
+            interaction.data.as_ref(),
+            Some(InteractionData::MessageComponent(data))
+                if data.custom_id == GAME_PREVIEW_SELECT_ID
+        ) {
+            return self
+                .reply(
+                    interaction,
+                    "Preview — roles not changed. I couldn't confirm this preview. No roles were changed. Please open the menu and try again.",
+                )
+                .await;
+        }
         self.reply(
             interaction,
             "I couldn't confirm this interaction. Your selection may already have been processed, so I won't apply it again. Please open the menu and try again.",
@@ -752,6 +776,7 @@ impl OnboardingRuntime {
             return self.reopen_menu(config, interaction).await;
         }
         let RoutedInteraction::Component {
+            custom_id,
             values,
             outcome: ComponentOutcome::Handled { handler },
             ..
@@ -776,6 +801,15 @@ impl OnboardingRuntime {
         };
         if user.bot {
             return Ok(());
+        }
+        // Preview is a separate no-effect route on the same handler: it
+        // re-reads current roles/catalog, never writes, and never shares the
+        // apply error boundary (no retract, no "may already have changed").
+        if custom_id == GAME_PREVIEW_SELECT_ID {
+            let keys: Vec<_> = values.iter().map(String::as_str).collect();
+            return self
+                .preview_game_selection(config, interaction, &keys, user.id.get())
+                .await;
         }
         // The caller has confirmed ingress defer and committed the delivery
         // receipt. Never issue a second initial callback from a feature worker.
@@ -1105,6 +1139,177 @@ impl OnboardingRuntime {
         Ok(())
     }
 
+    /// Preview proposed game-role changes without applying them.
+    ///
+    /// Read-only: re-reads the member's CURRENT roles and the CURRENT role
+    /// catalog, reuses the pure [`adjudicate_game_select`] policy with
+    /// `dry_run=false` (dry-run effects are empty, not a diff), and computes
+    /// actual additions by set difference (normal `add_role_ids` includes
+    /// already-held roles). Unknown-only input never implies clearing;
+    /// malformed, disallowed or unavailable evidence gets actionable private
+    /// guidance. Performs zero role, funnel, audit, ticket or public effects;
+    /// a later apply re-validates everything separately.
+    async fn preview_game_selection(
+        &self,
+        config: &OnboardingConfig,
+        interaction: &Interaction,
+        keys: &[&str],
+        member_id: u64,
+    ) -> Result<(), RuntimeError> {
+        // Forged UI bypass: the menu caps at the full catalog, Discord at 25.
+        if keys.len() > GAME_PICKS.len() {
+            return self.reply(interaction, PREVIEW_TOO_MANY_REPLY).await;
+        }
+        // Deduplicate: normal policy counts each grant once, never twice.
+        let mut seen = HashSet::new();
+        let mut proposed: Vec<&str> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if seen.insert(*key) {
+                proposed.push(*key);
+            }
+        }
+        // Only stable current game keys. Empty is a deliberate clear preview;
+        // unknown, platform, raw-role or forged input is guidance, never a diff.
+        if proposed
+            .iter()
+            .any(|key| !GAME_PICKS.iter().any(|pick| pick.key == *key))
+        {
+            return self.reply(interaction, PREVIEW_UNKNOWN_REPLY).await;
+        }
+        // Fresh member roles; unreadable evidence is unavailable, never empty.
+        let held: Vec<String> =
+            match MemberAccess::load(&self.executor, config.guild_id, member_id).await {
+                Ok(Some(access)) => access.role_ids,
+                Ok(None) | Err(_) => {
+                    return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+                }
+            };
+        let held_refs: Vec<&str> = held.iter().map(String::as_str).collect();
+        // Fresh catalog for existence and manageability.
+        let roles_value = match self
+            .executor
+            .get_json_checked(&format!("/guilds/{}/roles", config.guild_id))
+            .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) | Err(_) => {
+                return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+            }
+        };
+        let Some(roles) = roles_value.as_array() else {
+            return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+        };
+        let mut catalog: HashMap<&str, (bool, i64)> = HashMap::with_capacity(roles.len());
+        for role in roles {
+            let (Some(id), Some(managed), Some(position)) = (
+                role.get("id").and_then(serde_json::Value::as_str),
+                role.get("managed").and_then(serde_json::Value::as_bool),
+                role.get("position").and_then(serde_json::Value::as_i64),
+            ) else {
+                return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+            };
+            catalog.insert(id, (managed, position));
+        }
+        // Proposed roles must still exist.
+        let proposed_roles: Vec<&str> = proposed
+            .iter()
+            .filter_map(|key| {
+                GAME_PICKS
+                    .iter()
+                    .find(|pick| pick.key == *key)
+                    .map(|pick| pick.role_id)
+            })
+            .collect();
+        if proposed_roles
+            .iter()
+            .any(|role| !catalog.contains_key(*role))
+        {
+            return self.reply(interaction, PREVIEW_CATALOG_CHANGED_REPLY).await;
+        }
+        // Pure policy for removals; additions by set difference.
+        let Some(outcome) = adjudicate_game_select(
+            config.gates.mode,
+            &proposed,
+            &held_refs,
+            &|_| false,
+            config.guild_id,
+            false,
+        ) else {
+            return self
+                .reply(
+                    interaction,
+                    "The games preview isn't enabled right now. No selection was applied. Please try again once it is enabled.",
+                )
+                .await;
+        };
+        let held_set: HashSet<&str> = held_refs.iter().copied().collect();
+        let selected_set: HashSet<&str> =
+            outcome.routed.role_ids.iter().map(String::as_str).collect();
+        let game_roles: HashSet<&str> = GAME_PICKS.iter().map(|pick| pick.role_id).collect();
+        let mut additions: Vec<&str> = outcome
+            .routed
+            .role_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|role| !held_set.contains(role))
+            .collect();
+        let mut removals: Vec<&str> = outcome.remove_role_ids.iter().map(String::as_str).collect();
+        let mut unchanged: Vec<&str> = held_set
+            .intersection(&game_roles)
+            .copied()
+            .filter(|role| selected_set.contains(role))
+            .collect();
+        // Stable catalog order for every list.
+        let order = |role: &str| {
+            GAME_PICKS
+                .iter()
+                .position(|pick| pick.role_id == role)
+                .unwrap_or(usize::MAX)
+        };
+        additions.sort_by_key(|role| order(*role));
+        removals.sort_by_key(|role| order(*role));
+        unchanged.sort_by_key(|role| order(*role));
+        // Manageability: adding and removing both need Manage Roles (or
+        // Administrator) plus an unmanaged target below the bot.
+        let bot = match MemberAccess::load(&self.executor, config.guild_id, self.bot_id).await {
+            Ok(Some(access)) => access,
+            Ok(None) | Err(_) => {
+                return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+            }
+        };
+        if bot.permissions() & (PREVIEW_MANAGE_ROLES | PREVIEW_ADMINISTRATOR) == 0 {
+            return self.reply(interaction, PREVIEW_DISALLOWED_REPLY).await;
+        }
+        let mut highest: Option<i64> = None;
+        for role_id in &bot.role_ids {
+            match catalog.get(role_id.as_str()) {
+                Some((_, position)) => {
+                    highest = Some(highest.map_or(*position, |high| high.max(*position)));
+                }
+                None => {
+                    return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+                }
+            }
+        }
+        let Some(highest) = highest else {
+            return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+        };
+        for role in additions.iter().chain(removals.iter()) {
+            match catalog.get(*role) {
+                Some((managed, position)) => {
+                    if *managed || *position >= highest {
+                        return self.reply(interaction, PREVIEW_DISALLOWED_REPLY).await;
+                    }
+                }
+                None => {
+                    return self.reply(interaction, PREVIEW_CATALOG_CHANGED_REPLY).await;
+                }
+            }
+        }
+        let output = render_game_preview(&additions, &removals, &unchanged);
+        self.reply(interaction, &output).await
+    }
+
     /// Finish a game-picker role loop that failed partway with some roles
     /// already flipped. With nothing applied this is the legacy total failure
     /// (generic role reply, nothing recorded). Otherwise the applied grants
@@ -1244,6 +1449,42 @@ fn game_partial_failure_reply(applied: &[String], pending: &[String]) -> String 
         applied.join(", "),
         pending.join(", ")
     )
+}
+
+/// Member-facing preview diff: header plus Additions/Removals/Unchanged.
+/// Labels only, never raw input or ids; empty lists say None explicitly.
+/// Bounded to Discord's 2000-char ceiling with an explicit truncation note.
+fn render_game_preview(additions: &[&str], removals: &[&str], unchanged: &[&str]) -> String {
+    fn labels(roles: &[&str]) -> Vec<&'static str> {
+        roles
+            .iter()
+            .filter_map(|role| {
+                GAME_PICKS
+                    .iter()
+                    .find(|pick| pick.role_id == *role)
+                    .map(|pick| pick.label)
+            })
+            .collect()
+    }
+    fn section(heading: &str, labels: &[&'static str]) -> String {
+        if labels.is_empty() {
+            format!("**{heading}**\nNone")
+        } else {
+            format!("**{heading}**\n{}", labels.join("\n"))
+        }
+    }
+    let output = format!(
+        "Preview — roles not changed. Nothing was changed. To apply these choices, use the games picker above or open /reopen games again.\n\n{}\n\n{}\n\n{}",
+        section("Additions", &labels(additions)),
+        section("Removals", &labels(removals)),
+        section("Unchanged", &labels(unchanged)),
+    );
+    if output.chars().count() <= 2000 {
+        output
+    } else {
+        let kept: String = output.chars().take(1969).collect();
+        format!("{kept}\n…(preview truncated for display.)")
+    }
 }
 
 #[cfg(test)]
