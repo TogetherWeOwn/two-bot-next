@@ -44,6 +44,9 @@ use two_bot_discord::{
 };
 use two_bot_testsupport::TestDatabase;
 
+#[path = "support/custom_command_trigger_eligibility.rs"]
+mod trigger_eligibility;
+
 const MANAGEMENT: &str = "command-inspect";
 const TOKEN: &str = "inspect-acceptance-fixture";
 

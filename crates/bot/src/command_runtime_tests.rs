@@ -35,6 +35,8 @@ mod member_strict_decode_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
 mod sticky_uncertain_acceptance_tests;
 
+#[path = "custom_command_inspect_eligibility_acceptance.rs"]
+mod custom_command_inspect_eligibility_acceptance;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 #[path = "custom_command_toggle_acceptance.rs"]
