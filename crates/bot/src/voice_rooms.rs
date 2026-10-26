@@ -12144,13 +12144,13 @@ enum SetupOptionKind {
 
 impl SetupOptionKind {
     fn matches(self, value: &CommandOptionValue) -> bool {
-        match (self, value) {
+        matches!(
+            (self, value),
             (Self::String, CommandOptionValue::String(_))
-            | (Self::Integer, CommandOptionValue::Integer(_))
-            | (Self::Boolean, CommandOptionValue::Boolean(_))
-            | (Self::Channel, CommandOptionValue::Channel(_)) => true,
-            _ => false,
-        }
+                | (Self::Integer, CommandOptionValue::Integer(_))
+                | (Self::Boolean, CommandOptionValue::Boolean(_))
+                | (Self::Channel, CommandOptionValue::Channel(_))
+        )
     }
 }
 
@@ -12811,7 +12811,7 @@ impl VoiceCommand {
             Self::InheritPermissions { .. } => "inheritpermissions",
             Self::DefaultLimit { .. } => "defaultlimit",
             Self::AlwaysPrivate { .. } => "alwaysprivate",
-            Self::SetupShapeInvalid { command, .. } => *command,
+            Self::SetupShapeInvalid { command, .. } => command,
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Private => "private",
