@@ -1,7 +1,6 @@
 //! Protected edge cases for the close-repair acceptance target; not a production adapter.
 use super::*;
 use std::sync::Mutex;
-use tracing::instrument::WithSubscriber;
 use two_bot_core::lfg::LfgSelectAction;
 
 #[tokio::test]
@@ -274,6 +273,36 @@ impl std::io::Write for Capture {
     }
 }
 
+/// Process-wide log capture for this test binary.
+///
+/// A scoped `with_subscriber` capture can miss the repair diagnostic:
+/// `tracing-core` resolves a callsite's first registration against the
+/// registering thread's default while only one dispatcher is live, so a
+/// sibling test that reaches the same `warn!` callsite first can cache
+/// no-interest for it and the scoped subscriber is then never consulted.
+/// One global install keeps callsite interest stable for the whole binary;
+/// the logging test reads only the bytes appended after its own start
+/// offset and attributes the classified event by its unique post id.
+fn global_capture() -> Capture {
+    static LOG: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .json()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .expect("install global log capture");
+        capture
+    })
+    .clone()
+}
+
 #[tokio::test]
 async fn failed_repair_logs_a_bounded_outcome_class_without_member_sql_or_remote_bodies() {
     let f = Fixture::new(403).await;
@@ -281,40 +310,51 @@ async fn failed_repair_logs_a_bounded_outcome_class_without_member_sql_or_remote
     row.title = "MEMBER_TITLE_SENTINEL".into();
     f.seed(&row).await;
     f.close(&row.id).await.expect("close");
-    let capture = Capture::default();
-    let writer = capture.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(move || writer.clone())
-        .finish();
-    let processed = f.tick(clock(), 20).with_subscriber(subscriber).await;
-    let text = String::from_utf8(capture.0.lock().expect("capture").clone()).expect("UTF-8 logs");
+    let capture = global_capture();
+    let start = capture.0.lock().expect("log capture").len();
+    let processed = f.tick(clock(), 20).await;
+    let text = {
+        let bytes = capture.0.lock().expect("capture");
+        String::from_utf8_lossy(&bytes[start.min(bytes.len())..]).into_owned()
+    };
     f.finish().await;
     assert!(!text.contains("MEMBER_TITLE_SENTINEL"));
-    assert!(!text.contains("REMOTE_BODY_SENTINEL"));
-    assert!(!text.contains("SELECT ") && !text.contains("UPDATE "));
-    let classified = text
+    // The global window can also carry sibling tests' events (including
+    // sqlx slow-statement warnings that legitimately quote SQL), so the
+    // remaining content bans and the classification run on the diagnostics
+    // carrying this post's unique id, under any field name. The
+    // member-title sentinel stays window-wide: only this fixture can
+    // source it.
+    let diagnostics: Vec<Value> = text
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .any(|event| {
-            let fields = &event["fields"];
-            let outcome = fields.get("outcome").and_then(Value::as_str);
-            let class = ["error_class", "cause", "code"]
-                .iter()
-                .find_map(|key| fields.get(*key).and_then(Value::as_str));
-            [outcome, class].iter().all(|value| {
-                value.is_some_and(|value| {
-                    !value.is_empty()
-                        && value.len() <= 64
-                        && value
-                            .bytes()
-                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-                })
+        .filter(|event| {
+            event["fields"].as_object().is_some_and(|fields| {
+                fields
+                    .values()
+                    .any(|value| value.as_str() == Some(row.id.as_str()))
             })
-        });
+        })
+        .collect();
+    let diagnostic_text = serde_json::to_string(&diagnostics).expect("diagnostics serialize");
+    assert!(!diagnostic_text.contains("REMOTE_BODY_SENTINEL"));
+    assert!(!diagnostic_text.contains("SELECT ") && !diagnostic_text.contains("UPDATE "));
+    let classified = diagnostics.iter().any(|event| {
+        let fields = &event["fields"];
+        let outcome = fields.get("outcome").and_then(Value::as_str);
+        let class = ["error_class", "cause", "code"]
+            .iter()
+            .find_map(|key| fields.get(*key).and_then(Value::as_str));
+        [outcome, class].iter().all(|value| {
+            value.is_some_and(|value| {
+                !value.is_empty()
+                    && value.len() <= 64
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+        })
+    });
     assert!(processed > 0, "RED: repair attempt must actually execute");
     assert!(
         classified,
