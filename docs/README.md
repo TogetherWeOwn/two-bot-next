@@ -1,11 +1,11 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)`.
 
-Check: `python3 scripts/check_docs_index.py --json` (repo root).
-Empty `{missing,stale,oversize}` = PASS (exit 0); else exit 1: fix rows/split docs.
-Bad/duplicate rows land in `stale` as `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
+Check (repo root): `python3 scripts/check_docs_index.py --json`.
+Empty `{missing,stale,oversize}` = PASS/0; else fix/split (exit 1).
+Bad/duplicate: `stale`, `docs/README.md:<line>`.
+Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -143,6 +143,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
+- [Opener copy proposal](ticket-opener-copy-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
