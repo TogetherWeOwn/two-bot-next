@@ -14,10 +14,12 @@ draw, and run its lifecycle without rewriting history. A browser draft is
 **not** a giveaway, and a stored giveaway row is **not** a drawn result.
 
 **Recommend wiring-first, not a dashboard editor over today's surface.**
-Inventory at source commit `5e870a8251b3382c7b2f7f72c97f785a6710238e` finds
-eight shipped slash subcommands, but no guild template/config store, no signed
-giveaway read or lifecycle verb, no revision column, and unaudited
-pause/resume/extend. After intent acceptance, the smallest eventual page is a
+Inventory at source commit `fb11f134ac002a8a6fa6e9982c7b1de03734fbb1` finds
+nine shipped slash subcommands (eight in this contract plus read-only
+`inspect`, owned by the inspect slice), but no guild template/config store, no
+signed giveaway read or lifecycle verb, and no revision column.
+Pause/resume/extend audit with actor attribution in the same transaction.
+After intent acceptance, the smallest eventual page is a
 read-only active list plus detail behind one new least-privilege read verb
 (GW-B1 below). Lifecycle writes wait for GW-W1/GW-W2. If prerequisites cannot
 be proved, choose **no-build**, not a form that cannot act truthfully. Nothing
@@ -26,12 +28,14 @@ is built by this spec, including the narrowed read-only page.
 ## Source-backed inventory
 
 Giveaways are per-giveaway slash options only: one `giveaway` command with
-eight subcommands (`crates/core/src/feature_commands.rs:284`), all gated by
+nine subcommands (`crates/core/src/feature_commands.rs:284`), all gated by
 `PERM_MANAGE_GUILD` (`:286`; bit 32, `crates/core/src/commands.rs:286`).
-Entry buttons stay open to members. There is no guild template, default, or
-configuration row: create carries prize, duration, winners, one required role
-and two age gates as invocation options
-(`crates/discord/src/giveaway.rs:291-321`). The word "giveaway" appears nowhere
+Eight are in this contract; `inspect` (private channel-scoped saved detail)
+ships but stays with the inspect slice — the oracle pins its presence without
+contracting it. Entry buttons stay open to members. There is no guild
+template, default, or configuration row: create carries prize, duration,
+winners, one required role and two age gates as invocation options
+(`crates/discord/src/giveaway.rs:343-373`). The word "giveaway" appears nowhere
 in `crates/core/src/internal_actions.rs`, so no signed internal verb reads or
 mutates giveaways today; the web cannot reuse a transport the way the ticket
 page reuses `settings.get`/`settings.set`.
@@ -49,25 +53,25 @@ re-validate every entrant.
 The 15 s draw ticker claims due rows under a 600 s lease
 (`crates/bot/src/giveaway_runtime.rs:16`;
 `crates/discord/src/giveaway.rs:44`), re-validates every entrant against fresh
-membership reads (`:874-912`), commits the draw row plus the drawn flip
-atomically (`:842`), audits before announcing (`:860-869`), and retries
+membership reads (`:926-964`), commits the draw row plus the drawn flip
+atomically (`:894`), audits before announcing (`:912-921`), and retries
 announce from the stored row. A transport failure aborts the draw; it never
-silently shrinks the eligible set (`:923-929`). A crash between the draw-row
+silently shrinks the eligible set (`:975-981`). A crash between the draw-row
 insert and the drawn flip replays the stored row and never re-draws
-(`:761-788`).
+(`:813-840`).
 
 ### Present vs proposed
 
 | Shipped slash behavior | Proposed dashboard control | Page state |
 | --- | --- | --- |
-| GW-C1 `create`: validates prize/winners/duration (`giveaway.rs:201`), admits under quota+idempotency (`giveaway_store.rs:711-744`), posts the entry message, neutralizes orphans on attach failure (`giveaway.rs:348-375`) | Draft composer; drafts stay browser-local until a submit verb exists | `draft_only` until GW-W1 |
-| GW-C2 `list`: open+paused only, ends-first, max 10, 32-char prize preview (`giveaway.rs:154-170`) | Read-only active list + active-row detail (status, `updated_at`, `latest_draw_no`, `announced_at`, deadline, counts) | `candidate_readonly` after GW-W1 |
+| GW-C1 `create`: validates prize/winners/duration (`giveaway.rs:201`), admits under quota+idempotency (`giveaway_store.rs:711-744`), posts the entry message, neutralizes orphans on attach failure (`giveaway.rs:400-427`) | Draft composer; drafts stay browser-local until a submit verb exists | `draft_only` until GW-W1 |
+| GW-C2 `list`: open+paused only, ends-first, max 10, 32-char prize preview (`giveaway.rs:170-186`) | Read-only active list + active-row detail (status, `updated_at`, `latest_draw_no`, `announced_at`, deadline, counts) | `candidate_readonly` after GW-W1 |
 | GW-C3 `cancel`: open/paused-to-cancelled, clears claims, audited (`giveaway_store.rs:873-887`); can win a race against a draw in flight | Explicit confirm; re-read after commit because cancel-vs-draw races | `disabled_lifecycle` until GW-W1+GW-W2 |
-| GW-C4 `end`: claims open/paused (`:371-397`), draws under claim, commits from prior status (`:478-509`), audits, announces (`giveaway.rs:381-422`) | Explicit confirm; refused while claimed; re-read names the actual state | `disabled_lifecycle` until GW-W1+GW-W2 |
-| GW-C5 `pause`: open-to-paused only when unclaimed (`giveaway_store.rs:899-916`); leaves the due scan; **no audit row** | Explicit confirm; refused mid-draw | `disabled_lifecycle` until GW-W1+GW-W2 |
-| GW-C6 `resume`: paused-to-open with deadline shifted by the paused span (`:924-961`); **no audit row** | Explicit confirm; shows the recomputed deadline before commit | `disabled_lifecycle` until GW-W1+GW-W2 |
-| GW-C7 `extend`: open/paused deadline += 1 s–30 d (`giveaway.rs:325-330`; `:969-1007`); paused stays paused; **no audit row** | Explicit confirm; shows the new deadline before commit | `disabled_lifecycle` until GW-W1+GW-W2 |
-| GW-C8 `reroll`: requires a stored draw; re-validates members; appends `draw_no+1` (`giveaway.rs:430-524`); full or `single:<id>`; audited (`:1062-1080`) | Explicit confirm; refused before first draw; appends, never rewrites | `disabled_lifecycle` until GW-W1+GW-W2 |
+| GW-C4 `end`: claims open/paused (`:436-448`), draws under claim, commits from prior status (`:894-900`), audits (`:912-921`), announces (`:1077`) | Explicit confirm; refused while claimed; re-read names the actual state | `disabled_lifecycle` until GW-W1+GW-W2 |
+| GW-C5 `pause`: open-to-paused only when unclaimed (`giveaway_store.rs:910-933`); leaves the due scan; audited (`giveaway.pause`, actor, same transaction) | Explicit confirm; refused mid-draw | `disabled_lifecycle` until GW-W1+GW-W2 |
+| GW-C6 `resume`: paused-to-open with deadline shifted by the paused span (`:951-990`); audited (`giveaway.resume`, actor, same transaction) | Explicit confirm; shows the recomputed deadline before commit | `disabled_lifecycle` until GW-W1+GW-W2 |
+| GW-C7 `extend`: open/paused deadline += 1 s–30 d (`giveaway.rs:325-330`; `:1009-1049`); paused stays paused; audited (`giveaway.extend`, actor, same transaction) | Explicit confirm; shows the new deadline before commit | `disabled_lifecycle` until GW-W1+GW-W2 |
+| GW-C8 `reroll`: requires a stored draw; re-validates members; appends `draw_no+1` (`giveaway.rs:482-576`); full or `single:<id>`; audited (`:1114-1132`) | Explicit confirm; refused before first draw; appends, never rewrites | `disabled_lifecycle` until GW-W1+GW-W2 |
 
 ### Control map
 
@@ -77,13 +81,13 @@ insert and the drawn flip replays the stored row and never re-draws
 | GW-C2 list | none (read) | Manage Server | `list_active` | none | organizer only |
 | GW-C3 cancel | status open/paused; id charset `[A-Za-z0-9_-]{1,64}` | Manage Server | `cancel_audited` | `giveaway.cancel` | message refresh; tick skips cancelled |
 | GW-C4 end | claim free/expired; prior status open/paused | Manage Server | `claim_specific`, `commit_draw_from` | `giveaway.draw` | announce sweep; members replay from seed |
-| GW-C5 pause | status open + unclaimed | Manage Server | `pause_giveaway` | **none shipped** | due scan skips paused |
-| GW-C6 resume | status paused; deadline math saturates | Manage Server | `resume_giveaway` | **none shipped** | due scan resumes |
-| GW-C7 extend | 1–2592000 s via `extend_deadline_ms`; status open/paused | Manage Server | `extend_giveaway` | **none shipped** | countdown refresh; due scan |
+| GW-C5 pause | status open + unclaimed | Manage Server | `pause_audited` | `giveaway.pause` | due scan skips paused |
+| GW-C6 resume | status paused; deadline math saturates | Manage Server | `resume_audited` | `giveaway.resume` | due scan resumes |
+| GW-C7 extend | 1–2592000 s via `extend_deadline_ms`; status open/paused | Manage Server | `extend_audited` | `giveaway.extend` | countdown refresh; due scan |
 | GW-C8 reroll | prior draw exists; target (if any) is a current winner | Manage Server | `insert_reroll_draw` | `giveaway.reroll` | announce sweep; replay per round seed |
 
 Commands and the supervised ticker serialize on one effects mutex
-(`giveaway.rs:110-136`), and every mutating store path takes row locks or
+(`giveaway.rs:113-139`), and every mutating store path takes row locks or
 claim-conditional updates, so the dashboard's future verbs must join the same
 exclusion rather than invent a parallel writer.
 
@@ -136,7 +140,7 @@ claimed row refuses with `RACE_LOST`; on a lost race the page re-reads and
 names cancelled vs drawn. Pause during a draw refuses (claim guard); end during
 a pause draws from paused. Every lifecycle reply pattern follows the shipped
 `end` shape: commit, then re-read, then name the actual state
-(`giveaway.rs:396-413`).
+(`giveaway.rs:448-465`).
 
 ### CAS, idempotency and dry-run
 
@@ -144,7 +148,7 @@ No `giveaways` revision column ships. The proposed expected-state guard is
 `(status, updated_at, latest_draw_no, announced_at)` supplied with every
 lifecycle intent and re-checked server-side under the row lock before the
 mutation; any mismatch refuses with `STALE_STATE` and keeps the draft.
-`updated_at` stamps on every mutation (`:404-423` release path included), and
+`updated_at` stamps on every mutation (`:456-475` release path included), and
 inserts carry monotonic `draw_no`, so the tuple detects lifecycle races,
 reroll races and announce transitions without a schema change. The existing
 `set_giveaway_status` CAS primitive has no production callers; the proposal
@@ -181,15 +185,16 @@ what the admin could already set. One narrow exception: `winner_ids` for a
 round only when that round's `announced_at IS NOT NULL`, enforced server-side
 in the read verb — the field is omitted, not client-hidden, while
 unannounced. Announced winners are already published as mentions in the
-giveaway channel (`giveaway.rs:1025`), so this reads back facts the guild
+giveaway channel (`giveaway.rs:1077`), so this reads back facts the guild
 already saw; drawn-but-unannounced winners are never returned. Writes split
 by effect: create vs
 lifecycle-transition vs reroll-append, each refusing outside its transition
 set. Attribution derives `created_by`/actor from the authenticated admin's
 Discord identity on the server, never editable browser input, matching the
-shipped `actor_id` derivation (`giveaway.rs:1129`). Lifecycle audit rows that
-do not exist today (pause/resume/extend) must exist before those controls
-enable; the page shows no guessed history.
+shipped `actor_id` derivation (`giveaway.rs:1181`). Lifecycle audit rows ship
+for every transition (create/cancel/draw/reroll/pause/resume/extend); future
+dashboard verbs must reuse them with server-side attribution, and the page
+shows no guessed history.
 
 ### Honest state and failure UX
 
@@ -240,15 +245,15 @@ forces re-inventory instead of passing on a stale snapshot.
 ```json
 {
   "schema": "dashboard.giveaway.v1",
-  "source_sha": "5e870a8251b3382c7b2f7f72c97f785a6710238e",
+  "source_sha": "fb11f134ac002a8a6fa6e9982c7b1de03734fbb1",
   "controls": [
     {"id":"GW-C1","slash":"create","state":"draft_only","gate":["GW-W1"],"evidence":["E-CMD","E-PERM","E-VALIDATE","E-CREATE","E-QUOTA","E-AUDIT-CREATE"]},
     {"id":"GW-C2","slash":"list","state":"candidate_readonly","gate":["GW-W1"],"evidence":["E-LIST","E-PERM"]},
     {"id":"GW-C3","slash":"cancel","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-CANCEL","E-PERM","E-AUDIT-CANCEL"]},
     {"id":"GW-C4","slash":"end","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-END","E-COMMIT","E-AUDIT","E-PERM"]},
-    {"id":"GW-C5","slash":"pause","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-PAUSE","E-PERM"]},
-    {"id":"GW-C6","slash":"resume","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-RESUME","E-PERM"]},
-    {"id":"GW-C7","slash":"extend","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-EXTEND","E-VALIDATE-EXTEND","E-PERM"]},
+    {"id":"GW-C5","slash":"pause","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-PAUSE","E-PERM","E-AUDIT-PAUSE"]},
+    {"id":"GW-C6","slash":"resume","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-RESUME","E-PERM","E-AUDIT-RESUME"]},
+    {"id":"GW-C7","slash":"extend","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-EXTEND","E-VALIDATE-EXTEND","E-PERM","E-AUDIT-EXTEND"]},
     {"id":"GW-C8","slash":"reroll","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-REROLL","E-ELIG","E-AUDIT-REROLL","E-PERM"]}
   ],
   "other_states": [
@@ -269,25 +274,28 @@ forces re-inventory instead of passing on a stale snapshot.
     "E-VALIDATE-EXTEND":{"path":"crates/core/src/giveaway.rs","line":325,"contains":"pub fn extend_deadline_ms"},
     "E-STATUS":{"path":"crates/core/src/giveaway.rs","line":63,"contains":"ALL: [Self; 5]"},
     "E-TRANSITION":{"path":"crates/core/src/giveaway.rs","line":299,"contains":"pub fn transition"},
-    "E-CREATE":{"path":"crates/discord/src/giveaway.rs","line":348,"contains":"create_admitted"},
-    "E-LIST":{"path":"crates/discord/src/giveaway.rs","line":155,"contains":"list_active"},
-    "E-CANCEL":{"path":"crates/discord/src/giveaway.rs","line":176,"contains":"cancel_audited"},
-    "E-END":{"path":"crates/discord/src/giveaway.rs","line":384,"contains":"claim_specific"},
-    "E-END-DATA":{"path":"crates/discord/src/giveaway.rs","line":418,"contains":"Err(DrawError::Data)"},
-    "E-WINNERS-POST":{"path":"crates/discord/src/giveaway.rs","line":1025,"contains":"winners_posts("},
+    "E-CREATE":{"path":"crates/discord/src/giveaway.rs","line":400,"contains":"create_admitted"},
+    "E-LIST":{"path":"crates/discord/src/giveaway.rs","line":171,"contains":"list_active"},
+    "E-CANCEL":{"path":"crates/discord/src/giveaway.rs","line":192,"contains":"cancel_audited"},
+    "E-END":{"path":"crates/discord/src/giveaway.rs","line":436,"contains":"claim_specific"},
+    "E-END-DATA":{"path":"crates/discord/src/giveaway.rs","line":470,"contains":"Err(DrawError::Data)"},
+    "E-WINNERS-POST":{"path":"crates/discord/src/giveaway.rs","line":1077,"contains":"winners_posts("},
     "E-DUE":{"path":"crates/core/src/giveaway.rs","line":334,"contains":"pub fn is_due"},
     "E-ENTRY-CLOSED":{"path":"crates/core/src/giveaway_store.rs","line":800,"contains":"row.ends_at <= now"},
-    "E-PAUSE":{"path":"crates/discord/src/giveaway.rs","line":195,"contains":"pause_giveaway"},
-    "E-RESUME":{"path":"crates/discord/src/giveaway.rs","line":210,"contains":"resume_giveaway"},
-    "E-EXTEND":{"path":"crates/discord/src/giveaway.rs","line":236,"contains":"extend_giveaway"},
-    "E-REROLL":{"path":"crates/discord/src/giveaway.rs","line":502,"contains":"insert_reroll_draw"},
-    "E-COMMIT":{"path":"crates/discord/src/giveaway.rs","line":842,"contains":"commit_draw_from"},
-    "E-ELIG":{"path":"crates/discord/src/giveaway.rs","line":905,"contains":"adjudicate_eligibility"},
+    "E-PAUSE":{"path":"crates/discord/src/giveaway.rs","line":211,"contains":"pause_audited"},
+    "E-RESUME":{"path":"crates/discord/src/giveaway.rs","line":233,"contains":"resume_audited"},
+    "E-EXTEND":{"path":"crates/discord/src/giveaway.rs","line":265,"contains":"extend_audited"},
+    "E-REROLL":{"path":"crates/discord/src/giveaway.rs","line":554,"contains":"insert_reroll_draw"},
+    "E-COMMIT":{"path":"crates/discord/src/giveaway.rs","line":894,"contains":"commit_draw_from"},
+    "E-ELIG":{"path":"crates/discord/src/giveaway.rs","line":957,"contains":"adjudicate_eligibility"},
     "E-CLAIM":{"path":"crates/discord/src/giveaway.rs","line":44,"contains":"CLAIM_LEASE_SECS"},
-    "E-AUDIT":{"path":"crates/core/src/giveaway_store.rs","line":1039,"contains":"audit_draw"},
-    "E-AUDIT-REROLL":{"path":"crates/core/src/giveaway_store.rs","line":1062,"contains":"audit_reroll"},
+    "E-AUDIT":{"path":"crates/core/src/giveaway_store.rs","line":1091,"contains":"audit_draw"},
+    "E-AUDIT-REROLL":{"path":"crates/core/src/giveaway_store.rs","line":1114,"contains":"audit_reroll"},
     "E-AUDIT-CREATE":{"path":"crates/core/src/giveaway_store.rs","line":734,"contains":"surface_audit"},
     "E-AUDIT-CANCEL":{"path":"crates/core/src/giveaway_store.rs","line":883,"contains":"surface_audit"},
+    "E-AUDIT-PAUSE":{"path":"crates/core/src/giveaway_store.rs","line":929,"contains":"giveaway.pause"},
+    "E-AUDIT-RESUME":{"path":"crates/core/src/giveaway_store.rs","line":987,"contains":"giveaway.resume"},
+    "E-AUDIT-EXTEND":{"path":"crates/core/src/giveaway_store.rs","line":1046,"contains":"giveaway.extend"},
     "E-QUOTA":{"path":"crates/core/src/giveaway_store.rs","line":702,"contains":"MAX_OPEN_GIVEAWAYS"},
     "E-REDACT":{"path":"crates/core/src/giveaway_store.rs","line":70,"contains":"[REDACTED]"},
     "E-DRAWPK":{"path":"crates/cutover/migrations/0460_giveaways.sql","line":66,"contains":"PRIMARY KEY (guild_id, giveaway_id, draw_no)"},
@@ -364,7 +372,8 @@ anchors intentionally require re-inventory, not a waiver.
 >>> rows = m["controls"]; src = pathlib.Path("crates/core/src/feature_commands.rs").read_text()
 >>> span = src.split("pub fn giveaway_command", 1)[1].split("\n}\n\n/// Announcement", 1)[0]
 >>> subs = re.findall(r'CommandOption::new\(\s*"(\w+)",\s*"[^"\n]*",\s*CommandOptionType::SubCommand', span)
->>> assert [r["slash"] for r in rows] == subs == ["create","list","cancel","end","pause","resume","extend","reroll"]
+>>> assert subs == ["create","list","cancel","end","pause","resume","extend","reroll","inspect"]
+>>> assert [r["slash"] for r in rows] == [s for s in subs if s != "inspect"]
 >>> assert len(rows) == len({r["id"] for r in rows}) == 8
 >>> assert [r["id"] for r in rows if r["state"] == "draft_only"] == ["GW-C1"]
 >>> assert [r["id"] for r in rows if r["state"] == "candidate_readonly"] == ["GW-C2"]
@@ -397,7 +406,9 @@ parity (open/paused; claimed rows included until the flip) — with status,
 `updated_at`, `latest_draw_no`, `announced_at` (the exact expected-state
 fields a later lifecycle intent must supply), prize, deadline and counts;
 never nonce, claim token or other entrant identities, and `winner_ids`
-only under the announced-only rule. GW-B1 renders only the states reachable
+only under the announced-only rule. Slash `inspect` already renders saved
+detail privately; GW-B1's detail read mirrors that shape once GW-W1 exists,
+without taking the inspect slice's scope. GW-B1 renders only the states reachable
 in that
 scope — `draft`, `live`, `draw_pending`, `paused`, `claimed`, `unknown`;
 `ended`/`cancelled` are defined above for later detail/history slices, and
@@ -408,15 +419,15 @@ parity, no audit reader. Anything larger is a new card.
 
 ## No-build alternative
 
-Keep slash-only giveaways: organizers already create, list, cancel, end,
-pause, resume, extend and reroll from Discord with shipped validation,
-claim-lease safety and audit for create/cancel/draw/reroll. A dashboard that
-cannot read rows (no verb), cannot prove freshness (no revision), and cannot
-attribute lifecycle edits (missing pause/resume/extend audit) adds confusion,
-not parity. This alternative stands unless **all** overturn evidence lands:
+Keep slash-only giveaways: organizers already create, list, inspect, cancel,
+end, pause, resume, extend and reroll from Discord with shipped validation,
+claim-lease safety and audit for
+create/cancel/draw/reroll/pause/resume/extend. A dashboard that cannot read
+rows (no verb) and cannot prove freshness (no revision) adds confusion, not
+parity. This alternative stands unless **all** overturn evidence lands:
 recorded host/CEO intent alignment for a giveaway page; a reviewed, least-scope
 signed read verb with redaction proofs; expected-state guards proven against
-races GW-F02–F04; pause/resume/extend audit before those controls enable; and
+races GW-F02–F04; lifecycle-verb attribution reusing the shipped audit; and
 measured organizer demand (support volume or explicit requests) that slash
 cannot serve. Absent acceptance defaults to **no-build**, never timeout
 approval.
@@ -426,7 +437,7 @@ approval.
 | ID | Recommendation, not a build card or API |
 | --- | --- |
 | `GW-W1` | Add one least-privilege signed giveaway read verb with redaction proofs (no nonce/claim token/other entrant identities; `winner_ids` only for announced rounds), active rows first (`list_active` parity; any history/detail read beyond that is a separate decision), guild-pinned like the existing receiver, plus server-side Manage Server checks. No lifecycle verb is assumed. |
-| `GW-W2` | Define lifecycle verbs (create-submit, transition, reroll-append) with expected-state guards, per-effect scopes, server-side attribution, pause/resume/extend audit, and race fixtures GW-F02–F05 green before any control enables. |
+| `GW-W2` | Define lifecycle verbs (create-submit, transition, reroll-append) with expected-state guards, per-effect scopes, server-side attribution reusing the shipped `giveaway.*` audit facts, and race fixtures GW-F02–F05 green before any control enables. |
 | `GW-W3` | Before any build, prove web private-admin/guild checks, signer, session revocation, and inert PII-safe rendering. If no trusted effective-state evidence is available, explicitly keep read-only copy or no-build; invent no diagnostics endpoint. |
 
 Bind the CEO intent-alignment request to the exact task-document revision,
