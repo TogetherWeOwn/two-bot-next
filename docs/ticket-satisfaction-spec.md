@@ -181,7 +181,7 @@ of that terminal receipt and before window expiry; later self-service only.
 | Submission | Unique ticket + opener, one successful insert, one in-flight intent per ticket; <=5 admitted attempts/opener/10 minutes and <=100/guild/hour. Retry same intent consumes no additional quota |
 | Invitation | <=1 wire attempt/ticket; <=1/opener/24 hours and <=20/guild/hour; losing quota means self-service only, not a later send queue |
 | Private reads | <=10/actor/minute, <=60/guild/minute; 5-ticket or 10-comment pages; one report staff selector, no bulk selection |
-| Background maintenance | <=25 rows/pass, existing hourly privacy-maintenance budget, no unbounded scans or new host timers |
+| Background maintenance | <=25 affected physical rows/pass across feedback stores, including cascade fan-out; shared existing hourly privacy-maintenance budget, not reserved capacity or a deletion deadline (§7); no unbounded scans or new host timers |
 
 Admit a random operation ID and durable invite state **before** any DM attempt.
 Unknown admission commit means no send. Single-attempt transport, no automatic
@@ -300,18 +300,20 @@ unless withdrawn/erased under policy. There is no public or staff-self score pag
 
 ## 7. Minimization, retention, erasure and restore
 
-Proposed maximums, requiring explicit privacy-policy disposition:
+Proposed **logical-use expiry maximums**, not physical-erasure deadlines; explicit
+privacy-policy disposition and the physical-purge prerequisite below remain required:
 
 - Score, opener/responder link, response facts, operation/invalidated enrollment
   and invitation journal expire no later than **90 days from enrolled Open**, not
   last edit/close. Pending Open tickets age out too. Comments expire **7 days after
   submission** or that ceiling, whichever is earlier. The separate immediate
-  comment read never prolongs retention to match monthly numerical reporting.
-- Reads exclude expired facts immediately; physical purge <=1 hour via bounded
-  maintenance, including consent and receipts. Submission/read quota state <=1 hour;
-  the invitation's actor-bearing anti-spam admission fact <=24 hours, always bounded
-  by enrollment expiry and erasure. No permanent free-text audit, body hash,
-  prompt payload, raw REST/SQL error,
+  comment read never prolongs logical use to match monthly numerical reporting.
+- Reads exclude expired facts immediately, including consent and receipts;
+  submissions/sends cannot use expired facts either. Submission/read quota facts
+  expire within 1 hour; the invitation's actor-bearing anti-spam admission fact
+  within 24 hours, always bounded by enrollment expiry and erasure. These are
+  logical expiry limits too; expired stored bytes await physical cleanup below.
+  No permanent free-text audit, body hash, prompt payload, raw REST/SQL error,
   feedback-derived trace, metric label or transcript appendix.
 - Member erasure removes entire feedback contributions for opener, attributed
   responder, consent actor and any saved actor identity. Preserve existing
@@ -334,6 +336,29 @@ Proposed maximums, requiring explicit privacy-policy disposition:
   notifications, user screenshots or manager copies. Unknown restore guarantees
   keep B off; no claim of end-to-end deletion today.
 
+**Physical cleanup is asynchronous best effort, not a one-hour guarantee.** The
+25-row ceiling is an upper work bound, not a promise of that much service. The
+[current cadence](../crates/core/src/tickets.rs#L13) is 3,600 seconds;
+[missed/failed passes](../crates/bot/src/ticket_runtime.rs#L314-L347) can defer work.
+Even an isolated backlog of N expired physical rows, no new arrivals and full
+25-row service needs ceil(N/25) successful passes. Thus 26 comments expiring just
+after a sweep need two later sweeps, before counting consent, receipts, quota,
+audit or other journal rows; one fully failed pass needs a third opportunity.
+Shared work, ongoing arrivals or outages can delay cleanup further. This proposal
+establishes **no unconditional wall-clock physical-purge bound**; immediate logical
+suppression does not prove that stored bytes were deleted.
+
+**Unresolved acceptance prerequisite, not permission to retain indefinitely:**
+before B can be accepted for implementation, specify a finite physical-erasure
+lag across all affected stores, maximum row fan-out and global expiry/admission
+load (per-guild submission quotas alone are insufficient), shared-budget drain
+allocation/fairness, backlog admission stops and failed/interrupted-pass recovery.
+Prove the chosen lag with CSAT-12, counting every affected row, not just parent
+contributions or successful DML statements. Reconcile backup/pre-image retention
+and restore suppression separately. Do not silently extend logical-use limits,
+add timers or weaken existing privacy policy to make capacity fit. Missing capacity
+or privacy acceptance keeps B off and A/no-build in force.
+
 ## 8. Design matrix and future slices
 
 These are **planned oracles, not executed tests**. Independent Test Author owns
@@ -354,7 +379,7 @@ Record fixed outcome/row/send counts, never real comments or member data.
 | CSAT-09 | DM suppression, no consent, guild departure, 403/429/5xx/timeout and quota loss: <=1 wire attempt, no fallback disclosure, eligible self-service independent of DM outcome |
 | CSAT-10 | Wrong guild/opener/application, forged/expired handle, revoked manager, stale modal: same nonparticipant refusal; no comments/scores/counts/IDs disclosed |
 | CSAT-11 | Five distinct openers vs four, repeated tickets by one opener, unanswered/gapped timing, partial retention, exact percentile/rounding fixtures and 10,001 rows: suppression/unknown/refusal, never ranking or sampling |
-| CSAT-12 | Window/retention equality, rates at/over bounds, feature disable/re-enable, erasure racing send/read: no new mutation past admission fence; residual in-flight Discord race documented |
+| CSAT-12 | Window/logical-expiry equality, rates at/over bounds, disable/re-enable, erasure racing send/read: no mutation past admission fence; residual Discord race documented. Expire 26 comments just after a sweep plus consent/receipt/quota/audit rows; interrupt a pass and retry: immediate read/send suppression, <=25 total affected rows/pass, committed deletions survive retry, no skipped/resurrected rows. Under the accepted global load/fan-out/shared-budget and failure envelope, prove complete physical cleanup within the separately accepted finite lag (§7), never infer it from logical expiry |
 
 Cut only **after** accepted exact intent, independent privacy disposition and
 protected-test handoff. Each future row is a separate <=1-day PR-sized estimate,
@@ -369,7 +394,7 @@ rather than ship an unsafe half-enabled flow; flag stays off until all gates pas
 | Private opener list/form/receipt | <=1 day; persistence; reauthorization/nonparticipant bounds, one atomic score/comment, no DM |
 | Optional consented notification | <=1 day; lifecycle + consent/privacy proof; independent one-attempt journal/restart tests; closed DMs remain self-service |
 | Manager aggregate/comment reads | <=1 day; trusted observer + persistence; threshold/privacy/percentile fixtures and role-revocation controls |
-| Bounded purge/restore wiring | <=1 day; all stores known; delete/suppress before read/send, finite audit/quota cleanup and operational receipt |
+| Bounded purge/restore wiring | <=1 day; §7 finite physical lag/capacity policy accepted and all stores known; immediate suppression, expiry-burst/interruption proof, finite audit/quota cleanup, restore fence and operational receipt |
 | Fenced staging validation | <=1 day; all prior exact-head checks/review and normal execution contract; synthetic-only matrix evidence, health and rollback; production follows its existing pipeline |
 
 ## 9. Review disposition and no-build stop
@@ -378,8 +403,9 @@ Review gate not before **2026-11-02**: CEO/host intent alignment through the nor
 router must bind the task-spec revision, repository commit and file SHA-256; do not
 ask the owner for a routine click. This design does **not** supply that alignment.
 Independent CISO acceptance is required for new feedback/opener/manager data access,
-opt-out classification, DM consent and residual race, retention/erasure/restore,
-small-cohort inference and first-response observation. No tests/build cards before
+opt-out classification, DM consent and residual race, logical expiry and a finite
+capacity-backed physical-erasure/restore policy (§7), small-cohort inference and
+first-response observation. No tests/build cards before
 these dispositions, no default/timeout approval. A revised spec invalidates earlier
 acceptance. Existing security/activation/secret fences remain unchanged.
 
