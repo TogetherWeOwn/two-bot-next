@@ -1,7 +1,8 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
-No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
+Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
+Empty `{missing,stale,oversize}` = 0; else 1.
+Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References and architecture
 
@@ -112,13 +113,14 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
 - [Reward](dashboard-leveling-rewards-spec.md)
-- [LFG domain](lfg-port.md)
-- [LFG input contract](lfg-interaction-contract.md)
-- [Ready check](lfg-ready-check-spec.md)
-- [Backup-host handoff](lfg-backup-host-spec.md)
-- [LFG reuse](lfg-reuse-spec.md)
-- [LFG thread](lfg-thread-spec.md)
+- [LFG](lfg-port.md)
+- [Inputs](lfg-interaction-contract.md)
+- [Ready](lfg-ready-check-spec.md)
+- [Backup host](lfg-backup-host-spec.md)
+- [Reuse](lfg-reuse-spec.md)
+- [Threads](lfg-thread-spec.md)
 - [LFG voice](lfg-voice-room-spec.md)
+- [Play-now](lfg-play-now-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
 - [Relay move proposal](feed-move-spec.md)
@@ -126,7 +128,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Stream funnel](stream-funnel.md)
 - [Game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
-- [Time helper proposal](time-helper-spec.md)
+- [Time helper](time-helper-spec.md)
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
@@ -150,6 +152,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Resolution signal](ticket-resolution-request-spec.md)
+- [Giveaway leave](giveaway-withdrawal-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 
