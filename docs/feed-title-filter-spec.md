@@ -332,6 +332,7 @@ Every row asserts code, next_action, decision state and exact effect counts.
 Run from the repo root (Python standard library; no network, DB or runtime):
 
 ```sh
+set -e
 python3 scripts/check_docs_index.py --json
 python3 - <<'PY'
 from pathlib import Path
