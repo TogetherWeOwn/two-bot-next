@@ -11632,7 +11632,7 @@ fn setup_past_end_refusal(total: usize) -> String {
     format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
 }
 
-/// Private correction for an ambiguous setup option: names the option and a
+/// Private correction for a malformed setup option: names the option and a
 /// copyable invocation. Static per (command, field): no payload bytes, store
 /// errors or mentions can leak into it.
 fn setup_shape_correction(command: &str, field: &str) -> String {
@@ -11643,7 +11643,7 @@ fn setup_shape_correction(command: &str, field: &str) -> String {
         _ => "channel: #voice-creator",
     };
     format!(
-        "That `/{command}` call has an ambiguous `{field}` option: send each option once, \
+        "That `/{command}` call has a problem with its `{field}` option: send it exactly once, \
          with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
     )
 }
@@ -12018,7 +12018,7 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: AlwaysPrivateRequest,
     },
-    /// A setup command (`/textchannels`) arrived with an ambiguous option
+    /// A setup command (`/textchannels`) arrived with a malformed option
     /// shape: a known option sent twice, with the wrong wire type, or the
     /// required `channel` missing. Answered with a private correction before
     /// guild authority, role gates and every read or effect.
@@ -12176,7 +12176,7 @@ fn setup_shape_required(command: &str) -> Option<&'static str> {
 
 /// Strictly decode one setup command's option shape: each known option at
 /// most once and with its registered wire type, and the required option
-/// present. Returns the first ambiguous known option in payload order, or
+/// present. Returns the first malformed known option in payload order, or
 /// the required option when it is the only fault. Unknown names (even
 /// duplicated, even with nested known names beneath them) stay ignored, and
 /// value validation stays in the handlers, so omission semantics are
