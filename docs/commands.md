@@ -282,7 +282,11 @@ Show this server's aggregate game activity.
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | 10000 | — | — | Page of saved games to show (10 per page). Default: 1. |
+| `sort` | string | false | — | — | — | Play time = `"play"`; In-voice time = `"voice"` | Order games by play time or in-voice time. Default: play. |
+| `format` | string | false | — | — | — | JSON = `"json"`; Summary = `"summary"` | Show raw JSON or a readable summary. Default: JSON. |
 
 ## `/giveaway`
 
