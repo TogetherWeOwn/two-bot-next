@@ -299,6 +299,7 @@ Create, draw, reroll or cancel a giveaway
 | `create required-role` | role | false | — | — | — | — | Role every entrant must hold |
 | `create min-account-age-days` | integer | false | 0 | 3650 | — | — | Minimum account age in days |
 | `create min-server-age-days` | integer | false | 0 | 3650 | — | — | Minimum time in this server in days |
+| `create preview` | boolean | false | — | — | — | — | Privately preview without creating or reserving capacity |
 | `list` | subcommand | false | — | — | — | — | List open giveaways |
 | `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
 | `cancel id` | string | true | — | — | 64 | — | Giveaway id |

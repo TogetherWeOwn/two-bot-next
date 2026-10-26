@@ -17,7 +17,11 @@
 //! winners post carries `<@id>` text, the draw seed and the revealed nonce so
 //! any member can replay the draw.
 
-use std::{collections::HashMap, sync::Mutex, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -109,13 +113,20 @@ enum DrawError {
 // always-on container.
 static EFFECTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[derive(Debug)]
 pub struct GiveawayRuntime {
     pool: PgPool,
     executor: ActionExecutor,
+    create_clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    create_nonce: Arc<dyn Fn() -> String + Send + Sync>,
     // Serialize count edits with entry/cancel, including the refresh supervisor.
     // No spawned waiters: the existing command admission lane bounds callers.
     budgets: Mutex<HashMap<String, (Instant, u32)>>,
+}
+
+impl std::fmt::Debug for GiveawayRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GiveawayRuntime").finish_non_exhaustive()
+    }
 }
 
 impl GiveawayRuntime {
@@ -123,8 +134,22 @@ impl GiveawayRuntime {
         Self {
             pool,
             executor,
+            create_clock: Arc::new(OffsetDateTime::now_utc),
+            create_nonce: Arc::new(giveaway::mint_draw_nonce),
             budgets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Supply deterministic create sources. Preview reads the clock but never
+    /// invokes the nonce source; normal construction uses UTC and secure RNG.
+    pub fn with_create_sources(
+        mut self,
+        clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+        nonce: Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Self {
+        self.create_clock = clock;
+        self.create_nonce = nonce;
+        self
     }
 
     /// Called only after the shared router authorized and deferred the command.
@@ -298,7 +323,18 @@ impl GiveawayRuntime {
         let mut roles = Vec::new();
         let mut account_days = 0;
         let mut server_days = 0;
+        let mut preview = false;
+        let mut seen = HashSet::new();
         for option in options {
+            // Both duration names address the same field. Duplicate inputs,
+            // including preview:false, must never fall through to a live create.
+            let name = match option.name.as_str() {
+                "duration-minutes" => "duration",
+                name => name,
+            };
+            if !seen.insert(name) {
+                return Ok(INVALID.into());
+            }
             match (option.name.as_str(), &option.value) {
                 ("prize", CommandOptionValue::String(_))
                 | ("duration" | "winners" | "duration-minutes", CommandOptionValue::Integer(_)) => {
@@ -317,6 +353,7 @@ impl GiveawayRuntime {
                 // Accepted for forward compatibility: creation always posts in
                 // the invocation channel, so a channel argument never steers.
                 ("channel", CommandOptionValue::Channel(_)) => {}
+                ("preview", CommandOptionValue::Boolean(value)) => preview = *value,
                 _ => return Ok(INVALID.into()),
             }
         }
@@ -327,7 +364,26 @@ impl GiveawayRuntime {
         if actor.is_empty() {
             return Ok(INVALID.into());
         }
-        let now = OffsetDateTime::now_utc();
+        let now = (self.create_clock)();
+        let Some(ends_at) = now.checked_add(time::Duration::seconds(validated.duration_seconds))
+        else {
+            return Ok(INVALID.into());
+        };
+        let requirements_json = serde_json::json!({"roles": roles, "min_account_age_days": account_days, "min_guild_age_days": server_days});
+        let presentation = GiveawayPresentation {
+            prize: &validated.prize,
+            winners_count: validated.winners_count as i32,
+            ends_at,
+            requirements_json: &requirements_json,
+        };
+        if preview {
+            // Pure validation/presentation only: no capacity reservation, store
+            // lookup, admission, audit, draw randomness or public Discord effect.
+            return Ok(format!(
+                "Preview — not created\nProposed message in <#{channel}>:\n{}\n\nCapacity is not reserved; eligibility has not been checked. Later creation is not guaranteed. Run /giveaway create with the same options without preview (or preview:false) to create it; its closing time is recalculated then.",
+                presentation.render(0, "open", now)
+            ));
+        }
         // The interaction id is an opaque correlation id, not an authorization
         // capability. It makes a retried create fail closed before Discord I/O.
         let id = interaction.id.get().to_string();
@@ -339,17 +395,17 @@ impl GiveawayRuntime {
             message_id: "pending".into(),
             created_by: actor,
             winners_count: validated.winners_count as i32,
-            ends_at: now + time::Duration::seconds(validated.duration_seconds),
-            requirements_json: serde_json::json!({"roles": roles, "min_account_age_days": account_days, "min_guild_age_days": server_days}),
+            ends_at,
+            requirements_json,
             max_entries: store::MAX_GIVEAWAY_ENTRIES,
-            draw_nonce: giveaway::mint_draw_nonce(),
+            draw_nonce: (self.create_nonce)(),
             created_at: now,
         };
         let Some(row) = store::create_admitted(&self.pool, &input).await? else {
             return Ok("Giveaway already recorded or the server has 10 active giveaways.".into());
         };
         let nonce = format!("gw{id}");
-        match self.executor.post_message_with_components(&row.channel_id, &render(&row, 0), &components(&row), &nonce).await {
+        match self.executor.post_message_with_components(&row.channel_id, &render_at(&row, 0, now), &components(&row), &nonce).await {
             Ok(message) => {
                 if matches!(store::attach_message(&self.pool, guild, &id, &message).await, Ok(true)) {
                     return Ok(format!("Giveaway `{id}` created."));
@@ -1215,22 +1271,69 @@ fn winners_posts(
     posts
 }
 
+/// The same pure message source for validated proposals and persisted creates.
+/// It has no draw identity, nonce, executor or store capability.
+struct GiveawayPresentation<'a> {
+    prize: &'a str,
+    winners_count: i32,
+    ends_at: OffsetDateTime,
+    requirements_json: &'a serde_json::Value,
+}
+
+impl GiveawayPresentation<'_> {
+    fn render(&self, count: i64, status: &str, now: OffsetDateTime) -> String {
+        let ending =
+            if status == "open" && self.ends_at.unix_timestamp() - now.unix_timestamp() <= 30 {
+                " — ending soon!"
+            } else {
+                ""
+            };
+        let requirements = match giveaway::parse_requirements(&self.requirements_json.to_string()) {
+            Ok(requirements) => {
+                // Create accepts one role; bound the display of older stored
+                // multi-role rows too, without implying omitted gates are absent.
+                let mut roles = requirements
+                    .roles
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if roles.is_empty() {
+                    roles.push_str("none");
+                }
+                if requirements.roles.len() > 10 {
+                    roles.push_str(&format!(" (+{} more)", requirements.roles.len() - 10));
+                }
+                format!(
+                    "roles: {roles}; account age: {} days; server age: {} days",
+                    requirements.min_account_age_days, requirements.min_guild_age_days
+                )
+            }
+            Err(_) => "unavailable; ask staff to inspect the stored rules".into(),
+        };
+        let deadline = self.ends_at.unix_timestamp();
+        format!(
+            "Giveaway: {}\n{count} entrants · {} winners\nEnds <t:{deadline}:F> (<t:{deadline}:R>) · {status}{ending}\nRequirements: {requirements}",
+            self.prize, self.winners_count
+        )
+    }
+}
+
 fn render(row: &GiveawayRow, count: i64) -> String {
-    let ending = if row.status == "open"
-        && row.ends_at.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp() <= 30
-    {
-        " — ending soon!"
-    } else {
-        ""
+    render_at(row, count, OffsetDateTime::now_utc())
+}
+
+fn render_at(row: &GiveawayRow, count: i64, now: OffsetDateTime) -> String {
+    let presentation = GiveawayPresentation {
+        prize: &row.prize,
+        winners_count: row.winners_count,
+        ends_at: row.ends_at,
+        requirements_json: &row.requirements_json,
     };
     format!(
-        "Giveaway: {}\n{} entrants · {} winners\nEnds <t:{}:R> · {}{}\nID: `{}`",
-        row.prize,
-        count,
-        row.winners_count,
-        row.ends_at.unix_timestamp(),
-        row.status,
-        ending,
+        "{}\nID: `{}`",
+        presentation.render(count, &row.status, now),
         row.id
     )
 }
