@@ -57,6 +57,8 @@ mod name;
 mod name_filter_acceptance;
 #[path = "voice_name_rerender_tests.rs"]
 mod name_rerender;
+#[path = "voice_orphan_ledger_acceptance_tests.rs"]
+mod orphan_ledger_acceptance;
 #[path = "voice_ownership_receipt_acceptance_tests.rs"]
 mod ownership_receipt_acceptance;
 #[path = "voice_private_runtime_tests.rs"]
