@@ -1,13 +1,12 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest by area: `- [Purpose](relative.md)`.
 
-Repo root: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
-else exit 1, repair rows/split docs. Bad/duplicate rows use
-`docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Run `python3 scripts/check_docs_index.py --json` at repo root.
+Empty `{missing,stale,oversize}` = PASS (exit 0); else exit 1, repair.
+Bad/duplicate rows: `stale` names `docs/README.md:<line>`.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes.
+Legacy exceptions/reasons: `scripts/check_docs_index.py` (`LARGE_DOCS`).
 
 ## References and architecture
 
@@ -143,6 +142,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
+- [Resolution signal proposal](ticket-resolution-request-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 
