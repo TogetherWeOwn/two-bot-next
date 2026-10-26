@@ -1228,7 +1228,7 @@ fn commands_require_enabled_configured_guild_and_manage_guild() {
     assert_eq!(feed_list_text(&[]), "No feed relays configured.");
     assert_eq!(
         feed_list_text(&[feed]),
-        "`feed-1` rss → <#channel-1> https://example.org/feed.xml"
+        "`feed-1` rss enabled → <#channel-1> https://example.org/feed.xml"
     );
 }
 
@@ -1421,7 +1421,10 @@ fn feed_list_page_short_list_keeps_legacy_rows_with_attempt_and_inspect_hint() {
     // hint and no `Page n of total` footer.
     let mut lines = reply.lines();
     for feed in &feeds {
-        let frame = format!("`{}` rss → <#{}> {}", feed.id, feed.channel_id, feed.source);
+        let frame = format!(
+            "`{}` rss enabled → <#{}> {}",
+            feed.id, feed.channel_id, feed.source
+        );
         let line = lines.next().expect("one line per relay");
         assert!(
             line.starts_with(&frame),

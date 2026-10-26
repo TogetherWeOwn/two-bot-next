@@ -11,7 +11,7 @@
 //!   (`automationCommandData`) — all eight `ManageGuild`-gated.
 //! - announcements (#24–#30): `src/announcements/discord.ts`
 //!   (`announcementCommandData`) — `/rsvp` + RSVP totals open to everyone,
-//!   `/lfg` pair `ManageEvents`, `/feed-*` quartet `ManageGuild`.
+//!   `/lfg` pair `ManageEvents`, `/feed-*` sextet `ManageGuild`.
 //! - scorecard (#12): `src/analytics/communityAttendance.ts`
 //!   (`COMMUNITY_ATTENDANCE_COMMAND`) — keeps the `attendance` name.
 //!
@@ -391,8 +391,9 @@ pub fn giveaway_command() -> CommandDefinition {
 
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.
 ///
-/// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` management requires
-/// `ManageEvents`; `/feed-*` quartet requires `ManageGuild`. All guild-only.
+/// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` management
+/// requires `ManageEvents`; the six `/feed-*` commands require `ManageGuild`.
+/// All guild-only.
 #[must_use]
 pub fn announcement_commands() -> Vec<CommandDefinition> {
     vec![
@@ -528,6 +529,27 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             .max_length(MAX_FEED_SOURCE_BYTES as u32),
         ]),
         CommandDefinition::new("feed-remove", "Remove a feed relay")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "id",
+                "Feed id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new(
+            "feed-pause",
+            "Pause a feed relay without deleting its history",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "id",
+            "Feed id",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new("feed-resume", "Resume a paused feed relay")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![CommandOption::new(
                 "id",
@@ -701,6 +723,8 @@ mod tests {
                 "lfg-list",
                 "feed-add",
                 "feed-remove",
+                "feed-pause",
+                "feed-resume",
                 "feed-list",
                 "feed-inspect",
             ]
@@ -710,8 +734,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 7 core + 1 scorecard + 12 automation + 10 announcements.
-        assert_eq!(merged.len(), 30);
+        // 7 core + 1 scorecard + 12 automation + 12 announcements.
+        assert_eq!(merged.len(), 32);
         assert_eq!(
             &names(&merged)[..8],
             [
@@ -761,7 +785,14 @@ mod tests {
         assert_eq!(is(&ann, "lfg-close"), manage_events);
         assert_eq!(is(&ann, "lfg-edit"), manage_events);
         assert_eq!(is(&ann, "lfg-list"), manage_events);
-        for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+        ] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
         }
         // Open to everyone: no permission gate.
@@ -832,6 +863,8 @@ mod tests {
             ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
+            ("feed-pause", 0, 128),
+            ("feed-resume", 0, 128),
             ("feed-inspect", 0, 128),
             ("rsvp", 0, 128),
             ("rsvp-attendance", 0, 128),
