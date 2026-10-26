@@ -96,7 +96,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.151.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.152.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -195,7 +195,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.151.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.152.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 Container stdout is also in the Workers Observability `containers` dataset, which a
@@ -2780,7 +2780,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.151 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.152 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect

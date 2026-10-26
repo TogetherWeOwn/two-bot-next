@@ -179,7 +179,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Reopen",
-            "Deferred ephemeral reply; a fresh games or session menu edit for the invoker only, built from current roles and current configured picks with zero role, channel or funnel writes. Disabled kinds, malformed invocations and failed lookups get a private no-effect guidance edit instead of a menu.",
+            "Deferred ephemeral reply; a fresh games or session menu edit for the invoker only, built from current roles and current configured picks with zero role, channel or funnel writes. Games menus carry a second no-change preview select alongside the apply route. Disabled kinds, malformed invocations and failed lookups get a private no-effect guidance edit instead of a menu.",
             &["Valid:kind:required,games|session"],
         ),
         row(
@@ -199,7 +199,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             PERM_MANAGE_GUILD,
             "ManageGuild",
             "GameMix",
-            "Deferred private guild aggregate JSON: up to ten games, play milliseconds, in-voice milliseconds and session counts; empty hint or truthful truncation note. Live guild refused without a read.",
+            "Deferred private guild aggregate page: up to ten games per page, play or voice ordering, JSON or readable summary; play milliseconds, in-voice milliseconds and session counts; empty hint or truthful truncation note. Invalid selectors corrected before a read; live guild refused without a read.",
             &["Perm:ManageServerRequired"],
         ),
         row(

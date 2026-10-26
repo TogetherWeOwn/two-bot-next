@@ -125,26 +125,23 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
-        // Next-only saved-response inspection (parity row 33): one bounded
-        // management workflow with three private views, no enable/disable
-        // policy. Published after `command-list`; automation-gated and
-        // `ManageGuild`-gated like the other admin commands.
+        // Private saved inspection or unsaved preview; runtime requires exactly
+        // one name/draft. Automation- and ManageGuild-gated like other admin commands.
         CommandDefinition::new(
             "command-inspect",
-            "Inspect or privately preview a saved custom command",
+            "Inspect a saved command or privately preview an unsaved draft",
         )
         .permissions(PERM_MANAGE_GUILD)
         .options(vec![
             CommandOption::new(
                 "name",
-                "Saved command name, a-z 0-9 _ -",
+                "Saved command name, a-z 0-9 _ - (choose name or draft)",
                 CommandOptionType::String,
             )
-            .required()
             .max_length(MAX_COMMAND_NAME_CHARS as u32),
             CommandOption::new(
                 "view",
-                "Private view (summary by default)",
+                "Private view (saved: summary by default; draft: preview only)",
                 CommandOptionType::String,
             )
             .choices(vec![
@@ -167,6 +164,12 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::String,
             )
             .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
+            CommandOption::new(
+                "draft",
+                "Proposed template to preview without saving (choose name or draft)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEMPLATE_CHARS as u32),
         ]),
         // Next-only saved-response lifecycle (parity rows 40-41): pause and
         // resume one definition without deleting it. Published immediately
@@ -917,12 +920,13 @@ mod tests {
         let kind = get(&ann, "feed-add").options[0].clone();
         let values: Vec<_> = kind.choices.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, ["rss", "youtube", "twitch"]);
-        // /command-inspect: one required name, three bounded optional views,
+        // /command-inspect: exclusive optional name/draft, three saved views,
         // one bounded optional sample. No enable/disable policy option.
         let inspect = get(&auto, "command-inspect").options.clone();
-        assert_eq!(inspect.len(), 3);
-        assert_eq!(inspect[0].required, Some(true));
-        assert!(inspect[1].required.is_none() && inspect[2].required.is_none());
+        assert_eq!(inspect.len(), 4);
+        assert!(inspect.iter().all(|option| option.required.is_none()));
+        assert_eq!(inspect[3].name, "draft");
+        assert_eq!(inspect[3].max_length, Some(2000));
         let values: Vec<_> = inspect[1]
             .choices
             .iter()
