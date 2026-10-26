@@ -672,11 +672,48 @@ pub fn schedule_list_first_pages(lines: &[String], has_hidden: bool) -> Vec<Stri
 /// [`SCHEDULE_LIST_MESSAGE_LIMIT`].
 #[must_use]
 pub fn schedule_list_pages_global(lines: &[String], page_offset: i64) -> Vec<String> {
-    if page_offset <= 0 {
+    schedule_list_pages_with_heading(lines, page_offset, "")
+}
+
+/// Pack a this-channel window, reserving its heading on every reply before
+/// packing whole rows. Hidden windows keep global numbering; the first window
+/// names the next page when `has_hidden` is true. No guild output is changed.
+#[must_use]
+pub fn schedule_list_channel_pages(
+    lines: &[String],
+    page_offset: i64,
+    has_hidden: bool,
+) -> Vec<String> {
+    if lines.is_empty() {
+        return vec!["Nothing scheduled in this channel.".to_owned()];
+    }
+    let heading = "Schedules in this channel:\n";
+    let plain = schedule_list_pages_with_heading(lines, page_offset, heading);
+    if !has_hidden || plain.len() <= 1 {
+        return plain;
+    }
+    let mut total = plain.len() as i64;
+    loop {
+        let mut hinted = lines.to_vec();
+        hinted.push(schedule_list_continuation_hint(page_offset + total + 1));
+        let repacked = schedule_list_pages_with_heading(&hinted, page_offset, heading);
+        if repacked.len() as i64 == total {
+            return repacked;
+        }
+        total = repacked.len() as i64;
+    }
+}
+
+fn schedule_list_pages_with_heading(
+    lines: &[String],
+    page_offset: i64,
+    heading: &str,
+) -> Vec<String> {
+    if page_offset <= 0 && heading.is_empty() {
         return schedule_list_pages(lines);
     }
     if lines.is_empty() {
-        return vec!["Nothing scheduled.".to_owned()];
+        return vec![format!("{heading}Nothing scheduled.")];
     }
     // Converge like `schedule_list_pages`, but the footer width is driven by
     // the largest global number (`offset + total`), not the local one. At
@@ -696,15 +733,19 @@ pub fn schedule_list_pages_global(lines: &[String], page_offset: i64) -> Vec<Str
             );
             crate::message_safety::text_len(&widest)
         };
-        let rows_budget = SCHEDULE_LIST_MESSAGE_LIMIT.saturating_sub(overhead);
+        let rows_budget = SCHEDULE_LIST_MESSAGE_LIMIT
+            .saturating_sub(overhead + crate::message_safety::text_len(heading));
         let packed = pack_schedule_rows(lines, rows_budget);
         if packed.len() == total_guess {
             if packed.len() == 1 {
-                return vec![packed[0]
-                    .iter()
-                    .map(|s| (*s).as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")];
+                return vec![format!(
+                    "{heading}{}",
+                    packed[0]
+                        .iter()
+                        .map(|s| (*s).as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )];
             }
             let total = page_offset + packed.len() as i64;
             return packed
@@ -713,7 +754,7 @@ pub fn schedule_list_pages_global(lines: &[String], page_offset: i64) -> Vec<Str
                 .map(|(index, rows)| {
                     let current = page_offset + index as i64 + 1;
                     format!(
-                        "{}\n{}",
+                        "{heading}{}\n{}",
                         rows.iter()
                             .map(|s| (*s).as_str())
                             .collect::<Vec<_>>()

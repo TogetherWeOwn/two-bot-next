@@ -53,6 +53,29 @@ uncertain-send fence as relative schedules. Restart does not recalculate the
 instant. Completed one-offs remain disabled; an uncertain send remains fenced
 through backup/restore rather than blindly posting again.
 
+## List schedules in this channel
+
+Use `/schedule-list here:true` to privately browse only this channel's schedules;
+keep `here:true` when requesting another `page`. Omit `here` or use `here:false`
+for the unchanged server-wide list. The filter always uses the invoking channel,
+not a supplied channel or guild, and retains Manage Guild and the automations gate.
+Wrong-type or repeated `here` options refuse with a short correction before reads
+or audit writes.
+
+Every filtered page names **this channel**, including empty and out-of-range
+responses. SQL applies both guild and channel predicates before the 25-row cap,
+OFFSET and count, so earlier unrelated schedules cannot hide later matches. The
+same enriched rows are packed whole under 2,000 UTF-16 units, with the heading
+and page footer reserved before packing. A fetch window can span several pages;
+its row cap is not a rendered page size. At most two windows (50 matching rows)
+are discoverable, with the existing explicit truncation and continuation hints.
+
+An empty channel is not an empty server. A failed count still marks a full first
+window `(truncated)` without inventing a remainder; a failed hidden read or an
+unknown-count deep page returns the existing safe retry reply, never false
+absence. Successful lists write no schedule, claim, nonce, delivery fence or
+audit row. Listing does not resolve an uncertain send or change delivery.
+
 ## Queue model
 
 The store keeps `next_run_at` as `TEXT` in the `format_iso_ms` shape

@@ -172,8 +172,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-18: 19 — `/schedule-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor; walk page:1 and an out-of-range page.
-- **Expected:** Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences; every page fits Discord limits with a page indicator and out-of-range pages are refused.
+- **Action:** Invoke /schedule-list before and after creation/removal of fixture schedules in two channels, and as an unprivileged actor; compare omitted/false with here:true, including an empty channel, page:1 and an out-of-range page.
+- **Expected:** Only guild-scoped schedules listed to permitted actor; here:true lists only the invoking channel and names that filter, omitted/false preserves the server list. Matching IDs/cadences stay whole within Discord limits; multi-page replies carry indicators and out-of-range pages refuse without writes.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-19: 20 — `/sticky`

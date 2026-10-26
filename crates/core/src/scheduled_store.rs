@@ -165,14 +165,27 @@ pub async fn list_scheduled(
     pool: &Pool<Postgres>,
     guild_id: &str,
 ) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
+    list_scheduled_scoped(pool, guild_id, None).await
+}
+
+/// The same capped read, optionally narrowed to one channel before ordering
+/// and LIMIT. `None` retains the guild list; the guild predicate is mandatory.
+pub async fn list_scheduled_scoped(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    channel_id: Option<&str>,
+) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
     sqlx::query_as::<_, ScheduledMessageRow>(
         "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
                 claim_token, claimed_at, occurrence_nonce,
                 COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
-           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2",
+           FROM scheduled_messages
+          WHERE guild_id = $1 AND ($2::TEXT IS NULL OR channel_id = $2)
+          ORDER BY next_run_at, id LIMIT $3",
     )
     .bind(guild_id)
+    .bind(channel_id)
     .bind(SCHEDULE_LIST_CAP)
     .fetch_all(pool)
     .await
@@ -182,10 +195,24 @@ pub async fn list_scheduled(
 /// [`SCHEDULE_LIST_CAP`]-capped [`list_scheduled`] read. Only call it when
 /// the capped read came back full — under-cap guilds need no second query.
 pub async fn count_scheduled(pool: &Pool<Postgres>, guild_id: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT count(*) FROM scheduled_messages WHERE guild_id = $1")
-        .bind(guild_id)
-        .fetch_one(pool)
-        .await
+    count_scheduled_scoped(pool, guild_id, None).await
+}
+
+/// Count the same guild/channel scope as [`list_scheduled_scoped`], never the
+/// unfiltered guild when a channel filter is active.
+pub async fn count_scheduled_scoped(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    channel_id: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM scheduled_messages
+          WHERE guild_id = $1 AND ($2::TEXT IS NULL OR channel_id = $2)",
+    )
+    .bind(guild_id)
+    .bind(channel_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// One hidden window past the capped read, in the same list order:
@@ -200,14 +227,29 @@ pub async fn list_scheduled_window(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
+    list_scheduled_window_scoped(pool, guild_id, None, limit, offset).await
+}
+
+/// Read a bounded hidden window in the exact scope used by the first read and
+/// count. OFFSET skips matching rows, not unrelated rows in the guild.
+pub async fn list_scheduled_window_scoped(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    channel_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
     sqlx::query_as::<_, ScheduledMessageRow>(
         "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
                 claim_token, claimed_at, occurrence_nonce,
                 COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
-           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2 OFFSET $3",
+           FROM scheduled_messages
+          WHERE guild_id = $1 AND ($2::TEXT IS NULL OR channel_id = $2)
+          ORDER BY next_run_at, id LIMIT $3 OFFSET $4",
     )
     .bind(guild_id)
+    .bind(channel_id)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)

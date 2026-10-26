@@ -648,6 +648,7 @@ List scheduled messages for this server
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `page` | integer | false | 1 | — | — | — | Page of the schedule list (1-based) |
+| `here` | boolean | false | — | — | — | — | Only schedules in this channel (default: false) |
 
 ## `/schedule-remove`
 

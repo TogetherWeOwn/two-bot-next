@@ -31,16 +31,17 @@ use two_bot_core::{
     funnel::now_millis_for_test,
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
-        schedule_cancelled_text, schedule_confirm_text, schedule_list_first_pages,
-        schedule_list_line, schedule_list_overflow_for_count, schedule_list_overflow_line,
-        schedule_list_page, schedule_list_page_out_of_range_text,
+        schedule_cancelled_text, schedule_confirm_text, schedule_list_channel_pages,
+        schedule_list_first_pages, schedule_list_line, schedule_list_overflow_for_count,
+        schedule_list_overflow_line, schedule_list_page, schedule_list_page_out_of_range_text,
         schedule_list_page_underflow_text, schedule_list_pages, schedule_list_pages_global,
         validate_schedule, validate_schedule_at, ScheduleInput, IN_MINUTES_MIN,
     },
     scheduled_store::{
-        audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
-        list_scheduled_window, put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store,
-        ScheduledAuditInput, ScheduledWrite, SCHEDULE_LIST_CAP,
+        audit_scheduled, count_scheduled_scoped, delete_scheduled, get_scheduled,
+        list_scheduled_scoped, list_scheduled_window_scoped, put_scheduled,
+        resolve_scheduled_id as resolve_scheduled_id_store, ScheduledAuditInput, ScheduledWrite,
+        SCHEDULE_LIST_CAP,
     },
 };
 use two_bot_discord::ActionExecutor;
@@ -393,11 +394,32 @@ pub(crate) async fn schedule_list(
             return;
         }
     };
+    let here = match schedule_list_here_option_strict(interaction) {
+        Ok(here) => here,
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
+    let channel_id = if here {
+        let Some(channel_id) = interaction_channel(interaction) else {
+            finish(executor, interaction, NO_CHANNEL_REPLY).await;
+            return;
+        };
+        Some(channel_id)
+    } else {
+        None
+    };
     if page < 1 {
-        finish(executor, interaction, schedule_list_page_underflow_text()).await;
+        let refusal = if here {
+            "Page must be at least 1 for schedules in this channel."
+        } else {
+            schedule_list_page_underflow_text()
+        };
+        finish(executor, interaction, refusal).await;
         return;
     }
-    match list_scheduled(pool, guild_id).await {
+    match list_scheduled_scoped(pool, guild_id, channel_id.as_deref()).await {
         Ok(mut rows) => {
             rows.sort_by(|a, b| (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id)));
             let mut lines: Vec<String> = rows
@@ -419,15 +441,16 @@ pub(crate) async fn schedule_list(
             // and render exactly as before.
             if rows.len() as i64 == SCHEDULE_LIST_CAP {
                 let mut count_failure_class: Option<&str> = None;
-                let total_opt = match count_scheduled(pool, guild_id).await {
-                    Ok(total) => Some(total),
-                    Err(err) => {
-                        let class = db_class(&err);
-                        tracing::warn!(reason = class, "schedule list count failed");
-                        count_failure_class = Some(class);
-                        None
-                    }
-                };
+                let total_opt =
+                    match count_scheduled_scoped(pool, guild_id, channel_id.as_deref()).await {
+                        Ok(total) => Some(total),
+                        Err(err) => {
+                            let class = db_class(&err);
+                            tracing::warn!(reason = class, "schedule list count failed");
+                            count_failure_class = Some(class);
+                            None
+                        }
+                    };
                 if let Some(overflow) =
                     schedule_list_overflow_for_count(total_opt, SCHEDULE_LIST_CAP)
                 {
@@ -441,12 +464,17 @@ pub(crate) async fn schedule_list(
                 // no footer reads as the end of the list.
                 if matches!(total_opt, Some(total) if total > SCHEDULE_LIST_CAP) {
                     let total = total_opt.expect("guarded by the known-overflow match above");
-                    let first_pages = schedule_list_first_pages(&lines, true);
+                    let first_pages = if here {
+                        schedule_list_channel_pages(&lines, 0, true)
+                    } else {
+                        schedule_list_first_pages(&lines, true)
+                    };
                     let first_total = first_pages.len() as i64;
                     if page > first_total {
-                        match list_scheduled_window(
+                        match list_scheduled_window_scoped(
                             pool,
                             guild_id,
+                            channel_id.as_deref(),
                             SCHEDULE_LIST_CAP,
                             SCHEDULE_LIST_CAP,
                         )
@@ -473,12 +501,19 @@ pub(crate) async fn schedule_list(
                                     hidden_lines.push(schedule_list_overflow_line(remaining));
                                 }
                                 if hidden_lines.is_empty() {
-                                    finish(executor, interaction, schedule_list_page(&lines, page))
-                                        .await;
+                                    finish(
+                                        executor,
+                                        interaction,
+                                        schedule_list_scoped_page(&lines, page, here),
+                                    )
+                                    .await;
                                     return;
                                 }
-                                let hidden_pages =
-                                    schedule_list_pages_global(&hidden_lines, first_total);
+                                let hidden_pages = if here {
+                                    schedule_list_channel_pages(&hidden_lines, first_total, false)
+                                } else {
+                                    schedule_list_pages_global(&hidden_lines, first_total)
+                                };
                                 let hidden_total = hidden_pages.len() as i64;
                                 let hidden_page = page - first_total;
                                 if hidden_page <= hidden_total {
@@ -492,9 +527,10 @@ pub(crate) async fn schedule_list(
                                     finish(
                                         executor,
                                         interaction,
-                                        schedule_list_page_out_of_range_text(
+                                        schedule_list_scoped_out_of_range(
                                             page,
                                             first_total + hidden_total,
+                                            here,
                                         ),
                                     )
                                     .await;
@@ -546,7 +582,11 @@ pub(crate) async fn schedule_list(
                     // failure path below, including its audit row; the count
                     // failure already warned above, so the audit reuses its
                     // captured error-class token as reason.
-                    let first_total = schedule_list_pages(&lines).len() as i64;
+                    let first_total = if here {
+                        schedule_list_channel_pages(&lines, 0, false).len()
+                    } else {
+                        schedule_list_pages(&lines).len()
+                    } as i64;
                     if page > first_total {
                         // A failed list names no schedule id, so the audit
                         // carries an empty target.
@@ -568,7 +608,12 @@ pub(crate) async fn schedule_list(
                     }
                 }
             }
-            finish(executor, interaction, schedule_list_page(&lines, page)).await;
+            finish(
+                executor,
+                interaction,
+                schedule_list_scoped_page(&lines, page, here),
+            )
+            .await;
         }
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule list failed");
@@ -590,6 +635,25 @@ pub(crate) async fn schedule_list(
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
+}
+
+fn schedule_list_scoped_out_of_range(page: i64, total: i64, here: bool) -> String {
+    if here {
+        format!("Page {page} is out of range: this channel has {total} page(s) of schedules.")
+    } else {
+        schedule_list_page_out_of_range_text(page, total)
+    }
+}
+
+fn schedule_list_scoped_page(lines: &[String], page: i64, here: bool) -> String {
+    if !here {
+        return schedule_list_page(lines, page);
+    }
+    let pages = schedule_list_channel_pages(lines, 0, false);
+    if page > pages.len() as i64 {
+        return schedule_list_scoped_out_of_range(page, pages.len() as i64, true);
+    }
+    pages[(page - 1) as usize].clone()
 }
 
 /// Localize only a validated stored instant; a corrupt legacy row must not
@@ -883,6 +947,28 @@ pub(crate) fn schedule_remove_option_strict(
         None => Ok(None),
         Some(CommandOptionValue::String(value)) => Ok(Some((*value).clone())),
         Some(_) => Err(SCHEDULE_REMOVE_INVALID_ID),
+    }
+}
+
+/// Decode only the invoking-channel toggle, never a caller-supplied channel
+/// or guild. A duplicate (even two false values) or wrong wire type refuses
+/// before any list read or audit, without echoing untrusted values.
+fn schedule_list_here_option_strict(interaction: &Interaction) -> Result<bool, &'static str> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(false);
+    };
+    let mut options = data.options.iter().filter(|option| option.name == "here");
+    let Some(option) = options.next() else {
+        return Ok(false);
+    };
+    if options.next().is_some() {
+        return Err(
+            "Duplicate here option. Supply here once: /schedule-list here:true or here:false.",
+        );
+    }
+    match &option.value {
+        CommandOptionValue::Boolean(here) => Ok(*here),
+        _ => Err("Invalid here option. Use a boolean: /schedule-list here:true or here:false."),
     }
 }
 

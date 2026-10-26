@@ -532,6 +532,16 @@
           "max_value": null,
           "max_length": null,
           "choices": []
+        },
+        {
+          "name": "here",
+          "description": "Only schedules in this channel (default: false)",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
         }
       ],
       "smoke": "deferred",
