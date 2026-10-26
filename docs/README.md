@@ -2,12 +2,10 @@
 
 Sole manifest: `- [Purpose](relative.md)` by area.
 
-`python3 scripts/check_docs_index.py --json` (repo root).
-Sorted `{missing,stale,oversize}` arrays: empty = PASS/exit 0.
-Else exit 1: fix rows/split docs.
-Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
-Byte budgets: index <12,000; other docs ≤65,536.
-Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
+Check: `python3 scripts/check_docs_index.py --json` (repo root).
+Empty `{missing,stale,oversize}` = PASS (exit 0); else exit 1: fix rows/split docs.
+Bad/duplicate rows land in `stale` as `docs/README.md:<line>`.
+Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -129,6 +127,7 @@ Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 - [Stream funnel](stream-funnel.md)
 - [Staff game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
+- [Time helper (design only)](time-helper-spec.md)
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
