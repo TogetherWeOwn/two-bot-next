@@ -291,7 +291,8 @@ pub fn expected_registry() -> Value {
     .expect("welcome preview serializes");
     commands.insert(5, welcome_preview);
     // Next-only private staff aggregate, immediately after welcome-preview. Keep the
-    // legacy snapshot frozen and pin the whole additive definition literally.
+    // legacy snapshot frozen and pin the whole additive definition literally,
+    // including the optional browse selectors (never a guild/member override).
     commands.insert(
         6,
         json!({
@@ -299,27 +300,56 @@ pub fn expected_registry() -> Value {
             "description": "Show this server's aggregate game activity.",
             "dm_permission": false,
             "default_member_permissions": "32",
-            "options": []
+            "options": [
+                {
+                    "name": "page",
+                    "description": "Page of saved games to show (10 per page). Default: 1.",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 10000
+                },
+                {
+                    "name": "sort",
+                    "description": "Order games by play time or in-voice time. Default: play.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "Play time", "value": "play"},
+                        {"name": "In-voice time", "value": "voice"}
+                    ]
+                },
+                {
+                    "name": "format",
+                    "description": "Show raw JSON or a readable summary. Default: JSON.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "JSON", "value": "json"},
+                        {"name": "Summary", "value": "summary"}
+                    ]
+                }
+            ]
         }),
     );
-    // Next-only saved-response inspection. This independent literal pins the
-    // whole publication contract; never manufacture it from production shapes.
+    // Next-only saved-response inspection or unsaved draft preview. This
+    // independent literal pins the whole publication contract; never
+    // manufacture it from production shapes.
     let inspect = json!({
         "name": "command-inspect",
-        "description": "Inspect or privately preview a saved custom command",
+        "description": "Inspect a saved command or privately preview an unsaved draft",
         "dm_permission": false,
         "default_member_permissions": "32",
         "options": [
-            {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
-             "required": true, "max_length": 32},
-            {"name": "view", "description": "Private view (summary by default)", "type": 3,
+            {"name": "name", "description": "Saved command name, a-z 0-9 _ - (choose name or draft)", "type": 3,
+             "max_length": 32},
+            {"name": "view", "description": "Private view (saved: summary by default; draft: preview only)", "type": 3,
              "choices": [
                  {"name": "Summary", "value": "summary"},
                  {"name": "Saved template", "value": "template"},
                  {"name": "Preview", "value": "preview"}
              ]},
             {"name": "arguments", "description": "Sample invocation arguments (ignored by current templates)",
-             "type": 3, "max_length": 500}
+             "type": 3, "max_length": 500},
+            {"name": "draft", "description": "Proposed template to preview without saving (choose name or draft)",
+             "type": 3, "max_length": 2000}
         ]
     });
     let after_list = commands

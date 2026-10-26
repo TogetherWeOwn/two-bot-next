@@ -11632,6 +11632,30 @@ fn setup_past_end_refusal(total: usize) -> String {
     format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
 }
 
+/// Private correction for a malformed setup option: names the option and a
+/// copyable invocation. Static per (command, field): no payload bytes, store
+/// errors or mentions can leak into it.
+fn setup_shape_correction(command: &str, field: &str) -> String {
+    let usage = match command {
+        "create" => "name: lobby",
+        "textchannels" => {
+            "channel: #voice-creator enabled: true name: voice-chat viewer-role: @role"
+        }
+        "position" => "channel: #voice-creator position: below first-number: 5",
+        "group" => "channel: #voice-creator enabled: true",
+        "inheritpermissions" => {
+            "channel: #voice-creator source: channel source-channel: #voice-creator"
+        }
+        "defaultlimit" => "channel: #voice-creator limit: 4",
+        "alwaysprivate" => "channel: #voice-creator enabled: true",
+        _ => "channel: #voice-creator",
+    };
+    format!(
+        "That `/{command}` call has a problem with its `{field}` option: send it exactly once, \
+         with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
+    )
+}
+
 /// Voice definitions for the guild command merge, gated on `TWO_VOICE=1`.
 /// Production publication runs through `InteractionRouter::publish_set`
 /// (`RouterGates::voice`), which merges `voice_commands()` first-wins after
@@ -12002,6 +12026,16 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: AlwaysPrivateRequest,
     },
+    /// A setup command (`/create`, `/textchannels`, `/position`, `/group`,
+    /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
+    /// a malformed option shape: a known option sent twice, with the wrong
+    /// wire type, or (for `/textchannels`) the required `channel` missing.
+    /// Answered with a private correction before guild authority, role gates
+    /// and every read or effect.
+    SetupShapeInvalid {
+        command: &'static str,
+        field: &'static str,
+    },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
     /// Owner (or admin) hands the room to an occupant, who becomes the
@@ -12103,6 +12137,104 @@ fn decode_page(options: &[CommandDataOption]) -> PageArg {
     }
 }
 
+/// Expected wire type of one known setup option, for strict shape decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupOptionKind {
+    String,
+    Integer,
+    Boolean,
+    Channel,
+    Role,
+}
+
+impl SetupOptionKind {
+    fn matches(self, value: &CommandOptionValue) -> bool {
+        matches!(
+            (self, value),
+            (Self::String, CommandOptionValue::String(_))
+                | (Self::Integer, CommandOptionValue::Integer(_))
+                | (Self::Boolean, CommandOptionValue::Boolean(_))
+                | (Self::Channel, CommandOptionValue::Channel(_))
+                | (Self::Role, CommandOptionValue::Role(_))
+        )
+    }
+}
+
+/// Known options of one setup command as `(name, expected wire type)`.
+/// Unknown names stay ignored; only these refuse when duplicated, mistyped,
+/// or (for the [`setup_shape_required`] option) missing. `None` for commands
+/// without a strict shape.
+fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
+    match command {
+        "create" => Some(&[("name", SetupOptionKind::String)]),
+        "textchannels" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+            ("name", SetupOptionKind::String),
+            ("viewer-role", SetupOptionKind::Role),
+        ]),
+        "position" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("position", SetupOptionKind::String),
+            ("first-number", SetupOptionKind::Integer),
+        ]),
+        "group" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        "inheritpermissions" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("source", SetupOptionKind::String),
+            ("source-channel", SetupOptionKind::Channel),
+        ]),
+        "defaultlimit" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("limit", SetupOptionKind::Integer),
+        ]),
+        "alwaysprivate" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        _ => None,
+    }
+}
+
+/// The one registration-required option of a strict-shape command:
+/// `/textchannels` requires `channel`; its other options stay optional so
+/// omission keeps the stored value.
+fn setup_shape_required(command: &str) -> Option<&'static str> {
+    match command {
+        "textchannels" => Some("channel"),
+        _ => None,
+    }
+}
+
+/// Strictly decode one setup command's option shape: each known option at
+/// most once and with its registered wire type, and the required option
+/// present. Returns the first malformed known option in payload order, or
+/// the required option when it is the only fault. Unknown names (even
+/// duplicated, even with nested known names beneath them) stay ignored, and
+/// value validation stays in the handlers, so omission semantics are
+/// unchanged.
+fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&'static str> {
+    let fields = setup_shape_fields(command)?;
+    let mut seen: Vec<&'static str> = Vec::new();
+    for option in options {
+        let Some(&(name, kind)) = fields.iter().find(|field| option.name.as_str() == field.0)
+        else {
+            continue;
+        };
+        if seen.contains(&name) || !kind.matches(&option.value) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    match setup_shape_required(command) {
+        Some(required) if !seen.contains(&required) => Some(required),
+        _ => None,
+    }
+}
+
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
 /// is answered, never silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12160,6 +12292,12 @@ fn parse_voice_command_with_registry(
     let name = identities.slash_name(interaction)?;
     match name.as_str() {
         "create" => {
+            if let Some(field) = setup_shape_refusal("create", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "create",
+                    field,
+                });
+            }
             let name = command
                 .options
                 .iter()
@@ -12177,6 +12315,12 @@ fn parse_voice_command_with_registry(
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
         "textchannels" => {
+            if let Some(field) = setup_shape_refusal("textchannels", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "textchannels",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = TextChannelsRequest {
                 enabled: None,
@@ -12204,6 +12348,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "position" => {
+            if let Some(field) = setup_shape_refusal("position", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "position",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = PositionRequest {
                 position: None,
@@ -12231,6 +12381,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "group" => {
+            if let Some(field) = setup_shape_refusal("group", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "group",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = GroupRequest { enabled: None };
             for option in &command.options {
@@ -12248,6 +12404,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "inheritpermissions" => {
+            if let Some(field) = setup_shape_refusal("inheritpermissions", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "inheritpermissions",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = InheritPermissionsRequest {
                 source: None,
@@ -12271,6 +12433,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "defaultlimit" => {
+            if let Some(field) = setup_shape_refusal("defaultlimit", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "defaultlimit",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = DefaultLimitRequest { limit: None };
             for option in &command.options {
@@ -12288,6 +12456,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "alwaysprivate" => {
+            if let Some(field) = setup_shape_refusal("alwaysprivate", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "alwaysprivate",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = AlwaysPrivateRequest { enabled: None };
             for option in &command.options {
@@ -12592,51 +12766,104 @@ fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
     }
 }
 
+/// Strictly decoded single-occurrence option: `Missing` when absent,
+/// `Invalid` when duplicated or carrying the wrong value type, so callers
+/// refuse before any store touch instead of guessing a value.
+enum StrictArg<T> {
+    Missing,
+    Value(T),
+    Invalid,
+}
+
+/// Strictly decode one named option: `Missing` when absent, `Invalid` when
+/// the name repeats or `decode` rejects its value type. Unrelated names are
+/// ignored, so unknown or inapplicable options never refuse a shape.
+fn decode_strict_arg<T>(
+    args: &[CommandDataOption],
+    name: &str,
+    decode: impl Fn(&CommandOptionValue) -> Option<T>,
+) -> StrictArg<T> {
+    let mut seen: Option<StrictArg<T>> = None;
+    for option in args {
+        if option.name != name {
+            continue;
+        }
+        if seen.is_some() {
+            return StrictArg::Invalid;
+        }
+        seen = Some(match decode(&option.value) {
+            Some(value) => StrictArg::Value(value),
+            None => StrictArg::Invalid,
+        });
+    }
+    seen.unwrap_or(StrictArg::Missing)
+}
+
+/// Strictly decode role slots in listed order. A duplicated slot name or a
+/// non-`Role` value refuses (`None`); well-typed ids keep slot order and
+/// drop duplicate *values* — only duplicate *names* refuse.
+fn decode_access_roles(args: &[CommandDataOption], names: &[&str]) -> Option<Vec<Snowflake>> {
+    let mut roles: Vec<Snowflake> = Vec::new();
+    for name in names {
+        match decode_strict_arg(args, name, |value| match value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        }) {
+            StrictArg::Missing => {}
+            StrictArg::Value(role) => {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+            StrictArg::Invalid => return None,
+        }
+    }
+    Some(roles)
+}
+
+/// Strictly decode one `/access` invocation: exactly one top-level option,
+/// a known `SubCommand`, whose own options decode strictly (a wrong value
+/// type or a duplicated name refuses) while unknown or inapplicable names
+/// are ignored. Refusing here keeps a malformed shape from reaching the
+/// store read in `execute_access`. An omitted `role` is still a genuine
+/// clear, and `page` keeps the strict [`decode_page`] contract.
 fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
-    let Some(sub) = options.first() else {
+    let [sub] = options else {
         return AccessAction::Invalid;
     };
     let CommandOptionValue::SubCommand(args) = &sub.value else {
         return AccessAction::Invalid;
     };
-    let roles: Vec<Snowflake> = ["role", "role2", "role3"]
-        .iter()
-        .filter_map(|name| args.iter().find(|option| option.name == *name))
-        .filter_map(|option| match option.value {
-            CommandOptionValue::Role(role) => Some(role.get()),
-            _ => None,
-        })
-        .fold(Vec::new(), |mut roles, role| {
-            if !roles.contains(&role) {
-                roles.push(role);
-            }
-            roles
-        });
-    let command = args
-        .iter()
-        .find(|option| option.name == "command")
-        .and_then(|option| match &option.value {
-            CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
-            _ => None,
-        });
+    let command = decode_strict_arg(args, "command", |value| match value {
+        CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
+        _ => None,
+    });
     match sub.name.as_str() {
         "show" => AccessAction::Show {
             page: decode_page(args),
         },
-        "creation" => args
-            .iter()
-            .find(|option| option.name == "enabled")
-            .and_then(|option| match option.value {
-                CommandOptionValue::Boolean(enabled) => Some(AccessAction::Creation(enabled)),
-                _ => None,
-            })
-            .unwrap_or(AccessAction::Invalid),
-        "role" => AccessAction::RequiredRole(roles.first().copied()),
-        "restrict" => command.map_or(AccessAction::Invalid, |command| AccessAction::Restrict {
+        "creation" => match decode_strict_arg(args, "enabled", |value| match value {
+            CommandOptionValue::Boolean(enabled) => Some(*enabled),
+            _ => None,
+        }) {
+            StrictArg::Value(enabled) => AccessAction::Creation(enabled),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
+        "role" => match decode_access_roles(args, &["role"]) {
+            Some(roles) => AccessAction::RequiredRole(roles.first().copied()),
+            None => AccessAction::Invalid,
+        },
+        "restrict" => match (
             command,
-            roles,
-        }),
-        "unrestrict" => command.map_or(AccessAction::Invalid, AccessAction::Unrestrict),
+            decode_access_roles(args, &["role", "role2", "role3"]),
+        ) {
+            (StrictArg::Value(command), Some(roles)) => AccessAction::Restrict { command, roles },
+            _ => AccessAction::Invalid,
+        },
+        "unrestrict" => match command {
+            StrictArg::Value(command) => AccessAction::Unrestrict(command),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
         _ => AccessAction::Invalid,
     }
 }
@@ -12671,6 +12898,7 @@ impl VoiceCommand {
             Self::InheritPermissions { .. } => "inheritpermissions",
             Self::DefaultLimit { .. } => "defaultlimit",
             Self::AlwaysPrivate { .. } => "alwaysprivate",
+            Self::SetupShapeInvalid { command, .. } => command,
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Private => "private",
@@ -13293,6 +13521,12 @@ fn access_show_page(controls: &AccessControls, page: usize) -> String {
     lines.join("\n")
 }
 
+/// Short refusal for a malformed `/access` shape: names a copyable
+/// invocation, says nothing changed, and echoes none of the bad input.
+fn access_invalid_refusal() -> String {
+    "That /access option is not valid. Nothing was changed. Use /access show page:1 to see the current settings.".to_owned()
+}
+
 /// Short refusal for a malformed `/access show` page: names the remedy and a
 /// valid start, serves no rows and leaks no role mentions.
 fn access_page_refusal() -> String {
@@ -13348,8 +13582,11 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
-    // A malformed read page refuses before any store touch: no read cost,
+    // Malformed shapes refuse before any store touch: no read cost,
     // no save, no actor/config/audit mutation.
+    if matches!(&action, AccessAction::Invalid) {
+        return access_invalid_refusal();
+    }
     let show_page_invalid = matches!(
         &action,
         AccessAction::Show { page } if page.number().is_none()
@@ -13376,10 +13613,8 @@ async fn execute_access<S: RoomPersistence>(
             }
             return access_show_page(&controls, number);
         }
-        AccessAction::Invalid => {
-            return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
-                .to_owned()
-        }
+        // Refused before the store read above; kept for exhaustiveness.
+        AccessAction::Invalid => return access_invalid_refusal(),
         AccessAction::Creation(enabled) => {
             controls.room_creation_enabled = enabled;
             access_creation_ack(enabled)
@@ -13614,6 +13849,12 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Ambiguous setup options refuse before guild authority, role gates and
+    // every read or effect: the parser already proved the shape unusable.
+    if let VoiceCommand::SetupShapeInvalid { command, field } = &command {
+        reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+        return true;
+    }
     // Cold guild-role facts are not a permanent denial: a command that
     // needs that authority gets the retryable warming-up reply and fails
     // closed before any gate read or protected effect. Missing-member
@@ -14056,6 +14297,13 @@ where
                 },
             };
             reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::SetupShapeInvalid { command, field } => {
+            // Unreachable through the shared handler (answered above before
+            // any read), but a second dispatch path must still refuse here,
+            // never run.
+            reply(ephemeral_response(&setup_shape_correction(command, field))).await;
             true
         }
         VoiceCommand::Reclaim => {
