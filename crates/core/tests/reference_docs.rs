@@ -649,6 +649,37 @@ fn lfg_preview_option_renders_in_command_reference() {
 }
 
 #[test]
+fn schedule_preview_option_renders_in_command_reference() {
+    let section = render_commands()
+        .split("## `/schedule`\n")
+        .nth(1)
+        .expect("schedule section renders")
+        .split("\n## ")
+        .next()
+        .expect("schedule section ends")
+        .to_owned();
+    for row in [
+        "| `body` | string | true |",
+        "| `in-minutes` | integer | false |",
+        "| `every-minutes` | integer | false |",
+        "| `at` | string | false |",
+    ] {
+        assert!(
+            section.contains(row),
+            "existing schedule option stays rendered: {row}"
+        );
+    }
+    assert!(
+        section.contains("| `preview` | boolean | false | — | — | — | — |"),
+        "preview renders as an optional boolean: {section}"
+    );
+    assert!(
+        section.contains("Preview the proposed post and its first firing without saving it"),
+        "preview description renders: {section}"
+    );
+}
+
+#[test]
 fn rejects_deliberately_stale_documents() {
     for (path, generated) in generated_documents() {
         let stale = format!("{generated}\nDeliberately stale fixture.\n");

@@ -1,10 +1,6 @@
 # Documentation map
 
-Rows: `- [Purpose](relative.md)` by area.
-`python3 scripts/check_docs_index.py --json` (root):
-empty `{missing,stale,oversize}` = PASS (exit 0), else 1.
-Stale: bad/dup rows as `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
+Rows: `- [Purpose](relative.md)`. Run (root) `python3 scripts/check_docs_index.py --json`: empty `{missing,stale,oversize}` PASS (0), else 1. Stale=bad/dup rows (`docs/README.md:<line>`). Index <12,000; else ≤65,536, except `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -28,7 +24,7 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Readiness monitoring](container-readiness.md)
 - [Startup diagnostics](startup-diagnostics.md)
 - [Gateway recovery](gateway-recovery.md)
-- [Gateway failure rules](gateway-failure-classification.md)
+- [Gateway failures](gateway-failure-classification.md)
 - [Deferred capture poison](deferred-capture-poison.md)
 - [Backups and restores](backup.md)
 - [Backfill procedure](backfill-runbook.md)
@@ -102,17 +98,18 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Response page proposal](dashboard-custom-responses-spec.md)
 - [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
-- [Onboarding page (design only)](dashboard-onboarding-self-roles-spec.md)
+- [Onboarding page proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
-- [Giveaway self-check](giveaway-self-check-spec.md)
+- [Giveaway check](giveaway-self-check-spec.md)
 - [Community jobs](community-jobs.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey](member-journey-parity.md)
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
+- [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
@@ -122,10 +119,10 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
-- [Relay move (design only)](feed-move-spec.md)
+- [Relay move proposal](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
-- [Staff game mix report](game-activity-report.md)
+- [Game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
 - [Time helper (design only)](time-helper-spec.md)
 - [Queue order](schedule-queue-order.md)
@@ -135,11 +132,13 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
 - [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
+- [RSVP cutoff](rsvp-registration-cutoff-spec.md)
 - [Private agenda proposal](event-agenda-spec.md)
 - [Calendar handoff proposal](event-calendar-handoff-spec.md)
 - [Event role proposal](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Sticky config](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
@@ -149,7 +148,7 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 
 ## Voice
 
-- [Room specification](voice-rooms.md)
+- [Room spec](voice-rooms.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -171,7 +170,7 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
 - [Game aliases and nick](voice-alias-core.md)
-- [Channel-info resolution](voice-channelinfo-core.md)
+- [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
@@ -179,7 +178,7 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Placement/numbering](voice-placement-core.md)
 - [Companion text domain](voice-text-channel-core.md)
 - [Companion lifecycle](voice-companion-lifecycle.md)
-- [Join-request lifecycle](voice-join-request-lifecycle.md)
+- [Join lifecycle](voice-join-request-lifecycle.md)
 - [Logging resolution](voice-logging-core.md)
 - [Name filtering](voice-name-filter-core.md)
 - [Name panel and modal](voice-name-panel.md)
@@ -199,7 +198,7 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Rollback triggers](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
 - [Freeze readback](voice-t5-freeze-readback-receipt.md)
-- [Publish diff form](voice/publish-diff-record-template.md)
+- [Publish diff](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
@@ -219,7 +218,7 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Voice checks](staging-voice-event-verification.md)
 - [Smoke replies](smoke-expected-responses.md)
 - [Smoke record form](smoke-run-record.md)
-- [Smoke surface inventory](smoke-surface-inventory.md)
+- [Smoke inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
 - [Binary lifecycle tests](alive-acceptance.md)
@@ -258,12 +257,12 @@ Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 - [Quality gates](quality-gates.md)
 - [CI security](ci-security.md)
 - [CI speed rollout](ci-speed-rollout.md)
-- [Weekly delivery metrics](dora-metrics.md)
-- [Docs-only queue timing](ci-docs-only-queue-note.md)
+- [Delivery metrics](dora-metrics.md)
+- [Docs queue timing](ci-docs-only-queue-note.md)
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
-- [Load-sensitive fixtures](load-sensitive-test-fixtures.md)
+- [Load fixtures](load-sensitive-test-fixtures.md)
 - [Parser properties](property-tests.md)
 - [Pipeline benchmark](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)
