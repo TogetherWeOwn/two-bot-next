@@ -298,24 +298,27 @@ pub fn expected_registry() -> Value {
             "options": []
         }),
     );
-    // Next-only saved-response inspection. This independent literal pins the
-    // whole publication contract; never manufacture it from production shapes.
+    // Next-only saved-response inspection or unsaved draft preview. This
+    // independent literal pins the whole publication contract; never
+    // manufacture it from production shapes.
     let inspect = json!({
         "name": "command-inspect",
-        "description": "Inspect or privately preview a saved custom command",
+        "description": "Inspect a saved command or privately preview an unsaved draft",
         "dm_permission": false,
         "default_member_permissions": "32",
         "options": [
-            {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
-             "required": true, "max_length": 32},
-            {"name": "view", "description": "Private view (summary by default)", "type": 3,
+            {"name": "name", "description": "Saved command name, a-z 0-9 _ - (choose name or draft)", "type": 3,
+             "max_length": 32},
+            {"name": "view", "description": "Private view (saved: summary by default; draft: preview only)", "type": 3,
              "choices": [
                  {"name": "Summary", "value": "summary"},
                  {"name": "Saved template", "value": "template"},
                  {"name": "Preview", "value": "preview"}
              ]},
             {"name": "arguments", "description": "Sample invocation arguments (ignored by current templates)",
-             "type": 3, "max_length": 500}
+             "type": 3, "max_length": 500},
+            {"name": "draft", "description": "Proposed template to preview without saving (choose name or draft)",
+             "type": 3, "max_length": 2000}
         ]
     });
     let after_list = commands
