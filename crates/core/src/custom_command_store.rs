@@ -266,6 +266,42 @@ pub async fn delete_command<'c>(
     Ok(result.rows_affected() > 0)
 }
 
+/// Record that one guild's saved definitions are not yet reflected in the
+/// published registry. One row per guild: a repeated publication failure
+/// keeps the first marker (and its timestamp) instead of stacking work.
+/// Call with the pool (autocommit) after the failed publication, never in
+/// the already-committed mutation's transaction.
+pub async fn mark_registry_resync_pending<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+    at_iso: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO automation_command_registry_resync (guild_id, requested_at)
+         VALUES ($1, $2::text::timestamptz)
+         ON CONFLICT (guild_id) DO NOTHING",
+    )
+    .bind(guild_id)
+    .bind(at_iso)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Drop one guild's pending-publication marker after a confirmed full-set
+/// publication. Clearing an absent marker is a no-op, and other guilds'
+/// markers are never touched.
+pub async fn clear_registry_resync_pending<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM automation_command_registry_resync WHERE guild_id = $1")
+        .bind(guild_id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// Serialize a guild's capacity check + write inside the supplied transaction.
 /// Unrelated guilds use different advisory keys.
 pub async fn lock_command_capacity(
