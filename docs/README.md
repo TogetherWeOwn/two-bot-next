@@ -2,10 +2,10 @@
 
 Manifest: `- [Purpose](relative.md)`.
 
-Check (repo root): `python3 scripts/check_docs_index.py --json`.
-Empty `{missing,stale,oversize}` = PASS/0; else fix/split (exit 1).
-Bad/duplicate: `stale`, `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
+`python3 scripts/check_docs_index.py --json` (repo root).
+Empty `{missing,stale,oversize}` = PASS; else exit 1.
+Bad rows land in `stale` as `docs/README.md:<line>`.
+Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -25,18 +25,18 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 
 - [Operations and alerts](runbook.md)
 - [Observability triage](runbook-observability.md)
-- [Metrics catalog](metrics.md)
-- [Readiness monitoring](container-readiness.md)
-- [Startup diagnostics](startup-diagnostics.md)
+- [Metrics](metrics.md)
+- [Readiness](container-readiness.md)
+- [Startup](startup-diagnostics.md)
 - [Gateway recovery](gateway-recovery.md)
 - [Gateway failures](gateway-failure-classification.md)
 - [Deferred capture poison](deferred-capture-poison.md)
 - [Backups and restores](backup.md)
-- [Backfill procedure](backfill-runbook.md)
+- [Backfill](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
 - [Release architecture](releases.md)
-- [Passive gradual promote](gradual-promote-caller.md)
+- [Gradual promote](gradual-promote-caller.md)
 - [Logging contract](logging.md)
 - [Log/cardinality limits](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
@@ -56,7 +56,7 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 - [Database roles](database-roles.md)
 - [Database TLS](database-tls.md)
 - [Migration checksums](migrations.md)
-- [Legacy data copy](legacy-copy.md)
+- [Legacy copy](legacy-copy.md)
 - [Legacy data comparison](legacy-verify.md)
 - [Store cutover gates](store-cutover.md)
 - [Member erasure](privacy.md)
@@ -113,6 +113,7 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
+- [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
@@ -141,9 +142,10 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 - [Event role proposal](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Sticky config proposal](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
-- [Opener copy proposal](ticket-opener-copy-spec.md)
+- [Opener copy](ticket-opener-copy-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
@@ -151,7 +153,7 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 
 ## Voice
 
-- [Room specification](voice-rooms.md)
+- [Room spec](voice-rooms.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -173,7 +175,7 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
 - [Game aliases and nick](voice-alias-core.md)
-- [Channel-info resolution](voice-channelinfo-core.md)
+- [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
@@ -181,7 +183,7 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 - [Placement/numbering](voice-placement-core.md)
 - [Companion text domain](voice-text-channel-core.md)
 - [Companion lifecycle](voice-companion-lifecycle.md)
-- [Join-request lifecycle](voice-join-request-lifecycle.md)
+- [Join lifecycle](voice-join-request-lifecycle.md)
 - [Logging resolution](voice-logging-core.md)
 - [Name filtering](voice-name-filter-core.md)
 - [Name panel and modal](voice-name-panel.md)
@@ -201,7 +203,7 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 - [Rollback triggers](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
 - [Freeze readback](voice-t5-freeze-readback-receipt.md)
-- [Publish diff form](voice/publish-diff-record-template.md)
+- [Publish diff](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
@@ -265,7 +267,7 @@ Budgets: index <12,000; others ≤65,536; exceptions: `LARGE_DOCS`.
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
-- [Load-sensitive fixtures](load-sensitive-test-fixtures.md)
+- [Load fixtures](load-sensitive-test-fixtures.md)
 - [Parser properties](property-tests.md)
 - [Pipeline benchmark](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)

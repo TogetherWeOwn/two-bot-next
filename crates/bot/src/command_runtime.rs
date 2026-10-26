@@ -72,13 +72,12 @@ use two_bot_core::{
     feeds::{
         feed_already_paused_text, feed_already_resumed_text, feed_list_page,
         feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
-        feed_removed_text, feed_resumed_text, plan_command, FeedCommand, FeedCommandContext,
-        FeedCommandPlan, FeedKind, FEED_PAUSE_RECOVERY_REQUIRED_TEXT,
-        FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        feed_pending_evidence_refusal_text, feed_removed_text, feed_resumed_text, plan_command,
+        FeedCommand, FeedCommandContext, FeedCommandPlan, FeedKind, FeedPendingEvidenceOperation,
     },
     feeds_store::{
-        add_feed, list_feeds, pause_feed, remove_feed, resume_feed, write_audit, FeedAudit,
-        FeedPauseOutcome, FeedRemoval, FeedResumeOutcome,
+        add_feed, list_feeds, pause_feed_with_evidence, remove_feed_with_evidence, resume_feed,
+        write_audit, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence, FeedResumeOutcome,
     },
     funnel::now_millis_for_test,
     help::{canonical_help_selector, unknown_help_correction},
@@ -2150,9 +2149,10 @@ impl CommandRuntime {
     /// `/feed-remove`: decode `id` → plan → guild-scoped delete → `feed.remove`
     /// audit (`removed`/`missing`/`recovery_required` outcome) → ephemeral
     /// confirmation. A relay carrying unresolved pending delivery evidence is
-    /// retained with a fixed recovery reply, never claimed removed. A store
-    /// failure audits one `feed.remove`/`rejected` refusal row, then replies
-    /// safe. Malformed `id` options refuse before any store read or audit via
+    /// retained with a snapshot reply carrying the fenced pending count,
+    /// never claimed removed. A store failure audits one
+    /// `feed.remove`/`rejected` refusal row, then replies safe. Malformed `id`
+    /// options refuse before any store read or audit via
     /// [`feed_remove_option_strict`].
     async fn feed_remove(&self, interaction: &Interaction) {
         // Remove does not bind to the invoking channel; `channel_id` is only
@@ -2170,14 +2170,23 @@ impl CommandRuntime {
         let command = FeedCommand::Remove { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Remove { guild_id, id }) => {
-                match remove_feed(&self.pool, &guild_id, &id).await {
+                match remove_feed_with_evidence(&self.pool, &guild_id, &id).await {
                     Ok(outcome) => {
                         let (audit_outcome, reply) = match outcome {
-                            FeedRemoval::Removed => ("removed", feed_removed_text(true)),
-                            FeedRemoval::Missing => ("missing", feed_removed_text(false)),
-                            FeedRemoval::RecoveryRequired => {
-                                ("recovery_required", FEED_REMOVAL_RECOVERY_REQUIRED_TEXT)
+                            FeedRemovalEvidence::Removed => {
+                                ("removed", feed_removed_text(true).to_owned())
                             }
+                            FeedRemovalEvidence::Missing => {
+                                ("missing", feed_removed_text(false).to_owned())
+                            }
+                            FeedRemovalEvidence::RecoveryRequired { pending } => (
+                                "recovery_required",
+                                feed_pending_evidence_refusal_text(
+                                    FeedPendingEvidenceOperation::Remove,
+                                    &id,
+                                    pending,
+                                ),
+                            ),
                         };
                         self.feed_audit(&inputs, "feed.remove", &id, audit_outcome, None)
                             .await;
@@ -2204,10 +2213,11 @@ impl CommandRuntime {
     /// outcome) → ephemeral confirmation. URL, destination, seen-item and
     /// delivery history are preserved; only lifecycle state changes. An enabled
     /// relay carrying unresolved pending delivery evidence stays enabled with a
-    /// fixed retry-after-recovery reply, so recovery is never stranded behind
-    /// disabled discovery. Already-admitted work is not cancelled, and no
-    /// fresh post claim may begin after a successful pause. A store failure
-    /// audits one `feed.pause`/`rejected` refusal row, then replies safe.
+    /// snapshot reply carrying the fenced pending count, so recovery is never
+    /// stranded behind disabled discovery. Already-admitted work is not
+    /// cancelled, and no fresh post claim may begin after a successful pause.
+    /// A store failure audits one `feed.pause`/`rejected` refusal row, then
+    /// replies safe.
     async fn feed_pause(&self, interaction: &Interaction) {
         // Pause does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
@@ -2229,19 +2239,23 @@ impl CommandRuntime {
         let command = FeedCommand::Pause { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Pause { guild_id, id }) => {
-                match pause_feed(&self.pool, &guild_id, &id, inputs.now_ms).await {
+                match pause_feed_with_evidence(&self.pool, &guild_id, &id, inputs.now_ms).await {
                     Ok(outcome) => {
                         let (audit_outcome, reply) = match outcome {
-                            FeedPauseOutcome::Paused => ("paused", feed_paused_text(&id)),
-                            FeedPauseOutcome::AlreadyPaused => {
+                            FeedPauseEvidence::Paused => ("paused", feed_paused_text(&id)),
+                            FeedPauseEvidence::AlreadyPaused => {
                                 ("already_paused", feed_already_paused_text(&id))
                             }
-                            FeedPauseOutcome::Missing => {
+                            FeedPauseEvidence::Missing => {
                                 ("missing", feed_removed_text(false).to_owned())
                             }
-                            FeedPauseOutcome::RecoveryRequired => (
+                            FeedPauseEvidence::RecoveryRequired { pending } => (
                                 "recovery_required",
-                                FEED_PAUSE_RECOVERY_REQUIRED_TEXT.to_owned(),
+                                feed_pending_evidence_refusal_text(
+                                    FeedPendingEvidenceOperation::Pause,
+                                    &id,
+                                    pending,
+                                ),
                             ),
                         };
                         self.feed_audit(&inputs, "feed.pause", &id, audit_outcome, None)
