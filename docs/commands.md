@@ -637,6 +637,7 @@ Schedule a message, once or recurring
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
 | `at` | string | false | — | — | 64 | — | One-off RFC3339 time with Z or offset; cannot combine with other timing |
+| `preview` | boolean | false | — | — | — | — | Preview the proposed post and its first firing without saving it |
 
 ## `/schedule-list`
 

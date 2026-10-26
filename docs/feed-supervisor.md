@@ -18,8 +18,8 @@ available in DMs (`docs/commands.md`):
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
 | `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation. Every row labels its own `enabled`/`paused` state, carries its last-attempt phrase, and every reply points at `/feed-inspect` (`crates/core/src/feeds.rs`). |
-| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs`). Guild-scoped delete. |
-| `/feed-pause` | `id` (required string, max 128 chars) | Pauses one relay without deleting its history: URL, destination, seen-item state and delivery evidence are preserved. Replies ``Feed relay paused: `<id>`.``, ``Feed relay is already paused: `<id>`.``, `No feed relay with that id.`, or — when an enabled relay has a delivery still pending recovery — `Feed relay kept enabled: deliveries are still pending recovery. Retry after recovery settles.` (relay stays enabled; already-admitted work is not cancelled). |
+| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` or, while deliveries are still pending recovery, a private snapshot stating the relay was not removed, the stable id, and the guild/relay-scoped unresolved-evidence count with wait-for-reconciliation plus `/feed-inspect` guidance (`feed_pending_evidence_refusal_text` in `crates/core/src/feeds.rs`). Guild-scoped delete. |
+| `/feed-pause` | `id` (required string, max 128 chars) | Pauses one relay without deleting its history: URL, destination, seen-item state and delivery evidence are preserved. Replies ``Feed relay paused: `<id>`.``, ``Feed relay is already paused: `<id>`.``, `No feed relay with that id.`, or — when an enabled relay has deliveries still pending recovery — a private snapshot stating the relay was not paused and remains enabled, with the same evidence count and wait-plus-inspect guidance (relay stays enabled; already-admitted work is not cancelled). |
 | `/feed-resume` | `id` (required string, max 128 chars) | Resumes one paused relay with its history intact. Replies ``Feed relay resumed: `<id>`.``, ``Feed relay is already enabled: `<id>`.``, or `No feed relay with that id.` Catch-up keeps the existing 20-posts-per-pass budget; accepted items are never reposted. |
 | `/feed-inspect` | `id` (required string, max 128 chars) | Ephemeral detail for one saved relay: id, kind, destination, enabled state, redacted source and last attempted poll. Pure read, no audit row. The attempt is attempt evidence only, never a health verdict (`crates/core/src/feeds.rs`). |
 
@@ -37,14 +37,16 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
   guild (disabled relays count; `docs/runbook.md:1312`).
 - Removal cascades settled delivery history (`feed_deliveries` rows go with
   the relay). While any delivery is still pending recovery, removal is
-  refused and keeps the relay and its ledger; let recovery settle it, then
-  remove again (`docs/feeds-port.md`). Do not remove and re-add a relay to
-  "fix" it unless resetting its delivery history is intended — use
-  `/feed-pause` to silence a relay temporarily (history preserved) and
+  refused and keeps the relay and its ledger; the reply names the stable id
+  and the snapshot evidence count — let recovery settle it, then inspect via
+  `/feed-inspect` and remove again (`docs/feeds-port.md`). Do not remove and
+  re-add a relay to "fix" it unless resetting its delivery history is intended
+  — use `/feed-pause` to silence a relay temporarily (history preserved) and
   `/feed-resume` to restore it. Pausing an enabled relay is likewise refused
-  while pending recovery exists; retry after recovery settles. An already-paused
-  relay stays unchanged and reports already paused, even if restored with
-  pending evidence. Resume that relay to make recovery discoverable again.
+  while pending recovery exists, with the same snapshot guidance; retry after
+  recovery settles. An already-paused relay stays unchanged and reports already
+  paused, even if restored with pending evidence. Resume that relay to make
+  recovery discoverable again.
 - `/feed-remove`, `/feed-pause` and `/feed-resume` require exactly one string
   `id` option. Duplicate, wrong-type or missing options refuse with the correct
   command invocation before any store read or audit write.

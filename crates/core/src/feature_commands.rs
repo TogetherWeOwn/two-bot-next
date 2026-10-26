@@ -219,6 +219,11 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::String,
                 )
                 .max_length(MAX_AT_CHARS as u32),
+                CommandOption::new(
+                    "preview",
+                    "Preview the proposed post and its first firing without saving it",
+                    CommandOptionType::Boolean,
+                ),
             ])
             .examples(vec![
                 "/schedule body:Meeting reminder at:2027-01-15T18:30:00+05:30".to_owned(),

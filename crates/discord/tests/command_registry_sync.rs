@@ -462,6 +462,49 @@ async fn unknown_permission_bits_remain_visible_in_dry_run_and_trigger_full_appl
 }
 
 #[tokio::test]
+async fn checked_sync_refusal_sees_the_applied_diff_snapshot_and_preserves_cached_ids() {
+    let commands = desired();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, fetched_registry(&commands)),
+            ScriptedResponse::json(200, drifted_registry(&commands)),
+        ],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let executor = executor(&mock);
+    executor
+        .sync_guild_commands(APP_ID, GUILD_ID, &commands, true)
+        .await
+        .unwrap();
+    let mut checked = false;
+    let result = executor
+        .sync_guild_commands_checked(APP_ID, GUILD_ID, &commands, true, |current, diff| {
+            checked = true;
+            assert_eq!(current.len(), commands.len());
+            assert_eq!(diff.removed.len(), 1);
+            assert_eq!(diff.changed.len(), 1);
+            assert!(current.iter().any(|command| command.name == "retired"));
+            assert!(diff.removed.contains_key("1/retired"));
+            Err(DiscordError::Rejected("fixture guard refusal".into()))
+        })
+        .await;
+    assert!(checked);
+    assert!(matches!(result, Err(DiscordError::Rejected(_))));
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    requests.iter().for_each(assert_get);
+    assert_eq!(
+        executor
+            .command_identities()
+            .slash_name(&identity_interaction(9000, "wrong-name"))
+            .as_deref(),
+        Some("inspect")
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_or_malformed_get_never_falls_back_to_empty_registry_or_put() {
     let malformed = ScriptedResponse {
         body: b"not JSON".to_vec(),
