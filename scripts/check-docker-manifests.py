@@ -116,6 +116,15 @@ def _layer_instructions(docker_text):
     return instructions
 
 
+def _command_words(command):
+    """Keep COPY and RUN quoting failures on the same typed refusal path."""
+    try:
+        return shlex.split(command)
+    except ValueError as error:
+        raise Refusal(
+            "unsupported dependency-layer command: malformed quoting") from error
+
+
 def dependency_sources(docker_text):
     """COPY sources of the dependency layer (everything before `COPY . .`).
 
@@ -126,7 +135,7 @@ def dependency_sources(docker_text):
     for kind, stripped in _layer_instructions(docker_text):
         if kind != "copy":
             continue
-        *srcs, _destination = shlex.split(stripped)[1:]
+        *srcs, _destination = _command_words(stripped)[1:]
         sources.extend(srcs)
     return sources
 
@@ -154,18 +163,14 @@ def reconstruct(docker_text, root, dest):
         if kind == "preamble":
             continue
         if kind == "copy":
-            *sources, destination = shlex.split(stripped)[1:]
+            *sources, destination = _command_words(stripped)[1:]
             target = dest / destination
             target.mkdir(parents=True, exist_ok=True)
             for source in sources:
                 shutil.copyfile(root / source, target / Path(source).name)
         elif kind == "run":
             for command in stripped[4:].split("&&"):
-                try:
-                    words = shlex.split(command)
-                except ValueError as error:
-                    raise Refusal(
-                        "unsupported dependency-layer command: malformed quoting") from error
+                words = _command_words(command)
                 require(words, "unsupported dependency-layer command: empty segment")
                 if len(words) >= 3 and words[:2] == ["mkdir", "-p"]:
                     for path in words[2:]:
