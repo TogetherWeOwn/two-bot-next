@@ -277,6 +277,8 @@ jobs:
   deploy:
     name: wrangler deploy + intended rollout gate
     needs: [schema-gate, roles-gate]
+    outputs:
+      promotion_clean: ${{ steps.prepare.outputs.promotion_clean }}
     permissions:
       contents: read # checkout only; the deploy authenticates with `staging` environment secrets
       deployments: write # derive the deploy ID from today's staging Deployments, then record this one
@@ -365,6 +367,7 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
         run: node scripts/ownership-control.mjs preflight
       - name: Snapshot staging identity and generate per-deploy image provenance
+        id: prepare
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -399,6 +402,30 @@ jobs:
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --deploy-config "$ROLLOUT_DIR/staging-deploy.json" "${inject[@]}"
+          if [ "${#inject[@]}" -eq 0 ]; then
+            echo "promotion_clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "promotion_clean=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Bundle the Worker once before staging serves it
+        run: |
+          set -euo pipefail
+          # This dry run only packages JavaScript. The real staging deploy
+          # below builds the container once and serves these saved modules.
+          # Wrangler writes deploy/session records even on --dry-run. Keep
+          # packaging out of the single-deploy receipt consumed below.
+          env -u WRANGLER_OUTPUT_FILE_PATH npx --no-install wrangler deploy --config "$ROLLOUT_DIR/staging-deploy.json" \
+            --env staging --dry-run --containers-rollout=none --outdir "$ROLLOUT_DIR/worker-modules"
+          python3 - "$ROLLOUT_DIR" <<'PY'
+          import json, pathlib, sys
+          sys.path.insert(0, "../tooling/scripts")
+          from bot_promotion import configure_bundle
+          root = pathlib.Path(sys.argv[1])
+          path = root / "staging-deploy.json"
+          config = json.loads(path.read_text())
+          configure_bundle(config, root / "worker-modules", "index.js")
+          path.write_text(json.dumps(config) + "\n")
+          PY
       # Snapshot the serving Worker version, its stamped Git SHA and the
       # container image BEFORE replacing anything: a failed verify below
       # auto-rolls back to exactly this provenance receipt. Allowlisted IDs
@@ -427,7 +454,7 @@ jobs:
           # annotation with the deployed commit, the SHA member of the
           # rollback provenance receipt the next snapshot records (as
           # production): the validated deploy SHA, never the workflow head.
-          command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging --message ${{ env.DEPLOY_SHA }}
+          command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging --message ${{ env.DEPLOY_SHA }} --no-bundle
       # Ordering (TOG-12939): ownership must not move to a deploy whose Wrangler
       # receipt is not valid, fresh and pinned, so that part of the gate runs
       # here, before the transfer. It reads only the local NDJSON (no network,
@@ -638,3 +665,50 @@ jobs:
           fi
           echo "::error::Pinned drill deploy of $PINNED_SHA (workflow head $HEAD_SHA): staging serves the pin, so this run stays red and is not staging history for production."
           exit 1
+
+  # Failure diagnostics above are not promotion certificates. Only a normal
+  # run that passed every downstream gate can publish these immutable bytes.
+  certify-promotion:
+    name: certify immutable staging bytes
+    needs: [deploy, voice-synthetic, pinned-history-guard]
+    if: success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'certify-promotion') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: staging-rollout-evidence
+          path: ${{ runner.temp }}/promotion-source
+      - name: Certify the served module bytes and verified rollout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          source="$RUNNER_TEMP/promotion-source"
+          stamp="$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/promotion-source/evidence.json"))["deploy_id"])')"
+          python3 scripts/bot_promotion.py certify \
+            --modules "$source/worker-modules" --entrypoint index.js \
+            --evidence "$source/evidence.json" --config wrangler/wrangler.toml \
+            --sha "$SOURCE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --deploy-id "$stamp" --readiness-result success --synthetic-result success \
+            --fault-mode none --out "$RUNNER_TEMP/promotion.zip"
+          # The archive is our validated local output, not downloaded intake.
+          # Upload its contents so the immutable Actions ZIP has the same
+          # closed receipt/modules shape that the production consumer checks.
+          python3 -m zipfile -e "$RUNNER_TEMP/promotion.zip" "$RUNNER_TEMP/promotion-upload"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bot-promotion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/promotion-upload
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
