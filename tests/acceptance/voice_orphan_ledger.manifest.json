@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected RED-first evidence-only ledger for untracked creator-channel compensation failures",
+  "baseCommit": "c6e5213b516d5ef62b357cc2f5feeaf8f59889a8",
+  "branch": "test/voice-orphan-ledger-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/voice_orphan_ledger_acceptance_tests.rs",
+      "sha256": "513f7a8fcab04dddf2536094865c678bf171e38148286f6392286e6c90400f8f",
+      "tests": 12,
+      "observerTests": 3,
+      "instruction": "Preserve byte-for-byte; corrections return to the test author, never implement or weaken the acceptance file."
+    }
+  ],
+  "integrationFiles": [
+    {
+      "path": "crates/bot/src/voice_rooms_tests.rs",
+      "sha256": "c4ec1ab538c656704d02e66eb445bbe86a45f7cbe6f66dac4a98135039fb2c00",
+      "change": "Register the orphan_ledger_acceptance child module; other test content unchanged."
+    },
+    {
+      "path": "crates/bot/src/voice_setup_access_paging_acceptance_tests.rs",
+      "sha256": "e9d842027fa5158ae8b64136398880594ff739f1acbb8435a3811985aa84ffd6",
+      "change": "The older registry test still pins all 22 original voice surfaces; the new protected registry test owns the additional voice-orphans read surface."
+    }
+  ],
+  "existingDependency": {
+    "path": "crates/core/tests/support/hotpath_queries.rs",
+    "sha256": "4dafad83a759bd59ed8d93fe7e9d8f3e3b0cb1258e8aad5a24f8f220d051ec6b",
+    "purpose": "Unmodified scoped SQLx executed-query observer, including its own three controls."
+  },
+  "commands": {
+    "focused": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked voice_rooms::tests::orphan_ledger_acceptance:: -- --nocapture --test-threads=1",
+    "voiceControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked voice_rooms::tests:: -- --test-threads=1",
+    "format": "cargo fmt --all -- --check"
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "fixture": "TestDatabase with the cutover migration chain; independent pools for restart assertions; explicit close even after an assertion failure",
+    "missingEnvironment": "Explicit failure, never skip or ignore",
+    "ciRoute": "check.yml normal Rust binary tests supply the guarded disposable Postgres URL",
+    "boundaries": "No live Discord, no staging/production database, no application credentials"
+  },
+  "contract": {
+    "source": "Only /create's successful Discord receipt plus failed creator persistence plus failed compensation is untracked orphan evidence. It bypasses the reconcile queue today; the tests use real slash dispatch and separately pin real reconcile non-interference.",
+    "storage": "voice_orphan_ledger: guild_id text, channel_id text, reason text, recorded_at timestamptz; database-enforced unique guild/channel identity; reason creator_compensation_failed; observation time; no user-controlled text",
+    "retention": "1000 rows per guild, oldest recorded_at first; repeated identity preserves first evidence and cannot evict another row; parallel append/trim preserves the bound and other guilds",
+    "read": "/voice-orphans page:integer, default 1, 10 whole newest-first rows per page, RFC3339 times, Page n of total, guild context and copyable next-page invocation; deterministic replay and independent-pool restart; other guilds excluded",
+    "authorization": "Manage Channels or Administrator from trusted guild-role facts; refuse non-staff and forged permission claims before constructing or querying any store, including access_controls; observed through factory counts and SQLx receipts with a real SELECT sanity control",
+    "safety": "All replies ephemeral, bounded and mention-safe; malformed/past-end page refuses; reads never mutate evidence or Discord; no auto-deletion",
+    "controls": "Byte-identical successful-create and successful-compensation replies; unknown create receipt invents no channel; real tracked-ghost reconcile ignores arbitrary live residue; failed room rollback retains existing tracked/reservation compensation witness"
+  },
+  "handoff": [
+    "Do not merge this intentionally RED test-only branch by itself.",
+    "Use the immutable commit and file hash delivered on the acceptance card; cherry-pick only the test-only slice and manifest.",
+    "The builder owns the production table/store/runtime/command wiring and necessary additive help/reference/count pins, then demonstrates GREEN without editing the protected file.",
+    "Observed execution results and any cache refusal are recorded on the card; a manifest is not evidence of compilation or RED."
+  ]
+}
