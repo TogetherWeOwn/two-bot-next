@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "week": "2026-W44",
+  "window_days": 30,
+  "window": {
+    "start": "2026-09-26T14:20:57Z",
+    "end": "2026-10-26T14:20:57Z"
+  },
+  "generated_at": "2026-10-26T14:20:57Z",
+  "generator": {
+    "workflow": "dora-metrics",
+    "run_id": "40338783842",
+    "sha": "c838e512549de1c9d59fb434ae0518269b8b343d"
+  },
+  "repository": "TogetherWeOwn/two-bot-next",
+  "g2_change_failure_rate": {
+    "failed": 0,
+    "total": 0,
+    "rate": null,
+    "target_lt": 0.05,
+    "pass": null,
+    "unknown_state": 0,
+    "in_flight": 0,
+    "excluded_automatic_rows": 31
+  },
+  "g3_recovery_minutes": {
+    "incidents": [],
+    "recovered": 0,
+    "worst_minutes": null,
+    "mean_minutes": null,
+    "target_auto_lt": 5,
+    "target_worst_lt": 30,
+    "worst_pass": null,
+    "rollback_recoveries": 0,
+    "rollback_all_under_5": null,
+    "unverified_mechanism": 0,
+    "unrecovered": []
+  },
+  "g4_lead_time_minutes": {
+    "p50_minutes": null,
+    "p90_minutes": null,
+    "method": "nearest-rank",
+    "n": 0,
+    "unresolved_commits": 0,
+    "target_p50_lt": 60,
+    "target_p90_lt": 180,
+    "p50_pass": null,
+    "p90_pass": null
+  },
+  "g5_throughput": {
+    "successful_deploys": 0,
+    "per_day": {},
+    "mean_per_day": 0.0,
+    "target_note": ">=1/hour when green work exists",
+    "commits_per_deploy": {
+      "mean": null,
+      "max": null,
+      "target_max_le": 15,
+      "pass": null,
+      "unresolved": 0
+    }
+  },
+  "deployments": []
+}
