@@ -1,9 +1,7 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)` by area.
-
-Check `python3 scripts/check_docs_index.py --json` (repo root): empty `{missing,stale,oversize}` = PASS, else exit 1.
-Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,000, others ≤65,536 (`LARGE_DOCS`).
+Rows: `- [Purpose](relative.md)`. `python3 scripts/check_docs_index.py --json` (repo root): empty `{missing,stale,oversize}` = PASS, else exit 1;
+bad rows → `stale` as `docs/README.md:<line>`; index <12,000, others ≤65,536, exceptions only `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -12,7 +10,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Command reference](commands.md)
 - [Settings reference](configuration.md)
 - [Parity ledger](parity.md)
-- [Containment boundaries](containment.md)
+- [Containment bounds](containment.md)
 - [Prototype metrics](s2-prototype.md)
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
@@ -21,7 +19,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 
 ## Operations and observability
 
-- [Operations and alerts](runbook.md)
+- [Operations/alerts](runbook.md)
 - [Observability triage](runbook-observability.md)
 - [Metrics catalog](metrics.md)
 - [Readiness monitoring](container-readiness.md)
@@ -34,7 +32,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
 - [Release architecture](releases.md)
-- [Passive gradual promote](gradual-promote-caller.md)
+- [Gradual promote](gradual-promote-caller.md)
 - [Logging contract](logging.md)
 - [Log/cardinality limits](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
@@ -55,7 +53,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Database TLS](database-tls.md)
 - [Migration checksums](migrations.md)
 - [Legacy data copy](legacy-copy.md)
-- [Legacy data comparison](legacy-verify.md)
+- [Legacy comparison](legacy-verify.md)
 - [Store cutover gates](store-cutover.md)
 - [Member erasure](privacy.md)
 - [Membership chronology](membership-contract.md)
@@ -111,6 +109,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
+- [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
@@ -139,6 +138,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Event role proposal](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Sticky config proposal](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
 - [Inactivity (design only)](ticket-autoclose-spec.md)
@@ -149,7 +149,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 
 ## Voice
 
-- [Room specification](voice-rooms.md)
+- [Room spec](voice-rooms.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -170,8 +170,8 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Assistant requests](voice-assistant-request-core.md)
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
-- [Game aliases and nick](voice-alias-core.md)
-- [Channel-info resolution](voice-channelinfo-core.md)
+- [Game alias/nick](voice-alias-core.md)
+- [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
@@ -179,13 +179,13 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Placement/numbering](voice-placement-core.md)
 - [Companion text domain](voice-text-channel-core.md)
 - [Companion lifecycle](voice-companion-lifecycle.md)
-- [Join-request lifecycle](voice-join-request-lifecycle.md)
+- [Join lifecycle](voice-join-request-lifecycle.md)
 - [Logging resolution](voice-logging-core.md)
 - [Name filtering](voice-name-filter-core.md)
 - [Name panel and modal](voice-name-panel.md)
 - [Rename coalescing](voice-rename-coalescer-core.md)
 - [Rename pipeline](voice-rename-pipeline.md)
-- [Ping/invite utilities](voice-utilities-core.md)
+- [Ping/invite core](voice-utilities-core.md)
 - [Presence facts](voice-presence.md)
 - [Occupancy experiment](voice-occupancy-curve.md)
 - [Delete guards](voice-delete-guards.md)
@@ -199,7 +199,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Rollback triggers](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
 - [Freeze readback](voice-t5-freeze-readback-receipt.md)
-- [Publish diff form](voice/publish-diff-record-template.md)
+- [Publish diff](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
@@ -241,7 +241,7 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Rollback one-pager](cutover-rollback-onepager.md)
 - [Rollback procedure](cutover-rollback-runbook.md)
 - [Rollback tabletop](cutover-rollback-tabletop.md)
-- [Rollback delta report](rollback-delta.md)
+- [Rollback delta](rollback-delta.md)
 - [Dashboard queries](cutover-dashboard-queries.md)
 - [Watch handover](cutover-watch-handover.md)
 - [Watch checklist](watch-checklist.md)
@@ -263,12 +263,12 @@ Fix rows/split docs; bad rows → `stale` as `docs/README.md:<line>`; index <12,
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
-- [Load-sensitive fixtures](load-sensitive-test-fixtures.md)
+- [Load fixtures](load-sensitive-test-fixtures.md)
 - [Parser properties](property-tests.md)
 - [Pipeline benchmark](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)
 - [Image supply chain](supply-chain.md)
-- [Distroless evaluation](distroless-evaluation.md)
+- [Distroless eval](distroless-evaluation.md)
 - [Threat model](threat-model.md)
 - [Command wiring gates](command-wiring-security.md)
 - [Rejection telemetry](rejection-telemetry.md)
