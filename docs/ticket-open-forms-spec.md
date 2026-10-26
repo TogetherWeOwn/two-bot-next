@@ -37,6 +37,7 @@ facts, not deployed-feature or permission measurements.
 | Staff today | [Authorization](../crates/core/src/tickets.rs#L108-L127) accepts current configured staff role OR ManageChannels OR Administrator for Claim/Close. [Runtime](../crates/bot/src/ticket_runtime.rs#L951-L981) takes member facts from the interaction and live config |
 | Panels today | Exactly one panel: [config](../crates/bot/src/ticket_runtime.rs#L357-L434) reads a single `DISCORD_TICKET_PANEL_CHANNEL_ID`; [ensure_panel](../crates/bot/src/ticket_runtime.rs#L1831-L1853) posts one [Panel](../crates/discord/src/executor/tickets.rs#L364-L369) message. There is no panel registry, panel ID type or per-panel settings row; multi-panel provisioning does not exist |
 | Channel proof | [Executor](../crates/discord/src/executor/tickets.rs#L46-L146) requires same guild/category, GuildText, canonical channel ID, exactly four explicit overwrites and exact topic `two-ticket:<reservation-id>`. [Create](../crates/discord/src/executor/tickets.rs#L150-L172) sends generated name and exact topic, single attempt |
+| Message ceiling | The executor counts every message it sends in UTF-16 units and rejects anything over [2000 units](../crates/discord/src/executor.rs#L114) before any wire call ([check](../crates/discord/src/executor.rs#L3093-L3097)); 1001 astral scalars are 2002 units. Any single-message render (such as B's answers message) must fit that ceiling or it fails deterministically |
 | Close/transcript | [Close](../crates/bot/src/ticket_runtime.rs#L1212-L1262) freezes opener writes, captures and commits before cleanup. Close copy promises transcript saved up to 90 days ([copy](../crates/bot/src/ticket_runtime.rs#L1058-L1065)). There is no member-facing reopen: `reopen_interrupted` ([store](../crates/cutover/src/tickets.rs#L208-L217), [domain](../crates/core/src/tickets.rs#L244-L273)) only recovers an interrupted close |
 | Retention/erasure | [Store](../crates/cutover/src/tickets.rs#L338-L372) purges transcript rows and erases opener/claimant-owned tickets; [erasure inventory](../crates/cutover/src/member_erasure_plan.json#L219-L226) covers opener/claimant selectors only. Ticket metadata has no age purge here. [Privacy](privacy.md) excludes Discord-side deletion |
 
@@ -65,9 +66,18 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
   a label (1-45 chars), a kind (`short` | `paragraph` | `choice`), a required flag,
   and length bounds (`min_length` 0-4000, `max_length` 1-4000, and
   `min_length` <= `max_length`; paragraph `max_length` <=1000).
-  A `choice` adds 2-10 options, each 1-100 chars, unique after NFC+trim, each
-  option length within [`min_length`, `max_length`], and the ` / `-joined option
-  list fitting the 100-char hint budget so members can discover the options.
+  A `choice` adds 2-10 options. Each option is canonicalized at authoring time
+  with the exact submit normalization (NFC, then trim ASCII space at both ends)
+  and the canonical text is what is stored, previewed and matched; raw
+  non-canonical input is never stored. Every option rule below applies to the
+  canonical text, counted in Unicode scalars: 1-100 chars, length within
+  [`min_length`, `max_length`], exact-unique among the question's options
+  (case-sensitive), and free of the characters submit validation rejects for
+  `choice` answers (controls, bidi/zero-width formatting, line/paragraph
+  separators), so every stored option is an answer a member can actually
+  submit. The rendered choice hint (see PII minimization) — the ` / `-joined
+  canonical options, prefixed by the staff hint text when one is set — fits
+  the 100-char hint budget so members can discover the options.
 - **Staff-only authoring:** create/edit/disable a form or question only with
   current Claim/Close-grade authority (current configured staff role OR
   ManageChannels OR Administrator), current guild membership, and the
@@ -75,11 +85,17 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
   identity, past staff status, a service MAC, supplied actor ID or knowing a
   panel ID grants nothing. Members never author, edit, disable or preview the
   definition; they only see the runtime modal.
-- **Definition validation:** authoring/enable-time validation refuses a form with
-  duplicate question IDs, `min_length` > `max_length`, a `choice` option outside
-  [`min_length`, `max_length`], or a `choice` option list that cannot be rendered
-  within member-visible modal text (joined options exceed the hint budget).
-  Refusal increments no version and changes no enabled form.
+- **Definition validation:** authoring/enable-time validation canonicalizes
+  every `choice` option first (NFC + ASCII-space trim, exactly as submit does),
+  then refuses a form with duplicate question IDs, `min_length` > `max_length`,
+  a canonical option that is empty, outside 1-100 chars or outside
+  [`min_length`, `max_length`], duplicates another canonical option, or
+  contains a character submit validation rejects, or a rendered choice hint
+  (staff hint prefix plus joined canonical options, as composed under PII
+  minimization) over the 100-char budget. All lengths, uniqueness and the hint
+  budget are re-checked on the canonical text, never on raw input, and staff
+  preview shows the stored canonical options. Refusal increments no version
+  and changes no enabled form.
 - **Versioning:** each panel form carries a monotonically increasing version
   (including disable/clear, decimal 1-10 chars). Modal `custom_id` binds panel
   identity + form version + operation nonce with canonical encoding
@@ -116,10 +132,23 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
 - **Submit validation:** NFC-normalize, trim ASCII space at both ends, then
   enforce required (non-empty after trim). For a non-empty answer, enforce
   `min_length`/`max_length` in Unicode scalars; an empty optional answer skips
-  the length bounds. For `choice`, require an exact post-normalization match
-  against one option (case-sensitive; no fuzzy match, no prefix match). Reject controls,
+  the length bounds. For `choice`, require an exact match between the
+  normalized answer and one stored canonical option (case-sensitive; no fuzzy
+  match, no prefix match); options are stored canonical (definition contract),
+  so both sides of the comparison are canonical text. Reject controls,
   bidi/zero-width formatting, line/paragraph separators in `short`/`choice`
-  (paragraph keeps single newlines, no other category C). Invalid submit ->
+  (paragraph keeps single newlines, no other category C). Finally, before any
+  reserve, render the exact answers message that would be posted (labels,
+  escaping, directional isolation, separators — every character of the final
+  content) and require its length in UTF-16 units to be <=2000, the executor's
+  pre-send ceiling (baseline, Message ceiling). Per-question scalar bounds do
+  not imply this total: five 500-char answers or 1001 astral scalars pass
+  per-question checks yet exceed 2000 units, so the total check is separate
+  and mandatory. An overlong total is an ordinary invalid submit: private
+  "answers too long in total; shorten your answers" error, zero creation
+  effects, no reserve, no cooldown consumed. Every admitted submission is
+  therefore guaranteed renderable in the one answers message; deterministic
+  oversize can never reach the post-commit answers post. Invalid submit ->
   private error naming the question label only, zero creation effects, modal
   may be re-presented with valid answers preserved client-side only.
 - **Double submit / double click:** same operation nonce replays the recorded
@@ -136,9 +165,13 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
   separated; labels escaped, answers rendered with directional isolation, no
   embeds). Creation commits when the Controls post succeeds; the answers post is
   post-commit. If the Controls post fails, the open rolls back as today with no
-  answers message. Closed `allowed_mentions` on the answers post (empty
-  parse/users/roles, replied_user=false). Mention syntax stored in an answer
-  cannot ping from this message.
+  answers message. The rendered message is the exact string whose UTF-16-unit
+  length submit validation already proved <=2000 before reserve, so the
+  executor's pre-send ceiling cannot deterministically reject it; only a
+  transient send failure can reach the post-commit failure row. Closed
+  `allowed_mentions` on the answers post (empty parse/users/roles,
+  replied_user=false). Mention syntax stored in an answer cannot ping from
+  this message.
 - **Transcript interplay:** answers are captured only through the existing
   channel-message capture path; B adds no transcript writer, column or format
   change. Transcript retention stays the existing 90-day ceiling; no separate
@@ -147,9 +180,17 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
   nonce, actor, time, per-question answered/skipped flags and refusal/unknown
   cause. Never raw answer text, answer length, text hash, question text beyond
   stable IDs, option text, or remote bodies.
-- **PII minimization:** each question carries staff-authored hint text (<=100
-  chars) shown in the modal, and the form enable confirmation warns staff that
-  answers are visible to ticket staff and captured in transcripts. No answers in
+- **PII minimization:** each question carries optional staff-authored hint text
+  (<=100 chars, counted verbatim as stored) shown in the modal's single
+  100-char hint field. For a `choice` question that one field renders the
+  staff hint and the option list composed as a single string: the ` / `-joined
+  canonical options alone when the hint is empty, otherwise
+  `<hint>: <joined options>`. The composed string — never the joined options
+  alone — must fit the 100-char budget (Unicode scalars); definition
+  validation refuses a choice whose composed hint exceeds it, so options are
+  never truncated out of the member-visible field. The form enable
+  confirmation warns staff that answers are visible to ticket staff and
+  captured in transcripts. No answers in
   metric labels, SQL errors, traces, HTTP/access logs, clipboard export or
   private-to-public summaries. Do not claim automatic sensitive-data detection.
 - **Rate-limit interplay:** modal open and failed submits never consume or
@@ -185,6 +226,7 @@ missing/foreign/hidden/deleted case or a nonparticipant, return the same
 | --- | --- |
 | Modal dismissed / expired | Zero effects (see intake contract) |
 | Overlong / invalid answer | Private per-question error; nothing created; no cooldown consumed |
+| Answers valid per-question but rendered message over 2000 UTF-16 units | Refused at submit validation before any reserve: private shorten-answers error, zero effects, no cooldown; admitted submissions always fit the one answers message |
 | Form edited/disabled mid-intake | Submit version mismatch -> refuse with re-open guidance; no partial creation, no field merge |
 | Member already has active ticket (at open or submit) | Existing-ticket copy; no modal on pre-check fail, no creation on submit fail |
 | Cooldown active (at open or submit) | Cooldown copy with next-try time; modal fill never extends it |
@@ -267,20 +309,32 @@ use the seven-field envelope above, including on refusal.
 ...     if kind in {"short", "choice"}:
 ...         return not any(unicodedata.category(c).startswith("C") or ord(c) in (8232, 8233) for c in text)
 ...     return not any(unicodedata.category(c).startswith("C") and c != "\n" or ord(c) in (8232, 8233) for c in text)
+>>> def canon(s):
+...     return unicodedata.normalize("NFC", s).strip(" ")
 >>> def choice_match(raw, options):
-...     text = unicodedata.normalize("NFC", raw).strip(" ")
-...     return text in options
->>> def valid_definition(*, question_ids, min_len=0, max_len=500, options=None):
+...     return canon(raw) in [canon(o) for o in options]
+>>> def utf16_units(s):
+...     return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+>>> def render_fits(rendered):
+...     return utf16_units(rendered) <= 2000
+>>> def valid_definition(*, question_ids, min_len=0, max_len=500, options=None, hint=""):
 ...     if len(question_ids) != len(set(question_ids)):
 ...         return False
 ...     if min_len > max_len:
 ...         return False
 ...     if options is not None:
-...         if not (2 <= len(options) <= 10):
+...         canon_opts = [canon(o) for o in options]
+...         if not (2 <= len(canon_opts) <= 10):
 ...             return False
-...         if any(not (min_len <= len(o) <= max_len) for o in options):
+...         if len(set(canon_opts)) != len(canon_opts):
 ...             return False
-...         if len(" / ".join(options)) > 100:
+...         if any(not (1 <= len(o) <= 100) for o in canon_opts):
+...             return False
+...         if any(not valid_answer(o, kind="choice", min_len=min_len, max_len=max_len) for o in canon_opts):
+...             return False
+...         joined = " / ".join(canon_opts)
+...         composed = joined if not hint else f"{hint}: {joined}"
+...         if len(composed) > 100:
 ...             return False
 ...     return True
 >>> def decide(*, eligible=True, version="7", submitted="7", enabled=True, action="submit", answers_ok=True, dry_run=True):
@@ -309,16 +363,26 @@ use the seven-field envelope above, including on refusal.
 >>> assert valid_answer("", required=False, min_len=5) and not valid_answer("", required=True, min_len=5)
 >>> assert choice_match("Billing", ["Billing", "Appeal"]) and not choice_match("billing", ["Billing", "Appeal"])
 >>> assert not choice_match(" Bill", ["Billing", "Appeal"]) and choice_match(" Billing ", ["Billing", "Appeal"])
+>>> assert choice_match("Billing", [" Billing ", "Appeal"]) and choice_match("café", ["café", "Appeal"])
 >>> assert not valid_definition(question_ids=["a", "a"])
 >>> assert not valid_definition(question_ids=["a"], min_len=10, max_len=5)
 >>> assert not valid_definition(question_ids=["a"], min_len=0, max_len=3, options=["Billing", "Appeal"])
 >>> assert not valid_definition(question_ids=["a"], options=["x" * 60, "y" * 60])
 >>> assert valid_definition(question_ids=["a", "b"], min_len=0, max_len=100, options=["Billing", "Appeal"])
+>>> assert valid_definition(question_ids=["a"], options=[" Billing ", "Appeal"])
+>>> assert not valid_definition(question_ids=["a"], options=[" Billing", "Billing"])
+>>> assert not valid_definition(question_ids=["a"], options=["   ", "Appeal"])
+>>> assert not valid_definition(question_ids=["a"], options=[" abcd ", "Appeal"], min_len=5)
+>>> assert not valid_definition(question_ids=["a"], options=["Bill" + chr(8203) + "ing", "Appeal"])
+>>> assert valid_definition(question_ids=["a"], options=["a" * 30, "b" * 30]) and not valid_definition(question_ids=["a"], options=["a" * 30, "b" * 30], hint="x" * 80)
+>>> assert valid_definition(question_ids=["a"], options=["Billing", "Appeal"], hint="pick one")
+>>> assert render_fits("x" * 2000) and not render_fits("x" * 2001)
+>>> assert utf16_units(chr(0x1F600) * 1001) == 2002 and not render_fits(chr(0x1F600) * 1001) and render_fits(chr(0x1F600) * 1000)
 >>> text = pathlib.Path("docs/ticket-open-forms-spec.md").read_text()
 >>> cases = re.findall(r"^\| (TF-F\d{2}) ", text, re.M)
->>> assert cases == [f"TF-F{i:02}" for i in range(1, 18)]
+>>> assert cases == [f"TF-F{i:02}" for i in range(1, 19)]
 >>> print(json.dumps({"schema":"ticket.open_forms.mock.v1", "matrix_rows":len(cases), "outcome":"offline_examples_pass", "created":False, "answers_posted":False}, sort_keys=True))
-{"answers_posted": false, "created": false, "matrix_rows": 17, "outcome": "offline_examples_pass", "schema": "ticket.open_forms.mock.v1"}
+{"answers_posted": false, "created": false, "matrix_rows": 18, "outcome": "offline_examples_pass", "schema": "ticket.open_forms.mock.v1"}
 
 ```
 
@@ -347,7 +411,7 @@ live private-case collection. Timing limits are acceptance targets, not SLAs.
 | TF-F01 | Given enabled 5-question form, when eligible member opens and submits valid answers, then one ticket, Controls posts first (commit), one answers message after Controls, one audit row without text; no extra posts. |
 | TF-F02 | Given required/optional mix, when optional left blank, then creation proceeds with skipped flag; blank required refuses with per-question error and zero effects. |
 | TF-F03 | Given min/max bounds and choice options, when answers at 1/max/max+1 and option/non-option/case-variant submitted, then exact bounds above; no truncation, echo, mention firing or unsafe render. |
-| TF-F04 | Given staff authoring, when current staff creates/edits/disables, then version increments and modal shape changes; member/opener/claimant-alone/past-staff/forged actor can never author or view the definition; duplicate IDs, min>max, choice option outside [min,max], or unrenderable option list refuses with zero version increment. |
+| TF-F04 | Given staff authoring, when current staff creates/edits/disables, then version increments and modal shape changes; member/opener/claimant-alone/past-staff/forged actor can never author or view the definition; duplicate IDs, min>max, choice option outside [min,max], or unrenderable option list refuses with zero version increment. Options are checked and stored canonical (NFC+trim): a raw option that canonicalizes to empty, to a duplicate, outside 1-100/[min,max] on canonical length, or to submit-forbidden characters refuses; a raw ` Billing ` is stored and previewed as `Billing` and matches a normalized `Billing` answer; a choice whose composed hint (staff hint prefix + joined canonical options) exceeds 100 chars refuses even when the joined options alone fit. |
 | TF-F05 | Given modal opened, when dismissed/expired or pre-check fails, then zero ticket row, message, audit, cooldown or quota effect; re-open starts fresh. |
 | TF-F06 | Given overlong/empty-required/invalid-choice submit, when submitted, then private per-question error, nothing created, cooldown unconsumed; valid answers may be re-presented client-side only. |
 | TF-F07 | Given form edited or disabled mid-intake, when stale-version submit arrives, then version-mismatch refusal with re-open guidance; no partial creation or cross-version field merge. |
@@ -361,6 +425,7 @@ live private-case collection. Timing limits are acceptance targets, not SLAs.
 | TF-F15 | Given answers posted, when inspecting audit/metrics/logs/traces/SQL errors, then question IDs, versions, flags and counts only; no raw text, length, hash, option text or remote body anywhere. |
 | TF-F16 | Given local dry-run, malformed JSON/unknown fields/flags or oversized request, when invoked, then deterministic bounded error/next_action and zero network/SQL/nonce/cooldown/audit effects. |
 | TF-F17 | Given Controls-post failure before answers post, when post fails, then existing rollback applies with no answers message; member must re-open; no partial ticket remains. |
+| TF-F18 | Given per-question-valid answers whose exact rendered answers message exceeds 2000 UTF-16 units (five 500-char answers; a single 2001-unit answer; 1001 astral scalars = 2002 units), when submitted, then refused before any reserve with private shorten-answers error and zero ticket/reservation/audit/cooldown effects; a render of exactly 2000 units is admitted and posts exactly once. |
 
 Existing reusable mocks/tests: [shared recording transport](../crates/discord/tests/common/mod.rs#L381-L448),
 [receipt acceptance](../crates/discord/tests/ticket_creation_receipt_acceptance.rs#L22-L150),
@@ -395,7 +460,7 @@ boundaries require this disposition; existing grants, activation and secret
 fences remain untouched. Missing proof or rejected privacy/usefulness at review
 means A/no-build, not weakened permissions.
 
-Metric: all 17 oracles and three option decisions have an explicit disposition by
+Metric: all 18 oracles and three option decisions have an explicit disposition by
 2026-11-02; no live experiment, benefit or performance result is claimed. Unverified:
 actual guild objects/permissions, deployed ticket activation, runtime behavior of
 B (absent), modal UX, answer storage/erasure beyond transcript behavior, and usable
