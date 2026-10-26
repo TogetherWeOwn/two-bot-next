@@ -387,6 +387,25 @@ impl Query {
 pub mod lfg_store {
     use super::*;
     use crate::automation_quota::QuotaWriteError;
+    pub use crate::real_core::lfg_store::LfgSeatEditOutcome;
+
+    // Seat persistence and its atomic audit belong to the database acceptance
+    // slice. Compile against the real outcome type, but never invent success.
+    pub async fn increase_lfg_seats(
+        pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+        _role_key: &str,
+        _seats: u8,
+        _audit: &RsvpAudit,
+    ) -> Result<LfgSeatEditOutcome, Error> {
+        pool.0
+            .lock()
+            .expect("fixture state")
+            .trace
+            .push("store.increase_seats");
+        Err(Error)
+    }
 
     pub async fn get_lfg(pool: &PgPool, guild: &str, id: &str) -> Result<Option<LfgPost>, Error> {
         let mut state = pool.0.lock().expect("fixture state");
@@ -498,6 +517,36 @@ pub mod lfg_store {
         post.closed_at = Some(at.into());
         Ok(true)
     }
+    // Close-message repair is outside this signup/audit acceptance slice.
+    // Reuse its production state type, but fail loudly if a test reaches I/O.
+    pub use crate::real_core::lfg_store::CloseRefreshState;
+
+    pub async fn get_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+    ) -> Result<Option<CloseRefreshState>, Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
+    pub async fn clear_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+    ) -> Result<(), Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
+    pub async fn defer_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+        _attempts: i32,
+        _next_at: time::OffsetDateTime,
+    ) -> Result<(), Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
     // The included service also compiles its metadata-edit branch. Keep that
     // store boundary explicit without pretending this signup/audit double tests it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,6 +588,46 @@ pub mod lfg_store {
     pub async fn delete_lfg(_pool: &PgPool, _guild: &str, _id: &str) -> Result<bool, Error> {
         panic!("create is outside this offline acceptance slice")
     }
+}
+
+#[tokio::test]
+async fn unmodeled_seat_edit_reports_database_failure_without_side_effects() {
+    use crate::subject::{LfgError, LfgInteractions, LfgRequest};
+
+    let pool = PgPool::fixture();
+    pool.seed_post("post-a", "1");
+    pool.seed_signup("post-a", "2", "tank");
+    let before = pool.snapshot();
+    let executor = ActionExecutor::default();
+    let service = LfgInteractions::new(pool.clone());
+    let result = service
+        .execute(
+            &executor,
+            LfgRequest::EditSeats {
+                post_id: "post-a".into(),
+                role_key: "tank".into(),
+                seats: 3,
+            },
+            "1",
+            "5",
+            100,
+            99,
+        )
+        .await;
+
+    assert!(matches!(result, Err(LfgError::Database(_))));
+    assert_eq!(
+        pool.snapshot(),
+        before,
+        "unmodeled edit changed saved state"
+    );
+    assert_eq!(pool.audit_attempts(), 0);
+    assert!(executor.edits().is_empty());
+    assert_eq!(
+        pool.trace(),
+        ["sql.begin", "sql.lock", "store.increase_seats"],
+        "the service must reach the explicit fail-closed boundary"
+    );
 }
 
 pub mod rsvp_store {
@@ -602,6 +691,15 @@ impl ActionExecutor {
             return Err(DiscordError::Unavailable("offline refresh fault".into()));
         }
         Ok(())
+    }
+    pub async fn edit_message_for_close_refresh(
+        &self,
+        _channel: &str,
+        _message: &str,
+        _content: &str,
+        _components: &[Value],
+    ) -> crate::CloseRefreshEdit {
+        panic!("close repair is outside this offline acceptance slice")
     }
     pub async fn recover_message_by_nonce(
         &self,

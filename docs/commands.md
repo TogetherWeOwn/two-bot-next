@@ -142,16 +142,17 @@ Resume a saved custom command
 
 ## `/command-inspect`
 
-Inspect or privately preview a saved custom command
+Inspect a saved command or privately preview an unsaved draft
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
-| `view` | string | false | — | — | — | Summary = `"summary"`; Saved template = `"template"`; Preview = `"preview"` | Private view (summary by default) |
+| `name` | string | false | — | — | 32 | — | Saved command name, a-z 0-9 _ - (choose name or draft) |
+| `view` | string | false | — | — | — | Summary = `"summary"`; Saved template = `"template"`; Preview = `"preview"` | Private view (saved: summary by default; draft: preview only) |
 | `arguments` | string | false | — | — | 500 | — | Sample invocation arguments (ignored by current templates) |
+| `draft` | string | false | — | — | 2000 | — | Proposed template to preview without saving (choose name or draft) |
 
 ## `/command-list`
 
@@ -281,7 +282,11 @@ Show this server's aggregate game activity.
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | 10000 | — | — | Page of saved games to show (10 per page). Default: 1. |
+| `sort` | string | false | — | — | — | Play time = `"play"`; In-voice time = `"voice"` | Order games by play time or in-voice time. Default: play. |
+| `format` | string | false | — | — | — | JSON = `"json"`; Summary = `"summary"` | Show raw JSON or a readable summary. Default: JSON. |
 
 ## `/giveaway`
 
@@ -419,7 +424,7 @@ Close a raid/LFG signup
 
 ## `/lfg-edit`
 
-Update a raid/LFG title or start time
+Update LFG metadata or increase one role's seats
 
 - Default permissions: ManageEvents (`8589934592`)
 - Available in DMs: false
@@ -429,6 +434,8 @@ Update a raid/LFG title or start time
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
 | `title` | string | false | — | — | 100 | — | Event or group title |
 | `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
+| `role` | string | false | — | — | 32 | — | Existing signup role key (use with seats) |
+| `seats` | integer | false | 1 | 99 | — | — | Absolute seat target, increase only (1-99; use with role) |
 
 ## `/lfg-list`
 
@@ -592,7 +599,7 @@ No options.
 
 ## `/reopen`
 
-Reopen your games or session picker in a private menu.
+Reopen your games or session picker in a private menu; games includes a no-change preview.
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
@@ -637,6 +644,7 @@ Schedule a message, once or recurring
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
 | `at` | string | false | — | — | 64 | — | One-off RFC3339 time with Z or offset; cannot combine with other timing |
+| `preview` | boolean | false | — | — | — | — | Preview the proposed post and its first firing without saving it |
 
 ## `/schedule-list`
 
@@ -695,6 +703,7 @@ Set this channel's sticky message
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `body` | string | true | — | — | 2000 | — | Sticky text |
 | `debounce` | integer | false | 1 | 300 | — | — | Quiet seconds before re-posting (default 5, max 300) |
+| `preview` | boolean | false | — | — | — | — | Privately preview without saving |
 
 ## `/sticky-remove`
 

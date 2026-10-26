@@ -291,7 +291,8 @@ pub fn expected_registry() -> Value {
     .expect("welcome preview serializes");
     commands.insert(5, welcome_preview);
     // Next-only private staff aggregate, immediately after welcome-preview. Keep the
-    // legacy snapshot frozen and pin the whole additive definition literally.
+    // legacy snapshot frozen and pin the whole additive definition literally,
+    // including the optional browse selectors (never a guild/member override).
     commands.insert(
         6,
         json!({
@@ -299,7 +300,33 @@ pub fn expected_registry() -> Value {
             "description": "Show this server's aggregate game activity.",
             "dm_permission": false,
             "default_member_permissions": "32",
-            "options": []
+            "options": [
+                {
+                    "name": "page",
+                    "description": "Page of saved games to show (10 per page). Default: 1.",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 10000
+                },
+                {
+                    "name": "sort",
+                    "description": "Order games by play time or in-voice time. Default: play.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "Play time", "value": "play"},
+                        {"name": "In-voice time", "value": "voice"}
+                    ]
+                },
+                {
+                    "name": "format",
+                    "description": "Show raw JSON or a readable summary. Default: JSON.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "JSON", "value": "json"},
+                        {"name": "Summary", "value": "summary"}
+                    ]
+                }
+            ]
         }),
     );
     // Next-only saved-response inspection or unsaved draft preview. This

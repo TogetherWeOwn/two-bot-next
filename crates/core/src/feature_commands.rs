@@ -125,26 +125,23 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
-        // Next-only saved-response inspection (parity row 33): one bounded
-        // management workflow with three private views, no enable/disable
-        // policy. Published after `command-list`; automation-gated and
-        // `ManageGuild`-gated like the other admin commands.
+        // Private saved inspection or unsaved preview; runtime requires exactly
+        // one name/draft. Automation- and ManageGuild-gated like other admin commands.
         CommandDefinition::new(
             "command-inspect",
-            "Inspect or privately preview a saved custom command",
+            "Inspect a saved command or privately preview an unsaved draft",
         )
         .permissions(PERM_MANAGE_GUILD)
         .options(vec![
             CommandOption::new(
                 "name",
-                "Saved command name, a-z 0-9 _ -",
+                "Saved command name, a-z 0-9 _ - (choose name or draft)",
                 CommandOptionType::String,
             )
-            .required()
             .max_length(MAX_COMMAND_NAME_CHARS as u32),
             CommandOption::new(
                 "view",
-                "Private view (summary by default)",
+                "Private view (saved: summary by default; draft: preview only)",
                 CommandOptionType::String,
             )
             .choices(vec![
@@ -167,6 +164,12 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::String,
             )
             .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
+            CommandOption::new(
+                "draft",
+                "Proposed template to preview without saving (choose name or draft)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEMPLATE_CHARS as u32),
         ]),
         // Next-only saved-response lifecycle (parity rows 40-41): pause and
         // resume one definition without deleting it. Published immediately
@@ -219,6 +222,11 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::String,
                 )
                 .max_length(MAX_AT_CHARS as u32),
+                CommandOption::new(
+                    "preview",
+                    "Preview the proposed post and its first firing without saving it",
+                    CommandOptionType::Boolean,
+                ),
             ])
             .examples(vec![
                 "/schedule body:Meeting reminder at:2027-01-15T18:30:00+05:30".to_owned(),
@@ -262,6 +270,15 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .int_range(1, 300),
+                CommandOption::new(
+                    "preview",
+                    "Privately preview without saving",
+                    CommandOptionType::Boolean,
+                ),
+            ])
+            .examples(vec![
+                "/sticky body:Read the rules debounce:5 preview:true".to_owned(),
+                "/sticky body:Read the rules debounce:5 preview:false".to_owned(),
             ]),
         CommandDefinition::new("sticky-remove", "Remove this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD),
@@ -476,24 +493,39 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
-        CommandDefinition::new("lfg-edit", "Update a raid/LFG title or start time")
-            .permissions(PERM_MANAGE_EVENTS)
-            .options(vec![
-                CommandOption::new(
-                    "id",
-                    "LFG id from the posted signup",
-                    CommandOptionType::String,
-                )
-                .required()
-                .max_length(MAX_RESOURCE_ID_CHARS as u32),
-                CommandOption::new("title", "Event or group title", CommandOptionType::String)
-                    .max_length(MAX_TITLE_CHARS as u32),
-                CommandOption::new(
-                    "starts-at",
-                    "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
-                    CommandOptionType::String,
-                ),
-            ]),
+        CommandDefinition::new(
+            "lfg-edit",
+            "Update LFG metadata or increase one role's seats",
+        )
+        .permissions(PERM_MANAGE_EVENTS)
+        .options(vec![
+            CommandOption::new(
+                "id",
+                "LFG id from the posted signup",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32),
+            CommandOption::new("title", "Event or group title", CommandOptionType::String)
+                .max_length(MAX_TITLE_CHARS as u32),
+            CommandOption::new(
+                "starts-at",
+                "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                CommandOptionType::String,
+            ),
+            CommandOption::new(
+                "role",
+                "Existing signup role key (use with seats)",
+                CommandOptionType::String,
+            )
+            .max_length(crate::lfg::MAX_ROLE_KEY_CHARS as u32),
+            CommandOption::new(
+                "seats",
+                "Absolute seat target, increase only (1-99; use with role)",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, i64::from(crate::lfg::MAX_ROLE_SLOTS)),
+        ]),
         CommandDefinition::new("lfg-list", "List open game posts in this channel")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![CommandOption {
@@ -890,12 +922,13 @@ mod tests {
         let kind = get(&ann, "feed-add").options[0].clone();
         let values: Vec<_> = kind.choices.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, ["rss", "youtube", "twitch"]);
-        // /command-inspect: one required name, three bounded optional views,
+        // /command-inspect: exclusive optional name/draft, three saved views,
         // one bounded optional sample. No enable/disable policy option.
         let inspect = get(&auto, "command-inspect").options.clone();
-        assert_eq!(inspect.len(), 3);
-        assert_eq!(inspect[0].required, Some(true));
-        assert!(inspect[1].required.is_none() && inspect[2].required.is_none());
+        assert_eq!(inspect.len(), 4);
+        assert!(inspect.iter().all(|option| option.required.is_none()));
+        assert_eq!(inspect[3].name, "draft");
+        assert_eq!(inspect[3].max_length, Some(2000));
         let values: Vec<_> = inspect[1]
             .choices
             .iter()
@@ -925,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn lfg_edit_advertises_only_bounded_metadata_options_in_publish_order() {
+    fn lfg_edit_advertises_bounded_metadata_and_seat_options_in_publish_order() {
         let announcements = announcement_commands();
         let close = announcements
             .iter()
@@ -938,7 +971,7 @@ mod tests {
             serde_json::to_value(edit).expect("command serializes"),
             serde_json::json!({
                 "name": "lfg-edit",
-                "description": "Update a raid/LFG title or start time",
+                "description": "Update LFG metadata or increase one role's seats",
                 "dm_permission": false,
                 "default_member_permissions": "8589934592",
                 "options": [
@@ -947,7 +980,11 @@ mod tests {
                     {"name": "title", "description": "Event or group title", "type": 3,
                      "max_length": 100},
                     {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
-                     "type": 3}
+                     "type": 3},
+                    {"name": "role", "description": "Existing signup role key (use with seats)",
+                     "type": 3, "max_length": 32},
+                    {"name": "seats", "description": "Absolute seat target, increase only (1-99; use with role)",
+                     "type": 4, "min_value": 1, "max_value": 99}
                 ]
             })
         );

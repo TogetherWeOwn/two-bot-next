@@ -290,7 +290,7 @@
         "row": [
           "17",
           "`/schedule`",
-          "`body` req ≤2000; `at` RFC3339 with explicit offset opt ≤64 (one-off only, future ≤365 days); or `in-minutes` 1–525600 opt / `every-minutes` 60–525600 opt (at least one timing required)",
+          "`body` req ≤2000; `at` RFC3339 with explicit offset opt ≤64 (one-off only, future ≤365 days); or `in-minutes` 1–525600 opt / `every-minutes` 60–525600 opt (at least one timing required); `preview` boolean opt",
           "`ManageGuild`, runs in invoking channel"
         ]
       },

@@ -42,9 +42,12 @@ fences and the 25-schedule quota still apply.
 Explicit-time confirmations and enabled list rows show the canonical UTC instant
 and a Discord timestamp rendered in each reader's local timezone. Disabled list
 rows keep their canonical timestamp, stable ID and disabled marker without a
-pending-delivery hint. Use `/schedule-remove id:<id>` to cancel, and check the
-named ID in the cancellation receipt. Delivery runs on the existing 15-second
-ticker and may be delayed by backlog, restarts, rate limits or outages. This is
+pending-delivery hint. Use `/schedule-remove id:<id>` to remove a definition;
+the receipt names the removed ID and, as the section on
+[reading delivery holds](#reading-delivery-holds-and-removing-definitions)
+explains, promises nothing about a post that was already admitted. Delivery
+runs on the existing 15-second ticker and may be delayed by backlog, restarts,
+rate limits or outages. This is
 not an exact-second delivery promise. No timezone profile, natural-language
 parsing or DST-aware recurrence is implied.
 
@@ -75,6 +78,56 @@ window `(truncated)` without inventing a remainder; a failed hidden read or an
 unknown-count deep page returns the existing safe retry reply, never false
 absence. Successful lists write no schedule, claim, nonce, delivery fence or
 audit row. Listing does not resolve an uncertain send or change delivery.
+
+## Preview a proposed post
+
+`/schedule` accepts an optional `preview` boolean. With `preview:true` the
+handler runs the same body, mention, interval and absolute-time validation as
+create, then answers privately with the proposed body, the invoking channel,
+the first due instant in canonical UTC plus a Discord-local timestamp, and the
+one-off versus recurring shape — labelled `Preview — not scheduled`. The reply
+says outright that a later create revalidates timing and availability; it names
+no saved id, links no message and promises no delivery.
+
+A preview is read-only by construction: valid and invalid previews return
+before minting a persistent id, reading or writing the store, auditing,
+taking quota, or sending anything to the channel. Rendering the body never
+executes it — hostile input renders as inert, mention-safe data within the
+2,000-unit reply cap. A duplicated or wrong-typed `preview` value refuses with
+a private correction, never a write. Omitted or false keeps create behavior,
+including its rejection audits, unchanged. Staff, guild, feature and
+activation fences apply before any of this runs.
+
+## Reading delivery holds and removing definitions
+
+`/schedule-list` is a read-only snapshot of the stored delivery facts at the
+moment of the read, on the first window and the hidden window alike. It never
+clears a claim or a fence, writes no audit row on success, and never shows
+claim tokens, occurrence nonces or message bodies. A row can read:
+
+- **Ordinary enabled** — the localized due time plus the note that the 15 s
+  ticker and delivery may be delayed. Due is not a delivery promise.
+- **Claimed (lease held)** — a ticker claim exists. A claimed row's stored
+  run time is parked at the lease horizon, so the row labels the localized
+  time a lease horizon, not a promised delivery time. A claim also does not
+  prove a worker is running now: it may be a stale lease awaiting expiry.
+- **Delivery-fenced (uncertain)** — the occurrence's uncertainty fence is
+  armed. The fence is set before a send, so by itself it proves neither that
+  the delivery failed nor that it stays uncertain; the post may already have
+  appeared. Fenced evidence takes precedence over claimed, and both remain
+  visible on disabled or restored rows, next to the `(disabled)` marker.
+  Ordinary disabled rows still show no pending-delivery hint.
+
+When a row shows a hold, the safe next step is to check its destination
+channel for the post itself; the list cannot settle whether a held or fenced
+occurrence reached Discord.
+
+`/schedule-remove` confirms only what its delete proved: the definition and
+its future runs are removed. A delivery the ticker had already admitted when
+the delete landed may still appear in the destination channel, so the receipt
+names that channel for inspection. Removal is not a recall, does not cancel
+an admitted send, and does not promise that the ticker's stale-send cleanup
+of such a post succeeded; that cleanup keeps its own audited outcome.
 
 ## Queue model
 
@@ -153,9 +206,10 @@ no row is claimed, posted or audited; the `/readyz` status map lists
    of the list. A failed hidden-window or overflow-count read fails closed
    ("Schedule command failed; try again.") instead of reporting a
    possibly-false out-of-range page. Rows past the cap keep their order
-   and keep firing via `claim_due`. Enabled runtime rows include localized due
-   times and delivery uncertainty before packing, so enrichment cannot overflow
-   a page or silently split an ID.
+   and keep firing via `claim_due`. Runtime rows are enriched with their
+   localized times and current claim/fence snapshot wording before packing, so
+   enrichment cannot overflow a page or silently split an ID, and hidden
+   window rows carry the same delivery-hold facts as the first window.
 
 ## Out of scope
 

@@ -261,11 +261,49 @@ fn assert_picker(gates: RouterGates) {
         wire.get("dm_permission").is_none(),
         "deprecated DM field stays unset for guild publication"
     );
+    // Exactly three optional browse selectors: one guild-wide aggregate
+    // with no guild/member selector and no live-guild opt-in.
+    let options = wire["options"]
+        .as_array()
+        .expect("optional browse selectors published");
+    let mut selectors: Vec<_> = options
+        .iter()
+        .map(|option| option["name"].as_str().expect("option name"))
+        .collect();
+    selectors.sort_unstable();
+    assert_eq!(selectors, ["format", "page", "sort"]);
+    for option in options {
+        assert_ne!(
+            option["required"], true,
+            "legacy optionless call remains valid"
+        );
+    }
+    let page = options.iter().find(|o| o["name"] == "page").expect("page");
+    assert_eq!(page["type"], 4, "integer page");
+    assert_eq!(page["min_value"], 1);
     assert!(
-        wire.get("options")
-            .is_none_or(|options| options.as_array().is_some_and(Vec::is_empty)),
-        "no options: one guild-wide aggregate, no member selector"
+        page["max_value"]
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && n >= 2.0 && n <= f64::from(i32::MAX)),
+        "finite published page bound"
     );
+    for (name, expected) in [("sort", ["play", "voice"]), ("format", ["json", "summary"])] {
+        let selector = options
+            .iter()
+            .find(|o| o["name"] == name)
+            .expect("browse selector");
+        assert_eq!(selector["type"], 3);
+        let mut choices: Vec<_> = selector["choices"]
+            .as_array()
+            .expect("bounded choices")
+            .iter()
+            .map(|choice| choice["value"].as_str().expect("string choice"))
+            .collect();
+        choices.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(choices, expected);
+    }
 }
 
 #[test]
