@@ -60,6 +60,8 @@ mod giveaway_create_entry_acceptance_tests;
 mod schedule_absolute_acceptance;
 #[path = "schedule_absolute_correction_tests.rs"]
 mod schedule_absolute_correction_tests;
+#[path = "schedule_delivery_truth_acceptance_tests.rs"]
+mod schedule_delivery_truth_acceptance_tests;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
 
@@ -9172,7 +9174,10 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
         .collect();
     assert_eq!(edits.len(), 3, "one completion per remove");
     let removed: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
-    assert_eq!(removed["content"], "Cancelled. Schedule `xyz999`.");
+    schedule_delivery_truth_acceptance_tests::assert_removed_receipt(
+        removed["content"].as_str().expect("removal receipt"),
+        "xyz999",
+    );
     let ambiguous: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
     assert_eq!(
         ambiguous["content"],
@@ -9478,7 +9483,10 @@ async fn schedule_remove_invalid_ids_leave_store_untouched() {
         .collect();
     assert_eq!(edits.len(), 10, "one completion per interaction");
     let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
-    assert_eq!(valid["content"], "Cancelled. Schedule `xyz999`.");
+    schedule_delivery_truth_acceptance_tests::assert_removed_receipt(
+        valid["content"].as_str().expect("removal receipt"),
+        "xyz999",
+    );
     mock.shutdown().await;
     db.close().await;
 }

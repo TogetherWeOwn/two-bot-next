@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only schedule delivery-state snapshots and honest definition-removal receipts",
+  "baseCommit": "b9db8193af9e99495402a5b94e0d6bc67f016b61",
+  "branch": "test/schedule-delivery-truth-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/schedule_delivery_truth_acceptance_tests.rs",
+      "sha256": "b846dee5a99a9329a45decef1d82202d012914f743dc38854d90f22de413c301",
+      "tests": 13
+    },
+    {
+      "path": "crates/bot/src/command_runtime_tests.rs",
+      "sha256": "b3c4f6ae96518c9b8c042dd98e9374d1eee49959d9b7843dc53e99b047acdbf3",
+      "change": "Test-only module registration and two legacy success-receipt assertions delegated to the stronger removal oracle; all other assertions remain unchanged"
+    }
+  ],
+  "commands": {
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot command_runtime_tests::schedule_delivery_truth_acceptance_tests:: -- --nocapture --test-threads=1",
+    "uncertaintyControls": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot scheduled_jobs::tests::uncertainty_acceptance:: -- --nocapture --test-threads=1",
+    "coreControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test schedule_list_pagination --test schedule_queue_order --test schedule_ticker_safety_acceptance -- --nocapture",
+    "format": "cargo fmt --all -- --check",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref b9db8193af9e99495402a5b94e0d6bc67f016b61",
+    "inventory": "python3 scripts/ci/check-test-inventory.py",
+    "verifyHashes": "python3 -c 'import hashlib,json,pathlib; m=json.loads(pathlib.Path(\"tests/acceptance/schedule_delivery_truth.manifest.json\").read_text()); checks={f[\"path\"]: hashlib.sha256(pathlib.Path(f[\"path\"]).read_bytes()).hexdigest()==f[\"sha256\"] for f in m[\"protectedFiles\"]}; print(json.dumps(checks,sort_keys=True)); assert all(checks.values())'"
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "localValue": "postgres://agent_test:@agent-testdb:5432/two_bot_test_local",
+    "fixture": "two_bot_testsupport::TestDatabase with cutover migrations",
+    "missingEnvironment": "Fails explicitly; no ignored or silently skipped acceptance cases",
+    "ciRoute": "check.yml workspace lib/bins step supplies guarded two_bot_test_ci; existing uncertainty controls run in that same target",
+    "safety": "Disposable database and loopback REST doubles only; never staging, production or real Discord"
+  },
+  "testMatrix": [
+    {"test": "ready_and_disabled_control_retains_due_hint_without_mutation", "baselineExpected": "PASS", "contract": "Ordinary due and disabled healthy controls; complete database equality and no channel REST effects"},
+    {"test": "first_window_exposes_claim_fence_precedence_and_restored_disabled_facts", "baselineExpected": "RED", "contract": "Literal nine-case enabled/claim/fence matrix, including restored NULL fence, disabled+claim/fence and missing claimed_at; explicit snapshot and safe inspection; fence is armed before send, claim is not proof of an active worker"},
+    {"test": "hidden_window_projects_all_facts_and_packs_complete_unicode_rows_with_overflow", "baselineExpected": "RED", "contract": "52 restored Unicode rows plus foreign guild; first 25 and hidden 25 exactly once; complete enriched rows, UTF-16 bound, state projection in both windows, hostile field isolation, reachable continuation and remaining overflow"},
+    {"test": "list_reads_current_facts_after_defer_not_a_cached_ready_row", "baselineExpected": "RED", "contract": "Response barrier holds defer while a new claim/fence commits; actual list read observes it without mutation or settlement"},
+    {"test": "successful_remove_confirms_definition_not_message_absence", "baselineExpected": "RED", "contract": "Resolved stable ID and destination guidance; only future/definition removal confirmed; admitted-delivery warning; unchanged delete audit and no Discord recall probe"},
+    {"test": "remove_during_admitted_post_does_not_promise_successful_cleanup", "baselineExpected": "RED", "contract": "Slash removal completes while actual scheduler POST response is held; later successful stale-send cleanup is not promised by the earlier receipt"},
+    {"test": "remove_during_admitted_post_warns_even_when_cleanup_is_refused", "baselineExpected": "RED", "contract": "Same deterministic POST barrier with refused orphan DELETE; stale_completion/discord_rejected audit and no duplicate POST remain"},
+    {"test": "remove_during_unknown_post_outcome_does_not_claim_message_absence", "baselineExpected": "RED", "contract": "Held POST ends with truncated receipt; removal never claims remote absence or invents cleanup without a usable message ID"},
+    {"test": "missing_and_ambiguous_prefixes_remain_read_only_refusals_control", "baselineExpected": "PASS", "contract": "Existing no-unique-match response per supplied prefix; no schedule or audit changes"},
+    {"test": "first_read_failure_retains_rejected_audit_control", "baselineExpected": "PASS", "contract": "Real SELECT fault preserves safe generic failure, exactly one rejected list audit, actor and no target, with no schedule mutation"},
+    {"test": "hidden_read_failure_retains_rejected_audit_control", "baselineExpected": "PASS", "contract": "Same contract for the OFFSET hidden-window read"},
+    {"test": "unknown_overflow_failure_retains_rejected_audit_control", "baselineExpected": "PASS", "contract": "Same contract for failed count on an unknown-overflow deep page"},
+    {"test": "remove_storage_failure_is_not_a_successful_removal_control", "baselineExpected": "PASS", "contract": "Real DELETE trigger failure retains definition, generic failure and rejected delete audit, not success wording"}
+  ],
+  "handoff": [
+    "Expected statuses above are the test matrix, NOT execution evidence. Observed RED, healthy-control results and cache refusals belong to the immutable handoff report.",
+    "Do not merge a deliberately RED test-only PR. Consume the pinned commit in an isolated implementation workspace; return test corrections to the test author.",
+    "Builder changes product code only and owns combined GREEN, independent exact-head review, auto-merge and ordinary deployment gates.",
+    "Keep original absolute-time, strict-decode, disabled-row and scheduler-uncertainty protected oracles intact. No dependency on new edit/retime APIs.",
+    "Command-reference explanation is builder-owned human documentation, not a source-text grep test. Explain snapshots, lease horizons, pre-send fences and bounded future-run removal consistently with actual behavior.",
+    "No scheduler claim/lock/audit/retry/cleanup/fence/schema changes, recall mechanism, live activation or real sends are authorized by this test artifact."
+  ]
+}
