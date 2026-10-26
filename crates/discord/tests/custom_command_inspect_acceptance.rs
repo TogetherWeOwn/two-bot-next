@@ -439,6 +439,76 @@ async fn inspect_lookup_outage_is_not_a_missing_definition_or_a_run() {
     assert!(!content.contains("PoolClosed") && !content.contains("agent-testdb"));
 }
 
+// Removing the draft-only view guard must not turn a saved-only view into a
+// successful draft preview, even though both view names pass option parsing.
+async fn draft_saved_only_view_refuses_without_sql_or_effects(view: &str) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind SQL-access tripwire");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(100))
+        .connect_lazy_with(
+            PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(listener.local_addr().expect("tripwire address").port())
+                .username("preview_fixture")
+                .database("preview_fixture")
+                .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+        );
+    let mock = discord().await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    let observed = observe(
+        &runtime,
+        &mock,
+        &interaction(
+            490,
+            32,
+            vec![option("draft", "Hello"), option("view", view)],
+        ),
+        Some("TWO"),
+    )
+    .await;
+    let publication = runtime.published_commands();
+    pool.close().await;
+    mock.shutdown().await;
+    let listener = listener.into_std().expect("nonblocking SQL tripwire");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "draft {view} refusal attempted storage access"
+    );
+    assert!(publication.is_none(), "refusal never republishes commands");
+    let content = private_content(&observed);
+    assert_eq!(
+        content,
+        "Invalid draft view: only preview is available for unsaved text. Use /command-inspect draft:Hello view:preview",
+        "draft {view} must reach the saved-only view refusal"
+    );
+    assert!(!content.contains("Draft preview"));
+    for request in &observed.requests {
+        let wire: Value = serde_json::from_slice(&request.body).expect("private response JSON");
+        let data = if request.method == "POST" {
+            &wire["data"]
+        } else {
+            &wire
+        };
+        assert!(
+            data["components"].is_null() || data["components"] == json!([]),
+            "refusal must not expose mutation controls"
+        );
+    }
+}
+
+#[tokio::test]
+async fn draft_summary_view_refuses_without_sql_or_effects() {
+    draft_saved_only_view_refuses_without_sql_or_effects("summary").await;
+}
+
+#[tokio::test]
+async fn draft_template_view_refuses_without_sql_or_effects() {
+    draft_saved_only_view_refuses_without_sql_or_effects("template").await;
+}
+
 #[tokio::test]
 async fn inspect_forged_names_views_and_arguments_refuse_before_any_lookup() {
     let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new().host("agent-testdb"));

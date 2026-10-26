@@ -2052,6 +2052,17 @@ mod tests {
     }
 
     #[test]
+    fn draft_long_invalid_template_preserves_bounded_detail_and_correction() {
+        let template = format!("{{{}}}", "a".repeat(1998));
+        let view = format_draft_preview(&template, &inspect_ctx());
+        assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        assert!(view.starts_with("Draft cannot be previewed: Unknown placeholder"));
+        assert!(view.contains("…[truncated]"));
+        assert!(view.contains("retry /command-inspect draft:Hello."));
+        assert!(view.ends_with("Nothing was saved or published."));
+    }
+
+    #[test]
     fn inspect_preview_renders_exactly_then_escapes() {
         let view = format_inspect_preview(&inspect_row(), &inspect_ctx());
         assert_eq!(view, "Preview /faq\nHi <@3333> (tester) in TWO <#4444>");
