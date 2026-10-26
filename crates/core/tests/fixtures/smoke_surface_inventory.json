@@ -575,6 +575,16 @@
           "max_value": 300,
           "max_length": null,
           "choices": []
+        },
+        {
+          "name": "preview",
+          "description": "Privately preview without saving",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
         }
       ],
       "smoke": "deferred",
