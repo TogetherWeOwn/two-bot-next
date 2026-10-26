@@ -74,8 +74,13 @@ streak, `last_success_at`, `last_failure_at`, bounded `last_failure_class`,
 `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`,
 `http_error`, plus a new bounded `parse` class (today a parse failure after a
 2xx fetch records a metrics *success* and only a job error — recording joint
-fetch+parse outcome per relay is part of `FF-W1`). Fetch policy classes come
-from `crates/core/src/feeds_http.rs:15-28` via the existing metrics vocabulary.
+fetch+parse outcome per relay is part of `FF-W1`). `FetchError` policy classes
+come from `crates/core/src/feeds_http.rs:15-28`; `unsupported_encoding` comes
+from `FeedConnectError::UnsupportedEncoding`
+(`crates/core/src/feeds_connector.rs:100-118`), and completed non-2xx
+`http_error` outcomes from `feed_fetch_error_class`
+(`crates/core/src/feeds_connector.rs:146-158`). Both retain their existing
+metric names; only `parse` is new.
 
 **Neutral outcome** (neither increments nor resets the streak): `resolve`,
 `transport`, `deadline`, pass/relay `timeout`, `database`, `rest`,
@@ -128,6 +133,18 @@ not polled). Notice send failure records a bounded outcome
 send stays `unknown` rather than risking duplicates. Restart cannot duplicate
 a notice: the persisted claim precedes the send.
 
+One immutable batch binds every claimed relay episode to the coalesced message,
+including relays represented only by the overflow count. Its single send
+receipt applies to **all** claims in the batch: acknowledged send → `sent`,
+definite refusal → `failed`, ambiguous send/crash before settlement → `unknown`,
+unset/invalid channel → `not_configured`. Inspect projects that same outcome
+for each episode; `sent` means included in the batch, not necessarily listed
+by id. A durable batch receipt is the shared source of truth (not independently
+settled relay rows); absent a terminal receipt, claimed episodes show `unknown`.
+No outcome permits an automatic resend within the episode. A receipt is bound
+to the claimed episode, so late settlement cannot overwrite a refreshed relay's
+new episode or resurrect a removed relay.
+
 Rate bounds, all structural rather than timer-based:
 
 - At most one notice per relay per episode; a new episode requires a
@@ -164,9 +181,13 @@ Next: /feed-inspect id:relay-1, fix or replace the source, then refresh — or /
   or audits as a poll. Probe success clears the streak and `failed_at`,
   stamps `last_success_at`, and returns the relay to normal polling on the
   next ordinary pass (existing 20-posts-per-pass budget bounds catch-up).
-  Probe countable failure records evidence; an already-failed relay stays
-  failed and sends **no** second notice for the same episode. Probe neutral
-  outcome changes nothing and says so. Refresh on an active relay is allowed
+  Probe countable failure records evidence, including the streak, but never
+  transitions an active relay to failed or claims a notice: only an ordinary
+  countable poll outcome evaluates the transition. An already-failed relay
+  stays failed and sends **no** second notice for the same episode. Probe
+  neutral outcome changes nothing and says so. Every recorded poll outcome
+  and successful/countable probe marks previously-unknown evidence observed;
+  stale probes, like stale polls, are discarded before any mutation. Refresh on an active relay is allowed
   as a manual probe but is not a "poll now" and posts nothing.
 - **Pause**: unchanged, including the pending-evidence refusal. Pausing a
   failed relay keeps its evidence; it displays `paused`.
@@ -260,10 +281,10 @@ only; environment/compile failures are not behavioral RED.
 | `FF08` | Delivery `recovery_required` while fetch succeeds | Health untouched by delivery state; recovery path unchanged |
 | `FF09` | Failed relay with pending deliveries | Fetch skipped, recovery still attempted each pass; nothing released/reposted |
 | `FF10` | Refresh probe success on failed relay | Evidence cleared, zero posts from probe, normal polling resumes next pass |
-| `FF11` | Refresh probe countable failure on failed relay | Stays failed; no second notice in the episode |
+| `FF11` | Refresh countable failure on active or failed relay | Streak/evidence recorded; active stays active with no claim; failed stays failed with no second notice |
 | `FF12` | Pause failed relay; resume it; refresh while paused | Displays paused → failed on resume; probe-while-paused clears evidence only |
 | `FF13` | Remove failed relay with and without pending evidence | Existing refusal with pending; clean removal without; no notice either way |
-| `FF14` | 25 relays transition in one pass | One staff message, ≤10 listed + overflow count; 25 claims, 25 episodes |
+| `FF14` | 25 relays transition in one pass; send succeeds, fails or is ambiguous | One staff message, ≤10 listed + overflow count; 25 episode claims share the batch receipt in inspect, including overflow; no resend |
 | `FF15` | Stored source with userinfo + `?access_token=...` + secret-looking path | Notice contains host only; token/userinfo/path secret appear in no notice, log, audit or metric label |
 | `FF16` | Notice channel unset, then deleted, then send-ambiguous | `not_configured` / `failed` / `unknown`; status unaffected; no resend, no DM fallback |
 | `FF17` | Stale poll outcome after refresh; outcome for removed relay | Discarded by attempt-time fence; zero-row update, no resurrection |
@@ -294,14 +315,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ...     s = dict(enabled=True, streak=0, last_success=None, created=0, failed_at=None, notice="none", last_attempt=-1, evidence=True)
 ...     s.update(kw); return s
 >>> def health(s):
-...     if not s["evidence"]: return "unknown"
 ...     if not s["enabled"]: return "paused"
+...     if not s["evidence"]: return "unknown"
 ...     return "failed" if s["failed_at"] is not None else "active"
 >>> def poll_action(s):
 ...     return {"paused": "skip", "failed": "recovery_only"}.get(health(s), "fetch")
 >>> def record(s, outcome, now):
 ...     if now < s["last_attempt"]: return "stale_discarded"          # FF17
-...     s["last_attempt"] = now
+...     s["last_attempt"], s["evidence"] = now, True
 ...     if outcome == "success":
 ...         s["streak"], s["last_success"] = 0, now; return "success"
 ...     if outcome in m["neutral"]: return "neutral"                  # FF07/FF08
@@ -312,6 +333,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ...         s["failed_at"], s["notice"] = now, "claimed"; return "transition"
 ...     return "countable"
 >>> s = fresh(evidence=False); assert health(s) == "unknown" and poll_action(s) == "fetch"   # FF01
+>>> s = fresh(enabled=False, evidence=False); assert health(s) == "paused" and poll_action(s) == "skip"
+>>> s = fresh(evidence=False); assert record(s, "success", HOUR) == "success" and health(s) == "active"
+>>> s = fresh(evidence=False); assert [record(s, "parse", t) for t in (HOUR, 12*HOUR, 24*HOUR)][-1] == "transition" and health(s) == "failed" and poll_action(s) == "recovery_only"
 >>> s = fresh(last_success=0)
 >>> assert [record(s, "http_error", t) for t in (HOUR, 2*HOUR)] == ["countable"] * 2
 >>> assert record(s, "success", 3*HOUR) == "success" and s["streak"] == 0                     # FF02
@@ -327,10 +351,20 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 >>> s = fresh(last_success=0, streak=2)
 >>> assert all(record(s, o, t) == "neutral" for o, t in [("resolve", 30*HOUR), ("transport", 40*HOUR), ("recovery_required", 50*HOUR)]) and s["streak"] == 2  # FF07/FF08
 >>> def refresh(s, probe, now):
+...     if now < s["last_attempt"]: return "stale_discarded"
+...     if probe in m["neutral"]: return "PROBE_NEUTRAL"
+...     assert probe == "success" or probe in m["countable"]
+...     s["last_attempt"], s["evidence"] = now, True
 ...     if probe == "success":
-...         s["streak"], s["last_success"], s["failed_at"], s["notice"], s["last_attempt"] = 0, now, None, "none", now
+...         s["streak"], s["last_success"], s["failed_at"], s["notice"] = 0, now, None, "none"
 ...         return "PROBE_SUCCEEDED"
-...     return "PROBE_FAILED" if probe in m["countable"] else "PROBE_NEUTRAL"
+...     s["streak"] += 1
+...     return "PROBE_FAILED"
+>>> s = fresh(last_success=0, streak=2, evidence=False)
+>>> assert refresh(s, "http_error", 24*HOUR) == "PROBE_FAILED" and s["streak"] == 3 and health(s) == "active" and s["notice"] == "none"
+>>> assert refresh(s, "success", 23*HOUR) == "stale_discarded" and s["streak"] == 3
+>>> s = fresh(evidence=False); assert refresh(s, "success", HOUR) == "PROBE_SUCCEEDED" and health(s) == "active"
+>>> s = fresh(evidence=False); before = s.copy(); assert refresh(s, "deadline", HOUR) == "PROBE_NEUTRAL" and s == before
 >>> s = fresh(last_success=0, streak=4, failed_at=24*HOUR, notice="sent", last_attempt=24*HOUR)
 >>> assert refresh(s, "http_error", 30*HOUR) == "PROBE_FAILED" and health(s) == "failed"      # FF11
 >>> assert refresh(s, "success", 31*HOUR) == "PROBE_SUCCEEDED" and health(s) == "active"     # FF10
@@ -341,6 +375,20 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 >>> def coalesce(ids): return {"messages": 1, "listed": ids[:L["max_notice_listed"]], "overflow": max(0, len(ids) - L["max_notice_listed"])}
 >>> storm = coalesce([f"relay-{i}" for i in range(L["max_relays_per_guild"])])
 >>> assert storm["messages"] == 1 and len(storm["listed"]) == 10 and storm["overflow"] == 15  # FF14
+>>> def inspect_notice(batch, relay):
+...     assert relay in batch["episodes"]
+...     return batch["receipt"] or "unknown"
+>>> def claim_notice(claims, relay, episode):
+...     key = (relay, episode)
+...     if key in claims: return False
+...     claims.add(key); return True
+>>> for receipt in ("sent", "failed", None, "not_configured"):
+...     batch = {"episodes": {f"relay-{i}": "episode-1" for i in range(25)}, "receipt": receipt}
+...     claims = set(batch["episodes"].items())
+...     assert {inspect_notice(batch, relay) for relay in batch["episodes"]} == {receipt or "unknown"}
+...     assert inspect_notice(batch, "relay-24") == (receipt or "unknown")  # overflow too
+...     assert not any(claim_notice(claims, relay, episode) for relay, episode in batch["episodes"].items())
+...     assert claim_notice(claims, "relay-24", "episode-2") and not claim_notice(claims, "relay-24", "episode-2")
 >>> hostile = "https://user:hunter2@feeds.example.com/secretpath/feed.xml?access_token=abc123&format=xml"
 >>> host = re.search(r"https://(?:[^@]*@)?([^/]+)", hostile).group(1)
 >>> notice = f"Feed relay failed: `relay-1` (rss, host {host}). Last class: http_error."
