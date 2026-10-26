@@ -66,11 +66,16 @@ or API. No build or behavior-test card before the gates in §14.
   `/privacy`. Unknown options refuse before any read. The name is a proposal:
   the build must prove registry fit (100-command ceiling, no custom shadowing)
   or stop; renaming without a fresh collision proof is not permitted.
-- **Content:** active ledger sanctions of any age plus the invoker's sanction
-  events from the trailing 365 days, newest first, at most 25 rows plus the
-  exact truncation receipt in §10. Per row: sanction type, reason as inert
-  plain text (§5, truncated to the per-reason share in Reply bounds),
-  issued-at timestamp, and one terminal-or-live state word: `active`
+- **Content:** the eligible display set `E = A ∪ W` over the deduplicated
+  per-verb sources below, where `A` is rows whose state word at the captured
+  snapshot instant (§9) is `active` or `active until <expiry>` (any age) and
+  `W` is rows issued at or after `instant − 365 days`. At most 25 rows
+  render, in this order: `A` rows first, then the rest of `E`, each group
+  newest first (ties break by the internal dedup key, never displayed), so
+  an old active sanction is never displaced out of the 25 by newer events.
+  The exact receipt in §10 counts this same set `E`. Per row: sanction type,
+  reason as inert plain text (§5, truncated to the per-reason share in Reply
+  bounds), issued-at timestamp, and one terminal-or-live state word: `active`
   (permanent bans), `active until <expiry>`, `expired`, `completed`,
   `superseded`, or `recorded` (warnings, kicks and timeouts are events; only
   tempbans carry a stored expiry). Eligibility is closed: only the per-verb
@@ -100,12 +105,15 @@ or API. No build or behavior-test card before the gates in §14.
   labels are rejected: historical roles are not stored and live role reads
   would add a new REST surface plus a staff-presence oracle. Snowflakes,
   names and discriminators never appear.
-- **Empty state:** "No sanctions on your record in this server in the last 12
-  months." An erased or never-sanctioned member sees this same shape; there
-  is no tombstone and no "erased" disclosure (§8). When zero rows fall in
-  the window but older owned rows exist, the same sentence is followed by
-  the exact 0-of-N receipt (`showing 0 of 0 in the last 12 months; N older
-  entries are available from a moderator`).
+- **Empty state (only when `E` is empty):** "No active sanctions, and no
+  sanctions from the last 365 days, are on your record in this server." An
+  erased or never-sanctioned member sees this same shape; there is no
+  tombstone and no "erased" disclosure (§8). When `E` is empty but older
+  inactive rows exist (§10's `O`), the same sentence is followed by the
+  exact 0-of-0 receipt (`showing 0 of 0 (active sanctions of any age plus
+  sanctions from the last 365 days); O older inactive entries are available
+  from a moderator`). An old active row puts `E` at 1, so it renders as a
+  row with a `showing 1 of 1 …` receipt, never as this empty state.
 - **Unavailable shape:** DM, foreign guild, guild-less, non-member and
   lookup-failure invocations share one identical private reply: "This view is
   not available here." No existence flag, count, state word or retry hint that
@@ -120,7 +128,12 @@ or API. No build or behavior-test card before the gates in §14.
   512 UTF-16 units ([cap](docs/member-moderation.md#L20-L22)), so truncation
   is the rule, not the exception. Precedence is fixed: all 25 rows always
   render, and the reply never exceeds 1800 bytes. Truncation never splits a
-  code point, so the reply is always valid UTF-8 (SS-F18).
+  code point, so the reply is always valid UTF-8 (SS-F18). Shaping order is
+  also fixed: §5 neutralization runs first on the full reason, byte fitting
+  runs second on the neutralized text, and both the per-reason share and the
+  1800-byte cap are measured on that final text. Fitting raw text first is
+  forbidden, because neutralization can expand it (`[mention removed]`
+  tokens, zero-width splits) past its share (SS-F18).
 - **No live Discord reads.** The read path uses the authenticated interaction
   context (guild plus invoker, as `/privacy` does) and stored rows only. A
   current ban cannot be re-proven live and a current timeout cannot be
@@ -168,7 +181,9 @@ is required or permitted in this read path.
   masked: there is no general personal-data recognizer here (same boundary as
   [privacy](docs/privacy.md)), and guessing would both miss and over-redact.
   Staff guidance on reason wording is out of scope; the structural guarantee
-  is own-rows-only plus mention-syntax neutralization.
+  is own-rows-only plus mention-syntax neutralization. Neutralization always
+  precedes byte fitting (§3): the fitted, capped text is the neutralized
+  text, never raw text fitted first and expanded afterwards.
 - **Logs and telemetry.** Reasons, actor identifiers and per-member sanction
   counts never reach logs, traces, metrics labels or error strings. Aggregate
   invocation counters without identity are the only permitted telemetry, the
@@ -235,8 +250,10 @@ This spec defines only the hookup contract the self-view must satisfy:
 - **"Recent" is a display window, not deletion.** Warnings, audit and the ban
   ledger have no age purge (retention covers presence/voice captures, the
   audit-log cache, game aggregates and deletion requests). Rows older than
-  the 365-day window persist and stay available to staff tooling; the member
-  sees the receipt plus the ask-a-moderator pointer (§3).
+  the 365-day window persist and stay available to staff tooling; an older
+  row that is still active renders in this view (`A`, §3), and only older
+  inactive rows fall to the receipt count `O` plus the ask-a-moderator
+  pointer (§3, §10).
 - **Erasure empties the view.** Once the ordered manifest commits, every
   covered row is gone and the next read shows the empty state (§3) with no
   tombstone and no disclosure that erasure ran. A pending deletion request
@@ -254,7 +271,8 @@ truth, is displayed.
 
 The read captures one clock instant at snapshot start. Every derived state
 word compares `execute_at` against that instant, and the 365-day window
-bounds derive from it too. Per-row clock reads are not allowed.
+bound plus the `A`/`W` membership behind every receipt count (§3, §10)
+derive from it too. Per-row clock reads are not allowed.
 
 | Concurrent event | Read behavior |
 | --- | --- |
@@ -281,15 +299,24 @@ composed, and composition touches no database.
   gets a private "try again later" reply with no sanction content and no
   queue position.
 - **Query bounds:** fenced indexed scans only, in one `READ ONLY` snapshot:
-  the 25 display rows via `LIMIT 26` (25 rows plus the overflow witness),
-  plus two bounded `COUNT(*)` queries over the same fenced, deduplicated
-  eligible set (§3): the in-window total and the beyond-window total, both
-  partitioned by the single captured clock instant. A bounded statement
-  timeout applies. No full-history export and no pagination cursor in this
-  slice: the exact receipt plus the staff pointer is the whole overflow
-  story. Receipt templates: `showing R of T in the last 12 months` (R =
-  rendered rows, T = in-window total), with `; O older entries are available
-  from a moderator` appended when the beyond-window total O is nonzero.
+  the 25 display rows via `LIMIT 26` over `E` in §3 render order (25 rows
+  plus the overflow witness), plus two bounded `COUNT(*)` queries over the
+  same fenced, deduplicated eligible sources (§3), partitioning every
+  eligible row exactly once by the single captured clock instant: `T =
+  |E|` counts rows in `A ∪ W` (active at that instant, or issued at or
+  after `instant − 365 days`), and `O` counts the rest (issued before that
+  bound and not active). Corroborating audit pairs add zero to both counts,
+  a recent active row counts once in `T`, an old active row counts in `T`
+  and never in `O`, and excluded records (§3) count nowhere. A bounded
+  statement timeout applies. No full-history export and no pagination
+  cursor in this slice: the exact receipt plus the staff pointer is the
+  whole overflow story. Receipt template (the only one, for every case):
+  `showing R of T (active sanctions of any age plus sanctions from the last
+  365 days)`, where `R = min(25, T)` is the rendered row count, with `; O
+  older inactive entries are available from a moderator` appended when `O`
+  is nonzero. The counted set and the rendered set are therefore always the
+  same set `E`: no case can produce `R > T`, and no rendered row is ever
+  also counted in `O`.
 - **Reply bounds:** §3 (ephemeral at ACK, plain text, ≤1800 bytes, closed
   mentions). A failed reply after a successful read retries nothing: there
   is no mutation to reconcile, and the member simply re-invokes (which
@@ -301,7 +328,8 @@ composed, and composition touches no database.
 
 ## 11. Offline decision sketch (runnable now, stdlib only)
 
-The sketch below checks the redaction and byte-budget contract fragments and the matrix shape.
+The sketch below checks the redaction, shaping-order, receipt-partition and
+byte-budget contract fragments and the matrix shape.
 It is not production code, store behavior, runtime acceptance or a security
 proof. Its functions are policy fragments; the real seam must still satisfy
 §5 end to end, including non-selection (which no string function can prove).
@@ -321,6 +349,12 @@ proof. Its functions are policy fragments; the real seam must still satisfy
 ...     if len(encoded) <= share:
 ...         return reason
 ...     return encoded[:max(share - 3, 0)].decode("utf-8", "ignore") + "…"
+>>> def shape_reason(reason, share):
+...     return fit_reason(display_reason(reason), share)
+>>> def partition(rows):
+...     eligible = sum(1 for in_window, active in rows if in_window or active)
+...     older = sum(1 for in_window, active in rows if not in_window and not active)
+...     return eligible, older
 >>> assert display_actor("123") == display_actor("999") == "Moderation team"
 >>> assert display_reason("Slurs toward <@123> and @everyone") == "Slurs toward [mention removed] and [mention removed]"
 >>> assert display_reason("Plain reason stays intact.") == "Plain reason stays intact."
@@ -329,6 +363,11 @@ proof. Its functions are policy fragments; the real seam must still satisfy
 >>> assert fit_reason("x" * 100, 10) == "xxxxxxx…"
 >>> clipped = fit_reason("😀" * 10, 10)
 >>> assert clipped.endswith("…") and len(clipped.encode("utf-8")) <= 10
+>>> shaped = shape_reason("<@123>" * 4, 20)
+>>> assert shaped == "[mention removed]…" and len(shaped.encode("utf-8")) == 20
+>>> assert partition([(False, True), (True, False), (False, False), (False, False)]) == (2, 2)
+>>> assert partition([(False, True)]) == (1, 0)
+>>> assert partition([(True, True), (True, False)]) == (2, 0)
 >>> text = pathlib.Path("docs/moderation-sanction-selfview-spec.md").read_text()
 >>> cases = re.findall(r"^\| (SS-F\d{2}) ", text, re.M)
 >>> assert cases == [f"SS-F{i:02}" for i in range(1, 19)], cases
@@ -362,7 +401,7 @@ private text in evidence. Timing bounds are acceptance targets, not SLAs.
 | Case | Given / when / then oracle |
 | --- | --- |
 | SS-F01 | Given an accepted tempban with future `execute_at`, an accepted permanent ban, plus a warning, when the member reads, then one `active until <expiry>` row, one `active` row and one `recorded` row appear with reasons and issued-at; every actor reads `Moderation team`; no snowflake, name or ID appears in the reply |
-| SS-F02 | Given warnings across 400 days, when the member reads, then newest-first rows within the trailing 365 days appear with inert reasons; the receipt states exact in-window and beyond-window totals (`showing R of T in the last 12 months; O older entries are available from a moderator`); given only beyond-window rows, the empty-state sentence plus the exact `showing 0 of 0` receipt appears |
+| SS-F02 | Given warnings across 400 days, when the member reads, then the `E` rows appear in §3 render order with inert reasons and the receipt states the exact partition (`showing R of T (active sanctions of any age plus sanctions from the last 365 days); O older inactive entries are available from a moderator`); given only older inactive rows, the empty-state sentence plus the exact `showing 0 of 0 …` receipt appears; given a rejoined member whose stored newest accepted permanent ban was issued 400 days ago and is still ledger-current (stored truth, no live lookup), plus a warning issued yesterday and two inactive warnings older than 365 days, then the ban and the recent warning render (active first) with `showing 2 of 2 (…); 2 older inactive entries …` — the old active ban is in `T`, never in `O`; given only that old active ban, then its row renders (never the empty state) with `showing 1 of 1 (…)` and no older suffix; given that ban plus 30 in-window warnings, then the ban still renders within the 25 (active first) with `showing 25 of 31 (…)` |
 | SS-F03 | Given an expired tempban, a superseded schedule and a completed unban, when the member reads, then each shows its terminal state word and none claims `active` |
 | SS-F04 | Given kick and timeout audit events, when the member reads, then each shows as an event with issued-at (plus duration for the timeout); no row claims live-active state and no Discord member fetch runs |
 | SS-F05 | Given an erased member and a never-sanctioned member, when each reads, then both see the identical empty state; no tombstone, no "erased" disclosure, zero rows |
@@ -376,9 +415,9 @@ private text in evidence. Timing bounds are acceptance targets, not SLAs.
 | SS-F13 | Given expiry, sweep completion and erasure racing a read, when each lands mid-read, then the in-flight reply keeps snapshot truth and the next read converges; post-erasure reads show the empty state |
 | SS-F14 | Given appeal states mapped, unmapped and absent, when the member reads, then exact states map, others fall back to the generic pointer, and no appeal content, thread or note ever appears |
 | SS-F15 | Given table counters before a burst of reads, when members read, refuse and re-read, then every counter on all six moderation tables plus audit is unchanged; only identity-free aggregate telemetry moves |
-| SS-F16 | Given 30 owned rows in window, when the member reads, then 25 newest rows render within 1800 bytes ephemeral-at-ACK with the exact `showing 25 of 30 in the last 12 months` receipt; reasons over the per-reason share truncate on character boundaries with `…`; no cursor or second page exists |
+| SS-F16 | Given 30 owned rows in `E`, all in-window and none active, when the member reads, then the 25 newest rows render within 1800 bytes ephemeral-at-ACK with the exact `showing 25 of 30 (active sanctions of any age plus sanctions from the last 365 days)` receipt; reasons over the per-reason share truncate on character boundaries with `…`; no cursor or second page exists |
 | SS-F17 | Given a denied kick audit, a failed timeout audit, a prepared ban intent, a rejected ban generation and a `ban_reconcile` row for the member alongside one accepted warn, when the member reads, then only the single warn renders; denied, failed, prepared, rejected and reconciled records never appear and the warn renders once (no audit double-count) |
-| SS-F18 | Given 25 sanctions with maximum-length 512-unit multibyte reasons, when the member reads, then all 25 rows render within 1800 bytes with the exact `showing 25 of 25 in the last 12 months` receipt; every reason is character-boundary truncated with `…` and the reply is valid UTF-8 |
+| SS-F18 | Given 25 sanctions with maximum-length 512-unit multibyte reasons, one of them a repeated mention/URL pattern whose neutralized form is longer than its raw form, when the member reads, then all 25 rows render within 1800 bytes with the exact `showing 25 of 25 (active sanctions of any age plus sanctions from the last 365 days)` receipt; neutralization runs before byte fitting, so every final reason — including the expanding one — is within its per-reason share, character-boundary truncated with `…`, and the reply is valid UTF-8 |
 
 Reusable harnesses (existence is not evidence of B passing): the recording
 transport above, member-moderation DB suites, privacy self-serve suites and
@@ -396,8 +435,8 @@ dependency. No slice starts before the gates in §14.
 
 | Slice | One-day scope | Out of scope | Exit (all required) |
 | --- | --- | --- | --- |
-| S1 read model | Pure shaping/redaction: state words, mention plus link/URL neutralization, per-reason byte budgeting, receipt text, empty/unavailable shapes, byte cap; unit tests only | DB, Discord, command wiring, appeal | All §11 fragments plus edge cases covered; zero I/O in the module |
-| S2 store read | One fenced snapshot seam over warnings, ban ledger and audit with the §3 source-of-truth and allowlist; display rows via `LIMIT 26` plus bounded in-window/beyond-window `COUNT(*)`; one captured clock instant; ignored DB tests on disposable schemas | UX, budgets, appeal, migrations (none needed: existing indexes suffice) | Snapshot consistency plus fence proofs; zero-write assertion harness ready |
+| S1 read model | Pure shaping/redaction: state words, mention plus link/URL neutralization then per-reason byte budgeting (in that order), receipt text from supplied `R`/`T`/`O`, empty/unavailable shapes, byte cap; unit tests only | DB, Discord, command wiring, appeal | All §11 fragments plus edge cases covered; zero I/O in the module |
+| S2 store read | One fenced snapshot seam over warnings, ban ledger and audit with the §3 source-of-truth and allowlist; display rows via `LIMIT 26` over `E` in §3 render order plus bounded eligible-set (`T`) and older-inactive (`O`) `COUNT(*)` partitioning every eligible row once; one captured clock instant; ignored DB tests on disposable schemas | UX, budgets, appeal, migrations (none needed: existing indexes suffice) | Snapshot consistency plus fence proofs; zero-write assertion harness ready |
 | S3 command UX | `/my-sanctions` wiring: router gates, ephemeral lifecycle, 10/hour budget, help text, registry collision proof | Appeal pointer (generic fallback only), staff views, pagination | Staging-dark with S1+S2; SS-F01–F13 and SS-F15–F18 green |
 | S4 appeal pointer | Exact-state mapping table against landed appeal states plus fallback; mapping tests | Any appeal behavior, content or eligibility change | SS-F14 green; unknown-state fuzz green |
 | S5 matrix closeout | Full §12 execution, evidence pack, docs finalization | New behavior of any kind | 18/18 oracles disposed; spec revision bound to results |
