@@ -27,10 +27,10 @@ never opened.
 
 **Recommend panel operations over blob writes with truthful publish, not a
 raw JSON editor.** After intent acceptance, the smallest eventual surface is
-a read-only panel inventory (SR-S1, the <=1-day slice); panel
+a read-only panel inventory (SR-B1, the <=1-day slice); panel
 create/edit/publish/unpublish follow only behind SR-W1/SR-W2. If the
 prerequisites cannot be proved, choose **no-build**, not a form that can
-blank live pickers. Nothing is built by this spec, including SR-S1.
+blank live pickers. Nothing is built by this spec, including SR-B1.
 
 ## Source-backed inventory
 
@@ -360,7 +360,7 @@ catalogue takes over unseen.
 | `SR-F02` | Publish: read token t, add one strict-valid panel, preview names it in `panels_added` with zero removals, save with t; dispatch on its message serves it after one poll; exactly one audit row. |
 | `SR-F03` | Unpublish: read token t, remove panel P, preview names P with option/role counts and the keep-granted-roles copy, save with t; P's pickers stop after one poll while previously granted roles stay; exactly one audit row. |
 | `SR-F04` | Truthful publish: a save whose diff drops a panel outside the confirmed operations is refused client-side before signing; prove the unsigned refusal, not only the CAS backstop. |
-| `SR-F05` | Role deletion under a live panel: delete the role from the guild double, dispatch refuses `missing_role` with the vetted reply, page shows the panel `UNKNOWN` until re-read; no auto-repair, no silent unpublish. |
+| `SR-F05` | Role deletion under a live panel: delete the role from the guild double, dispatch refuses `missing_role` with the vetted reply; `settings.get` is unaffected so the page keeps rendering the stored panel unchanged, with no auto-repair and no silent unpublish. Proactive display needs the absent role oracle (SR-S3), not a re-read. |
 | `SR-F06` | Stale revision: A/B get token t; A saves; B saves t: only A commits, B receives conflict and retains draft. Two creators expecting 0: one success. |
 | `SR-F07` | Access changes: drift the live role mask from the deployment approval, dispatch refuses `role_permissions_changed`; move the role above the bot, dispatch refuses `role_hierarchy`; the page discloses unverified roles/channels at save and never claims pre-verification. |
 | `SR-F08` | Dry-run inert: a directly stored `TWO_SELF_ROLE_DRY_RUN=1` row leaves dispatch behavior unchanged; the page renders no toggle (`NOT_EDITABLE`). Flips only when SR-W3 lands. |
@@ -428,7 +428,7 @@ waiver.
 | `SR-W2` | Build the panel-operations client: read-modify-write over the whole blob with CAS, strict-shape pre-check, diff preview naming added/removed/changed panels, truthful unpublish confirm, unset-to-boot disclosure, and refusal of diffs outside the confirmed operations. |
 | `SR-W3` | Apply `TWO_SELF_ROLE_DRY_RUN` live (store-first per-operation read, boot fallback, last-good on a bad row, plus pins) before any toggle; shared with the sibling proposal's dry-run wiring card, not duplicated here. |
 
-Smallest future build slice (SR-S1, <=1 day): a read-only panel
+Smallest future build slice (SR-B1, <=1 day): a read-only panel
 inventory page behind SR-W1 only. It performs `settings.get`, renders the
 strict-shape catalogue (or `INHERITED_BOOT` / `STORED_INVALID` /
 `UNKNOWN`), and signs nothing. No writes, no migration, no new grant, no
@@ -453,7 +453,7 @@ surface, no new write path, no per-panel visibility for staff. This stays
 the default if intent is not granted. Evidence that would overturn it:
 sustained operator panel-change volume (multiple host edits per month with
 review pain), a panel misconfiguration incident traceable to blind env
-editing, or a staging SR-S1 pilot showing staff can read the catalogue
+editing, or a staging SR-B1 pilot showing staff can read the catalogue
 truthfully. Any overturn re-enters through this same intent gate; it does
 not authorize writes.
 
