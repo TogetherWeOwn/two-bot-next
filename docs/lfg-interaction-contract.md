@@ -97,9 +97,10 @@ Closing a post commits the closed row before its Discord PATCH runs. When
 that edit fails (a 403, a timeout, a restart), the close transition leaves a
 durable repair intent behind instead of losing it: the lifecycle sweep keeps
 retrying the exact saved guild/channel/message under the existing runtime
-lock and send-admission fences, with durable backoff (5 minutes doubling per
-attempt, capped at 6 hours). Repair candidates share the sweep's 20-row cap
-and per-tick budget, so one stuck row cannot starve expiry work. A confirmed
+lock and send-admission fences, with durable backoff (10 minutes after the
+first failed repair, doubling per failure and capped at 6 hours). Repair
+candidates share the sweep's 20-row cap and per-tick budget, so one stuck row
+cannot starve expiry work. A confirmed
 edit settles the intent, as does a definitive Unknown Message outcome
 (Discord code 10008); a bare 404 without that code stays retryable. The
 repair never recreates a message, sends, deletes or reopens, and historical
@@ -113,7 +114,7 @@ remote bodies appear. A `retry_scheduled` line needs no action: the next
 eligible tick retries on its own. Pending state lives on the closed row
 (`close_refresh_pending`, `close_refresh_attempts`, `close_refresh_next_at`)
 and clears only on a confirmed edit, a definitive Unknown Message outcome,
-or erasure of the row itself.
+a closed post with no saved message to repair, or erasure of the row itself.
 
 ## Bind a receipt to its request
 

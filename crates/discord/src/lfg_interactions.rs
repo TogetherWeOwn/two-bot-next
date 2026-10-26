@@ -883,8 +883,9 @@ fn lifecycle_warning(message: &'static str) {
 }
 
 /// Delay before the next close-refresh attempt after `attempts` recorded
-/// failures: 5 minutes doubling per attempt, capped at 6 hours. Same-tick
-/// restarts never hammer Discord; a day-separated tick is always eligible.
+/// failures: a 5-minute base doubled per failure, capped at 6 hours (10 minutes
+/// after the first failure). Same-tick restarts never hammer Discord; a
+/// day-separated tick is always eligible.
 fn close_refresh_backoff(attempts: i32) -> time::Duration {
     let shift = (attempts.max(0) as u32).min(7);
     let minutes = 5_i64.saturating_mul(1_i64 << shift);
