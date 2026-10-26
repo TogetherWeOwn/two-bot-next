@@ -1,7 +1,7 @@
 # Documentation map
 
 Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
-No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
+No `{missing,stale,oversize}` = PASS (0), else 1. Index <12,000; others <=65,536; except LARGE_DOCS.
 
 ## References and architecture
 
@@ -86,12 +86,13 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Attribution corpus](classifier-golden.md)
 - [Attribution PII tests](classifier-pii-absence.md)
 - [Channel access tests](channel-access-acceptance.md)
-- [Channel locking tests](channel-lockdown-acceptance.md)
+- [Lockdown tests](channel-lockdown-acceptance.md)
 - [Timed lockdown: no build](time-boxed-lockdown-decision.md)
+- [Lockdown preview](lockdown-preview-spec.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
-- [Moderation disable gate](moderation-disable-preflight.md)
+- [Disable gate](moderation-disable-preflight.md)
 - [Hierarchy order](moderation-hierarchy-order.md)
 - [Moderation MAC tests](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
