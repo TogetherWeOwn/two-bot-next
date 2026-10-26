@@ -114,9 +114,12 @@ Private non-cacheable responses, escaped inert names, no mentions or raw remote
 errors, no credential/env rendering, no value-bearing logs are prerequisites.
 Web guards/signing are **unverified**, not presumed present.
 
-Proposed editor bounds: at most **10 rows**, body at most **8192 UTF-8 bytes**,
-level JSON integer 1..2147483647 (not boolean/fraction/string), canonical role ID
-string of 17–20 ASCII digits, no leading zero, <=18446744073709551615. Both level
+Proposed editor bounds: at most **10 rows**, complete raw signed JSON body at
+most **8192 UTF-8 bytes**, checked before decoding/parsing. Count envelope fields,
+confirmation, punctuation and whitespace, not reserialized rows or characters;
+transport headers are outside this body bound. Level JSON integer 1..2147483647
+(not boolean/fraction/string), canonical role ID string of 17–20 ASCII digits,
+no leading zero, <=18446744073709551615. Both level
 and role must be unique; duplicate levels are an explicit error rather than a
 silent last-wins UI. Sort ascending level; row identity is `(guild_id,level)`;
 editing a level is remove+add, not an array-index identity. Reject unknown fields,
@@ -274,11 +277,15 @@ permit a bounded retry with backoff/Retry-After; not automatic write retries.
 ### Runnable offline oracle (not backend acceptance)
 
 From repo root: `python3 -m doctest -v docs/dashboard-leveling-rewards-spec.md`.
-This executes the 24 synthetic decision rows plus lexical bounds, saved/failed-
-application and disabled-write presentation below. It checks source anchors,
-not real session/Discord facts or DB atomicity. Pure trusted-fact flags are test
-inputs, **not browser authority**. Production implementations must not use this
-Python model or its simplified confirmation boolean as an authorization layer.
+This executes all 24 synthetic decisions through a raw-request byte boundary,
+plus exact 8192/8193-byte ASCII and multibyte UTF-8 envelopes, whitespace padding,
+lexical bounds, saved/failed-application and disabled-write presentation. The
+`decide` helper models parsed row decisions only; `decide_request` checks the
+complete raw body before decoding/parsing. The latter is not a full envelope or
+lexical-token validator: those remain future protected acceptance requirements.
+It checks source anchors, not real session/Discord facts or DB atomicity. Pure
+trusted-fact flags are test inputs, **not browser authority**. Production must
+not use this Python model or its simplified confirmation boolean as authority.
 
 ```pycon
 >>> import copy, hashlib, json, pathlib, re
@@ -300,7 +307,6 @@ Python model or its simplified confirmation boolean as an authorization layer.
 ...     if not complete: return "UNSUPPORTED_LADDER"
 ...     if not version: return "VERSION_CONFLICT"
 ...     if type(rows) is not list or len(rows) > m["max_rows"]: return "INVALID_VALUE"
-...     if len(json.dumps(rows, ensure_ascii=False).encode()) > m["max_body_bytes"]: return "INVALID_VALUE"
 ...     for row in rows:
 ...         if type(row) is not dict or set(row) != {"level", "role_id"}: return "INVALID_VALUE"
 ...         if type(row["level"]) is not int or not 1 <= row["level"] <= 2147483647 or not canonical_id(row["role_id"]): return "INVALID_VALUE"
@@ -313,14 +319,24 @@ Python model or its simplified confirmation boolean as an authorization layer.
 ...     if pairs(rows) == pairs(old): return "UNCHANGED"
 ...     if set(pairs(old)) - set(pairs(rows)) and not confirmed: return "CONFIRM_REPLACEMENT"
 ...     return "PREVIEW_ONLY"
+>>> def decide_request(body, **flags):
+...     if type(body) is not bytes: return "INVALID_VALUE"
+...     if len(body) > m["max_body_bytes"]: return "INVALID_VALUE"
+...     try: envelope = json.loads(body.decode("utf-8"))
+...     except (UnicodeDecodeError, ValueError): return "INVALID_VALUE"
+...     if type(envelope) is not dict or "rows" not in envelope: return "INVALID_VALUE"
+...     return decide(envelope["rows"], **flags)
 >>> a = {"level": 1, "role_id": role}; b = {"level": 2, "role_id": "10000000000000003"}
+>>> envelope = {"schema":"leveling.rewards.v1", "guild_id":"10000000000000001", "actor_id":"10000000000000004", "intent_id":"fixture-intent", "expected_version":"1", "rows":[a], "confirmation":None}
+>>> encode_request = lambda rows, **fields: json.dumps(dict(envelope, rows=rows, **fields), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 >>> cases = {name: ([a], {}) for _, name, _ in m["fixtures"]}
 >>> cases.update(empty=([], {}), duplicate_level=([a,a], {}), duplicate_role=([a,dict(a,level=2)], {}), invalid_level=([dict(a,level=0)], {}), invalid_id=([dict(a,role_id="0"*17)], {}), missing_role=([a], {"facts":"missing"}), managed=([a], {"facts":"managed"}), above_bot=([a], {"facts":"above_bot"}), privileged=([a], {"facts":"privileged"}), foreign_guild=([a], {"guild":False}), no_staff_authority=([a], {"staff":False}), unchanged=([a], {"old":[a]}), stale_version=([a], {"version":False}), facts_unavailable=([a], {"facts":"unknown"}), clear_existing=([], {"old":[a]}), confirmed_clear=([], {"old":[a],"confirmed":True}), oversize=([a]*11, {}), existing_oversize=([a], {"complete":False}), read_unavailable=([a], {"read":False}), write_unknown=([a], {"unknown":True}), everyone=([a], {"facts":"everyone"}), above_editor=([a], {"facts":"above_editor"}), no_bot_permission=([a], {"facts":"no_bot_permission"}))
 >>> before = copy.deepcopy(cases)
 >>> for ident, name, expected in m["fixtures"]:
 ...     rows, flags = cases[name]
-...     assert decide(rows, **flags) == expected, ident
-...     assert decide(rows, **flags) == decide(rows, **flags), ident
+...     body = encode_request(rows)
+...     assert decide_request(body, **flags) == expected, ident
+...     assert decide_request(body, **flags) == decide_request(body, **flags), ident
 >>> assert before == cases
 >>> assert all(decide([dict(a,level=x)]) == "INVALID_VALUE" for x in [True,1.0,"1",-1,2147483648,None])
 >>> assert all(not canonical_id(x) for x in [1,None,"", "0"*17,"18446744073709551616","１"*17,"+10000000000000002"])
@@ -328,6 +344,19 @@ Python model or its simplified confirmation boolean as an authorization layer.
 >>> draft_hash = lambda rows: hashlib.sha256(json.dumps(sorted(rows,key=lambda r:r["level"]),sort_keys=True,separators=(",",":")).encode()).hexdigest()
 >>> assert draft_hash([a,b]) == draft_hash([b,a]) and draft_hash([a]) != draft_hash([b])
 >>> assert decide([], old=[a], confirmed=False) == "CONFIRM_REPLACEMENT"  # stale target must be unconfirmed
+>>> raw = encode_request([a])
+>>> at_limit = raw + b" " * (8192 - len(raw))
+>>> over_limit = at_limit + b" "
+>>> assert len(at_limit) == 8192 and len(over_limit) == 8193
+>>> assert decide_request(at_limit) == "PREVIEW_ONLY"
+>>> assert decide_request(over_limit) == "INVALID_VALUE"
+>>> assert decide_request(raw + b" " * (8420 - len(raw))) == "INVALID_VALUE"
+>>> utf8 = encode_request([a], intent_id="é" * 10, confirmation={"guild_id":envelope["guild_id"], "expected_version":"1", "draft_sha256":"a"*64})
+>>> utf8_at_limit = utf8 + b" " * (8192 - len(utf8))
+>>> assert len(utf8_at_limit) == 8192 and len(utf8_at_limit.decode("utf-8")) < 8192
+>>> assert decide_request(utf8_at_limit) == "PREVIEW_ONLY"
+>>> assert decide_request(utf8_at_limit + b" ") == "INVALID_VALUE"
+>>> assert all(decide_request(body) == "INVALID_VALUE" for body in [b"\xff", b"{", b"[]", raw.decode("utf-8")])
 >>> def presentation(saved, observed_role_failure=False, role_writes_enabled=True):
 ...     return {"configuration":"STORED_UNVERIFIED" if saved else "COMMIT_UNKNOWN", "application":"unconfirmed", "apply_action":None}
 >>> assert presentation(True, True) == presentation(True, False, False) == presentation(True)
