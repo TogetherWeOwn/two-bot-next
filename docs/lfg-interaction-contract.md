@@ -66,10 +66,48 @@ Discord, including tuple preservation, concurrent select/leave/close orderings,
 no-op/refusal effects, hostile text and post-commit failures. This does not claim
 staging usage or activate the feature in production.
 
+### Increase one role's seats
+
+`/lfg-edit id:<id> role:<existing role key> seats:<absolute total>` uses the
+same configured-guild, announcements and **Manage Events** gates on every
+interaction. The selector is the stable signup key (for example `tank`), not its
+label or a Discord role ID. Supply `role` and `seats` together, without `title`
+or `starts-at`; metadata edits remain a separate mode of the same command.
+Unknown, duplicate, mistyped, unpaired or mixed-mode options refuse before any
+mutation. Keys use the existing 1–32 ASCII letter/digit/underscore/hyphen bound;
+seats must be a strict integer from 1 to 99, not a delta.
+
+Only an open post whose start is still in the future can change. A dedicated
+transaction takes the shared signup/close advisory lock, the guild-fenced post
+row lock, then the selected role row lock. After waiting, it checks the current
+capacity and execution-time clock. A smaller target refuses, including a stale
+request behind a newer increase. An equal target returns `LFG seats unchanged`
+with no row rewrite, audit append or channel refresh, including a replayed
+successful target. A larger target updates only that role's `slots` in place.
+Post metadata, lifecycle, role identities/labels/order, message identity and
+all signups with their original join times remain untouched.
+
+Each saved increase commits one bounded `lfg.edit.seats` / `increased` audit in
+the same transaction. An audit insert failure or identity collision rolls back
+the capacity update. No refusal or no-op writes an audit. The runtime retains
+the per-post lock through one mention-suppressed PATCH to the existing message;
+it never creates a new public message or pings members. The private receipt
+says `LFG seats saved`. If the PATCH fails, it still says saved, then explains
+that the visible post could not be refreshed. Check saved state before retrying:
+an equal target remains a no-op, not a refresh retry. No claim of exactly-once
+Discord delivery or automatic refresh recovery is made.
+
+`crates/core/tests/lfg_seat_edit_catalog_acceptance.rs` pins publication/help.
+`crates/discord/tests/lfg_seat_edit_acceptance.rs` covers router/store/REST
+behavior, tuple preservation, private replies, stale targets and actual lock
+contention with signup, close and metadata edits in disposable fixtures. These
+are hermetic checks, not production or staging activation evidence.
+
 ## Applied state is not an audited success
 
-LFG store mutations commit independently of the runtime's advisory-lock
-transaction. If a signup, leave or close succeeds but its audit append fails,
+Except for the atomic seat/audit transaction above, LFG store mutations commit
+independently of the runtime's advisory-lock transaction. If a signup, leave or
+close succeeds but its audit append fails,
 the service returns the actual outcome followed by:
 
 > Audit could not be recorded; check the saved state before retrying.
