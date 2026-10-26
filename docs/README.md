@@ -1,12 +1,12 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`.
+Sole manifest: `- [Purpose](relative.md)`.
 
-Root check: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}`: empty = PASS (0), else fail (1).
-Fix rows/split docs; bad/duplicate rows use `docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions and reasons:
-`scripts/check_docs_index.py` (`LARGE_DOCS`).
+Root: `python3 scripts/check_docs_index.py --json`.
+Sorted `{missing,stale,oversize}`: empty PASS/0; else FAIL/1, fix rows/split docs.
+Bad/duplicate: `docs/README.md:<line>` in `stale`.
+Bytes: index <12,000; docs ≤65,536.
+Legacy exceptions/why: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 
 ## References and architecture
 
@@ -141,6 +141,7 @@ Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions and reason
 - [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
+- [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
