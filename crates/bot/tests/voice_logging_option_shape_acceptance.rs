@@ -80,8 +80,7 @@ use twilight_model::{
     },
     guild::{Permissions, Role},
     http::interaction::{InteractionResponse, InteractionResponseType},
-    id::Id,
-    user::UserMarker,
+    id::{marker::UserMarker, Id},
 };
 use two_bot::voice_rooms::{
     handle_voice_interaction, BotAccess, EventVoiceBinding, GuildSnapshot, NoticeTarget,
