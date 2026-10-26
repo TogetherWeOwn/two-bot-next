@@ -24,6 +24,7 @@ use super::*;
 use crate::gateway::GatewayPipeline;
 use crate::onboarding::{OnboardingJob, OnboardingRuntime};
 
+mod goodbye_preview;
 mod ingress;
 mod recipient_acceptance;
 
