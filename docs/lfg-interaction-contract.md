@@ -129,6 +129,34 @@ audit row there is no durable replay receipt; inspect saved state before
 retrying. Likewise, this change does not address a crash between the store
 commit and audit append. It adds no migration or separate replay store.
 
+## Closed-post refresh repair
+
+Closing a post commits the closed row before its Discord PATCH runs. When
+that edit fails (a 403, a timeout, a restart), the close transition leaves a
+durable repair intent behind instead of losing it: the lifecycle sweep keeps
+retrying the exact saved guild/channel/message under the existing runtime
+lock and send-admission fences, with durable backoff (10 minutes after the
+first failed repair, doubling per failure and capped at 6 hours). Repair
+candidates share the sweep's 20-row cap and per-tick budget, so one stuck row
+cannot starve expiry work. A confirmed
+edit settles the intent, as does a definitive Unknown Message outcome
+(Discord code 10008); a bare 404 without that code stays retryable. The
+repair never recreates a message, sends, deletes or reopens, and historical
+closed rows are never reclassified as pending.
+
+Each terminal attempt logs a content-free `outcome` (`repaired`,
+`settled_missing`, `retry_scheduled`) with an `error_class` in fixed
+vocabulary (`unknown_message`, `rejected`, `timeout`, `unavailable`,
+`rate_limited`, `admission_blocked`, `guard_*`). No member text, SQL or
+remote bodies appear. A `retry_scheduled` line needs no action: the next
+eligible tick retries on its own. Pending state lives on the closed row
+(`close_refresh_pending`, `close_refresh_attempts`, `close_refresh_next_at`)
+and clears only on a confirmed edit, a definitive Unknown Message outcome,
+a closed post with no saved message to repair, or erasure of the row itself.
+If a closed post first gains its saved message later (recovered from channel
+history), saving the identifier re-arms the same repair intent, so stale
+controls on the late-bound message keep a durable retry.
+
 ## Bind a receipt to its request
 
 Both signup and leave use `lfg:signup:<interaction-id>` as the shared audit ID,
