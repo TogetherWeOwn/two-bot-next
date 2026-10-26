@@ -44,8 +44,10 @@ use two_bot_testsupport::TestDatabase;
 const HOLDER_TEMPLATE: &str = "Holder replacement";
 const HOSTILE: &str = "UNTRUSTED_SENTINEL @everyone <@9876>";
 const AT: &str = "2026-10-01T00:00:00.000000+00:00";
+const CASE_TIMEOUT: Duration = Duration::from_secs(2);
+const RESPONSE_DELAY: Duration = Duration::from_millis(450);
 
-fn runtime(pool: PgPool, mock: &MockRest) -> CustomCommandRuntime {
+fn runtime(pool: PgPool, mock: &MockRest, holder_timeout: Duration) -> CustomCommandRuntime {
     let mut router = InteractionRouter::new(RouterGates {
         configured_guild: Some(2222),
         automations: true,
@@ -63,8 +65,12 @@ fn runtime(pool: PgPool, mock: &MockRest) -> CustomCommandRuntime {
     CustomCommandRuntime::new(
         pool,
         Arc::new(router),
-        ActionExecutor::with_proxy("writer-lock-fixture".to_owned(), Some(mock.origin()))
-            .expect("loopback-only executor"),
+        ActionExecutor::with_proxy_and_moderation_timeout(
+            "writer-lock-fixture".to_owned(),
+            Some(mock.origin()),
+            holder_timeout,
+        )
+        .expect("loopback-only executor"),
         1111,
     )
 }
@@ -216,58 +222,6 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
         .connect_with(db.pool().connect_options().as_ref().clone())
         .await
         .expect("observed pool in the same disposable database");
-    // Script order is deterministic: malformed writers run sequentially
-    // while the holder's PUT is gated, so requests never interleave.
-    let completion = || ScriptedResponse::json(200, json!({"id": "9000"}));
-    let (mock, gate) = MockRest::start_gated_at(
-        vec![
-            ScriptedResponse::status(204), // holder defer
-            ScriptedResponse::status(403), // holder publication PUT (gated)
-            ScriptedResponse::status(204), // malformed define defer
-            completion(),                  // malformed define completion
-            ScriptedResponse::status(204), // malformed remove defer
-            completion(),                  // malformed remove completion
-            ScriptedResponse::status(204), // unknown-option define defer
-            completion(),                  // unknown-option define completion
-            ScriptedResponse::status(204), // integer-template define defer
-            completion(),                  // integer-template define completion
-            ScriptedResponse::status(204), // missing-template define defer
-            completion(),                  // missing-template define completion
-            ScriptedResponse::status(204), // integer-description define defer
-            completion(),                  // integer-description define completion
-            ScriptedResponse::status(204), // integer-text-trigger define defer
-            completion(),                  // integer-text-trigger define completion
-        ],
-        completion(),
-        1,
-    )
-    .await;
-    let runtime = runtime(pool.clone(), &mock);
-
-    // Holder: a valid replacement commits, then blocks republishing the
-    // whole registry while still owning the shared registry mutex.
-    let holder_runtime = runtime.clone();
-    let task = tokio::spawn(async move {
-        let holder = interaction(
-            7001,
-            "command",
-            vec![
-                option("name", "FAQ"),
-                option("template", HOLDER_TEMPLATE),
-                option("description", "New description"),
-                option("text-trigger", "!NewFaq"),
-            ],
-        );
-        holder_runtime
-            .handle_interaction(&holder, Some("Test guild"))
-            .await
-    });
-    let reached = tokio::time::timeout(Duration::from_secs(3), gate.wait_for_request())
-        .await
-        .is_ok();
-    // The holder's write has committed by the time its PUT is in flight.
-    let during = snapshot(db.pool()).await;
-    accesses.store(0, Ordering::SeqCst);
     let malformed: Vec<(u64, &str, Vec<Value>, &str)> = vec![
         (
             7002,
@@ -327,13 +281,75 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
             "text-trigger",
         ),
     ];
+    // Cover every case's full allowance plus four five-second snapshot
+    // queries and ten seconds of setup/scheduling headroom. Never let the
+    // holder's ordinary five-second wire deadline end contention mid-matrix.
+    let holder_timeout = CASE_TIMEOUT
+        * u32::try_from(malformed.len()).expect("bounded malformed matrix")
+        + Duration::from_secs(30);
+    // Script order is deterministic: malformed writers run sequentially
+    // while the holder's PUT is gated, so requests never interleave.
+    // Fourteen delayed responses exceed the production five-second budget,
+    // while each malformed request still fits comfortably inside two seconds.
+    let defer = || ScriptedResponse::status(204).delayed(RESPONSE_DELAY);
+    let completion = || ScriptedResponse::json(200, json!({"id": "9000"})).delayed(RESPONSE_DELAY);
+    let (mock, gate) = MockRest::start_gated_at(
+        vec![
+            ScriptedResponse::status(204), // holder defer
+            ScriptedResponse::status(403), // holder publication PUT (gated)
+            defer(),                       // malformed define defer
+            completion(),                  // malformed define completion
+            defer(),                       // malformed remove defer
+            completion(),                  // malformed remove completion
+            defer(),                       // unknown-option define defer
+            completion(),                  // unknown-option define completion
+            defer(),                       // integer-template define defer
+            completion(),                  // integer-template define completion
+            defer(),                       // missing-template define defer
+            completion(),                  // missing-template define completion
+            defer(),                       // integer-description define defer
+            completion(),                  // integer-description define completion
+            defer(),                       // integer-text-trigger define defer
+            completion(),                  // integer-text-trigger define completion
+        ],
+        completion(),
+        1,
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, holder_timeout);
+
+    // Holder: a valid replacement commits, then blocks republishing the
+    // whole registry while still owning the shared registry mutex.
+    let holder_runtime = runtime.clone();
+    let task = tokio::spawn(async move {
+        let holder = interaction(
+            7001,
+            "command",
+            vec![
+                option("name", "FAQ"),
+                option("template", HOLDER_TEMPLATE),
+                option("description", "New description"),
+                option("text-trigger", "!NewFaq"),
+            ],
+        );
+        holder_runtime
+            .handle_interaction(&holder, Some("Test guild"))
+            .await
+    });
+    let reached = tokio::time::timeout(Duration::from_secs(3), gate.wait_for_request())
+        .await
+        .is_ok();
+    // The holder's write has committed by the time its PUT is in flight.
+    let during = snapshot(db.pool()).await;
+    accesses.store(0, Ordering::SeqCst);
     let mut outcomes: Vec<Option<Observed>> = Vec::new();
+    let matrix_started = tokio::time::Instant::now();
     if reached {
         for (id, command, options, _field) in &malformed {
             let input = interaction(*id, command, options.clone());
             let start = mock.requests().len();
             let timed = tokio::time::timeout(
-                Duration::from_secs(2),
+                CASE_TIMEOUT,
                 runtime.handle_interaction(&input, Some("Test guild")),
             )
             .await;
@@ -350,6 +366,7 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
             }
         }
     }
+    let matrix_elapsed = matrix_started.elapsed();
     let after = snapshot(db.pool()).await;
     let accesses_after = accesses.load(Ordering::SeqCst);
     let holder_finished_before_release = task.is_finished();
@@ -392,6 +409,10 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
             .expect("malformed writer must not wait behind the held publication");
         correction(observed, field);
     }
+    assert!(
+        matrix_elapsed > Duration::from_secs(5),
+        "the delayed matrix must exercise contention past the default wire timeout"
+    );
     assert_eq!(
         accesses_after, 0,
         "malformed writers perform zero pool accesses under contention"
