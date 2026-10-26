@@ -219,7 +219,7 @@ impl Fixture {
             "one ack and completion per handled command"
         );
         let mut replies = Vec::new();
-        for pair in requests.chunks_exact(2) {
+        for pair in requests.as_chunks::<2>().0 {
             assert_eq!(
                 (pair[0].method.as_str(), pair[0].path.as_str()),
                 ("POST", "/api/v10/interactions/7/mock-visibility/callback")
