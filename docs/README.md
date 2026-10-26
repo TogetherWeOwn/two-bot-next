@@ -1,13 +1,12 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)` by area.
 
 Repo root: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
-else exit 1, repair rows/split docs. Bad/duplicate rows use
-`docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Sorted `{missing,stale,oversize}`: empty = PASS (exit 0);
+else exit 1; repair rows/split docs. Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes.
+Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 
 ## References and architecture
 
@@ -96,6 +95,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
+- [Warning history (proposal)](warning-history-spec.md)
 - [Moderation disable gate](moderation-disable-preflight.md)
 - [Hierarchy refusal order](moderation-hierarchy-order.md)
 - [Moderation MAC tests](moderation-mac-acceptance.md)
