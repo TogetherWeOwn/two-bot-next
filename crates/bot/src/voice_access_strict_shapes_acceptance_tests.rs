@@ -872,7 +872,8 @@ async fn genuine_clear_still_clears_and_valid_sets_save_byte_identically() {
 #[tokio::test]
 async fn admission_and_guild_controls_behave() {
     // Non-admins are denied before validation, for valid and malformed
-    // shapes alike, with zero effects.
+    // shapes alike, with zero effects. Without a required-role gate the
+    // admin check denies; with one, the missing role denies first.
     for sub in [
         sub_option("role", vec![role_option("role", 11)]),
         sub_option("role", vec![string_option("role", "seize-gate")]),
@@ -882,16 +883,21 @@ async fn admission_and_guild_controls_behave() {
         ),
         sub_option("show", Vec::new()),
     ] {
-        let seeded = seeded_controls();
-        let (fixture, mut rx) = healthy_fixture(seeded.clone());
-        let (owned, response) =
-            handle_capture(&fixture.runtime, &access_interaction(sub, false)).await;
-        assert!(owned);
-        assert_eq!(
-            response_text(&response.expect("denial")),
-            "You need Manage Channels to use /access."
-        );
-        assert_no_effects(&fixture, &seeded, &mut rx, "member denial");
+        for required_role in [None, Some(9)] {
+            let mut seeded = seeded_controls();
+            seeded.required_role = required_role;
+            let (fixture, mut rx) = healthy_fixture(seeded.clone());
+            let (owned, response) =
+                handle_capture(&fixture.runtime, &access_interaction(sub.clone(), false)).await;
+            assert!(owned);
+            let expected = if required_role.is_some() {
+                "You need the server's required role to use voice-room commands."
+            } else {
+                "You need Manage Channels to use /access."
+            };
+            assert_eq!(response_text(&response.expect("denial")), expected);
+            assert_no_effects(&fixture, &seeded, &mut rx, "member denial");
+        }
     }
 
     // An interaction without a guild is not ours: unowned, unanswered,
