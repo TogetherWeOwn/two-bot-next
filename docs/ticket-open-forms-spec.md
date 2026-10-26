@@ -132,10 +132,14 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
 - **Submit validation:** NFC-normalize, trim ASCII space at both ends, then
   enforce required (non-empty after trim). For a non-empty answer, enforce
   `min_length`/`max_length` in Unicode scalars; an empty optional answer skips
-  the length bounds. For `choice`, require an exact match between the
-  normalized answer and one stored canonical option (case-sensitive; no fuzzy
-  match, no prefix match); options are stored canonical (definition contract),
-  so both sides of the comparison are canonical text. Reject controls,
+  the length bounds. For a non-empty `choice` answer, require an exact match
+  between the normalized answer and one stored canonical option
+  (case-sensitive; no fuzzy match, no prefix match); options are stored
+  canonical (definition contract), so both sides of the comparison are
+  canonical text. An empty optional `choice` answer skips the match exactly
+  as it skips the length bounds (an empty required answer is already refused
+  above), so `required=false` is effective for `choice` questions. Reject
+  controls,
   bidi/zero-width formatting, line/paragraph separators in `short`/`choice`
   (paragraph keeps single newlines, no other category C). Finally, before any
   reserve, render the exact answers message that would be posted (labels,
@@ -313,6 +317,10 @@ use the seven-field envelope above, including on refusal.
 ...     return unicodedata.normalize("NFC", s).strip(" ")
 >>> def choice_match(raw, options):
 ...     return canon(raw) in [canon(o) for o in options]
+>>> def choice_answer_ok(raw, options, *, required=True, min_len=0, max_len=500):
+...     if not canon(raw):
+...         return not required
+...     return valid_answer(raw, kind="choice", required=required, min_len=min_len, max_len=max_len) and choice_match(raw, options)
 >>> def utf16_units(s):
 ...     return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
 >>> def render_fits(rendered):
@@ -364,6 +372,9 @@ use the seven-field envelope above, including on refusal.
 >>> assert choice_match("Billing", ["Billing", "Appeal"]) and not choice_match("billing", ["Billing", "Appeal"])
 >>> assert not choice_match(" Bill", ["Billing", "Appeal"]) and choice_match(" Billing ", ["Billing", "Appeal"])
 >>> assert choice_match("Billing", [" Billing ", "Appeal"]) and choice_match("café", ["café", "Appeal"])
+>>> assert choice_answer_ok("", ["Billing", "Appeal"], required=False) and choice_answer_ok("   ", ["Billing", "Appeal"], required=False)
+>>> assert not choice_answer_ok("", ["Billing", "Appeal"], required=True) and not choice_match("", ["Billing", "Appeal"])
+>>> assert choice_answer_ok(" Billing ", ["Billing", "Appeal"]) and not choice_answer_ok("billing", ["Billing", "Appeal"], required=False)
 >>> assert not valid_definition(question_ids=["a", "a"])
 >>> assert not valid_definition(question_ids=["a"], min_len=10, max_len=5)
 >>> assert not valid_definition(question_ids=["a"], min_len=0, max_len=3, options=["Billing", "Appeal"])
@@ -409,11 +420,11 @@ live private-case collection. Timing limits are acceptance targets, not SLAs.
 | Case | Given / when / then oracle |
 | --- | --- |
 | TF-F01 | Given enabled 5-question form, when eligible member opens and submits valid answers, then one ticket, Controls posts first (commit), one answers message after Controls, one audit row without text; no extra posts. |
-| TF-F02 | Given required/optional mix, when optional left blank, then creation proceeds with skipped flag; blank required refuses with per-question error and zero effects. |
+| TF-F02 | Given required/optional mix including an optional `choice` question, when optional answers (including the `choice`) are left blank, then creation proceeds with skipped flags and no choice match is attempted for the blank; blank required (including a required `choice`) refuses with per-question error and zero effects. |
 | TF-F03 | Given min/max bounds and choice options, when answers at 1/max/max+1 and option/non-option/case-variant submitted, then exact bounds above; no truncation, echo, mention firing or unsafe render. |
 | TF-F04 | Given staff authoring, when current staff creates/edits/disables, then version increments and modal shape changes; member/opener/claimant-alone/past-staff/forged actor can never author or view the definition; duplicate IDs, min>max, choice option outside [min,max], or unrenderable option list refuses with zero version increment. Options are checked and stored canonical (NFC+trim): a raw option that canonicalizes to empty, to a duplicate, outside 1-100/[min,max] on canonical length, or to submit-forbidden characters refuses; a raw ` Billing ` is stored and previewed as `Billing` and matches a normalized `Billing` answer; a choice whose composed hint (staff hint prefix + joined canonical options) exceeds 100 chars refuses even when the joined options alone fit. |
 | TF-F05 | Given modal opened, when dismissed/expired or pre-check fails, then zero ticket row, message, audit, cooldown or quota effect; re-open starts fresh. |
-| TF-F06 | Given overlong/empty-required/invalid-choice submit, when submitted, then private per-question error, nothing created, cooldown unconsumed; valid answers may be re-presented client-side only. |
+| TF-F06 | Given overlong/empty-required/non-empty-invalid-choice submit, when submitted, then private per-question error, nothing created, cooldown unconsumed; valid answers may be re-presented client-side only. |
 | TF-F07 | Given form edited or disabled mid-intake, when stale-version submit arrives, then version-mismatch refusal with re-open guidance; no partial creation or cross-version field merge. |
 | TF-F08 | Given existing active ticket or active cooldown at open or submit, when intake attempted, then standard existing/cooldown copy; modal open never reserves or extends cooldown. |
 | TF-F09 | Given double submit with same nonce, when replayed, then receipt replay with at most one ticket; distinct nonces race through reserve and loser gets existing-ticket copy. |
