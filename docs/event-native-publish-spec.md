@@ -51,7 +51,8 @@ only, not deployed-state evidence:
   a later edit cannot silently recreate; every response binds guild and event
   ID before the mirror write; unknown outcomes never retry the original POST.
 - `crates/core/src/internal_actions.rs:82-85,1211-1238,1240-1317`: name ≤100,
-  description ≤1000, location ≤100 UTF-16 units; `ends_at` strictly after
+  description ≤1000, location ≤100, all UTF-16 units (`utf16_len`, :993-999);
+  `ends_at` strictly after
   `starts_at`; exactly one of `channel_key`/`location`; channel IDs resolve
   through a key map, never raw caller snowflakes; at most 100 active events
   per guild and a full calendar files nothing.
@@ -76,7 +77,7 @@ only, not deployed-state evidence:
 Draft source is one organizer modal, not a stored TWO event object: name,
 start, end, exactly one placement (voice-channel key or external location),
 optional description. Bounds reuse §1 verbatim: name ≤100, description ≤1000,
-location ≤100 UTF-16 units; end strictly after start; start strictly in the
+location ≤100, all UTF-16 units; end strictly after start; start strictly in the
 future at confirm time. The preview mints `draft_id`
 (`npub:<guild>:<uuidv4>`); the ledger row `(guild_id, draft_id)` is the only
 draft store. No TWO event table, no series object, no template change.
@@ -92,27 +93,38 @@ collapse into one reply with no existence oracle.
 Preview is read-only and ephemeral, ≤400 UTF-16 units per message, no
 pings/DMs: exact name, start/end as Discord-localized tags plus UTC, the
 resolved channel name or location, description or "(no description)", the
-current active-event count against the 100 cap, and the disclosure "This
-creates a public event every member can see." Controls are **Publish this
-event** / **Cancel**. Confirm binds the preview's exact content hash, draft
-ID, expiry (DB UTC preview time + 300 s, equality expired) and runtime boot
-nonce, never silently the newest draft. One fixed encoding, mirroring the
-withdrawal proposal: `two:np1:` + unpadded canonical base64url of draft UUID
-16 bytes + content hash 32 bytes (SHA-256 over canonical fields) + expiry u64
-+ boot nonce 16 bytes (network order), 72 payload bytes / 96 encoded
-characters. Reject malformed length or invalid fields; never log tokens, raw
+current scheduled-or-active count against the 100 cap, and the disclosure
+"This creates a public event every member can see." The preview shows the
+description whole, never truncated or split: a draft whose exact rendering
+would exceed 400 UTF-16 units is refused at preview (shorten the description),
+even when it fits Discord's 1000-unit bound; the hash binds only what the
+organizer saw in full. Controls are **Publish this event** / **Cancel**.
+Confirm binds the preview's exact content hash, draft ID, expiry (DB UTC
+preview time + 300 s, equality expired) and runtime boot nonce, never silently
+the newest draft. One fixed encoding: `two:np1:` + unpadded canonical
+base64url of draft UUID 16 bytes + the first 16 bytes of the content hash
+(SHA-256 over canonical fields), 32 payload bytes / 43 encoded characters, 51
+characters total — inside Discord's 100-character `custom_id` cap (the §6
+oracle pins the serialized length). The full 32-byte hash, expiry and boot
+nonce live in the ledger row keyed by the draft UUID and are re-read at
+confirm; the token's truncated hash only proves the control belongs to that
+preview. Reject malformed length or invalid fields; never log tokens, raw
 component IDs or reply bodies.
 
 Confirm revalidates everything before any POST: authority, membership,
 channel binding with fresh evidence of organizer View Channel, bot Manage
 Events, future start, active-count headroom, draft state `previewed`, and the
 content hash. Then one transaction: take the per-`(guild,draft)` advisory
-lock, re-check state, mark `publishing`, commit, POST once, bind the response
+lock, re-check state, mark `publishing`, commit — the transaction-scoped lock
+releases at that commit, before the POST; it serializes only the
+`previewed -> publishing` transition — POST once, bind the response
 (guild + nonzero snowflake id), upsert the mirror row, mark `published` with
 the Discord event ID. A second confirm on a `published` draft returns the
-existing mapping with zero POST. A confirm whose fields differ from the
-preview hash is stale: fresh preview required. No automatic POST retry; the
-existing call-once semantics apply.
+existing mapping with zero POST. A confirm that finds `publishing` makes zero
+POST and returns `publish_in_progress` (inspect later); no mapping exists yet
+and none is implied. A confirm whose fields differ from the preview hash is
+stale: fresh preview required. No automatic POST retry; the existing
+call-once semantics apply.
 
 One-way only. After publish the ledger row is read-only: Discord event ID,
 content hash, organizer, timestamps. TWO never PATCHes or DELETEs the native
@@ -134,40 +146,63 @@ the rendered instants, never the typed string.
 ## 3. Failures, races, cost and audit
 
 Unknown outcomes: a lost POST acknowledgement is `commit_unknown`, never
-claimed success or rollback. Recovery is inspect-then-decide through the
-keyless single-event GET: if Discord holds an event the ledger cannot bind to
-this draft, the draft stays `publishing` and needs organizer inspection, not
-a blind re-POST. Mirror-write failure after a bound response retains the
+claimed success or rollback, and the draft stays `publishing`. There is no
+keyless lookup: the existing single-event GET requires guild + event ID
+(`get_scheduled_event`, `crates/discord/src/executor.rs:2108-2120`), which an
+unacknowledged POST does not provide, and no guild scan or list-and-bind is
+permitted. Recovery is organizer inspection of the Events tab, then one of
+two explicit resolutions: found — the organizer supplies the observed Discord
+event ID and a fresh confirm-style check binds it through that keyed GET
+(guild, nonzero ID, name/start equal to the ledger fields; 404 or mismatch
+stays `publishing`) before marking `published`; or not found — the organizer
+explicitly confirms absence and the draft moves to `abandoned`, after which
+only a fresh draft may publish (if Discord did create it, the organizer
+deletes it in Discord; TWO never does). No background reconciliation, no
+blind re-POST. Mirror-write failure after a bound response retains the
 fence and reports failure (the existing `EventActionError::Mirror` pattern);
 Discord holds the event and the ledger says so honestly. Discord-side
 deletion after publish leaves the ledger row `published` with a note from the
 poller tombstone; TWO never recreates it. Pre-wire refusals (authority loss,
 cap reached, Discord 4xx on a preflight GET) write nothing.
 
-Races resolve by the ledger: concurrent confirms on one draft serialize on
-the advisory lock — first publishes, the rest return the mapping. Organizer
-loses Manage Events or membership between preview and confirm: refused at
-confirm, draft stays `previewed`. Channel deleted or organizer loses View
-Channel: refused. Bot loses Manage Events: refused. Restart or boot-nonce
-rotation invalidates pending previews. Ledger state machine is
-`previewed -> publishing -> published`, plus terminal `abandoned` (cancelled
-or expired preview) and non-terminal `publishing` requiring inspection; no
-other transitions exist.
+Races resolve by the ledger: concurrent confirms on one draft serialize only
+on the `previewed -> publishing` transition — first publishes; a later confirm
+returns the mapping (`published`) or `publish_in_progress` (`publishing`),
+never a second POST. Organizer loses Manage Events or membership between
+preview and confirm: refused at confirm, draft stays `previewed`. Channel
+deleted or organizer loses View Channel: refused. Bot loses Manage Events:
+refused. Restart or boot-nonce rotation invalidates pending previews. Ledger
+transitions, no others: `previewed -> publishing` (confirm);
+`publishing -> published` (bound POST response, or the recovery bind above);
+`publishing -> previewed` (only a POST response proving no creation: 400/403,
+or 429 not processed); `publishing -> abandoned` (organizer-confirmed
+not-found after inspection); `previewed -> abandoned` (cancelled or expired
+preview). `publishing` is non-terminal and requires inspection until one of
+its exits fires.
 
 Bounded Discord cost per attempt: ≤4 paced GETs (membership evidence, channel
-fetch, bot permission read, optional single-event inspect on the unknown path
-only), exactly ≤1 POST, one mirror upsert. No POST retry loop, no sweep, no
-background reconciliation. Publishes consume the existing member write budget
-(20 writes/member/guild/UTC minute) under the same budget lock with the new
-audit action counted; rolled-back attempts consume nothing. Guild headroom
-comes from the local mirror active count, not a Discord scan; a guild at the
-100 cap refuses before any POST.
+fetch, bot permission read, and on the recovery path only one keyed
+single-event GET per organizer-initiated bind attempt), exactly ≤1 POST, one
+mirror upsert. No POST retry loop, no sweep, no background reconciliation.
+Publishes consume the existing member write budget (20 writes/member/guild/UTC
+minute) under the same budget lock with the new audit action counted; the
+debit happens in the transition transaction, a proven no-create refusal keeps
+the debit (no refund, no audit row) and a re-confirm counts again, and
+rolled-back attempts consume nothing. Guild headroom comes from the local
+mirror count of `SCHEDULED` + `ACTIVE` rows (Discord's 100 cap spans both),
+not a Discord scan; it is best-effort — different drafts are not serialized
+against each other, so two drafts may both pass at 99 and Discord's capacity
+refusal routes through `publish_refused` (`publishing -> previewed`). A guild
+at the local 100 count refuses before any POST.
 
 Atomic publish audit in the existing transaction-aware seam:
 action `event.native_publish`, guild, actor=organizer, target=Discord event
 ID, draft ID, SHA-256 content hash, outcome; deterministic ID
 `npub:<interaction-id>`; exactly one row required or the ledger commit rolls
-back. No description text, location text, raw payload or token in metadata.
+back. Recovery bind writes exactly one row under the same action, deterministic
+ID `npub:<draft-id>:bind`, outcome `bound_recovered`, in the bind transaction;
+the `publishing -> previewed` and `publishing -> abandoned` exits write none.
+No description text, location text, raw payload or token in metadata.
 Per-refusal audit is forbidden. Retention follows the existing 365-day audit
 floor; the new action joins purge/count/erasure tests before any build.
 Organizer erasure deletes actor-attributed rows under the existing predicate;
@@ -191,8 +226,8 @@ Preview reply (ephemeral, exact rendering bound by the content hash):
 
 ```text
 Publish this public event? Every member can see it.
-Friday Melee Night — <t:1793486400:F> to <t:1793497200:F>
-In Arena Voice. 12 of 100 active events used.
+Friday Melee Night — <t:1794009600:F> to <t:1794020400:F>
+In Arena Voice. 12 of 100 scheduled-or-active events used.
 [Publish this event] [Cancel]
 ```
 
@@ -211,14 +246,15 @@ Human replies stay plain language.
 | `preview / confirmation_required` | false / confirm same hash or cancel |
 | `published / created` | false / none; bound response + mirror row only |
 | `noop / already_published` | false / none; existing Discord event ID returned |
+| `unavailable / publish_in_progress` | false / inspect later; zero POST, no mapping implied |
 | `noop / cancelled` | false / none; no store call |
 | `stale / preview_changed_or_expired` | false / fresh preview |
 | `denied / organizer_or_context_mismatch` | false / invoke as organizer in the guild |
 | `unavailable / event_or_access_unavailable` | false / verify channel/access; no existence oracle |
 | `unavailable / active_cap_reached` | false / cancel or wait for an active event to end |
 | `unavailable / rate_limited` | true / fresh preview next UTC minute |
-| `unavailable / publish_refused` | false / fix fields per reason; Discord rejected pre-wire |
-| `unavailable / commit_unknown` | false / inspect Events tab, never blindly re-publish |
+| `unavailable / publish_refused` | false / fix fields per reason; draft back in `previewed`, nothing created |
+| `unavailable / commit_unknown` | false / inspect Events tab, then bind the observed ID or confirm absence; never blindly re-publish |
 | `unavailable / store_or_mirror_failed` | true / inspect first; fence retained, no success claim |
 
 ## 5. Deterministic future scenario matrix
@@ -234,17 +270,17 @@ double only; never staging/production databases.
 | --- | --- |
 | P01 | Valid modal -> preview -> confirm => one POST, bound ID, mirror row, one audit; reply names the event only |
 | P02 | Second confirm same draft => `already_published`, zero new POST/audit; mapping returned |
-| P03 | Two devices confirm one draft at a barrier => one publish, one mapping; exactly one POST/audit |
+| P03 | Two devices confirm one draft at a barrier => one publish; the other returns the mapping or `publish_in_progress`; exactly one POST/audit |
 | P04 | Confirm with edited fields vs preview hash => stale; fresh preview required; zero POST |
 | P05 | DM/foreign guild/M-as-invoker/creator-without-Manage-Events => denied; no disclosure or writes |
 | P06 | O loses Manage Events or membership after preview => refused at confirm; draft stays previewed |
 | P07 | C deleted / O loses View Channel / bot loses Manage Events => refused; zero POST |
 | P08 | Start passes between preview and confirm => stale; never shifted or auto-republished |
-| P09 | Mirror count at 100 => refused pre-wire; a full calendar files nothing |
-| P10 | EXTERNAL location >100 chars / both placements / end <= start => typed field refusal; zero POST |
+| P09 | Mirror scheduled-or-active count at 100 => refused pre-wire; two drafts racing at 99 => Discord capacity refusal returns one to `previewed`; a full calendar files nothing |
+| P10 | EXTERNAL location >100 chars / both placements / end <= start / description fitting 1000 units but not the whole 400-unit preview => typed field refusal, never truncated; zero POST |
 | P11 | Restart/boot-nonce rotation/expired or forged control => stale; no clock-rewind revival |
-| P12 | Discord 400/403 on POST => `publish_refused`, draft stays previewed; 429/5xx pre-wire => retryable, zero claim |
-| P13 | Lost POST acknowledgement => `commit_unknown`; no auto retry; inspect path decides, never a blind re-POST |
+| P12 | Discord 400/403, or 429 not processed, on POST (incl. capacity) => `publish_refused`, `publishing -> previewed`, budget debit kept, no audit; 429/5xx pre-wire on GETs => retryable, zero claim |
+| P13 | Lost POST acknowledgement or POST 5xx => `commit_unknown`, draft stays `publishing`; organizer-supplied ID binds via keyed GET (404/mismatch stays `publishing`) or confirmed absence => `abandoned`; never a blind re-POST, no scan |
 | P14 | Bound response then mirror failure => fence retained, failure reported; Discord state disclosed honestly |
 | P15 | Discord-side delete after publish => ledger stays published + tombstone note; never recreated |
 | P16 | Discord-side edit after publish => observed by poll only; ledger hash unchanged; no TWO write-back |
@@ -280,25 +316,30 @@ envelope: a test-harness report, not a result envelope.
 ```pycon
 >>> import json
 >>> CAP, BUDGET, WINDOW = 100, 20, 300
+>>> def utf16_units(value):
+...     return len(value.encode("utf-16-le")) // 2
 >>> def preview(d):
 ...     # fail closed: every missing key behaves as denied
+...     # preview_units: exact rendered preview length, computed by the renderer
 ...     if not d.get("guild_ok"): return "UNAVAILABLE", "verify_access"
 ...     if not d.get("announcements"): return "ANNOUNCEMENTS_DISABLED", "enable_announcements"
 ...     if d.get("member") != "present": return "MEMBER_UNAVAILABLE", "verify_membership"
 ...     if not d.get("manage_events"): return "MISSING_MANAGE_EVENTS", "ask_organizer"
-...     if len(d.get("name", "")) == 0 or len(d.get("name", "")) > 100:
+...     if utf16_units(d.get("name", "")) == 0 or utf16_units(d.get("name", "")) > 100:
 ...         return "BAD_NAME", "fix_name_length"
 ...     if d.get("ends", 0) <= d.get("starts", 0): return "ENDS_BEFORE_STARTS", "fix_times"
 ...     if d.get("starts", 0) <= d.get("now", 0): return "START_IN_PAST", "pick_future_start"
 ...     if bool(d.get("channel")) == bool(d.get("location")):
 ...         return "PLACE_AMBIGUOUS", "pick_exactly_one_place"
-...     if len(d.get("location") or "") > 100: return "LOCATION_TOO_LONG", "shorten_location"
-...     if len(d.get("description") or "") > 1000: return "DESCRIPTION_TOO_LONG", "shorten_description"
+...     if utf16_units(d.get("location") or "") > 100: return "LOCATION_TOO_LONG", "shorten_location"
+...     if utf16_units(d.get("description") or "") > 1000: return "DESCRIPTION_TOO_LONG", "shorten_description"
+...     if d.get("preview_units", 0) > 400: return "PREVIEW_TOO_LONG", "shorten_description"
 ...     if d.get("active", 0) >= CAP: return "ACTIVE_CAP_REACHED", "wait_for_slot"
 ...     return "OK", "confirm_same_hash"
 >>> def confirm(c, led):
-...     # led: {} | {"state": ...}; one draft, advisory lock held
-...     if c.get("state") != "previewed": return "refuse", "NOT_PREVIEWED", 0
+...     # led: persisted row; state is read from led, never from the request
+...     if led.get("state") == "publishing": return "unavailable", "PUBLISH_IN_PROGRESS", 0
+...     if led.get("state") not in ("previewed", "published"): return "refuse", "NOT_PREVIEWED", 0
 ...     if c.get("hash") != led.get("hash"): return "stale", "PREVIEW_CHANGED", 0
 ...     if c.get("now", 0) >= c.get("expiry", 0): return "stale", "PREVIEW_EXPIRED", 0
 ...     if c.get("nonce") != led.get("nonce"): return "stale", "NONCE_ROTATED", 0
@@ -309,7 +350,7 @@ envelope: a test-harness report, not a result envelope.
 ...     if c.get("starts", 0) <= c.get("now", 0): return "stale", "START_PASSED", 0
 ...     if c.get("active", 0) >= CAP: return "refuse", "ACTIVE_CAP_REACHED", 0
 ...     if c.get("budget_used", 0) >= BUDGET: return "refuse", "RATE_LIMITED", 0
-...     if led.get("published"): return "noop", "ALREADY_PUBLISHED", 0
+...     if led.get("state") == "published": return "noop", "ALREADY_PUBLISHED", 0
 ...     if c.get("post") == "unknown": return "unknown", "COMMIT_UNKNOWN", 1
 ...     if c.get("post") == "refused": return "refuse", "PUBLISH_REFUSED", 0
 ...     if c.get("mirror") == "failed": return "unavailable", "MIRROR_FAILED", 1
@@ -330,14 +371,16 @@ envelope: a test-harness report, not a result envelope.
 ...     ("both_places", dict(OK, location="Park"), "PLACE_AMBIGUOUS"),
 ...     ("no_place", dict(OK, channel=None), "PLACE_AMBIGUOUS"),
 ...     ("location_too_long", dict(OK, channel=None, location="l" * 101), "LOCATION_TOO_LONG"),
+...     ("location_astral_too_long", dict(OK, channel=None, location="\U0001d11e" * 51), "LOCATION_TOO_LONG"),
 ...     ("description_too_long", dict(OK, description="d" * 1001), "DESCRIPTION_TOO_LONG"),
+...     ("preview_too_long", dict(OK, description="d" * 500, preview_units=401), "PREVIEW_TOO_LONG"),
 ...     ("cap_reached", dict(OK, active=100), "ACTIVE_CAP_REACHED"),
 ... ]
 >>> for name, case, want in pre:
 ...     assert preview(case)[0] == want, name
 >>> assert all(preview(c)[1] for _, c, _ in pre)
 >>> LED = {"state": "previewed", "hash": "h", "nonce": "n"}
->>> GOOD = dict(state="previewed", hash="h", nonce="n", manage_events=True, member="present",
+>>> GOOD = dict(hash="h", nonce="n", manage_events=True, member="present",
 ...             channel_ok=True, bot_ok=True, starts=200, now=100, expiry=100 + WINDOW,
 ...             active=12, budget_used=0, post="ok", mirror="ok")
 >>> con = [
@@ -356,25 +399,32 @@ envelope: a test-harness report, not a result envelope.
 ...     ("post_refused", dict(GOOD, post="refused"), ("refuse", "PUBLISH_REFUSED", 0)),
 ...     ("post_unknown", dict(GOOD, post="unknown"), ("unknown", "COMMIT_UNKNOWN", 1)),
 ...     ("mirror_failed", dict(GOOD, post="ok", mirror="failed"), ("unavailable", "MIRROR_FAILED", 1)),
-...     ("not_previewed", dict(GOOD, state="abandoned"), ("refuse", "NOT_PREVIEWED", 0)),
+...     ("not_previewed", dict(GOOD), ("refuse", "NOT_PREVIEWED", 0)),
+...     ("confirm_during_publishing", dict(GOOD), ("unavailable", "PUBLISH_IN_PROGRESS", 0)),
 ... ]
 >>> for name, case, want in con:
-...     led = dict(LED, published=(name == "replay_mapping"))
+...     states = {"replay_mapping": "published", "not_previewed": "abandoned",
+...               "confirm_during_publishing": "publishing"}
+...     led = dict(LED, state=states.get(name, "previewed"))
 ...     assert confirm(case, led) == want, name
 >>> assert all(w == 0 for _, _, (d, _, w) in con if d in ("refuse", "stale", "noop"))
 >>> assert all(w <= 1 for _, _, (_, _, w) in con)
 >>> assert CAP == 100 and BUDGET == 20 and WINDOW == 300
+>>> import base64
+>>> token = "two:np1:" + base64.urlsafe_b64encode(bytes(32)).rstrip(b"=").decode()
+>>> assert len(token) == 51 <= 100
 >>> names = [n for n, _, _ in pre] + [n for n, _, _ in con]
->>> assert len(names) == 30 and len(set(names)) == 30
+>>> assert len(names) == 33 and len(set(names)) == 33
 >>> print(json.dumps({"schema": "events.native_publish.oracle.v1", "fixtures": len(names), "status": "pass"}, sort_keys=True))
-{"fixtures": 30, "schema": "events.native_publish.oracle.v1", "status": "pass"}
+{"fixtures": 33, "schema": "events.native_publish.oracle.v1", "status": "pass"}
 
 ```
 
 Fixtures the reference model cannot express need future protected acceptance
 tests with barriers, an injected clock and REST fault injection against the
 real callers in disposable fixtures: concurrent confirm/confirm interleavings
-(the per-draft lock plus the published mapping), confirm versus authority
+(the per-draft lock, the published mapping and the in-progress reply),
+confirm versus authority
 revocation on both sides of the POST, duplicate delivery of one confirm,
 unknown-outcome inspect ordering, per-guild isolation of locks, and rollback
 to an older binary. Zero tests is not proof; none are created here.
@@ -384,7 +434,8 @@ to an older binary. Zero tests is not proof; none are created here.
 One possible later slice: one modal plus ephemeral preview/confirm handler via
 the existing router, one additive publish-ledger table with the §2 state
 machine and per-draft advisory lock, reuse of the existing member write
-budget, audit seam and single-event GET, and minimum compatibility work. No
+budget, audit seam and keyed single-event GET (recovery bind only), and
+minimum compatibility work. No
 recurrence, edit/cancel-after-publish, drift display, DM, calendar, RSVP
 change, series template or follow-on build card. If the ledger, claim fence
 or revalidation scope cannot fit a small reviewed slice, choose A; never cut
