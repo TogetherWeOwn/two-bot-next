@@ -3077,7 +3077,8 @@ mod tests {
                 "private",
                 "public",
                 "limit",
-                "unlimit"
+                "unlimit",
+                "voice-orphans"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.

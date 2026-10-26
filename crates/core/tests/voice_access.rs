@@ -191,6 +191,7 @@ fn command_list_covers_every_spec_command() {
         "textchannels",
         "transfer",
         "unlimit",
+        "voice-orphans",
     ] {
         assert!(
             is_voice_command(command),

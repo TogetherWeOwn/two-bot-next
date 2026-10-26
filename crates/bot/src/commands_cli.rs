@@ -633,7 +633,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 64);
+        assert_eq!(with_voice.len(), 65);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
