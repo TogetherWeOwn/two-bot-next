@@ -1,7 +1,7 @@
 # Documentation map
 
-Rows: `- [Purpose](relative.md)`. `python3 scripts/check_docs_index.py --json` (repo root): empty `{missing,stale,oversize}` = PASS, else exit 1;
-bad rows → `stale` as `docs/README.md:<line>`; index <12,000, others ≤65,536, exceptions only `LARGE_DOCS`.
+Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
+No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
 
 ## References and architecture
 
@@ -96,11 +96,11 @@ bad rows → `stale` as `docs/README.md:<line>`; index <12,000, others ≤65,536
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
-- [Response page proposal](dashboard-custom-responses-spec.md)
+- [Response proposal](dashboard-custom-responses-spec.md)
 - [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
 - [Self-role panels](dashboard-self-roles-spec.md)
-- [Onboarding page proposal](dashboard-onboarding-self-roles-spec.md)
+- [Onboarding proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
@@ -125,19 +125,20 @@ bad rows → `stale` as `docs/README.md:<line>`; index <12,000, others ≤65,536
 - [Stream funnel](stream-funnel.md)
 - [Game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
-- [Time helper (design only)](time-helper-spec.md)
+- [Time helper proposal](time-helper-spec.md)
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
+- [RSVP proposal](dashboard-event-rsvp-spec.md)
 - [Notice proposal](event-change-notices-spec.md)
 - [Reminder prefs](event-reminder-preferences-spec.md)
-- [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
-- [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
-- [RSVP cutoff proposal](rsvp-registration-cutoff-spec.md)
+- [Seat proposal](rsvp-capacity-spec.md)
+- [Withdrawal proposal](rsvp-withdrawal-spec.md)
+- [Cutoff proposal](rsvp-registration-cutoff-spec.md)
 - [Agenda](event-agenda-spec.md)
 - [Calendar handoff](event-calendar-handoff-spec.md)
 - [Event role](event-role-spec.md)
-- [Event recap proposal](event-recap-spec.md)
+- [Event recap](event-recap-spec.md)
 - [Native publish](event-native-publish-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Sticky config proposal](dashboard-sticky-config-spec.md)
@@ -146,6 +147,7 @@ bad rows → `stale` as `docs/README.md:<line>`; index <12,000, others ≤65,536
 - [Inactivity (design only)](ticket-autoclose-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
+- [Resolution signal](ticket-resolution-request-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 

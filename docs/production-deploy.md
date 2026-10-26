@@ -377,7 +377,7 @@ verifies the saved module inventory and renders immutable inputs as described
 above. The legacy recovery invocation makes source/build paths absolute and
 sets `image_vars` on the single production container; existing protected tests
 still pin that legacy diff. The lockfile's Wrangler
-(4.151.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.152.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In ordinary
