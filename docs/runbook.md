@@ -3672,3 +3672,68 @@ winner DMs: deferred until a DM send path exists. Staging smoke: create,
 enter from two test members, verify two rows plus ephemeral replies, end,
 verify the draw row plus winners post, reroll, verify a second round, then
 cancel a fresh giveaway and verify a later entry is refused.
+
+### Lifecycle audit and saved-versus-delivered state
+
+Successful pause, resume and extension commands commit one minimal fact in
+`automation_audit_log` in the **same transaction** as the lifecycle/deadline
+change. `actor_id` is the authenticated staff member, not the giveaway creator;
+store-only system calls use NULL. Actions are `giveaway.pause`,
+`giveaway.resume` and `giveaway.extend`, with `guild_id`, the giveaway id as
+`target_key`, `outcome = 'ok'`, a stable fact `id` and `created_at`; `reason`
+stays NULL. No prize/body, entrant roster, seed/nonce, claim capability or raw
+database error belongs in these facts or command logs.
+
+Pause still requires an unclaimed open row. Resume locks the paused row and
+adds the nonnegative paused span before reopening entries. Extend locks an
+open or paused row, adds the validated duration and preserves its status.
+Unknown/foreign targets, wrong states and invalid deadlines create neither a
+transition nor a success fact. Audit insertion failure rolls back the change
+and returns `Giveaway unavailable; try again later.` without a message refresh.
+A resume with a backwards clock still changes paused to open and records a fact,
+even when its deadline does not move.
+
+A fact's random per-write suffix distinguishes repeated valid extensions and
+pause/resume cycles, including equal-timestamp writes. It is **not** a durable
+interaction replay key: submitting a fresh extension can extend again. Existing
+create/cancel identities and round-numbered draw/reroll audit identities do not
+change. Do not infer ordering from the random suffix.
+
+With existing authorized database read access, inspect one guild and giveaway
+using this bounded read (replace both placeholders; no new endpoint or grant):
+
+```sql
+SELECT id, guild_id, actor_id, action, target_key, outcome, created_at
+FROM automation_audit_log
+WHERE guild_id = '<guild-id>' AND target_key = '<giveaway-id>'
+  AND action IN ('giveaway.pause', 'giveaway.resume', 'giveaway.extend')
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+```
+
+The result is a capped snapshot, not a full-history export. An empty successful
+read means no matching retained facts; a failed read means unknown, not empty.
+There is no automatic age-based expiry or actor pseudonymization for this table;
+the 45-day `operational_audit_log` cache policy applies to a different table.
+Existing [member erasure](privacy.md) deletes entire rows matching guild and
+`actor_id`, subject to safety checks, not every fact about that member's
+giveaways. NULL/system and other-actor facts can remain. A true guild removal
+queues guild-wide deletion, including these facts, but only a successful
+executing retention run deletes them: dry-run deletes nothing, rejoin cancels
+the queue entry and guards/failures can defer completion. No new retention
+window, purge trigger or grant is introduced. Existing MCP/ops audit readers
+are not giveaway-audit listing APIs.
+
+The transaction confirms **saved state**, not Discord delivery. The subsequent
+message edit is separate and best-effort: `Giveaway paused/resumed/extended; its
+message could not be refreshed.` means the state and audit are already saved.
+Inspect the saved giveaway and channel before retrying; in particular, do not
+repeat an extension just to repair its display. Even a saved success fact does
+not prove that the final interaction reply reached Discord. For a repeatable
+disposable-DB check, run the protected runtime corpus:
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
+  --test giveaway_actor_audit_acceptance -- --test-threads=1
+```
