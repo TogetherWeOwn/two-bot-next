@@ -2,10 +2,12 @@
 
 Manifest: `- [Purpose](relative.md)` by area.
 
-Check: `python3 scripts/check_docs_index.py --json` at repo root.
-Empty `{missing,stale,oversize}` = exit 0; else exit 1: repair/split.
-Bad/duplicate rows: `stale` → `docs/README.md:<line>`.
-Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`.
+`python3 scripts/check_docs_index.py --json` (repo root).
+Sorted `{missing,stale,oversize}` arrays: empty = PASS/exit 0.
+Else exit 1: fix rows/split docs.
+Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
+Byte budgets: index <12,000; other docs ≤65,536.
+Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 
 ## References and architecture
 
@@ -31,14 +33,14 @@ Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`
 - [Gateway recovery](gateway-recovery.md)
 - [Gateway failure rules](gateway-failure-classification.md)
 - [Deferred capture poison](deferred-capture-poison.md)
-- [Backups and restores](backup.md)
-- [Backfill procedure](backfill-runbook.md)
+- [Backup](backup.md)
+- [Backfill](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
 - [Release architecture](releases.md)
 - [Passive gradual promote](gradual-promote-caller.md)
 - [Logging contract](logging.md)
-- [Log/cardinality limits](log-volume-guard.md)
+- [Log limits](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
 - [Pool gauge ownership](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
@@ -103,7 +105,7 @@ Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`
 - [Response page proposal](dashboard-custom-responses-spec.md)
 - [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
-- [Onboarding page (design only)](dashboard-onboarding-self-roles-spec.md)
+- [Onboarding page proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
@@ -112,7 +114,7 @@ Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`
 - [Member journey](member-journey-parity.md)
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
-- [Welcome timing (design only)](onboarding-event-welcome-spec.md)
+- [Welcome timing proposal](onboarding-event-welcome-spec.md)
 - [Leveling domain](leveling-port.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
@@ -123,7 +125,7 @@ Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`
 - [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
-- [Relay move (design only)](feed-move-spec.md)
+- [Relay move proposal](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Staff game mix report](game-activity-report.md)
@@ -132,14 +134,16 @@ Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [Notice proposal](event-change-notices-spec.md)
-- [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
-- [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
-- [Private agenda (design only)](event-agenda-spec.md)
-- [Calendar handoff (design only)](event-calendar-handoff-spec.md)
-- [Event role (design only)](event-role-spec.md)
-- [Event recap (design only)](event-recap-spec.md)
+- [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
+- [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
+- [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
+- [Private agenda proposal](event-agenda-spec.md)
+- [Calendar handoff proposal](event-calendar-handoff-spec.md)
+- [Event role proposal](event-role-spec.md)
+- [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
+- [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
@@ -207,15 +211,15 @@ Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`
 - [Soak entry gates](soak-entry-gates.md)
 - [Expected/processed evidence](evidence-route.md)
 - [Expected-join tests](expected-joins-acceptance.md)
-- [E2E command matrix](staging-e2e-command-matrix.md)
-- [E2E record form](staging-e2e-run-record.md)
+- [E2E matrix](staging-e2e-command-matrix.md)
+- [E2E record](staging-e2e-run-record.md)
 - [Fixture census](staging-fixture-census.md)
-- [Health-contract probe](staging-health-contract-probe.md)
+- [Health probe](staging-health-contract-probe.md)
 - [Migration claim](staging-migrate-claim.md)
-- [Rollout acceptance](staging-rollout-gate.md)
+- [Rollout gate](staging-rollout-gate.md)
 - [Slash smoke](staging-slash-smoke.md)
-- [Voice event checks](staging-voice-event-verification.md)
-- [Smoke response table](smoke-expected-responses.md)
+- [Voice checks](staging-voice-event-verification.md)
+- [Smoke replies](smoke-expected-responses.md)
 - [Smoke record form](smoke-run-record.md)
 - [Smoke surface inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
