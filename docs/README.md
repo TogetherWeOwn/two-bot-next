@@ -1,8 +1,7 @@
 # Documentation map
 
-Sole: `- [Purpose](relative.md)` by area. `python3 scripts/check_docs_index.py --json` (root).
-Empty `{missing,stale,oversize}` = PASS (0), else 1: fix rows/split docs; bad/dup rows in stale as docs/README.md:<line>.
-Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
+Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
+No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
 
 ## References and architecture
 
@@ -110,6 +109,7 @@ Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
+- [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
@@ -138,6 +138,7 @@ Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
 - [Event role proposal](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Sticky config proposal](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
@@ -148,7 +149,7 @@ Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
 
 ## Voice
 
-- [Room specification](voice-rooms.md)
+- [Room spec](voice-rooms.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -170,7 +171,7 @@ Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
 - [Game aliases and nick](voice-alias-core.md)
-- [Channel-info resolution](voice-channelinfo-core.md)
+- [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
@@ -178,7 +179,7 @@ Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
 - [Placement/numbering](voice-placement-core.md)
 - [Companion text domain](voice-text-channel-core.md)
 - [Companion lifecycle](voice-companion-lifecycle.md)
-- [Join-request lifecycle](voice-join-request-lifecycle.md)
+- [Join lifecycle](voice-join-request-lifecycle.md)
 - [Logging resolution](voice-logging-core.md)
 - [Name filtering](voice-name-filter-core.md)
 - [Name panel and modal](voice-name-panel.md)
@@ -198,7 +199,7 @@ Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
 - [Rollback triggers](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
 - [Freeze readback](voice-t5-freeze-readback-receipt.md)
-- [Publish diff form](voice/publish-diff-record-template.md)
+- [Publish diff](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
@@ -262,7 +263,7 @@ Budgets: index <12,000; others ≤65,536; except LARGE_DOCS.
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
-- [Load-sensitive fixtures](load-sensitive-test-fixtures.md)
+- [Load fixtures](load-sensitive-test-fixtures.md)
 - [Parser properties](property-tests.md)
 - [Pipeline benchmark](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)
