@@ -1636,6 +1636,9 @@ impl Metrics {
     /// while any thread holds or poisoned the `Values` mutex.
     pub fn drop_poison(&self, guard: &str) {
         let counter = &self.1[bounded_index(guard, DROP_POISON_GUARDS)];
+        // `fetch_update` is deprecated for `try_update` in Rust 1.99, but the
+        // new name does not exist on the 1.94 floor: keep the old name.
+        #[allow(deprecated)]
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             Some(count.saturating_add(1))
         });

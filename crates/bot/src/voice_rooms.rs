@@ -7677,6 +7677,9 @@ impl ActorInboxBackpressure {
     /// for test-only direct sends.
     fn release_for(&self, command: &ActorCommand) {
         if command.is_bufferable() {
+            // `fetch_update` is deprecated for `try_update` in Rust 1.99, but the
+            // new name does not exist on the 1.94 floor: keep the old name.
+            #[allow(deprecated)]
             let _ = self
                 .in_flight
                 .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |in_flight| {
