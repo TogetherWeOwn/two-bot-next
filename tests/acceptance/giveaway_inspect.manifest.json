@@ -6,7 +6,7 @@
   "protected_paths": [
     {
       "path": "crates/discord/tests/giveaway_inspect_acceptance.rs",
-      "sha256": "50affde31149956c408a3da58f83346a7527a83e9e6be901485d054587305c91",
+      "sha256": "b328e0d28aed89ca1cef1788906637e00924a2573de918e3f7a5f19863dec831",
       "test_count": 18
     }
   ],
@@ -37,9 +37,9 @@
       "retained_timed_draw_controls_passed": 17,
       "retained_controls_job_id": 121230431932
     },
-    "reason": "Prior head compiled and produced assertion-level RED for absent inspect mode and static entry requirements, plus one foreign-key fixture defect. This revision removes child fixture rows before their parent; corrected-head execution is pending. Controller verification refused exit 75; refusal is not RED. Do not release the Builder dependency until the corrected hidden-ID oracle executes.",
-    "passed": ["cargo fmt", "secret-debug guard and 23 self-tests", "Docker dependency shape", "80 cache fixture tests", "soak checklist and 49 self-tests", "voice corpus and 22 validator tests", "docs index", "floor guard", "test inventory"],
-    "not_executed": ["focused Rust acceptance target", "retained Rust runtime controls", "workspace Rust tests", "workspace clippy"]
+    "reason": "This revision corrects one oracle fixture only: the repeated-inspection entry control now releases the seeded draw lease (claim_token/claimed_at) after the no-mutation snapshot and list controls and before the entry button, because entry admission is Closed while a draw lease is held. The lease stays seeded through every inspection and in every other test, and every assertion is preserved, including admitted == 1. Exact-head CI on the combined implementation head showed this test failing only at that admission witness (admitted 0); a production-shaped entry control passed in the same run. Local corrected-head execution was refused by the cargo pool (no idle, below-budget slot); refusal is not RED or GREEN. Do not release the Builder dependency until the corrected test executes green on the combined PR head.",
+    "passed": ["cargo fmt --all -- --check"],
+    "not_executed": ["focused Rust acceptance target (cargo pool refused: no idle, below-budget slot)", "retained Rust runtime controls", "workspace Rust tests", "workspace clippy"]
   },
   "expected_baseline_red": ["inspect mode absent from published command", "valid inspect returns invalid options instead of saved detail or unavailable", "entry posts omit static requirements"],
   "controls": ["configured-guild refusal versus foreign-guild silence", "strict malformed-option rejection", "guild-scoped saved get/count", "existing create/entry/list/end/reroll behavior", "existing command verbs and Manage Guild default permission"],

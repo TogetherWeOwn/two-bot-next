@@ -796,6 +796,12 @@ async fn repeated_inspection_consumes_no_entry_budget_and_default_list_stays_liv
         assert_eq!(snapshot(pool).await, before, "read mode applied a mutation or consumed admission state");
         assert!(rt.handle(&slash(9120, subcommand("list", json!([])))).await.expect("list control"));
         assert!(content(&mock.requests()[cursor..]).contains(ID), "default active-list control lost");
+        // The seed holds a draw-ticker lease so the inspections above prove the
+        // claim capability is neither rendered nor disturbed. Entry admission
+        // is Closed while that lease is held, so release it before the entry
+        // control to model the production-shaped open row the control targets.
+        sqlx::query("UPDATE giveaways SET claim_token=NULL, claimed_at=NULL WHERE guild_id=$1 AND id=$2")
+            .bind(GUILD).bind(ID).execute(pool).await.expect("release seeded draw lease before entry control");
         let mut button = serde_json::to_value(slash(9130, json!([]))).expect("button base");
         button["type"] = json!(3);
         button["data"] = json!({"custom_id":"gw:7001","component_type":2});
