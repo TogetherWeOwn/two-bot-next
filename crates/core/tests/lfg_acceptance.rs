@@ -30,8 +30,10 @@ fn parse_role_spec_refuses_exact_reserved_key() {
 fn reserved_refusal_message_names_the_reservation() {
     let err = parse_role_spec("__leave__:Leave:1").expect_err("must refuse");
     let message = err.to_string();
+    // The key renders inert (inspect-escaped): the sentinel's underscores
+    // carry backslashes, so pin the escaped bytes, not the raw sentinel.
     assert!(
-        message.contains("__leave__"),
+        message.contains("\\_\\_leave\\_\\_"),
         "message must name the key: {message}"
     );
     assert!(

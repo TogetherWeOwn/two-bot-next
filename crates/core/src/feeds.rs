@@ -968,7 +968,7 @@ pub fn feed_pending_evidence_refusal_text(
 
 /// Pause/resume confirmations. The relay id is interpolated by the caller so
 /// the member can copy the stable id back into `/feed-resume`, `/feed-remove`
-/// or `/feed-list page:<n>`. The supplied id renders through [`inert`] inside
+/// or `/feed-list page:<n>`. The supplied id renders through `inert` inside
 /// the trusted backticks: stable ids pass through byte-identical, but a
 /// crafted id cannot close the code span or forge markup.
 #[must_use]
