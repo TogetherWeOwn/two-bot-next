@@ -6,6 +6,19 @@ mod pause_resume_acceptance_tests;
 #[path = "feed_duplicate_acceptance_tests.rs"]
 mod duplicate_acceptance_tests;
 
+impl duplicate_acceptance_tests::ObserveAdd for store::FeedAddOutcome {
+    fn observe(&self, attempted: &FeedRelay) -> duplicate_acceptance_tests::AddObservation {
+        use duplicate_acceptance_tests::AddObservation;
+        match self {
+            Self::Created => AddObservation::Created(attempted.id.clone()),
+            Self::Existing { id, enabled } => AddObservation::Existing {
+                id: id.clone(),
+                enabled: *enabled,
+            },
+        }
+    }
+}
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
