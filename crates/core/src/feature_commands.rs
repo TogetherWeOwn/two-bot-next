@@ -240,6 +240,31 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new(
+            "schedule-retime",
+            "Correct an unsent one-off's time in this channel",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "id",
+                "Full scheduled message id from /schedule-list",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32),
+            CommandOption::new(
+                "at",
+                "Future RFC3339 time with Z or numeric offset, within 365 days",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_AT_CHARS as u32),
+        ])
+        .examples(vec![
+            "/schedule-retime id:<full-id> at:2027-01-15T18:30:00+05:30".to_owned(),
+            "/schedule-retime id:<full-id> at:2027-01-15T13:00:00Z".to_owned(),
+        ]),
         CommandDefinition::new("schedule-list", "List scheduled messages for this server")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![CommandOption::new(

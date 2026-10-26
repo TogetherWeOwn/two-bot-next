@@ -89,6 +89,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-enable",
             "schedule",
             "schedule-remove",
+            "schedule-retime",
             "schedule-list",
             "sticky",
             "sticky-remove",

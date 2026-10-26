@@ -331,6 +331,21 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "schedule-retime",
+            46,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then private saved/no-op/not-saved receipt; atomic due-time correction and audit only, no public post.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required,1..=128",
+                "Valid:at:required,RFC3339,future,365-days",
+            ],
+        ),
+        row(
             "schedule-list",
             19,
             E2eGate::Automations,

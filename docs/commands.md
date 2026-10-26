@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 64.
+Built-in commands: 65.
 
 ## `/access`
 
@@ -662,6 +662,18 @@ Cancel a scheduled message
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | Scheduled message id |
+
+## `/schedule-retime`
+
+Correct an unsent one-off's time in this channel
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Full scheduled message id from /schedule-list |
+| `at` | string | true | — | — | 64 | — | Future RFC3339 time with Z or numeric offset, within 365 days |
 
 ## `/setup`
 

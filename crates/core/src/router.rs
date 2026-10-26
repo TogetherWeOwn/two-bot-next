@@ -708,7 +708,7 @@ impl InteractionRouter {
             },
             "command" | "command-remove" | "command-list" | "command-inspect"
             | "command-disable" | "command-enable" | "schedule" | "schedule-remove"
-            | "schedule-list" | "sticky" | "sticky-remove" => Row {
+            | "schedule-retime" | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),

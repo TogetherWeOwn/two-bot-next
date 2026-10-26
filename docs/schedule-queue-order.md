@@ -53,6 +53,34 @@ uncertain-send fence as relative schedules. Restart does not recalculate the
 instant. Completed one-offs remain disabled; an uncertain send remains fenced
 through backup/restore rather than blindly posting again.
 
+## Correct an unsent one-off's time
+
+Use `/schedule-retime id:<full-id> at:2027-01-15T13:00:00Z` in the schedule's
+original channel. Copy the full stable ID from `/schedule-list`. This private
+Manage Server operation uses the same feature/guild fences and explicit-offset,
+64-character, future-within-365-days time contract as creation. Equivalent
+offsets normalize to the same millisecond UTC instant.
+
+Only enabled, never-run one-offs qualify. Recurring, disabled, completed,
+previously run, claimed or delivery-uncertain rows refuse with guidance. Unknown,
+foreign-guild and other-channel IDs share the same safe miss. Duplicate,
+wrong-typed, missing or extra options refuse before any store access or audit.
+
+A saved correction changes only the due time and update attribution, with one
+content-free audit in the same transaction. It preserves the ID, body, destination,
+creator, creation time, quota occupancy, occurrence nonce and every delivery fence.
+A same-instant retry changes nothing, including metadata and audit. A failed audit
+rolls the correction back; an unconfirmed store result asks staff to inspect the
+list before retrying the same ID/time. The saved receipt shows old/new localized
+times, not delivery. No retime invocation sends or edits a public message.
+
+Retime and due-claim admission serialize on the same schedule row: if retime wins,
+the old deadline cannot claim; if claiming wins, retime refuses without releasing
+its claim or uncertainty. Expiry is not proof of no delivery. Inspect retained
+delivery evidence rather than deleting/recreating to bypass a busy or uncertain
+row. The existing 15-second ticker may run late; retime makes no exact-second
+promise and cannot replay a completed occurrence.
+
 ## Preview a proposed post
 
 `/schedule` accepts an optional `preview` boolean. With `preview:true` the

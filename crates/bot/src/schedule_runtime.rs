@@ -41,7 +41,8 @@ use two_bot_core::{
     scheduled_store::{
         audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
         list_scheduled_window, put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store,
-        ScheduledAuditInput, ScheduledWrite, SCHEDULE_LIST_CAP,
+        retime_scheduled, ScheduledAuditInput, ScheduledRetime, ScheduledRetimeOutcome,
+        ScheduledWrite, SCHEDULE_LIST_CAP,
     },
 };
 use two_bot_discord::ActionExecutor;
@@ -285,6 +286,120 @@ pub(crate) async fn schedule_create(
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
+}
+
+/// `/schedule-retime`: strict validation before store access, then a guarded
+/// due-time correction with atomic audit. The shared router owns guild,
+/// automations and Manage Guild admission, as for the other schedule commands.
+/// No public message effect and no definition replacement occur here.
+pub(crate) async fn schedule_retime(
+    pool: &Pool<Postgres>,
+    executor: &ActionExecutor,
+    guild_id: &str,
+    interaction: &Interaction,
+) {
+    let Some(channel_id) = interaction_channel(interaction) else {
+        finish(executor, interaction, NO_CHANNEL_REPLY).await;
+        return;
+    };
+    let now = now_millis();
+    let (id, due) = match schedule_retime_options(interaction, now) {
+        Ok(options) => options,
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
+    let actor = actor_id(interaction);
+    let now_iso = format_iso_ms(now);
+    let next_run_at = format_iso_ms(due);
+    let audit_id = new_id();
+    let result = retime_scheduled(
+        pool,
+        &ScheduledRetime {
+            guild_id,
+            channel_id: &channel_id,
+            id: &id,
+            next_run_at: &next_run_at,
+            actor_id: &actor,
+            updated_at: &now_iso,
+            audit_id: &audit_id,
+        },
+    )
+    .await;
+    let text = match result {
+        Ok(ScheduledRetimeOutcome::Saved { previous_due }) => {
+            format!(
+                "Saved schedule `{id}`: <t:{}:F> → <t:{}:F>. Timing only; no message was sent. The 15s ticker and delivery may be delayed.",
+                previous_due / 1000,
+                due / 1000,
+            )
+        }
+        Ok(ScheduledRetimeOutcome::Unchanged) => format!(
+            "Schedule `{id}` is unchanged: already due <t:{}:F>. No change was saved and no message was sent.",
+            due / 1000,
+        ),
+        Ok(ScheduledRetimeOutcome::Missing) =>
+            "Not saved: schedule not found in this channel. Copy its full id from /schedule-list in its original channel.".to_owned(),
+        Ok(ScheduledRetimeOutcome::Busy) =>
+            "Not saved: this schedule is busy with a claimed delivery. Inspect its delivery state before trying to retime it; do not recreate it to bypass the claim.".to_owned(),
+        Ok(ScheduledRetimeOutcome::Uncertain) =>
+            "Not saved: delivery is uncertain. Inspect the destination and retained delivery evidence; retime cannot release this fence or replay the message.".to_owned(),
+        Ok(ScheduledRetimeOutcome::Ineligible) =>
+            "Not saved: only an enabled, never-run one-off can be retimed. Recurring, disabled, completed or previously sent schedules cannot be retimed. Inspect /schedule-list.".to_owned(),
+        Err(err) => {
+            tracing::warn!(reason = db_class(&err), "schedule retime failed");
+            "Retime not saved or not confirmed. Inspect /schedule-list before retrying the same id and at time; no delivery fence was released.".to_owned()
+        }
+    };
+    finish(executor, interaction, text).await;
+}
+
+/// Require exactly one string `id` and `at`, with no alternate mutation mode.
+/// Refusals never echo raw input and happen before any store/audit operation.
+fn schedule_retime_options(
+    interaction: &Interaction,
+    now_ms: u64,
+) -> Result<(String, u64), String> {
+    const INVALID_ID: &str = "Not saved: invalid or missing id option. Use /schedule-retime id:<full-id> at:<RFC3339 time>; id must be 1–128 UTF-16 units.";
+    const INVALID_AT: &str = "Not saved: invalid or missing at option. Use /schedule-retime id:<full-id> at:<RFC3339 time with Z or a numeric offset>.";
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Err(INVALID_ID.to_owned());
+    };
+    let mut id = None;
+    let mut at = None;
+    let mut unknown = false;
+    for option in &data.options {
+        let slot = match option.name.as_str() {
+            "id" => &mut id,
+            "at" => &mut at,
+            _ => {
+                unknown = true;
+                continue;
+            }
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "Not saved: duplicate {} option. Supply one id and one at RFC3339 time.",
+                option.name,
+            ));
+        }
+        *slot = Some(&option.value);
+    }
+    let Some(CommandOptionValue::String(id)) = id else {
+        return Err(INVALID_ID.to_owned());
+    };
+    if id.trim().is_empty() || text_len(id) > MAX_RESOURCE_ID_CHARS {
+        return Err(INVALID_ID.to_owned());
+    }
+    let Some(CommandOptionValue::String(at)) = at else {
+        return Err(INVALID_AT.to_owned());
+    };
+    let due = validate_schedule_at(at, now_ms).map_err(|error| format!("Not saved: {error}"))?;
+    if unknown {
+        return Err("Not saved: invalid option. Supply only id and at; /schedule-retime has no preview or body-edit mode.".to_owned());
+    }
+    Ok((id.clone(), due))
 }
 
 /// `/schedule-remove`: prefix-resolve the id → guild-scoped delete →

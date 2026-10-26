@@ -66,10 +66,10 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 46 entries (43 retained builtins — the 27 legacy ones plus the Next-only
+all 47 entries (44 retained builtins — the 27 legacy ones plus the Next-only
 `/help`, `/privacy`, `/command-inspect`, `/reopen`, `/welcome-preview`, `/lfg-edit`,
 `/command-disable`, `/command-enable`, `/purge-preview`, `/channel-inspect`,
-`/giveaway`, `/lfg-list`, `/feed-inspect`, `/feed-pause`, `/feed-resume` and `/game-mix` — the dropped rota command, custom
+`/giveaway`, `/lfg-list`, `/feed-inspect`, `/feed-pause`, `/feed-resume`, `/schedule-retime` and `/game-mix` — the dropped rota command, custom
 slash commands, and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
@@ -115,6 +115,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `schedule` | docs/parity.md §1 #17 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
 | `schedule` | docs/parity.md §1 #17 absolute-time | Add only optional string `at` (max_length 64), explicit-offset RFC3339 for one-offs within the existing 365-day horizon; retain relative options, bounds and permissions. Set/list include canonical and localized due times with delivery uncertainty; cancellation names the stable ID. See [absolute scheduling](schedule-queue-order.md#schedule-at-a-known-instant). |
 | `schedule` | docs/parity.md §1 #17 preview | Add only optional boolean `preview` after `at`; `preview:true` renders the proposed body, invoking channel, first due instant (canonical UTC plus Discord-local timestamp) and one-off versus recurring shape privately, running the same validation but minting no id, writing no row or audit, and taking no quota. Omitted or false keeps create behavior unchanged. See [proposed-post preview](schedule-queue-order.md#preview-a-proposed-post). |
+| `schedule-retime` | docs/parity.md §1 schedule-retime | Add Next-only one-off timing correction (parity row 46) after `schedule-remove`: automations-gated, guild-only, ManageGuild, required string `id` ≤128 and `at` ≤64. Exact-ID original-channel scope; enabled never-run one-offs only; same-instant no-op, atomic audit, preserved delivery fences and no public message effect. See [retime](schedule-queue-order.md#correct-an-unsent-one-offs-time). |
 | `schedule-remove` | docs/parity.md §1 #18 caps | Advertise only `max_length` 128 on `id`; empty and overlong prefixes are refused before resolution. |
 | `sticky` | docs/parity.md §1 #20 caps | Advertise `max_length` 2000 on `body`, matching the runtime cap; the legacy body/debounce options retain their other fields. |
 | `sticky` | docs/parity.md §1 #20 preview | Add the optional Boolean `preview` as the third option: true privately validates and shows unsaved proposed content/debounce without store, audit, claim, fence, counter, job or channel effects. Omitted/false preserves saving and uncertainty recovery; malformed or unknown flags refuse before storage. See [sticky preview](sticky-debounce-acceptance.md#preview-unsaved-input-privately). |

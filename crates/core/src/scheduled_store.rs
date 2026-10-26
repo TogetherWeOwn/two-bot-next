@@ -379,6 +379,111 @@ pub async fn put_scheduled(
     Ok(result.rows_affected() > 0)
 }
 
+/// An in-place correction, never a definition replacement. The caller validates
+/// the explicit future timestamp before constructing this request.
+pub struct ScheduledRetime<'a> {
+    pub guild_id: &'a str,
+    pub channel_id: &'a str,
+    pub id: &'a str,
+    pub next_run_at: &'a str,
+    pub actor_id: &'a str,
+    pub updated_at: &'a str,
+    pub audit_id: &'a str,
+}
+
+/// No refusal writes schedule or audit rows; a same-instant retry is a no-op.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScheduledRetimeOutcome {
+    Saved { previous_due: u64 },
+    Unchanged,
+    Missing,
+    Busy,
+    Uncertain,
+    Ineligible,
+}
+
+/// Retime an enabled, never-run one-off in its original guild/channel. Holding
+/// the same row lock as [`claim_due`] makes claim admission and retime mutually
+/// exclusive. Eligibility is checked under that lock, including on no-ops.
+/// Only the due time and update attribution change; even a retained nonce from
+/// a proven-unsent retry stays intact. Audit failure rolls the entire write
+/// back. A stale claim snapshot still cannot arm delivery after this wins.
+pub async fn retime_scheduled(
+    pool: &Pool<Postgres>,
+    input: &ScheduledRetime<'_>,
+) -> Result<ScheduledRetimeOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let current = sqlx::query_as::<_, ScheduledMessageRow>(
+        "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
+                claim_token, claimed_at, occurrence_nonce,
+                COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
+           FROM scheduled_messages
+          WHERE guild_id = $1 AND channel_id = $2 AND id = $3 FOR UPDATE",
+    )
+    .bind(input.guild_id)
+    .bind(input.channel_id)
+    .bind(input.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(current) = current else {
+        return Ok(ScheduledRetimeOutcome::Missing);
+    };
+    if current.delivery_uncertain {
+        return Ok(ScheduledRetimeOutcome::Uncertain);
+    }
+    if current.claim_token.is_some() || current.claimed_at.is_some() {
+        return Ok(ScheduledRetimeOutcome::Busy);
+    }
+    if !current.enabled
+        || current.interval_seconds.is_some()
+        || current.last_run_at.is_some()
+        || current.last_message_id.is_some()
+    {
+        return Ok(ScheduledRetimeOutcome::Ineligible);
+    }
+    let parse_due = |value: &str| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .and_then(|instant| u64::try_from(instant.unix_timestamp_nanos() / 1_000_000).ok())
+    };
+    let (Some(previous_due), Some(next_due)) = (
+        parse_due(&current.next_run_at),
+        parse_due(input.next_run_at),
+    ) else {
+        return Ok(ScheduledRetimeOutcome::Ineligible);
+    };
+    if previous_due == next_due {
+        return Ok(ScheduledRetimeOutcome::Unchanged);
+    }
+    sqlx::query(
+        "UPDATE scheduled_messages SET next_run_at = $4, updated_by = $5, updated_at = $6
+          WHERE guild_id = $1 AND channel_id = $2 AND id = $3",
+    )
+    .bind(input.guild_id)
+    .bind(input.channel_id)
+    .bind(input.id)
+    .bind(input.next_run_at)
+    .bind(input.actor_id)
+    .bind(input.updated_at)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO automation_audit_log
+           (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+         VALUES ($1, $2, $3, 'scheduled.retime', $4, 'ok', NULL, $5::TEXT::TIMESTAMPTZ)",
+    )
+    .bind(input.audit_id)
+    .bind(input.guild_id)
+    .bind(input.actor_id)
+    .bind(input.id)
+    .bind(input.updated_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(ScheduledRetimeOutcome::Saved { previous_due })
+}
+
 /// Record a run and compute what happens next (legacy `markScheduledRun`).
 /// A one-shot disables itself; a recurring row advances `next_run_at` from
 /// the run instant so no catch-up burst fires after downtime. Only the claim

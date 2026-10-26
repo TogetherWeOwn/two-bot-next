@@ -1513,9 +1513,8 @@ impl CommandRuntime {
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
             "game-mix" => Some(HandlerId::GameMix),
-            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
-                Some(HandlerId::AutomationAdmin)
-            }
+            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-retime"
+            | "schedule-list" => Some(HandlerId::AutomationAdmin),
             "giveaway" => Some(HandlerId::Giveaway),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
@@ -1607,6 +1606,15 @@ impl CommandRuntime {
             }
             "schedule-remove" => {
                 crate::schedule_runtime::schedule_remove(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            "schedule-retime" => {
+                crate::schedule_runtime::schedule_retime(
                     &self.pool,
                     &self.executor,
                     &self.guild_id.to_string(),
