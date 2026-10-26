@@ -834,6 +834,28 @@
               "choices": []
             }
           ]
+        },
+        {
+          "name": "inspect",
+          "description": "Privately inspect saved giveaway details in this channel",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
         }
       ],
       "smoke": "deferred",

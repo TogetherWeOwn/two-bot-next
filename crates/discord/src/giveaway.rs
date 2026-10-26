@@ -49,6 +49,9 @@ const TICK_BATCH: i64 = 25;
 /// UTF-16 units, so posts packed under this ceiling never trip Discord's
 /// 2000-unit rejection.
 const POST_BUDGET: usize = 1800;
+/// Prize characters shown in private saved detail: drifted or oversized saved
+/// prizes stay bounded well inside Discord's 2000-unit framing.
+const DETAIL_PRIZE_CHARS: usize = 120;
 
 /// One tick's work: fresh draws committed plus announcements delivered (fresh
 /// draws, re-announces and skip-to-announce recoveries all count).
@@ -151,6 +154,19 @@ impl GiveawayRuntime {
         };
         match sub.name.as_str() {
             "create" => self.create(interaction, &guild, options).await,
+            "inspect" => {
+                let [option] = options.as_slice() else {
+                    return Ok(INVALID.into());
+                };
+                let ("id", CommandOptionValue::String(id)) = (option.name.as_str(), &option.value)
+                else {
+                    return Ok(INVALID.into());
+                };
+                if !valid_id(id) {
+                    return Ok(INVALID.into());
+                }
+                self.inspect(interaction, &guild, id).await
+            }
             "list" => {
                 let rows = store::list_active(&self.pool, &guild).await?;
                 if rows.is_empty() {
@@ -271,6 +287,28 @@ impl GiveawayRuntime {
             }
             _ => Ok(INVALID.into()),
         }
+    }
+
+    async fn inspect(
+        &self,
+        interaction: &Interaction,
+        guild: &str,
+        id: &str,
+    ) -> Result<String, sqlx::Error> {
+        let Some(channel) = super::channel_moderation::invoking_channel_id(interaction) else {
+            return Ok(INVALID.into());
+        };
+        let missing = "Giveaway not found in this channel. Check the saved ID and invoke here.";
+        let Some(row) = store::get_giveaway(&self.pool, guild, id).await? else {
+            return Ok(missing.into());
+        };
+        // Resolve visibility from the saved scope, before any supplemental read.
+        // Neither Manage Guild nor a guessed ID grants cross-channel inspection.
+        if row.guild_id != guild || row.channel_id != channel {
+            return Ok(missing.into());
+        }
+        let count = store::entry_count(&self.pool, guild, id).await?;
+        Ok(render_detail(&row, count))
     }
 
     async fn create(
@@ -1224,15 +1262,116 @@ fn render(row: &GiveawayRow, count: i64) -> String {
         ""
     };
     format!(
-        "Giveaway: {}\n{} entrants · {} winners\nEnds <t:{}:R> · {}{}\nID: `{}`",
-        row.prize,
+        "Giveaway: {}\n{} entrants · {} winners\nEnds <t:{}:R> · {}{}\nID: `{}`\n{}",
+        inline_prize(&row.prize, giveaway::PRIZE_MAX_CHARS),
         count,
         row.winners_count,
         row.ends_at.unix_timestamp(),
         row.status,
         ending,
-        row.id
+        row.id,
+        requirements_line(row)
     )
+}
+
+/// Private saved-state detail for staff inspection. Saved records only, never
+/// a live Discord read: `drawn` is not announcement-confirmed, and an
+/// unconfirmed entry message is never rendered as a jump link. Omits the
+/// pre-draw nonce, claim token, entry roster and member timestamps.
+fn render_detail(row: &GiveawayRow, count: i64) -> String {
+    let reference =
+        if !row.message_id.is_empty() && row.message_id.bytes().all(|b| b.is_ascii_digit()) {
+            format!(
+                "https://discord.com/channels/{}/{}/{}",
+                row.guild_id, row.channel_id, row.message_id
+            )
+        } else {
+            "pending delivery (unconfirmed); check this channel before recreating".to_owned()
+        };
+    let announcement = match row.announced_at {
+        Some(receipt) => format!(
+            "Announcement: confirmed <t:{}:F> (saved receipt; does not prove the message still exists)",
+            receipt.unix_timestamp()
+        ),
+        None if row.status == "drawn" || row.status == "drawing" => {
+            "Announcement: unconfirmed (saved draw; no announcement receipt)".to_owned()
+        }
+        None => "Announcement: none (not drawn)".to_owned(),
+    };
+    format!(
+        "Saved giveaway `{}`: {}\nStatus: {} (saved)\nEnds <t:{}:F>\nMessage: {}\nEntries (saved): {}\nWinners (configured): {}\n{}\n{}",
+        row.id,
+        inline_prize(&row.prize, DETAIL_PRIZE_CHARS),
+        row.status,
+        row.ends_at.unix_timestamp(),
+        reference,
+        count,
+        row.winners_count,
+        requirements_line(row),
+        announcement
+    )
+}
+
+/// Saved prize as bounded inert text: control characters (including newlines
+/// that could inject fake requirement or status lines) are stripped and the
+/// remainder is cut to `bound` characters. Mentions stay suppressed by the
+/// outbound `allowed_mentions` policy, not by this renderer.
+fn inline_prize(prize: &str, bound: usize) -> String {
+    prize
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(bound)
+        .collect()
+}
+
+/// One static requirements summary shared by entry posts and private detail:
+/// saved rules only, never a per-member eligibility verdict, an admission
+/// promise or a winning promise, and no member/profile reads to format it.
+/// Damaged saved requirements report unavailable instead of guessing
+/// unrestricted.
+fn requirements_line(row: &GiveawayRow) -> String {
+    format!("Requirements: {}", requirements_summary(row))
+}
+
+fn requirements_summary(row: &GiveawayRow) -> String {
+    let Ok(requirements) = store_requirements(row) else {
+        return "unavailable (saved rules unreadable; ask staff)".to_owned();
+    };
+    let mut parts = Vec::new();
+    if !requirements.roles.is_empty() {
+        // Role ids shown before the bounded overflow marker.
+        const SHOWN_ROLES: usize = 10;
+        let mut roles = requirements
+            .roles
+            .iter()
+            .take(SHOWN_ROLES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if requirements.roles.len() > SHOWN_ROLES {
+            roles.push_str(&format!(
+                " (+{} more; ask staff)",
+                requirements.roles.len() - SHOWN_ROLES
+            ));
+        }
+        parts.push(format!("roles {roles} (all required)"));
+    }
+    if requirements.min_account_age_days > 0 {
+        parts.push(format!(
+            "account age {}+ days",
+            requirements.min_account_age_days
+        ));
+    }
+    if requirements.min_guild_age_days > 0 {
+        parts.push(format!(
+            "server age {}+ days",
+            requirements.min_guild_age_days
+        ));
+    }
+    if parts.is_empty() {
+        return "Everyone".to_owned();
+    }
+    parts.join("; ")
 }
 
 fn components(row: &GiveawayRow) -> Vec<serde_json::Value> {

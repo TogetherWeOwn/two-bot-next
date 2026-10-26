@@ -7,7 +7,7 @@ Empty `{missing,stale,oversize}` = PASS; else exit 1.
 Bad rows land in `stale` as `docs/README.md:<line>`.
 Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 
-## References and architecture
+## References
 
 - [Find a doc](README.md)
 - [Framework choice](adr/0001-discord-framework.md)
@@ -21,7 +21,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Read-only MCP tools](mcp.md)
 - [Admin token registry](admin-registry.md)
 
-## Operations and observability
+## Operations
 
 - [Operations and alerts](runbook.md)
 - [Observability triage](runbook-observability.md)
@@ -108,6 +108,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
+- [Giveaways](giveaways.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey](member-journey-parity.md)
 - [Onboarding ops](onboarding-operator-guide.md)

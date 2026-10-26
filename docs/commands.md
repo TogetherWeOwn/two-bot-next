@@ -314,6 +314,8 @@ Create, draw, reroll or cancel a giveaway
 | `reroll` | subcommand | false | — | — | — | — | Redraw the winners |
 | `reroll id` | string | true | — | — | 64 | — | Giveaway id |
 | `reroll user` | user | false | — | — | — | — | Replace only this winner |
+| `inspect` | subcommand | false | — | — | — | — | Privately inspect saved giveaway details in this channel |
+| `inspect id` | string | true | — | — | 64 | — | Giveaway id |
 
 ## `/group`
 

@@ -391,6 +391,18 @@ pub fn giveaway_command() -> CommandDefinition {
                     .max_length(64),
                 CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
             ]),
+            CommandOption::new(
+                "inspect",
+                "Privately inspect saved giveaway details in this channel",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
         ])
 }
 
