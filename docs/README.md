@@ -6,7 +6,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 ## References and architecture
 
 - [Find a doc](README.md)
-- [Framework choice](adr/0001-discord-framework.md)
+- [Framework](adr/0001-discord-framework.md)
 - [Commands](commands.md)
 - [Settings](configuration.md)
 - [Parity ledger](parity.md)
@@ -19,7 +19,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 
 ## Operations and observability
 
-- [Ops/alerts](runbook.md)
+- [Operations](runbook.md)
 - [Observability triage](runbook-observability.md)
 - [Metrics](metrics.md)
 - [Readiness](container-readiness.md)
@@ -31,9 +31,9 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Backfill](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
-- [Release architecture](releases.md)
+- [Releases](releases.md)
 - [Gradual promote](gradual-promote-caller.md)
-- [Logging contract](logging.md)
+- [Logging](logging.md)
 - [Log limits](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
 - [Pool gauge](pool-gauge-ownership.md)
@@ -48,15 +48,15 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 
 ## Storage and internal actions
 
-- [Event-store wiring](event-store.md)
+- [Event store](event-store.md)
 - [Database roles](database-roles.md)
 - [Database TLS](database-tls.md)
-- [Migration checksums](migrations.md)
+- [Migrations](migrations.md)
 - [Legacy copy](legacy-copy.md)
 - [Legacy verify](legacy-verify.md)
 - [Store cutover gates](store-cutover.md)
 - [Member erasure](privacy.md)
-- [Membership chronology](membership-contract.md)
+- [Membership](membership-contract.md)
 - [Send admission](discord-send-admission.md)
 - [REST guard](rest-guard.md)
 - [Audit domain](audit-core.md)
@@ -123,6 +123,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Play-now](lfg-play-now-spec.md)
 - [Feed ops](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
+- [Title filter](feed-title-filter-spec.md)
 - [Relay move proposal](feed-move-spec.md)
 - [EventSub ops](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
@@ -178,7 +179,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Assistant requests](voice-assistant-request-core.md)
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
-- [Game aliases and nick](voice-alias-core.md)
+- [Game aliases/nick](voice-alias-core.md)
 - [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
@@ -226,7 +227,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Slash smoke](staging-slash-smoke.md)
 - [Voice checks](staging-voice-event-verification.md)
 - [Smoke replies](smoke-expected-responses.md)
-- [Smoke record form](smoke-run-record.md)
+- [Smoke record](smoke-run-record.md)
 - [Smoke inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
