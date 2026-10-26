@@ -520,9 +520,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 41 all-gate builtins: 7 core + 1 scorecard + 12 automation
-            // + 10 announcements + 9 moderation mutations + 2 private reads.
-            41
+            // 43 all-gate builtins: 7 core + 1 scorecard + 12 automation
+            // + 12 announcements + 9 moderation mutations + 2 private reads.
+            43
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -552,9 +552,17 @@ mod tests {
             all_on.iter().any(|def| def.name == "feed-inspect"),
             "feed-inspect survives the all-on registry"
         );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-pause"),
+            "feed-pause survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-resume"),
+            "feed-resume survives the all-on registry"
+        );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 62);
+        assert_eq!(with_voice.len(), 64);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -582,6 +590,14 @@ mod tests {
         assert!(
             with_voice.iter().any(|def| def.name == "feed-inspect"),
             "feed-inspect survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-pause"),
+            "feed-pause survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-resume"),
+            "feed-resume survives the voice registry"
         );
     }
 

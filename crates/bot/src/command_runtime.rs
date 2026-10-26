@@ -15,10 +15,11 @@
 //! - sticky (`/sticky`, `/sticky-remove` + the accepted-message re-post hook;
 //!   legacy order pinned below: claim → post → record → delete previous →
 //!   audit, with `post_failed`/orphan cleanup on the failure edges).
-//! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`, `/feed-inspect`;
-//!   TOG-10085 domain and store): plan → guild-scoped CRUD → `announcements_audit_log`
-//!   row → ephemeral completion. The generated relay/audit ids replace legacy
-//!   `randomUUID()`. List and inspect are pure reads and write no audit row.
+//! - feed relays (`/feed-add`, `/feed-remove`, `/feed-pause`, `/feed-resume`,
+//!   `/feed-list`, `/feed-inspect`; TOG-10085 domain and store): plan →
+//!   guild-scoped CRUD → `announcements_audit_log` row → ephemeral completion.
+//!   The generated relay/audit ids replace legacy `randomUUID()`. List and
+//!   inspect are pure reads and write no audit row.
 //! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
 //!   router authorization → ephemeral defer → durable claim/lane → REST effect →
 //!   atomic result/audit → original-response edit. Ambiguity retains the lane.
@@ -69,11 +70,16 @@ use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
-        feed_list_page, feed_list_page_invalid_text, feed_list_page_underflow_text,
-        feed_removed_text, plan_command, FeedCommand, FeedCommandContext, FeedCommandPlan,
-        FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        feed_already_paused_text, feed_already_resumed_text, feed_list_page,
+        feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
+        feed_removed_text, feed_resumed_text, plan_command, FeedCommand, FeedCommandContext,
+        FeedCommandPlan, FeedKind, FEED_PAUSE_RECOVERY_REQUIRED_TEXT,
+        FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
     },
-    feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
+    feeds_store::{
+        add_feed, list_feeds, pause_feed, remove_feed, resume_feed, write_audit, FeedAudit,
+        FeedPauseOutcome, FeedRemoval, FeedResumeOutcome,
+    },
     funnel::now_millis_for_test,
     help::{canonical_help_selector, unknown_help_correction},
     moderation::ModerationAction,
@@ -1514,6 +1520,8 @@ impl CommandRuntime {
             "giveaway" => Some(HandlerId::Giveaway),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
+            "feed-pause" => Some(HandlerId::FeedPause),
+            "feed-resume" => Some(HandlerId::FeedResume),
             "feed-list" => Some(HandlerId::FeedList),
             "feed-inspect" => Some(HandlerId::FeedInspect),
             // Member verbs are owned only while the consumer exists; without
@@ -1585,6 +1593,8 @@ impl CommandRuntime {
             "sticky-remove" => self.sticky_remove(interaction).await,
             "feed-add" => self.feed_add(interaction).await,
             "feed-remove" => self.feed_remove(interaction).await,
+            "feed-pause" => self.feed_pause(interaction).await,
+            "feed-resume" => self.feed_resume(interaction).await,
             "feed-list" => self.feed_list(interaction).await,
             "feed-inspect" => self.feed_inspect(interaction).await,
             "schedule" => {
@@ -2189,6 +2199,130 @@ impl CommandRuntime {
         }
     }
 
+    /// `/feed-pause`: decode `id` → plan → guild-scoped disable →
+    /// `feed.pause` audit (`paused`/`already_paused`/`missing`/`recovery_required`
+    /// outcome) → ephemeral confirmation. URL, destination, seen-item and
+    /// delivery history are preserved; only lifecycle state changes. An enabled
+    /// relay carrying unresolved pending delivery evidence stays enabled with a
+    /// fixed retry-after-recovery reply, so recovery is never stranded behind
+    /// disabled discovery. Already-admitted work is not cancelled, and no
+    /// fresh post claim may begin after a successful pause. A store failure
+    /// audits one `feed.pause`/`rejected` refusal row, then replies safe.
+    async fn feed_pause(&self, interaction: &Interaction) {
+        // Pause does not bind to the invoking channel; `channel_id` is only
+        // context the planner ignores for this command.
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        let id = match feed_id_option_strict(
+            interaction,
+            FEED_PAUSE_INVALID_ID,
+            FEED_PAUSE_DUPLICATE_ID,
+            FEED_PAUSE_MISSING_ID,
+        ) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
+        let command = FeedCommand::Pause { id };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Pause { guild_id, id }) => {
+                match pause_feed(&self.pool, &guild_id, &id, inputs.now_ms).await {
+                    Ok(outcome) => {
+                        let (audit_outcome, reply) = match outcome {
+                            FeedPauseOutcome::Paused => ("paused", feed_paused_text(&id)),
+                            FeedPauseOutcome::AlreadyPaused => {
+                                ("already_paused", feed_already_paused_text(&id))
+                            }
+                            FeedPauseOutcome::Missing => {
+                                ("missing", feed_removed_text(false).to_owned())
+                            }
+                            FeedPauseOutcome::RecoveryRequired => (
+                                "recovery_required",
+                                FEED_PAUSE_RECOVERY_REQUIRED_TEXT.to_owned(),
+                            ),
+                        };
+                        self.feed_audit(&inputs, "feed.pause", &id, audit_outcome, None)
+                            .await;
+                        self.finish(interaction, reply).await;
+                    }
+                    Err(err) => {
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed pause failed");
+                        self.feed_audit(&inputs, "feed.pause", &id, "rejected", Some(class))
+                            .await;
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
+                }
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-pause planned to a non-pause variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// `/feed-resume`: decode `id` → plan → guild-scoped enable →
+    /// `feed.resume` audit (`resumed`/`already_resumed`/`missing` outcome) →
+    /// ephemeral confirmation. Seen-item/high-water and nonce/dedup history
+    /// are preserved; resume never reposts an accepted item and keeps the
+    /// existing per-poll post budget rather than draining a backlog. A store
+    /// failure audits one `feed.resume`/`rejected` refusal row, then replies
+    /// safe.
+    async fn feed_resume(&self, interaction: &Interaction) {
+        // Resume does not bind to the invoking channel; `channel_id` is only
+        // context the planner ignores for this command.
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        let id = match feed_id_option_strict(
+            interaction,
+            FEED_RESUME_INVALID_ID,
+            FEED_RESUME_DUPLICATE_ID,
+            FEED_RESUME_MISSING_ID,
+        ) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
+        let command = FeedCommand::Resume { id };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Resume { guild_id, id }) => {
+                match resume_feed(&self.pool, &guild_id, &id, inputs.now_ms).await {
+                    Ok(outcome) => {
+                        let (audit_outcome, reply) = match outcome {
+                            FeedResumeOutcome::Resumed => ("resumed", feed_resumed_text(&id)),
+                            FeedResumeOutcome::AlreadyResumed => {
+                                ("already_resumed", feed_already_resumed_text(&id))
+                            }
+                            FeedResumeOutcome::Missing => {
+                                ("missing", feed_removed_text(false).to_owned())
+                            }
+                        };
+                        self.feed_audit(&inputs, "feed.resume", &id, audit_outcome, None)
+                            .await;
+                        self.finish(interaction, reply).await;
+                    }
+                    Err(err) => {
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed resume failed");
+                        self.feed_audit(&inputs, "feed.resume", &id, "rejected", Some(class))
+                            .await;
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
+                }
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-resume planned to a non-resume variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
     /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
     /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
     /// only) and writes no audit row. An omitted `page` means page 1; a
@@ -2575,6 +2709,12 @@ const FEED_ADD_MISSING_SOURCE: &str = "Missing source. Use /feed-add kind:rss so
 const FEED_REMOVE_INVALID_ID: &str = "Invalid id. Use /feed-remove id:<relay-id>.";
 const FEED_REMOVE_DUPLICATE_ID: &str = "Duplicate id. Use /feed-remove id:<relay-id>.";
 const FEED_REMOVE_MISSING_ID: &str = "Missing id. Use /feed-remove id:<relay-id>.";
+const FEED_PAUSE_INVALID_ID: &str = "Invalid id. Use /feed-pause id:<relay-id>.";
+const FEED_PAUSE_DUPLICATE_ID: &str = "Duplicate id. Use /feed-pause id:<relay-id>.";
+const FEED_PAUSE_MISSING_ID: &str = "Missing id. Use /feed-pause id:<relay-id>.";
+const FEED_RESUME_INVALID_ID: &str = "Invalid id. Use /feed-resume id:<relay-id>.";
+const FEED_RESUME_DUPLICATE_ID: &str = "Duplicate id. Use /feed-resume id:<relay-id>.";
+const FEED_RESUME_MISSING_ID: &str = "Missing id. Use /feed-resume id:<relay-id>.";
 
 /// Strictly decode `/feed-add`'s options: `kind` and `source` must each
 /// appear exactly once with a string value. Duplicates win over wrong types
@@ -2633,10 +2773,27 @@ pub(crate) fn feed_add_options_strict(
 /// Present-but-empty still decodes (the planner's `validate_id` owns that
 /// refusal), so valid invocations plan byte-identically to before.
 pub(crate) fn feed_remove_option_strict(interaction: &Interaction) -> Result<String, &'static str> {
+    feed_id_option_strict(
+        interaction,
+        FEED_REMOVE_INVALID_ID,
+        FEED_REMOVE_DUPLICATE_ID,
+        FEED_REMOVE_MISSING_ID,
+    )
+}
+
+/// Share strict relay-id decoding without sharing command-worded refusals.
+/// Malformed options refuse before planning, store access or audit writes;
+/// typed-empty values still reach the planner's `validate_id` check.
+fn feed_id_option_strict(
+    interaction: &Interaction,
+    invalid_id: &'static str,
+    duplicate_id: &'static str,
+    missing_id: &'static str,
+) -> Result<String, &'static str> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return Err(FEED_REMOVE_MISSING_ID);
+        return Err(missing_id);
     };
     let mut ids: Vec<&CommandOptionValue> = Vec::new();
     for option in &data.options {
@@ -2645,12 +2802,12 @@ pub(crate) fn feed_remove_option_strict(interaction: &Interaction) -> Result<Str
         }
     }
     if ids.len() > 1 {
-        return Err(FEED_REMOVE_DUPLICATE_ID);
+        return Err(duplicate_id);
     }
     match ids.first() {
-        None => Err(FEED_REMOVE_MISSING_ID),
+        None => Err(missing_id),
         Some(CommandOptionValue::String(value)) => Ok((*value).clone()),
-        Some(_) => Err(FEED_REMOVE_INVALID_ID),
+        Some(_) => Err(invalid_id),
     }
 }
 
@@ -2738,6 +2895,8 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
         for id in [
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
             HandlerId::FeedList,
             HandlerId::FeedInspect,
             // The ordered RSVP surface executes these ids; registration

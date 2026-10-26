@@ -72,6 +72,12 @@ IMAGE_MAX_BYTES = 112 * MIB
 # e07140dd repairs) measures 17,854,776 bytes (17.03 MiB) in hosted CI
 # (run 40094727805), 28,984 over 17 MiB. 18 MiB stands on merged-tree
 # evidence with no new dependencies and no release-profile change.
+# 2026-10-24: the feed pause/resume slice (~24,800 bytes of command, store
+# and poller code, no new dependencies, same minimal release profile)
+# measured 17,831,440 bytes (5,648 over 17 MiB) on its pre-giveaway base
+# (CI run 40099776675 job 120889388251). The giveaway+feed union below the
+# 18 MiB ceiling still requires a fresh combined-head container-smoke run.
+#
 # On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
 # cc07f31436 measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over, in
 # [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
