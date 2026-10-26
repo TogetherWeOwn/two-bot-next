@@ -7,7 +7,7 @@
 use super::*;
 use serde::de::DeserializeSeed;
 use serde_json::Value;
-use twilight_model::gateway::{GatewayEvent, GatewayEventDeserializer};
+use twilight_model::gateway::event::{GatewayEvent, GatewayEventDeserializer};
 
 const OTHER_CREATOR: u64 = 201;
 const UNKNOWN_CHANNEL: u64 = 202;
