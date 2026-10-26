@@ -82,9 +82,12 @@ receipt rather than creating another session.
 
 One public message reads, for example:
 
-> Member pickup · Example Game · hosted by Example Member  
-> Need 3 more · starts in 15 minutes · signups close 30 minutes after start  
-> 0/3 additional players · Join / Leave / Close / Report  
+> Member pickup · Example Game · hosted by Example Member
+>
+> Need 3 more · starts in 15 minutes · signups close 30 minutes after start
+>
+> 0/3 additional players · Join / Leave / Close / Report
+>
 > Notifications: off, or up to 5 opted-in players notified once
 
 Host attribution is non-pinging text. The host is implicitly playing and cannot
@@ -277,9 +280,10 @@ this page introduces no tables, data collection or deletion job.
 ## No-build alternatives
 
 **Lower `/lfg` permissions:** cheapest code change, rejected for this experiment.
-It broadens staff create/edit/close authority, does not distinguish unofficial
-pickups, and provides no notification consent, per-host/game caps or short-lived
-member lifecycle. Reusing Join/Leave is desirable; dropping the staff permission
+Lowering only create permissions broadens creation authority, does not
+distinguish unofficial pickups, and provides no notification consent,
+per-host/game caps or short-lived member lifecycle. It would not by itself
+lower edit/close permissions; owner-scoped member controls still need design. Reusing Join/Leave is desirable; dropping the staff permission
 boundary is not equivalent to this design. Keep the current permissions.
 
 **Human-only channel template:** accepted fallback and first demand check. A
@@ -337,7 +341,7 @@ If a slice cannot meet that bound, split it before admission.
 | --- | --- | --- |
 | A: policy core | Accepted spec; pure validation, time windows, limits and typed refusal reasons; no Discord publication | PN-01/02/07, boundary and property fixtures, fixed clocks and DST cases |
 | B: consent and state | A; durable preference generations, post/recipient budgets, idempotency, CAS, erasure fences; no sends | PN-01/02/04/05/10, isolated disposable DB races and restart/retention fixtures |
-| C: shared budget prerequisite | B; first prove existing guild-wide counts/reservations can satisfy noise admission; no new telemetry platform | PN-07, concurrent other-bot reservation, incomplete data fails closed; if unavailable, stop rather than enable |
+| C: shared budget prerequisite | B; first prove existing guild-wide counts/reservations can satisfy noise admission; no new telemetry platform | PN-07, concurrent TWO-writer reservation plus observed other-bot volume, incomplete data fails closed; if unavailable, stop rather than enable |
 | D: silent creation | B/C; gated command confirmation, game/member reads, fixed-slot post with notifications off | PN-01/03/05/07/09, fake Discord request bodies, private refusals and role-loss boundaries |
 | E: optional single ping | D; bounded recipient reads, withdrawal linearization, allowed mentions and uncertain-send fence | PN-02/03/04/08, controlled before/after-admission races, request capture, timeout/restart faults |
 | F: lifecycle and controls | D/E; bound existing Join/Leave to member kind, capacity, expiry, Close/Report and kill gates | PN-05/06/09/10, concurrent final seat, cross-post controls, report and edit budgets |
