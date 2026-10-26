@@ -280,7 +280,7 @@ fn assert_updated_time(text: &str) {
 }
 
 #[test]
-fn registry_exposes_only_metadata_options_with_the_existing_management_permission() {
+fn registry_exposes_metadata_and_increase_only_seat_options_with_existing_management_permission() {
     let commands = two_bot_core::announcement_commands();
     let command = commands
         .iter()
@@ -293,8 +293,8 @@ fn registry_exposes_only_metadata_options_with_the_existing_management_permissio
     assert!(!command.dm_permission);
     assert_eq!(
         command.options.len(),
-        3,
-        "role/channel/roster edits are not part of this command"
+        5,
+        "only metadata and increase-only seats, not channel or roster replacement"
     );
     let id = command
         .options
@@ -311,14 +311,31 @@ fn registry_exposes_only_metadata_options_with_the_existing_management_permissio
         .iter()
         .find(|o| o.name == "starts-at")
         .expect("time option");
+    let role = command
+        .options
+        .iter()
+        .find(|o| o.name == "role")
+        .expect("existing signup role option");
+    let seats = command
+        .options
+        .iter()
+        .find(|o| o.name == "seats")
+        .expect("absolute seat target option");
     assert_eq!(id.required, Some(true));
     assert_eq!(id.max_length, Some(128));
     assert_eq!(title.max_length, Some(100));
     assert_ne!(title.required, Some(true));
     assert_ne!(starts_at.required, Some(true));
-    for option in &command.options {
-        assert_eq!(option.kind, 3, "metadata and id options use string input");
+    assert_ne!(role.required, Some(true));
+    assert_eq!(role.max_length, Some(32));
+    for option in [id, title, starts_at, role] {
+        assert_eq!(option.kind, 3, "metadata, id and role use string input");
     }
+    assert_ne!(seats.required, Some(true));
+    assert_eq!(seats.kind, 4, "absolute seat targets use integer input");
+    let seats_wire = serde_json::to_value(seats).expect("serialize seat target option");
+    assert_eq!(seats_wire["min_value"], json!(1));
+    assert_eq!(seats_wire["max_value"], json!(99));
 }
 
 async fn successful_edit(

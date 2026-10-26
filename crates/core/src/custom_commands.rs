@@ -977,8 +977,7 @@ pub fn format_inspect_summary(row: &StoredCommand) -> String {
 /// Heading plus full escaped body when it fits; otherwise the heading, the
 /// longest fitting escape-boundary prefix and an explicit truncation marker.
 /// Total stays within Discord's content ceiling.
-fn format_bounded_view(view: InspectView, name: &str, escaped: &str) -> String {
-    let heading = view.heading(name);
+fn format_bounded_view(heading: &str, escaped: &str) -> String {
     let head_units = heading.encode_utf16().count() + 1;
     let total_units = escaped.encode_utf16().count();
     if head_units + total_units <= MAX_RENDERED_CHARS {
@@ -1003,8 +1002,7 @@ fn format_bounded_view(view: InspectView, name: &str, escaped: &str) -> String {
 #[must_use]
 pub fn format_inspect_template(row: &StoredCommand) -> String {
     format_bounded_view(
-        InspectView::Template,
-        &row.name,
+        &InspectView::Template.heading(&row.name),
         &escape_inspect_text(&row.template),
     )
 }
@@ -1048,10 +1046,33 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
         }
     };
     format_bounded_view(
-        InspectView::Preview,
-        &row.name,
+        &InspectView::Preview.heading(&row.name),
         &escape_inspect_text(&rendered),
     )
+}
+
+/// Validate and preview proposed text without constructing or saving a command.
+/// Uses the saved preview's single-pass renderer, escaping and framing; raw
+/// expansion overflow refuses rather than presenting a partial successful render.
+#[must_use]
+pub fn format_draft_preview(template: &str, ctx: &TemplateContext) -> String {
+    match validate_template(template).and_then(|()| render_template(template, ctx)) {
+        Ok(rendered) => format_bounded_view(
+            "Draft preview — not saved or published",
+            &escape_inspect_text(&rendered),
+        ),
+        Err(error) => {
+            let detail = escape_inspect_text(&error.to_string());
+            let detail = if detail.encode_utf16().count() > 256 {
+                format!("{}…[truncated]", truncate_escaped_units(&detail, 256))
+            } else {
+                detail
+            };
+            format!(
+                "Draft cannot be previewed: {detail} Correct or shorten the draft and retry /command-inspect draft:Hello. Nothing was saved or published."
+            )
+        }
+    }
 }
 
 /// Preview refused for missing render context (no invoking member, channel
@@ -2028,6 +2049,17 @@ mod tests {
         assert!(view.starts_with("Template for /faq is invalid: Unknown placeholder"));
         assert!(view.contains("…[truncated]"));
         assert!(view.ends_with(" Replace it with /command name:faq template:..."));
+    }
+
+    #[test]
+    fn draft_long_invalid_template_preserves_bounded_detail_and_correction() {
+        let template = format!("{{{}}}", "a".repeat(1998));
+        let view = format_draft_preview(&template, &inspect_ctx());
+        assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        assert!(view.starts_with("Draft cannot be previewed: Unknown placeholder"));
+        assert!(view.contains("…[truncated]"));
+        assert!(view.contains("retry /command-inspect draft:Hello."));
+        assert!(view.ends_with("Nothing was saved or published."));
     }
 
     #[test]
