@@ -37,7 +37,7 @@ binding = "CF_VERSION_METADATA"
 
 # Default-environment bindings. Named environments do NOT inherit these —
 # every [env.*] below repeats the full Container/DO wiring explicitly.
-# Verified against wrangler 4.151.0 (`deploy --dry-run --env <name>` warns on
+# Verified against wrangler 4.152.0 (`deploy --dry-run --env <name>` warns on
 # any omission); enforced in CI by scripts/check-env-bindings.py, which also
 # requires both [env.staging] and [env.production] to be declared.
 [[containers]]
