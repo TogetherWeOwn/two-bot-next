@@ -69,9 +69,14 @@ available command.
   simply moves its window; a move after admission never creates a second fire.
 - **Audience:** current signups at admission time. Read a candidate snapshot,
   then revalidate the full ordered roster inside admission (event-reminder
-  pattern: bounded array equality plus exact count). Signup after admission
-  misses this fire with no catch-up; withdrawal after admission hits the
-  disclosed in-flight limit below. Zero signups at admission means no send.
+  pattern: bounded `user_id`-ordered array equality plus exact count; sibling
+  order, not LFG join order). A join or leave between the candidate read and
+  admission changes the roster, so that admission attempt refuses with zero
+  POST and the post stays undecided; the next regular tick re-snapshots from
+  scratch (no catch-up job, no delayed queue). Only changes after a committed
+  admission hit the miss/in-flight limits: signup after committed admission
+  misses this fire; withdrawal after committed admission cannot recall an
+  in-flight message. Zero signups at admission means no send.
 - **Channel:** one short message in the post's saved guild text channel,
   addressed to nobody: no user/role/everyone/here mention, no roster, no
   attendee count, no title, no DM, thread, webhook or fallback channel.
@@ -94,7 +99,7 @@ available command.
 Fixed body (render Discord-local full dates, not ambiguous clock-only or
 relative-only values; UTC instants included here to make fixtures reproducible):
 
-- Reminder: `Starting soon: <t:1793490600:F>. Details in the original post:
+- Reminder: `Starting soon: <t:1793493000:F>. Details in the original post:
   <validated Discord jump link>.` Instant: 2026-11-01T00:30:00+00:00, firing
   for a 00:45 start. No title (a title edit after admission must not stale the
   message), no count (signup races must not stale it), no roster.
@@ -145,10 +150,14 @@ transport retries for this effect. `sent` means Discord accepted, not read.
   (unbound) message at admission refuses with zero POST. Expiry/orphan closure
   must never be described as organizer cancellation.
 - **Signup/withdrawal races:** the admission roster comparison is the
-  serialization point. Join after admission misses; leave after admission
-  cannot recall an in-flight message. The message names nobody, so neither race
-  leaks or misattributes identity; disclose the race instead of holding DB
-  locks across HTTP.
+  serialization point. Join or leave between the candidate read and admission
+  mismatches the roster, so that attempt refuses with zero POST and the post
+  stays undecided for the next regular tick to re-snapshot. Join after a
+  committed admission misses; leave after a committed admission cannot recall
+  an in-flight message. The message names nobody, so no race outcome leaks or
+  misattributes identity; disclose the race instead of holding DB locks across
+  HTTP. Sustained churn can defer admission past the window; the post then
+  stays quiet under `out_of_window`, with no catch-up.
 - **Restart/double-fire:** the permanent fence makes duplicate ticks, duplicate
   workers and crash-replay return the saved decision with **no new POST**.
   Backup/restore must preserve decided attempts before enabling any sender;
@@ -243,8 +252,8 @@ effect counts.
 | Case | Required result |
 | --- | --- |
 | M01 trigger window / DST boundary | First tick inside T-15 admits; equal instants across offsets/DST admit identically; no personal timezone collection |
-| M02 signup after snapshot | Join between candidate read and admission misses this fire; zero extra POST; no catch-up job |
-| M03 withdraw after snapshot | Leave before admission drops eligibility; leave after admission cannot recall in-flight; neither leaks identity |
+| M02 signup after snapshot | Join between candidate read and admission mismatches the roster; that attempt refuses with zero POST; post undecided, next regular tick re-snapshots; no catch-up job |
+| M03 withdraw after snapshot | Leave before admission mismatches the roster; that attempt refuses, next tick re-snapshots (zero signups then means no send); leave after committed admission cannot recall in-flight; neither leaks identity |
 | M04 edit before fire | Start edit moves window; title/role edits do not disqualify; stale snapshot cannot send to moved post |
 | M05 close/cancel/delete before fire | Closed/deleted/unbound at admission refuses with zero POST; expiry never described as organizer cancellation |
 | M06 no quiet-hours rule | No time-of-day suppression, timezone store or daily schedule exists; quiet is behavioral bounds only |
