@@ -196,7 +196,7 @@ impl Harness {
         let data = response.data.as_ref().expect("private response data");
         assert!(data
             .flags
-            .unwrap_or_default()
+            .unwrap_or(MessageFlags::empty())
             .contains(MessageFlags::EPHEMERAL));
         let text = response_text(&response);
         assert!(two_bot_core::message_safety::text_len(&text) <= 2000);
