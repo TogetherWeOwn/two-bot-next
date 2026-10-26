@@ -2,11 +2,10 @@
 
 Sole manifest: `- [Purpose](relative.md)`.
 
-Root: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}`: empty PASS/0; else FAIL/1, fix rows/split docs.
-Bad/duplicate: `docs/README.md:<line>` in `stale`.
-Bytes: index <12,000; docs ≤65,536.
-Legacy exceptions/why: `LARGE_DOCS` in `scripts/check_docs_index.py`.
+Check: `python3 scripts/check_docs_index.py --json`.
+Empty `{missing,stale,oversize}`=PASS/0; else 1: fix rows/split docs.
+Bad/dup rows: `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -129,16 +128,18 @@ Legacy exceptions/why: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 - [Stream funnel](stream-funnel.md)
 - [Staff game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
+- [Time helper (design only)](time-helper-spec.md)
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [Notice proposal](event-change-notices-spec.md)
-- [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
-- [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
-- [Private agenda (design only)](event-agenda-spec.md)
-- [Calendar handoff (design only)](event-calendar-handoff-spec.md)
-- [Event role (design only)](event-role-spec.md)
-- [Event recap (design only)](event-recap-spec.md)
+- [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
+- [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
+- [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
+- [Private agenda proposal](event-agenda-spec.md)
+- [Calendar handoff proposal](event-calendar-handoff-spec.md)
+- [Event role proposal](event-role-spec.md)
+- [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
@@ -209,15 +210,15 @@ Legacy exceptions/why: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 - [Soak entry gates](soak-entry-gates.md)
 - [Expected/processed evidence](evidence-route.md)
 - [Expected-join tests](expected-joins-acceptance.md)
-- [E2E command matrix](staging-e2e-command-matrix.md)
-- [E2E record form](staging-e2e-run-record.md)
+- [E2E matrix](staging-e2e-command-matrix.md)
+- [E2E record](staging-e2e-run-record.md)
 - [Fixture census](staging-fixture-census.md)
-- [Health-contract probe](staging-health-contract-probe.md)
+- [Health probe](staging-health-contract-probe.md)
 - [Migration claim](staging-migrate-claim.md)
-- [Rollout acceptance](staging-rollout-gate.md)
+- [Rollout gate](staging-rollout-gate.md)
 - [Slash smoke](staging-slash-smoke.md)
-- [Voice event checks](staging-voice-event-verification.md)
-- [Smoke response table](smoke-expected-responses.md)
+- [Voice checks](staging-voice-event-verification.md)
+- [Smoke replies](smoke-expected-responses.md)
 - [Smoke record form](smoke-run-record.md)
 - [Smoke surface inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
