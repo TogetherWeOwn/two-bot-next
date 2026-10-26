@@ -196,7 +196,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Delete guards](voice-delete-guards.md)
 - [Health contract](voice-health-contract.md)
 - [Config codec](voice-config-codec.md)
-- [Config diff preview](voice-config-diff-core.md)
+- [Config diff/review](voice-config-diff-core.md)
 - [Config apply](voice-config-apply.md)
 - [Staging synthetic](voice-synthetic.md)
 - [Lifecycle alert drill](voice-lifecycle-alert-drill.md)
