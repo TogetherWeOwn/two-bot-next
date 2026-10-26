@@ -1,24 +1,25 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)`.
 
-`python3 scripts/check_docs_index.py --json`: empty `{missing,stale,oversize}` = PASS/exit 0, else exit 1.
-Fix rows/split docs; `stale` cites `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
+`python3 scripts/check_docs_index.py --json` (repo root).
+Empty `{missing,stale,oversize}` = PASS; else exit 1.
+Bad rows land in `stale` as `docs/README.md:<line>`.
+Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 
 ## References and architecture
 
 - [Find a doc](README.md)
 - [Framework choice](adr/0001-discord-framework.md)
-- [Command reference](commands.md)
-- [Settings reference](configuration.md)
+- [Commands](commands.md)
+- [Settings](configuration.md)
 - [Parity ledger](parity.md)
-- [Containment boundaries](containment.md)
+- [Containment](containment.md)
 - [Prototype metrics](s2-prototype.md)
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
-- [Read-only MCP tools](mcp.md)
-- [Admin token registry](admin-registry.md)
+- [MCP tools](mcp.md)
+- [Token registry](admin-registry.md)
 
 ## Operations and observability
 
@@ -35,9 +36,9 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
 - [Release architecture](releases.md)
-- [Passive gradual promote](gradual-promote-caller.md)
+- [Gradual promote](gradual-promote-caller.md)
 - [Logging contract](logging.md)
-- [Log/cardinality limits](log-volume-guard.md)
+- [Log volume guard](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
 - [Pool gauge ownership](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
@@ -56,11 +57,11 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Database TLS](database-tls.md)
 - [Migration checksums](migrations.md)
 - [Legacy data copy](legacy-copy.md)
-- [Legacy data comparison](legacy-verify.md)
+- [Legacy verify](legacy-verify.md)
 - [Store cutover gates](store-cutover.md)
 - [Member erasure](privacy.md)
 - [Membership chronology](membership-contract.md)
-- [Durable send admission](discord-send-admission.md)
+- [Send admission](discord-send-admission.md)
 - [REST guard](rest-guard.md)
 - [Audit domain](audit-core.md)
 - [Audit mirror](audit-service.md)
@@ -80,7 +81,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Command publication](command-publish.md)
 - [Command restoration](command-restoration.md)
 - [Reply lifecycle](interaction-replies.md)
-- [Prefix trigger gates](prefix-gate-matrix.md)
+- [Prefix gates](prefix-gate-matrix.md)
 - [Actor admission](automation-admission.md)
 - [Automod operations](automod-operator-guide.md)
 - [Automod runtime](automod-runtime.md)
@@ -95,7 +96,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
 - [Moderation disable gate](moderation-disable-preflight.md)
-- [Hierarchy refusal order](moderation-hierarchy-order.md)
+- [Hierarchy order](moderation-hierarchy-order.md)
 - [Moderation MAC tests](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
@@ -103,6 +104,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Response page proposal](dashboard-custom-responses-spec.md)
 - [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
+- [Self-role panels](dashboard-self-roles-spec.md)
 - [Onboarding page proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
@@ -113,6 +115,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
+- [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
@@ -132,15 +135,17 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [Notice proposal](event-change-notices-spec.md)
-- [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
+- [Reminder prefs](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
 - [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
 - [RSVP cutoff proposal](rsvp-registration-cutoff-spec.md)
-- [Private agenda proposal](event-agenda-spec.md)
-- [Calendar handoff proposal](event-calendar-handoff-spec.md)
-- [Event role proposal](event-role-spec.md)
+- [Agenda](event-agenda-spec.md)
+- [Calendar handoff](event-calendar-handoff-spec.md)
+- [Event role](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
+- [Native publish](event-native-publish-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Sticky config proposal](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
@@ -150,7 +155,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 
 ## Voice
 
-- [Room specification](voice-rooms.md)
+- [Room spec](voice-rooms.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -172,7 +177,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
 - [Game aliases and nick](voice-alias-core.md)
-- [Channel-info resolution](voice-channelinfo-core.md)
+- [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
@@ -180,10 +185,10 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Placement/numbering](voice-placement-core.md)
 - [Companion text domain](voice-text-channel-core.md)
 - [Companion lifecycle](voice-companion-lifecycle.md)
-- [Join-request lifecycle](voice-join-request-lifecycle.md)
+- [Join lifecycle](voice-join-request-lifecycle.md)
 - [Logging resolution](voice-logging-core.md)
 - [Name filtering](voice-name-filter-core.md)
-- [Name panel and modal](voice-name-panel.md)
+- [Name panel](voice-name-panel.md)
 - [Rename coalescing](voice-rename-coalescer-core.md)
 - [Rename pipeline](voice-rename-pipeline.md)
 - [Ping/invite utilities](voice-utilities-core.md)
@@ -200,7 +205,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Rollback triggers](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
 - [Freeze readback](voice-t5-freeze-readback-receipt.md)
-- [Publish diff form](voice/publish-diff-record-template.md)
+- [Publish diff](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
@@ -208,7 +213,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Soak lifecycle](staging-soak.md)
 - [Soak coverage plan](soak-checklist.md)
 - [Soak entry gates](soak-entry-gates.md)
-- [Expected/processed evidence](evidence-route.md)
+- [Evidence route](evidence-route.md)
 - [Expected-join tests](expected-joins-acceptance.md)
 - [E2E matrix](staging-e2e-command-matrix.md)
 - [E2E record](staging-e2e-run-record.md)
@@ -242,7 +247,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Rollback one-pager](cutover-rollback-onepager.md)
 - [Rollback procedure](cutover-rollback-runbook.md)
 - [Rollback tabletop](cutover-rollback-tabletop.md)
-- [Rollback delta report](rollback-delta.md)
+- [Rollback delta](rollback-delta.md)
 - [Dashboard queries](cutover-dashboard-queries.md)
 - [Watch handover](cutover-watch-handover.md)
 - [Watch checklist](watch-checklist.md)
@@ -264,7 +269,7 @@ Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
-- [Load-sensitive fixtures](load-sensitive-test-fixtures.md)
+- [Load fixtures](load-sensitive-test-fixtures.md)
 - [Parser properties](property-tests.md)
 - [Pipeline benchmark](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)

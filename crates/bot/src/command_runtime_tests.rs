@@ -34,6 +34,8 @@ mod member_dispatch_authority_acceptance;
 mod member_strict_decode_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
 mod sticky_uncertain_acceptance_tests;
+#[path = "sticky_unsaved_preview_acceptance_tests.rs"]
+mod sticky_unsaved_preview_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
@@ -60,6 +62,8 @@ mod giveaway_create_entry_acceptance_tests;
 mod schedule_absolute_acceptance;
 #[path = "schedule_absolute_correction_tests.rs"]
 mod schedule_absolute_correction_tests;
+#[path = "schedule_preview_dispatch_acceptance.rs"]
+mod schedule_preview_dispatch_acceptance;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
 
