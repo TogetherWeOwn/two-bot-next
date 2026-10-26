@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/schedule_delivery_truth_acceptance_tests.rs",
-      "sha256": "b846dee5a99a9329a45decef1d82202d012914f743dc38854d90f22de413c301",
+      "sha256": "0ee37599326fb1946ab8b49ef24d725d86cfb1ae4b9f540f889baaa03dfecc88",
       "tests": 13
     },
     {

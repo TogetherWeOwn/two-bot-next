@@ -17,6 +17,14 @@ const NONCE: &str = "private-occurrence-nonce-sentinel";
 const BODY: &str = "private-body-sentinel @everyone <@&9999>";
 const T0: u64 = 1_790_000_000_000;
 
+type FailureAudit = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Clone, Copy)]
 enum View {
     Ready,
@@ -855,13 +863,7 @@ async fn read_failure(pattern: &str, page: i64) {
             .fetch_one(db.pool())
             .await
             .expect("rows after fault");
-    let audits: Vec<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let audits: Vec<FailureAudit> = sqlx::query_as(
         "SELECT action, outcome, target_key, reason, actor_id FROM automation_audit_log",
     )
     .fetch_all(db.pool())
