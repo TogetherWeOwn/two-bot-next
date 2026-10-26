@@ -46,7 +46,7 @@ JOB_INVENTORY = {
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
                               "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
-                           "pinned-history-guard"},
+                           "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
@@ -7929,6 +7929,36 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(runs_on=runs_on):
                 self.assertFalse(runner_allowed("worker", runs_on))
 
+    def test_certify_promotion_runner_must_use_its_own_routed_expression(self):
+        # Reconciliation pin: certification is artifact-only, but that buys
+        # service/container isolation, not a runner waiver. The real job must
+        # use the exact canonical routed expression naming certify-promotion,
+        # matching scripts/test-runner-routing.py::routed('certify-promotion').
+        canonical = ROUTED_RUNNER.format(job="certify-promotion")
+        job = self.workflows["deploy-staging.yml"]["jobs"]["certify-promotion"]
+        self.assertTrue(runner_allowed("certify-promotion", canonical))
+        # Public repositories reach GitHub-hosted runners before any variable
+        # or self-hosted label is read.
+        self.assertTrue(canonical.startswith(
+            "${{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "))
+        missing_public_first = canonical.replace(
+            "(!github.event.repository.private && '[\"ubuntu-latest\"]') || ", "")
+        self.assertNotEqual(missing_public_first, canonical)
+        for runs_on in ("ubuntu-latest",
+                        ROUTED_RUNNER.format(job="deploy"),
+                        missing_public_first,
+                        ["self-hosted"],
+                        ["self-hosted", "two-selfhosted"],
+                        "${{ vars.CI_OVERFLOW_RUNNER }}"):
+            with self.subTest(runs_on=runs_on):
+                self.assertFalse(runner_allowed("certify-promotion", runs_on))
+        self.assertNotIn("services", job)
+        self.assertNotIn("container", job)
+        self.assertNotIn("environment", job)
+        self.assertNotIn("secrets", job)
+        self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"})
+        self.assertEqual(job["runs-on"], canonical)
+
     def test_duplicate_keys_cannot_hide_an_enabled_job(self):
         with self.assertRaises(ValueError):
             yaml.load("jobs:\n  deploy:\n    if: '${{ false }}'\n    if: true\n", Loader=UniqueKeyLoader)
@@ -7953,8 +7983,18 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("runs-on", job)
                         self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
                         continue
-                    # Main #183 returned container smoke to the shared pool.
-                    self.assertTrue(runner_allowed(job_id, job["runs-on"]))
+                    if (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
+                        # Artifact-only certification has no host/container dependency,
+                        # but it still uses the canonical routed expression for its
+                        # own job id (public repo -> hosted first). A literal
+                        # ubuntu-latest would bill private hosted minutes if the
+                        # repo went private; see scripts/test-runner-routing.py.
+                        self.assertEqual(job["runs-on"], ROUTED_RUNNER.format(job=job_id))
+                        self.assertNotIn("services", job)
+                        self.assertNotIn("container", job)
+                    else:
+                        # Main #183 returned container smoke to the shared pool.
+                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
@@ -8375,10 +8415,16 @@ class WorkflowTests(unittest.TestCase):
                         # Derives the deploy ID from today's staging
                         # Deployments, then records this one.
                         expected = {"contents": "read", "deployments": "write"}
+                    elif (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
+                        # Reads the producing run and its immutable diagnostics artifact;
+                        # certification itself has no environment or deploy credentials.
+                        expected = {"contents": "read", "actions": "read"}
+                        self.assertNotIn("environment", job)
+                        self.assertNotIn("secrets", job)
                     elif (name, job_id) == ("deploy-production.yml", "production"):
-                        # Derives the deploy ID from today's production
-                        # Deployments, then records this one.
-                        expected = {"contents": "read", "deployments": "write"}
+                        # Reads immutable staging artifacts, then records this
+                        # independent production Deployment event.
+                        expected = {"contents": "read", "actions": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):
