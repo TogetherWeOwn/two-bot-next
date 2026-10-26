@@ -1,6 +1,6 @@
 # Dashboard feed configuration contract
 
-Status: **proposed; design only**, 2026-10-25. Intent review by 2026-10-31.
+Status: **proposed; design only**, re-inventoried 2026-10-26. Intent review by 2026-10-31.
 No page, signed verb, runtime change, permission, migration, live write or
 activation is implemented or authorized here. This file is the single repository
 source, including the JSON manifest and offline oracle. The separate
@@ -19,7 +19,7 @@ cadence edits read-only until typed validation is shared with its real reader.
 Relay editing needs missing signed verbs and concurrency rules, not a direct
 website database writer. This is not an approval to build those prerequisites.
 
-Source inventory is pinned to `c3af7333df80a766f5d4c229506a3bce53680828`, not a
+Source inventory is pinned to `e1868d97d3519cae3f2ed91726e83e98f77dff0d`, not a
 claim about a deployed image. Existing runtime readers are source witnesses,
 not an acknowledgement that any particular stored revision was consumed.
 
@@ -29,18 +29,18 @@ not an acknowledgement that any particular stored revision was consumed.
 | --- | --- | --- |
 | `FC-K1` / `TWO_FEED_POLL_SECONDS` | Environment or settings store → `live_poll_seconds_with` (`crates/bot/src/feed_jobs.rs:206-236`), supervisor cadence and per-tick schedule (`:276-327`). Both catalogue Hot and HOT_WIRED (`crates/core/src/settings.rs:267`, `:299`). | Conditionally live, boot default 300 s, reader accepts 60..86400. Missing/deleted, wrong-type, unparsable or out-of-range snapshot value falls back to **boot**, not last-good. Invalid boot interval refuses job construction even if stored interval is valid (`feed_jobs.rs:294-299`). Generic write validation has no cadence-specific bound (`settings.rs:1061-1140`): keep edit/reset read-only; validation-first. |
 | `FC-K2` / `TWO_ANNOUNCEMENTS` | Environment or settings store → `live_announcements_with` and pre-pass gate (`feed_jobs.rs:239-266`, `:402-418`). Hot/HOT_WIRED (`settings.rs:191`, `:310`); store gate validation (`:1035-1042`, `:1088-1094`). | Conditionally live for an **existing** boot-enabled, identity-permitted poller: rendering `1` runs, `0` parks; unset falls back to boot. Not an immediate cancellation: a pass already running can finish. Parking skips pending-delivery recovery too. |
-| `FC-S1` / job existence and slash surface | Boot `FeatureGates` plus activation constrain registration (`feed_jobs.rs:329-395`); command publication uses boot map (`crates/bot/src/commands_cli.rs:110-130`); routing uses boot gates (`crates/bot/src/command_runtime.rs:419-470`, `:2268-2282`). | **Restart/boot-only** prerequisites. Boot-off cannot become a job through stored `1`. Changing slash surface requires a permitted boot configuration and publication; stored gate is **unwired for slash dispatch at this head**. Restart alone does not turn stored data into environment. |
-| `FC-R1` / `id,guild_id,channel_id,kind,source` | `/feed-add` planner sets context guild/channel and normalized source (`crates/core/src/feeds.rs:121-164`); insert-only store (`crates/core/src/feeds_store.rs:25-50`). Poller uses guild-scoped enabled rows and source/kind/destination. | Runtime-read relay definition; no in-place edit. Add validates but never fetches. Destination is invoking channel. Duplicate guild/channel/kind/source tuple refused; 25 definitions/guild including disabled rows. No dashboard verb. |
-| `FC-R2` / `enabled` | Schema default true and add initializes true (`crates/cutover/migrations/0180_feeds.sql:8`; `feeds.rs:140`); list/claim/recovery readers honor it (`feeds_store.rs:53-84`, `:188-285`). | Reader exists, **update surface absent**, not stored-unwired. No supported pause/resume writer on this head. Do not use remove/re-add as pause: removal refuses pending evidence, otherwise cascades settled ledger history (`feeds_store.rs:87-149`). |
-| `FC-R3` / `last_checked_at` | Poller `mark_checked` after processing, including fetch failure (`feed_jobs.rs:431-489`); inspect/list render qualified last attempt (`feeds.rs:295-319`, `:546-574`). | Read-only attempt metadata, not success/health or a consumed-config revision. Cancellation can leave it unchanged. |
-| `FC-R4` / `created_by,created_at,updated_at` | Add supplies actor/time (`feeds.rs:142-144`); store loads these; ordering uses created_at/id (`feeds_store.rs:41-81`). `mark_checked` changes only last_checked_at (`:331-339`). | Stored metadata; not settings or a concurrency token. No editor is exposed. Do not call updated_at the last poll time. |
+| `FC-S1` / job existence and slash surface | Boot `FeatureGates` plus activation constrain registration (`feed_jobs.rs:329-395`); command publication uses boot map (`crates/bot/src/commands_cli.rs:110-130`); routing uses boot gates (`crates/bot/src/command_runtime.rs:419-470`, `:2402-2417`). | **Restart/boot-only** prerequisites. Boot-off cannot become a job through stored `1`. Changing slash surface requires a permitted boot configuration and publication; stored gate is **unwired for slash dispatch at this head**. Restart alone does not turn stored data into environment. |
+| `FC-R1` / `id,guild_id,channel_id,kind,source` | `/feed-add` planner sets context guild/channel and normalized source (`crates/core/src/feeds.rs:129-185`); insert-only store (`crates/core/src/feeds_store.rs:25-50`). Poller uses guild-scoped enabled rows and source/kind/destination. | Runtime-read relay definition; no in-place edit. Add validates but never fetches. Destination is invoking channel. Duplicate guild/channel/kind/source tuple refused; 25 definitions/guild including paused rows. No dashboard verb. |
+| `FC-R2` / `enabled` | Add initializes true (`crates/cutover/migrations/0180_feeds.sql:8`; `feeds.rs:148`); slash pause/resume update it (`feeds_store.rs:180-275`). List/claim/recovery readers honor it (`:53-84`, `:331-430`); each poll rechecks it (`feed_jobs.rs:431-450`). | Runtime reader and **slash lifecycle writer exist**; dashboard transport is absent. Paused rows remain inspectable. Pause preserves history and refuses an enabled relay with pending evidence; resume permits recovery. Removal is not pause: it refuses pending evidence, otherwise cascades settled history (`feeds_store.rs:87-135`). |
+| `FC-R3` / `last_checked_at` | Poller `mark_checked` after processing, including fetch failure (`feed_jobs.rs:431-503`); inspect/list render qualified last attempt (`feeds.rs:354-361`, `:593-620`). | Read-only attempt metadata, not success/health or a consumed-config revision. Cancellation can leave it unchanged. |
+| `FC-R4` / `created_by,created_at,updated_at` | Add supplies actor/time (`feeds.rs:150-152`); ordering uses created_at/id (`feeds_store.rs:41-81`). Successful pause/resume transitions also set updated_at (`:219-273`); `mark_checked` changes only last_checked_at (`:474-482`). | Stored metadata, not settings or a concurrency token. Already-state lifecycle calls leave timestamps unchanged. No dashboard editor exists. Do not call updated_at the last poll time or a monotonic revision. |
 
 Schema: `feed_relays` has exactly these ten fields
 (`crates/cutover/migrations/0180_feeds.sql:2-14`); `feed_deliveries` is a separate
 runtime claim/history ledger, never page-editable. There is **no per-relay
 interval**, template, source-sampling setting or feed runtime dry-run key.
 Kinds are RSS, YouTube and Twitch feed URLs; YouTube channel IDs normalize to
-a feed URL (`feeds.rs:179-195`), not a new provider/Helix integration.
+a feed URL (`feeds.rs:201-216`), not a new provider/Helix integration.
 
 **Other classifications:** no separate feed-specific Cold catalogue row exists;
 restart-only above describes construction/publication, not a made-up Cold key.
@@ -66,17 +66,37 @@ boot/identity refusal and an in-flight pass invalidate a wall-clock assertion.
 
 **Read-only precedent and safety:** `/feed-inspect` makes a bounded guild read,
 not a source fetch, audit, schedule edit, claim renewal or repair
-(`command_runtime.rs:2220-2253`). All four feed commands require ManageGuild
-and the existing guild/announcements gate (`feeds.rs:121-129`). Preserve HTTPS
+(`command_runtime.rs:2354-2388`). All six feed commands require ManageGuild
+and the existing guild/announcements gate (`feeds.rs:129-185`). Preserve HTTPS
 443/no credentials, 2048-byte source bound, all-public DNS answers and repinned
 same-host redirects (maximum 3), no proxy/second-resolution bypass
 (`crates/core/src/feeds_http.rs:8-11`, `:58-190`;
 `crates/core/src/feeds_connector.rs:1-33`). No page fetch to test a source.
 
-**In flight, not merged evidence:** [pause/resume #1720](https://github.com/TogetherWeOwn/two-bot-next/pull/1720)
-and [live command dispatch #1639](https://github.com/TogetherWeOwn/two-bot-next/pull/1639)
-were open at the 2026-10-25 inventory. Do not borrow their behavior or tests as
-HEAD guarantees. Re-inventory after merge before changing this contract.
+**Lifecycle limits:** pause/resume use guild + stable relay ID, not the invoking
+channel. Missing/already-state results change nothing, including updated_at.
+Enabled-to-paused refuses **any** pending delivery evidence; already-paused
+returns before that check. Resume does not refuse pending evidence, so recovery
+can discover the relay again (`feeds_store.rs:138-275`). The shared lifecycle,
+removal and fresh-admission fence is transaction-scoped: READ COMMITTED,
+5 s lock timeout, 15 s statement timeout, no network under lock (`:278-315`).
+This is state-idempotence, not request/audit idempotence or CAS: no lifecycle
+expected-version/durable intent key exists. Opposing commands serialize without
+detecting stale intent. Post-operation audit is separate and best effort, even
+for no-op/refused outcomes (`command_runtime.rs:2211-2315`, `:2420-2450`).
+
+A poll recheck skips a false/missing relay at that check (`feed_jobs.rs:431-450`),
+not a pass-wide cancellation: work already past it can still fetch or write
+attempt metadata/audit. Fresh claims revalidate under the fence; already-admitted
+pending work makes pause refuse. Resume returns to ordinary gated polling and
+its 20 POST-attempt budget per relay poll, not immediate/unbounded catch-up
+(`feed_jobs.rs:530-550`, `:585-738`). Pending nonce recovery is not blind reposting.
+
+**Merged versus in flight:** [pause/resume #1720](https://github.com/TogetherWeOwn/two-bot-next/pull/1720)
+is included in this source inventory via `fa12fb938`; this does not prove
+publication or deployment. [Live command dispatch #1639](https://github.com/TogetherWeOwn/two-bot-next/pull/1639)
+remained open at re-inventory; the inspected slash path is still boot-gated.
+Do not borrow unmerged behavior or treat merged source as applied runtime state.
 
 ## Existing signed settings contract
 
@@ -196,7 +216,7 @@ an existing reader rejects or a boot-only prerequisite.
 ```json
 {
   "schema":"dashboard.feed_config.v1",
-  "source_sha":"c3af7333df80a766f5d4c229506a3bce53680828",
+  "source_sha":"e1868d97d3519cae3f2ed91726e83e98f77dff0d",
   "decision":"wiring_first_or_no_build",
   "relay_identity":["guild_id","id"],
   "keys":[
@@ -205,16 +225,16 @@ an existing reader rejects or a boot-only prerequisite.
   ],
   "relays":[
     {"id":"FC-R1","fields":["id","guild_id","channel_id","kind","source"],"state":"runtime_read_no_dashboard_verb","edit":false,"writer":"slash_add_insert_only","reader":["E-RELAY-READ","E-FETCH"],"evidence":["E-ADD","E-SCHEMA"]},
-    {"id":"FC-R2","fields":["enabled"],"state":"reader_wired_update_absent","edit":false,"writer":"insert_only","reader":["E-RELAY-READ"],"evidence":["E-ADD","E-COMMANDS"]},
+    {"id":"FC-R2","fields":["enabled"],"state":"runtime_read_slash_lifecycle_no_dashboard_verb","edit":false,"writer":"slash_add_pause_resume","reader":["E-RELAY-READ","E-POLL-LIFECYCLE"],"evidence":["E-ADD","E-PAUSE","E-RESUME","E-LIFECYCLE-LOCK","E-LIFECYCLE-AUDIT"]},
     {"id":"FC-R3","fields":["last_checked_at"],"state":"attempt_only","edit":false,"writer":"runtime_mark_checked","reader":["E-INSPECT"],"evidence":["E-MARK"]},
-    {"id":"FC-R4","fields":["created_by","created_at","updated_at"],"state":"stored_metadata","edit":false,"writer":"slash_add","reader":["E-RELAY-READ"],"evidence":["E-ADD"]}
+    {"id":"FC-R4","fields":["created_by","created_at","updated_at"],"state":"stored_metadata","edit":false,"writer":"slash_add_and_lifecycle_transition","reader":["E-RELAY-READ"],"evidence":["E-ADD","E-PAUSE","E-RESUME"]}
   ],
   "other_states":[
     {"id":"FC-S1","state":"restart_only","evidence":["E-BOOT","E-SLASH"]},
     {"id":"FC-S2","state":"stored_unwired_for_slash","key":"TWO_ANNOUNCEMENTS","evidence":["E-SLASH"]},
     {"id":"FC-S3","state":"env_only","evidence":["E-ENV","E-PREFIX","E-EVENTSUB"]},
     {"id":"FC-S4","state":"absent","evidence":["E-SCHEMA","E-VERBS"]},
-    {"id":"FC-S5","state":"in_flight_not_merged","pull_requests":[1720,1639],"evidence":["E-COMMANDS","E-SLASH"]},
+    {"id":"FC-S5","state":"in_flight_not_merged","pull_requests":[1639],"evidence":["E-SLASH"]},
     {"id":"FC-S6","state":"activation_denied_for_live","evidence":["E-ACTIVATION"]}
   ],
   "evidence":{
@@ -225,14 +245,19 @@ an existing reader rejects or a boot-only prerequisite.
     "E-GATE":{"path":"crates/bot/src/feed_jobs.rs","line":250,"contains":"fn live_announcements_with"},
     "E-TICK":{"path":"crates/bot/src/feed_jobs.rs","line":412,"contains":"if !gate()"},
     "E-BOOT":{"path":"crates/bot/src/feed_jobs.rs","line":386,"contains":"if !gates.announcements"},
-    "E-SLASH":{"path":"crates/bot/src/command_runtime.rs","line":2274,"contains":"self.interactions.router.gates().announcements"},
+    "E-SLASH":{"path":"crates/bot/src/command_runtime.rs","line":2408,"contains":"self.interactions.router.gates().announcements"},
     "E-RELAY-READ":{"path":"crates/core/src/feeds_store.rs","line":63,"contains":"WHERE guild_id = $1 AND (NOT $2 OR enabled)"},
-    "E-FETCH":{"path":"crates/bot/src/feed_jobs.rs","line":455,"contains":"fetch.fetch(feed.clone())"},
+    "E-FETCH":{"path":"crates/bot/src/feed_jobs.rs","line":469,"contains":"fetch.fetch(feed.clone())"},
     "E-ADD":{"path":"crates/core/src/feeds_store.rs","line":29,"contains":"pub async fn add_feed"},
+    "E-PAUSE":{"path":"crates/core/src/feeds_store.rs","line":180,"contains":"pub async fn pause_feed"},
+    "E-RESUME":{"path":"crates/core/src/feeds_store.rs","line":238,"contains":"pub async fn resume_feed"},
+    "E-LIFECYCLE-LOCK":{"path":"crates/core/src/feeds_store.rs","line":297,"contains":"async fn lock_feed_delivery"},
+    "E-POLL-LIFECYCLE":{"path":"crates/bot/src/feed_jobs.rs","line":448,"contains":"if live != Some(true)"},
+    "E-LIFECYCLE-AUDIT":{"path":"crates/bot/src/command_runtime.rs","line":2424,"contains":"async fn feed_audit"},
     "E-SCHEMA":{"path":"crates/cutover/migrations/0180_feeds.sql","line":2,"contains":"CREATE TABLE IF NOT EXISTS feed_relays"},
     "E-COMMANDS":{"path":"crates/core/src/feeds.rs","line":88,"contains":"pub enum FeedCommand"},
-    "E-MARK":{"path":"crates/bot/src/feed_jobs.rs","line":485,"contains":"store::mark_checked"},
-    "E-INSPECT":{"path":"crates/bot/src/command_runtime.rs","line":2225,"contains":"async fn feed_inspect"},
+    "E-MARK":{"path":"crates/bot/src/feed_jobs.rs","line":499,"contains":"store::mark_checked"},
+    "E-INSPECT":{"path":"crates/bot/src/command_runtime.rs","line":2359,"contains":"async fn feed_inspect"},
     "E-ENV":{"path":"crates/core/src/settings.rs","line":105,"contains":"SettingClass::EnvOnly"},
     "E-PREFIX":{"path":"crates/core/src/settings.rs","line":1071,"contains":"ENV_ONLY_KEY_PREFIXES"},
     "E-EVENTSUB":{"path":"crates/core/src/settings.rs","line":149,"contains":"SettingClass::EnvOnly"},
@@ -259,10 +284,10 @@ an existing reader rejects or a boot-only prerequisite.
 | --- | --- |
 | `FC-F01` | For both keys, get stored/unset, permitted signed CAS write in an isolated store, injected settings publication, then actual interval/gate consumer. Only the consumer effect witnesses runtime use; get/saved/snapshot log alone must not pass. Page controls remain read-only under this proposal. |
 | `FC-F02` | Interval 59/86401, negative/overflow, boolean/object/array, fractions and malformed text fall back to boot under the current reader; 60/86400 are boundaries. Direct generic store accepts some unusable intervals: demonstrate that gap, then FC-W1 must refuse before SQL. Future UI uses canonical decimal integer seconds, null only for reset; generic 8192-byte/NUL refusals remain. Test gate 0/1/booleans versus malformed renderings separately. |
-| `FC-F03` | Two signed settings writers read t; only one save at t commits/audits, the loser retains draft and rereads. Two creators expect 0: one wins. Slash add/remove are **relay**, not settings writers: settings CAS cannot protect them. Future FC-W2 must race slash versus dashboard on the same relay token; until then dashboard relay mutation is refused. |
+| `FC-F03` | Two signed settings writers read t; only one save at t commits/audits, the loser retains draft and rereads. Two creators expect 0: one wins. Slash add/remove/pause/resume are **relay**, not settings writers: settings CAS cannot protect them, and the lifecycle fence is not optimistic conflict detection. Future FC-W2 must race slash versus dashboard on the same relay token; until then dashboard relay mutation is refused. |
 | `FC-F04` | Inject interval increase/decrease during pending timer: target last-run + new interval, no overlap or phase drift for unchanged value; boot-invalid registration still fails despite a valid stored value. No sleep-based apply guarantee. |
 | `FC-F05` | Existing permitted poller consumes gate 0 then 1: no new pass while parked, already-running work may finish, recovery resumes only when passes resume. Boot-off or denied identity + stored 1 creates no job. Slash routing/publication still uses boot gate at this head. |
-| `FC-F06` | Stored enabled true/false controls selection/admission; missing pause/resume surface yields NOT_EDITABLE, never remove/re-add. After #1720 merges, separately prove paused relay retains history and revalidate in-flight send/recovery behavior before updating this spec; do not borrow unmerged tests. |
+| `FC-F06` | Isolated-store pause/resume preserves identity, source, destination, attempt and nonce/history state. Only transitions change enabled/updated_at; missing/already-state calls leave timestamps unchanged. Enabled + pending refuses pause; paused + restored pending is a no-op, not repair; resume allows recovery discovery. Paused rows stay inspectable. False/missing at poll recheck skips work, but a pass already past it can fetch/write attempt metadata; successful pause fences subsequent fresh claims, not already-admitted work. Repeated lifecycle commands can still audit. Resume uses normal gates/cadence and bounded POST attempts, not immediate catch-up. Dashboard mutation remains NOT_EDITABLE because signed relay verbs/concurrency are absent; never substitute remove/re-add. |
 | `FC-F07` | Foreign session guild: zero signatures/requests and no values. Isolated guild B rows cannot affect guild A readers. Pin receiver's staging constant independently; do not test a fictional body-guild refusal. |
 | `FC-F08` | Same idempotency key/body: one DML/audit. Different body: refusal. Replay after later write returns current CAS; failed side-read or terminal ambiguity yields COMMIT_UNKNOWN. No fresh-key forced retry. |
 | `FC-F09` | CAS unset/prior-value rollback: audited change then fallback after publication, subject to operator overlay. Invalid/deleted stored interval returns **boot**, not last-good. Missing gate returns boot; reset does not undo sent messages or relay history. |
@@ -346,8 +371,8 @@ state, including overlays, boot and activation. Each prerequisite needs its own
 single-repo card and independent tests. A later web page belongs in its own web
 project/card, not this bot checkout. If evidence is insufficient, keep every
 control read-only or choose no-build; do not substitute generic settings for
-relay CRUD. Pending pause/resume and command-live-gate PRs remain independently
-owned and are not prerequisites for writing this design.
+relay CRUD. Merged pause/resume is source evidence only; the independent
+command-live-gate PR is not a prerequisite for writing this design.
 
 Metric at intent review: both existing global keys and all relay field groups
 have reader/state decisions; every fixture has an accepted or rejected oracle.

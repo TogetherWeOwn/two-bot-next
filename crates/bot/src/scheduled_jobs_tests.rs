@@ -2,6 +2,8 @@
 mod event_reminder_acceptance;
 #[path = "event_reminder_regression_tests.rs"]
 mod event_reminder_regression;
+#[path = "scheduled_phase_isolation_acceptance_tests.rs"]
+mod phase_isolation_acceptance;
 #[path = "scheduled_uncertainty_acceptance_tests.rs"]
 mod uncertainty_acceptance;
 
