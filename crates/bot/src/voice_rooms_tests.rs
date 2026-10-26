@@ -5766,8 +5766,16 @@ async fn channel_manage_channels_never_bypasses_voice_restrictions_or_configurat
         "defaultlimit",
         "alwaysprivate",
     ] {
+        // `/textchannels` strictly decodes its options before the
+        // permission check, so it needs its required `channel` option to
+        // reach the authority refusal under test.
+        let options = if name == "textchannels" {
+            vec![channel_option("channel", CREATOR)]
+        } else {
+            vec![]
+        };
         let mut interaction = voice_interaction(
-            Some(command_data(name, vec![])),
+            Some(command_data(name, options)),
             Some(Permissions::MANAGE_CHANNELS),
             true,
         );
