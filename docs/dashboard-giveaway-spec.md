@@ -14,7 +14,7 @@ draw, and run its lifecycle without rewriting history. A browser draft is
 **not** a giveaway, and a stored giveaway row is **not** a drawn result.
 
 **Recommend wiring-first, not a dashboard editor over today's surface.**
-Inventory at source commit `baa387910bf8191f1632f07b03bf77c2c4713804` finds
+Inventory at source commit `1441cbef76a1c8237a3a91a8944e2d25b66c4ce4` finds
 eight shipped slash subcommands, but no guild template/config store, no signed
 giveaway read or lifecycle verb, no revision column, and unaudited
 pause/resume/extend. After intent acceptance, the smallest eventual page is a
@@ -26,8 +26,8 @@ is built by this spec, including the narrowed read-only page.
 ## Source-backed inventory
 
 Giveaways are per-giveaway slash options only: one `giveaway` command with
-eight subcommands (`crates/core/src/feature_commands.rs:272`), all gated by
-`PERM_MANAGE_GUILD` (`:274`; bit 32, `crates/core/src/commands.rs:286`).
+eight subcommands (`crates/core/src/feature_commands.rs:281`), all gated by
+`PERM_MANAGE_GUILD` (`:283`; bit 32, `crates/core/src/commands.rs:286`).
 Entry buttons stay open to members. There is no guild template, default, or
 configuration row: create carries prize, duration, winners, one required role
 and two age gates as invocation options
@@ -212,7 +212,7 @@ validates their presence, not runtime effects.
 ```json
 {
   "schema": "dashboard.giveaway.v1",
-  "source_sha": "baa387910bf8191f1632f07b03bf77c2c4713804",
+  "source_sha": "1441cbef76a1c8237a3a91a8944e2d25b66c4ce4",
   "controls": [
     {"id":"GW-C1","slash":"create","state":"draft_only","gate":["GW-W1"],"evidence":["E-CMD","E-PERM","E-VALIDATE","E-CREATE","E-QUOTA","E-AUDIT-CREATE"]},
     {"id":"GW-C2","slash":"list","state":"candidate_readonly","gate":["GW-W1"],"evidence":["E-LIST","E-PERM"]},
@@ -234,8 +234,8 @@ validates their presence, not runtime effects.
     {"id":"GW-S8","state":"absent","reason":"no_template_config_history_or_prize_claim_store","evidence":["E-CMD","E-LIST"]}
   ],
   "evidence": {
-    "E-CMD":{"path":"crates/core/src/feature_commands.rs","line":272,"contains":"giveaway_command"},
-    "E-PERM":{"path":"crates/core/src/feature_commands.rs","line":274,"contains":"PERM_MANAGE_GUILD"},
+    "E-CMD":{"path":"crates/core/src/feature_commands.rs","line":281,"contains":"giveaway_command"},
+    "E-PERM":{"path":"crates/core/src/feature_commands.rs","line":283,"contains":"PERM_MANAGE_GUILD"},
     "E-VALIDATE":{"path":"crates/core/src/giveaway.rs","line":201,"contains":"pub fn validate_new_giveaway"},
     "E-VALIDATE-EXTEND":{"path":"crates/core/src/giveaway.rs","line":325,"contains":"pub fn extend_deadline_ms"},
     "E-STATUS":{"path":"crates/core/src/giveaway.rs","line":63,"contains":"ALL: [Self; 5]"},
