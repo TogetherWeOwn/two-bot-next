@@ -191,13 +191,22 @@ input excerpt in success, refusal, or error shapes.
 
 | Field | Values | Notes |
 | --- | --- | --- |
-| Result | `matched` / `no_match` / `exempt` / `not_evaluated` | `not_evaluated` covers disabled or out-of-scope (§5) with one generic line |
-| Deciding filter | one of the six `as_str` names | **First match only**, exactly like live; later filters are neither evaluated-for-report nor hinted at |
-| Deciding knob | setting *name(s)* from the table below | Never a value: no bad word, no threshold number, no list size, no "4 of 5 mentions" near-miss |
+| Result | `matched` / `no_match` / `exempt` / `partial` / `not_evaluated` | `partial` means repeat evaluation is `indeterminate` (§5.1); `not_evaluated` covers disabled or out-of-scope (§5) with one generic line |
+| Deciding filter | one of the six `as_str` names, only for `matched` | **First match only**, exactly like live; absent for `partial`, which stops at the unproven repeat check without evaluating later filters |
+| Deciding knob | setting *name(s)* from the table below, only for a match or exemption | Never a value: no bad word, no threshold number, no list size, no "4 of 5 mentions" near-miss; absent for `partial` |
 | Exemption class | `exempt_channel` / `bypass_role` | The invoker's own channel/roles; no ids printed |
-| Mode consequence | fixed sentence for `dry_run` or `enforce` | §5; a consequence statement, not a sanction prediction |
-| Config currency | `current at <UTC time>` | No hash/fingerprint of the policy (a digest of the word list is dictionary-confirmable offline), no revision contents |
+| Mode consequence | fixed sentence for `dry_run` or `enforce` | §5; a consequence statement, not a sanction prediction; absent for `not_evaluated`, which has no effective mode |
+| Config currency | `current at <UTC time>` | No hash/fingerprint of the policy (a digest of the word list is dictionary-confirmable offline), no revision contents; absent for `not_evaluated` |
 | Fixed caveats | first-match order; preview not recorded (§5.1); sanction/protection not previewed | Same words every time |
+
+For `partial`, the reply uses the fixed sentence *Repeat evaluation is
+indeterminate; no complete first-match verdict is available.* It includes
+mode and config currency, but no deciding filter or knob. It never reports
+`no_match` or a later filter. An exemption or `bad_words` match still
+short-circuits before repeat evaluation and remains a complete result;
+`partial` applies only when execution reaches the unproven repeat check.
+Rate refusals and unavailable errors use the generic lines specified in
+§4.3 and §6, not a fabricated verdict.
 
 Knob mapping (names only; ranges/defaults stay in
 [configuration](configuration.md#settings-catalog), which preview holders
@@ -449,12 +458,18 @@ target fetch, no `target_gate`, no `plan`, no executor call.
   messages, claim/violation stores, or any file. **Its hash must not be
   stored either** — a digest of a guessed phrase confirms the guess
   offline, the same reason no policy fingerprint is shown (§3.2). The
-  canary test (§8) greps every sink for the sentinel string itself and
-  for its precomputable digests (e.g. SHA-256, MD5 hex); the repeat
-  tracker's per-process `DefaultHasher` digest
-  (`crates/core/src/automod.rs:375-381`) is not precomputable, so there
-  the proof is the tracker's immutability plus its digest-only shape,
-  not a grep.
+  canary test (§8) checks every sink for the raw and normalized sentinel
+  and their digests (including SHA-256/MD5 hex). It must also compute the
+  actual repeat digest through the same `digest_content` helper and
+  normalization as the matcher, under the pinned toolchain
+  (`crates/core/src/automod.rs:375-381`), and check its emitted
+  representations, including decimal u64 `Debug`/`Display` and hex forms.
+  `DefaultHasher::new()` does **not** use a process-random seed: its
+  digest is offline-computable for a guessed phrase on that toolchain,
+  even though the algorithm is not stable across Rust releases. Never
+  substitute tracker immutability for this sink check: a read-only
+  evaluation can log a digest without changing a row. The independent
+  tracker-immutability proof (§5.1) is required as well.
 - Discord itself transports the slash option; bot-side rules cannot
   govern Discord's own handling. Command help text must warn: *test the
   smallest synthetic phrase; do not paste real member messages
@@ -469,17 +484,26 @@ target fetch, no `target_gate`, no `plan`, no executor call.
   refusal, mapped onto its columns with enum-only values:
   `id = automod-preview:<interaction_id>`, `guild_id`, `actor_id`
   (invoker), `action = automod.preview`, `target_key` (channel id),
-  `outcome` (one of `matched`, `no_match`, `exempt`, `rate_limited`),
-  and `reason` built *only* from enums —
+  `outcome` (one of `matched`, `no_match`, `exempt`, `partial`,
+  `rate_limited`), and `reason` built *only* from enums —
   `filter=<name|none>;mode=<dry_run|enforce>;len=<bucket>` with input
   length bucketed as `0_50` / `51_500` / `501_2000` UTF-16 units (a
-  length, never content). Plus a fixed-label metric counter (`result`,
-  `filter`, `mode` — the closed vocabularies of §3.2 only).
-  `not_evaluated` attempts get the metric but no row: they are outside
-  the scoped guild's audit story and carry no oracle bit.
+  length, never content). `partial` always means repeat evaluation was
+  `indeterminate`, with `filter=none`; replay reconstructs exactly the
+  partial reply of §3.2, never `no_match` or a later-filter verdict.
+  Plus a fixed-label metric counter with these closed vocabularies:
+  `result=matched|no_match|exempt|partial|rate_limited|not_evaluated|unavailable`,
+  `filter=<one of the six names|none>`, and
+  `mode=dry_run|enforce|not_evaluated`. The last mode value is a sentinel
+  for no effective config snapshot, not an automod runtime mode.
+  `not_evaluated` attempts get the metric with
+  `result=not_evaluated,filter=none,mode=not_evaluated` but no row: they
+  are outside the scoped guild's audit story and carry no oracle bit.
   **Audit failure fails closed:** if the row cannot be written, the
   verdict is suppressed and the reply is the generic unavailable line;
-  an unaudited oracle is worse than a briefly unavailable one.
+  the metric uses `result=unavailable,filter=none`, with the effective
+  mode if a snapshot exists or `mode=not_evaluated` otherwise. An
+  unaudited oracle is worse than a briefly unavailable one.
   Redelivery is fenced by a read-before-evaluate gate, not by the
   insert alone (`audit_once` deduplicates facts, not executions,
   `crates/core/src/custom_command_store.rs:39-51`): after strict decode
@@ -545,10 +569,10 @@ until slice 4. Each row names the proof, not a vague area.
 | T4 | Order masking | Text matching `bad_words` + invite + repeats → `bad_words` only; text matching mention + invite → `mention_spam` only |
 | T5 | Cross-author isolation | Author B's real repeat streak never affects author A's preview verdict |
 | T6 | Exemptions | Invoker with bypass role / in exempt channel → `exempt` with class only, matcher not reached |
-| T7 | Scope/mode matrix | Disabled, out-of-scope guild, DM → identical `not_evaluated`; dry-run vs enforce → same filter, different consequence sentence |
+| T7 | Scope/mode matrix | Disabled, out-of-scope guild, DM → identical `not_evaluated`, no audit row or mode/currency in reply, metric `result=not_evaluated,filter=none,mode=not_evaluated`; dry-run vs enforce → same filter, different consequence sentence |
 | T8 | Permission matrix | ManageGuild admitted; ManageMessages/ModerateMembers/everyone refused by router; picker default alone insufficient if bits absent |
 | T9 | Output disclosure | Verdict struct field inventory test; for a property set of inputs, replies contain no input substring and render no threshold value (only knob names) |
-| T10 | Canary | Unique sentinel text and its precomputable digests (SHA-256/MD5 hex) absent from captured logs, audit rows, metrics, errors, and reply; tracker rows unchanged (§6) |
+| T10 | Canary | Raw/normalized sentinel and digests (SHA-256/MD5 hex plus actual matcher repeat digest, including decimal u64 Debug/Display and hex forms) absent from captured logs, audit rows, metrics, errors, and reply; independently, tracker rows unchanged (§6). Deliberately logging a computed repeat digest must fail the sink check even with an unchanged tracker |
 | T11 | Bounds | 2,000 units ok / 2,001 refused; astral-plane chars counted in UTF-16; 10 attachments ok / 11 refused; a filename without a dot is treated as its own extension, as live; `mentions` 100 ok / 101 refused; whitespace-only text refused bare, evaluated with attachments, and evaluated with `mentions` at the limit → `mention_spam` (§3.1) |
 | T12 | Rate limiter | Paused-clock boundaries for 5 s / hourly / daily caps; refusal does not evaluate (matcher call count 0); full-map refuses new actor |
 | T13 | Zero pipeline writes | Mock ledger/executor/funnel counters all 0 after matched preview in enforce mode |
@@ -557,6 +581,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T16 | Injection | Text with `<@everyone>`, markdown, URLs → reply byte-shape is a fixed template, `allowed_mentions` empty |
 | T17 | Redelivery | Same interaction delivered twice sequentially: matcher call count 1, one audit row, identical replies incl. currency time; concurrently: both replies equal the first stored row (§6) |
 | T18 | Registration scope | Publish set contains `automod-preview` only for the configured guild when the automod scope admits it; absent for the live guild without approval (§5.0) |
+| T19 | Unproven repeat equivalence | When repeat equivalence cannot be proven and execution reaches that check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
 
 ## 9. Future build slices (each ≤1 day, cut-ready; not created here)
 
@@ -568,7 +593,7 @@ slices (2–4) carry the CISO comment-gate.
 1. **Core preview in `crates/core`** — preview entry point over a
    synthetic message + mention count + cloned config: first-match verdict,
    exemption class, deciding-knob names, mode; read-only repeat path per
-   §5.1. Tests T1–T6, T9 (struct shape). Stop/go: if T2 equivalence fails,
+   §5.1. Tests T1–T6, T9 (struct shape), T19. Stop/go: if T2 equivalence fails,
    implement the `indeterminate` fallback or stop — do not ship silent
    fall-through.
 2. **Command definition + permission row (unpublished)** —
@@ -582,7 +607,7 @@ slices (2–4) carry the CISO comment-gate.
    (§4.3), the §6 `automation_audit_log` row + metric with fail-closed
    suppression. No migration is expected (table and erasure entry
    exist); needing one re-opens the slice boundary instead of folding
-   DDL in here. Tests T7, T10–T17 with mock executor/ledger.
+   DDL in here. Tests T7, T10–T17, T19 with mock executor/ledger.
 4. **Publish + docs + staging proof** — add the definition to the
    published moderation set under the §5.0 scope condition (T18),
    regenerate `docs/commands.md`, operator-guide
