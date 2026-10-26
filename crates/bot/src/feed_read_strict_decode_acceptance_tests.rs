@@ -135,15 +135,21 @@ async fn dispatch_on_dead_pool(interaction: &Interaction) -> String {
 async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
     let valid = format!("feed-{LEAK_MARKER}-own");
     let other = format!("feed-{LEAK_MARKER}-other");
-    let cases: Vec<(&str, Interaction)> = vec![
-        ("missing id", inspect(Vec::new())),
+    let cases: Vec<(&str, Interaction, &str)> = vec![
+        (
+            "missing id",
+            inspect(Vec::new()),
+            "Missing id. Use /feed-inspect id:<relay-id>.",
+        ),
         (
             "duplicate string ids",
             inspect(vec![string_id(&valid), string_id(&other)]),
+            "Duplicate id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "duplicate string ids reversed",
             inspect(vec![string_id(&other), string_id(&valid)]),
+            "Duplicate id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "string then wrong-typed id",
@@ -151,6 +157,7 @@ async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
                 string_id(&valid),
                 option("id", CommandOptionValue::Integer(42)),
             ]),
+            "Duplicate id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "wrong-typed then string id",
@@ -158,18 +165,22 @@ async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
                 option("id", CommandOptionValue::Integer(42)),
                 string_id(&valid),
             ]),
+            "Duplicate id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "wrong-typed id alone (integer)",
             inspect(vec![option("id", CommandOptionValue::Integer(42))]),
+            "Invalid id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "wrong-typed id alone (boolean)",
             inspect(vec![option("id", CommandOptionValue::Boolean(true))]),
+            "Invalid id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "wrong-typed id alone (number)",
             inspect(vec![option("id", CommandOptionValue::Number(1.5))]),
+            "Invalid id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "unknown option after valid id",
@@ -177,6 +188,7 @@ async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
                 string_id(&valid),
                 option("extra", CommandOptionValue::Boolean(true)),
             ]),
+            "Unknown option. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "unknown option before valid id",
@@ -187,10 +199,12 @@ async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
                 ),
                 string_id(&valid),
             ]),
+            "Unknown option. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "unknown option alone",
             inspect(vec![option("extra", CommandOptionValue::Boolean(true))]),
+            "Unknown option. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "nested value as id",
@@ -198,6 +212,7 @@ async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
                 "id",
                 CommandOptionValue::SubCommand(vec![string_id(&valid)]),
             )]),
+            "Invalid id. Use /feed-inspect id:<relay-id>.",
         ),
         (
             "nested group alongside valid id",
@@ -208,10 +223,31 @@ async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
                     CommandOptionValue::SubCommandGroup(vec![string_id(&other)]),
                 ),
             ]),
+            "Unknown option. Use /feed-inspect id:<relay-id>.",
+        ),
+        // Combined-invalid precedence: an unknown name wins over a
+        // duplicated id, which wins over a wrong wire type.
+        (
+            "unknown option with duplicate ids",
+            inspect(vec![
+                string_id(&valid),
+                string_id(&other),
+                option("extra", CommandOptionValue::Boolean(true)),
+            ]),
+            "Unknown option. Use /feed-inspect id:<relay-id>.",
+        ),
+        (
+            "unknown option with wrong-typed id",
+            inspect(vec![
+                option("id", CommandOptionValue::Integer(42)),
+                option("extra", CommandOptionValue::Boolean(true)),
+            ]),
+            "Unknown option. Use /feed-inspect id:<relay-id>.",
         ),
     ];
-    for (label, interaction) in &cases {
+    for (label, interaction, expected) in &cases {
         let reply = dispatch_on_dead_pool(interaction).await;
+        assert_eq!(reply, *expected, "{label}: exact correction");
         assert_strict_refusal(&reply, "id", "/feed-inspect");
         assert!(
             !reply.contains("Feed relay `"),
@@ -227,9 +263,17 @@ async fn feed_read_strict_inspect_malformed_shapes_refuse_before_store_read() {
 #[tokio::test]
 async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
     let page = |value: i64| option("page", CommandOptionValue::Integer(value));
-    let cases: Vec<(&str, Interaction)> = vec![
-        ("duplicate pages", list(vec![page(1), page(2)])),
-        ("duplicate pages reversed", list(vec![page(2), page(1)])),
+    let cases: Vec<(&str, Interaction, &str)> = vec![
+        (
+            "duplicate pages",
+            list(vec![page(1), page(2)]),
+            "Duplicate page. Use /feed-list page:<number>.",
+        ),
+        (
+            "duplicate pages reversed",
+            list(vec![page(2), page(1)]),
+            "Duplicate page. Use /feed-list page:<number>.",
+        ),
         (
             "integer then wrong-typed page",
             list(vec![
@@ -239,6 +283,7 @@ async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
                     CommandOptionValue::String(format!("{LEAK_MARKER}-two")),
                 ),
             ]),
+            "Duplicate page. Use /feed-list page:<number>.",
         ),
         (
             "wrong-typed then integer page",
@@ -249,6 +294,7 @@ async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
                 ),
                 page(1),
             ]),
+            "Duplicate page. Use /feed-list page:<number>.",
         ),
         (
             "wrong-typed page alone (string)",
@@ -256,14 +302,17 @@ async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
                 "page",
                 CommandOptionValue::String("second".to_owned()),
             )]),
+            "Invalid page. Use /feed-list page:<number> with a whole number from 1.",
         ),
         (
             "wrong-typed page alone (number)",
             list(vec![option("page", CommandOptionValue::Number(1.5))]),
+            "Invalid page. Use /feed-list page:<number> with a whole number from 1.",
         ),
         (
             "wrong-typed page alone (boolean)",
             list(vec![option("page", CommandOptionValue::Boolean(true))]),
+            "Invalid page. Use /feed-list page:<number> with a whole number from 1.",
         ),
         (
             "unknown option after valid page",
@@ -271,6 +320,7 @@ async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
                 page(1),
                 option("extra", CommandOptionValue::Boolean(true)),
             ]),
+            "Unknown option. Use /feed-list page:<number>.",
         ),
         (
             "unknown option before valid page",
@@ -278,10 +328,12 @@ async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
                 option("extra", CommandOptionValue::Boolean(true)),
                 page(1),
             ]),
+            "Unknown option. Use /feed-list page:<number>.",
         ),
         (
             "unknown option alone",
             list(vec![option("extra", CommandOptionValue::Boolean(true))]),
+            "Unknown option. Use /feed-list page:<number>.",
         ),
         (
             "nested value as page",
@@ -289,6 +341,7 @@ async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
                 "page",
                 CommandOptionValue::SubCommand(vec![page(1)]),
             )]),
+            "Invalid page. Use /feed-list page:<number> with a whole number from 1.",
         ),
         (
             "nested group alongside absent page",
@@ -296,10 +349,34 @@ async fn feed_read_strict_list_malformed_shapes_refuse_before_store_read() {
                 "group",
                 CommandOptionValue::SubCommandGroup(vec![page(2)]),
             )]),
+            "Unknown option. Use /feed-list page:<number>.",
+        ),
+        // Combined-invalid precedence: an unknown name wins over a
+        // duplicated page, which wins over a wrong wire type.
+        (
+            "unknown option with duplicate pages",
+            list(vec![
+                page(1),
+                page(2),
+                option("extra", CommandOptionValue::Boolean(true)),
+            ]),
+            "Unknown option. Use /feed-list page:<number>.",
+        ),
+        (
+            "unknown option with wrong-typed page",
+            list(vec![
+                option(
+                    "page",
+                    CommandOptionValue::String(format!("{LEAK_MARKER}-two")),
+                ),
+                option("extra", CommandOptionValue::Boolean(true)),
+            ]),
+            "Unknown option. Use /feed-list page:<number>.",
         ),
     ];
-    for (label, interaction) in &cases {
+    for (label, interaction, expected) in &cases {
         let reply = dispatch_on_dead_pool(interaction).await;
+        assert_eq!(reply, *expected, "{label}: exact correction");
         assert_strict_refusal(&reply, "page", "/feed-list");
         assert!(
             !reply.contains("Page ") || reply.contains("/feed-list"),
@@ -400,12 +477,32 @@ async fn feed_read_strict_malformed_invocations_leave_saved_relays_and_audit_unt
         ]),
         list(vec![option("extra", CommandOptionValue::Boolean(true))]),
     ];
-    let expected: Vec<(&str, &str)> = vec![
-        ("id", "/feed-inspect"),
-        ("id", "/feed-inspect"),
-        ("page", "/feed-list"),
-        ("page", "/feed-list"),
-        ("page", "/feed-list"),
+    let expected: Vec<(&str, &str, &str)> = vec![
+        (
+            "id",
+            "/feed-inspect",
+            "Duplicate id. Use /feed-inspect id:<relay-id>.",
+        ),
+        (
+            "id",
+            "/feed-inspect",
+            "Unknown option. Use /feed-inspect id:<relay-id>.",
+        ),
+        (
+            "page",
+            "/feed-list",
+            "Duplicate page. Use /feed-list page:<number>.",
+        ),
+        (
+            "page",
+            "/feed-list",
+            "Duplicate page. Use /feed-list page:<number>.",
+        ),
+        (
+            "page",
+            "/feed-list",
+            "Unknown option. Use /feed-list page:<number>.",
+        ),
     ];
     for interaction in &malformed {
         runtime.on_interaction(interaction).await;
@@ -414,7 +511,8 @@ async fn feed_read_strict_malformed_invocations_leave_saved_relays_and_audit_unt
     // `patch_contents` pins mention safety on every completion.
     let contents = patch_contents(&mock);
     assert_eq!(contents.len(), malformed.len(), "one completion each");
-    for (content, (option_name, command)) in contents.iter().zip(&expected) {
+    for (content, (option_name, command, expected)) in contents.iter().zip(&expected) {
+        assert_eq!(content.as_str(), *expected, "exact correction");
         assert_strict_refusal(content, option_name, command);
         assert!(
             !content.contains("feed-own") && !content.contains("feed-foreign"),
