@@ -261,8 +261,14 @@ seats. Proposed additional hard bounds: <=1,000 retained policies/guild;
 <=20 editor attempts/actor/guild/minute; <=50,000 retained receipts/guild and
 <=1,000/event, with no eviction of live replay guards to make room. At receipt
 capacity refuse new B actions `SAFETY_LIMIT`; a no-write read remains available.
-This can delay Declined, just as existing rate/storage limits can; do not falsely
-report success. New explicit actions can retry after eligible cleanup. Point
+A full receipt store cannot remember another refusal: atomically advance that
+event's non-subject `action_not_before` to DB UTC +30 seconds before replying,
+so the unrecorded old operation cannot execute after space frees. This has the
+same fresh-click tradeoff as erasure; never evict a guard or claim a remembered
+outcome. If even that fence cannot persist, keep B writes unavailable through
+the intake/proof expiry window and reconcile before reopening. This can delay
+Declined, just as existing rate/storage limits can; do not falsely report success.
+New explicit actions can retry after eligible cleanup and the action fence. Point
 reads are O(1), authorized pages <=25, cleanup <=25 expired rows/pass in existing
 retention machinery, no whole-member scan or perpetual per-event timer. Use
 existing stricter pacing/timeout limits; retries count against the stated budgets.
@@ -272,10 +278,14 @@ storage, excluding WAL/backups/audit. These are unmeasured sizing assumptions,
 not authorized spend or measured headroom. Measure in disposable fixtures before
 any activation; reduce bounds or choose A rather than purchase capacity.
 
-Every local/direct/shared-database RSVP writer, compensation path, policy writer,
-retention/erasure executor and restore/import must be inventoried before enabling
-B. An unchanged writer can bypass a new cutoff; no cross-repository compatibility
-is verified here. Keep B dark if any writer cannot be fenced or safely excluded.
+Every local/direct/shared-database writer must be inventoried before enabling B.
+Known local seams: both `rsvp_store.rs` upsert wrappers, compensation/pruning;
+`crates/cutover/src/member_erasure.rs:256-334`, generic deletes in
+`crates/cutover/src/retention.rs:1230-1242,1442-1453`, backup restore in
+`crates/core/src/backup/dump.rs:617-647`, and rollback import in
+`crates/cutover/src/rollback_import.rs:447-464`. This list is not a complete
+cross-repository proof. An unchanged writer can bypass cutoff; keep B dark if
+any writer cannot be fenced or safely excluded.
 
 **Reminder contract is unchanged.** Closing/clearing cutoff neither changes RSVP
 rows nor filters existing Going/Interested. An allowed Declined before reminder
@@ -332,6 +342,9 @@ nonzero, without inventing today's HTTP statuses:
 | `UNAVAILABLE / POLICY_UNKNOWN`, `AUTHORITY_UNKNOWN`, `EVENT_UNKNOWN`, `CLOCK_UNKNOWN`, `STORE_UNKNOWN` | true / `retry_fresh_preview_when_available` |
 | `UNKNOWN / COMMIT_UNKNOWN` | false / `inspect_same_operation_no_new_save` |
 
+`mutated` describes RSVP/cutoff business state, not operational receipt or replay
+fence bookkeeping. Those writes remain atomic and private. A fence-expired
+operation returns `INTENT_EXPIRED`, not a cached historical success.
 A replay response additionally carries `replayed:true`, original constant outcome
 and an authorized **current** policy revision/state if readable; unknown current
 state is explicit, never inferred from an old receipt. Reauthorization precedes
@@ -365,7 +378,7 @@ real member data, staging/production DB tests or live RSVP actions.
 | R13 | Live member/event changes pre/post write; concurrent newer response | Existing compensation fences retained; no success on invalid positive postcheck; no stale overwrite |
 | R14 | Declined before / after reminder admission; close/reopen | Fresh recipients / disclosed in-flight limit; permanent fence and all volume/mention limits unchanged |
 | R15 | Erasure during proof, unseen delayed action, receipt TTL, restore | No erased-subject resurrection; event action fence/proof expiry wins; no identity tombstone; dry-run zero writes |
-| R16 | Each exact cap/cap+1; same-choice at cap; unavailable policy | No overflow/guard eviction, no-op writes zero, no missing-policy fallback; actual reductions remain budgeted |
+| R16 | Each exact cap/cap+1; same-choice at cap; unavailable policy | No overflow/guard eviction, business no-op writes zero, no missing-policy fallback; receipt-cap refusal fences replay after cleanup; actual reductions remain budgeted |
 
 Run now from the repo root:
 
