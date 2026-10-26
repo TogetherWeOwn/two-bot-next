@@ -281,7 +281,7 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
     let mut outcomes: Vec<Option<Observed>> = Vec::new();
     if reached {
         for (id, command, options, _field) in &malformed {
-            let input = interaction(*id, *command, options.clone());
+            let input = interaction(*id, command, options.clone());
             let start = mock.requests().len();
             let timed = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -341,7 +341,7 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
         let observed = outcome
             .as_ref()
             .expect("malformed writer must not wait behind the held publication");
-        correction(observed, *field);
+        correction(observed, field);
     }
     assert_eq!(
         accesses_after, 0,
