@@ -136,22 +136,24 @@ claims; missing in a bounded 100-message search is not authoritative absence.
 Relay removal and delivery admission share one bounded guild/feed-scoped
 database fence (`pg_advisory_xact_lock`, held only across short statements,
 never across network IO, with `lock_timeout = '5s'` / `statement_timeout =
-'15s'`). Removal atomically refuses with a fixed recovery-required reply and
-audit outcome while any pending delivery row for that guild/feed is unresolved,
-retaining relay and ledger; a stale polled relay revalidates existence under
-the same fence, so it can never POST after removal has confirmed. Ordinary
-settled/no-pending removal, not-found and foreign-guild behavior are unchanged.
-No blind resend, history-based absence claim or operator release authority is
-introduced: the member waits for the existing nonce reconciliation, then
-removes again.
+'15s'`). Removal atomically refuses with a private evidence snapshot (stable
+id, guild/relay-scoped unresolved count, no-change statement, wait plus
+`/feed-inspect` guidance) and the `recovery_required` audit outcome while any
+pending delivery row for that guild/feed is unresolved, retaining relay and
+ledger; a stale polled relay revalidates existence under the same fence, so
+it can never POST after removal has confirmed. Ordinary settled/no-pending
+removal, not-found and foreign-guild behavior are unchanged. No blind resend,
+history-based absence claim or operator release authority is introduced: the
+member waits for the existing nonce reconciliation, then removes again.
 
 Pause and resume share that same fence and change only the relay's
 lifecycle state (`enabled`/`updated_at`): URL, destination, seen-item
 high-water and the delivery/nonce ledger are preserved verbatim, and pending
 or uncertain-send settlement is untouched. An enabled-to-paused transition
-refuses — leaving the relay enabled with a fixed retry-after-recovery reply —
-while any pending delivery row for that guild/feed is unresolved, because
-pending discovery only reads enabled relays and pausing would strand recovery.
+refuses — leaving the relay enabled with the same private evidence snapshot
+and retry-after-recovery guidance — while any pending delivery row for that
+guild/feed is unresolved, because pending discovery only reads enabled relays
+and pausing would strand recovery.
 An already-paused relay returns the idempotent already-paused outcome before
 checking pending evidence, without changing any stored state. If a restored
 paused relay carries pending evidence, resume it to restore recovery discovery.
