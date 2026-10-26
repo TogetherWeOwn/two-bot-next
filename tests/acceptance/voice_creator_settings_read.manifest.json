@@ -1,0 +1,50 @@
+{
+  "schema": "two-bot.acceptance.v1",
+  "title": "Read saved creator settings when position, group or textchannels has no change option",
+  "baseline_sha": "b5776432c5c1df36f14af5843c17140aae07b5f7",
+  "branch": "test/voice-creator-settings-read-acceptance",
+  "protected_files": [
+    {
+      "path": "crates/bot/src/voice_creator_settings_read_acceptance_tests.rs",
+      "sha256": "68f72082ecceda28320c03a8da34f3dccfc0171c8c129ac4f6b64c951534352e",
+      "tests": 14
+    }
+  ],
+  "registration": {
+    "path": "crates/bot/src/voice_rooms_tests.rs",
+    "module": "creator_settings_read_acceptance",
+    "source": "voice_creator_settings_read_acceptance_tests.rs",
+    "policy": "Preserve registration. The tests-only parent is not frozen wholesale; its other test modules and legacy pure decision tests are outside this protected file."
+  },
+  "commands": {
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib creator_settings_read_acceptance:: -- --nocapture",
+    "controls": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib creator_settings_read_acceptance::control_ -- --nocapture",
+    "voice_regressions": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::",
+    "format": "cargo fmt --all -- --check",
+    "hosted_runtime": "cargo test -p two-bot --lib --locked creator_settings_read_acceptance:: -- --nocapture"
+  },
+  "contract": {
+    "dispatch": "Decode a complete synthetic INTERACTION_CREATE envelope with Twilight GatewayEventDeserializer; pass the resulting Event through the actual VoiceResponder EventSink. No direct decide/summary helper calls supply the expected result.",
+    "reads": "Channel-only position, group and textchannels return the existing private summary for the selected saved creator. Alternating two creators preserves all whole rows and has exactly zero successful add_creator writes; the store has no configured write error, so attempted creator writes succeed and are counted.",
+    "text": "Cover custom name/extra role, off with retained configuration, default voice-chat with occupants/admins, and everyone visibility.",
+    "saves": "Side-only and number-only position edits, both group booleans, textchannels false, name-only and viewer-only edits save once, preserve unrelated fields and the other creator, and retain existing private summaries.",
+    "refusals": "Unknown creator and missing Manage Channels each reject read and edit packets for all three commands with existing exact copy, private responses, zero writes and unchanged rows. Permission-denial exact copy also excludes settings disclosure.",
+    "oracle": "Literal hand-checked baseline summary/refusal strings, explicit successful write counts, and full CreatorChannel equality. No expected response is derived from a production renderer."
+  },
+  "expected_baseline": {
+    "total": 14,
+    "intended_assertion_failures": 5,
+    "healthy_controls": 9,
+    "failures": [
+      "position_channel_only_reads_saved_placement_without_writing",
+      "group_channel_only_reads_saved_grouping_without_writing",
+      "textchannels_channel_only_reads_saved_companions_without_writing",
+      "textchannels_read_uses_default_name_and_private_viewers_without_saving",
+      "textchannels_read_reports_everyone_without_saving"
+    ],
+    "observed": false,
+    "evidence": "Local bounded-cache commands refused exit 75: no idle, below-budget slot; no per-worktree fallback. This is not behavioral RED and not a compile or control pass. Actual exact-head evidence belongs in the task handoff."
+  },
+  "ownership": "Tests-only failing-first handoff. Builder consumes the immutable pushed SHA, verifies the protected file hash, and makes it GREEN unchanged in one implementation PR. Do not merge this RED branch alone. Test Author owns oracle corrections. The combined PR requires exact-head CI and independent review, then squash auto-merge.",
+  "safety": "Synthetic gateway packet, established in-memory Store/Http/Replies doubles, no network or database, no production source/migration/workflow edits, no ignored tests or gate waivers."
+}
