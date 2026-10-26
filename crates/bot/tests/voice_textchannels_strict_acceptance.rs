@@ -925,7 +925,7 @@ async fn omitted_optional_fields_preserve_existing_receipts_and_state() {
         let response = fixture.dispatch("textchannels", options.clone()).await;
         assert_eq!(
             private_text(&response),
-            receipt,
+            *receipt,
             "/textchannels omission receipt"
         );
         let observed = fixture.state.lock().expect("observation lock");
