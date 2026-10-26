@@ -2,11 +2,12 @@
 
 Sole manifest: `- [Purpose](relative.md)` by area.
 
-Run `python3 scripts/check_docs_index.py --json` from repo root.
-Sorted `{missing,stale,oversize}` path arrays: empty = PASS/0; else fix rows/size (exit 1).
-Malformed/duplicate rows appear as `docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions/reasons:
-`scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Repo root: `python3 scripts/check_docs_index.py --json`.
+Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
+else exit 1, repair rows/split docs. Bad/duplicate rows use
+`docs/README.md:<line>` in `stale`.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
+and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
 
 ## References and architecture
 
@@ -101,7 +102,8 @@ Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions/reasons:
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
-- [Args substitution (design only)](custom-command-args-spec.md)
+- [Response page proposal](dashboard-custom-responses-spec.md)
+- [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
 - [Onboarding page (design only)](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
@@ -118,11 +120,12 @@ Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions/reasons:
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
 - [Backup-host handoff](lfg-backup-host-spec.md)
-- [LFG reuse (design only)](lfg-reuse-spec.md)
+- [LFG reuse](lfg-reuse-spec.md)
 - [LFG thread](lfg-thread-spec.md)
-- [LFG voice (design only)](lfg-voice-room-spec.md)
+- [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
+- [Relay move (design only)](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Staff game mix report](game-activity-report.md)
@@ -130,11 +133,11 @@ Budgets: index <12,000 bytes; docs ≤65,536 bytes. Legacy exceptions/reasons:
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
-- [Session-change notices (design only)](event-change-notices-spec.md)
-- [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
-- [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
+- [Notice proposal](event-change-notices-spec.md)
+- [Reminder design](event-reminder-preferences-spec.md)
+- [RSVP design](rsvp-capacity-spec.md)
 - [Private agenda (design only)](event-agenda-spec.md)
-- [Calendar handoff (design only)](event-calendar-handoff-spec.md)
+- [Calendar design](event-calendar-handoff-spec.md)
 - [Event role (design only)](event-role-spec.md)
 - [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
