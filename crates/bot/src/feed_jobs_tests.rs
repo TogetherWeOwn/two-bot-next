@@ -2061,9 +2061,6 @@ async fn wait_for_advisory_waiters(
 
 #[tokio::test]
 #[ignore = "requires guarded agent-testdb; CI runs explicitly"]
-// The recovery refusal is matched with `{ .. }` so this pin stays valid
-// whether the variant is a unit or carries a typed evidence payload.
-#[allow(clippy::unneeded_struct_pattern)]
 async fn fresh_claim_waits_before_pending_removal_is_refused() {
     let db = fixture().await;
     let relay = feed("contended-claim-first");
@@ -2118,10 +2115,7 @@ async fn fresh_claim_waits_before_pending_removal_is_refused() {
     let claim_result = claim_join.expect("claim task must not panic");
     let removal_result = removal_join.expect("removal task must not panic");
     let claim_is_fresh = matches!(claim_result, Ok(Some(DeliveryClaim::Fresh)));
-    let removal_was_refused = matches!(
-        removal_result,
-        Ok(store::FeedRemoval::RecoveryRequired { .. })
-    );
+    let removal_was_refused = matches!(removal_result, Ok(store::FeedRemoval::RecoveryRequired));
     let relay_after_release = relay_count(&remover, &relay.id).await;
     let rows_after_release = delivery_rows(&remover, &relay.id).await;
     let expected_rows = vec![(

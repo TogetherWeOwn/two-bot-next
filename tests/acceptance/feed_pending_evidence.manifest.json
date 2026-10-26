@@ -13,16 +13,6 @@
       "path": "crates/bot/src/feed_pause_resume_acceptance_tests.rs",
       "sha256": "223a403c68e3c22aeb99cbd9848ade70067fed048e9add9168808f2d4b7dd2f9",
       "change": "Register the new child module in an existing tests-only parent; preserve all 34 original tests and assertions"
-    },
-    {
-      "path": "crates/bot/src/feed_jobs_tests.rs",
-      "sha256": "d68781bdb95cd9eadc3cd227815fbe58c7d38e98590551d5e01bbd6a63145395",
-      "change": "Match recovery refusal independent of unit versus payload variant shape; preserve the existing admission/removal race assertions"
-    },
-    {
-      "path": "crates/core/tests/feeds_store.rs",
-      "sha256": "db5c829a0d5c4d02515624cb9e896fbcc627549ac3de1b4fd28113fa984c33fa",
-      "change": "Keep the existing store refusal assertion compatible with a typed recovery payload, without changing its semantic expectation"
     }
   ],
   "commands": {
@@ -75,6 +65,7 @@
     "Expected baseline behavior is six assertion failures for missing evidence UX and four healthy controls. This is an expectation, not a claim of an observed run; actual results and CI links are recorded in the task handoff document.",
     "Local cache refusal is not test RED and authorizes no direct Cargo, new target directory, cache cleanup or gate bypass.",
     "Retain compatible recovery-required audit semantics and safe retry of the lifecycle operation only after reconciliation. Existing command/help registry counts do not change because no command is added.",
-    "Builder owns implementation GREEN, reference/runbook explanation, all review fixes, exact-head CI/review, auto-merge and delivery evidence in one combined PR."
+    "Builder owns implementation GREEN, reference/runbook explanation, all review fixes, exact-head CI/review, auto-merge and delivery evidence in one combined PR.",
+    "Compatible existing pins are cited by name in existingPins and left unmodified at baseline. If the Builder design changes the shared refusal enum shape such that a cited pin no longer compiles, the Test Author issues a follow-up correction; the Builder never edits test files to fit."
   ]
 }

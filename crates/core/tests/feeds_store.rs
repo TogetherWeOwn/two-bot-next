@@ -174,9 +174,6 @@ fn post(feed: &FeedRelay, key: &str) -> FeedPost {
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb; CI runs explicitly"]
-// The recovery refusal is matched with `{ .. }` so this pin stays valid
-// whether the variant is a unit or carries a typed evidence payload.
-#[allow(clippy::unneeded_struct_pattern)]
 async fn feed_crud_audit_scope_and_timestamp_roundtrip() {
     let (pool, schema) = setup().await;
     let feed = relay();
@@ -226,11 +223,9 @@ async fn feed_crud_audit_scope_and_timestamp_roundtrip() {
         .await
         .unwrap()
         .is_some());
-    assert!(
-        matches!(
-            remove_feed(&pool, "guild-1", &feed.id).await.unwrap(),
-            FeedRemoval::RecoveryRequired { .. }
-        ),
+    assert_eq!(
+        remove_feed(&pool, "guild-1", &feed.id).await.unwrap(),
+        FeedRemoval::RecoveryRequired,
         "unresolved pending evidence refuses removal and retains the ledger"
     );
     assert!(
