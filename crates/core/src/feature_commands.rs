@@ -483,24 +483,39 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
-        CommandDefinition::new("lfg-edit", "Update a raid/LFG title or start time")
-            .permissions(PERM_MANAGE_EVENTS)
-            .options(vec![
-                CommandOption::new(
-                    "id",
-                    "LFG id from the posted signup",
-                    CommandOptionType::String,
-                )
-                .required()
-                .max_length(MAX_RESOURCE_ID_CHARS as u32),
-                CommandOption::new("title", "Event or group title", CommandOptionType::String)
-                    .max_length(MAX_TITLE_CHARS as u32),
-                CommandOption::new(
-                    "starts-at",
-                    "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
-                    CommandOptionType::String,
-                ),
-            ]),
+        CommandDefinition::new(
+            "lfg-edit",
+            "Update LFG metadata or increase one role's seats",
+        )
+        .permissions(PERM_MANAGE_EVENTS)
+        .options(vec![
+            CommandOption::new(
+                "id",
+                "LFG id from the posted signup",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32),
+            CommandOption::new("title", "Event or group title", CommandOptionType::String)
+                .max_length(MAX_TITLE_CHARS as u32),
+            CommandOption::new(
+                "starts-at",
+                "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                CommandOptionType::String,
+            ),
+            CommandOption::new(
+                "role",
+                "Existing signup role key (use with seats)",
+                CommandOptionType::String,
+            )
+            .max_length(crate::lfg::MAX_ROLE_KEY_CHARS as u32),
+            CommandOption::new(
+                "seats",
+                "Absolute seat target, increase only (1-99; use with role)",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, i64::from(crate::lfg::MAX_ROLE_SLOTS)),
+        ]),
         CommandDefinition::new("lfg-list", "List open game posts in this channel")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![CommandOption {
@@ -932,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn lfg_edit_advertises_only_bounded_metadata_options_in_publish_order() {
+    fn lfg_edit_advertises_bounded_metadata_and_seat_options_in_publish_order() {
         let announcements = announcement_commands();
         let close = announcements
             .iter()
@@ -945,7 +960,7 @@ mod tests {
             serde_json::to_value(edit).expect("command serializes"),
             serde_json::json!({
                 "name": "lfg-edit",
-                "description": "Update a raid/LFG title or start time",
+                "description": "Update LFG metadata or increase one role's seats",
                 "dm_permission": false,
                 "default_member_permissions": "8589934592",
                 "options": [
@@ -954,7 +969,11 @@ mod tests {
                     {"name": "title", "description": "Event or group title", "type": 3,
                      "max_length": 100},
                     {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
-                     "type": 3}
+                     "type": 3},
+                    {"name": "role", "description": "Existing signup role key (use with seats)",
+                     "type": 3, "max_length": 32},
+                    {"name": "seats", "description": "Absolute seat target, increase only (1-99; use with role)",
+                     "type": 4, "min_value": 1, "max_value": 99}
                 ]
             })
         );
