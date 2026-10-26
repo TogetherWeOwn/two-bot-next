@@ -517,6 +517,36 @@ pub mod lfg_store {
         post.closed_at = Some(at.into());
         Ok(true)
     }
+    // Close-message repair is outside this signup/audit acceptance slice.
+    // Reuse its production state type, but fail loudly if a test reaches I/O.
+    pub use crate::real_core::lfg_store::CloseRefreshState;
+
+    pub async fn get_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+    ) -> Result<Option<CloseRefreshState>, Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
+    pub async fn clear_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+    ) -> Result<(), Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
+    pub async fn defer_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+        _attempts: i32,
+        _next_at: time::OffsetDateTime,
+    ) -> Result<(), Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
     // The included service also compiles its metadata-edit branch. Keep that
     // store boundary explicit without pretending this signup/audit double tests it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,6 +691,15 @@ impl ActionExecutor {
             return Err(DiscordError::Unavailable("offline refresh fault".into()));
         }
         Ok(())
+    }
+    pub async fn edit_message_for_close_refresh(
+        &self,
+        _channel: &str,
+        _message: &str,
+        _content: &str,
+        _components: &[Value],
+    ) -> crate::CloseRefreshEdit {
+        panic!("close repair is outside this offline acceptance slice")
     }
     pub async fn recover_message_by_nonce(
         &self,

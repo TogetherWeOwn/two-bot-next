@@ -11,19 +11,34 @@ For the pipeline behind the numbers see the `game_activity` module docs
 
 ## In Discord: `/game-mix`
 
-- No options. Published with DMs disabled and **Manage Server** (Manage Guild)
+- Three optional browse selectors, and nothing else: `page` (integer 1–10000,
+  ten games per page), `sort` (`play` or `voice`) and `format` (`json` or
+  `summary`). Published with DMs disabled and **Manage Server** (Manage Guild)
   as its default permission. The runtime also requires Manage Guild or
   Administrator; overriding picker visibility cannot bypass that check.
 - Only the invoking, configured guild is read. Missing/foreign guilds are
   ignored before any handler or query. No guild ID can be supplied.
 - **The live guild is refused before reading.** This command has no equivalent
-  to `--allow-live-guild`: staff permission or a configured production identity
-  is not rollout approval. This slice does not activate production reporting.
-- Every answer is private (ephemeral), with mentions disabled. It is one JSON
-  fenced block, using the CLI keys below, capped at ten games and 2000 UTF-16
-  units. Order and numeric totals match the CLI. Hostile labels are made inert;
-  labels are shortened to 24 UTF-16 units only when needed to fit the complete
-  JSON, with an explicit note. `truncated` is true when rows or labels are cut. No per-member fields appear.
+  to `--allow-live-guild`, and the selectors never become one: staff permission
+  or a configured production identity is not rollout approval. This slice does
+  not activate production reporting.
+- Selector decoding is strict and happens before any storage read: an invalid,
+  duplicated, unknown or wrong-typed option gets one private correction naming
+  the offending selector, never a served report. A well-formed page past the
+  saved games is likewise a correction, not an empty success.
+- Every answer is private (ephemeral), with mentions disabled. The optionless
+  call keeps its original shape: one JSON fenced block, using the CLI keys
+  below, capped at ten games and 2000 UTF-16 units, with CLI order and numeric
+  totals. Selected pages reach every saved game: sorting is the selected total
+  (descending), then the other total, then game title ascending, so an
+  unchanged snapshot lists each game exactly once across its pages. Pages are
+  snapshots per call — totals that change between calls can move a game across
+  a boundary. `summary` renders readable whole-second durations instead of
+  JSON, distinguishing accumulated play time from the overlapping part spent
+  in voice. Hostile labels are made inert; labels are shortened only when
+  needed to fit the complete reply, with an explicit note, and whole rows are
+  never dropped to fit. `truncated` is true when rows or labels are cut. No
+  per-member fields appear.
 - Empty storage returns `rows: []`, `truncated: false` and
   `no game activity recorded for this guild`. It is a valid result, not an error.
   A store failure returns private **try again** guidance, with no JSON or
