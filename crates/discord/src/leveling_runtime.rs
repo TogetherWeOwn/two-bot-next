@@ -347,12 +347,23 @@ impl Drop for DrainRequeue {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        // The mutex guard derefs as one place, so the counters travel out
+        // and back instead of borrowing each queue and its counter in the
+        // same call.
+        let mut dropped = (
+            state.dropped_pending,
+            state.dropped_rules,
+            state.dropped_joins,
+        );
         let pending = self.pending.split_off(self.pending_done);
-        requeue_family(&mut state.pending, pending, &mut state.dropped_pending);
+        requeue_family(&mut state.pending, pending, &mut dropped.0);
         let rules = self.rules.split_off(self.rules_done);
-        requeue_family(&mut state.rules, rules, &mut state.dropped_rules);
+        requeue_family(&mut state.rules, rules, &mut dropped.1);
         let joins = self.joins.split_off(self.joins_done);
-        requeue_family(&mut state.joins, joins, &mut state.dropped_joins);
+        requeue_family(&mut state.joins, joins, &mut dropped.2);
+        state.dropped_pending = dropped.0;
+        state.dropped_rules = dropped.1;
+        state.dropped_joins = dropped.2;
     }
 }
 
