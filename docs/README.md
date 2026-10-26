@@ -4,8 +4,8 @@ Sole manifest: `- [Purpose](relative.md)` by area.
 
 Check: `python3 scripts/check_docs_index.py --json` (repo root).
 Empty `{missing,stale,oversize}` = PASS (exit 0); else exit 1: fix rows/split docs.
-Bad/duplicate rows land in `stale` as `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
+Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000; others ≤65,536; exceptions in `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -132,8 +132,8 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [Notice proposal](event-change-notices-spec.md)
-- [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
-- [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
+- [Reminder prefs proposal](event-reminder-preferences-spec.md)
+- [RSVP seats proposal](rsvp-capacity-spec.md)
 - [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
 - [Private agenda proposal](event-agenda-spec.md)
 - [Calendar handoff proposal](event-calendar-handoff-spec.md)
@@ -142,6 +142,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
+- [Priority labels proposal](ticket-priority-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
@@ -219,7 +220,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Voice checks](staging-voice-event-verification.md)
 - [Smoke replies](smoke-expected-responses.md)
 - [Smoke record form](smoke-run-record.md)
-- [Smoke surface inventory](smoke-surface-inventory.md)
+- [Smoke surface list](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
 - [Binary lifecycle tests](alive-acceptance.md)
