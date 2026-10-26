@@ -19,6 +19,8 @@ mod cold_authority;
 mod control_plane_overflow_acceptance;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
+#[path = "voice_creator_settings_read_acceptance_tests.rs"]
+mod creator_settings_read_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_disconnect_loud_acceptance_tests.rs"]
