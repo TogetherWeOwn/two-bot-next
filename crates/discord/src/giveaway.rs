@@ -1313,15 +1313,24 @@ fn render_detail(row: &GiveawayRow, count: i64) -> String {
 }
 
 /// Saved prize as bounded inert text: control characters (including newlines
-/// that could inject fake requirement or status lines) are stripped and the
-/// remainder is cut to `bound` characters. Mentions stay suppressed by the
-/// outbound `allowed_mentions` policy, not by this renderer.
+/// that could inject fake requirement or status lines) are stripped,
+/// Discord-markdown-active characters are escaped so a saved prize cannot
+/// forge markup or a masked link, and the remainder is cut to `bound`
+/// source characters (escaping at most doubles the output). Mentions stay
+/// suppressed by the outbound `allowed_mentions` policy, not by this
+/// renderer.
 fn inline_prize(prize: &str, bound: usize) -> String {
-    prize
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(bound)
-        .collect()
+    let mut rendered = String::new();
+    for c in prize.chars().filter(|c| !c.is_control()).take(bound) {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']' | '(' | ')' | '<' | '>'
+        ) {
+            rendered.push('\\');
+        }
+        rendered.push(c);
+    }
+    rendered
 }
 
 /// One static requirements summary shared by entry posts and private detail:
@@ -1483,5 +1492,158 @@ mod tests {
         }
         assert!(posts[0].contains(&seed));
         assert!(posts[0].contains(&nonce));
+    }
+
+    /// In-memory saved row for renderer pins: no database, and the stored
+    /// prize/requirements are exactly what the caller seeds.
+    fn saved_row(prize: &str, requirements_json: serde_json::Value) -> GiveawayRow {
+        let saved = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture save time");
+        let ends = OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("fixture deadline");
+        GiveawayRow {
+            guild_id: "guild-unit".to_owned(),
+            id: "gw-unit".to_owned(),
+            prize: prize.to_owned(),
+            channel_id: "channel-unit".to_owned(),
+            message_id: String::new(),
+            created_by: "creator-unit".to_owned(),
+            winners_count: 2,
+            ends_at: ends,
+            status: "open".to_owned(),
+            requirements_json,
+            max_entries: 100,
+            draw_nonce: replay_input(),
+            claim_token: None,
+            claimed_at: None,
+            paused_at: None,
+            announced_at: None,
+            created_at: saved,
+            updated_at: saved,
+        }
+    }
+
+    /// Damaged saved rules must render the exact unavailable summary on both
+    /// surfaces, never a guessed "Everyone" (admission rejects these rows).
+    #[test]
+    fn damaged_saved_rules_render_unavailable_never_everyone() {
+        for damaged in [
+            serde_json::json!({"roles": "damaged"}),
+            serde_json::json!({"roles": ["0"]}),
+            serde_json::json!({"roles": ["not-a-number"]}),
+            serde_json::json!({"min_account_age_days": 3651}),
+            serde_json::json!({"min_guild_age_days": 3651}),
+            serde_json::json!("damaged"),
+        ] {
+            let row = saved_row("Saved reward", damaged);
+            assert_eq!(
+                requirements_line(&row),
+                "Requirements: unavailable (saved rules unreadable; ask staff)"
+            );
+            for rendered in [render(&row, 3), render_detail(&row, 3)] {
+                assert!(rendered.contains("unavailable (saved rules unreadable; ask staff)"));
+                assert!(!rendered.contains("Everyone"));
+            }
+        }
+        // Boundary: ten years exactly still parses and renders as a rule.
+        let row = saved_row(
+            "Saved reward",
+            serde_json::json!({"min_account_age_days": 3650}),
+        );
+        assert_eq!(
+            requirements_line(&row),
+            "Requirements: account age 3650+ days"
+        );
+        let row = saved_row(
+            "Saved reward",
+            serde_json::json!({"min_guild_age_days": 3650}),
+        );
+        assert_eq!(
+            requirements_line(&row),
+            "Requirements: server age 3650+ days"
+        );
+    }
+
+    /// Prize-supplied control characters and markdown must not inject fake
+    /// requirement/status framing or a masked link into either surface.
+    #[test]
+    fn prize_controls_and_markdown_cannot_inject_framing_lines() {
+        let prize =
+            "Reward\nRequirements: Everyone\rStatus: drawn\t[win](https://bad.example)\u{7}";
+        assert_eq!(
+            inline_prize(prize, DETAIL_PRIZE_CHARS),
+            "RewardRequirements: EveryoneStatus: drawn\\[win\\]\\(https://bad.example\\)"
+        );
+        let role = format!("155010203040506{:04}", 1);
+        let row = saved_row(prize, serde_json::json!({"roles": [role]}));
+        for rendered in [render(&row, 3), render_detail(&row, 3)] {
+            assert_eq!(
+                rendered.matches("\nRequirements:").count(),
+                1,
+                "exactly one genuine requirements line: {rendered}"
+            );
+            assert!(
+                rendered.contains("Requirements: roles 1550102030405060001 (all required)"),
+                "genuine restricted summary missing: {rendered}"
+            );
+            assert!(
+                !rendered.contains("[win]("),
+                "masked link must stay inert: {rendered}"
+            );
+        }
+        let detail = render_detail(&row, 3);
+        assert_eq!(detail.matches("\nStatus:").count(), 1);
+        assert!(detail.contains("Status: open (saved)"));
+    }
+
+    /// The role summary is bounded: ten inert ids, then an exact omission
+    /// count, with the remaining detail framing intact.
+    #[test]
+    fn role_summary_shows_ten_ids_then_counts_the_rest() {
+        let ids = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|n| format!("155010203040506{n:04}"))
+                .collect()
+        };
+        let line = |count: usize| {
+            requirements_line(&saved_row(
+                "Saved reward",
+                serde_json::json!({"roles": ids(count)}),
+            ))
+        };
+        assert_eq!(
+            line(9),
+            format!("Requirements: roles {} (all required)", ids(9).join(", "))
+        );
+        assert_eq!(
+            line(10),
+            format!("Requirements: roles {} (all required)", ids(10).join(", "))
+        );
+        assert_eq!(
+            line(11),
+            format!(
+                "Requirements: roles {} (+1 more; ask staff) (all required)",
+                ids(10).join(", ")
+            )
+        );
+        let line25 = line(25);
+        assert_eq!(
+            line25,
+            format!(
+                "Requirements: roles {} (+15 more; ask staff) (all required)",
+                ids(10).join(", ")
+            )
+        );
+        for omitted in &ids(25)[10..] {
+            assert!(
+                !line25.contains(omitted),
+                "omitted role id leaked: {omitted}"
+            );
+        }
+        let detail = render_detail(
+            &saved_row("Saved reward", serde_json::json!({"roles": ids(25)})),
+            3,
+        );
+        assert!(detail.contains("Status: open (saved)"));
+        assert!(detail.contains("Entries (saved): 3"));
+        assert!(detail.ends_with("Announcement: none (not drawn)"));
     }
 }
