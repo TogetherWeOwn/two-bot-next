@@ -161,8 +161,10 @@ One command, guild-only, published only in the final build slice (§9):
   a real mention-only post means pasting the mention tokens as the text
   (so repeat identity sees the same content) *and* setting the count.
 - **`attachments`** is a comma-separated list of at most 10 bare filenames,
-  each 1–255 UTF-16 units, no `/`, `\`, or control characters; total
-  option ≤1,000 UTF-16 units. Names pass to the same matcher helper as
+  each 1–255 UTF-16 units, no `/`, `\`, `,`, or control characters; total
+  option ≤1,000 UTF-16 units. Comma rejection keeps entry boundaries
+  unambiguous: without it `safe.exe,txt` would split into two names and
+  diverge from the live matcher. Names pass to the same matcher helper as
   live, which extracts the extension internally
   (`crates/core/src/automod.rs:623-629`). No file upload option: the
   bot must never receive a blocked-type file to prove it is blocked.
@@ -504,19 +506,21 @@ target fetch, no `target_gate`, no `plan`, no executor call.
   the metric uses `result=unavailable,filter=none`, with the effective
   mode if a snapshot exists or `mode=not_evaluated` otherwise. An
   unaudited oracle is worse than a briefly unavailable one.
-  Redelivery is fenced by a read-before-evaluate gate, not by the
+  Redelivery is fenced by an atomic interaction-ID claim, not by the
   insert alone (`audit_once` deduplicates facts, not executions,
   `crates/core/src/custom_command_store.rs:39-51`): after strict decode
-  the handler loads any row under the interaction's audit id (the
-  existing replay read, `custom_command_store.rs:66-77`) and, if one
-  exists, renders the stored row — outcome, reason, and its
-  `created_at` as the config-currency time — without re-evaluating or
-  consuming rate budget. After its own insert, a handler likewise
-  renders the first stored row, so two racing deliveries report one
-  verdict. Sequential redelivery therefore evaluates once; concurrent
-  redelivery may evaluate twice internally but can only ever *report*
-  the first stored verdict, disclosing nothing the first answer did
-  not. **Stated retention:** `automation_audit_log` has no installed
+  the handler claims the interaction's audit id (claim-or-replay on the
+  existing replay read, `custom_command_store.rs:66-77`) and only the
+  claim winner charges rate budget and evaluates, then inserts the row.
+  Every other delivery — sequential or concurrent — renders the stored
+  row — outcome, reason, and its `created_at` as the config-currency
+  time — without re-evaluating or consuming rate budget. If rate
+  accounting cannot share the claim, actor and guild charges must each
+  be idempotent by interaction ID. Sequential redelivery therefore
+  evaluates once; concurrent redelivery waits for or replays the
+  committed first stored verdict, so two racing deliveries evaluate
+  once, charge once, and report one verdict, disclosing nothing the
+  first answer did not. **Stated retention:** `automation_audit_log` has no installed
   age-based purger ([privacy](privacy.md#retention-and-explicit-exceptions)
   — no live TTL is claimed beyond the windows the retention job
   enforces, and this table is not one of them), so preview audit rows
@@ -573,13 +577,13 @@ until slice 4. Each row names the proof, not a vague area.
 | T8 | Permission matrix | ManageGuild admitted; ManageMessages/ModerateMembers/everyone refused by router; picker default alone insufficient if bits absent |
 | T9 | Output disclosure | Verdict struct field inventory test; for a property set of inputs, replies contain no input substring and render no threshold value (only knob names) |
 | T10 | Canary | Raw/normalized sentinel and digests (SHA-256/MD5 hex plus actual matcher repeat digest, including decimal u64 Debug/Display and hex forms) absent from captured logs, audit rows, metrics, errors, and reply; independently, tracker rows unchanged (§6). Deliberately logging a computed repeat digest must fail the sink check even with an unchanged tracker |
-| T11 | Bounds | 2,000 units ok / 2,001 refused; astral-plane chars counted in UTF-16; 10 attachments ok / 11 refused; a filename without a dot is treated as its own extension, as live; `mentions` 100 ok / 101 refused; whitespace-only text refused bare, evaluated with attachments, and evaluated with `mentions` at the limit → `mention_spam` (§3.1) |
+| T11 | Bounds | 2,000 units ok / 2,001 refused; astral-plane chars counted in UTF-16; 10 attachments ok / 11 refused; `safe.exe,txt` refused (comma in filename); a filename without a dot is treated as its own extension, as live; `mentions` 100 ok / 101 refused; whitespace-only text refused bare, evaluated with attachments, and evaluated with `mentions` at the limit → `mention_spam` (§3.1) |
 | T12 | Rate limiter | Paused-clock boundaries for 5 s / hourly / daily caps; refusal does not evaluate (matcher call count 0); full-map refuses new actor |
 | T13 | Zero pipeline writes | Mock ledger/executor/funnel counters all 0 after matched preview in enforce mode |
 | T14 | Audit fail-closed | Failing audit sink → no verdict in reply, generic unavailable, metric incremented |
 | T15 | Config parity | Hot-changed word/threshold via live snapshot flips preview and next real delivery identically; invalid stored value keeps last-good in both |
 | T16 | Injection | Text with `<@everyone>`, markdown, URLs → reply byte-shape is a fixed template, `allowed_mentions` empty |
-| T17 | Redelivery | Same interaction delivered twice sequentially: matcher call count 1, one audit row, identical replies incl. currency time; concurrently: both replies equal the first stored row (§6) |
+| T17 | Redelivery | Same interaction delivered twice sequentially: matcher call count 1, one audit row, one actor charge, one guild charge, identical replies incl. currency time; concurrently: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed first stored row (§6) |
 | T18 | Registration scope | Publish set contains `automod-preview` only for the configured guild when the automod scope admits it; absent for the live guild without approval (§5.0) |
 | T19 | Unproven repeat equivalence | When repeat equivalence cannot be proven and execution reaches that check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
 
