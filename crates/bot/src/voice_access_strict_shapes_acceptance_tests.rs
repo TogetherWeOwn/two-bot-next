@@ -79,24 +79,12 @@ fn bool_option(name: &str, value: bool) -> CommandDataOption {
     value_option(name, CommandOptionValue::Boolean(value))
 }
 
-fn number_option(name: &str, value: f64) -> CommandDataOption {
-    value_option(name, CommandOptionValue::Number(value))
-}
-
 fn user_option(name: &str, id: u64) -> CommandDataOption {
     value_option(name, CommandOptionValue::User(Id::new(id)))
 }
 
 fn channel_option(name: &str, id: u64) -> CommandDataOption {
     value_option(name, CommandOptionValue::Channel(Id::new(id)))
-}
-
-fn mentionable_option(name: &str, id: u64) -> CommandDataOption {
-    value_option(name, CommandOptionValue::Mentionable(Id::new(id)))
-}
-
-fn attachment_option(name: &str, id: u64) -> CommandDataOption {
-    value_option(name, CommandOptionValue::Attachment(Id::new(id)))
 }
 
 fn access_top(options: Vec<CommandDataOption>) -> Interaction {
@@ -269,8 +257,10 @@ fn assert_no_echo(text: &str, needles: &[&str], what: &str) {
 }
 
 fn seeded_controls() -> AccessControls {
-    let mut controls = AccessControls::default();
-    controls.required_role = Some(9);
+    let mut controls = AccessControls {
+        required_role: Some(9),
+        ..AccessControls::default()
+    };
     controls.command_roles.insert("kick".to_owned(), vec![7]);
     controls
         .command_roles
@@ -366,34 +356,34 @@ fn wrong_command_values() -> Vec<(&'static str, CommandOptionValue, Option<&'sta
     vec![
         (
             "integer",
-            CommandOptionValue::Integer(876_543_21),
+            CommandOptionValue::Integer(87_654_321),
             Some("87654321"),
         ),
         ("boolean", CommandOptionValue::Boolean(true), None),
         ("number", CommandOptionValue::Number(1.5), None),
         (
             "role",
-            CommandOptionValue::Role(Id::new(876_543_22)),
+            CommandOptionValue::Role(Id::new(87_654_322)),
             Some("87654322"),
         ),
         (
             "user",
-            CommandOptionValue::User(Id::new(876_543_23)),
+            CommandOptionValue::User(Id::new(87_654_323)),
             Some("87654323"),
         ),
         (
             "channel",
-            CommandOptionValue::Channel(Id::new(876_543_24)),
+            CommandOptionValue::Channel(Id::new(87_654_324)),
             Some("87654324"),
         ),
         (
             "mentionable",
-            CommandOptionValue::Mentionable(Id::new(876_543_25)),
+            CommandOptionValue::Mentionable(Id::new(87_654_325)),
             Some("87654325"),
         ),
         (
             "attachment",
-            CommandOptionValue::Attachment(Id::new(876_543_26)),
+            CommandOptionValue::Attachment(Id::new(87_654_326)),
             Some("87654326"),
         ),
         (
