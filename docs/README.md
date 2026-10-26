@@ -1,6 +1,6 @@
 # Documentation map
 
-`- [Purpose](relative.md)` rows. From root: `python3 scripts/check_docs_index.py --json` (empty `{missing,stale,oversize}`=PASS 0, else 1). Index <12,000, docs <=65,536 except LARGE_DOCS.
+`- [Purpose](relative.md)` rows. Root: `python3 scripts/check_docs_index.py --json` (empty `{missing,stale,oversize}`=PASS 0; else 1). Index <12,000; docs <=65,536 except LARGE_DOCS.
 
 ## References and architecture
 
