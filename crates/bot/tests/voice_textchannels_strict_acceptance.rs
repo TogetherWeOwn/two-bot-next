@@ -730,29 +730,30 @@ async fn valid_and_unknown_control(command: &'static str) {
             shape.receipt,
             "/{command} valid receipt"
         );
-        let observed = fixture.state.lock().expect("observation lock");
-        assert_eq!(
-            observed.saved,
-            vec![shape.saved()],
-            "/{command} saved exact creator"
-        );
-        assert_eq!(
-            observed.creators.get(&(FOREIGN_GUILD, FOREIGN_CHANNEL)),
-            Some(&CreatorChannel::new(FOREIGN_GUILD, FOREIGN_CHANNEL)),
-            "foreign guild unchanged"
-        );
-        assert!(
-            !observed
-                .calls
-                .iter()
-                .any(|call| call == "record_kick_audit" || call == "claim_create"),
-            "textchannels does not enter room audit/admission"
-        );
-        assert!(
-            observed.discord_creates.is_empty(),
-            "settings do not mutate live Discord"
-        );
-        drop(observed);
+        {
+            let observed = fixture.state.lock().expect("observation lock");
+            assert_eq!(
+                observed.saved,
+                vec![shape.saved()],
+                "/{command} saved exact creator"
+            );
+            assert_eq!(
+                observed.creators.get(&(FOREIGN_GUILD, FOREIGN_CHANNEL)),
+                Some(&CreatorChannel::new(FOREIGN_GUILD, FOREIGN_CHANNEL)),
+                "foreign guild unchanged"
+            );
+            assert!(
+                !observed
+                    .calls
+                    .iter()
+                    .any(|call| call == "record_kick_audit" || call == "claim_create"),
+                "textchannels does not enter room audit/admission"
+            );
+            assert!(
+                observed.discord_creates.is_empty(),
+                "settings do not mutate live Discord"
+            );
+        }
         // Repeating the valid set is byte-identical: same receipt, same row.
         let repeat = fixture.dispatch(command, shape.options()).await;
         assert_eq!(
