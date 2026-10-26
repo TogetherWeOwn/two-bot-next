@@ -4,7 +4,7 @@ Sole manifest: `- [Purpose](relative.md)` by area.
 
 `python3 scripts/check_docs_index.py --json` (repo root).
 Sorted `{missing,stale,oversize}` arrays: empty = PASS/exit 0.
-Else exit 1: fix rows/split oversized docs.
+Else exit 1: fix rows/split docs.
 Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
 Byte budgets: index <12,000; other docs ≤65,536.
 Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
@@ -102,7 +102,8 @@ Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
-- [Args substitution (design only)](custom-command-args-spec.md)
+- [Response page proposal](dashboard-custom-responses-spec.md)
+- [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
 - [Onboarding page (design only)](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
@@ -118,11 +119,12 @@ Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
 - [Backup-host handoff](lfg-backup-host-spec.md)
-- [LFG reuse (design only)](lfg-reuse-spec.md)
+- [LFG reuse](lfg-reuse-spec.md)
 - [LFG thread](lfg-thread-spec.md)
-- [LFG voice (design only)](lfg-voice-room-spec.md)
+- [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
+- [Relay move (design only)](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Staff game mix report](game-activity-report.md)
@@ -130,7 +132,7 @@ Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
-- [Session-change notices (design only)](event-change-notices-spec.md)
+- [Notice proposal](event-change-notices-spec.md)
 - [Reminder baseline/stop (design only)](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist (design only)](rsvp-capacity-spec.md)
 - [Private agenda (design only)](event-agenda-spec.md)

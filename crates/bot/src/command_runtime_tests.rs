@@ -739,6 +739,8 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
             HandlerId::Giveaway,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
             HandlerId::FeedList,
             HandlerId::FeedInspect,
         ] {
@@ -1582,6 +1584,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "sticky-remove"
                         | "feed-add"
                         | "feed-remove"
+                        | "feed-pause"
+                        | "feed-resume"
                         | "feed-list"
                         | "feed-inspect"
                         | "purge"
@@ -3685,19 +3689,26 @@ fn schedule_remove_and_page_strict_decode_exact_values() {
 async fn feed_commands_refuse_ephemerally_while_announcements_off() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     // announcements OFF in the router gates → the shared router refuses all
-    // four feed commands; the runtime answers through the shared executor.
+    // six feed commands; the runtime answers through the shared executor.
     let runtime = runtime_without_db(gates(true, false), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
+    for name in [
+        "feed-add",
+        "feed-remove",
+        "feed-pause",
+        "feed-resume",
+        "feed-list",
+        "feed-inspect",
+    ] {
         runtime
             .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
             .await;
     }
     let requests = mock.requests();
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 4, "one ephemeral refusal per command");
+    assert_eq!(callbacks.len(), 6, "one ephemeral refusal per command");
     assert_eq!(
         requests.len(),
-        4,
+        6,
         "no defer, no edit, no publish: {requests:?}"
     );
     for callback in &callbacks {
@@ -3740,7 +3751,14 @@ async fn feed_add_without_manage_server_is_refused() {
 async fn feed_commands_from_other_guilds_are_silent() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
+    for name in [
+        "feed-add",
+        "feed-remove",
+        "feed-pause",
+        "feed-resume",
+        "feed-list",
+        "feed-inspect",
+    ] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
@@ -4171,6 +4189,8 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
     for withheld in [
         "feed-add",
         "feed-remove",
+        "feed-pause",
+        "feed-resume",
         "feed-list",
         "feed-inspect",
         "rsvp",
@@ -4290,6 +4310,8 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::LfgList,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
             HandlerId::FeedList,
             HandlerId::FeedInspect,
             HandlerId::PurgePreview,
@@ -4459,6 +4481,8 @@ async fn resumed_boot_synchronizes_current_gates_once_without_ready() {
         for name in [
             "feed-add",
             "feed-remove",
+            "feed-pause",
+            "feed-resume",
             "feed-list",
             "feed-inspect",
             "rsvp",
