@@ -5,8 +5,10 @@
 use super::*;
 
 async fn shape(pool: &PgPool, id: &str, fields: &str) {
+    // `fields` is always a test-authored literal fragment in this file,
+    // never interaction input; the id stays a bound parameter.
     let query = format!("UPDATE scheduled_messages SET {fields} WHERE id = $1");
-    sqlx::query(&query)
+    sqlx::query(sqlx::AssertSqlSafe(query))
         .bind(id)
         .execute(pool)
         .await
