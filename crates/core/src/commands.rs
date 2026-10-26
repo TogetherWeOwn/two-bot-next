@@ -399,7 +399,8 @@ pub const PRIVACY_DESCRIPTION: &str =
     "Manage your analytics privacy and deletion requests for this server.";
 
 /// Self-service picker-recovery description, shared by the registry fixtures.
-pub const REOPEN_DESCRIPTION: &str = "Reopen your games or session picker in a private menu.";
+pub const REOPEN_DESCRIPTION: &str =
+    "Reopen your games or session picker in a private menu; games includes a no-change preview.";
 
 /// Merge the authoritative guild command set.
 ///
