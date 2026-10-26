@@ -408,8 +408,9 @@ staging/deploy, credential and production fences remain unchanged.
 
 Review metric by 2026-11-02: 22/22 oracles explicitly accepted/revised, intent and
 independent boundary records present, and bounded feasibility accepted or B
-rejected/deferred. Default/kill rule: absent substantiated staff value or any
-unresolved safety prerequisite, **A/no-build**; expiry never enables a feature.
+rejected/deferred. Default/kill rule: if substantiated staff value is absent or any
+safety prerequisite remains unresolved, choose **A/no-build**; expiry never enables
+a feature.
 Unverified: deployed ticket capability, real guild/private audience, activity
 frequency, host intent, runtime B (absent), ingestion continuity and performance.
 Cross-model review skipped: non-interactive context; no external CLI invoked.
