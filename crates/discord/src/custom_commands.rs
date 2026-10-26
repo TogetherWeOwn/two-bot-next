@@ -36,6 +36,7 @@ use two_bot_core::{
 
 use crate::{
     automation_admission::ActorCooldowns,
+    custom_command_prefix_render::{render_prefix_response, PrefixRenderRefusal},
     interactions::{
         publish_commands, refusal_response, route_interaction, text_response, RoutedInteraction,
     },
@@ -460,22 +461,21 @@ impl CustomCommandRuntime {
         // Same stored-row re-validation as the slash boundary: an imported
         // or corrupt template refuses as `Render` before any send, keeping
         // the durable attempt/result pair and leaving the row untouched.
-        // The context check stays first, preserving `context_unavailable`.
-        let rendered = guild_name
-            .ok_or(CustomCommandError::Context)
-            .and_then(|server| {
-                validate_template(&row.template).map_err(|_| CustomCommandError::Render)?;
-                render_template(
-                    &row.template,
-                    &TemplateContext {
-                        user: format!("<@{}>", message.author.id),
-                        username: message.author.name.clone(),
-                        server: server.to_owned(),
-                        channel: format!("<#{}>", message.channel_id),
-                    },
-                )
-                .map_err(|_| CustomCommandError::Render)
-            });
+        // The context check stays first, preserving `context_unavailable`;
+        // that ordering is pinned by the helper's unit tests.
+        let user_mention = format!("<@{}>", message.author.id);
+        let channel_mention = format!("<#{}>", message.channel_id);
+        let rendered = render_prefix_response(
+            guild_name,
+            &row.template,
+            &user_mention,
+            &message.author.name,
+            &channel_mention,
+        )
+        .map_err(|refusal| match refusal {
+            PrefixRenderRefusal::Context => CustomCommandError::Context,
+            PrefixRenderRefusal::Render => CustomCommandError::Render,
+        });
         let (result, reason) = match rendered {
             Ok(content) => {
                 let result = match self
