@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Tests-only room owner access-inspection handoff. Do not merge the deliberately red acceptance branch alone.",
+  "baseCommit": "dffb6755937ee3c6a4b8c967d3fe9e8408a39257",
+  "branch": "test/room-access-inspect-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/voice_room_access_inspect_acceptance_tests.rs",
+      "sha256": "aeaec8a2209c178ff83a487d92b0d2f905bfee4dc0fb2e211785c950952b0aee",
+      "tests": 11
+    },
+    {
+      "path": "crates/core/tests/room_access_inspect_registry_acceptance.rs",
+      "sha256": "df68215d6200dbb866b4d4fae2bab947e9a80b5fbe70c554b06016643bcb22aa",
+      "tests": 3
+    },
+    {
+      "path": "crates/bot/src/voice_setup_access_paging_acceptance_tests.rs",
+      "sha256": "a8630ff92bbfe3908cd1bbb8c525ec74f88bec24b2c8e3a7e5229e14d985a937",
+      "scopeCorrection": "The prior 22-command/no-other-page scope pin now recognizes exactly one additive owner read (23 commands). All existing setup/access assertions remain; their paging restrictions on all other existing commands remain. The new read's permissions/options are independently protected."
+    }
+  ],
+  "registration": {
+    "path": "crates/bot/src/voice_rooms_tests.rs",
+    "module": "room_access_inspect_acceptance",
+    "productionBehaviorChanged": false,
+    "note": "Only the test-module registration is added here; the shared host file is not wholly protected. Builder must move its existing command-count/inventory pins with the new command."
+  },
+  "commands": {
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib room_access_inspect_acceptance -- --nocapture",
+    "registry": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test room_access_inspect_registry_acceptance -- --nocapture",
+    "priorPaging": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib setup_access_paging_acceptance -- --nocapture",
+    "referenceDocs": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs",
+    "workspace": "python3 scripts/cargo_cache.py run -- test --workspace --locked",
+    "format": "cargo fmt --all -- --check"
+  },
+  "contract": {
+    "surface": "Guild-only /room-access-inspect, voice-gated, no staff default permission and no room/member selector. Only optional one-based Integer page is permitted if paging is used. Discoverable in the owner Voice rooms help group, not creator /access settings.",
+    "authorization": "Resolve the caller's current tracked room and use the existing require_room_owner semantics/refusals. This existing gate includes the Manage Channels admin exception; no arbitrary cross-room staff view is added. Ordinary non-owner, no-voice and untracked-current-room calls disclose no access rows.",
+    "content": "One ephemeral completion with distinct Blocked, Granted and Pending (or Waiting) sections. Complete synthetic member IDs in the correct section, explicit empty states, no other room's members. Repeated reads are stable and do not consume requests.",
+    "bounds": "Plain content <=2000 UTF-16 units. Long lists either use repeatable Page n of total with optional page and complete, nonduplicated coverage across pages, or explicitly bound each section, show some members and retain that section's total count/omission notice. Silent final clipping or clipped member mentions fails.",
+    "public": "After a real /public transition is fully drained, durable blocks remain visible; grants and pending are empty. A never-private room without any privacy record still has all three empty sections, without creating storage or in-memory privacy state.",
+    "restart": "No grant/request reconstruction from cached Discord Connect overwrites. Preserve existing durable join_grants hydration: a witnessed approval is current after load, while old pending requests are not. The domain PrivacyRecord comment alone does not describe the worker's separate durable grant source.",
+    "effects": "Compare live private-room state, durable privacy/grants and ownership rows after actor shutdown. The shared Store/Http trace must contain no new writes; a subsequent dispatch must find no queued mutation. No mutation buttons. The ordinary already-public /public command is the passing fixture/control.",
+    "builderPins": "Update registry, permission/access classification, command counts, smoke inventory, staging publication fixtures as selected by their gates, help and rendered docs as one coherent set. Existing reference_docs/registry/smoke suites remain required; this acceptance branch does not regenerate implementation-facing fixtures."
+  },
+  "verification": {
+    "localCargo": "Not compiled or behavior-RED-verified locally: runtime, registry and workspace commands were refused with exit 75 (no idle, below-budget slot; no per-worktree fallback). Exact-head hosted CI must establish assertion RED and passing controls before acceptance closeout.",
+    "database": "None required. All new runtime cases use the existing stateful in-memory Store/Http fixtures and real actor/slash handling. No production/staging APIs or databases.",
+    "ciRoute": "Runtime module is part of existing bot lib/bin unit targets; the unignored core integration target is included in the existing workspace integration lane. No workflow or source production change is needed."
+  },
+  "handoff": "Builder consumes the exact pushed commit named on the acceptance card, verifies every protected hash, and never edits these protected files. Route test defects back to the Test Author. Builder owns implementation, full GREEN, exact-head independent review and squash auto-merge. This manifest does not claim RED, GREEN, review, merge or deployment."
+}
