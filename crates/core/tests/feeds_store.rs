@@ -223,9 +223,11 @@ async fn feed_crud_audit_scope_and_timestamp_roundtrip() {
         .await
         .unwrap()
         .is_some());
-    assert_eq!(
-        remove_feed(&pool, "guild-1", &feed.id).await.unwrap(),
-        FeedRemoval::RecoveryRequired,
+    assert!(
+        matches!(
+            remove_feed(&pool, "guild-1", &feed.id).await.unwrap(),
+            FeedRemoval::RecoveryRequired { .. }
+        ),
         "unresolved pending evidence refuses removal and retains the ledger"
     );
     assert!(

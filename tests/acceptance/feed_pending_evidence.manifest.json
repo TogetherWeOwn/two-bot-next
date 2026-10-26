@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected behavioral tests for evidence-aware refusal of feed pause and removal",
+  "baseCommit": "e1868d97d3519cae3f2ed91726e83e98f77dff0d",
+  "branch": "test/feed-pending-evidence-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/feed_pending_evidence_acceptance_tests.rs",
+      "sha256": "a4806cafdea12ce458290a3c009207719c83546470e494b7e912dabc6c74a2cf",
+      "tests": 10
+    },
+    {
+      "path": "crates/bot/src/feed_pause_resume_acceptance_tests.rs",
+      "sha256": "223a403c68e3c22aeb99cbd9848ade70067fed048e9add9168808f2d4b7dd2f9",
+      "change": "Register the new child module in an existing tests-only parent; preserve all 34 original tests and assertions"
+    },
+    {
+      "path": "crates/bot/src/feed_jobs_tests.rs",
+      "sha256": "c2e4f866b03137279571b42986e09e8069306d52ef117b897a2f9be6ef71cee4",
+      "change": "Match recovery refusal independent of unit versus payload variant shape; preserve the existing admission/removal race assertions"
+    },
+    {
+      "path": "crates/core/tests/feeds_store.rs",
+      "sha256": "ce8658088b74acc48331edf96fe946261336a9038cd1f2a89504b4211f6a64e5",
+      "change": "Keep the existing store refusal assertion compatible with a typed recovery payload, without changing its semantic expectation"
+    }
+  ],
+  "commands": {
+    "protectedRuntime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked pending_evidence_acceptance_tests:: -- --nocapture --test-threads=1",
+    "healthyControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked pending_evidence_acceptance_tests::healthy_control_ -- --nocapture --test-threads=1",
+    "pauseAndResumeControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked feed_jobs::tests::pause_resume_acceptance_tests:: -- --nocapture --test-threads=1",
+    "storeAndAdmissionRaces": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked feed_jobs::tests:: -- --include-ignored --nocapture --test-threads=1",
+    "compatibleCoreStore": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test feeds_store --locked -- --include-ignored --nocapture --test-threads=1",
+    "discoveryControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test feed_pause_resume_acceptance --test feeds --test feeds_connector --test reference_docs --locked"
+  },
+  "database": {
+    "fixture": "Existing TestDatabase::create with cutover migrations, explicit teardown and independent pools",
+    "environment": "TWO_TEST_DATABASE_URL",
+    "missingEnvironment": "Fails explicitly; no new ignored or silently skipped tests",
+    "ciRoute": "Existing check.yml unit/binary and nextest lanes supply the guarded disposable database URL",
+    "boundaries": "Disposable database and loopback REST only; never production, staging or a real Discord member"
+  },
+  "contract": {
+    "runtime": "Both existing slash commands return a private, mention-safe, bounded reply through the actual CommandRuntime and real fenced store",
+    "evidence": "One and three unresolved rows are counted for only the selected guild/relay; fresh, expired and tokenless evidence count, settled and other relay/guild evidence do not",
+    "presentation": "Preserve stable relay ID; call the count a snapshot of unresolved delivery evidence, not failed or successful deliveries; explicitly state no lifecycle change occurred; wait for reconciliation and inspect via /feed-inspect",
+    "privacy": "No source URL, item key/body, nonce, claim/lease token or other relay/guild evidence; no channel POSTs or reconciliation triggered by the command",
+    "preservation": "An exact refusal leaves every relay, high-water and delivery-history column unchanged, including existing claim tokens, leases and timestamps; recovery_required audit outcomes remain",
+    "bounds": "A 2048-row ledger and maximum-length 128-character relay ID produce one summary within 2000 UTF-16 units; exact totals or explicit capped lower bounds are accepted",
+    "fence": "A claim observed queued ahead of the lifecycle operation is counted after admission, never from a pre-fence read; a settlement committed inside the fence wait is not reported as stale pending evidence",
+    "controls": "Zero/settled, missing/foreign, restored already-paused plus pending, and store-failure outcomes retain their existing state/audit semantics",
+    "implementationOwnership": "Builder supplies the two typed refusal outcomes, shared safe renderer, runtime integration and concise reference/runbook updates. Tests deliberately do not dictate private field names or source layout. No new recovery job, force operation or success timestamp."
+  },
+  "existingPins": [
+    "feed_pause_resume_acceptance_tests::already_paused_current_pending_relay_preserves_state_and_resumes_discovery",
+    "feed_pause_resume_acceptance_tests::already_paused_expired_pending_relay_preserves_state_and_resumes_discovery",
+    "feed_pause_resume_acceptance_tests::already_paused_tokenless_pending_relay_preserves_state_and_resumes_discovery",
+    "feed_pause_resume_acceptance_tests::pause_during_an_admitted_send_refuses_and_preserves_settlement",
+    "feed_pause_resume_acceptance_tests::pause_uses_the_existing_contended_relay_delivery_fence",
+    "feed_pause_resume_acceptance_tests::claim_queued_before_pause_wins_and_pause_keeps_recovery_discoverable",
+    "feed_jobs::tests::fresh_claim_waits_before_pending_removal_is_refused",
+    "feed_jobs::tests::removal_waits_before_stale_polled_relay_claim_is_rejected",
+    "feed_jobs::tests::delivery_fence_lock_timeout_bounds_waiting_claim_and_removal",
+    "feed_jobs::tests::held_post_removal_never_confirms_before_settlement",
+    "feed_jobs::tests::accepted_but_unrecorded_send_survives_removal_attempt_and_restart",
+    "feed_jobs::tests::unconfirmed_send_survives_removal_attempts_and_restart_without_repost",
+    "command_runtime_tests::feed_remove_with_pending_delivery_refuses_and_retains_evidence",
+    "feeds_store::feed_crud_audit_scope_and_timestamp_roundtrip",
+    "feed_pause_resume_acceptance",
+    "reference_docs"
+  ],
+  "handoff": [
+    "Keep knowingly RED tests off main. Do not open or merge a test-only implementation PR.",
+    "Consume the immutable handoff SHA in an isolated Builder workspace and verify every protected SHA-256 before and after implementation. Never edit protected files; return oracle corrections to their author.",
+    "Expected baseline behavior is six assertion failures for missing evidence UX and four healthy controls. This is an expectation, not a claim of an observed run; actual results and CI links are recorded in the task handoff document.",
+    "Local cache refusal is not test RED and authorizes no direct Cargo, new target directory, cache cleanup or gate bypass.",
+    "Retain compatible recovery-required audit semantics and safe retry of the lifecycle operation only after reconciliation. Existing command/help registry counts do not change because no command is added.",
+    "Builder owns implementation GREEN, reference/runbook explanation, all review fixes, exact-head CI/review, auto-merge and delivery evidence in one combined PR."
+  ]
+}

@@ -2115,7 +2115,10 @@ async fn fresh_claim_waits_before_pending_removal_is_refused() {
     let claim_result = claim_join.expect("claim task must not panic");
     let removal_result = removal_join.expect("removal task must not panic");
     let claim_is_fresh = matches!(claim_result, Ok(Some(DeliveryClaim::Fresh)));
-    let removal_was_refused = matches!(removal_result, Ok(store::FeedRemoval::RecoveryRequired));
+    let removal_was_refused = matches!(
+        removal_result,
+        Ok(store::FeedRemoval::RecoveryRequired { .. })
+    );
     let relay_after_release = relay_count(&remover, &relay.id).await;
     let rows_after_release = delivery_rows(&remover, &relay.id).await;
     let expected_rows = vec![(
