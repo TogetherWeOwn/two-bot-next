@@ -282,6 +282,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // on intent; a revocation or refused grant deletes the row, so only
     // approvals are measurable.
     TableSpec { table: "voice_join_grants", measure: TableMeasure::Columns(&["created_at"]) },
+    // Insert-once orphan evidence (0468); oldest-out retention removes rows,
+    // so only retained evidence is measurable, not historical deletions.
+    TableSpec { table: "voice_orphan_ledger", measure: TableMeasure::Columns(&["recorded_at"]) },
     // Insert-once creation snapshot plus V2 ownership handoffs, whose
     // timestamp lives in `owner_touched_at` (migration 0412), V3 `/name`
     // custom-name changes, stamped in `name_touched_at` (migration 0414), and V3

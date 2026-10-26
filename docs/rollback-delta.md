@@ -134,7 +134,8 @@ via `created_at`/`owner_touched_at`/`name_touched_at`/`privacy_touched_at`,
 `voice_room_blocks` via `created_at`, `voice_join_grants` via `created_at`,
 the owner-grant journal (`voice_owner_grants`) via `touched_at`,
 `voice_text_companions` via
-`created_at`, the append-only `voice_vote_kick_audit` via `occurred_at`, and
+`created_at`, the retained `voice_orphan_ledger` via `recorded_at`,
+the append-only `voice_vote_kick_audit` via `occurred_at`, and
 the event voice pair (`event_voice_channels` via
 `created_at`/`updated_at`, `event_voice_presence` via
 `joined_at`/`left_at`)) need no
@@ -146,7 +147,11 @@ prepared. A reservation accepted before the baseline
 but bound or rolled back after it is included in both count and export. A block removed
 after the freeze deletes its row, so `voice_room_blocks` measures additions only; a grant
 revoked or refused after the freeze deletes its row, so `voice_join_grants` measures
-approvals only.
+approvals only. Oldest-out retention deletes orphan-evidence rows, so
+`voice_orphan_ledger` measures surviving evidence recorded after the baseline,
+not every orphan ever observed or the rows removed by retention. Restoring an
+older binary leaves this additive evidence table intact; it does not authorize
+channel cleanup.
 
 Read access does **not** authorize execution against real databases for
 tests. Acceptance uses only the disposable test service below. Operational
