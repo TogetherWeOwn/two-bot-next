@@ -7,7 +7,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/giveaway_list_facts_acceptance_tests.rs",
-      "sha256": "2dced736ee3712a66dfb445b2a9348161c29660ff92f4918fc788fb7f8e34967",
+      "sha256": "37d70774d4dea54fa80b2fc541d529aebbac3fbcc3923ee19e06508862c4573c",
       "tests": 9
     }
   ],

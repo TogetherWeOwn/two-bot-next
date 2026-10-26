@@ -33,7 +33,7 @@ async fn runtime(pool: &PgPool, enabled: bool) -> (Arc<CommandRuntime>, MockRest
         executor_at(origin),
         router_with_commands(gates(enabled, enabled)),
         GUILD,
-        true,
+        enabled,
     );
     (runtime, mock)
 }
@@ -716,7 +716,6 @@ async fn authority_and_activation_controls_refuse_without_disclosure_or_effects(
             "absent-guild" => {
                 interaction.guild_id = None;
                 interaction.member = None;
-                interaction.channel_id = None;
                 interaction.channel = None;
                 if let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_mut() {
                     data.guild_id = None;
