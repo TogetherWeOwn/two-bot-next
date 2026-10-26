@@ -150,6 +150,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Opener copy](ticket-opener-copy-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
+- [Claim handoff](ticket-claim-handoff-spec.md)
 - [Resolution signal](ticket-resolution-request-spec.md)
 - [Giveaway leave](giveaway-withdrawal-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
