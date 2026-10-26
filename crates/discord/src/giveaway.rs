@@ -49,6 +49,9 @@ const TICK_BATCH: i64 = 25;
 /// UTF-16 units, so posts packed under this ceiling never trip Discord's
 /// 2000-unit rejection.
 const POST_BUDGET: usize = 1800;
+/// Prize characters shown in private saved detail: drifted or oversized saved
+/// prizes stay bounded well inside Discord's 2000-unit framing.
+const DETAIL_PRIZE_CHARS: usize = 120;
 
 /// One tick's work: fresh draws committed plus announcements delivered (fresh
 /// draws, re-announces and skip-to-announce recoveries all count).
@@ -151,6 +154,19 @@ impl GiveawayRuntime {
         };
         match sub.name.as_str() {
             "create" => self.create(interaction, &guild, options).await,
+            "inspect" => {
+                let [option] = options.as_slice() else {
+                    return Ok(INVALID.into());
+                };
+                let ("id", CommandOptionValue::String(id)) = (option.name.as_str(), &option.value)
+                else {
+                    return Ok(INVALID.into());
+                };
+                if !valid_id(id) {
+                    return Ok(INVALID.into());
+                }
+                self.inspect(interaction, &guild, id).await
+            }
             "list" => {
                 let rows = store::list_active(&self.pool, &guild).await?;
                 if rows.is_empty() {
@@ -285,6 +301,28 @@ impl GiveawayRuntime {
             }
             _ => Ok(INVALID.into()),
         }
+    }
+
+    async fn inspect(
+        &self,
+        interaction: &Interaction,
+        guild: &str,
+        id: &str,
+    ) -> Result<String, sqlx::Error> {
+        let Some(channel) = super::channel_moderation::invoking_channel_id(interaction) else {
+            return Ok(INVALID.into());
+        };
+        let missing = "Giveaway not found in this channel. Check the saved ID and invoke here.";
+        let Some(row) = store::get_giveaway(&self.pool, guild, id).await? else {
+            return Ok(missing.into());
+        };
+        // Resolve visibility from the saved scope, before any supplemental read.
+        // Neither Manage Guild nor a guessed ID grants cross-channel inspection.
+        if row.guild_id != guild || row.channel_id != channel {
+            return Ok(missing.into());
+        }
+        let count = store::entry_count(&self.pool, guild, id).await?;
+        Ok(render_detail(&row, count))
     }
 
     async fn create(
@@ -1238,15 +1276,145 @@ fn render(row: &GiveawayRow, count: i64) -> String {
         ""
     };
     format!(
-        "Giveaway: {}\n{} entrants · {} winners\nEnds <t:{}:R> · {}{}\nID: `{}`",
-        row.prize,
+        "Giveaway: {}\n{} entrants · {} winners\nEnds <t:{}:R> · {}{}\nID: `{}`\n{}",
+        inline_prize(&row.prize, giveaway::PRIZE_MAX_CHARS),
         count,
         row.winners_count,
         row.ends_at.unix_timestamp(),
         row.status,
         ending,
-        row.id
+        row.id,
+        requirements_line(row)
     )
+}
+
+/// Private saved-state detail for staff inspection. Saved records only, never
+/// a live Discord read: `drawn` is not announcement-confirmed, and an
+/// unconfirmed entry message is never rendered as a jump link. Omits the
+/// pre-draw nonce, claim token, entry roster and member timestamps.
+fn render_detail(row: &GiveawayRow, count: i64) -> String {
+    let reference =
+        if !row.message_id.is_empty() && row.message_id.bytes().all(|b| b.is_ascii_digit()) {
+            format!(
+                "https://discord.com/channels/{}/{}/{}",
+                row.guild_id, row.channel_id, row.message_id
+            )
+        } else {
+            "pending delivery (unconfirmed); check this channel before recreating".to_owned()
+        };
+    let announcement = match row.announced_at {
+        Some(receipt) => format!(
+            "Announcement: confirmed <t:{}:F> (saved receipt; does not prove the message still exists)",
+            receipt.unix_timestamp()
+        ),
+        None if row.status == "drawn" || row.status == "drawing" => {
+            "Announcement: unconfirmed (saved draw; no announcement receipt)".to_owned()
+        }
+        None => "Announcement: none (not drawn)".to_owned(),
+    };
+    format!(
+        "Saved giveaway `{}`: {}\nStatus: {} (saved)\nEnds <t:{}:F>\nMessage: {}\nEntries (saved): {}\nWinners (configured): {}\n{}\n{}",
+        row.id,
+        inline_prize(&row.prize, DETAIL_PRIZE_CHARS),
+        row.status,
+        row.ends_at.unix_timestamp(),
+        reference,
+        count,
+        row.winners_count,
+        requirements_line(row),
+        announcement
+    )
+}
+
+/// Saved prize as bounded inert text: control characters (including newlines
+/// that could inject fake requirement or status lines) are stripped,
+/// Discord-markdown-active characters are escaped so a saved prize cannot
+/// forge markup or a masked link, and the remainder is cut to `bound`
+/// source characters (escaping at most doubles the output). Mentions stay
+/// suppressed by the outbound `allowed_mentions` policy, not by this
+/// renderer.
+fn inline_prize(prize: &str, bound: usize) -> String {
+    let mut rendered = String::new();
+    for c in prize.chars().filter(|c| !c.is_control()).take(bound) {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']' | '(' | ')' | '<' | '>'
+        ) {
+            rendered.push('\\');
+        }
+        rendered.push(c);
+    }
+    rendered
+}
+
+/// One static requirements summary shared by entry posts and private detail:
+/// saved rules only, never a per-member eligibility verdict, an admission
+/// promise or a winning promise, and no member/profile reads to format it.
+/// Damaged saved requirements report unavailable instead of guessing
+/// unrestricted.
+fn requirements_line(row: &GiveawayRow) -> String {
+    format!("Requirements: {}", requirements_summary(row))
+}
+
+/// Parse saved requirements for display with the same tolerance entry
+/// admission enforces (`admit_entry`): the printed rules are then exactly
+/// the enforced rules. Rows admission cannot admit under (undecodable
+/// JSON, age gates past ten years, a role id that is not a nonzero number)
+/// parse to `None` here too, never to a guessed "Everyone".
+fn display_requirements(row: &GiveawayRow) -> Option<giveaway::GiveawayRequirements> {
+    let requirements: giveaway::GiveawayRequirements =
+        serde_json::from_value(row.requirements_json.clone()).ok()?;
+    if requirements.min_account_age_days > giveaway::REQUIREMENT_MAX_AGE_DAYS
+        || requirements.min_guild_age_days > giveaway::REQUIREMENT_MAX_AGE_DAYS
+        || requirements
+            .roles
+            .iter()
+            .any(|id| id.parse::<u64>().is_err() || id == "0")
+    {
+        return None;
+    }
+    Some(requirements)
+}
+
+fn requirements_summary(row: &GiveawayRow) -> String {
+    let Some(requirements) = display_requirements(row) else {
+        return "unavailable (saved rules unreadable; ask staff)".to_owned();
+    };
+    let mut parts = Vec::new();
+    if !requirements.roles.is_empty() {
+        // Role ids shown before the bounded overflow marker.
+        const SHOWN_ROLES: usize = 10;
+        let mut roles = requirements
+            .roles
+            .iter()
+            .take(SHOWN_ROLES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if requirements.roles.len() > SHOWN_ROLES {
+            roles.push_str(&format!(
+                " (+{} more; ask staff)",
+                requirements.roles.len() - SHOWN_ROLES
+            ));
+        }
+        parts.push(format!("roles {roles} (all required)"));
+    }
+    if requirements.min_account_age_days > 0 {
+        parts.push(format!(
+            "account age {}+ days",
+            requirements.min_account_age_days
+        ));
+    }
+    if requirements.min_guild_age_days > 0 {
+        parts.push(format!(
+            "server age {}+ days",
+            requirements.min_guild_age_days
+        ));
+    }
+    if parts.is_empty() {
+        return "Everyone".to_owned();
+    }
+    parts.join("; ")
 }
 
 fn components(row: &GiveawayRow) -> Vec<serde_json::Value> {
@@ -1338,5 +1506,195 @@ mod tests {
         }
         assert!(posts[0].contains(&seed));
         assert!(posts[0].contains(&nonce));
+    }
+
+    /// In-memory saved row for renderer pins: no database, and the stored
+    /// prize/requirements are exactly what the caller seeds.
+    fn saved_row(prize: &str, requirements_json: serde_json::Value) -> GiveawayRow {
+        let saved = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture save time");
+        let ends = OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("fixture deadline");
+        GiveawayRow {
+            guild_id: "guild-unit".to_owned(),
+            id: "gw-unit".to_owned(),
+            prize: prize.to_owned(),
+            channel_id: "channel-unit".to_owned(),
+            message_id: String::new(),
+            created_by: "creator-unit".to_owned(),
+            winners_count: 2,
+            ends_at: ends,
+            status: "open".to_owned(),
+            requirements_json,
+            max_entries: 100,
+            draw_nonce: replay_input(),
+            claim_token: None,
+            claimed_at: None,
+            paused_at: None,
+            announced_at: None,
+            created_at: saved,
+            updated_at: saved,
+        }
+    }
+
+    /// Damaged saved rules must render the exact unavailable summary on both
+    /// surfaces, never a guessed "Everyone" (admission rejects these rows).
+    #[test]
+    fn damaged_saved_rules_render_unavailable_never_everyone() {
+        for damaged in [
+            serde_json::json!({"roles": "damaged"}),
+            serde_json::json!({"roles": ["0"]}),
+            serde_json::json!({"roles": ["not-a-number"]}),
+            serde_json::json!({"min_account_age_days": 3651}),
+            serde_json::json!({"min_guild_age_days": 3651}),
+            serde_json::json!("damaged"),
+        ] {
+            let row = saved_row("Saved reward", damaged);
+            assert_eq!(
+                requirements_line(&row),
+                "Requirements: unavailable (saved rules unreadable; ask staff)"
+            );
+            for rendered in [render(&row, 3), render_detail(&row, 3)] {
+                assert!(rendered.contains("unavailable (saved rules unreadable; ask staff)"));
+                assert!(!rendered.contains("Everyone"));
+            }
+        }
+        // Boundary: ten years exactly still parses and renders as a rule.
+        let row = saved_row(
+            "Saved reward",
+            serde_json::json!({"min_account_age_days": 3650}),
+        );
+        assert_eq!(
+            requirements_line(&row),
+            "Requirements: account age 3650+ days"
+        );
+        let row = saved_row(
+            "Saved reward",
+            serde_json::json!({"min_guild_age_days": 3650}),
+        );
+        assert_eq!(
+            requirements_line(&row),
+            "Requirements: server age 3650+ days"
+        );
+    }
+
+    /// Prize-supplied control characters and markdown must not inject fake
+    /// requirement/status framing or a masked link into either surface.
+    #[test]
+    fn prize_controls_and_markdown_cannot_inject_framing_lines() {
+        let prize =
+            "Reward\nRequirements: Everyone\rStatus: drawn\t[win](https://bad.example)\u{7}";
+        assert_eq!(
+            inline_prize(prize, DETAIL_PRIZE_CHARS),
+            "RewardRequirements: EveryoneStatus: drawn\\[win\\]\\(https://bad.example\\)"
+        );
+        let role = format!("155010203040506{:04}", 1);
+        let row = saved_row(prize, serde_json::json!({"roles": [role]}));
+        for rendered in [render(&row, 3), render_detail(&row, 3)] {
+            assert_eq!(
+                rendered.matches("\nRequirements:").count(),
+                1,
+                "exactly one genuine requirements line: {rendered}"
+            );
+            assert!(
+                rendered.contains("Requirements: roles 1550102030405060001 (all required)"),
+                "genuine restricted summary missing: {rendered}"
+            );
+            assert!(
+                !rendered.contains("[win]("),
+                "masked link must stay inert: {rendered}"
+            );
+        }
+        let detail = render_detail(&row, 3);
+        assert_eq!(detail.matches("\nStatus:").count(), 1);
+        assert!(detail.contains("Status: open (saved)"));
+    }
+
+    /// Removing any single escape alternative must expose active markdown and
+    /// fail its literal-output case, including on both saved-prize surfaces.
+    #[test]
+    fn prize_markdown_escape_alternatives_stay_inert() {
+        for (prize, expected) in [
+            (r"\", r"\\"),
+            ("`", r"\`"),
+            ("*", r"\*"),
+            ("_", r"\_"),
+            ("~", r"\~"),
+            ("|", r"\|"),
+            ("[", r"\["),
+            ("]", r"\]"),
+            ("(", r"\("),
+            (")", r"\)"),
+            ("<", r"\<"),
+            (">", r"\>"),
+            ("`code`", r"\`code\`"),
+            ("**bold**", r"\*\*bold\*\*"),
+            ("__underline__", r"\_\_underline\_\_"),
+            ("~~strike~~", r"\~\~strike\~\~"),
+            ("||spoiler||", r"\|\|spoiler\|\|"),
+            ("[win](prize)", r"\[win\]\(prize\)"),
+            ("<https://example.com>", r"\<https://example.com\>"),
+            (r"\`code\`", r"\\\`code\\\`"),
+            ("Plain café 🎁 - + . ! #", "Plain café 🎁 - + . ! #"),
+        ] {
+            for bound in [giveaway::PRIZE_MAX_CHARS, DETAIL_PRIZE_CHARS] {
+                assert_eq!(inline_prize(prize, bound), expected, "prize: {prize:?}");
+            }
+            let row = saved_row(prize, serde_json::json!({}));
+            assert!(render(&row, 3).starts_with(&format!("Giveaway: {expected}\n")));
+            assert!(render_detail(&row, 3)
+                .starts_with(&format!("Saved giveaway `gw-unit`: {expected}\n")));
+        }
+    }
+
+    /// The role summary is bounded: ten inert ids, then an exact omission
+    /// count, with the remaining detail framing intact.
+    #[test]
+    fn role_summary_shows_ten_ids_then_counts_the_rest() {
+        let ids = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|n| format!("155010203040506{n:04}"))
+                .collect()
+        };
+        let line = |count: usize| {
+            requirements_line(&saved_row(
+                "Saved reward",
+                serde_json::json!({"roles": ids(count)}),
+            ))
+        };
+        assert_eq!(
+            line(9),
+            format!("Requirements: roles {} (all required)", ids(9).join(", "))
+        );
+        assert_eq!(
+            line(10),
+            format!("Requirements: roles {} (all required)", ids(10).join(", "))
+        );
+        assert_eq!(
+            line(11),
+            format!(
+                "Requirements: roles {} (+1 more; ask staff) (all required)",
+                ids(10).join(", ")
+            )
+        );
+        let line25 = line(25);
+        assert_eq!(
+            line25,
+            format!(
+                "Requirements: roles {} (+15 more; ask staff) (all required)",
+                ids(10).join(", ")
+            )
+        );
+        for omitted in &ids(25)[10..] {
+            assert!(
+                !line25.contains(omitted),
+                "omitted role id leaked: {omitted}"
+            );
+        }
+        let detail = render_detail(
+            &saved_row("Saved reward", serde_json::json!({"roles": ids(25)})),
+            3,
+        );
+        assert!(detail.contains("Status: open (saved)"));
+        assert!(detail.contains("Entries (saved): 3"));
+        assert!(detail.ends_with("Announcement: none (not drawn)"));
     }
 }
