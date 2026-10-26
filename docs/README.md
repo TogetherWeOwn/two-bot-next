@@ -3,7 +3,7 @@
 Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
 No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
 
-## References and architecture
+## References
 
 - [Find a doc](README.md)
 - [Framework](adr/0001-discord-framework.md)
@@ -17,7 +17,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [MCP tools](mcp.md)
 - [Token registry](admin-registry.md)
 
-## Operations and observability
+## Operations
 
 - [Operations](runbook.md)
 - [Observability triage](runbook-observability.md)
@@ -106,6 +106,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
+- [Giveaways](giveaways.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey](member-journey-parity.md)
 - [Onboarding ops](onboarding-operator-guide.md)
