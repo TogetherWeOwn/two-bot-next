@@ -32,9 +32,7 @@ use std::ops::AsyncFnOnce;
 use std::panic::{resume_unwind, AssertUnwindSafe};
 use two_bot_testsupport::TestDatabase;
 
-#[path = "../../core/tests/support/hotpath_queries.rs"]
-mod hotpath_queries;
-use hotpath_queries::Queries;
+use crate::hotpath_settings_test_support::queries::Queries;
 
 const CAP: i64 = 1000;
 const PAGE_SIZE: usize = 10;
