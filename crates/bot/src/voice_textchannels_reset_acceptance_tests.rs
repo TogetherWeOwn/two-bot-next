@@ -179,11 +179,17 @@ fn assert_mention_safe(response: &InteractionResponse) {
 fn assert_future_notice(text: &str) {
     let lower = text.to_lowercase();
     assert!(
-        lower.contains("future") || lower.contains("new companion") || lower.contains("new room"),
+        lower.contains("future")
+            || lower.contains("new companion")
+            || lower.contains("new room")
+            || lower.contains("from now on"),
         "explain when saved settings apply: {text}"
     );
     assert!(
-        lower.contains("existing") || lower.contains("creation-time") || lower.contains("snapshot"),
+        lower.contains("existing")
+            || lower.contains("creation-time")
+            || lower.contains("snapshot")
+            || lower.contains("open rooms keep"),
         "explain the existing-companion snapshot: {text}"
     );
     assert!(
