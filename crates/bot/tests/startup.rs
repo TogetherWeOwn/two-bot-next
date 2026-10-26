@@ -69,11 +69,27 @@ fn is_eventsub_bind_failure(logs: &str) -> bool {
     logs.contains("receiver_bind_failed")
 }
 
+/// A bind failure is retryable only while attempts remain: on the last
+/// attempt it must fall through to the fail-loud panic with its child logs,
+/// mirroring `should_retry_park_attempt` for the parked-gateway loop.
+fn should_retry_eventsub_attempt(logs: &str, attempt: u8, attempts: u8) -> bool {
+    attempt < attempts && is_eventsub_bind_failure(logs)
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default()
+}
+
 /// One eventsub-reconcile attempt: spawn the entrypoint with the given bind
 /// and wait for the startup pass to log its config refusal. Returns `None`
-/// when the child failed to bind (retryable); panics on a timeout or any
-/// other early exit so genuine regressions never become a retried pass.
-fn eventsub_reconcile_once(bind: &str) -> Option<()> {
+/// only when the child failed to bind and attempts remain; panics with the
+/// child logs on a timeout, a last-attempt bind failure, or any other early
+/// exit so genuine regressions never become a retried or silent pass.
+fn eventsub_reconcile_once(bind: &str, attempt: u8, attempts: u8) -> Option<()> {
     let mut child = command("127.0.0.1:0")
         .env("DISCORD_TOKEN", "INVALID")
         .env("GUILD_ID", "123")
@@ -106,7 +122,7 @@ fn eventsub_reconcile_once(bind: &str) -> Option<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Both forwarder threads ended at pipe EOF, so every line the
                 // child wrote is already in `logs`.
-                if is_eventsub_bind_failure(&logs) {
+                if should_retry_eventsub_attempt(&logs, attempt, attempts) {
                     return None;
                 }
                 panic!("bot exited before the startup pass logged its refusal; child logs: {logs}");
@@ -118,7 +134,7 @@ fn eventsub_reconcile_once(bind: &str) -> Option<()> {
 fn assert_eventsub_reconcile_with_binds(next_bind: &mut dyn FnMut() -> String) {
     const ATTEMPTS: u8 = 3;
     for attempt in 1..=ATTEMPTS {
-        if eventsub_reconcile_once(&next_bind()).is_some() {
+        if eventsub_reconcile_once(&next_bind(), attempt, ATTEMPTS).is_some() {
             return;
         }
         assert!(
@@ -128,6 +144,10 @@ fn assert_eventsub_reconcile_with_binds(next_bind: &mut dyn FnMut() -> String) {
         // Bind failure: the port was stolen under parallel load. The exited
         // child is reaped on drop; the next attempt reserves a fresh bind.
     }
+    // Unreachable while `eventsub_reconcile_once` panics on the last attempt,
+    // but keep the fallthrough loud in its own right: exhausting the retries
+    // without seeing the reconcile refusal is a failure, never a pass.
+    panic!("eventsub reconcile attempts exhausted without the startup refusal");
 }
 
 #[test]
@@ -168,6 +188,79 @@ fn eventsub_retry_gates_only_on_receiver_bind_failure() {
     ));
     assert!(!is_eventsub_bind_failure("database initialization failed"));
     assert!(!is_eventsub_bind_failure(""));
+    assert!(should_retry_eventsub_attempt(
+        "error_class=\"receiver_bind_failed\"",
+        1,
+        3
+    ));
+    assert!(!should_retry_eventsub_attempt(
+        "error_class=\"receiver_bind_failed\"",
+        3,
+        3
+    ));
+    assert!(!should_retry_eventsub_attempt(
+        "database initialization failed",
+        1,
+        3
+    ));
+}
+
+#[test]
+fn eventsub_bind_exhaustion_panics_with_child_logs() {
+    // Pin the loop's fail-loud exit: every attempt's bind is held, so all
+    // three children die with receiver_bind_failed and the last one must
+    // panic carrying its logs, never fall out as a silent pass.
+    let held = TcpListener::bind("127.0.0.1:0").expect("hold test port");
+    let held_bind = held.local_addr().unwrap().to_string();
+    let calls = std::cell::Cell::new(0u8);
+    let mut provider = || {
+        calls.set(calls.get() + 1);
+        held_bind.clone()
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eventsub_reconcile_with_binds(&mut provider);
+    }));
+    let payload = outcome.expect_err("exhausted bind retries must panic, never pass silently");
+    assert_eq!(
+        calls.get(),
+        3,
+        "exhaustion must stop after the third attempt"
+    );
+    let message = panic_message(&*payload);
+    assert!(
+        message.contains("receiver_bind_failed"),
+        "the last attempt's child logs must ride the panic: {message}"
+    );
+    assert!(
+        message.contains("bot exited before the startup pass"),
+        "exhaustion must fail loud, not drift into the timeout arm: {message}"
+    );
+}
+
+#[test]
+fn eventsub_non_bind_early_exit_panics_without_retry() {
+    // Pin the non-bind fail-fast path: port 0 is a config refusal
+    // (receiver_config_invalid, no bind attempted), so the first child's
+    // early exit must panic at once instead of consuming retries.
+    let calls = std::cell::Cell::new(0u8);
+    let mut provider = || {
+        calls.set(calls.get() + 1);
+        "127.0.0.1:0".to_string()
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eventsub_reconcile_with_binds(&mut provider);
+    }));
+    let payload = outcome.expect_err("a non-bind early exit must panic at once");
+    assert_eq!(calls.get(), 1, "a non-bind early exit must not retry");
+    let message = panic_message(&*payload);
+    assert!(
+        message.contains("receiver_config_invalid"),
+        "the child's refusal must ride the panic: {message}"
+    );
+    assert!(
+        !message.contains("receiver_bind_failed"),
+        "a config refusal must not be misread as a bind failure: {message}"
+    );
 }
 
 #[test]
