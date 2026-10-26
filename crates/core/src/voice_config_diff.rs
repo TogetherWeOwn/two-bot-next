@@ -30,7 +30,7 @@ pub const PREVIEW_CHAR_LIMIT: usize = 2000;
 /// Separate from the upload cap: old values and JSON escaping count too.
 pub const FULL_REVIEW_BYTE_LIMIT: usize = 32 * 1024;
 
-const REVIEW_HINT: &str = "Full review attached; read it before confirming.\n";
+const REVIEW_HINT: &str = "Full review attached; read it before confirming.";
 
 /// No single preview line is longer than this many characters.
 const LINE_CHAR_LIMIT: usize = 200;
@@ -318,15 +318,17 @@ pub fn render_preview(diff: &ConfigDiff, max_lines: usize) -> String {
 }
 
 /// Compact preview plus an attachment hint, with room reserved for the hint
-/// inside the same UTF-16 message budget. Only use after a full review exists.
+/// inside the same UTF-16 message budget. The hint trails the preview so the
+/// body still starts with the `Import preview:` summary line (or `No
+/// changes`). Only use after a full review exists.
 #[must_use]
 pub fn render_review_preview(diff: &ConfigDiff, max_lines: usize) -> String {
     let body = render_preview_with_budget(
         diff,
         max_lines,
-        PREVIEW_CHAR_LIMIT - message_len(REVIEW_HINT),
+        PREVIEW_CHAR_LIMIT - message_len(REVIEW_HINT) - 1,
     );
-    format!("{REVIEW_HINT}{body}")
+    format!("{body}\n{REVIEW_HINT}")
 }
 
 fn render_preview_with_budget(diff: &ConfigDiff, max_lines: usize, budget: usize) -> String {
