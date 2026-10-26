@@ -2,12 +2,10 @@
 
 Sole manifest: `- [Purpose](relative.md)` by area.
 
-Run `python3 scripts/check_docs_index.py --json` at repo root.
-Sorted `{missing,stale,oversize}` arrays: empty = PASS/exit 0;
-else exit 1: fix rows or split docs. Bad/duplicate rows:
-`docs/README.md:<line>` in `stale`.
-Bytes: index <12,000; other docs ≤65,536. Legacy exceptions/reasons only in
-`scripts/check_docs_index.py` (`LARGE_DOCS`).
+Check: `python3 scripts/check_docs_index.py --json` (repo root).
+Empty `{missing,stale,oversize}` = PASS (exit 0); else exit 1: fix rows/split docs.
+Bad/duplicate rows land in `stale` as `docs/README.md:<line>`.
+Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -142,6 +140,7 @@ Bytes: index <12,000; other docs ≤65,536. Legacy exceptions/reasons only in
 - [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
+- [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
