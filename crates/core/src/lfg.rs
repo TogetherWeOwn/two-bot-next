@@ -70,8 +70,13 @@ pub enum RoleSpecError {
     /// A comma-separated entry is not exactly `key:label:slots`.
     #[error("roles must be key:label:slots entries separated by commas.")]
     BadShape,
-    /// Key fails `^[a-z0-9_-]{{1,32}}$` after trim+lowercase; carries a bounded raw prefix.
-    #[error("Invalid LFG role key \"{0}\".")]
+    /// Key fails `^[a-z0-9_-]{{1,32}}$` after trim+lowercase; carries a
+    /// bounded raw prefix, rendered inert by the `Display` impl so a crafted
+    /// key cannot forge markup in the refusal reply.
+    #[error(
+        "Invalid LFG role key \"{}\".",
+        crate::custom_commands::escape_inspect_text(.0)
+    )]
     BadKey(String),
     /// The raw specification exceeds the published input bound.
     #[error("LFG role specification is too long.")]
@@ -79,7 +84,10 @@ pub enum RoleSpecError {
     /// Normalized key equals the reserved leave-action value (`__leave__`);
     /// carries the normalized key. Legacy `normalizeRoles` throws
     /// `LFG role key "__leave__" is reserved for leaving the group.`
-    #[error("LFG role key \"{0}\" is reserved for leaving the group.")]
+    #[error(
+        "LFG role key \"{}\" is reserved for leaving the group.",
+        crate::custom_commands::escape_inspect_text(.0)
+    )]
     ReservedKey(String),
     /// Label empty or longer than 80 chars.
     #[error("LFG role labels must be 1-80 characters.")]
@@ -91,7 +99,10 @@ pub enum RoleSpecError {
     #[error("LFG needs 1-20 roles.")]
     BadCount,
     /// Normalized key seen twice; carries the normalized key.
-    #[error("Duplicate LFG role key \"{0}\".")]
+    #[error(
+        "Duplicate LFG role key \"{}\".",
+        crate::custom_commands::escape_inspect_text(.0)
+    )]
     DuplicateKey(String),
 }
 
@@ -1095,7 +1106,7 @@ mod tests {
         );
         assert_eq!(
             RoleSpecError::ReservedKey(LFG_LEAVE_VALUE.to_owned()).to_string(),
-            "LFG role key \"__leave__\" is reserved for leaving the group."
+            "LFG role key \"\\_\\_leave\\_\\_\" is reserved for leaving the group."
         );
     }
 

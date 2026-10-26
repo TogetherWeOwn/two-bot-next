@@ -221,7 +221,7 @@ pub struct PutCommandInput {
 pub enum CommandError {
     #[error("Command name must match ^[a-z0-9_-]{{1,32}}$.")]
     InvalidName,
-    #[error("Command name \"{0}\" is reserved by Owen.")]
+    #[error("Command name \"{}\" is reserved by Owen.", escape_inspect_text(.0))]
     ReservedName(String),
     #[error("Description must be between 1 and 100 characters.")]
     InvalidDescription,
@@ -231,7 +231,7 @@ pub enum CommandError {
     InvalidTextTrigger,
     #[error("Text trigger must be lowercase.")]
     TextTriggerNotLowercase,
-    #[error("Text trigger \"{0}\" is reserved by Owen.")]
+    #[error("Text trigger \"{}\" is reserved by Owen.", escape_inspect_text(.0))]
     ReservedTextTrigger(String),
     #[error("Write would define more than {0} custom commands, but that is the guild limit.")]
     OverCapacity(usize),
@@ -815,7 +815,9 @@ impl InspectView {
     }
 
     /// Trusted plain-text heading, always the first line, always followed by
-    /// a newline before untrusted text.
+    /// a newline before untrusted text. The validated name still renders
+    /// through [`escape_inspect_text`]: a stored `__name__` is active
+    /// Markdown until escaped.
     #[must_use]
     pub fn heading(self, name: &str) -> String {
         let view = match self {
@@ -823,7 +825,7 @@ impl InspectView {
             Self::Template => "Saved template",
             Self::Preview => "Preview",
         };
-        format!("{view} /{name}")
+        format!("{view} /{}", escape_inspect_text(name))
     }
 }
 
@@ -933,7 +935,10 @@ pub fn invalid_inspect_view_reply(raw: Option<&str>) -> String {
 /// copy.
 #[must_use]
 pub fn format_inspect_miss(name: &str) -> String {
-    format!("No command /{name} found in this server. List saved commands with /command-list.")
+    format!(
+        "No command /{} found in this server. List saved commands with /command-list.",
+        escape_inspect_text(name)
+    )
 }
 
 /// Private definition summary: saved description, existing enabled state,
@@ -1080,7 +1085,10 @@ pub fn format_draft_preview(template: &str, ctx: &TemplateContext) -> String {
 /// saved definition is not at fault.
 #[must_use]
 pub fn inspect_preview_context_unavailable(name: &str) -> String {
-    format!("Preview for /{name} is unavailable: command context is missing. Please try again.")
+    format!(
+        "Preview for /{} is unavailable: command context is missing. Please try again.",
+        escape_inspect_text(name)
+    )
 }
 
 /// DB-backed delete set for disable-time deregistration, sorted and deduped

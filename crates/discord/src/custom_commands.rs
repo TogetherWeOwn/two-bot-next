@@ -23,9 +23,10 @@ use twilight_model::{
 use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        accepted_text_trigger, builtin_command_names, format_command_list_page,
-        format_draft_preview, format_inspect_miss, format_inspect_preview, format_inspect_summary,
-        format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
+        accepted_text_trigger, builtin_command_names, escape_inspect_text,
+        format_command_list_page, format_draft_preview, format_inspect_miss,
+        format_inspect_preview, format_inspect_summary, format_inspect_template,
+        inspect_preview_context_unavailable, invalid_inspect_option_reply,
         invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
         AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand, TemplateContext,
         ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
@@ -795,6 +796,7 @@ impl CustomCommandRuntime {
             return Ok("A command name is required.".to_owned());
         };
         let name = name.to_lowercase();
+        let shown = shown_command_name(&name);
         let audit_id = format!("custom:manage:{}", interaction.id);
         let at = two_bot_core::now_iso();
         let _guard = self.registry.lock().await;
@@ -821,7 +823,7 @@ impl CustomCommandRuntime {
             )
             .await
             {
-                Ok(decision) => (format!("Saved /{name}."), decision.resync_registry),
+                Ok(decision) => (format!("Saved /{shown}."), decision.resync_registry),
                 Err(service::ServiceError::Storage(_)) => return Err(CustomCommandError::Storage),
                 Err(error) => return Ok(error.to_string()),
             }
@@ -839,9 +841,9 @@ impl CustomCommandRuntime {
             {
                 Ok(decision) => (
                     if decision.deleted {
-                        format!("Removed /{name}.")
+                        format!("Removed /{shown}.")
                     } else {
-                        format!("No command /{name} found.")
+                        format!("No command /{shown} found.")
                     },
                     decision.resync_registry,
                 ),
@@ -887,6 +889,7 @@ impl CustomCommandRuntime {
             .ok_or(CustomCommandError::Context)?
             .to_string();
         let name = raw.to_lowercase();
+        let shown = shown_command_name(&name);
         let audit_id = format!("custom:manage:{}", interaction.id);
         let at = two_bot_core::now_iso();
         let _guard = self.registry.lock().await;
@@ -906,13 +909,13 @@ impl CustomCommandRuntime {
         let (reply, resync) = match decision {
             Ok(decision) => {
                 let reply = match decision.outcome {
-                    ToggleOutcome::Missing => format!("No command /{name} found."),
+                    ToggleOutcome::Missing => format!("No command /{shown} found."),
                     ToggleOutcome::Unchanged if target => {
-                        format!("/{name} is already enabled.")
+                        format!("/{shown} is already enabled.")
                     }
-                    ToggleOutcome::Unchanged => format!("/{name} is already disabled."),
-                    ToggleOutcome::Changed if target => format!("Enabled /{name}."),
-                    ToggleOutcome::Changed => format!("Disabled /{name}."),
+                    ToggleOutcome::Unchanged => format!("/{shown} is already disabled."),
+                    ToggleOutcome::Changed if target => format!("Enabled /{shown}."),
+                    ToggleOutcome::Changed => format!("Disabled /{shown}."),
                 };
                 (reply, decision.resync_registry)
             }
@@ -942,6 +945,15 @@ fn delivery_error(error: crate::DiscordError) -> CustomCommandError {
     } else {
         CustomCommandError::DeliveryUnknown
     }
+}
+
+/// Render a supplied or stored command name inert in a management receipt:
+/// inspect-style Markdown escaping plus mass-mention neutralization,
+/// composing the two existing core helpers (no new escape logic here).
+/// Plain names pass through byte-identical; a valid stored `__name__` or a
+/// hostile absent name cannot forge markup or a ping in the reply.
+fn shown_command_name(name: &str) -> String {
+    two_bot_core::message_safety::neutralize_mentions(&escape_inspect_text(name))
 }
 
 /// Toggle-option refusal: the lifecycle commands take exactly one text
