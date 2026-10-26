@@ -1,9 +1,10 @@
 """Guard Rust toolchain/image parity: one pin, every consumer.
 
-`rust-toolchain.toml` is the single source of truth (currently 1.98.1).
-Every `dtolnay/rust-toolchain` step in `check.yml`, `nightly.yml` and
-`pipeline-benchmark.yml` must request that exact channel (the fuzz-compile
-job alone uses pinned nightly), `Dockerfile` must build
+`rust-toolchain.toml` is the single source of truth (currently 1.99.1).
+Every `dtolnay/rust-toolchain` step in `check.yml`, `nightly.yml`,
+`pipeline-benchmark.yml` and `reusable-rust-nextest.yml` must request that
+exact channel (the fuzz-compile job alone uses pinned nightly), `Dockerfile`
+must build
 `FROM rust:<major>.<minor>-trixie`, and the selected workflow job containers
 must use the matching pinned Rust trixie image. Runs offline via the existing
 `Source-level CI gate regressions` discover step in check.yml.
@@ -20,7 +21,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml")
+WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml", "reusable-rust-nextest.yml")
 CONTAINER_WORKFLOWS = {
     "deploy-staging.yml": ("schema-gate", "roles-gate"),
     "staging-migrate.yml": ("plan", "apply"),
@@ -199,7 +200,7 @@ PINNED_DOCKERFILE = "FROM rust:{tag}@sha256:{digest} AS builder\n"
 PINNED_CONTAINER_IMAGE = "rust:{tag}@sha256:{digest}"
 
 
-def make_fixture_root(parent, channel="1.98.1", workflow_toolchain="1.98.1", docker_tag="1.98-trixie", container_tag="1.98-trixie", docker_digest=PINNED_DIGEST, container_digest=PINNED_DIGEST):
+def make_fixture_root(parent, channel="1.99.1", workflow_toolchain="1.99.1", docker_tag="1.99-trixie", container_tag="1.99-trixie", docker_digest=PINNED_DIGEST, container_digest=PINNED_DIGEST):
     root = Path(parent) / "root"
     (root / ".github/workflows").mkdir(parents=True)
     (root / "rust-toolchain.toml").write_text(
@@ -246,26 +247,26 @@ class ToolchainParityTests(unittest.TestCase):
 
     def test_wrong_version_workflow_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch, workflow_toolchain="1.99.0")
+            root = make_fixture_root(scratch, workflow_toolchain="1.100.0")
             errors = workflow_toolchain_errors(root)
-            self.assertTrue(errors, "1.99.0 against a 1.98.1 pin must fail")
+            self.assertTrue(errors, "1.100.0 against a 1.99.1 pin must fail")
 
     def test_drifted_dockerfile_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch, docker_tag="1.99-trixie")
+            root = make_fixture_root(scratch, docker_tag="1.100-trixie")
             errors = dockerfile_parity_errors(root)
             self.assertEqual(len(errors), len(DOCKERFILES))
-            self.assertTrue(all("1.99-trixie" in error for error in errors))
+            self.assertTrue(all("1.100-trixie" in error for error in errors))
 
     def test_drifted_container_image_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch, container_tag="1.98-bookworm")
+            root = make_fixture_root(scratch, container_tag="1.99-bookworm")
             errors = container_image_errors(root)
             self.assertEqual(len(errors), sum(map(len, CONTAINER_WORKFLOWS.values())))
-            self.assertTrue(all("1.98-bookworm" in error for error in errors))
+            self.assertTrue(all("1.99-bookworm" in error for error in errors))
             wired = toolchain_parity_errors(root)
             self.assertTrue(wired, "container drift must fail through the CI entry point")
-            self.assertTrue(any("1.98-bookworm" in error for error in wired))
+            self.assertTrue(any("1.99-bookworm" in error for error in wired))
 
     def test_digest_only_drifted_container_image_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
@@ -288,22 +289,22 @@ class ToolchainParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
             root = make_fixture_root(scratch)
             (root / "Dockerfile").write_text(
-                PINNED_DOCKERFILE.format(tag="1.98-trixie", digest=PINNED_DIGEST)
-                + f"FROM rust:1.99-trixie@sha256:{PINNED_DIGEST} AS extra\n"
+                PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+                + f"FROM rust:1.100-trixie@sha256:{PINNED_DIGEST} AS extra\n"
             )
             errors = dockerfile_parity_errors(root)
             self.assertEqual(len(errors), 1, errors)
-            self.assertIn("1.99-trixie", errors[0])
+            self.assertIn("1.100-trixie", errors[0])
             wired = toolchain_parity_errors(root)
             self.assertTrue(wired, "second-stage tag drift must fail through the CI entry point")
-            self.assertTrue(any("1.99-trixie" in error for error in wired))
+            self.assertTrue(any("1.100-trixie" in error for error in wired))
 
     def test_multistage_second_rust_digest_drift_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
             root = make_fixture_root(scratch)
             (root / "Dockerfile").write_text(
-                PINNED_DOCKERFILE.format(tag="1.98-trixie", digest=PINNED_DIGEST)
-                + f"FROM rust:1.98-trixie@sha256:{'b' * 64} AS extra\n"
+                PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+                + f"FROM rust:1.99-trixie@sha256:{'b' * 64} AS extra\n"
             )
             errors = container_image_errors(root)
             self.assertEqual(len(errors), 1, errors)
@@ -315,8 +316,8 @@ class ToolchainParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
             root = make_fixture_root(scratch)
             (root / "Dockerfile").write_text(
-                "FROM rust:1.98-trixie AS builder\n"
-                + f"FROM rust:1.98-trixie@sha256:{PINNED_DIGEST} AS extra\n"
+                "FROM rust:1.99-trixie AS builder\n"
+                + f"FROM rust:1.99-trixie@sha256:{PINNED_DIGEST} AS extra\n"
             )
             errors = container_image_errors(root)
             self.assertEqual(len(errors), 1, errors)
@@ -326,18 +327,18 @@ class ToolchainParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
             root = make_fixture_root(scratch)
             (root / "Dockerfile").write_text(
-                f"FROM --platform=$BUILDPLATFORM rust:1.98-trixie@sha256:{PINNED_DIGEST} AS builder\n"
+                f"FROM --platform=$BUILDPLATFORM rust:1.99-trixie@sha256:{PINNED_DIGEST} AS builder\n"
             )
             self.assertEqual(toolchain_parity_errors(root), [])
             (root / "Dockerfile").write_text(
-                f"FROM --platform=$BUILDPLATFORM rust:1.99-trixie@sha256:{PINNED_DIGEST} AS builder\n"
+                f"FROM --platform=$BUILDPLATFORM rust:1.100-trixie@sha256:{PINNED_DIGEST} AS builder\n"
             )
             errors = dockerfile_parity_errors(root)
             self.assertEqual(len(errors), 1, errors)
-            self.assertIn("1.99-trixie", errors[0])
+            self.assertIn("1.100-trixie", errors[0])
             wired = toolchain_parity_errors(root)
             self.assertTrue(wired, "flagged-stage tag drift must fail through the CI entry point")
-            self.assertTrue(any("1.99-trixie" in error for error in wired))
+            self.assertTrue(any("1.100-trixie" in error for error in wired))
 
     def test_each_container_image_is_covered(self):
         for name, job_ids in CONTAINER_WORKFLOWS.items():
@@ -350,14 +351,14 @@ class ToolchainParityTests(unittest.TestCase):
             with self.subTest(drifted=drifted):
                 with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
                     root = make_fixture_root(scratch)
-                    (root / drifted).write_text(PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST))
+                    (root / drifted).write_text(PINNED_DOCKERFILE.format(tag="1.100-trixie", digest=PINNED_DIGEST))
                     errors = dockerfile_parity_errors(root)
                     self.assertEqual(len(errors), 1, errors)
                     self.assertIn(drifted, errors[0])
 
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch, channel="1.98")
+            root = make_fixture_root(scratch, channel="1.99")
             self.assertTrue(toolchain_parity_errors(root), "a looser channel must fail")
 
     def test_pinned_workflows_carry_the_match_comment(self):
