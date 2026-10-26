@@ -7,13 +7,15 @@
 //! (play|voice), format (json|summary). Pages contain ten rows except the last;
 //! optionless output and the operator CLI retain their existing JSON contract.
 //! JSON metadata names are not pinned: selected page/sort may be in prose or
-//! JSON. Summary layout is free; labelled h/m/s or HH:MM:SS durations work.
+//! JSON. Summary rows bind each game's labelled play/voice/session values;
+//! duration controls additionally accept labelled h/m/s or HH:MM:SS.
 
 #![cfg(test)]
 
 use super::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
+use two_bot_core::game_activity::{GameMixBrowseFormat, GameMixBrowseSort, GAME_MIX_MAX_PAGE};
 use two_bot_core::message_safety::contains_mass_mention;
 use two_bot_testsupport::TestDatabase;
 
@@ -261,6 +263,7 @@ fn selectors_publish_bounded_optional_choices_without_a_guild_or_member_override
     let page = options.iter().find(|o| o["name"] == "page").expect("page");
     assert_eq!(page["type"], 4, "integer page");
     assert_eq!(page["min_value"], 1);
+    assert_eq!(page["max_value"], 10_000, "contractual page ceiling");
     assert!(
         page["max_value"]
             .as_f64()
@@ -284,6 +287,30 @@ fn selectors_publish_bounded_optional_choices_without_a_guild_or_member_override
             .collect();
         assert_eq!(choices, expected.into_iter().collect());
     }
+}
+
+#[test]
+fn page_ceiling_is_inclusive_and_preserves_default_sort_and_format() {
+    assert_eq!(GAME_MIX_MAX_PAGE, 10_000, "contractual page ceiling");
+    for (value, expected_page) in [(GAME_MIX_MAX_PAGE - 1, 9999), (GAME_MIX_MAX_PAGE, 10_000)] {
+        let interaction = staff(vec![option("page", CommandOptionValue::Integer(value))]);
+        assert_eq!(
+            crate::command_runtime::game_mix_browse_request(&interaction),
+            Ok(Some((
+                expected_page,
+                GameMixBrowseSort::Play,
+                GameMixBrowseFormat::Json,
+            ))),
+            "valid page {value} must decode with legacy selector defaults"
+        );
+    }
+    let interaction = staff(vec![option(
+        "page",
+        CommandOptionValue::Integer(GAME_MIX_MAX_PAGE + 1),
+    )]);
+    let error = crate::command_runtime::game_mix_browse_request(&interaction)
+        .expect_err("10001 must be rejected by the decoder, not by storage pagination");
+    correction(&error, "page");
 }
 
 #[tokio::test]
@@ -563,6 +590,13 @@ async fn explicit_summary_distinguishes_accumulated_play_and_overlapping_voice_w
         "readable summary is explicitly selected, not raw JSON"
     );
     assert!(text.contains("Solo"));
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("- `"))
+            .collect::<Vec<_>>(),
+        ["- `Solo` — play 1h 2m 3s · in voice 0h 1m 2s · 7 sessions"],
+        "Solo's play, voice and sessions must stay bound: {text}"
+    );
     assert!(
         duration_present(&text, 1, 2, 3),
         "3723000ms is 1h 2m 3s: {text}"
@@ -615,10 +649,36 @@ async fn summary_pages_preserve_all_rows_and_large_accumulated_hours_do_not_wrap
     }
     pool.close().await;
     db.close().await.expect("drop owned fixture");
+    let expected_rows = [
+        "- `Long00` — play 2562047788015h 12m 55s · in voice 2501999792h 59m 0s · 1 sessions",
+        "- `Long01` — play 2562047788015h 12m 54s · in voice 2501999792h 58m 59s · 1 sessions",
+        "- `Long02` — play 2562047788015h 12m 53s · in voice 2501999792h 58m 58s · 1 sessions",
+        "- `Long03` — play 2562047788015h 12m 52s · in voice 2501999792h 58m 57s · 1 sessions",
+        "- `Long04` — play 2562047788015h 12m 51s · in voice 2501999792h 58m 56s · 1 sessions",
+        "- `Long05` — play 2562047788015h 12m 50s · in voice 2501999792h 58m 55s · 1 sessions",
+        "- `Long06` — play 2562047788015h 12m 49s · in voice 2501999792h 58m 54s · 1 sessions",
+        "- `Long07` — play 2562047788015h 12m 48s · in voice 2501999792h 58m 53s · 1 sessions",
+        "- `Long08` — play 2562047788015h 12m 47s · in voice 2501999792h 58m 52s · 1 sessions",
+        "- `Long09` — play 2562047788015h 12m 46s · in voice 2501999792h 58m 51s · 1 sessions",
+        "- `Long10` — play 2562047788015h 12m 45s · in voice 2501999792h 58m 50s · 1 sessions",
+        "- `Long11` — play 2562047788015h 12m 44s · in voice 2501999792h 58m 49s · 1 sessions",
+        "- `Long12` — play 2562047788015h 12m 43s · in voice 2501999792h 58m 48s · 1 sessions",
+    ];
     for (page, reply) in replies[..2].iter().enumerate() {
         let text = content(reply);
         assert!(!text.contains("```json"));
         selection_notice(&text, page + 1, "play");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("- `"))
+                .collect::<Vec<_>>(),
+            if page == 0 {
+                &expected_rows[..10]
+            } else {
+                &expected_rows[10..]
+            },
+            "every game's play, voice and sessions stay bound across pages: {text}"
+        );
         for index in 0..13 {
             let expected = if (page == 0 && index < 10) || (page == 1 && index >= 10) {
                 1
@@ -633,6 +693,11 @@ async fn summary_pages_preserve_all_rows_and_large_accumulated_hours_do_not_wrap
         }
     }
     let first = content(&replies[0]);
+    assert_eq!(
+        first.lines().find(|line| line.starts_with("- `Long00`")),
+        Some("- `Long00` — play 2562047788015h 12m 55s · in voice 2501999792h 59m 0s · 1 sessions"),
+        "large play and voice durations belong to Long00: {first}"
+    );
     assert!(
         duration_present(&first, 2_562_047_788_015, 12, 55),
         "BIGINT play expressed as accumulated hours, no 24-hour wrap: {first}"
@@ -716,6 +781,13 @@ async fn malformed_selectors_are_corrected_before_any_aggregate_read() {
     observe_reads(db.pool()).await;
     let cases = vec![
         ("page", vec![option("page", CommandOptionValue::Integer(0))]),
+        (
+            "page",
+            vec![option(
+                "page",
+                CommandOptionValue::Integer(GAME_MIX_MAX_PAGE + 1),
+            )],
+        ),
         (
             "page",
             vec![option("page", CommandOptionValue::Integer(-1))],

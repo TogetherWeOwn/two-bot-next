@@ -69,6 +69,36 @@ fn pages_reach_every_row_once_in_both_orders() {
 }
 
 #[test]
+fn secondary_totals_break_primary_ties_in_both_orders_across_the_page_boundary() {
+    for sort in [GameMixBrowseSort::Play, GameMixBrowseSort::Voice] {
+        // Ascending input/title order opposes descending secondary totals.
+        let rows: Vec<_> = (0..12)
+            .map(|index| match sort {
+                GameMixBrowseSort::Play => {
+                    aggregate(&format!("Tie{index:02}"), 60_000, index * 1000)
+                }
+                GameMixBrowseSort::Voice => {
+                    aggregate(&format!("Tie{index:02}"), 60_000 + index * 1000, 30_000)
+                }
+            })
+            .collect();
+        assert_eq!(
+            row_names(&page(&rows, 1, sort)),
+            [
+                "Tie11", "Tie10", "Tie09", "Tie08", "Tie07", "Tie06", "Tie05", "Tie04", "Tie03",
+                "Tie02",
+            ],
+            "secondary totals must decide the first ten rows for {sort:?}"
+        );
+        assert_eq!(
+            row_names(&page(&rows, 2, sort)),
+            ["Tie01", "Tie00"],
+            "secondary totals must decide the remaining rows for {sort:?}"
+        );
+    }
+}
+
+#[test]
 fn full_ties_order_by_game_title_across_the_page_boundary() {
     let rows: Vec<_> = (0..12)
         .rev()
@@ -125,6 +155,16 @@ fn summary_durations_use_accumulated_hours_without_wrapping() {
     ) else {
         panic!("expected a summary page");
     };
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("- `"))
+            .collect::<Vec<_>>(),
+        [
+            "- `Huge` — play 2562047788015h 12m 55s · in voice 2501999792h 59m 0s · 1 sessions",
+            "- `Solo` — play 1h 2m 3s · in voice 0h 1m 2s · 1 sessions",
+        ],
+        "game identity, play, voice and sessions must stay bound: {text}"
+    );
     assert!(text.contains("1h 2m 3s"), "{text}");
     assert!(text.contains("0h 1m 2s"), "{text}");
     assert!(text.contains("2562047788015h 12m 55s"), "{text}");
