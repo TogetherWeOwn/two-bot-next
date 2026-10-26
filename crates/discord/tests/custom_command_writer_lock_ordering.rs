@@ -11,7 +11,13 @@
 //! clone of the same runtime to settle with their private corrections and
 //! zero store effects BEFORE the gate is released. Moving writer decoding
 //! behind the registry lock makes the malformed calls wait for the held
-//! publication instead, and this test times out and fails.
+//! publication instead, and this test times out and fails. The gated cases
+//! are not all early exits: alongside the unknown-key and duplicate-name
+//! shapes, each later `/command` field is exercised on its own with a valid
+//! name (and valid earlier fields) — a wrong-typed template, a missing
+//! template, a wrong-typed description and a wrong-typed text-trigger — so
+//! slipping the lock between the name decoder and any later field decoder
+//! also leaves a case waiting behind the held publication and fails here.
 
 #[allow(dead_code)]
 mod common;
@@ -65,6 +71,10 @@ fn runtime(pool: PgPool, mock: &MockRest) -> CustomCommandRuntime {
 
 fn option(name: &str, value: &str) -> Value {
     json!({"name": name, "type": 3, "value": value})
+}
+
+fn integer_option(name: &str) -> Value {
+    json!({"name": name, "type": 4, "value": 17})
 }
 
 fn interaction(id: u64, command: &str, options: Vec<Value>) -> Interaction {
@@ -219,6 +229,14 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
             completion(),                  // malformed remove completion
             ScriptedResponse::status(204), // unknown-option define defer
             completion(),                  // unknown-option define completion
+            ScriptedResponse::status(204), // integer-template define defer
+            completion(),                  // integer-template define completion
+            ScriptedResponse::status(204), // missing-template define defer
+            completion(),                  // missing-template define completion
+            ScriptedResponse::status(204), // integer-description define defer
+            completion(),                  // integer-description define completion
+            ScriptedResponse::status(204), // integer-text-trigger define defer
+            completion(),                  // integer-text-trigger define completion
         ],
         completion(),
         1,
@@ -276,6 +294,37 @@ async fn malformed_writers_reject_before_a_contended_registry_lock() {
                 option("unexpected", HOSTILE),
             ],
             "option",
+        ),
+        // Later fields, one at a time: the name (and every field decoded
+        // before the malformed one) is valid, so these settle only if that
+        // field's decoder also runs before the registry lock.
+        (
+            7005,
+            "command",
+            vec![option("name", "FAQ"), integer_option("template")],
+            "template",
+        ),
+        (7006, "command", vec![option("name", "FAQ")], "template"),
+        (
+            7007,
+            "command",
+            vec![
+                option("name", "FAQ"),
+                option("template", "Integer description must not win"),
+                integer_option("description"),
+            ],
+            "description",
+        ),
+        (
+            7008,
+            "command",
+            vec![
+                option("name", "FAQ"),
+                option("template", "Integer text-trigger must not win"),
+                option("description", "Valid description"),
+                integer_option("text-trigger"),
+            ],
+            "text-trigger",
         ),
     ];
     let mut outcomes: Vec<Option<Observed>> = Vec::new();
