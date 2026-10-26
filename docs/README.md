@@ -1,13 +1,11 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)` by area.
 
-Repo root: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
-else exit 1, repair rows/split docs. Bad/duplicate rows use
-`docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Check: `python3 scripts/check_docs_index.py --json` at repo root.
+Empty `{missing,stale,oversize}` = exit 0; else exit 1: repair/split.
+Bad/duplicate rows: `stale` → `docs/README.md:<line>`.
+Budgets: index <12,000 bytes; docs ≤65,536; exceptions: checker's `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -114,6 +112,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Member journey](member-journey-parity.md)
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
+- [Welcome timing (design only)](onboarding-event-welcome-spec.md)
 - [Leveling domain](leveling-port.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
