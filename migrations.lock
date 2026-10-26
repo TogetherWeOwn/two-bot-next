@@ -516,6 +516,10 @@
     "crates/cutover/migrations/0466_pause_resume_marker.sql": {
       "sha256": "c8a89d2216fddc78613252613701d96b43f905e8433b5409ca71d4d387ec05ef",
       "justification": "Cutover mirror of the store 0465 giveaway paused_at marker; additive ADD COLUMN IF NOT EXISTS so both chains cross-run in either order. Neutral stem before first merge: the slice-1 acceptance scan bans ALTER in giveaway-named files."
+    },
+    "crates/cutover/migrations/0467_lfg_close_refresh_retry.sql": {
+      "sha256": "e87c72b263549eacd4b56bad5aa66ca7c5c99351bf76509e2a0bac7c7f74a8e3",
+      "justification": "Persist the pending close-message edit atomically with LFG close transitions so the lifecycle worker can retry the exact saved message after failed edits and restarts; historical closed rows read back not pending."
     }
   }
 }
