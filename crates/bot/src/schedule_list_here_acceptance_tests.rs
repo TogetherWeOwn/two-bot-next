@@ -222,22 +222,25 @@ fn assert_complete_row(line: &str, id: &str, channel: u64, n: usize) {
     } else {
         ""
     };
-    let status = if n % 5 == 4 {
-        " (disabled)".to_owned()
+    let disabled = if n % 5 == 4 { " (disabled)" } else { "" };
+    // Every seeded row carries claim facts; the delivery fence (even `n`)
+    // beats claimed, and hold snapshots render on disabled rows as well.
+    let status = if n.is_multiple_of(2) {
+        " Snapshot: delivery-fenced (uncertain). The fence is set before a send, so it does not prove the delivery failed or stays uncertain; the post may have appeared. Check the destination channel.".to_owned()
     } else {
         format!(
-            " <t:{}:F>. The 15s ticker and delivery may be delayed.",
+            " Snapshot: claimed (lease held) <t:{}:F>; that time is a lease horizon, not a promised delivery time. A claim does not prove a worker is running. Check the destination channel.",
             1_893_456_000 + (n / 2) * 60
         )
     };
     assert_eq!(
         line,
         format!(
-            "`{id}` `<#{channel}>` 2030-01-01T{:02}:{:02}:00.000Z{interval}{status}",
+            "`{id}` `<#{channel}>` 2030-01-01T{:02}:{:02}:00.000Z{interval}{disabled}{status}",
             n / 120,
             (n / 2) % 60
         ),
-        "complete copyable row, including current localized due/uncertainty for enabled rows"
+        "complete copyable row, including the current delivery-hold snapshot"
     );
 }
 
@@ -346,9 +349,9 @@ async fn schedule_here_omitted_false_and_existing_pages_are_byte_identical() {
     assert_eq!(text[0], text[1]);
     assert_eq!(
         text[0],
-        "`row-000` `<#3333>` 2030-01-01T00:00:00.000Z every 90m <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
-         `row-001` `<#4444>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.",
-        "omitted/false retain current localized due times and uncertainty, not the retired ISO-only output"
+        "`row-000` `<#3333>` 2030-01-01T00:00:00.000Z every 90m Snapshot: delivery-fenced (uncertain). The fence is set before a send, so it does not prove the delivery failed or stays uncertain; the post may have appeared. Check the destination channel.\n\
+         `row-001` `<#4444>` 2030-01-01T00:00:00.000Z Snapshot: claimed (lease held) <t:1893456000:F>; that time is a lease horizon, not a promised delivery time. A claim does not prove a worker is running. Check the destination channel.",
+        "omitted/false retain current delivery-hold snapshots, not the retired ISO-only output"
     );
     assert_eq!(text[2], "Page must be at least 1.");
     assert_eq!(text[3], "Page must be at least 1.");
@@ -774,7 +777,12 @@ async fn schedule_here_executed_store_reads_share_sql_scope_and_bounds() {
     db.close().await.expect("drop executed-SQL fixture");
     assert_eq!(before, after);
     assert_eq!(requests.len(), total as usize * 2);
-    let contents: Vec<_> = requests.chunks_exact(2).map(reply).collect();
+    let (pairs, remainder) = requests.as_chunks::<2>();
+    assert!(
+        remainder.is_empty(),
+        "complete defer+edit request pairs only"
+    );
+    let contents: Vec<_> = pairs.iter().map(|pair| reply(pair)).collect();
     assert_window_pages(&contents, first_total);
     for (pages, range) in [
         (&contents[..first_total as usize], 0..25),
