@@ -7,7 +7,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/giveaway_list_facts_acceptance_tests.rs",
-      "sha256": "6e0f6774871cfbd76494614ebdd6dde9a24fdf290973259dcd694b04f0c4c590",
+      "sha256": "2dced736ee3712a66dfb445b2a9348161c29660ff92f4918fc788fb7f8e34967",
       "tests": 9
     }
   ],
@@ -41,7 +41,7 @@
     {"test": "ten_hostile_unicode_prizes_keep_every_id_and_complete_facts_reachable", "baselineExpected": "RED", "contract": "Ten 64-byte IDs and valid long astral/mention/backtick/newline prizes, mixed recorded/pending and paused/open rows, foreign-guild sentinel, bounded complete replies, explicit prize elision, whole-row facts and no silent quota loss"},
     {"test": "empty_control_is_private_read_only_and_distinct_from_unavailable", "baselineExpected": "PASS", "contract": "Foreign-only fixture is honestly empty, never disclosed or unavailable"},
     {"test": "unavailable_control_never_masquerades_as_empty_or_leaks_storage_details", "baselineExpected": "PASS", "contract": "Real local SQL read-name failure yields safe unavailable response, no empty success, details or mutations"},
-    {"test": "authority_and_activation_controls_refuse_without_disclosure_or_effects", "baselineExpected": "PASS", "contract": "Denied/missing staff permissions, absent/foreign guild and disabled feature preserve private refusals with no stored-detail disclosure or effects"},
+    {"test": "authority_and_activation_controls_refuse_without_disclosure_or_effects", "baselineExpected": "PASS", "contract": "Denied/missing staff permissions and disabled feature preserve private refusals; absent/foreign guild preserve the existing silent Ignore fence; no stored-detail disclosure or effects"},
     {"test": "repeated_list_control_never_spends_entry_budget_or_changes_saved_state", "baselineExpected": "PASS", "contract": "Twelve same-actor lists leave saved state unchanged and preserve the actual subsequent entry consumer's budget"}
   ],
   "sharedOracles": [
