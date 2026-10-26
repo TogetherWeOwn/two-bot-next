@@ -29,8 +29,10 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command-remove", "docs/parity.md §1 #15 caps"),
     ("schedule", "docs/parity.md §1 #17 caps"),
     ("schedule", "docs/parity.md §1 #17 absolute-time"),
+    ("schedule", "docs/parity.md §1 #17 preview"),
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
+    ("sticky", "docs/parity.md §1 #20 preview"),
     ("lfg", "docs/parity.md §1 #26 caps"),
     ("lfg", "docs/parity.md §1 #26 preview"),
     ("lfg-close", "docs/parity.md §1 #27 caps"),
@@ -326,12 +328,12 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
-    // Next-only metadata editing reuses LFG's parity row, never the frozen
-    // legacy snapshot. Pin the complete wire shape independently of production.
+    // Next-only metadata and increase-only seat editing reuse LFG's parity row,
+    // never the frozen legacy snapshot. Pin the wire shape independently of production.
     assert!(commands.iter().all(|command| command["name"] != "lfg-edit"));
     let edit = json!({
         "name": "lfg-edit",
-        "description": "Update a raid/LFG title or start time",
+        "description": "Update LFG metadata or increase one role's seats",
         "dm_permission": false,
         "default_member_permissions": "8589934592",
         "options": [
@@ -340,7 +342,11 @@ pub fn expected_registry() -> Value {
             {"name": "title", "description": "Event or group title", "type": 3,
              "max_length": 100},
             {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
-             "type": 3}
+             "type": 3},
+            {"name": "role", "description": "Existing signup role key (use with seats)",
+             "type": 3, "max_length": 32},
+            {"name": "seats", "description": "Absolute seat target, increase only (1-99; use with role)",
+             "type": 4, "min_value": 1, "max_value": 99}
         ]
     });
     let after_close = commands
@@ -715,6 +721,24 @@ pub fn expected_registry() -> Value {
         );
         option["max_length"] = json!(max_length);
     }
+    // Sticky preview adds only an optional Boolean to the legacy setup fields.
+    {
+        let reference = "docs/parity.md §1 #20 preview";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("sticky", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "sticky")
+            .expect(reference);
+        let options = command["options"].as_array_mut().expect("sticky options");
+        assert_eq!(options.len(), 2, "legacy body and debounce stay intact");
+        assert_eq!(options[0]["name"], json!("body"));
+        assert_eq!(options[1]["name"], json!("debounce"));
+        options.push(json!({
+            "name": "preview",
+            "description": "Privately preview without saving",
+            "type": 5
+        }));
+    }
     // LFG private preview: the Next-only additive fourth `preview` boolean
     // keeps the signup form submittable without posting. The three legacy
     // string options (title, starts-at, roles) and their bounds stay
@@ -776,6 +800,29 @@ pub fn expected_registry() -> Value {
             "description": "One-off RFC3339 time with Z or offset; cannot combine with other timing",
             "type": 3,
             "max_length": 64
+        }));
+    }
+    // Proposed-post preview adds ONLY one optional boolean after `at`: the
+    // picker shows the post and its first firing without saving anything.
+    // The four earlier options and their bounds stay untouched; the option
+    // itself is optional (`required` omitted, which the canonical form
+    // normalizes to false) with no bounds or choices.
+    {
+        let reference = "docs/parity.md §1 #17 preview";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("schedule", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule")
+            .expect(reference);
+        let options = command["options"]
+            .as_array_mut()
+            .expect("schedule options array");
+        assert_eq!(options.len(), 4, "legacy schedule plus absolute-time");
+        assert_eq!(options[3]["name"], json!("at"));
+        options.push(json!({
+            "name": "preview",
+            "description": "Preview the proposed post and its first firing without saving it",
+            "type": 5
         }));
     }
     // Schedule-list pagination: the Next-only additive `page` option keeps

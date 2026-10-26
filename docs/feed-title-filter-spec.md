@@ -32,20 +32,20 @@ unwanted bot volume, not more bot engagement. No spend or live experiment follow
 ## 2. Observed baseline and limits
 
 Original inspection baseline: `c3af7333df80a766f5d4c229506a3bce53680828`.
-Current-source links rechecked at `e1868d97d3519cae3f2ed91726e83e98f77dff0d`;
+Current-source links rechecked at `1441cbef76a1c8237a3a91a8944e2d25b66c4ce4`;
 not deployment verification. See [feed operations](feed-supervisor.md) and
 [domain/store contract](feeds-port.md). The model exposes a parsed title and URL,
 not a filter policy. Existing parsing, URL safety, message bounds, 20 POST-attempt
 budget and nonce recovery remain mandatory, before and after any future matcher.
 
 - [Model](../crates/core/src/feeds.rs#L65-L85) has no title-filter setting or
-  durable filtered outcome. The [parser](../crates/core/src/feeds.rs#L1153-L1168)
+  durable filtered outcome. The [parser](../crates/core/src/feeds.rs#L1200-L1215)
   substitutes `Untitled` for missing, empty, repeated or literal JS-trim-whitespace-only
   title fields, losing presence evidence. Numeric references such as `&#32;` stay
-  present as literal text: [decoding](../crates/core/src/feeds.rs#L1437-L1447) does
+  present as literal text: [decoding](../crates/core/src/feeds.rs#L1484-L1494) does
   **not** convert them to whitespace. An actual title `Untitled` is indistinguishable
   through `FeedItem.title` alone.
-  [Scalar extraction](../crates/core/src/feeds.rs#L1236-L1264) rejects repeated
+  [Scalar extraction](../crates/core/src/feeds.rs#L1283-L1311) rejects repeated
   title fields and omits nested element text. B needs a separate presence/usability
   signal before fallback; this design does not implement it.
 - [Poller](../crates/bot/src/feed_jobs.rs): recovery and new XML candidates are

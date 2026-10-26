@@ -89,6 +89,25 @@ pub async fn remove_feed(
     guild_id: &str,
     id: &str,
 ) -> Result<FeedRemoval, FeedStoreError> {
+    match remove_feed_with_evidence(pool, guild_id, id).await? {
+        FeedRemovalEvidence::Removed => Ok(FeedRemoval::Removed),
+        FeedRemovalEvidence::Missing => Ok(FeedRemoval::Missing),
+        FeedRemovalEvidence::RecoveryRequired { .. } => Ok(FeedRemoval::RecoveryRequired),
+    }
+}
+
+/// Guild/relay-scoped removal carrying the fenced pending-evidence count.
+///
+/// Same fence, lock, audit and state semantics as [`remove_feed`]; the
+/// refusal additionally reports how many unresolved `pending` rows the
+/// fenced decision observed, so the runtime can render a snapshot without a
+/// second read. The projection is one bounded `count(*)`; no ledger rows,
+/// bodies, URLs, nonces or tokens leave the store.
+pub async fn remove_feed_with_evidence(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+) -> Result<FeedRemovalEvidence, FeedStoreError> {
     let mut tx = pool.begin().await?;
     lock_feed_delivery(&mut tx, guild_id, id).await?;
     // Under the fence: refuse while unresolved pending delivery evidence
@@ -104,7 +123,8 @@ pub async fn remove_feed(
     .await?;
     if pending > 0 {
         tx.rollback().await?;
-        return Ok(FeedRemoval::RecoveryRequired);
+        let count = usize::try_from(pending).unwrap_or(usize::MAX);
+        return Ok(FeedRemovalEvidence::RecoveryRequired { pending: count });
     }
     let removed = sqlx::query("DELETE FROM feed_relays WHERE guild_id = $1 AND id = $2")
         .bind(guild_id)
@@ -115,9 +135,9 @@ pub async fn remove_feed(
         == 1;
     tx.commit().await?;
     Ok(if removed {
-        FeedRemoval::Removed
+        FeedRemovalEvidence::Removed
     } else {
-        FeedRemoval::Missing
+        FeedRemovalEvidence::Missing
     })
 }
 
@@ -133,6 +153,26 @@ pub enum FeedRemoval {
     /// Relay and ledger are retained for nonce reconciliation; the member
     /// waits for recovery instead of reposting or removing.
     RecoveryRequired,
+}
+
+/// Outcome of an attempted relay removal with pending-evidence count.
+///
+/// Same variants as [`FeedRemoval`]; the refusal carries the guild/relay-
+/// scoped `pending` rows observed under the delivery fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedRemovalEvidence {
+    /// The relay existed, carried no unresolved pending delivery evidence,
+    /// and was deleted; its settled ledger cascades with it.
+    Removed,
+    /// No relay with that id exists in this guild; nothing was deleted.
+    Missing,
+    /// The relay exists but carries `pending` unresolved rows. Relay and
+    /// ledger are retained for nonce reconciliation; the member waits for
+    /// recovery instead of reposting or removing.
+    RecoveryRequired {
+        /// Unresolved `pending` rows for this guild/relay under the fence.
+        pending: usize,
+    },
 }
 
 /// Outcome of an attempted relay pause. Only the `enabled`/`updated_at`
@@ -151,6 +191,30 @@ pub enum FeedPauseOutcome {
     /// (`pending_deliveries` only reads enabled relays), so the member
     /// retries after recovery settles. Already-admitted work is untouched.
     RecoveryRequired,
+}
+
+/// Outcome of an attempted relay pause with pending-evidence count.
+///
+/// Same variants as [`FeedPauseOutcome`]; the enabled-to-paused refusal
+/// carries the guild/relay-scoped `pending` rows observed under the fence.
+/// Missing and already-paused return before the pending check, so restored
+/// paused+pending rows stay an idempotent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedPauseEvidence {
+    /// The relay was enabled and is now paused.
+    Paused,
+    /// The relay was already paused; no columns changed.
+    AlreadyPaused,
+    /// No relay with that id exists in this guild; nothing changed.
+    Missing,
+    /// The relay stays enabled because `pending` unresolved rows exist.
+    /// Pausing would strand recovery behind disabled discovery, so the
+    /// member retries after recovery settles. Already-admitted work is
+    /// untouched.
+    RecoveryRequired {
+        /// Unresolved `pending` rows for this guild/relay under the fence.
+        pending: usize,
+    },
 }
 
 /// Outcome of an attempted relay resume. Only the `enabled`/`updated_at`
@@ -183,6 +247,26 @@ pub async fn pause_feed(
     id: &str,
     now_ms: i64,
 ) -> Result<FeedPauseOutcome, FeedStoreError> {
+    match pause_feed_with_evidence(pool, guild_id, id, now_ms).await? {
+        FeedPauseEvidence::Paused => Ok(FeedPauseOutcome::Paused),
+        FeedPauseEvidence::AlreadyPaused => Ok(FeedPauseOutcome::AlreadyPaused),
+        FeedPauseEvidence::Missing => Ok(FeedPauseOutcome::Missing),
+        FeedPauseEvidence::RecoveryRequired { .. } => Ok(FeedPauseOutcome::RecoveryRequired),
+    }
+}
+
+/// Guild/relay-scoped pause carrying the fenced pending-evidence count.
+///
+/// Same fence, lock, audit and state semantics as [`pause_feed`]; only the
+/// enabled-to-paused refusal additionally reports how many unresolved
+/// `pending` rows the fenced decision observed. The projection is one
+/// bounded `count(*)`; no ledger content leaves the store.
+pub async fn pause_feed_with_evidence(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    now_ms: i64,
+) -> Result<FeedPauseEvidence, FeedStoreError> {
     let mut tx = pool.begin().await?;
     lock_feed_delivery(&mut tx, guild_id, id).await?;
     let current: Option<bool> =
@@ -194,11 +278,11 @@ pub async fn pause_feed(
     match current {
         None => {
             tx.rollback().await?;
-            Ok(FeedPauseOutcome::Missing)
+            Ok(FeedPauseEvidence::Missing)
         }
         Some(false) => {
             tx.rollback().await?;
-            Ok(FeedPauseOutcome::AlreadyPaused)
+            Ok(FeedPauseEvidence::AlreadyPaused)
         }
         Some(true) => {
             // Only an enabled-to-paused transition can strand recovery.
@@ -214,7 +298,8 @@ pub async fn pause_feed(
             .await?;
             if pending > 0 {
                 tx.rollback().await?;
-                return Ok(FeedPauseOutcome::RecoveryRequired);
+                let count = usize::try_from(pending).unwrap_or(usize::MAX);
+                return Ok(FeedPauseEvidence::RecoveryRequired { pending: count });
             }
             sqlx::query(
                 "UPDATE feed_relays SET enabled = false,
@@ -227,7 +312,7 @@ pub async fn pause_feed(
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            Ok(FeedPauseOutcome::Paused)
+            Ok(FeedPauseEvidence::Paused)
         }
     }
 }
