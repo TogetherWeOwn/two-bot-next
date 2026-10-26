@@ -37,7 +37,7 @@ asserted absent. No second repository is needed for this design.
 | `SP-C5` retime | No retime operation in baseline; fresh create is not retime. | Pending separately owned never-run one-off work; no page control or new allocation here. |
 | `SP-C6` preview | No create preview option in baseline. | Pending separately owned pure proposed-post preview; local form review below is not bot-equivalent preview. |
 | `SP-C7` pause/resume | Only enabled bit exists; completed one-shots also disable (`scheduled_store.rs:382-438`). | Separate Proposed lifecycle design, not an available toggle. Never infer intentionally paused from disabled. |
-| `SP-C8` list/receipt truth | Claim/fence projection and honest remove copy are not baseline behavior. [PR #1778](https://github.com/TogetherWeOwn/two-bot-next/pull/1778) is pending acceptance work, not delivered implementation. | Separately owned work; consume its eventual accepted contract, do not recard or implement it here. |
+| `SP-C8` list/receipt truth | Claim/fence projection and honest remove copy are not baseline behavior. [PR #1778](https://github.com/TogetherWeOwn/two-bot-next/pull/1778) is pending acceptance work, not delivered implementation. | Separately owned work; consume its eventual accepted contract, do not duplicate or implement it here. |
 
 Re-inventory at a future build head: an open PR or approved design is not merged
 code, and merged code is not deployment evidence. Internal ownership links live
@@ -243,8 +243,9 @@ button. Recreating a deleted schedule is new intent/identity, not undo or resend
 The following JSON is a **Proposed document contract**, not verbs, routes or a
 runtime implementation. All IDs/revisions are strings; revision null forbids a
 mutation. Per-intent durable idempotency must bind exact guild/ID/revision/state/
-body before any wire mutator is exposed. Same key/exact body may replay its original
-receipt; changed bytes/target refuse, unknown commit reconciles with the same intent.
+body before any wire mutator is exposed. Every later retry with the same key and
+exact body returns the original receipt; the mutation occurs once. Changed bytes/
+target refuse; unknown commit reconciles with the same intent.
 Do not confuse nonce replay protection, command-generated IDs or internal-action
 idempotency errors with schedule CAS. No claim token/nonce/body appears in summaries.
 
@@ -298,7 +299,7 @@ and consistency; they implement no scheduler, validator, state engine or CAS sto
 | `SP-F09` | Removal before fence -> no worker POST; during admitted POST with confirmed/refused cleanup or unknown receipt -> definition-only receipt, never message-absence promise. Fenced adapter removal refuses, evidence unchanged; current slash race remains accurately described. |
 | `SP-F10` | Same local dry-run input/frozen now twice -> identical PREVIEW_ONLY, zero effects/allocated IDs; unknown mode refuses. Later save revalidates clock/quota/authority, does not reuse a preview reservation. |
 | `SP-F11` | Empty/invisible body, 2000/2001 UTF-16, emoji, neutralization growth/invites, wrong types/duplicates, invalid interval/quota-full -> exact validator refusals. Legacy second-based interval is shown in seconds without rounding to a new minute schedule. |
-| `SP-F12` | Confirmed save with delayed/parked worker -> stored only. Write timeout -> COMMIT_UNKNOWN, same-intent reconcile. Same idempotency key/exact body replays once; changed target/body refuses. Audit failure cannot yield a future atomic-mutation success; baseline best-effort audit remains labeled. |
+| `SP-F12` | Confirmed save with delayed/parked worker -> stored only. Write timeout -> COMMIT_UNKNOWN, same-intent reconcile. Every later retry with the same idempotency key and exact body returns the original receipt; the mutation occurs once. Changed target/body refuses. Audit failure cannot yield a future atomic-mutation success; baseline best-effort audit remains labeled. |
 
 Use injected clocks, mock Discord and disposable test DBs for future behavior
 acceptance. No live messages, staging/production DB tests or migrations. Performance
