@@ -35,7 +35,7 @@ test callers; its module doc leaves wiring `ReferralInput` and delivering
   grew (`crates/discord/src/pipeline.rs:780-805`); `on_join` writes
   `metadata["inviterId"]` only for that singly-grown case
   (`crates/core/src/handlers.rs:615-653`); bots file no funnel row
-  (:640-644). `referral_counts` already aggregates those rows per inviter
+  (:635-637). `referral_counts` already aggregates those rows per inviter
   as raw evidence, explicitly not credit
   (`crates/core/src/invites.rs:180-228`).
 - No member ever sees a count: `docs/commands.md` has no invites surface.
@@ -125,7 +125,7 @@ seam is a projection from funnel facts to `ReferralInput`
 | `code_inviter` | the same rows | Synthesized as `CODE -> inviterId`, first (chronological) row wins per code. Current `invite_snapshots` lose deleted codes, so rows are the only complete source. A code later recreated by a different inviter collides in this map: first-seen wins and the conflict is logged; Discord codes are random and `rotate_code` preserves the inviter (`invites.rs:438-478`), so a genuine collision needs manual review, not silent re-credit |
 | `standings[].left_at_ms` | `member_leave` rows (`funnel.rs:45-46`) | First leave after the member's attributed join; absent = still present |
 | `standings[].engaged` | funnel rows for that member | Any of `gate_cleared`, `first_message`, `first_voice_session` (`funnel.rs:23-39`). `gate_cleared` persists unconditionally (`privacy.rs:19-23`), so a privacy-opted-out member can still credit their inviter through the rules gate without any analytics row (§4) |
-| `known_referrals`, `prior_credits` | the credit ledger, once §7 slice 3 lands | Until then: empty, with all joins evaluated as one chronological batch (input order = `occurred_at`, so first-attribution-wins means the earliest join). After banking: prior edges/totals load from the ledger and only unbanked joins are evaluated — the engine's fields exist exactly for this (`:64-75`) |
+| `known_referrals`, `prior_credits` | the credit ledger, once §7 slice 3 lands | Until then: empty, with all joins evaluated as one chronological batch (input order = `occurred_at`, so first-attribution-wins means the earliest join). After banking: prior edges/totals load from the ledger, and "unbanked" means every join whose member has no credited edge — **including previously rejected or pending joins**, re-fed in chronological order. Only credits bank; rejections never do. Anything narrower breaks RF-04: fed alone, a genuine rejoin after a rejected temporary first stay would credit, because cross-batch duplicate detection sees only credited edges (`:64-75,325-327`) |
 | `now_ms`, `min_tenure_days` | clock; engine default | `MIN_TENURE_DAYS_DEFAULT` (7) unchanged in v1; per-guild tuning is out of scope |
 
 Sequencing keeps one source of truth for counts:
@@ -140,7 +140,7 @@ Sequencing keeps one source of truth for counts:
   5,000 projected rows returns "unavailable" instead of a partial count;
   the build slice pins the real bound with fixtures.
 - **Notices = a daily evaluator job plus a small ledger** (§7 slice 3),
-  because compute-on-read cannot send exactly-once DMs. The job runs
+  because compute-on-read has nowhere to record what was already sent. The job runs
   under the existing community-jobs supervisor (`docs/community-jobs.md`),
   evaluates uncredited joins with banked priors, inserts credit rows
   (`ON CONFLICT DO NOTHING` on `(guild_id, member_id)` for direct credit —
@@ -172,12 +172,14 @@ unlock) into one counts-only message via the `direct_notice` seam
   perk, out of scope. The tier-unlock DM names the tier earned, nothing
   more.
 
-Exactly-once mechanism: insert a notice row `(guild_id, recipient_id,
-notice_key)` — keys are `credit:<member_id>`, `bonus:<member_id>`,
-`tier:<kind>` — in the same transaction as the credit rows, then send one
-DM per recipient covering all unclaimed keys, then mark them sent. Claim
-before send gives at-most-once: a crash mid-batch can lose a
-celebration, never duplicate one. DMs closed or recipient no longer in
+Delivery semantics are exactly-once credits, at-most-once notices:
+insert a notice row `(guild_id, recipient_id, notice_key)` — keys are
+`credit:<member_id>`, `bonus:<member_id>`, `tier:<kind>`, with a unique
+constraint on the triple and the same `ON CONFLICT DO NOTHING` discipline
+as credit rows — in the same transaction as the credit rows, then send
+one DM per recipient covering all unclaimed keys, then mark them sent.
+Claim before send gives at-most-once delivery: a crash mid-batch can
+lose a celebration, never duplicate one. DMs closed or recipient no longer in
 the guild: mark undeliverable, never retry; standing still shows the
 credit. Bot-noise budget: notices are DMs, not channel messages, and are
 bounded at one per member per day in the worst case (daily batch), only
