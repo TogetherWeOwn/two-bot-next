@@ -276,7 +276,7 @@ in section 3, not only `settings.get`. All rows require zero Discord calls.
 | F11 | Unknown key | `REFUSED_UNKNOWN`; 0 rows |
 | F12 | Malformed channel list (`"0"`, text, overflow) | Today stored and fails `config()`; after W1 `INVALID_VALUE` |
 | F13 | Malformed panel catalogue | `INVALID_VALUE`; 0 rows |
-| F14 | Panel edit while a member's role change is processing | `RECOVERY_PENDING`; 0 rows; succeeds after drain |
+| F14 (future) | Panel edit while a member's role change is processing | `RECOVERY_PENDING` once a bounded drain signal exists; 0 rows; succeeds after drain |
 | F15 | Admins A and B read token `t`; A saves, B saves with `t` | A `SAVED`; B `VERSION_CONFLICT`; B's value absent; 1 audit row |
 | F16 | Two creators both expect token `0` | One `SAVED`, one `VERSION_CONFLICT` |
 | F17 | Dashboard write vs another signed caller with a different `updated_by` (no slash writer exists today) | Last commit wins; each audited under its own actor; stale token conflicts |

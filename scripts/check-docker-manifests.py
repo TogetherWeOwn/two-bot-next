@@ -125,6 +125,20 @@ def _command_words(command):
             "unsupported dependency-layer command: malformed quoting") from error
 
 
+def _copy_parts(stripped):
+    """Split a COPY line into (sources, destination), refusing arity drift.
+
+    A bare star-unpack silently accepts `COPY foo` (sources=[]) — an
+    invalid Dockerfile that must refuse with typed vocabulary instead.
+    """
+    parts = _command_words(stripped)[1:]
+    require(len(parts) >= 2,
+            "unsupported dependency-layer command: "
+            "COPY needs sources and destination")
+    *sources, destination = parts
+    return sources, destination
+
+
 def dependency_sources(docker_text):
     """COPY sources of the dependency layer (everything before `COPY . .`).
 
@@ -135,7 +149,7 @@ def dependency_sources(docker_text):
     for kind, stripped in _layer_instructions(docker_text):
         if kind != "copy":
             continue
-        *srcs, _destination = _command_words(stripped)[1:]
+        srcs, _destination = _copy_parts(stripped)
         sources.extend(srcs)
     return sources
 
@@ -163,7 +177,7 @@ def reconstruct(docker_text, root, dest):
         if kind == "preamble":
             continue
         if kind == "copy":
-            *sources, destination = _command_words(stripped)[1:]
+            sources, destination = _copy_parts(stripped)
             target = dest / destination
             target.mkdir(parents=True, exist_ok=True)
             for source in sources:
