@@ -148,9 +148,12 @@ One command, guild-only, published only in the final build slice (§9):
   probing of the exempt list.
 - **Guild = invocation guild**, gated by §5. DM use refuses
   (`dm_permission: false` plus the handler guild check).
-- **Timestamp = invocation receipt time.** The verdict reads *"if posted
-  now"*. A pasted historical phrase is evaluated as a new post, which is
-  the only truthful framing for repeat windows.
+- **Timestamp = invocation receipt time.** Capture one UTC receipt time
+  for the winning attempt and use it for the synthetic message and audit
+  `created_at`. The first reply and every replay render that same committed
+  timestamp (§6), never a fresh wall-clock time. The verdict reads *"if
+  posted now"*. A pasted historical phrase is evaluated as a new post,
+  which is the only truthful framing for repeat windows.
 - **`mentions`** is a synthetic count of explicit user mentions, default 0.
   The matcher compares `mentioned_user_ids.len()` to the limit
   (`crates/core/src/automod.rs:504-506`); Discord, not raw text, decides
@@ -321,11 +324,11 @@ limits therefore buy *detection time*, and §6's audit plus the 30-day
 review (§1) are load-bearing, not decoration.
 
 Compute bound: text ≤2,000 units, ≤10 filenames. The matcher core does
-no I/O; the handler around it adds exactly the in-memory live-snapshot
-refresh of §5.0, one replay read, and one audit INSERT (§6) — no Discord
-fetch of any kind. The matcher cost is the same scan live already pays
-per message, and the hourly cap keeps added load negligible beside
-gateway traffic.
+no I/O; the handler adds the in-memory live-snapshot refresh of §5.0 and
+a bounded transaction containing the interaction lock, replay read, and
+(one new attempt only) audit INSERT (§6) — no Discord fetch of any kind.
+The matcher cost is the same scan live already pays per message, and the
+hourly cap keeps added load negligible beside gateway traffic.
 
 ### 4.4 No second oracle
 
@@ -506,21 +509,51 @@ target fetch, no `target_gate`, no `plan`, no executor call.
   the metric uses `result=unavailable,filter=none`, with the effective
   mode if a snapshot exists or `mode=not_evaluated` otherwise. An
   unaudited oracle is worse than a briefly unavailable one.
-  Redelivery is fenced by an atomic interaction-ID claim, not by the
-  insert alone (`audit_once` deduplicates facts, not executions,
-  `crates/core/src/custom_command_store.rs:39-51`): after strict decode
-  the handler claims the interaction's audit id (claim-or-replay on the
-  existing replay read, `custom_command_store.rs:66-77`) and only the
-  claim winner charges rate budget and evaluates, then inserts the row.
-  Every other delivery — sequential or concurrent — renders the stored
-  row — outcome, reason, and its `created_at` as the config-currency
-  time — without re-evaluating or consuming rate budget. If rate
-  accounting cannot share the claim, actor and guild charges must each
-  be idempotent by interaction ID. Sequential redelivery therefore
-  evaluates once; concurrent redelivery waits for or replays the
-  committed first stored verdict, so two racing deliveries evaluate
-  once, charge once, and report one verdict, disclosing nothing the
-  first answer did not. **Stated retention:** `automation_audit_log` has no installed
+  **Redelivery and crash recovery.** An INSERT alone is insufficient:
+  `audit_once` deduplicates facts, not executions
+  (`crates/core/src/custom_command_store.rs:39-51`). After strict decode
+  and permission/scope checks, serialize by interaction ID with a
+  **transaction-scoped advisory lock**, then read the audit id on that
+  same transaction connection. This is the claim; it is never committed
+  separately from the result and creates no durable claim row. Use
+  READ COMMITTED so a waiter reads the preceding winner's committed row
+  after acquiring the lock. Bound lock acquisition and the transaction
+  by database timeouts within the handler's reply deadline; a timeout
+  returns unavailable, never an unbounded wait or an unlocked evaluation.
+  A found row replays without charging or evaluating. Otherwise the
+  winner charges, evaluates synchronously, inserts the audit row, and
+  commits **before any verdict reply**. Release the runtime mutex before
+  awaiting audit I/O; never hold it across the transaction's awaits.
+  A crash, cancellation, or insert failure before commit rolls back the
+  transaction and releases its claim: a later delivery finds no row and
+  may retry. No permanent claimed-without-result state is possible.
+  A commit with an unknown outcome suppresses the verdict; the next
+  delivery acquires the same lock and reads before deciding whether to
+  replay or retry, never guessing that commit failed. Failed attempts
+  can therefore evaluate more than once, but disclose no uncommitted
+  verdict. Actor and guild charges are each idempotent by interaction ID
+  for the limiter's in-memory lifetime (§4.3); rollback does not refund
+  or double-charge them. A process restart loses those in-memory charges
+  with the rest of the limiter, not a durable claim that could wedge it.
+  Do not reuse the permanent `claim_text_attempt` fence
+  (`custom_command_store.rs:79-108`): that fence protects an unknown
+  external mutation, whereas this preview has none to repeat.
+
+  **One committed reply timestamp.** Pass the winning attempt's captured
+  UTC receipt time (§3.1) explicitly as `created_at`, not a database
+  default or insertion-time clock. Add a preview-specific,
+  transaction-capable replay read returning `(outcome, reason, created_at)`;
+  the existing `load_audit` returns only the first two
+  (`custom_command_store.rs:66-77`) and cannot satisfy this contract as-is.
+  Read back the stored timestamp (e.g. INSERT RETURNING) and use the same
+  canonical UTC rendering for the first reply after commit and every
+  replay, including database timestamp precision. On the successful path,
+  sequential and concurrent redeliveries evaluate once, charge once, and
+  render the committed row, including its config-currency time. If a
+  failed uncommitted attempt is retried, only the eventual committed
+  attempt's receipt time appears; no prior verdict was exposed.
+
+  **Stated retention:** `automation_audit_log` has no installed
   age-based purger ([privacy](privacy.md#retention-and-explicit-exceptions)
   — no live TTL is claimed beyond the windows the retention job
   enforces, and this table is not one of them), so preview audit rows
@@ -580,10 +613,10 @@ until slice 4. Each row names the proof, not a vague area.
 | T11 | Bounds | 2,000 units ok / 2,001 refused; astral-plane chars counted in UTF-16; 10 attachments ok / 11 refused; `safe.exe,txt` refused (comma in filename); a filename without a dot is treated as its own extension, as live; `mentions` 100 ok / 101 refused; whitespace-only text refused bare, evaluated with attachments, and evaluated with `mentions` at the limit → `mention_spam` (§3.1) |
 | T12 | Rate limiter | Paused-clock boundaries for 5 s / hourly / daily caps; refusal does not evaluate (matcher call count 0); full-map refuses new actor |
 | T13 | Zero pipeline writes | Mock ledger/executor/funnel counters all 0 after matched preview in enforce mode |
-| T14 | Audit fail-closed | Failing audit sink → no verdict in reply, generic unavailable, metric incremented |
+| T14 | Audit fail-closed and abandoned claim | Inject insert failure, cancellation, and connection loss after lock acquisition and before commit: no verdict exposed, transaction/claim released, later delivery can retry, no permanent claimed-without-row state; ordinary errors return generic unavailable and increment metric. Lock/transaction timeout also fails closed; unknown commit outcome permits only a locked replay read, not an assumed rollback |
 | T15 | Config parity | Hot-changed word/threshold via live snapshot flips preview and next real delivery identically; invalid stored value keeps last-good in both |
 | T16 | Injection | Text with `<@everyone>`, markdown, URLs → reply byte-shape is a fixed template, `allowed_mentions` empty |
-| T17 | Redelivery | Same interaction delivered twice sequentially: matcher call count 1, one audit row, one actor charge, one guild charge, identical replies incl. currency time; concurrently: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed first stored row (§6) |
+| T17 | Redelivery and recovery | Successful sequential/concurrent delivery: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed row. Advance the clock between receipt, insert, commit, and replay; replay read includes `created_at`, and first/replayed currency times equal the stored receipt timestamp at database precision. Crash/failure before commit then redelivery: retry succeeds without a stranded claim; failed evaluations disclose nothing; idempotent actor/guild charges do not double in the same limiter lifetime. Unknown commit outcome: replay if committed, retry only if the locked read proves no row (§6) |
 | T18 | Registration scope | Publish set contains `automod-preview` only for the configured guild when the automod scope admits it; absent for the live guild without approval (§5.0) |
 | T19 | Unproven repeat equivalence | When repeat equivalence cannot be proven and execution reaches that check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
 
@@ -609,9 +642,12 @@ slices (2–4) carry the CISO comment-gate.
 3. **Runtime handler** — ephemeral handler through the shared
    `AutomodRuntime` handle with the §5.0 refresh, bounded rate limiter
    (§4.3), the §6 `automation_audit_log` row + metric with fail-closed
-   suppression. No migration is expected (table and erasure entry
-   exist); needing one re-opens the slice boundary instead of folding
-   DDL in here. Tests T7, T10–T17, T19 with mock executor/ledger.
+   suppression, transaction-scoped claim/recovery, and replay read of
+   outcome/reason/committed receipt timestamp. No migration is expected
+   (table and erasure entry exist); needing one re-opens the slice
+   boundary instead of folding DDL in here. Tests T7, T10–T17, T19 with
+   mock executor/ledger; T14/T17 additionally use a disposable test DB to
+   prove transaction release, contended replay, and stored-time parity.
 4. **Publish + docs + staging proof** — add the definition to the
    published moderation set under the §5.0 scope condition (T18),
    regenerate `docs/commands.md`, operator-guide
