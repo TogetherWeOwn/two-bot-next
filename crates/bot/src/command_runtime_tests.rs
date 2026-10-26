@@ -1602,6 +1602,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "lfg-close"
                         | "lfg-edit"
                         | "lfg-list"
+                        | "lfg-inspect"
                         | "schedule"
                         | "schedule-remove"
                         | "schedule-list"
@@ -1622,6 +1623,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
         assert!(!unwired.contains(&"lfg-list"));
+        assert!(!unwired.contains(&"lfg-inspect"));
         assert!(!unwired.contains(&"reopen"));
         assert!(!unwired.contains(&"welcome-preview"));
         assert!(!unwired.contains(&"game-mix"));
@@ -4146,6 +4148,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "lfg-close",
         "lfg-edit",
         "lfg-list",
+        "lfg-inspect",
         "feed-add",
         "feed-remove",
         "feed-list",
@@ -4202,6 +4205,7 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
         "lfg-close",
         "lfg-edit",
         "lfg-list",
+        "lfg-inspect",
     ] {
         assert!(
             !names.contains(&withheld),
@@ -4312,6 +4316,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::LfgClose,
             HandlerId::LfgEdit,
             HandlerId::LfgList,
+            HandlerId::LfgInspect,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedPause,
@@ -4346,6 +4351,7 @@ fn production_router_matches_composed_production_wiring() {
         router.register(Box::new(Marker(HandlerId::LfgClose)));
         router.register(Box::new(Marker(HandlerId::LfgEdit)));
         router.register(Box::new(Marker(HandlerId::LfgList)));
+        router.register(Box::new(Marker(HandlerId::LfgInspect)));
         router
     }
 
@@ -4492,6 +4498,7 @@ async fn resumed_boot_synchronizes_current_gates_once_without_ready() {
             "rsvp",
             "lfg",
             "lfg-list",
+            "lfg-inspect",
         ] {
             assert_eq!(
                 names.contains(&name),

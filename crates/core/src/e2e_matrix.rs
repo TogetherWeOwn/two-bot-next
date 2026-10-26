@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 43 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 44 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -123,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 43-row contract in publish order (core, scorecard, automation,
+/// The 44-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -464,6 +464,23 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:AnnouncementsDisabled",
                 "Perm:ManageEventsRequired",
                 "Valid:cursor:optional,bound-to-guild-and-channel,max-512",
+            ],
+        ),
+        row(
+            "lfg-inspect",
+            46,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgInspect",
+            "Ephemeral current-channel saved-roster inspection; bounded whole-row pages over every role and selected-role signup, read-only.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:id:required,max-128",
+                "Valid:role:optional,1-20",
+                "Valid:page:optional,1-100,default-1",
+                "Valid:post:same-guild,same-channel",
             ],
         ),
         row(

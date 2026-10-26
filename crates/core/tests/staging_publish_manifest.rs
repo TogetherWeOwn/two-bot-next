@@ -42,6 +42,15 @@ fn manifest_names(key: &str) -> Vec<String> {
         .expect("saved manifest retains close")
         + 1;
     names.insert(after_close, "lfg-edit".to_owned());
+    // Same compiled-only bridge for saved-roster inspection: the saved
+    // fixture stays immutable and no staging publish is claimed for it.
+    assert!(!names.iter().any(|name| name == "lfg-inspect"));
+    let after_list = names
+        .iter()
+        .position(|name| name == "lfg-list")
+        .expect("saved manifest retains list")
+        + 1;
+    names.insert(after_list, "lfg-inspect".to_owned());
     names
 }
 
@@ -120,14 +129,15 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 43 all-on builtins minus 12 automation-gated commands, including
+    // 44 all-on builtins minus 12 automation-gated commands, including
     // command-inspect, pause/resume and giveaway; announcements-gated lfg-edit and
     // feed-inspect still publish, and read-only current-channel discovery
-    // lfg-list stays published. welcome-preview is core-always and survives too.
+    // lfg-list plus saved-roster inspection stay published. welcome-preview is
+    // core-always and survives too.
     // The stored dynamic row stays unpublished:
     // every such invocation refuses at dispatch while gated off, so publishing
     // would burn the ceiling.
-    assert_eq!(names.len(), 31, "automations-off staging set: {names:?}");
+    assert_eq!(names.len(), 32, "automations-off staging set: {names:?}");
     assert!(names.contains(&"reopen".to_owned()));
     assert!(names.contains(&"game-mix".to_owned()));
     assert!(
@@ -141,6 +151,10 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
     assert!(
         names.iter().any(|name| name == "lfg-list"),
         "read-only current-channel discovery stays published while automations are off"
+    );
+    assert!(
+        names.iter().any(|name| name == "lfg-inspect"),
+        "read-only saved-roster inspection stays published while automations are off"
     );
     assert!(
         names.iter().any(|name| name == "feed-inspect"),

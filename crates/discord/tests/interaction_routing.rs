@@ -5,7 +5,7 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 43 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 44 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
@@ -379,11 +379,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 46);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 47);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 43);
+    assert_eq!(commands.len(), 44);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -462,6 +462,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("lfg", HandlerId::Lfg),
         ("lfg-close", HandlerId::LfgClose),
         ("lfg-edit", HandlerId::LfgEdit),
+        ("lfg-inspect", HandlerId::LfgInspect),
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-pause", HandlerId::FeedPause),
@@ -471,7 +472,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
     ];
     assert_eq!(
         cases.len(),
-        41,
+        42,
         "all handlers except giveaway and lfg-list covered (each has its own test)"
     );
     for (_, id) in cases {

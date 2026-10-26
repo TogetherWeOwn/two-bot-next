@@ -1376,7 +1376,8 @@ impl CommandRuntime {
                     handler: HandlerId::Lfg
                         | HandlerId::LfgClose
                         | HandlerId::LfgEdit
-                        | HandlerId::LfgList,
+                        | HandlerId::LfgList
+                        | HandlerId::LfgInspect,
                 },
                 ..
             } | RoutedInteraction::Component {

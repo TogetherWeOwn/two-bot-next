@@ -337,6 +337,69 @@ fn decode_lfg_edit(
     }
 }
 
+/// Strict `/lfg-inspect` decode: exactly the published `id`, `role` and
+/// `page` options, each at most once and correctly typed, with the ID inside
+/// the shared 1..=128 UTF-16 bound and both integers positive and bounded.
+/// Any deviation refuses with one fixed message before any storage read;
+/// input values are never echoed back.
+#[cfg(feature = "db")]
+fn decode_lfg_inspect(
+    options: &[twilight_model::application::interaction::application_command::CommandDataOption],
+) -> Result<(String, two_bot_core::lfg_inspect::InspectSelection), &'static str> {
+    use twilight_model::application::interaction::application_command::CommandOptionValue;
+    let invalid = two_bot_core::lfg_inspect::INVALID;
+    let mut post_id: Option<String> = None;
+    let mut role: Option<usize> = None;
+    let mut page: Option<usize> = None;
+    for option in options {
+        match option.name.as_str() {
+            "id" => {
+                if post_id.is_some() {
+                    return Err(invalid);
+                }
+                let CommandOptionValue::String(value) = &option.value else {
+                    return Err(invalid);
+                };
+                if value.trim().is_empty() || !two_bot_core::lfg::valid_post_id(value) {
+                    return Err(invalid);
+                }
+                post_id = Some(value.clone());
+            }
+            "role" | "page" => {
+                let slot = if option.name == "role" {
+                    &mut role
+                } else {
+                    &mut page
+                };
+                if slot.is_some() {
+                    return Err(invalid);
+                }
+                let CommandOptionValue::Integer(value) = &option.value else {
+                    return Err(invalid);
+                };
+                let max = if option.name == "role" {
+                    two_bot_core::lfg::MAX_LFG_ROLES as i64
+                } else {
+                    two_bot_core::lfg_inspect::MAX_PAGE as i64
+                };
+                if !(1..=max).contains(value) {
+                    return Err(invalid);
+                }
+                *slot = Some(*value as usize);
+            }
+            _ => return Err(invalid),
+        }
+    }
+    let post_id = post_id.ok_or(invalid)?;
+    Ok((
+        post_id,
+        two_bot_core::lfg_inspect::InspectSelection {
+            role,
+            page: page.unwrap_or(1),
+        },
+    ))
+}
+
 #[must_use]
 pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse> {
     match outcome {
@@ -399,7 +462,8 @@ impl InteractionRuntime {
                     handler: two_bot_core::HandlerId::Lfg
                         | two_bot_core::HandlerId::LfgClose
                         | two_bot_core::HandlerId::LfgEdit
-                        | two_bot_core::HandlerId::LfgList,
+                        | two_bot_core::HandlerId::LfgList
+                        | two_bot_core::HandlerId::LfgInspect,
                 },
                 ..
             } | RoutedInteraction::Component {
@@ -624,6 +688,9 @@ impl InteractionRuntime {
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgEdit)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgList)));
+        router.register(Box::new(LfgRegistration(
+            two_bot_core::HandlerId::LfgInspect,
+        )));
         Self {
             router: std::sync::Arc::new(router),
             pool: pool.clone(),
@@ -752,6 +819,62 @@ impl InteractionRuntime {
         Ok(true)
     }
 
+    /// Private saved-roster inspection: strict decode first (malformed input
+    /// never reaches storage, and its refusal is one immediate ephemeral
+    /// reply), then an ephemeral defer so no roster read starts before the
+    /// acknowledgement succeeds, then the read-only projection edit.
+    async fn handle_lfg_inspect(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<bool, crate::DiscordError> {
+        let channel_id = crate::channel_moderation::invoking_channel_id(interaction);
+        let (Some(guild), Some(channel_id), Some(InteractionData::ApplicationCommand(data))) =
+            (interaction.guild_id, channel_id, interaction.data.as_ref())
+        else {
+            return Ok(false);
+        };
+        let (post_id, selection) = match decode_lfg_inspect(&data.options) {
+            Ok(decoded) => decoded,
+            Err(reply) => {
+                self.executor
+                    .answer_interaction_with_blocked_retry(
+                        interaction.id.get(),
+                        &interaction.token,
+                        &text_response(InteractionReply::new(reply, true)),
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        };
+        self.executor
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &deferred_response(true),
+            )
+            .await?;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::lfg_inspect::inspect(
+                &self.pool,
+                &guild.to_string(),
+                &channel_id,
+                &post_id,
+                &selection,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| two_bot_core::lfg_inspect::UNAVAILABLE.into());
+        self.executor
+            .edit_interaction_response_with_blocked_retry(
+                interaction.application_id.get(),
+                &interaction.token,
+                &reply,
+            )
+            .await?;
+        Ok(true)
+    }
+
     /// Execute an outcome from this runtime's shared router without routing twice.
     pub async fn handle_routed(
         &self,
@@ -776,6 +899,13 @@ impl InteractionRuntime {
                     },
                 ..
             } => return self.handle_lfg_list(interaction).await,
+            RoutedInteraction::Slash {
+                outcome:
+                    SlashOutcome::Handled {
+                        handler: HandlerId::LfgInspect,
+                    },
+                ..
+            } => return self.handle_lfg_inspect(interaction).await,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Refuse { refusal },
                 ..

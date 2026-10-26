@@ -56,6 +56,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
     ("lfg-list", "docs/parity.md §1 lfg-list"),
+    ("lfg-inspect", "docs/parity.md §1 lfg-inspect"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
 ];
@@ -399,6 +400,27 @@ pub fn expected_registry() -> Value {
         .expect("lfg-edit is published")
         + 1;
     commands.insert(after_edit, lfg_list);
+    // Next-only saved-roster inspection has its own independent literal too.
+    let lfg_inspect = json!({
+        "name": "lfg-inspect",
+        "description": "Privately inspect a saved LFG post's full roster in this channel",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+             "required": true, "max_length": 128},
+            {"name": "role", "description": "Role number (1-20) to show saved signups for",
+             "type": 4, "required": false, "min_value": 1, "max_value": 20},
+            {"name": "page", "description": "Page of roles or saved signups (1-100)",
+             "type": 4, "required": false, "min_value": 1, "max_value": 100}
+        ]
+    });
+    let after_lfg_list = commands
+        .iter()
+        .position(|c| c["name"] == "lfg-list")
+        .expect("lfg-list is published")
+        + 1;
+    commands.insert(after_lfg_list, lfg_inspect);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
     // publish position (index 19, immediately after sticky-remove, with
     // game-mix, welcome-preview, pause/resume and inspection inserts above)

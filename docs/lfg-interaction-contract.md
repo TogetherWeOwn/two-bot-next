@@ -38,6 +38,30 @@ same `lfg::valid_post_id` predicate as Close: nonempty and at most 128 UTF-16
 units. Whitespace is not trimmed; multibyte UTF-8 byte length is not the
 bound. Invalid Select IDs produce no store, audit or channel operation.
 
+## Inspect a saved roster in this channel
+
+`/lfg-inspect id:<id> [role:<1-20>] [page:<1-100>]` requires Manage Events
+(revalidated on every invocation) plus the announcements and configured-guild
+gates, and reads one saved post from the invoking channel only. The public
+post truncates its rendered roster at 2,000 UTF-16 units, so later roles can
+disappear there; inspection instead pages whole rows deterministically —
+roles by saved position then key, signups by join time then user ID — until
+every configured role and saved signup has been shown exactly once. Without
+`role`, pages show each role's filled/total and remaining seats and no member
+IDs; with `role`, pages show that one role's saved signups. Saved titles and
+labels render inert (mentions, links and markdown cannot activate), output
+stays within the 2,000 UTF-16-unit limit, and rows are never cut.
+
+Guild and invoking channel are authorized from the saved post before any
+role or signup row is read; unknown, other-guild and other-channel IDs share
+one private miss. Malformed, duplicated or out-of-range options refuse
+before storage, an out-of-range page or role answers honestly with a restart
+cue, and a store outage is reported as unavailable, never as empty. The
+reply shows saved title, start and state only: a stored message ID is not
+rendered as a jump link or delivery proof. Inspection is read-only — no
+signup, cooldown, audit, claim or message effect — and ordinary preview,
+signup, edit, close and list behavior is unchanged.
+
 ## Edit an existing game post
 
 `/lfg-edit id:<id> title:<optional title> starts-at:<optional RFC3339 timestamp>`

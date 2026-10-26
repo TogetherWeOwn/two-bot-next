@@ -97,7 +97,8 @@ pub fn canonical_snowflake(value: &str) -> bool {
 }
 
 /// Keep Unicode and complete names, but not mentions, links or active markdown.
-fn inert_title(text: &str) -> String {
+/// Shared with the saved-roster inspection projection (`lfg_inspect`).
+pub(crate) fn inert_title(text: &str) -> String {
     let mut safe = String::new();
     for ch in text.chars() {
         match ch {
@@ -119,7 +120,7 @@ fn inert_title(text: &str) -> String {
     safe
 }
 
-fn quoted_id(id: &str) -> String {
+pub(crate) fn quoted_id(id: &str) -> String {
     // A delimiter longer than any run in the ID cannot be closed by that ID.
     // Space padding preserves IDs that begin/end in backticks. Control chars
     // use their explicit Unicode spelling so a stored ID cannot add fake rows.

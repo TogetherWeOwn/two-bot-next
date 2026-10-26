@@ -66,10 +66,10 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 46 entries (43 retained builtins — the 27 legacy ones plus the Next-only
+all 47 entries (44 retained builtins — the 27 legacy ones plus the Next-only
 `/help`, `/privacy`, `/command-inspect`, `/reopen`, `/welcome-preview`, `/lfg-edit`,
 `/command-disable`, `/command-enable`, `/purge-preview`, `/channel-inspect`,
-`/giveaway`, `/lfg-list`, `/feed-inspect`, `/feed-pause`, `/feed-resume` and `/game-mix` — the dropped rota command, custom
+`/giveaway`, `/lfg-list`, `/lfg-inspect`, `/feed-inspect`, `/feed-pause`, `/feed-resume` and `/game-mix` — the dropped rota command, custom
 slash commands, and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
@@ -124,6 +124,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `lfg` | docs/parity.md §1 #26 preview | Add the Next-only optional boolean `preview` ("Privately preview without posting") as the fourth option; omitted or false posts exactly as legacy, true renders one private ephemeral preview with no store, quota, audit or channel effect. The three legacy string options stay untouched. |
 | `lfg-close` | docs/parity.md §1 #27 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `lfg-list` | docs/parity.md §1 lfg-list | Add Next-only current-channel discovery after `lfg-close`: announcements-gated, guild-only, `ManageEvents`, with one optional string `cursor` capped at 512. No legacy counterpart; no mutations. |
+| `lfg-inspect` | docs/parity.md §1 lfg-inspect | Add Next-only private saved-roster inspection after `lfg-list`: announcements-gated, guild-only, `ManageEvents`, required string `id` capped at 128 UTF-16 units plus optional integers `role` (1–20) and `page` (1–100, default 1). Current-channel only; bounded whole-row pages reach every saved role and signup; read-only. No legacy counterpart; no mutations. |
 | `feed-add` | docs/parity.md §1 #28 caps | Advertise only `max_length` 2048 on `source`, matching the server-side byte bound enforced before URL parsing. |
 | `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id through the first 50 rows stays discoverable within Discord's 2,000-unit cap (guild list reads at most 25 earliest rows per window; over-cap guilds page past the overflow line to reach hidden rows); command name, description and permissions stay legacy-identical. |

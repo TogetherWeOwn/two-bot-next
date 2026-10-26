@@ -122,6 +122,7 @@ impl ProductionRegistrations for InteractionRouter {
         router.register(Box::new(Stub(HandlerId::Lfg)));
         router.register(Box::new(Stub(HandlerId::LfgClose)));
         router.register(Box::new(Stub(HandlerId::LfgEdit)));
+        router.register(Box::new(Stub(HandlerId::LfgInspect)));
         // Next-only `/lfg-list`: name-based so the baseline still compiles
         // before the production `HandlerId::LfgList` arm lands. Resolve the
         // handler from the routing table when the builder lands it instead of
@@ -245,7 +246,7 @@ fn claiming_surfaces(
     }
     if (matches!(
         handler,
-        HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit
+        HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit | HandlerId::LfgInspect
     ) || name == "lfg-list")
         && admitted
     {
@@ -266,6 +267,7 @@ fn claiming_surfaces(
             HandlerId::Lfg
                 | HandlerId::LfgClose
                 | HandlerId::LfgEdit
+                | HandlerId::LfgInspect
                 | HandlerId::Rank
                 | HandlerId::Leaderboard
         )

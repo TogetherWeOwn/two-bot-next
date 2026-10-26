@@ -180,6 +180,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 46] = [
     row(27, "lfg-close", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(26, "lfg-edit", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(38, "lfg-list", BuiltinSlash, PERM_MANAGE_EVENTS, None),
+    row(46, "lfg-inspect", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(28, "feed-add", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),

@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 64.
+Built-in commands: 65.
 
 ## `/access`
 
@@ -432,6 +432,19 @@ Update LFG metadata or increase one role's seats
 | `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
 | `role` | string | false | — | — | 32 | — | Existing signup role key (use with seats) |
 | `seats` | integer | false | 1 | 99 | — | — | Absolute seat target, increase only (1-99; use with role) |
+
+## `/lfg-inspect`
+
+Privately inspect a saved LFG post's full roster in this channel
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+| `role` | integer | false | 1 | 20 | — | — | Role number (1-20) to show saved signups for |
+| `page` | integer | false | 1 | 100 | — | — | Page of roles or saved signups (1-100) |
 
 ## `/lfg-list`
 

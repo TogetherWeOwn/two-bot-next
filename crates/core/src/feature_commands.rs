@@ -531,6 +531,38 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 .max_length(crate::lfg_list::MAX_CURSOR_LEN as u32)
             }]),
         CommandDefinition::new(
+            "lfg-inspect",
+            "Privately inspect a saved LFG post's full roster in this channel",
+        )
+        .permissions(PERM_MANAGE_EVENTS)
+        .options(vec![
+            CommandOption::new(
+                "id",
+                "LFG id from the posted signup",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32),
+            CommandOption {
+                required: Some(false),
+                ..CommandOption::new(
+                    "role",
+                    "Role number (1-20) to show saved signups for",
+                    CommandOptionType::Integer,
+                )
+                .int_range(1, crate::lfg::MAX_LFG_ROLES as i64)
+            },
+            CommandOption {
+                required: Some(false),
+                ..CommandOption::new(
+                    "page",
+                    "Page of roles or saved signups (1-100)",
+                    CommandOptionType::Integer,
+                )
+                .int_range(1, crate::lfg_inspect::MAX_PAGE as i64)
+            },
+        ]),
+        CommandDefinition::new(
             "feed-add",
             "Relay an RSS, YouTube, or Twitch feed into this channel",
         )
@@ -753,6 +785,7 @@ mod tests {
                 "lfg-close",
                 "lfg-edit",
                 "lfg-list",
+                "lfg-inspect",
                 "feed-add",
                 "feed-remove",
                 "feed-pause",
@@ -766,8 +799,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 7 core + 1 scorecard + 12 automation + 12 announcements.
-        assert_eq!(merged.len(), 32);
+        // 7 core + 1 scorecard + 12 automation + 13 announcements.
+        assert_eq!(merged.len(), 33);
         assert_eq!(
             &names(&merged)[..8],
             [
@@ -817,6 +850,7 @@ mod tests {
         assert_eq!(is(&ann, "lfg-close"), manage_events);
         assert_eq!(is(&ann, "lfg-edit"), manage_events);
         assert_eq!(is(&ann, "lfg-list"), manage_events);
+        assert_eq!(is(&ann, "lfg-inspect"), manage_events);
         for name in [
             "feed-add",
             "feed-remove",
@@ -893,6 +927,7 @@ mod tests {
             ("lfg-edit", 0, 128),
             ("lfg-edit", 1, 100),
             ("lfg-list", 0, 512),
+            ("lfg-inspect", 0, 128),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
             ("feed-pause", 0, 128),
