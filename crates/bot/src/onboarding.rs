@@ -1266,9 +1266,9 @@ impl OnboardingRuntime {
                 .position(|pick| pick.role_id == role)
                 .unwrap_or(usize::MAX)
         };
-        additions.sort_by_key(|role| order(*role));
-        removals.sort_by_key(|role| order(*role));
-        unchanged.sort_by_key(|role| order(*role));
+        additions.sort_by_key(|role| order(role));
+        removals.sort_by_key(|role| order(role));
+        unchanged.sort_by_key(|role| order(role));
         // Manageability: adding and removing both need Manage Roles (or
         // Administrator) plus an unmanaged target below the bot.
         let bot = match MemberAccess::load(&self.executor, config.guild_id, self.bot_id).await {

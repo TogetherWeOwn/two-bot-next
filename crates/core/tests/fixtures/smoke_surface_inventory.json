@@ -160,7 +160,7 @@
     },
     {
       "name": "reopen",
-      "description": "Reopen your games or session picker in a private menu.",
+      "description": "Reopen your games or session picker in a private menu; games includes a no-change preview.",
       "family": "core",
       "gate": "always",
       "default_member_permissions": null,
