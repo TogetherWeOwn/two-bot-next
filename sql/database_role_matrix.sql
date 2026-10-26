@@ -65,6 +65,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'voice_command_roles', 'table'),
     ('public', 'voice_command_role_members', 'table'),
     ('public', 'voice_vote_kick_audit', 'table'),
+    ('public', 'voice_orphan_ledger', 'table'),
     ('public', 'gateway_boot_directives', 'table'),
     ('public', 'guild_settings', 'table'),
     ('public', 'guild_settings_revision', 'table'),

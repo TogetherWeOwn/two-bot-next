@@ -86,7 +86,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 18] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 19] = [
     "voice room rename decision",
     "voice join completed",
     "voice_operation succeeded",
@@ -96,6 +96,7 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 18] = [
     "voice_reconcile planned",
     "voice action dead-lettered",
     "voice creator orphan needs manual deletion",
+    "could not persist voice orphan evidence",
     "voice creator join accepted",
     "voice creator join refused before queueing",
     "voice creator view revalidated from the store",
@@ -109,7 +110,7 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 18] = [
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded
 /// voice vocabulary that rides the gateway sink.
-const VOICE_EVENT_VALUES: [&str; 8] = [
+const VOICE_EVENT_VALUES: [&str; 9] = [
     "voice_join",
     "voice_join_received",
     "voice_operation",
@@ -117,6 +118,7 @@ const VOICE_EVENT_VALUES: [&str; 8] = [
     "voice_reconcile",
     "voice_dead_letter",
     "voice_creator_orphan",
+    "voice_orphan_ledger_write_failed",
     "voice_admin_store",
 ];
 
