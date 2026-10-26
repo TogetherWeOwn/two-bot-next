@@ -5,7 +5,7 @@
   "executionBase": "5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
   "branch": "test/tempban-expiry-inventory-acceptance",
   "protectedFiles": [
-    {"path": "crates/bot/src/tempban_inventory_acceptance_tests.rs", "sha256": "b70b7b712671905b6a3e4322cbd1a50ca4a11acc44e216cf5a365bc416e992a6", "tests": 7},
+    {"path": "crates/bot/src/tempban_inventory_acceptance_tests.rs", "sha256": "d1324bd2461b133054cdadd8da672c686496ad01e4449a8b9fc3ce77de2fbbb7", "tests": 7},
     {"path": "crates/core/tests/tempban_inventory_contract.rs", "sha256": "440ec257baed7e027c7764dd120b08bf07601e2466bdcfb1ab6d56692b896b55", "tests": 2}
   ],
   "registration": {
@@ -39,7 +39,7 @@
   },
   "verification": {
     "localCompiled": "NOT RUN: publication, runtime and workspace wrapper attempts were refused before Cargo, each exit 75: no idle, below-budget slot; no per-worktree fallback.",
-    "behavioralRed": "UNVERIFIED pending hosted exact-head run. No assertion failure, GREEN control or compile success is claimed.",
+    "behavioralRed": "UNVERIFIED. Hosted run 40395040848 at candidate 1ae0c9398d4be2561db4a6671a0644b9a527da31 failed compilation with E0277 at runtime fixture lines 165 and 191, not behavior assertions. This test-author correction wraps only fixed-enumeration fixture SQL in AssertSqlSafe. Corrected local runtime attempt again refused cache admission (exit 75). No assertion failure, GREEN control or compile success for corrected bytes is claimed.",
     "offline": "cargo fmt --all -- --check, git diff --check, floor guard, test inventory, secret Debug guard (including 23 self-tests), and docs index passed before publication.",
     "baselineCompatibility": "git diff sourceBaseline..executionBase for member_runtime.rs, member_moderation_store.rs and moderation.rs was empty. This static check is not compiled verification."
   },

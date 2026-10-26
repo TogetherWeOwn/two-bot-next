@@ -162,7 +162,8 @@ async fn snapshot(pool: &PgPool) -> Vec<String> {
     ] {
         let query = format!("SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb)::text FROM {table} t");
         result.push(
-            sqlx::query_scalar(&query)
+            // Only the fixed table identifiers above enter this statement.
+            sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
                 .fetch_one(pool)
                 .await
                 .expect("full ledger snapshot"),
@@ -188,7 +189,8 @@ async fn install_write_probe(pool: &PgPool) {
         "moderation_warnings",
     ] {
         let ddl = format!("CREATE TRIGGER inventory_no_writes BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON {table} FOR EACH STATEMENT EXECUTE FUNCTION inventory_write_seen()");
-        sqlx::query(&ddl)
+        // Only the fixed table identifiers above enter this fixture DDL.
+        sqlx::query(sqlx::AssertSqlSafe(ddl.as_str()))
             .execute(pool)
             .await
             .expect("statement mutation probe");
