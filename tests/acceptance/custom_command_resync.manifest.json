@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/discord/tests/custom_command_resync_acceptance.rs",
-      "sha256": "d76f4fe722d878bbbdf5947734d30955fd2a17c937429da80365349d8d11c9cc",
+      "sha256": "4ea1e3b4f424d25c62ca58fa9a09812be716159025e263ffe294aa5b7fd876d7",
       "tests": 11
     }
   ],

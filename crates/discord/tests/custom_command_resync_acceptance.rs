@@ -331,9 +331,10 @@ fn private_reply(observed: &Observed) -> String {
 }
 
 fn assert_saved(rows: &[Value], mutation: Mutation) {
+    let guild = GUILD.to_string();
     let row = rows
         .iter()
-        .find(|row| row["guild_id"] == GUILD.to_string() && row["name"] == mutation.expected_name())
+        .find(|row| row["guild_id"] == guild && row["name"] == mutation.expected_name())
         .expect("mutation committed, not deleted or rolled back after the failed PUT");
     assert_eq!(row["enabled"], mutation.enabled());
     assert_eq!(row["template"], TEMPLATE);
