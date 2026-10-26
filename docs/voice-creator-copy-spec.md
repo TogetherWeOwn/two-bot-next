@@ -187,7 +187,7 @@ compensation is promised: a later Discord revocation cannot undo a saved commit.
 | Two confirms against target revision 7 | One commits revision 8; other is stale, never overwrites revision 8 |
 | Source=target / same three values | `SAME_CREATOR` / `NO_CHANGE`; zero writes and no revision bump |
 | Same confirmed preview + same request ID + same fingerprint | Reauthorize, return original committed receipt; no second write |
-| Same request ID + changed IDs/digest/input | `IDEMPOTENCY_CONFLICT`; zero writes |
+| Same request ID + changed IDs/digest/input while its receipt is retained | `IDEMPOTENCY_CONFLICT`; zero writes |
 | Different request IDs for the same preview | At most one success: consumed preview identity and target CAS arbitrate |
 | Commit result lost / connection failure | `OUTCOME_UNKNOWN`; inspect original receipt first, never report failure or blindly retry as a new request |
 
@@ -204,7 +204,17 @@ a retained receipt. Matching replay during retention is a **read-only receipt
 lookup**, not a new confirm: recheck all current admission/authority/access fences
 first, and return `NOT_AVAILABLE` without receipt data if denied. Otherwise return
 the original receipt, explicitly `replayed=true`, with zero new writes, even after
-token expiry or process restart. After retention return `EXPIRED`, never execute.
+token expiry or process restart. After retention, an authenticated original token
+returns `EXPIRED`: verify its signed issuance/expiry against server time even when
+no receipt exists. A request ID alone cannot look up or execute an operation; no
+permanent tombstone is needed to reject that expired token. Invalid signatures or
+revoked signing generations fail closed, never execute or disclose a receipt.
+Request-ID conflict/replay guarantees last only while the receipt is retained.
+After deletion, that actor may reuse the ID **only with a fresh preview**, complete
+review and new explicit confirmation, subject to current authority and CAS. That
+is a new operation, not recovery/replay of the erased one; the old token remains
+expired regardless of the reused ID. Clients recovering an unknown outcome must
+not silently substitute a new preview for the original confirmation.
 Cancel discards the token/UI and marks any local record cancelled; an already
 submitted authorized confirm may have won, so inspect its receipt instead of
 claiming rollback. Missing local preview state cannot execute after restart.
@@ -302,7 +312,7 @@ configuration write count and zero Discord mutations; no live data.
 | F06 | Target edit/ABA, delete-recreate with same ID, import or restore -> stale/generation refusal; no blind update or reuse of revision |
 | F07 | Existing target room occupied and another creation admitted before commit: all existing/in-flight settings, owners, permissions and occupants unchanged; fresh later admission uses copied defaults |
 | F08 | Preview/cancel/expiry/restart halfway through pages -> zero durable writes; no confirm without complete current view; lost commit response -> inspect receipt |
-| F09 | Same-key replay (even after token expiry), changed-key/input conflict, alternate key same preview, receipt expiry/erasure and capacity -> at most one commit; no expired-token execution |
+| F09 | Same-key replay (even after token expiry), retained-key/input conflict, alternate key same preview, receipt expiry/erasure and capacity -> at most one commit per preview. Commit at t0; after t0+24h delete its receipt, resend the signed original token+ID -> EXPIRED, zero writes. Reuse that ID with a fresh fully reviewed/confirmed preview -> new operation subject to CAS; then resend the old token again -> EXPIRED, never the new receipt or a second commit |
 | F10 | Exact/one-over 4 KiB input, 32 KiB review, 20 pages and 2,000 UTF-16 units/page; a whole unrenderable field refuses; no truncated confirm |
 | F11 | Excluded template contains @everyone, Markdown, emoji, combining characters and bidi controls: escaped complete private diff, no ping; raw values preserved, byte/scalar/UTF-16 bounds distinguished |
 | F12 | Unknown schema/field, malformed stored scalar, duplicate JSON key, missing ID, invalid mode, DB/read failure, revoked access at confirm: bounded refusal; no defaulting, partial update or raw error leak |
