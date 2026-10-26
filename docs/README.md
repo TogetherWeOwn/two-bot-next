@@ -158,6 +158,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 ## Voice
 
 - [Room spec](voice-rooms.md)
+- [Presets proposal](voice-presets-spec.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
