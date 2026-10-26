@@ -1333,8 +1333,28 @@ fn requirements_line(row: &GiveawayRow) -> String {
     format!("Requirements: {}", requirements_summary(row))
 }
 
+/// Parse saved requirements for display with the same tolerance entry
+/// admission enforces (`admit_entry`): the printed rules are then exactly
+/// the enforced rules. Rows admission cannot admit under (undecodable
+/// JSON, age gates past ten years, a role id that is not a nonzero number)
+/// parse to `None` here too, never to a guessed "Everyone".
+fn display_requirements(row: &GiveawayRow) -> Option<giveaway::GiveawayRequirements> {
+    let requirements: giveaway::GiveawayRequirements =
+        serde_json::from_value(row.requirements_json.clone()).ok()?;
+    if requirements.min_account_age_days > giveaway::REQUIREMENT_MAX_AGE_DAYS
+        || requirements.min_guild_age_days > giveaway::REQUIREMENT_MAX_AGE_DAYS
+        || requirements
+            .roles
+            .iter()
+            .any(|id| id.parse::<u64>().is_err() || id == "0")
+    {
+        return None;
+    }
+    Some(requirements)
+}
+
 fn requirements_summary(row: &GiveawayRow) -> String {
-    let Ok(requirements) = store_requirements(row) else {
+    let Some(requirements) = display_requirements(row) else {
         return "unavailable (saved rules unreadable; ask staff)".to_owned();
     };
     let mut parts = Vec::new();
