@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
         matrix_names, published_names,
         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
     );
-    assert_eq!(matrix.len(), 43, "contract covers the 43 built-in commands");
+    assert_eq!(matrix.len(), 44, "contract covers the 44 built-in commands");
 }
 
 #[test]
@@ -110,6 +110,7 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "command-enable",
             "schedule",
             "schedule-remove",
+            "schedule-retime",
             "schedule-list",
             "sticky",
             "sticky-remove",

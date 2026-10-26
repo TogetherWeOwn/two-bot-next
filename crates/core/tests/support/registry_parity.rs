@@ -31,6 +31,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("schedule", "docs/parity.md §1 #17 absolute-time"),
     ("schedule", "docs/parity.md §1 #17 preview"),
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
+    ("schedule-retime", "docs/parity.md §1 schedule-retime"),
     ("sticky", "docs/parity.md §1 #20 caps"),
     ("sticky", "docs/parity.md §1 #20 preview"),
     ("lfg", "docs/parity.md §1 #26 caps"),
@@ -396,10 +397,35 @@ pub fn expected_registry() -> Value {
         .expect("lfg-edit is published")
         + 1;
     commands.insert(after_edit, lfg_list);
+    // Next-only one-off timing correction, immediately after schedule-remove.
+    // Independent literal pins the whole publication contract; never
+    // manufacture it from production shapes.
+    let after_schedule_remove = commands
+        .iter()
+        .position(|command| command["name"] == "schedule-remove")
+        .expect("legacy schedule-remove remains published")
+        + 1;
+    commands.insert(
+        after_schedule_remove,
+        json!({
+            "name": "schedule-retime",
+            "description": "Correct an unsent one-off's time in this channel",
+            "type": 1,
+            "default_member_permissions": "32",
+            "dm_permission": false,
+            "options": [
+                {"name": "id", "description": "Full scheduled message id from /schedule-list",
+                 "type": 3, "required": true, "max_length": 128},
+                {"name": "at", "description": "Future RFC3339 time with Z or numeric offset, within 365 days",
+                 "type": 3, "required": true, "max_length": 64}
+            ]
+        }),
+    );
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 19, immediately after sticky-remove, with
-    // game-mix, welcome-preview, pause/resume and inspection inserts above)
-    // as the exact published definition, so parity pins its shape too.
+    // publish position (index 20, immediately after sticky-remove, with
+    // schedule-retime, game-mix, welcome-preview, pause/resume and inspection
+    // inserts above) as the exact published definition, so parity pins its
+    // shape too.
     let giveaway = serde_json::to_value(
         CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
             .permissions(PERM_MANAGE_GUILD)
@@ -525,7 +551,7 @@ pub fn expected_registry() -> Value {
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(19, giveaway);
+    commands.insert(20, giveaway);
     // Next-only feed lifecycle pair. These independent literals pin the whole
     // publication contract; never manufacture them from production shapes.
     // The feed-remove lookup stays dynamic so the giveaway insert above does

@@ -1030,6 +1030,7 @@ mod tests {
             ("command-enable", HandlerId::AutomationAdmin),
             ("schedule", HandlerId::AutomationAdmin),
             ("schedule-remove", HandlerId::AutomationAdmin),
+            ("schedule-retime", HandlerId::AutomationAdmin),
             ("schedule-list", HandlerId::AutomationAdmin),
             ("sticky", HandlerId::AutomationAdmin),
             ("sticky-remove", HandlerId::AutomationAdmin),
@@ -1047,7 +1048,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 43, "all 43 handler-owned builtins covered");
+        assert_eq!(cases.len(), 44, "all 44 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1134,6 +1135,7 @@ mod tests {
             ("attendance", RouterRefusal::ScorecardDisabled),
             ("command", RouterRefusal::AutomationsDisabled),
             ("schedule-list", RouterRefusal::AutomationsDisabled),
+            ("schedule-retime", RouterRefusal::AutomationsDisabled),
             ("rsvp", RouterRefusal::AnnouncementsDisabled),
             ("rsvp-attendance", RouterRefusal::AnnouncementsDisabled),
             ("lfg", RouterRefusal::AnnouncementsDisabled),
@@ -1155,6 +1157,59 @@ mod tests {
             r.route_slash(&ctx("rank", Some(GUILD), Some(0))),
             SlashOutcome::Handled {
                 handler: HandlerId::Rank
+            }
+        );
+    }
+
+    #[test]
+    fn schedule_retime_cannot_borrow_custom_or_wrong_guild_authority() {
+        let router = router();
+        for permissions in [None, Some(0), Some(8), Some(!32_u64)] {
+            assert_eq!(
+                router.route_slash(&SlashContext {
+                    custom_row: Some(true),
+                    ..ctx("schedule-retime", Some(GUILD), permissions)
+                }),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                }
+            );
+        }
+        assert_eq!(
+            router.route_slash(&ctx("schedule-retime", Some(GUILD), Some(32))),
+            SlashOutcome::Handled {
+                handler: HandlerId::AutomationAdmin
+            }
+        );
+        for guild in [None, Some(9999)] {
+            assert_eq!(
+                router.route_slash(&ctx("schedule-retime", guild, Some(u64::MAX))),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::GuildRestricted
+                }
+            );
+        }
+        let unconfigured = InteractionRouter::new(RouterGates {
+            configured_guild: None,
+            ..all_on()
+        });
+        assert_eq!(
+            unconfigured.route_slash(&ctx("schedule-retime", Some(GUILD), Some(u64::MAX))),
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::GuildRestricted
+            }
+        );
+        let off = InteractionRouter::new(RouterGates {
+            automations: false,
+            ..all_on()
+        });
+        assert_eq!(
+            off.route_slash(&SlashContext {
+                custom_row: Some(true),
+                ..ctx("schedule-retime", Some(GUILD), Some(u64::MAX))
+            }),
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::AutomationsDisabled
             }
         );
     }
@@ -1651,9 +1706,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 7 core + 1 scorecard + 12 automation + 12 announcements + 9 moderation
-        // + 2 reads + 1 custom = 44, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 44);
+        // 7 core + 1 scorecard + 13 automation + 12 announcements + 9 moderation
+        // + 2 reads + 1 custom = 45, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 45);
         assert_eq!(
             &names[..8],
             [
@@ -1668,13 +1723,17 @@ mod tests {
             ]
         );
         assert_eq!(names[11], "command-inspect");
-        assert_eq!(&names[18..21], ["sticky-remove", "giveaway", "rsvp"]);
+        assert_eq!(
+            &names[15..18],
+            ["schedule-remove", "schedule-retime", "schedule-list"]
+        );
+        assert_eq!(&names[19..22], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
-        assert_eq!(names[24], "lfg-edit");
-        assert_eq!(names[25], "lfg-list");
+        assert_eq!(names[25], "lfg-edit");
+        assert_eq!(names[26], "lfg-list");
         assert_eq!(
-            &names[26..32],
+            &names[27..33],
             [
                 "feed-add",
                 "feed-remove",
@@ -1685,14 +1744,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[32..41],
+            &names[33..42],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[41..43], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[43], "faq");
+        assert_eq!(&names[42..44], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[44], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1709,6 +1768,7 @@ mod tests {
             "command-enable",
             "schedule",
             "schedule-remove",
+            "schedule-retime",
             "schedule-list",
             "sticky",
             "sticky-remove",
@@ -1808,6 +1868,7 @@ mod tests {
                 for (name, enabled, permission) in [
                     ("command-disable", gates.automations, "32"),
                     ("command-enable", gates.automations, "32"),
+                    ("schedule-retime", gates.automations, "32"),
                     ("lfg-edit", gates.announcements, "8589934592"),
                 ] {
                     let found = defs.iter().find(|def| def.name == name);
@@ -2008,7 +2069,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 43);
+        assert_eq!(off.len(), 44);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -2018,16 +2079,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 43 builtins keep their order; the 21 voice names that survive
+        // 44 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 64);
-        assert_eq!(on_names[..43], off_names[..]);
+        assert_eq!(on.len(), 65);
+        assert_eq!(on_names[..44], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[43..], expected[..]);
+        assert_eq!(on_names[44..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -2088,13 +2149,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 43
+        // Both gates on is the full voice set without the assistant: 44
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 64);
+        assert_eq!(both.len(), 65);
     }
 
     #[test]
