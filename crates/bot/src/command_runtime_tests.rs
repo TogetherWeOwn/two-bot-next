@@ -1606,6 +1606,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "lfg-list"
                         | "schedule"
                         | "schedule-remove"
+                        | "schedule-retime"
                         | "schedule-list"
                         | "rank"
                         | "leaderboard"
