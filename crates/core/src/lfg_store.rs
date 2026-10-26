@@ -202,7 +202,13 @@ pub async fn edit_lfg_metadata(
     })
 }
 
-/// Save an accepted message without replacing roles, signups or a concurrent close.
+/// Save an accepted message without replacing roles, signups or a concurrent
+/// close. Binding a message to an already-closed row for the first time also
+/// re-arms close-refresh repair in the same statement: the saved message may
+/// still carry live signup controls, and the no-message refresh may already
+/// have settled the original intent. An intent that was settled becomes
+/// eligible immediately; a live backoff schedule is kept. Re-saving the same
+/// identifier (or saving on an open row) leaves the retry state untouched.
 pub async fn save_lfg_message_id(
     pool: &sqlx::PgPool,
     guild_id: &str,
@@ -210,8 +216,18 @@ pub async fn save_lfg_message_id(
     message_id: &str,
 ) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE lfg_posts SET message_id = $3 WHERE guild_id = $1 AND id = $2
-         AND (message_id IS NULL OR message_id = $3)",
+        "UPDATE lfg_posts
+         SET close_refresh_pending = close_refresh_pending
+                 OR (status = 'closed' AND message_id IS NULL),
+             close_refresh_next_at = CASE
+                 WHEN status = 'closed' AND message_id IS NULL
+                      AND NOT close_refresh_pending
+                     THEN NULL
+                 ELSE close_refresh_next_at
+             END,
+             message_id = $3
+         WHERE guild_id = $1 AND id = $2
+           AND (message_id IS NULL OR message_id = $3)",
     )
     .bind(guild_id)
     .bind(id)
@@ -951,6 +967,15 @@ mod tests {
         assert_eq!(stored.message_id.as_deref(), Some("333333333333333333"));
         assert_eq!(stored.status, LfgStatus::Closed);
         assert!(stored.closed_at.is_some());
+        // The close already armed repair; the late bind must keep it armed.
+        let armed = get_lfg_close_refresh(&pool, &post.guild_id, id)
+            .await
+            .expect("refresh state")
+            .expect("post refresh state");
+        assert!(
+            armed.pending,
+            "first bind on a closed row keeps repair armed"
+        );
         assert_eq!(list_lfg_roles(&pool, id).await.expect("roles"), roles);
         assert_eq!(list_lfg_signups(&pool, id).await.expect("signups").len(), 1);
         assert!(
@@ -958,6 +983,82 @@ mod tests {
                 .await
                 .is_err()
         );
+        reset(&pool, id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs agent-testdb or the CI service container"]
+    async fn binding_a_message_rearms_settled_close_repair_but_keeps_live_backoff() {
+        let pool = test_pool().await;
+        let id = "lfg-store-rearm";
+        reset(&pool, id).await;
+        let post = test_post(id);
+        put_lfg(&pool, &post, &test_roles(id), true)
+            .await
+            .expect("insert");
+        close_lfg(&pool, &post.guild_id, id, "2026-09-10T12:00:00Z")
+            .await
+            .expect("close");
+        // The no-message refresh settles the intent while nothing is bound.
+        clear_lfg_close_refresh(&pool, &post.guild_id, id)
+            .await
+            .expect("settle unbound intent");
+        let settled = get_lfg_close_refresh(&pool, &post.guild_id, id)
+            .await
+            .expect("settled state")
+            .expect("post state");
+        assert!(!settled.pending, "fixture must start settled");
+        // First bind on the closed row re-arms repair, eligible immediately:
+        // the recovered message may still show live signup controls.
+        save_lfg_message_id(&pool, &post.guild_id, id, "333333333333333333")
+            .await
+            .expect("first bind");
+        let rearmed = get_lfg_close_refresh(&pool, &post.guild_id, id)
+            .await
+            .expect("rearmed state")
+            .expect("post state");
+        assert!(rearmed.pending, "first bind re-arms settled repair");
+        assert_eq!(rearmed.next_at, None, "rearmed intent is due at once");
+        // A live backoff schedule survives re-saving the same identifier.
+        let next_at = time::OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("2100 UTC");
+        defer_lfg_close_refresh(&pool, &post.guild_id, id, 2, next_at)
+            .await
+            .expect("defer");
+        save_lfg_message_id(&pool, &post.guild_id, id, "333333333333333333")
+            .await
+            .expect("idempotent re-save");
+        let deferred = get_lfg_close_refresh(&pool, &post.guild_id, id)
+            .await
+            .expect("deferred state")
+            .expect("post state");
+        assert!(deferred.pending);
+        assert_eq!(deferred.attempts, 2);
+        assert_eq!(
+            deferred.next_at,
+            Some(next_at),
+            "re-saving the bound identifier must not clear backoff"
+        );
+        reset(&pool, id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs agent-testdb or the CI service container"]
+    async fn binding_a_message_to_an_open_post_arms_no_repair() {
+        let pool = test_pool().await;
+        let id = "lfg-store-open-bind";
+        reset(&pool, id).await;
+        let post = test_post(id);
+        put_lfg(&pool, &post, &test_roles(id), true)
+            .await
+            .expect("insert");
+        save_lfg_message_id(&pool, &post.guild_id, id, "333333333333333333")
+            .await
+            .expect("bind open post");
+        let state = get_lfg_close_refresh(&pool, &post.guild_id, id)
+            .await
+            .expect("refresh state")
+            .expect("post state");
+        assert!(!state.pending, "open posts never carry repair intent");
         reset(&pool, id).await;
     }
 

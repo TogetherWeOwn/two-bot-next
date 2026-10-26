@@ -115,6 +115,9 @@ eligible tick retries on its own. Pending state lives on the closed row
 (`close_refresh_pending`, `close_refresh_attempts`, `close_refresh_next_at`)
 and clears only on a confirmed edit, a definitive Unknown Message outcome,
 a closed post with no saved message to repair, or erasure of the row itself.
+If a closed post first gains its saved message later (recovered from channel
+history), saving the identifier re-arms the same repair intent, so stale
+controls on the late-bound message keep a durable retry.
 
 ## Bind a receipt to its request
 
