@@ -62,6 +62,24 @@ pub struct OwnerGrantIntent {
     pub members: Vec<Snowflake>,
 }
 
+/// Evidence retention and read bounds, independent of tracked-room cleanup.
+pub const ORPHAN_LEDGER_CAP: usize = 1000;
+pub const ORPHAN_LEDGER_PAGE_SIZE: usize = 10;
+
+/// A fixed-reason, insert-once failed-compensation observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanEvidence {
+    pub channel_id: Snowflake,
+    pub recorded_at: OffsetDateTime,
+}
+
+/// One snapshot-consistent newest-first page, with its exact row total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanEvidencePage {
+    pub rows: Vec<OrphanEvidence>,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
     pool: PgPool,
@@ -113,6 +131,81 @@ impl PgRoomStore {
     #[must_use]
     pub fn voice_configs(&self) -> PgVoiceConfigStore {
         PgVoiceConfigStore::new(self.pool.clone())
+    }
+
+    /// Retain the first observation, then evict only the oldest excess rows.
+    /// Every writer holds this transaction lock, including independent runtimes.
+    pub async fn record_creator_orphan(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("voice_orphan_ledger:{guild}"))
+            .execute(&mut *tx)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO voice_orphan_ledger (guild_id, channel_id, reason)
+             VALUES ($1, $2, 'creator_compensation_failed')
+             ON CONFLICT (guild_id, channel_id) DO NOTHING",
+        )
+        .bind(guild.to_string())
+        .bind(channel.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted != 0 {
+            sqlx::query(
+                "DELETE FROM voice_orphan_ledger WHERE guild_id = $1 AND channel_id IN (
+                 SELECT channel_id FROM voice_orphan_ledger WHERE guild_id = $1
+                 ORDER BY recorded_at DESC, channel_id DESC LIMIT $2 OFFSET $2)",
+            )
+            .bind(guild.to_string())
+            .bind(ORPHAN_LEDGER_CAP as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Ten complete rows and a total from the same SQL statement/snapshot.
+    /// Empty past-end pages carry no evidence; callers refuse them rather than
+    /// clamping. Reject offsets outside the retention bound before arithmetic.
+    pub async fn orphan_evidence_page(
+        &self,
+        guild: Snowflake,
+        page: usize,
+    ) -> Result<OrphanEvidencePage, sqlx::Error> {
+        if page == 0 || page > ORPHAN_LEDGER_CAP.div_ceil(ORPHAN_LEDGER_PAGE_SIZE) {
+            return Err(invalid_argument("invalid voice orphan page"));
+        }
+        let rows = sqlx::query(
+            "SELECT channel_id, recorded_at, count(*) OVER () AS total
+             FROM voice_orphan_ledger WHERE guild_id = $1
+             ORDER BY recorded_at DESC, channel_id DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(guild.to_string())
+        .bind(ORPHAN_LEDGER_PAGE_SIZE as i64)
+        .bind(((page - 1) * ORPHAN_LEDGER_PAGE_SIZE) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let total = rows
+            .first()
+            .map(|row| row.try_get::<i64, _>("total"))
+            .transpose()?
+            .unwrap_or(0) as usize;
+        let rows = rows
+            .iter()
+            .map(|row| {
+                let channel: String = row.try_get("channel_id")?;
+                Ok(OrphanEvidence {
+                    channel_id: channel.parse().map_err(invalid_argument)?,
+                    recorded_at: row.try_get("recorded_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        Ok(OrphanEvidencePage { rows, total })
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {

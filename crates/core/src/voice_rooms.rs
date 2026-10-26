@@ -1917,6 +1917,17 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         )
         .int_range(0, MAX_USER_LIMIT)]),
         CommandDefinition::new("unlimit", "Remove your room's user limit"),
+        CommandDefinition::new(
+            "voice-orphans",
+            "Privately inspect retained failed-compensation evidence (never deletes channels)",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of orphan evidence to show (starts at 1)",
+            CommandOptionType::Integer,
+        )
+        .min_value(1)]),
     ]
 }
 
@@ -3077,7 +3088,8 @@ mod tests {
                 "private",
                 "public",
                 "limit",
-                "unlimit"
+                "unlimit",
+                "voice-orphans"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.

@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0468_voice_orphan_ledger.sql": {
+      "sha256": "fe08eb045145986f9092f12a38428eebc1cb8fcc083ab14b7805dcc6c5a4df98",
+      "justification": "Retain bounded insert-once untracked creator compensation evidence for private staff inspection."
+    },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."

@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 64.
+Built-in commands: 65.
 
 ## `/access`
 
@@ -783,6 +783,17 @@ Allow @everyone to send messages
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/voice-orphans`
+
+Privately inspect retained failed-compensation evidence (never deletes channels)
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of orphan evidence to show (starts at 1) |
 
 ## `/warn`
 

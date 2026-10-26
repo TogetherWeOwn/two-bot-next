@@ -122,7 +122,10 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
+use two_bot_cutover::voice_rooms::{
+    CreateClaim, JoinGrantIntent, OrphanEvidencePage, OwnerGrantIntent, PgRoomStore,
+    ORPHAN_LEDGER_CAP, ORPHAN_LEDGER_PAGE_SIZE,
+};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
     RoomHttp, RoomHttpError,
@@ -178,6 +181,24 @@ pub struct EventVoiceBinding {
 
 /// No synchronous database work is allowed on the gateway event loop.
 pub trait RoomPersistence: Send + Sync {
+    /// Durable evidence only; unsupported adapters fail rather than discard it.
+    fn record_creator_orphan(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let _ = (guild, channel);
+        async { Err(StoreError::Unavailable) }
+    }
+    /// A bounded, snapshot-consistent page of first-observation evidence.
+    fn orphan_evidence_page(
+        &self,
+        guild: Snowflake,
+        page: usize,
+    ) -> impl Future<Output = Result<OrphanEvidencePage, StoreError>> + Send {
+        let _ = (guild, page);
+        async { Err(StoreError::Unavailable) }
+    }
     fn creators(
         &self,
         guild: Snowflake,
@@ -446,6 +467,26 @@ pub trait RoomPersistence: Send + Sync {
 }
 
 impl RoomPersistence for PgRoomStore {
+    async fn record_creator_orphan(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.record_creator_orphan(guild, channel)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn orphan_evidence_page(
+        &self,
+        guild: Snowflake,
+        page: usize,
+    ) -> Result<OrphanEvidencePage, StoreError> {
+        self.orphan_evidence_page(guild, page)
+            .await
+            .map_err(store_error)
+    }
+
     async fn creators(&self, guild: Snowflake) -> Result<Vec<CreatorChannel>, StoreError> {
         self.creators(guild).await.map_err(store_error)
     }
@@ -12031,6 +12072,9 @@ pub enum VoiceCommand {
     Setup {
         page: PageArg,
     },
+    Orphans {
+        page: PageArg,
+    },
     Ping,
     Invite,
     TextChannels {
@@ -12346,6 +12390,9 @@ fn parse_voice_command_with_registry(
             Some(VoiceCommand::Create { name })
         }
         "setup" => Some(VoiceCommand::Setup {
+            page: decode_page(&command.options),
+        }),
+        "voice-orphans" => Some(VoiceCommand::Orphans {
             page: decode_page(&command.options),
         }),
         "ping" => Some(VoiceCommand::Ping),
@@ -12926,6 +12973,7 @@ impl VoiceCommand {
         match self {
             Self::Create { .. } => "create",
             Self::Setup { .. } => "setup",
+            Self::Orphans { .. } => "voice-orphans",
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::TextChannels { .. } => "textchannels",
@@ -13345,9 +13393,19 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
             let compensation = http.delete(channel_id, always).await;
             let removed = compensation.is_ok();
             if !removed {
-                // Untracked orphan: reconcile will not delete it, so count it
-                // here with no channel ID. The ephemeral reply above names the
-                // channel for manual cleanup.
+                // Untracked evidence is never cleanup authority. Keep the
+                // private manual-cleanup reply unchanged even if SQL is down.
+                if store
+                    .record_creator_orphan(guild_id, channel_id)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        voice_event = "voice_orphan_ledger_write_failed",
+                        outcome = "unavailable",
+                        "could not persist voice orphan evidence"
+                    );
+                }
                 metrics::global().voice_orphan();
                 warn!(
                     voice_event = "voice_creator_orphan",
@@ -13363,6 +13421,36 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
             }
         }
     }
+}
+
+fn orphan_page_refusal() -> &'static str {
+    "Unknown page. Use /voice-orphans page:1 to see the first page."
+}
+
+fn render_orphan_evidence(guild: Snowflake, page: usize, evidence: &OrphanEvidencePage) -> String {
+    let total = evidence.total.div_ceil(ORPHAN_LEDGER_PAGE_SIZE).max(1);
+    let mut lines = vec![format!(
+        "Voice orphan evidence — guild {guild}\nPage {page} of {total}\nEvidence only; cleanup is a separate decision."
+    )];
+    for row in &evidence.rows {
+        let Ok(stamp) = row
+            .recorded_at
+            .format(&time::format_description::well_known::Rfc3339)
+        else {
+            return "Could not render voice orphan evidence. Try /voice-orphans page:1 again shortly.".to_owned();
+        };
+        lines.push(format!(
+            "- <#{}> — creator_compensation_failed — {stamp}",
+            row.channel_id
+        ));
+    }
+    if evidence.rows.is_empty() {
+        lines.push("No retained orphan evidence.".to_owned());
+    }
+    if page < total {
+        lines.push(format!("Next page: /voice-orphans page:{}", page + 1));
+    }
+    lines.join("\n")
 }
 
 /// Creation and required-role context, rendered on every `/access show` page.
@@ -13891,6 +13979,17 @@ where
         reply(ephemeral_response(&setup_shape_correction(command, field))).await;
         return true;
     }
+    // Evidence is staff-only even when the payload claims Administrator.
+    // Do this before the shared role gate constructs a store or reads SQL.
+    if matches!(command, VoiceCommand::Orphans { .. })
+        && !is_voice_admin(runtime.guild_permissions(interaction))
+    {
+        reply(ephemeral_response(
+            "You need Manage Channels to use /voice-orphans. If permissions are syncing, try again shortly.",
+        ))
+        .await;
+        return true;
+    }
     // Cold guild-role facts are not a permanent denial: a command that
     // needs that authority gets the retryable warming-up reply and fails
     // closed before any gate read or protected effect. Missing-member
@@ -14037,6 +14136,23 @@ where
                     reply(ephemeral_response(kick_refusal_text(&refusal))).await;
                 }
             }
+            true
+        }
+        VoiceCommand::Orphans { page } => {
+            let text = match page.number() {
+                Some(number) if number <= ORPHAN_LEDGER_CAP.div_ceil(ORPHAN_LEDGER_PAGE_SIZE) => {
+                    let (store, _) = runtime.make_pair();
+                    match store.orphan_evidence_page(guild_id, number).await {
+                        Ok(evidence) if number == 1 || !evidence.rows.is_empty() => {
+                            render_orphan_evidence(guild_id, number, &evidence)
+                        }
+                        Ok(_) => orphan_page_refusal().to_owned(),
+                        Err(_) => "Could not read voice orphan evidence. Try /voice-orphans page:1 again shortly.".to_owned(),
+                    }
+                }
+                _ => orphan_page_refusal().to_owned(),
+            };
+            reply(ephemeral_response(&text)).await;
             true
         }
         VoiceCommand::Setup { page } => {

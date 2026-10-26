@@ -30,9 +30,9 @@ Phases, in order:
 The 17 pinned voice names are the freeze-receipt publish order (create,
 setup, ping, invite, textchannels, access, reclaim, transfer, logging,
 export, import, position, group, inheritpermissions, defaultlimit,
-alwaysprivate, kick). The five newer room controls (name, private, public,
-limit, unlimit) ride along as extended surfaces so the harness stays
-accurate whether or not the pending registration includes them.
+alwaysprivate, kick). The newer room controls (name, private, public,
+limit, unlimit) and private staff evidence read (voice-orphans) ride along
+as extended surfaces, whether or not the pending registration includes them.
 
 Registration identity contract: the list is admitted for every targeted
 name before any resource is read: the name must appear on exactly one
@@ -91,7 +91,7 @@ VOICE_COMMANDS = (
     "group", "inheritpermissions", "defaultlimit", "alwaysprivate", "kick",
 )
 # Newer room controls present in the current source; reported separately.
-EXTENDED_COMMANDS = ("name", "private", "public", "limit", "unlimit")
+EXTENDED_COMMANDS = ("name", "private", "public", "limit", "unlimit", "voice-orphans")
 
 BODY_CAP = 64 << 10
 TIMEOUT_SECONDS = 10

@@ -44,6 +44,7 @@ pub const VOICE_COMMANDS: &[&str] = &[
     "textchannels",
     "transfer",
     "unlimit",
+    "voice-orphans",
 ];
 
 /// Guild-level controls for room commands. The creation flag is a global

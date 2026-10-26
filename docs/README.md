@@ -1,7 +1,7 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
-No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
+Manifest: `- [Purpose](relative.md)`. Check: `python3 scripts/check_docs_index.py --json`.
+PASS (0): no `{missing,stale,oversize}`; else 1. Index <12,000 bytes; others <=65,536 except LARGE_DOCS.
 
 ## References and architecture
 
@@ -17,7 +17,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [MCP tools](mcp.md)
 - [Token registry](admin-registry.md)
 
-## Operations and observability
+## Operations
 
 - [Operations and alerts](runbook.md)
 - [Observability triage](runbook-observability.md)
@@ -196,6 +196,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Presence facts](voice-presence.md)
 - [Occupancy experiment](voice-occupancy-curve.md)
 - [Delete guards](voice-delete-guards.md)
+- [Orphan evidence](voice-orphan-ledger.md)
 - [Health contract](voice-health-contract.md)
 - [Config codec](voice-config-codec.md)
 - [Config diff/review](voice-config-diff-core.md)
