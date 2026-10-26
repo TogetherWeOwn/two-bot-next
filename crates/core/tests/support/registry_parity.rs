@@ -444,6 +444,11 @@ pub fn expected_registry() -> Value {
                         CommandOptionType::Integer,
                     )
                     .int_range(0, 3650),
+                    CommandOption::new(
+                        "preview",
+                        "Privately preview without creating or reserving capacity",
+                        CommandOptionType::Boolean,
+                    ),
                 ]),
                 CommandOption::new("list", "List open giveaways", CommandOptionType::SubCommand),
                 CommandOption::new(
