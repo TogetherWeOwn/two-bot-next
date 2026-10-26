@@ -82,8 +82,8 @@ or API. No build/test card before accepted exact intent and CISO disposition.
     facts. Overwrite shape alone does not establish current member authority.
   - Only **Open**, bound and proven, with no pending close/recovery/uncertain
     work, permits set/clear, including queue reads of the label. Refuse for
-    Creating, Closing, CleanupPending, Closed, missing channel, ambiguous
-    creation or expired label. Serialize with real claim/close transitions
+    Creating, Closing, CleanupPending, Closed, missing channel or ambiguous
+    creation. Serialize with real claim/close transitions
     and re-read under the ticket lock. A stale claimant shown in a client is
     not authority.
   - For a missing/foreign/hidden/deleted case, nonparticipant or unprovable
