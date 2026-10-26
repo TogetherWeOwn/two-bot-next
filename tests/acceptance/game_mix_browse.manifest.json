@@ -1,34 +1,47 @@
 {
   "schemaVersion": 1,
-  "purpose": "Test-only RED-first game-mix browsing candidate; not an implementation and not eligible to merge into main.",
-  "baseCommit": "8c1dba5a9e9b485e57e70f3df1b29b02ad56e186",
-  "branch": "test/game-mix-browse-acceptance",
+  "purpose": "Test-only regression correction for implemented game-mix browsing; no production behavior changes and no separate product PR.",
+  "baseCommit": "2efc06d08790033795629a89e412b79151233cd3",
+  "branch": "test/game-mix-regression-boundaries",
   "protectedFiles": [
-    {"path": "crates/bot/src/game_mix_browse_acceptance_tests.rs", "sha256": "d8985d6706a419fdfa582b4b1639416adc9b94914232c521785b9d982f9cfe70", "tests": 15}
+    {"path": "crates/bot/src/game_mix_browse_acceptance_tests.rs", "sha256": "c2ed1a5c5f9e83ec0a3386bf4c499d78eed22cf1e8b99aea3f4b74e9b0a2878e", "tests": 16}
   ],
-  "registration": {"path": "crates/bot/src/command_runtime_tests.rs", "module": "game_mix_browse_acceptance_tests", "productionBehaviorChanged": false},
+  "correctionFiles": [
+    {"path": "crates/core/tests/game_activity_browse_render.rs", "sha256": "8f30895e50143e01ebc0f27ce59a1b04747dba5264398a7fd9b1ab7b5f6104b6", "tests": 6},
+    {"path": "tests/acceptance/game_mix_browse.manifest.json", "hashRecordedInHandoff": true}
+  ],
+  "registration": {"path": "crates/bot/src/command_runtime_tests.rs", "module": "game_mix_browse_acceptance_tests", "productionBehaviorChanged": false, "changed": false},
   "commands": {
+    "renderer": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test game_activity_browse_render -- --nocapture",
+    "runtimeAndLegacyControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot game_mix_ -- --nocapture --test-threads=1",
     "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot game_mix_browse_acceptance_tests -- --nocapture --test-threads=1",
     "unchangedRuntimeControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot game_mix_acceptance_tests -- --nocapture --test-threads=1",
     "unchangedContentControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot game_mix_content_acceptance_tests -- --nocapture --test-threads=1",
     "cliRendererControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test game_activity_report_render -- --nocapture",
     "cliProcessControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test game_activity_report_cli -- --nocapture --test-threads=1"
   },
-  "database": {"guard": "two_bot_testsupport::TestDatabase", "missingEnvironment": "Fails fixture setup, never reports skipped/zero-test work as RED.", "ciRoute": "check.yml workspace lib/bins unit step supplies the authorized disposable database and executes the registered module.", "effects": "Owned disposable databases and loopback Discord only; no staging/production access."},
+  "database": {"guard": "two_bot_testsupport::TestDatabase", "missingEnvironment": "Fails fixture setup, never reports skipped/zero-test work as RED.", "ciRoute": "check.yml workspace lib/bins unit step supplies the authorized disposable database and executes the registered module; the existing workspace integration step discovers the pure renderer suite.", "effects": "Owned disposable databases and loopback Discord only; no staging/production access."},
   "contract": {
-    "selectors": "Optional page integer with published finite positive bounds; sort play|voice; format json|summary. Ten complete rows per page except the last. Defaults: page 1, play, json.",
-    "compatibility": "Optionless JSON and the operator CLI remain unchanged. JSON metadata layout, prose layout, label-shortening algorithm and ascending/descending lexical full-tie direction are not pinned.",
-    "coverage": "0/1/10/12/13/105 rows; all pages; differing play/voice order; full ties; independent legacy golden; readable exact second durations including BIGINT hours; supplementary Unicode/control/fence/mention/escaping safety and whole-content UTF-16 budget; foreign guilds; malformed/duplicate/unknown/type-confused selectors; empty/out-of-range/outage distinction.",
-    "spies": "Volatile aggregate predicate with positive read control; empty set-returning member-table readers with a positive COUNT control; statement triggers plus a nontransactional sequence detect even zero-row/rolled-back writes; REST capture permits only private callback and optional original-message edit.",
-    "limits": "Tests use unchanged snapshots, not concurrent snapshot guarantees. No new date window or collector. Probe counts are not query-count or storage-reader-bound oracles.",
-    "greenIntegration": "Registry/help/reference and option decoder must agree. Older no-options picker pins describe the superseded selector surface, not an authorization to edit another protected handoff; coordinate a bounded oracle correction with its author if still protected. Keep all legacy data/authority/CLI controls. No production opt-in."
+    "selectors": "Optional page integer, inclusive range 1 through 10000; sort play|voice; format json|summary. Ten complete rows per page except the last. Defaults: page 1, play, json.",
+    "compatibility": "Optionless JSON and the operator CLI remain unchanged. JSON metadata layout, label-shortening algorithm and ascending/descending lexical full-tie direction are not pinned by the runtime acceptance module. Summary complete-row assertions bind labels to play, voice and session values.",
+    "coverage": "0/1/10/12/13/105 rows; all pages; differing play/voice order; primary ties with opposing secondary/title order in both sorts across the ten-row boundary; full ties; independent legacy golden; exact complete summary rows including BIGINT hours; inclusive page 9999/10000 decode and default selectors; page 10001 rejection before aggregate reads; supplementary Unicode/control/fence/mention/escaping safety and whole-content UTF-16 budget; foreign guilds; malformed/duplicate/unknown/type-confused selectors; empty/out-of-range/outage distinction.",
+    "spies": "Volatile aggregate predicate with positive read control, including page 10001; empty set-returning member-table readers with a positive COUNT control; statement triggers plus a nontransactional sequence detect even zero-row/rolled-back writes; REST capture permits only private callback and optional original-message edit.",
+    "limits": "Tests use unchanged snapshots, not concurrent snapshot guarantees. No new date window or collector. Probe counts are not query-count or storage-reader-bound oracles. Valid ceiling pages are decoder units, not 100000-row database fixtures.",
+    "mutationTargets": "Removing/reversing the secondary descending comparator; swapping summary play/voice formatter arguments; widening decoder page range to i32::MAX; making the upper bound exclusive; raising the shared 10000 constant. These are intended sensitivity targets, not claims of executed mutants.",
+    "greenIntegration": "Builder consumes this test-only correction in the existing product PR. Preserve all unrelated tests, legacy data/authority/CLI controls, and production refusal. No production opt-in. No changes to withdrawn findings."
   },
   "observed": {
-    "behavioralRed": "UNVERIFIED: hosted candidate bfb498100374 failed compilation with three E0308 fixture argument errors, not behavioral RED. Corrected set_guild inputs to Option<Id<GuildMarker>> without changing assertions. Corrected candidate local verification was refused before Cargo; compiled RED/control evidence still required.",
-    "runtime": {"exitCode": 75, "finding": "refused", "reason": "no idle, below-budget slot; no per-worktree fallback", "selectedTests": 0},
-    "cliRenderer": {"attempts": 2, "exitCode": 75, "selectedTests": 0},
-    "fastChecks": "PASS: cargo fmt --all -- --check; git diff --check; secret Debug guard and 23 fixtures; Docker dependency shape; 80 cache fixtures; soak checklist and 49 fixtures; 338 voice corpus validation cases and 22 fixtures; floor guard; test inventory; docs index.",
-    "notRun": "Rust workspace tests, clippy and CLI/runtime controls require admitted cache or hosted CI. No cache fallback used."
+    "renderer": {"exitCode": 75, "finding": "refused", "reason": "no idle, below-budget slot; no per-worktree fallback", "selectedTests": 0},
+    "runtimeAndLegacyControls": {"exitCode": 75, "finding": "refused", "reason": "no idle, below-budget slot; no per-worktree fallback", "selectedTests": 0},
+    "behavioralRed": "NOT RUN: cache admission refused before Cargo. This correction targets missing regression coverage in existing behavior, not a known product defect. No compiled RED/GREEN or mutant execution is claimed.",
+    "notRun": "Compiled renderer/runtime tests and legacy controls, Rust workspace tests, clippy, CLI controls and mutant execution require admitted cache or hosted CI. No cache fallback or source mutation used."
   },
-  "handoff": "Candidate only until an actual compiled behavior-specific RED and unchanged controls are observed. Builder remains blocked. Preserve protected bytes; return oracle defects to their author. Do not merge an intentionally failing test-only PR."
+  "provenance": {
+    "originalCandidateBase": "8c1dba5a9e9b485e57e70f3df1b29b02ad56e186",
+    "originalCandidateBranch": "test/game-mix-browse-acceptance",
+    "previousProtectedSha256": "d8985d6706a419fdfa582b4b1639416adc9b94914232c521785b9d982f9cfe70",
+    "previousProtectedTests": 15,
+    "originalCandidateEvidence": "The original candidate lacked verified behavioral RED: an early hosted candidate failed compilation with three fixture argument type errors; corrected candidate local verification was refused before Cargo. That historical evidence is not reused as verification for this correction."
+  },
+  "handoff": "One cherry-pickable test-only correction on the immutable product head. Builder owns integration, compiled and mutation verification, the single existing PR push and exact-head CI/review gates. Publication is not proof that these Rust tests pass."
 }
