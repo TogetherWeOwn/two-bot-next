@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/voice_orphan_ledger_acceptance_tests.rs",
-      "sha256": "513f7a8fcab04dddf2536094865c678bf171e38148286f6392286e6c90400f8f",
+      "sha256": "d10253de65dc1c2de702dbe051584f399a132c0be48ebf2ed94824933352d79d",
       "tests": 12,
       "observerTests": 3,
       "instruction": "Preserve byte-for-byte; corrections return to the test author, never implement or weaken the acceptance file."
