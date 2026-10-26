@@ -1,6 +1,6 @@
 //! LFG interaction handlers using the shared router, store and REST executor.
 
-use crate::{automation_admission::ActorCooldowns, ActionExecutor, DiscordError};
+use crate::{automation_admission::ActorCooldowns, ActionExecutor, CloseRefreshEdit, DiscordError};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use two_bot_core::lfg::{self, LfgPost, LfgRole, LfgSelectAction, LfgSignup, LfgStatus};
@@ -603,6 +603,10 @@ impl LfgInteractions {
     /// Process a bounded lifecycle batch for one configured guild. The jobs
     /// supervisor is the only production caller; row-local failures are logged
     /// without aborting later rows. The count includes failed row attempts.
+    /// Besides expiring open posts, each tick retries the durable
+    /// close-refresh intents that failed edits left behind: closed rows whose
+    /// pending flag is armed and whose backoff has elapsed share the same
+    /// 20-row cap and per-tick budget as expiry work.
     pub async fn sweep_lifecycle(
         &self,
         executor: &ActionExecutor,
@@ -622,13 +626,17 @@ impl LfgInteractions {
         let expired_before = now.saturating_sub(LFG_EXPIRY_GRACE);
         let orphan_before = now.saturating_sub(LFG_ORPHAN_AGE);
         let candidates: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM lfg_posts WHERE guild_id = $1 AND status = 'open'
-             AND (starts_at <= $2 OR (message_id IS NULL AND created_at <= $3))
-             ORDER BY created_at, id LIMIT $4",
+            "SELECT id FROM lfg_posts WHERE guild_id = $1
+             AND ((status = 'open'
+                   AND (starts_at <= $2 OR (message_id IS NULL AND created_at <= $3)))
+                  OR (status = 'closed' AND close_refresh_pending
+                      AND (close_refresh_next_at IS NULL OR close_refresh_next_at <= $4)))
+             ORDER BY created_at, id LIMIT $5",
         )
         .bind(guild_id)
         .bind(expired_before)
         .bind(orphan_before)
+        .bind(now)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
@@ -674,8 +682,8 @@ impl LfgInteractions {
         let Some(post) = store::get_lfg(&self.pool, guild_id, id).await? else {
             return Ok(false);
         };
-        if post.status != LfgStatus::Open {
-            return Ok(false);
+        if post.status == LfgStatus::Closed {
+            return self.repair_closed_row(executor, guild_id, &post, now).await;
         }
         let parse = |at: &str| {
             time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
@@ -714,6 +722,90 @@ impl LfgInteractions {
         Ok(true)
     }
 
+    /// Retry one durable close-message edit under the runtime lock already
+    /// held by [`Self::sweep_lifecycle_row`]. Repairs only the exact saved
+    /// message of a still-pending closed post: a confirmed edit or a
+    /// definitive Unknown Message outcome settles the intent, while any other
+    /// failure defers it with durable backoff. Never recreates a message,
+    /// sends, deletes or reopens. Returns `true` when an attempt ran.
+    async fn repair_closed_row(
+        &self,
+        executor: &ActionExecutor,
+        guild_id: &str,
+        post: &LfgPost,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, LfgError> {
+        // The candidate scan already filtered to pending, due rows; re-check
+        // under the held runtime lock so a concurrent repair cannot double-PATCH.
+        let state = store::get_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+        let eligible =
+            state.is_some_and(|state| state.pending && state.next_at.is_none_or(|due| due <= now));
+        if !eligible {
+            return Ok(false);
+        }
+        let attempts = state.map(|state| state.attempts).unwrap_or(0);
+        let Some(message_id) = post.message_id.as_deref() else {
+            // No saved message to repair: settle quietly without wire work.
+            // Uncertainty never authorizes a replacement send.
+            store::clear_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+            return Ok(false);
+        };
+        let roles = store::list_lfg_roles(&self.pool, &post.id).await?;
+        let signups = store::list_lfg_signups(&self.pool, &post.id).await?;
+        // Rebuilt from current saved state, never a stale open snapshot: a
+        // closed post always renders with its controls removed.
+        let payload = message_payload(post, &roles, &signups);
+        match executor
+            .edit_message_for_close_refresh(
+                &post.channel_id,
+                message_id,
+                payload["content"].as_str().unwrap_or_default(),
+                Self::payload_components(&payload),
+            )
+            .await
+        {
+            CloseRefreshEdit::Edited => {
+                store::clear_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+                tracing::info!(
+                    outcome = "repaired",
+                    post_id = %post.id,
+                    "lfg close repair removed stale controls"
+                );
+                Ok(true)
+            }
+            CloseRefreshEdit::UnknownMessage => {
+                store::clear_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+                tracing::info!(
+                    outcome = "settled_missing",
+                    error_class = "unknown_message",
+                    post_id = %post.id,
+                    "lfg close repair settled a deleted message without recreating it"
+                );
+                Ok(true)
+            }
+            CloseRefreshEdit::Retryable(error) => {
+                let attempts = attempts.saturating_add(1);
+                store::defer_lfg_close_refresh(
+                    &self.pool,
+                    guild_id,
+                    &post.id,
+                    attempts,
+                    now.saturating_add(close_refresh_backoff(attempts)),
+                )
+                .await?;
+                // Fixed-vocabulary classification only: never the error text
+                // (it can carry transport detail), member text or SQL.
+                tracing::warn!(
+                    outcome = "retry_scheduled",
+                    error_class = error.cause(),
+                    post_id = %post.id,
+                    "lfg close repair deferred; retry stays bounded"
+                );
+                Ok(true)
+            }
+        }
+    }
+
     async fn refresh(
         &self,
         executor: &ActionExecutor,
@@ -724,6 +816,10 @@ impl LfgInteractions {
             return Ok(());
         };
         let Some(message_id) = post.message_id.as_deref() else {
+            // A closed post with no saved message has nothing to repair.
+            if post.status == LfgStatus::Closed {
+                store::clear_lfg_close_refresh(&self.pool, guild_id, id).await?;
+            }
             return Ok(());
         };
         let roles = store::list_lfg_roles(&self.pool, id).await?;
@@ -737,6 +833,11 @@ impl LfgInteractions {
                 Self::payload_components(&payload),
             )
             .await?;
+        // A confirmed edit of a closed message satisfies any pending
+        // close-refresh intent armed by its close transition.
+        if post.status == LfgStatus::Closed {
+            store::clear_lfg_close_refresh(&self.pool, guild_id, id).await?;
+        }
         Ok(())
     }
 
@@ -779,6 +880,15 @@ impl LfgInteractions {
 // One callsite for both constant warnings keeps tracing metadata shared.
 fn lifecycle_warning(message: &'static str) {
     tracing::warn!(message = message);
+}
+
+/// Delay before the next close-refresh attempt after `attempts` recorded
+/// failures: 5 minutes doubling per attempt, capped at 6 hours. Same-tick
+/// restarts never hammer Discord; a day-separated tick is always eligible.
+fn close_refresh_backoff(attempts: i32) -> time::Duration {
+    let shift = (attempts.max(0) as u32).min(7);
+    let minutes = 5_i64.saturating_mul(1_i64 << shift);
+    time::Duration::minutes(minutes).min(time::Duration::hours(6))
 }
 
 /// Versioned, length-delimited request binding. Hashing keeps the audit reason
@@ -998,6 +1108,22 @@ mod tests {
                 "2"
             )
         );
+    }
+
+    #[test]
+    fn close_refresh_backoff_suppresses_same_tick_and_allows_next_day() {
+        assert_eq!(close_refresh_backoff(0), time::Duration::minutes(5));
+        assert_eq!(close_refresh_backoff(1), time::Duration::minutes(10));
+        assert_eq!(close_refresh_backoff(-3), time::Duration::minutes(5));
+        for attempts in 0..1000 {
+            let backoff = close_refresh_backoff(attempts);
+            assert!(backoff > time::Duration::ZERO, "same-tick retries wait");
+            assert!(
+                backoff <= time::Duration::hours(6),
+                "a day-later tick is eligible"
+            );
+        }
+        assert_eq!(close_refresh_backoff(1000), time::Duration::hours(6));
     }
 
     #[test]

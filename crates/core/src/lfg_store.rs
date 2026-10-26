@@ -489,7 +489,11 @@ pub async fn leave_lfg(pool: &sqlx::PgPool, id: &str, user_id: &str) -> Result<b
 }
 
 /// Close a post (legacy `closeLfg`): open-only update, so a second close
-/// reports `false` (`already_closed_or_missing`).
+/// reports `false` (`already_closed_or_missing`). A successful transition
+/// also arms the close-refresh retry state in the same statement, so a later
+/// failed PATCH or restart still leaves a durable repair intent behind; the
+/// lifecycle worker clears it only on a confirmed edit or a definitive
+/// Unknown Message outcome.
 pub async fn close_lfg(
     pool: &sqlx::PgPool,
     guild_id: &str,
@@ -502,7 +506,10 @@ pub async fn close_lfg(
         .execute(&mut *tx)
         .await?;
     let result = sqlx::query(
-        "UPDATE lfg_posts SET status = 'closed', closed_at = $1::timestamptz
+        "UPDATE lfg_posts
+         SET status = 'closed', closed_at = $1::timestamptz,
+             close_refresh_pending = TRUE, close_refresh_attempts = 0,
+             close_refresh_next_at = NULL
          WHERE guild_id = $2 AND id = $3 AND status = 'open'",
     )
     .bind(closed_at)
@@ -512,6 +519,85 @@ pub async fn close_lfg(
     .await?;
     tx.commit().await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Durable close-refresh retry state for one closed post: whether its
+/// close-message edit still needs a confirmed PATCH, how many attempts ran,
+/// and when the next attempt is eligible (`None` means now). Written only by
+/// close transitions and the lifecycle repair; historical rows predate the
+/// columns and read back not pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseRefreshState {
+    pub pending: bool,
+    pub attempts: i32,
+    pub next_at: Option<time::OffsetDateTime>,
+}
+
+/// Read the retry state for one fenced post; `None` when the post is missing
+/// or fenced to another guild.
+pub async fn get_lfg_close_refresh(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    id: &str,
+) -> Result<Option<CloseRefreshState>, sqlx::Error> {
+    let row: Option<(bool, i32, Option<time::OffsetDateTime>)> = sqlx::query_as(
+        "SELECT close_refresh_pending, close_refresh_attempts, close_refresh_next_at
+         FROM lfg_posts WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(pending, attempts, next_at)| CloseRefreshState {
+        pending,
+        attempts,
+        next_at,
+    }))
+}
+
+/// Clear the retry state after a confirmed edit, a definitive Unknown Message
+/// outcome, or when there is no saved message to repair. Never touches the
+/// closed status, roster or audit history.
+pub async fn clear_lfg_close_refresh(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE lfg_posts
+         SET close_refresh_pending = FALSE, close_refresh_attempts = 0,
+             close_refresh_next_at = NULL
+         WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Defer the next attempt after a retryable failure, recording the grown
+/// attempt count and the next eligible instant. The row stays pending and
+/// closed; only [`clear_lfg_close_refresh`] settles it.
+pub async fn defer_lfg_close_refresh(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    id: &str,
+    attempts: i32,
+    next_at: time::OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE lfg_posts
+         SET close_refresh_attempts = $3, close_refresh_next_at = $4
+         WHERE guild_id = $1 AND id = $2 AND close_refresh_pending",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .bind(attempts)
+    .bind(next_at)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
