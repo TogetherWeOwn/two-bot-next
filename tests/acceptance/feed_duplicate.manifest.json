@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/feed_duplicate_acceptance_tests.rs",
-      "sha256": "d9a4f5aa5dc40172270749af7e337584f3395fd5f4aa823cf6563f00792052b1",
+      "sha256": "9255dd1569b6af3e679526b3f20ec1179ef4b271f213e22f72abba0ba2c94d73",
       "tests": 16
     }
   ],

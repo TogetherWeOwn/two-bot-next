@@ -53,7 +53,7 @@ fn add(kind: &str, source: &str, channel: &str) -> Interaction {
     })).expect("synthetic slash interaction")
 }
 
-fn runtime(pool: &PgPool, mock: &MockRest) -> CommandRuntime {
+fn runtime(pool: &PgPool, mock: &MockRest) -> std::sync::Arc<CommandRuntime> {
     CommandRuntime::new(
         pool.clone(),
         executor(mock),
