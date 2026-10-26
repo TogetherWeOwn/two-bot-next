@@ -136,6 +136,26 @@ remaining gateway/accepted-prefix work:
    inspectable. Unknown, other-guild-only and deleted names share one truthful
    miss pointing at `/command-list`; lookup outages reuse the fixed
    availability reply below.
+
+   To check proposed text before saving or replacing a response, use
+   `/command-inspect draft:Hello {username}` instead of a saved `name`.
+   Pass exactly one of `name` or `draft`; missing input, both inputs, duplicate
+   options, unknown options and non-text values refuse before any lookup.
+   Drafts default to preview; explicit `view:preview` is equivalent, while
+   `view:summary` and `view:template` require saved-name mode. The proposed
+   template must be 1–2000 UTF-16 units and uses only `{user}`, `{username}`,
+   `{server}` and `{channel}` with the same single-pass invocation context as
+   saved previews. Optional `arguments` remain ignored — no `{args}` or
+   second interpolation pass. The private response starts **Draft preview —
+   not saved or published**. Markdown escaping and empty allowed mentions keep
+   hostile text inert; framing-only truncation is explicit, but invalid
+   placeholders and expanded output over 2000 units refuse with a correction.
+   Missing context is reported separately. Draft mode works without storage
+   and never reads/writes saved commands, republishes registration, sends to a
+   channel, records audit facts, matches triggers or consumes cooldowns/claims.
+   It cannot overwrite or enable anything. Saving later is a distinct
+   `/command name:<name> template:<text>` invocation with fresh checks; a
+   preview is not permission or a guarantee that the later save will succeed.
 9. `/command-disable name:<name>` pauses one saved definition and
    `/command-enable name:<name>` resumes it, without deleting anything.
    Both take exactly one text `name` (a forged type, a duplicate or any
