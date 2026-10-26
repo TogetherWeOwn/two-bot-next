@@ -1,10 +1,10 @@
 # Documentation map
 
 Rows: `- [Purpose](relative.md)` by area.
-`python3 scripts/check_docs_index.py --json` (repo root):
-empty `{missing,stale,oversize}` = PASS (exit 0), else exit 1.
-Stale: bad/duplicate rows as `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; `LARGE_DOCS` exceptions.
+`python3 scripts/check_docs_index.py --json` (root):
+empty `{missing,stale,oversize}` = PASS (exit 0), else 1.
+Stale: bad/dup rows as `docs/README.md:<line>`.
+Budgets: index <12,000; others ≤65,536; except `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -106,7 +106,7 @@ Budgets: index <12,000; others ≤65,536; `LARGE_DOCS` exceptions.
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
-- [Giveaway self-check design](giveaway-self-check-spec.md)
+- [Giveaway self-check](giveaway-self-check-spec.md)
 - [Community jobs](community-jobs.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey](member-journey-parity.md)
