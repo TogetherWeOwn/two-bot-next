@@ -37,7 +37,7 @@ scope. Silence is **unknown**, never absence or a reason to remove a signup.
 
 ## 2. Source map: observed baseline, not future capabilities
 
-Inspected source: `5db6ecccd7c67202ecea6d76f9ae65ceab2e3654`. Source inspection
+Inspected source: `fb11f134ac002a8a6fa6e9982c7b1de03734fbb1`. Source inspection
 only; no deployment, message, live member list or database was inspected.
 
 | Seam | Evidence and limit |
