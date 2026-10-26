@@ -48,10 +48,11 @@ transfer a claim, repair ACLs, move a channel or alter transcript capture.
 degenerates to one form, and B adds no multi-panel provisioning.
 
 Discord modal limits below are external API constraints the design must respect
-(title <=45 chars, custom_id <=100 chars, at most 5 text-input components per
+(title <=45 chars, custom_id <=100 chars, at most 5 input components per
 modal, text input max_length 1-4000); they are not TWO measurements. A Discord
-modal carries **only text inputs** (short/paragraph): there is no native select,
-so B's "choice" is a short-text answer validated against the option list.
+modal can carry text inputs (short/paragraph) and select menus inside Label
+components. B uses a short-text answer validated against the option list as a
+product decision, not as an API limit.
 
 ## Conditional B: form definition contract
 
@@ -60,10 +61,13 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
 
 - **Scope:** at most one form per panel identity (today: the single panel
   channel), at most **5 questions** per form (modal cap), each with a stable
-  staff-chosen question ID (slug, `^[a-z0-9-]{1,32}$`), a label (1-45 chars),
-  a kind (`short` | `paragraph` | `choice`), a required flag, and length bounds
-  (`min_length` 0-4000, `max_length` 1-4000; paragraph `max_length` <=1000).
-  A `choice` adds 2-10 options, each 1-100 chars, unique after NFC+trim.
+  staff-chosen question ID (slug, `^[a-z0-9-]{1,32}$`, unique within the form),
+  a label (1-45 chars), a kind (`short` | `paragraph` | `choice`), a required flag,
+  and length bounds (`min_length` 0-4000, `max_length` 1-4000, and
+  `min_length` <= `max_length`; paragraph `max_length` <=1000).
+  A `choice` adds 2-10 options, each 1-100 chars, unique after NFC+trim, each
+  option length within [`min_length`, `max_length`], and the ` / `-joined option
+  list fitting the 100-char hint budget so members can discover the options.
 - **Staff-only authoring:** create/edit/disable a form or question only with
   current Claim/Close-grade authority (current configured staff role OR
   ManageChannels OR Administrator), current guild membership, and the
@@ -71,11 +75,20 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
   identity, past staff status, a service MAC, supplied actor ID or knowing a
   panel ID grants nothing. Members never author, edit, disable or preview the
   definition; they only see the runtime modal.
+- **Definition validation:** authoring/enable-time validation refuses a form with
+  duplicate question IDs, `min_length` > `max_length`, a `choice` option outside
+  [`min_length`, `max_length`], or a `choice` option list that cannot be rendered
+  within member-visible modal text (joined options exceed the hint budget).
+  Refusal increments no version and changes no enabled form.
 - **Versioning:** each panel form carries a monotonically increasing version
-  (including disable/clear). Modal `custom_id` binds panel identity + form
-  version + operation nonce. A submit against a superseded version refuses with
-  re-open guidance; fields are never merged across versions and no partial
-  ticket is created.
+  (including disable/clear, decimal 1-10 chars). Modal `custom_id` binds panel
+  identity + form version + operation nonce with canonical encoding
+  `tofv1:<panel>:<ver>:<nonce>` where `<panel>` is `single` or a snowflake
+  (1-20 chars), `<ver>` is the decimal version (1-10 chars), `<nonce>` is 16
+  lowercase hex chars, and separators are literal `:`; the composed ID is at
+  most 54 chars and always within the 100-char limit. A submit against a
+  superseded version refuses with re-open guidance; fields are never merged
+  across versions and no partial ticket is created.
 - **Disabled/empty form:** a panel with no enabled form, or an enabled form
   with zero questions, opens exactly as today (channel + rate limit only).
   Disabling a form never deletes already-posted answers from channels or
@@ -87,7 +100,7 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
 ## Conditional B: modal intake contract
 
 - **Order:** Open button -> eligibility pre-check -> modal -> member fills ->
-  submit admission -> reserve/create/answers message. The modal opens only from
+  submit admission -> reserve/create/Controls/answers message. The modal opens only from
   the panel Open control in the configured guild; no direct modal URL or
   arbitrary-guild entry.
 - **Close-without-submit creates nothing:** dismiss, timeout, failed pre-check
@@ -101,9 +114,10 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
   ineligible mid-fill gets the standard refusal copy and nothing is created.
   Advisory open never reserves or extends a cooldown.
 - **Submit validation:** NFC-normalize, trim ASCII space at both ends, then
-  enforce required (non-empty after trim), `min_length`/`max_length` in Unicode
-  scalars, and for `choice` an exact post-normalization match against one
-  option (case-sensitive; no fuzzy match, no prefix match). Reject controls,
+  enforce required (non-empty after trim). For a non-empty answer, enforce
+  `min_length`/`max_length` in Unicode scalars; an empty optional answer skips
+  the length bounds. For `choice`, require an exact post-normalization match
+  against one option (case-sensitive; no fuzzy match, no prefix match). Reject controls,
   bidi/zero-width formatting, line/paragraph separators in `short`/`choice`
   (paragraph keeps single newlines, no other category C). Invalid submit ->
   private error naming the question label only, zero creation effects, modal
@@ -116,12 +130,15 @@ modal or API. No build/test card before accepted exact intent and CISO dispositi
 
 ## Answers-attached contract
 
-- **What lands where:** on successful creation only, the bot posts exactly one
-  answers message in the new ticket channel, before the Controls message, as
-  inert plain text (question label + answer, each pair separated; labels escaped,
-  answers rendered with directional isolation, no embeds). Closed
-  `allowed_mentions` on that post (empty parse/users/roles, replied_user=false).
-  Mention syntax stored in an answer cannot ping from this message.
+- **What lands where:** on successful creation only, after the Controls message
+  posts (the commit point), the bot posts exactly one answers message in the new
+  ticket channel, as inert plain text (question label + answer, each pair
+  separated; labels escaped, answers rendered with directional isolation, no
+  embeds). Creation commits when the Controls post succeeds; the answers post is
+  post-commit. If the Controls post fails, the open rolls back as today with no
+  answers message. Closed `allowed_mentions` on the answers post (empty
+  parse/users/roles, replied_user=false). Mention syntax stored in an answer
+  cannot ping from this message.
 - **Transcript interplay:** answers are captured only through the existing
   channel-message capture path; B adds no transcript writer, column or format
   change. Transcript retention stays the existing 90-day ceiling; no separate
@@ -174,7 +191,8 @@ missing/foreign/hidden/deleted case or a nonparticipant, return the same
 | Double submit, same nonce | Receipt replay; at most one ticket |
 | Double submit, distinct nonces | Reserve race; loser gets existing-ticket copy |
 | Channel create fails after reserve | Existing abandon/recovery path unchanged; answers message never posts without a bound channel |
-| Answers post fails after activate | Ticket stays open (creation already committed); record bounded failure token, no retry loop that duplicates the message; staff triage in-channel as today |
+| Controls post fails (before answers post) | Existing rollback applies (queue open rollback, cleanup); no answers message posts; member must re-open |
+| Answers post fails after Controls (post-commit) | Ticket stays open (creation committed at Controls success); record bounded failure token, no retry loop that duplicates the message; staff triage in-channel as today; Controls is never re-posted |
 | Close races submit admission | Admission under store serialization wins or refuses; no ticket created into Closing/CleanupPending/Closed |
 | Config (category/staff/panel) changes mid-intake | Submit re-reads live config; proof failure refuses like today |
 | Member erasure after open | Existing transcript/opener selectors apply; no separate answer purge path exists |
@@ -185,10 +203,14 @@ missing/foreign/hidden/deleted case or a nonparticipant, return the same
   zero retained answer text, zero modal/version machinery. Choose A unless
   intent + CISO gates pass.
 - **B. Conditional text-modal forms (smallest useful):** as specified above.
-  Single form per panel, <=5 text questions, no new store.
+  Single form per panel, <=5 questions (short/paragraph/validated-text choice),
+  no new store.
 - **C1. Native select pre-step:** a select-menu step before/alongside the modal
   for choice questions. Rejected for B: two-interaction flow, component-state
   expiry, and custom-id state budget, for value unproven over validated text.
+  In-modal selects (now API-allowed) are likewise not used by B; B keeps
+  validated short-text as a product decision to preserve the single-modal flow
+  and hint-based option rendering.
 - **C2. Durable answers table:** queryable Q/A rows with own retention/erasure.
   Rejected for B: a new PII store, erasure inventory entries, backup/restore
   non-resurrection proof and access grants, with no demonstrated need beyond
@@ -216,10 +238,11 @@ Each slice needs its own exact-scope card; none is authorized by this design.
 ## Agent contract and runnable offline decision mock
 
 No new endpoint or CLI flag exists. Proposed bounded request: schema, string IDs
-(guild/panel/actor/operation/form_version), action open/submit, answers only for
-submit (question ID -> text), and strict Boolean dry_run. Reject unknown
-fields/actions, bad IDs, non-Boolean/missing dry_run and >8192-byte request
-before dispatch. Replies <=2048 UTF-8 bytes have
+(guild/panel/actor snowflakes 1-20 chars, operation 16 hex chars, form_version
+decimal 1-10 chars), action open/submit, answers only for submit (question ID ->
+text), and strict Boolean dry_run. Reject unknown fields/actions, bad IDs,
+non-Boolean/missing dry_run and >8192-byte request before dispatch.
+Replies <=2048 UTF-8 bytes have
 `schema,operation_id,outcome,error_code,next_action,created,answers_posted`;
 IDs/version and per-question flags appear only after successful proof. No raw
 request serialization in observability.
@@ -235,11 +258,11 @@ use the seven-field envelope above, including on refusal.
 
 ```pycon
 >>> import json, pathlib, re, unicodedata
->>> def valid_answer(raw, *, kind="short", required=True, max_len=500):
+>>> def valid_answer(raw, *, kind="short", required=True, min_len=0, max_len=500):
 ...     text = unicodedata.normalize("NFC", raw).strip(" ")
 ...     if not text:
 ...         return not required
-...     if len(text) > max_len:
+...     if len(text) < min_len or len(text) > max_len:
 ...         return False
 ...     if kind in {"short", "choice"}:
 ...         return not any(unicodedata.category(c).startswith("C") or ord(c) in (8232, 8233) for c in text)
@@ -247,6 +270,19 @@ use the seven-field envelope above, including on refusal.
 >>> def choice_match(raw, options):
 ...     text = unicodedata.normalize("NFC", raw).strip(" ")
 ...     return text in options
+>>> def valid_definition(*, question_ids, min_len=0, max_len=500, options=None):
+...     if len(question_ids) != len(set(question_ids)):
+...         return False
+...     if min_len > max_len:
+...         return False
+...     if options is not None:
+...         if not (2 <= len(options) <= 10):
+...             return False
+...         if any(not (min_len <= len(o) <= max_len) for o in options):
+...             return False
+...         if len(" / ".join(options)) > 100:
+...             return False
+...     return True
 >>> def decide(*, eligible=True, version="7", submitted="7", enabled=True, action="submit", answers_ok=True, dry_run=True):
 ...     if action not in {"open", "submit"} or type(dry_run) is not bool:
 ...         return {"outcome":"refused", "error_code":"INVALID_REQUEST", "next_action":"fix_request"}
@@ -269,13 +305,20 @@ use the seven-field envelope above, including on refusal.
 >>> assert all(not valid_answer(s) for s in ["", " " * 5, "x" * 501, "a\nb", "a\tb", "a" + chr(8238) + "b"])
 >>> assert valid_answer("", required=False) and valid_answer("ok", required=True)
 >>> assert valid_answer("a\nb", kind="paragraph") and not valid_answer("a\nb", kind="short")
+>>> assert not valid_answer("hi", min_len=5) and valid_answer("hello", min_len=5)
+>>> assert valid_answer("", required=False, min_len=5) and not valid_answer("", required=True, min_len=5)
 >>> assert choice_match("Billing", ["Billing", "Appeal"]) and not choice_match("billing", ["Billing", "Appeal"])
 >>> assert not choice_match(" Bill", ["Billing", "Appeal"]) and choice_match(" Billing ", ["Billing", "Appeal"])
+>>> assert not valid_definition(question_ids=["a", "a"])
+>>> assert not valid_definition(question_ids=["a"], min_len=10, max_len=5)
+>>> assert not valid_definition(question_ids=["a"], min_len=0, max_len=3, options=["Billing", "Appeal"])
+>>> assert not valid_definition(question_ids=["a"], options=["x" * 60, "y" * 60])
+>>> assert valid_definition(question_ids=["a", "b"], min_len=0, max_len=100, options=["Billing", "Appeal"])
 >>> text = pathlib.Path("docs/ticket-open-forms-spec.md").read_text()
 >>> cases = re.findall(r"^\| (TF-F\d{2}) ", text, re.M)
->>> assert cases == [f"TF-F{i:02}" for i in range(1, 17)]
+>>> assert cases == [f"TF-F{i:02}" for i in range(1, 18)]
 >>> print(json.dumps({"schema":"ticket.open_forms.mock.v1", "matrix_rows":len(cases), "outcome":"offline_examples_pass", "created":False, "answers_posted":False}, sort_keys=True))
-{"answers_posted": false, "created": false, "matrix_rows": 16, "outcome": "offline_examples_pass", "schema": "ticket.open_forms.mock.v1"}
+{"answers_posted": false, "created": false, "matrix_rows": 17, "outcome": "offline_examples_pass", "schema": "ticket.open_forms.mock.v1"}
 
 ```
 
@@ -301,22 +344,23 @@ live private-case collection. Timing limits are acceptance targets, not SLAs.
 
 | Case | Given / when / then oracle |
 | --- | --- |
-| TF-F01 | Given enabled 5-question form, when eligible member opens and submits valid answers, then one ticket, one answers message before Controls, one audit row without text; no extra posts. |
+| TF-F01 | Given enabled 5-question form, when eligible member opens and submits valid answers, then one ticket, Controls posts first (commit), one answers message after Controls, one audit row without text; no extra posts. |
 | TF-F02 | Given required/optional mix, when optional left blank, then creation proceeds with skipped flag; blank required refuses with per-question error and zero effects. |
 | TF-F03 | Given min/max bounds and choice options, when answers at 1/max/max+1 and option/non-option/case-variant submitted, then exact bounds above; no truncation, echo, mention firing or unsafe render. |
-| TF-F04 | Given staff authoring, when current staff creates/edits/disables, then version increments and modal shape changes; member/opener/claimant-alone/past-staff/forged actor can never author or view the definition. |
+| TF-F04 | Given staff authoring, when current staff creates/edits/disables, then version increments and modal shape changes; member/opener/claimant-alone/past-staff/forged actor can never author or view the definition; duplicate IDs, min>max, choice option outside [min,max], or unrenderable option list refuses with zero version increment. |
 | TF-F05 | Given modal opened, when dismissed/expired or pre-check fails, then zero ticket row, message, audit, cooldown or quota effect; re-open starts fresh. |
 | TF-F06 | Given overlong/empty-required/invalid-choice submit, when submitted, then private per-question error, nothing created, cooldown unconsumed; valid answers may be re-presented client-side only. |
 | TF-F07 | Given form edited or disabled mid-intake, when stale-version submit arrives, then version-mismatch refusal with re-open guidance; no partial creation or cross-version field merge. |
 | TF-F08 | Given existing active ticket or active cooldown at open or submit, when intake attempted, then standard existing/cooldown copy; modal open never reserves or extends cooldown. |
 | TF-F09 | Given double submit with same nonce, when replayed, then receipt replay with at most one ticket; distinct nonces race through reserve and loser gets existing-ticket copy. |
 | TF-F10 | Given channel-create failure after reserve, when creation fails, then existing abandon/recovery applies and no answers message posts without a bound channel. |
-| TF-F11 | Given answers-post failure after activate, when post fails, then ticket stays open with one bounded failure token; no retry loop duplicates the message. |
+| TF-F11 | Given answers-post failure after Controls (post-commit), when post fails, then ticket stays open with one bounded failure token; no retry loop duplicates the message; Controls is not re-posted. |
 | TF-F12 | Given close admission racing submit, when both commit, then store serialization admits one outcome; no ticket is created into Closing/CleanupPending/Closed and no close is corrupted. |
 | TF-F13 | Given prior ticket closed with answers, when member opens again, then current form presented fresh; no prefill, carryover or resurrection of prior answers. |
 | TF-F14 | Given close, 90-day transcript ceiling, opener/claimant erasure or restore, when reading/replaying, then answers follow existing transcript retention/erasure exactly; no separate answer purge path. |
 | TF-F15 | Given answers posted, when inspecting audit/metrics/logs/traces/SQL errors, then question IDs, versions, flags and counts only; no raw text, length, hash, option text or remote body anywhere. |
 | TF-F16 | Given local dry-run, malformed JSON/unknown fields/flags or oversized request, when invoked, then deterministic bounded error/next_action and zero network/SQL/nonce/cooldown/audit effects. |
+| TF-F17 | Given Controls-post failure before answers post, when post fails, then existing rollback applies with no answers message; member must re-open; no partial ticket remains. |
 
 Existing reusable mocks/tests: [shared recording transport](../crates/discord/tests/common/mod.rs#L381-L448),
 [receipt acceptance](../crates/discord/tests/ticket_creation_receipt_acceptance.rs#L22-L150),
@@ -339,8 +383,9 @@ acceptance. Use native review/approval stages; no routine owner click-gate.
 Any spec revision invalidates earlier acceptance; no timeout approval.
 
 CEO/host decision: keep A, or substantiate B's triage-saving use case and accept
-single-form-per-panel scope, text-only modal limits, <=5 questions, validated
-choice, answers-in-channel retention, and no member authoring or prefill.
+single-form-per-panel scope, <=5 questions, validated-text choice (product
+decision; in-modal selects API-allowed but unused), answers-in-channel retention,
+and no member authoring or prefill.
 
 CISO decision: staff-only authoring proof, member definition invisibility,
 version-mismatch refusal, answer PII/recipient limits and residual disclosure
@@ -350,7 +395,7 @@ boundaries require this disposition; existing grants, activation and secret
 fences remain untouched. Missing proof or rejected privacy/usefulness at review
 means A/no-build, not weakened permissions.
 
-Metric: all 16 oracles and three option decisions have an explicit disposition by
+Metric: all 17 oracles and three option decisions have an explicit disposition by
 2026-11-02; no live experiment, benefit or performance result is claimed. Unverified:
 actual guild objects/permissions, deployed ticket activation, runtime behavior of
 B (absent), modal UX, answer storage/erasure beyond transcript behavior, and usable
