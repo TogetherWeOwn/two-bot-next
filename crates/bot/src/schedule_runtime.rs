@@ -468,8 +468,10 @@ pub(crate) async fn schedule_list(
                         &row.next_run_at,
                         row.interval_seconds,
                         row.enabled,
-                        row.claim_token.is_some() || row.claimed_at.is_some(),
-                        row.delivery_uncertain,
+                        DeliveryHold::from_facts(
+                            row.claim_token.is_some() || row.claimed_at.is_some(),
+                            row.delivery_uncertain,
+                        ),
                     )
                 })
                 .collect();
@@ -526,8 +528,11 @@ pub(crate) async fn schedule_list(
                                             &row.next_run_at,
                                             row.interval_seconds,
                                             row.enabled,
-                                            row.claim_token.is_some() || row.claimed_at.is_some(),
-                                            row.delivery_uncertain,
+                                            DeliveryHold::from_facts(
+                                                row.claim_token.is_some()
+                                                    || row.claimed_at.is_some(),
+                                                row.delivery_uncertain,
+                                            ),
                                         )
                                     })
                                     .collect();
@@ -780,6 +785,28 @@ fn render_schedule_preview(
     format!("{head}{shown}{foot}")
 }
 
+/// Delivery hold observed on one stored row, with precedence resolved at
+/// construction: delivery-fenced beats claimed, so a row carrying both
+/// facts renders its fence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeliveryHold {
+    None,
+    Claimed,
+    Fenced,
+}
+
+impl DeliveryHold {
+    fn from_facts(claimed: bool, delivery_uncertain: bool) -> Self {
+        if delivery_uncertain {
+            Self::Fenced
+        } else if claimed {
+            Self::Claimed
+        } else {
+            Self::None
+        }
+    }
+}
+
 /// Render one list row with the delivery facts the store just read, before
 /// whole-row packing. State precedence is deterministic: delivery-fenced
 /// beats claimed, and both stay visible on disabled or restored rows (the
@@ -789,24 +816,21 @@ fn render_schedule_preview(
 /// hint; ordinary disabled rows still carry none. The snapshot wording on
 /// hold rows names the observation and a safe next action without exposing
 /// the claim token, occurrence nonce or body.
-#[allow(clippy::too_many_arguments)]
 fn schedule_list_line_localized(
     id: &str,
     channel_id: &str,
     next_run_at: &str,
     interval_seconds: Option<i64>,
     enabled: bool,
-    claimed: bool,
-    delivery_uncertain: bool,
+    hold: DeliveryHold,
 ) -> String {
     let channel = safe_channel_ref(channel_id);
     let mut line = schedule_list_line(id, &channel, next_run_at, interval_seconds, enabled);
-    if delivery_uncertain {
-        line.push_str(SCHEDULE_FENCED_SNAPSHOT);
-    } else if claimed {
-        line.push_str(&schedule_claimed_snapshot(next_run_at));
-    } else if enabled {
-        line.push_str(&schedule_delivery_hint(next_run_at));
+    match hold {
+        DeliveryHold::Fenced => line.push_str(SCHEDULE_FENCED_SNAPSHOT),
+        DeliveryHold::Claimed => line.push_str(&schedule_claimed_snapshot(next_run_at)),
+        DeliveryHold::None if enabled => line.push_str(&schedule_delivery_hint(next_run_at)),
+        DeliveryHold::None => {}
     }
     line
 }
@@ -1134,8 +1158,7 @@ mod tests {
             "2030-01-01T00:00:00.000Z",
             Some(3600),
             false,
-            false,
-            true,
+            DeliveryHold::Fenced,
         );
         assert!(line.contains("(disabled)"), "{line}");
         assert!(line.contains("delivery-fenced"), "{line}");
@@ -1145,8 +1168,14 @@ mod tests {
 
     #[test]
     fn claimed_row_labels_lease_horizon_and_unparsable_time_stays_clean() {
-        let line =
-            schedule_list_line_localized("row-1", "3333", "not-a-time", None, true, true, false);
+        let line = schedule_list_line_localized(
+            "row-1",
+            "3333",
+            "not-a-time",
+            None,
+            true,
+            DeliveryHold::Claimed,
+        );
         assert!(line.contains("claimed (lease held)"), "{line}");
         assert!(
             line.contains("does not prove a worker is running"),
@@ -1158,8 +1187,14 @@ mod tests {
 
     #[test]
     fn ordinary_row_with_unparsable_time_keeps_single_spaced_hint() {
-        let line =
-            schedule_list_line_localized("row-1", "3333", "not-a-time", None, true, false, false);
+        let line = schedule_list_line_localized(
+            "row-1",
+            "3333",
+            "not-a-time",
+            None,
+            true,
+            DeliveryHold::None,
+        );
         assert!(
             line.ends_with(" The 15s ticker and delivery may be delayed."),
             "{line}"
@@ -1177,8 +1212,7 @@ mod tests {
             "2030-01-01T00:00:00.000Z",
             None,
             true,
-            false,
-            false,
+            DeliveryHold::None,
         );
         assert_eq!(line.lines().count(), 1, "{line}");
         assert!(!line.contains("@everyone"), "{line}");
