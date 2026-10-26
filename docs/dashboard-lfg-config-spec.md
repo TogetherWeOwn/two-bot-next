@@ -19,7 +19,7 @@ and the lifecycle sweep can close a post between a dashboard read and a
 dashboard write.
 
 **Recommend read-first, not a post editor over today's verbs.** Inventory
-at source commit `5e870a8251b3382c7b2f7f72c97f785a6710238e` finds four
+at source commit `d2a4274c6462595fa723ea33167fa1e233f406db` finds four
 shipped organizer operations, but no guild configuration, no signed LFG
 verb or revision/CAS column. Writes use advisory locks, and metadata
 edit also takes a row lock (`lfg_store.rs:166`); neither supplies a stale
@@ -42,12 +42,12 @@ needs a new verb (LG-W1/LG-W3).
 
 | Shipped op and source | Permission and gates | Store, audit and consumer | Proposed page state |
 | --- | --- | --- | --- |
-| `/lfg` create (`crates/core/src/feature_commands.rs:455-479`): title, future-only starts-at, role spec, preview flag | Manage Events (`crates/core/src/commands.rs:287`) + Announcements row gate (`crates/core/src/router.rs:734-738`) + configured-guild fence; quota 20 open posts per guild (`crates/core/src/automation_quota.rs:9-16`) | `put_lfg` upsert with guild fence and quota lock (`crates/core/src/lfg_store.rs:54-138`); audit `lfg.create`/`posted`; Discord post with signup Select; nonce recovery; `delete_lfg` cascade only on failed-post cleanup (`:420-431`) | `not_exposed`: create needs quota/nonce/Discord post; stays slash-only |
-| `/lfg-close` (`feature_commands.rs:480-488`): post id | Same Manage Events + Announcements + guild gates (`router.rs:739-743`) | `close_lfg` open-only update, signups and roles retained (`lfg_store.rs:578-600`); audit `lfg.close`/`closed` or `already_closed_or_missing`; refresh removes the Select (`crates/discord/src/lfg_interactions.rs:784-808`); reply `LFG closed.` / `LFG was already closed or missing.` (`crates/core/src/lfg.rs:691-699`) | `gated_write` after LG-W2 through LG-W4; dry-run plus explicit confirm |
+| `/lfg` create (`crates/core/src/feature_commands.rs:455-479`): title, future-only starts-at, role spec, preview flag | Manage Events (`crates/core/src/commands.rs:287`) + Announcements row gate (`crates/core/src/router.rs:734-738`) + configured-guild fence; quota 20 open posts per guild (`crates/core/src/automation_quota.rs:9-16`) | `put_lfg` upsert with guild fence and quota lock (`crates/core/src/lfg_store.rs:54-138`); audit `lfg.create`/`posted`; Discord post with signup Select; nonce recovery; `delete_lfg` cascade only on failed-post cleanup (`:436-447`) | `not_exposed`: create needs quota/nonce/Discord post; stays slash-only |
+| `/lfg-close` (`feature_commands.rs:480-488`): post id | Same Manage Events + Announcements + guild gates (`router.rs:739-743`) | `close_lfg` open-only update, signups and roles retained, durable close-refresh intent armed (`lfg_store.rs:598-623`); audit `lfg.close`/`closed` or `already_closed_or_missing`; refresh removes the Select on success (`crates/discord/src/lfg_interactions.rs:876-909`), otherwise the sweep repairs pending closed rows; reply `LFG closed.` / `LFG was already closed or missing.` (`crates/core/src/lfg.rs:691-699`) | `gated_write` after LG-W2 through LG-W4; dry-run plus explicit confirm |
 | `/lfg-edit` (`feature_commands.rs:489-521`): post id plus title and/or starts-at, or role+seats together to increase one existing role's seats (never mixed with metadata; `crates/discord/src/interactions.rs:296-337`) | Same gates (`router.rs:744-748`); at least one metadata field (`lfg_interactions.rs:423-430`) or a complete role+seats pair | Metadata: `edit_lfg_metadata` under advisory + row lock; Missing/Closed/Unchanged/Updated; roles/signups/ids preserved; never reopens (`lfg_store.rs:153-203`); audit `lfg.edit`/`updated`; no-op writes nothing (`lfg_interactions.rs:467-470`). Seats: `increase_lfg_seats` is increase-only, refuses started/shrink/missing-role, and commits its `lfg.edit.seats` audit in the capacity transaction (`lfg_store.rs:207-288`) | `gated_write` metadata only after LG-W2 through LG-W4; signup preservation is the confirm copy; seat increase stays slash-only |
-| `/lfg-list` (`feature_commands.rs:522-532`): optional cursor | Same gates (`router.rs:749-753`); current channel only; no pause gate exists on this path | `list_lfg_channel`: open + confirmed canonical message id, keyset order, no signup/role/member columns (`lfg_store.rs:376-415`); cursor MAC-bound to guild/channel/query with a process-local key (`crates/core/src/lfg_list.rs:11-66`); each process mints its own key, so restarts and other instances invalidate issued pages (`:19-30`); past/unknown labels, never fabricated (`:157-179`) | `candidate_read` after LG-W1: read-only rows, same predicates |
-| Member Select signup/leave (component surface) | Any member; 5 s signup cooldown; capacity adjudication order missing/closed/role/same/full/moved/joined (`lfg.rs:392-423`) | `signup_lfg` treats `starts_at <= joined_at` as closed (`lfg_store.rs:500-514`); receipt `lfg:signup:<interaction>` with versioned binding; leave is id-only after a guild-fence read | `member_only`: the dashboard never signs members up or removes them |
-| Lifecycle sweep (`lfg_sweep` job) | Supervisor-only caller; bounded 20 rows; try-lock leaves contended rows (`lfg_interactions.rs:673-782`) | Signups stop at start; sweep closes after a 15-minute grace (`:81`); orphans reconciled by nonce, unrecovered retained rows closed; expired posts lose signup controls on refresh | `automatic`: no control; the page surfaces `expired` truthfully |
+| `/lfg-list` (`feature_commands.rs:522-532`): optional cursor | Same gates (`router.rs:749-753`); current channel only; no pause gate exists on this path | `list_lfg_channel`: open + confirmed canonical message id, keyset order, no signup/role/member columns (`lfg_store.rs:392-431`); cursor MAC-bound to guild/channel/query with a process-local key (`crates/core/src/lfg_list.rs:11-66`); each process mints its own key, so restarts and other instances invalidate issued pages (`:19-30`); past/unknown labels, never fabricated (`:157-179`) | `candidate_read` after LG-W1: read-only rows, same predicates |
+| Member Select signup/leave (component surface) | Any member; 5 s signup cooldown; capacity adjudication order missing/closed/role/same/full/moved/joined (`lfg.rs:392-423`) | `signup_lfg` treats `starts_at <= joined_at` as closed (`lfg_store.rs:516-530`); receipt `lfg:signup:<interaction>` with versioned binding; leave is id-only after a guild-fence read | `member_only`: the dashboard never signs members up or removes them |
+| Lifecycle sweep (`lfg_sweep` job) | Supervisor-only caller; bounded 20 rows; try-lock leaves contended rows (`lfg_interactions.rs:677-790`) | Signups stop at start; sweep closes after a 15-minute grace (`:81`); orphans reconciled by nonce, unrecovered retained rows closed; pending closed-post refreshes retry with durable backoff under the same 20-row budget (`:792-874`) | `automatic`: no control; the page surfaces `expired` truthfully |
 
 **Concurrency without CAS:** `lfg_posts` has no revision column
 (migration `crates/cutover/migrations/0170_lfg.sql` carries no
@@ -64,7 +64,7 @@ Every dashboard write is read-then-act until LG-W2 lands; see
 edit append to the shared `announcements_audit_log`
 (`crates/core/src/rsvp_store.rs:286`) with actor, action
 (`lfg.close`/`lfg.edit`), target post and outcome
-(`lfg_interactions.rs:811-843`). Non-select audit ids embed nanosecond time,
+(`lfg_interactions.rs:912-944`). Non-select audit ids embed nanosecond time,
 so they are not idempotent receipts. Their store commits stand alone: audit
 loss keeps applied state and appends the `Audit could not be recorded`
 suffix (`:640-649`); it is never silent rollback and never a second write.
@@ -101,6 +101,16 @@ consumer reads LFG rows. LG-F06 pins this.
 (`crates/core/src/activation.rs:52`). Announcements-gated LFG is not
 cleared for the recognized live identity. Preserve that fence.
 
+**Closed-post refresh repair is not CAS or application proof:** the close
+transition arms `close_refresh_pending` in the same store update. The
+lifecycle sweep retries the exact saved message with durable backoff;
+confirmed edit, definitive Unknown Message, or no saved message settles it.
+Repair never sends a replacement, deletes or reopens; historical closed
+rows start not pending. These retry columns (`0467_lfg_close_refresh_retry.sql`)
+are not revision tokens. A saved close still cannot claim the Discord post
+matches until observed; the proposed page exposes no new retry controls.
+See [the shipped repair contract](lfg-interaction-contract.md#closed-post-refresh-repair).
+
 ### Control map
 
 Each proposed control names its exact validator, permission chain, store
@@ -111,7 +121,7 @@ send and no page affordance.
 | --- | --- | --- | --- | --- | --- |
 | Channel list read (S1) | `ListCursor::decode` shape/MAC/scope; canonical snowflakes (`lfg_list.rs:56-66`, `:157-164`); decode failure surfaces `STALE_CURSOR`, never an empty list | Web admin + same-guild Manage Events + Announcements + configured guild + channel-visible, all server-side | `list_lfg_channel` | none (read; matches `/lfg-list`) | Organizer browser only; same columns as the slash list |
 | Edit title / starts-at | `valid_post_id` (`lfg.rs:608`), `validate_title` trimmed 1-100 UTF-16 (`:222`), `normalize_starts_at` future-only with the server clock at confirm (`:247`) | Same chain plus a fresh read before confirm; LG-W2 token once it exists | `edit_lfg_metadata` | `lfg.edit`/`updated` (no-op: no audit) | Message refresh; signup adjudication (new starts-at); sweep |
-| Close post | `valid_post_id`; dry-run plus explicit confirm naming the observed snapshot | Same chain plus fresh read; close frees one of 20 quota slots | `close_lfg` open-only | `lfg.close`/`closed` or `already_closed_or_missing` | Refresh (Select removed); sweep skips closed; quota release |
+| Close post | `valid_post_id`; dry-run plus explicit confirm naming the observed snapshot | Same chain plus fresh read; close frees one of 20 quota slots | `close_lfg` open-only | `lfg.close`/`closed` or `already_closed_or_missing` | Refresh (Select removed on success); sweep repairs pending closed-post refreshes, never reopens; quota release |
 | No control: create, delete, role/capacity edit, member signup/remove | absent by design | not exposed | `put_lfg` / `delete_lfg` / `increase_lfg_seats` / `signup_lfg` / `leave_lfg` stay slash/component/sweep-only | no dashboard rows | none |
 
 ## Minimal private page contract
@@ -185,7 +195,7 @@ example dry-run close: {"schema":"dashboard.lfg_config.v1","guild_id":"771111111
 ```
 
 ```text
-example agent result: {"schema":"dashboard.lfg_config.v1","source_sha":"5e870a8251b3382c7b2f7f72c97f785a6710238e",
+example agent result: {"schema":"dashboard.lfg_config.v1","source_sha":"d2a4274c6462595fa723ea33167fa1e233f406db",
 "guild_id":"771111111111111111","post_id":"lfg-1401","request_id":"example-request-1","reason":"SAVED_UNVERIFIED",
 "retryable":false,"next_action":"reread_before_edit"}
 ```
@@ -237,7 +247,7 @@ entries name doctest absence assertions, not line anchors.
 ```json
 {
   "schema": "dashboard.lfg_config.v1",
-  "source_sha": "5e870a8251b3382c7b2f7f72c97f785a6710238e",
+  "source_sha": "d2a4274c6462595fa723ea33167fa1e233f406db",
   "controls": [
     {"id":"LG-C1","op":"lfg_create","present":"slash_only","state":"not_exposed","gate":[],"evidence":["E-CREATE","E-PERM","E-ROUTE","E-QUOTA","E-PUT","E-DELETE"]},
     {"id":"LG-C2","op":"lfg_close","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3","LG-W4"],"evidence":["E-CLOSE-DEF","E-PERM","E-CLOSE-ROUTE","E-CLOSE","E-CLOSE-REPLY","E-AUDIT","E-REFRESH"]},
@@ -272,12 +282,12 @@ entries name doctest absence assertions, not line anchors.
     "E-CLOSE-REPLY":{"path":"crates/core/src/lfg.rs","line":691,"contains":"pub fn close_reply(closed: bool) -> String {"},
     "E-ADJUDICATE":{"path":"crates/core/src/lfg.rs","line":392,"contains":"pub fn adjudicate_signup("},
     "E-PUT":{"path":"crates/core/src/lfg_store.rs","line":54,"contains":"pub async fn put_lfg("},
-    "E-DELETE":{"path":"crates/core/src/lfg_store.rs","line":420,"contains":"pub async fn delete_lfg("},
+    "E-DELETE":{"path":"crates/core/src/lfg_store.rs","line":436,"contains":"pub async fn delete_lfg("},
     "E-EDIT":{"path":"crates/core/src/lfg_store.rs","line":153,"contains":"pub async fn edit_lfg_metadata("},
     "E-SEAT-EDIT":{"path":"crates/core/src/lfg_store.rs","line":221,"contains":"pub async fn increase_lfg_seats("},
-    "E-LIST":{"path":"crates/core/src/lfg_store.rs","line":376,"contains":"pub async fn list_lfg_channel("},
-    "E-SIGNUP":{"path":"crates/core/src/lfg_store.rs","line":487,"contains":"pub async fn signup_lfg("},
-    "E-CLOSE":{"path":"crates/core/src/lfg_store.rs","line":578,"contains":"pub async fn close_lfg("},
+    "E-LIST":{"path":"crates/core/src/lfg_store.rs","line":392,"contains":"pub async fn list_lfg_channel("},
+    "E-SIGNUP":{"path":"crates/core/src/lfg_store.rs","line":503,"contains":"pub async fn signup_lfg("},
+    "E-CLOSE":{"path":"crates/core/src/lfg_store.rs","line":598,"contains":"pub async fn close_lfg("},
     "E-CURSOR":{"path":"crates/core/src/lfg_list.rs","line":11,"contains":"pub const PAGE_ROWS: usize = 5;"},
     "E-CURSOR-KEY":{"path":"crates/core/src/lfg_list.rs","line":21,"contains":"static CURSOR_KEY: OnceLock<Secret<[u8; 32]>> = OnceLock::new();"},
     "E-CURSOR-MINT":{"path":"crates/core/src/lfg_list.rs","line":42,"contains":"fn encode(&self, guild: &str, channel: &str) -> String {"},
@@ -287,9 +297,9 @@ entries name doctest absence assertions, not line anchors.
     "E-PAST":{"path":"crates/core/src/lfg_list.rs","line":177,"contains":"(past)"},
     "E-UNKNOWN":{"path":"crates/core/src/lfg_list.rs","line":179,"contains":"Start time unknown"},
     "E-EXPIRY":{"path":"crates/discord/src/lfg_interactions.rs","line":81,"contains":"pub const LFG_EXPIRY_GRACE: time::Duration = time::Duration::minutes(15);"},
-    "E-SWEEP":{"path":"crates/discord/src/lfg_interactions.rs","line":673,"contains":"pub async fn sweep_lifecycle("},
-    "E-REFRESH":{"path":"crates/discord/src/lfg_interactions.rs","line":784,"contains":"async fn refresh("},
-    "E-AUDIT":{"path":"crates/discord/src/lfg_interactions.rs","line":811,"contains":"async fn audit("},
+    "E-SWEEP":{"path":"crates/discord/src/lfg_interactions.rs","line":677,"contains":"pub async fn sweep_lifecycle("},
+    "E-REFRESH":{"path":"crates/discord/src/lfg_interactions.rs","line":876,"contains":"async fn refresh("},
+    "E-AUDIT":{"path":"crates/discord/src/lfg_interactions.rs","line":912,"contains":"async fn audit("},
     "E-LIST-HANDLER":{"path":"crates/discord/src/lfg_list.rs","line":5,"contains":"pub(crate) async fn list("},
     "E-QUOTA":{"path":"crates/core/src/automation_quota.rs","line":16,"contains":"Self::OpenLfgPosts => 20,"},
     "E-ACTIVATION":{"path":"crates/core/src/activation.rs","line":52,"contains":"&[LiveCapability::SelfRoles]"},
