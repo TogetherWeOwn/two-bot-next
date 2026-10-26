@@ -161,11 +161,16 @@ def reconstruct(docker_text, root, dest):
                 shutil.copyfile(root / source, target / Path(source).name)
         elif kind == "run":
             for command in stripped[4:].split("&&"):
-                words = shlex.split(command)
-                if words[:2] == ["mkdir", "-p"]:
+                try:
+                    words = shlex.split(command)
+                except ValueError as error:
+                    raise Refusal(
+                        "unsupported dependency-layer command: malformed quoting") from error
+                require(words, "unsupported dependency-layer command: empty segment")
+                if len(words) >= 3 and words[:2] == ["mkdir", "-p"]:
                     for path in words[2:]:
                         (dest / path).mkdir(parents=True, exist_ok=True)
-                elif words[0] == "echo" and words[2] == ">":
+                elif len(words) == 4 and words[0] == "echo" and words[2] == ">":
                     (dest / words[3]).write_text(words[1] + "\n")
                 elif words == ["cargo", "fetch", "--locked"]:
                     fetch_seen = True

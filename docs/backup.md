@@ -192,7 +192,7 @@ versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (game-activity aggregates and assistant monthly-cap ledger), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
 | v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
 | v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
 | v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
@@ -207,14 +207,14 @@ versioned additions introduced later:
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
-is unchanged from before these additions; older v4–v12 archives need not
-invent entries for the v9 guild counters, the v10 epoch-claim guard, the
-v11 delete tombstones, the v12 token registry, the v13 event voice pair or
-the v14 starboard tables or v15 giveaway tables.
+is unchanged from before these additions. Each version may omit only the later
+additions listed in its row above. In particular, only v4–v8 may omit the v9
+`game_activity_guild_aggregates` and `assistant_monthly_builds` tables; v9 and
+later require both. The separate `guild_counters` table is never waived.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
-target state. In particular, restoring v8 without guild counters clears both
-counters; it cannot recover assistant usage that predates its persistence.
+target state. Restoring v8 without the two v9 tables clears their destination
+rows; it cannot recover assistant usage that predates its persistence.
 Restoring v9 without the claim guard clears the guard, the tombstones and
 the registry and event voice pair; the mirror re-fences on the next winning fetch. Restoring a
 claim-only v10 clears the tombstones, registry and event voice pair while keeping the
@@ -494,7 +494,8 @@ bounded-helper contract from the nightly backup above: a hung helper is
 terminated and reaped (direct child only), the run fails, and both files
 stay on disk. The snapshot + drift report land in
 `TWO_GUILD_CONFIG_BACKUP_DIR` (default `./guild-config-backups`;
-`crates/bot/src/backup_cli.rs:1067`, usage at `:200`).
+`cmd_guild_config_snapshot` in `crates/bot/src/backup_cli.rs`; usage in
+`print_server_usage` in the same file).
 
 Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
 (the service's `LoadCredential` contract). Only an absent credential/no configured

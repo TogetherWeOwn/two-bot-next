@@ -11,8 +11,9 @@ Consumer: a guild admin setting up member onboarding and self-role pickers.
 Value: what they save on the dashboard is what the bot does, with no slash
 command archaeology and no operator ticket. No customer validation is claimed.
 
-Inspected repository head: `89b26ae050ffba9fb409622ffd54d31cdc79e7fc`. The web
-repository, a live guild, permissions and deployments were **not** inspected.
+Inspected repository head: `1441cbef76a1c8237a3a91a8944e2d25b66c4ce4`.
+Source citations below name symbols at that revision, not moving line numbers.
+The web repository, a live guild, permissions and deployments were **not** inspected.
 
 | Option | Cost and value | Disposition |
 | --- | --- | --- |
@@ -33,16 +34,16 @@ read-only until its wiring card lands.
   updated_at,updated_by)` with append-only `guild_settings_audit` and a
   transactional poll revision (`crates/cutover/migrations/0330_guild_settings.sql`-`crates/cutover/migrations/0334_guild_settings_cas.sql`). The
   writer is `SettingsStore::set_if_version` (`crates/cutover/src/settings.rs`):
-  CAS compare `:203-209`, self-role drain check `:214-241`, audit insert
-  `:277-288`, all in one transaction.
-- **One verb pair.** `settings.get` / `settings.set`
-  (`crates/core/src/internal_settings.rs:35-75`; receiver
-  `crates/bot/src/internal_action_http.rs:2614-2727`). `get` returns
-  `{key,value,source}` plus the CAS `version` (`:2782`); `set` takes optional
-  `expected_version`, `updated_by` (a Discord ID) and an idempotency key.
-  Key classification fails closed (`crates/core/src/settings.rs:87-270`).
+  CAS compare, self-role drain check and audit insert all run in one transaction.
+- **One verb pair.** `settings.get` / `settings.set` are parsed by
+  `SettingsCommand::parse` (`crates/core/src/internal_settings.rs`); receiver
+  `read_setting` / `write_setting` live in `crates/bot/src/internal_action_http.rs`.
+  `get` returns `{key,value,source}` plus the CAS `version` through
+  `settings_read_response`; `set` takes optional `expected_version`, `updated_by`
+  (a Discord ID) and an idempotency key. Key classification fails closed through
+  `classify_key` (`crates/core/src/settings.rs`).
 - **The receiver pins one guild.** Both handlers use the configured guild
-  constant (`internal_action_http.rs:2626`, `:2662`) and ignore any body guild.
+  constant (`read_setting` / `write_setting`) and ignore any body guild.
 - **Onboarding state is not configuration.** `onboarding_store.rs` holds prompt
   guards and funnel facts (`begin_prompt`, `record_*`) over the legacy `events`
   table. Nothing on the page reads or writes it.
@@ -50,34 +51,36 @@ read-only until its wiring card lands.
   `commands.rs` and `router` for the settings store finds no writer. Other
   writers are operator-side imports (`legacy_copy`, `rollback_import`).
 - **Self-roles are fenced.** The service exists only when the activation fence
-  clears `self_roles` (`crates/bot/src/main.rs:495-499`), the boot catalogue is
-  non-empty and the guild is in a one-guild staging allowlist
-  (`self_role_handlers.rs:44-46,130,189`).
+  clears `LiveCapability::SelfRoles` (`run` in `crates/bot/src/main.rs`), the
+  boot catalogue is non-empty and the guild is in a one-guild staging allowlist
+  (`SelfRoleService::new`, `boot` and `staging_allowlist` in
+  `crates/bot/src/self_role_handlers.rs`).
 - **No read path for "last changed by/at".** `SettingsStore::get` selects
-  value and CAS only (`settings.rs:132-146`); the web reader role has no view of
+  value and CAS only (`crates/cutover/src/settings.rs`); the web reader role has no view of
   `guild_settings` or its audit (`docs/database-roles.md`).
 
 ## 3. Live-apply matrix, per key and store
 
-Source: `SETTING_CLASSES` (`crates/core/src/settings.rs:87-270`) and `HOT_WIRED`
-(`:277-312`). "Live" means a stored row changes behavior with no restart.
+Source: `SETTING_CLASSES` and `HOT_WIRED` (`crates/core/src/settings.rs`).
+"Live" means a stored row changes behavior with no restart. Matrix paths below
+are under `crates/bot/src/` unless another crate or `docs/` is named.
 
 | Key | Class / hot-wired | Apply path and evidence | Disposition |
 | --- | --- | --- | --- |
-| `TWO_SELF_ROLE_PANELS` | hot / yes | Resolved from the live snapshot on every dispatch and sweep, boot fallback on absent or unparsable row (`self_role_handlers.rs:59-83`); landed by the merged live-keys change (`docs/ticket-feed-self-role-live-keys-acceptance.md`). Edits and deletes refuse while durable work drains. Excluded from the /ops overlay (`settings.rs:366-369`) | **Live now** |
-| `TWO_SELF_ROLE_DRY_RUN` | hot / no | `dry_run` is set once at service construction (`self_role_handlers.rs:117,139`) from `SelfRoleGates::from_env`, which reads the process environment only (`self_roles.rs:776`). A stored row is read by nothing, not even after restart. `docs/configuration.md:297` says "stored unwired" | **Wiring card W2**; read-only until then |
-| `TWO_ONBOARDING_DRY_RUN` | hot / no | `OnboardingRuntime::config` reloads a fresh DB snapshot at the start of each job and interaction, 1.5 s timeout (`bot/src/onboarding.rs:276-300,456`); only exact `0`/`1` merges (`:164`). Pinned by `onboarding_runtime_hotpath_config_materializes_only_its_guild` (`onboarding_tests.rs:267`) | **Live now** |
-| `DISCORD_LANDING_CHANNEL_IDS`, `DISCORD_GOODBYE_CHANNEL_IDS` | hot / yes | Same per-event reload (`onboarding.rs:21-30,186-205`). No write-time validation, and a malformed stored row makes `config()` fail every job and picker (`:299`, `:427-440`) | Live; **W1** before the page writes them |
-| `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` | hot / no | Same reload; consumed only in anchor mode (`discord/src/onboarding_config.rs:67-72`) | Live; **W1** first |
-| `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID`, `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot / no | Same reload; both required, and consumed only, in session mode (`onboarding_config.rs:73-84`) | Live; **W1** first |
-| `TWO_ONBOARDING_MODE` | env_only | Deployment selects legacy/session/anchor; stored rows never override it (`onboarding.rs:186-195`). `settings.get` refuses env-only keys, so the page cannot show the value | Read-only with reason |
+| `TWO_SELF_ROLE_PANELS` | hot / yes | Resolved from the live snapshot on every dispatch and sweep, boot fallback on absent or unparsable row (`live_panels_with` / `panels_from_snapshot`, `self_role_handlers.rs`); landed by the merged live-keys change (`docs/ticket-feed-self-role-live-keys-acceptance.md`). Edits and deletes refuse while durable work drains. Excluded from the /ops overlay (`is_ops_key`, `crates/core/src/settings.rs`) | **Live now** |
+| `TWO_SELF_ROLE_DRY_RUN` | hot / no | `dry_run` is set once at `SelfRoleService::new` (`self_role_handlers.rs`) from `SelfRoleGates::from_env`, which reads the process environment only (`crates/core/src/self_roles.rs`). A stored row is read by nothing, not even after restart. The `TWO_SELF_ROLE_DRY_RUN` row in `docs/configuration.md` says "stored unwired" | **Wiring card W2**; read-only until then |
+| `TWO_ONBOARDING_DRY_RUN` | hot / no | `OnboardingRuntime::config` reloads a fresh DB snapshot at the start of each job and interaction, 1.5 s timeout (`onboarding.rs`); only exact `0`/`1` merges (`apply_stored_dry_run`). Pinned by `onboarding_runtime_hotpath_config_materializes_only_its_guild` (`onboarding_tests.rs`) | **Live now** |
+| `DISCORD_LANDING_CHANNEL_IDS`, `DISCORD_GOODBYE_CHANNEL_IDS` | hot / yes | Same per-event reload (`CONFIG_KEYS` / `merge_stored_vars`, `onboarding.rs`). No write-time validation, and a malformed stored row makes `OnboardingRuntime::config` fail every job and picker | Live; **W1** before the page writes them |
+| `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` | hot / no | Same reload; consumed only in anchor mode (`OnboardingConfig::from_map`, `crates/discord/src/onboarding_config.rs`) | Live; **W1** first |
+| `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID`, `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot / no | Same reload; both required, and consumed only, in session mode (`OnboardingConfig::from_map`, `crates/discord/src/onboarding_config.rs`) | Live; **W1** first |
+| `TWO_ONBOARDING_MODE` | env_only | Deployment selects legacy/session/anchor; stored rows never override it (`merge_stored_vars`, `onboarding.rs`). `settings.get` refuses env-only keys, so the page cannot show the value | Read-only with reason |
 | `DISCORD_GUILD_ID` | env_only | Gateway identity; excluded from the stored merge | Read-only with reason |
-| `TWO_ONBOARDING_ROTA_MEASUREMENT`, `_NOTICE`, `_PSEUDONYM_KEY`, `_PRIMARY_ACTOR_ID`, `_READER_IDS` | env_only | Rota runtime dropped; no reader in this repository; refusal kept (`settings.rs:168-177`) | "Not available"; the secret is never rendered |
+| `TWO_ONBOARDING_ROTA_MEASUREMENT`, `_NOTICE`, `_PSEUDONYM_KEY`, `_PRIMARY_ACTOR_ID`, `_READER_IDS` | env_only | Rota runtime dropped; no reader in this repository; refusal kept (`SETTING_CLASSES`, `crates/core/src/settings.rs`) | "Not available"; the secret is never rendered |
 
 Findings the matrix exposes, all evidenced above:
 
 1. **`TWO_SELF_ROLE_DRY_RUN` is inert.** `settings.set` accepts it (it is Hot and
-   passes the 0/1 check, `settings.rs:1030-1033,1083`), so a naive page would
+   passes the 0/1 check in `validate_write`, `crates/core/src/settings.rs`), so a naive page would
    show "Saved" for a value that no code reads. A dry-run toggle that silently
    does nothing is the worst case for a safety control.
 2. **Channel IDs are unvalidated at write time.** A bad value is stored, then
@@ -85,11 +88,12 @@ Findings the matrix exposes, all evidenced above:
    requirements (session mode needs both session channels) are invisible to the
    page because the mode is environment-only.
 3. **Four onboarding keys report "restart required" while applying live.** The
-   poll reports non-`HOT_WIRED` hot keys as cold (`settings.rs:648-690`), logging
+   poll reports non-`HOT_WIRED` hot keys as cold (`SettingsCache::refresh` and
+   `RefreshReport::push_change`, `crates/core/src/settings.rs`), logging
    `settings_restart_required`, yet onboarding reads them per event. Operators
    reading logs would be misled; this is wiring card W3.
 4. **/ops overrides never reach onboarding.** The per-event reload builds a fresh
-   `SettingsCache::load` with an empty override layer (`settings.rs:556-560`), so
+   `SettingsCache::load` with an empty override layer (`crates/core/src/settings.rs`), so
    an override of the landing or goodbye key does not change onboarding. The
    page therefore needs no override banner for these keys.
 5. **Unmeasured.** Real apply latency, a parked runtime, and whether the roles or
@@ -135,7 +139,7 @@ guards); this document does not redefine that shell or the voice page.
 | Path | Bound (design, unmeasured live) | Copy after a successful save |
 | --- | --- | --- |
 | Onboarding keys | The next job or picker interaction after commit; the reload times out at 1.5 s | "Saved. Applies to the next member who joins or opens the menu." |
-| Self-role catalogue | One 15 s poll (`POLL_SECONDS`, `settings.rs:51`) after commit; a failed poll keeps the last good snapshot | "Saved. Applies within about a minute." |
+| Self-role catalogue | One 15 s poll (`POLL_SECONDS`, `crates/core/src/settings.rs`) after commit; a failed poll keeps the last good snapshot | "Saved. Applies within about a minute." |
 
 The page never says "applied" or "live": it cannot observe the runtime. A staging
 apply-check before any ship is mandatory (section 8).
@@ -146,7 +150,8 @@ Guild rows have **no epoch**; the /ops epoch applies only to the global override
 layer, which does not reach these keys (finding 4, plus the panels exclusion).
 Conflict control is the CAS token: opaque, compared only for equality, `0` means
 "expect absent". A stale token returns non-retryable 409
-`settings_version_conflict` before any value, audit or revision change. Two
+`version_conflict` before any value, audit or revision change
+(server-only log reason: `settings_version_conflict`). Two
 admins, or an admin and an operator writing the same row, resolve as: first
 commit wins, the second gets the conflict and a re-read; there is no merge.
 Tokens survive restarts; migration `0334` invalidated older tokens, so clients
@@ -175,15 +180,24 @@ separate activation decision exists.
 
 ### Failure UX
 
+Detect names the response's `error.code`, not `ActionError::log_reason`.
+`Failure::from_action` strips both the detailed message and log reason
+(`crates/bot/src/internal_action_http.rs`). Wire names come from `ErrorCode::as_str`
+(`crates/core/src/internal_actions.rs`), except the receiver's explicit
+`needs_reconciliation` response. A generic `action_not_allowed` cannot identify
+self-role drain versus another refusal: `RECOVERY_PENDING` below is reserved
+page vocabulary, not a currently distinguishable wire outcome. Specific drain
+copy needs a future bounded discriminant; clients must not guess from a 403.
+
 | State | Detect | Copy |
 | --- | --- | --- |
-| Stale read | 409 `settings_version_conflict` | "Someone else changed this setting. Showing the current value; your edit is kept below. Nothing was saved." |
-| Failed write, definite | 4xx with a reason | Field-level reason; never echo the submitted value |
+| Stale read | 409 `version_conflict` | "Someone else changed this setting. Showing the current value; your edit is kept below. Nothing was saved." |
+| Failed write, definite | 4xx `error.code` | Generic refusal mapped from the wire code; no field-level server reason is exposed; never echo the submitted value |
 | Failed write, ambiguous | timeout, 5xx, 409 `needs_reconciliation` | "We could not confirm whether this saved. Reload before trying again." Retry only with the **same** idempotency key, or re-read first |
 | Unavailable runtime | signer timeout or 5xx before any response | "The bot did not answer. Nothing was changed as far as we know." No optimistic update |
-| Self-role work pending | `settings_self_role_recovery_pending` | "Role changes from members are still being finished. Try again in a few minutes." |
+| Self-role work pending | Currently only 403 `action_not_allowed`; `settings_self_role_recovery_pending` is server-log-only | Use the generic refusal today. Only a future explicit drain signal may show "Role changes from members are still being finished. Try again in a few minutes." |
 | Read-only row | state in the manifest | Reason from section 6; no control |
-| Wrong server | `FOREIGN_GUILD` | Section 5 isolation copy; no request sent |
+| Wrong server | Local session-guild guard (`FOREIGN_GUILD` page vocabulary, not a wire code) | Section 5 isolation copy; no request sent |
 
 ## 6. Agent contract
 
@@ -238,7 +252,7 @@ Preview shape (pure, deterministic, offline):
 
 | Card | One-PR scope | Needed for |
 | --- | --- | --- |
-| W1 | Refuse malformed onboarding channel IDs at write time, using the runtime's own `channel_ids` parser, with typed `settings_value_invalid` | Page writes the five channel keys |
+| W1 | Refuse malformed onboarding channel IDs at write time, using the runtime's own `channel_ids` parser, with wire code 400 `malformed` (server log reason `settings_value_invalid`) | Page writes the five channel keys |
 | W2 | Apply `TWO_SELF_ROLE_DRY_RUN` live: store-first per-operation read, boot fallback, last-good on a bad row, plus pins | Making the dry-run toggle writable |
 | W3 | Report the four non-wired onboarding keys as live, not restart-required, without widening the /ops overlay | Honest operator logs; not a page blocker |
 | W4 | Return `updated_by` and `updated_at` from `settings.get` (value-free metadata); shared with the moderation page | Showing the previous editor |
@@ -284,10 +298,10 @@ python3 scripts/check_docs_index.py --json
 
 The doctest reads the manifest from this file and checks it against
 `crates/core/src/settings.rs`: every key's class and hot-wired flag, allowed
-state values with per-state gate and apply values, and reason/next_action
-presence. It checks no
-fixture row and does **not** run the bot, a database, a dashboard, or any apply
-path. Future protected acceptance tests must implement
+state values, gate/apply membership by state, and next_action/retryable shape
+for each declared reason. It does not prove that a key has the correct gate or
+apply path, or that the reason vocabulary is complete. It checks no fixture row
+and does **not** run the bot, a database, a dashboard, or any apply path. Future protected acceptance tests must implement
 the oracle against real callers in a disposable database; zero tests is not
 proof.
 
