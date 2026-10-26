@@ -1,13 +1,12 @@
 # Documentation map
 
-Sole manifest: `- [Purpose](relative.md)` by area.
+Manifest: `- [Purpose](relative.md)`.
 
 Repo root: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
-else exit 1, repair rows/split docs. Bad/duplicate rows use
-`docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+Empty `{missing,stale,oversize}` arrays = PASS (exit 0); else exit 1.
+Repair rows/split docs. Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Legacy exceptions/reasons:
+`scripts/check_docs_index.py` (`LARGE_DOCS`).
 
 ## References and architecture
 
@@ -140,6 +139,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Event role (design only)](event-role-spec.md)
 - [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
+- [Sticky page (design only)](dashboard-sticky-config-spec.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
