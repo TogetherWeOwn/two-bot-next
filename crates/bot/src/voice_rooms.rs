@@ -11638,6 +11638,9 @@ fn setup_past_end_refusal(total: usize) -> String {
 fn setup_shape_correction(command: &str, field: &str) -> String {
     let usage = match command {
         "create" => "name: lobby",
+        "textchannels" => {
+            "channel: #voice-creator enabled: true name: voice-chat viewer-role: @role"
+        }
         "position" => "channel: #voice-creator position: below first-number: 5",
         "group" => "channel: #voice-creator enabled: true",
         "inheritpermissions" => {
@@ -12023,7 +12026,7 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: AlwaysPrivateRequest,
     },
-    /// A setup command (`/create`, `/position`, `/group`,
+    /// A setup command (`/create`, `/textchannels`, `/position`, `/group`,
     /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
     /// an ambiguous option shape: a known option sent twice or with the wrong
     /// wire type. Answered with a private correction before guild authority,
@@ -12140,6 +12143,7 @@ enum SetupOptionKind {
     Integer,
     Boolean,
     Channel,
+    Role,
 }
 
 impl SetupOptionKind {
@@ -12150,6 +12154,7 @@ impl SetupOptionKind {
                 | (Self::Integer, CommandOptionValue::Integer(_))
                 | (Self::Boolean, CommandOptionValue::Boolean(_))
                 | (Self::Channel, CommandOptionValue::Channel(_))
+                | (Self::Role, CommandOptionValue::Role(_))
         )
     }
 }
@@ -12160,6 +12165,12 @@ impl SetupOptionKind {
 fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
     match command {
         "create" => Some(&[("name", SetupOptionKind::String)]),
+        "textchannels" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+            ("name", SetupOptionKind::String),
+            ("viewer-role", SetupOptionKind::Role),
+        ]),
         "position" => Some(&[
             ("channel", SetupOptionKind::Channel),
             ("position", SetupOptionKind::String),
@@ -12287,6 +12298,12 @@ fn parse_voice_command_with_registry(
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
         "textchannels" => {
+            if let Some(field) = setup_shape_refusal("textchannels", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "textchannels",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = TextChannelsRequest {
                 enabled: None,
