@@ -486,6 +486,16 @@
           "max_value": null,
           "max_length": 64,
           "choices": []
+        },
+        {
+          "name": "preview",
+          "description": "Preview the proposed post and its first firing without saving it",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
         }
       ],
       "smoke": "deferred",
