@@ -53,6 +53,8 @@ mod kick;
 mod kick_ballot_delivery;
 #[path = "voice_rooms_limit_tests.rs"]
 mod limit_command;
+#[path = "voice_myroom_acceptance_tests.rs"]
+mod myroom_acceptance;
 #[path = "voice_name_tests.rs"]
 mod name;
 #[path = "voice_name_filter_acceptance_tests.rs"]
