@@ -15,7 +15,10 @@ single-line nonzero refusal that echoes no remote value.
 
 import argparse
 import json
+import os
+import re
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -89,7 +92,9 @@ def render(args):
     containers = config.get("env", {}).get("production", {}).get("containers", [])
     if len(containers) != 1 or containers[0].get("class_name") != "TwoBotContainer" or containers[0].get("max_instances") != 1:
         sys.exit("render: production needs exactly one TwoBotContainer with max_instances = 1")
-    config["main"] = str((source.parent / config["main"]).resolve())
+    # Wrangler validates unused environment definitions too. Resolve every
+    # local container path against the source TOML before relocating the JSON,
+    # then replace only production's build inputs with the admitted image.
     declared = [
         *config.get("containers", []),
         *(container for env in config.get("env", {}).values() for container in env.get("containers", [])),
@@ -97,7 +102,28 @@ def render(args):
     for container in declared:
         container["image"] = str((source.parent / container["image"]).resolve())
         container["image_build_context"] = str(source.parent.parent)
-    containers[0]["image_vars"] = {"BOT_BUILD_REVISION": args.sha,
+    artifact = getattr(args, "artifact", None)
+    if artifact:
+        from bot_promotion import configure_bundle, load_admitted
+
+        try:
+            admitted = load_admitted(artifact, args.sha, verify_modules=True)
+            worker = admitted["receipt"]["worker"]
+            production = config["env"]["production"]
+            if (production.get("compatibility_date", config.get("compatibility_date"))
+                    != worker["compatibility_date"]
+                    or production.get("compatibility_flags", config.get("compatibility_flags", []))
+                    != worker["compatibility_flags"]):
+                raise ValueError("incompatible saved Worker")
+            configure_bundle(config, Path(artifact).resolve().parent / "modules", worker["entrypoint"])
+            containers[0]["image"] = admitted["production_image"]
+            containers[0].pop("image_vars", None)
+            containers[0].pop("image_build_context", None)
+        except (OSError, ValueError):
+            return reject("render: immutable promotion artifact refused")
+    else:
+        config["main"] = str((source.parent / config["main"]).resolve())
+        containers[0]["image_vars"] = {"BOT_BUILD_REVISION": args.sha,
                                       "BOT_BUILD_ID": f"{args.run_id}-{args.attempt}",
                                       "BOT_DEPLOY_ID": args.deploy_id}
     # Worker-edge span lines log this SHA as `release` (same commit as the
@@ -148,6 +174,27 @@ def readyz(args):
             return reject("readyz needs a canonical deploy ID to judge")
         if expected_sha7 != args.sha[:7]:
             return reject("the expected deploy ID names a different commit")
+    expected_build = args.build_id
+    artifact = getattr(args, "artifact", None)
+    if artifact:
+        from bot_promotion import load_admitted
+
+        try:
+            admitted = load_admitted(artifact, args.sha)
+            version = getattr(args, "expected_worker_version", None)
+            if (args.mode != "deploy" or not isinstance(version, str)
+                    or re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", version) is None
+                    or version == admitted["receipt"]["staging"]["worker_version"]
+                    or (response_version(args.headers) if getattr(args, "headers", None)
+                        else getattr(args, "worker_version", None)) != version
+                    or (getattr(args, "health_headers", None)
+                        and response_version(args.health_headers) != version)
+                    or getattr(args, "image", None) != admitted["production_image"]):
+                raise ValueError("serving production identity mismatch")
+            expected_build = admitted["receipt"]["build"]["build_id"]
+            expected = admitted["receipt"]["build"]["deploy_id"]
+        except (OSError, ValueError):
+            return reject("readyz: immutable promotion or serving identity refused")
     try:
         with open(args.body, "rb") as handle:
             raw = handle.read(MAX_READYZ_BYTES + 1)
@@ -196,9 +243,9 @@ def readyz(args):
         if deploy_id != UNSTAMPED and not is_deploy_id_shape(deploy_id):
             return reject("/readyz deploy_id has an unexpected shape")
     if revision == args.sha:
-        if args.mode == "deploy" and build_id != args.build_id:
+        if args.mode == "deploy" and build_id != expected_build:
             return reject(
-                f"build_id {build_id} is not this run's build ({args.build_id}): "
+                f"build_id {build_id} is not this run's build ({expected_build}): "
                 "a previous container still serves this SHA"
             )
         if args.mode == "deploy" and expected is not None and deploy_id != expected:
@@ -227,6 +274,161 @@ def readyz(args):
     return reject("build_revision does not match the SHA")
 
 
+def response_version(path):
+    with open(path, "rb") as handle:
+        raw = handle.read(MAX_READYZ_BYTES + 1)
+    if len(raw) > MAX_READYZ_BYTES:
+        raise ValueError("response headers over cap")
+    values = [line.split(b":", 1)[1].strip().decode("ascii")
+              for line in raw.splitlines() if line.lower().startswith(b"x-two-worker-version:")]
+    if len(values) != 1:
+        raise ValueError("ambiguous response version")
+    return values[0]
+
+
+def _promoted_runtime_ready(client, url, version, receipt):
+    """Confirm live Worker headers and original stamps without logging bodies."""
+    for suffix in ("health", "readyz"):
+        status, headers, body = client.request(f"{url}/{suffix}")
+        if status != 200 or len(body) > MAX_READYZ_BYTES:
+            return False
+        # HTTPMessage retains duplicate fields; a last-wins header lookup
+        # would let an ambiguous response authorize the promoted image.
+        if hasattr(headers, "get_all"):
+            versions = headers.get_all("x-two-worker-version", [])
+        else:
+            versions = [value for key, value in headers.items()
+                        if key.lower() == "x-two-worker-version"]
+        if versions != [version]:
+            return False
+        if suffix == "readyz":
+            try:
+                report = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+            except (ValueError, UnicodeError, RecursionError):
+                return False
+            build = receipt["build"]
+            if (not isinstance(report, dict) or _too_deeply_nested(report)
+                    or report.get("build_revision") != receipt["source"]["sha"]
+                    or report.get("build_id") != build["build_id"]
+                    or report.get("deploy_id") != build["deploy_id"]
+                    or not _gateway_ready(report)):
+                return False
+    return True
+
+
+def serving(args):
+    """Check identity before cold start; prove convergence only after readiness."""
+    import worker_container_rollback as rollback
+    from bot_promotion import PRODUCTION_APP, REGISTRY_HOST, load_admitted
+
+    try:
+        admitted = load_admitted(args.artifact, args.sha)
+        if not is_deploy_id_shape(args.deploy_id) or parse_deploy_id(args.deploy_id)[2] != args.sha[:7]:
+            raise ValueError("invalid production event ID")
+        image = admitted["production_image"]
+        account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        expected_image = f"{REGISTRY_HOST}/{account}/{PRODUCTION_APP}@{admitted['receipt']['container']['digest']}"
+        if not account or image != expected_image:
+            raise ValueError("production image account mismatch")
+        if (not isinstance(args.expected_worker_version, str)
+                or rollback.VERSION_ID.fullmatch(args.expected_worker_version) is None
+                or args.expected_worker_version == admitted["receipt"]["staging"]["worker_version"]):
+            raise ValueError("invalid production version")
+        preflight = getattr(args, "preflight", False)
+        url = getattr(args, "url", None)
+        if url:
+            url = rollback.check_url("production", url)
+        previous = None
+        snapshot = getattr(args, "snapshot", None)
+        if snapshot:
+            with open(snapshot, "rb") as handle:
+                raw = handle.read(MAX_READYZ_BYTES + 1)
+            if len(raw) > MAX_READYZ_BYTES:
+                raise ValueError("snapshot over cap")
+            previous = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+            if (not isinstance(previous, dict)
+                    or previous.get("worker") != rollback.WORKERS["production"]
+                    or previous.get("application") != PRODUCTION_APP
+                    or type(previous.get("has_previous")) is not bool):
+                raise ValueError("snapshot identity mismatch")
+        deadline = time.monotonic() + 600
+        client = rollback.base.Client(account, os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
+        lag_streak = 0
+        lag_identity = None
+        while time.monotonic() < deadline:
+            version = rollback.serving_version(client, rollback.WORKERS["production"])
+            if version != args.expected_worker_version:
+                raise ValueError("production Worker drift")
+            app = rollback.application_by_name(client, rollback.APPLICATIONS["production"])
+            if previous and previous["has_previous"] and previous.get("application_id") != app["id"]:
+                raise ValueError("production application drift")
+            rows = rollback.app_rollouts(client, app["id"])
+            row = None
+            if rows:
+                latest = max(rows, key=lambda row: rollback.base.timestamp(row.get("created_at")))
+                row = rollback.base.mapping(client.api(
+                    f"/containers/applications/{rollback.base.identifier(app['id'])}/rollouts/"
+                    f"{rollback.base.identifier(latest.get('id'))}"))
+                if row.get("id") != latest.get("id"):
+                    raise ValueError("production rollout drift")
+                if rollback.rollout_image(row, rollback.APPLICATIONS["production"]) != image:
+                    # Only the explicitly snapshotted old rollout can be a
+                    # stale listing. A different/newer foreign image refuses.
+                    if (previous and previous["has_previous"]
+                            and row["id"] == previous.get("serving_rollout_id")
+                            and row["target_configuration"]["image"] == previous.get("serving_image")):
+                        row = None
+                    else:
+                        raise ValueError("production rollout image drift")
+            accepted = False
+            if row is not None:
+                target = rollback.base.number(row.get("target_version"))
+                converged = rollback.base.converged(row, image, target)
+                app_matches = (rollback.base.mapping(app.get("configuration")).get("image") == image
+                               and app.get("version") == target)
+                if preflight:
+                    # Takeover leaves the process stopped. This proves only
+                    # intended configuration, not running-instance readiness.
+                    accepted = app_matches
+                elif app_matches:
+                    runtime_ready = (not url or _promoted_runtime_ready(
+                        client, url, version, admitted["receipt"]))
+                    lag = rollback.base.active_lag(row, image, target)
+                    identity = (app["id"], row["id"], target)
+                    if lag and url and runtime_ready:
+                        lag_streak = lag_streak + 1 if lag_identity == identity else 1
+                        lag_identity = identity
+                    else:
+                        lag_streak = 0
+                        lag_identity = None
+                    accepted = runtime_ready and (converged or lag_streak >= rollback.base.ACTIVE_LAG_CONFIRMATIONS)
+            if not accepted:
+                # Empty/stale listings and any unready poll break consecutive
+                # confirmations, including when application state lags.
+                if row is None or not app_matches:
+                    lag_streak = 0
+                    lag_identity = None
+                time.sleep(min(5, max(0, deadline - time.monotonic())))
+                continue
+            # Re-read after every accepted observation: an intervening secret-
+            # only Worker publish must never authorize the old version's bytes.
+            if rollback.serving_version(client, rollback.WORKERS["production"]) != version:
+                raise ValueError("production Worker drift")
+            proof = {"worker_version": version, "production_image": image,
+                     "production_deploy_id": args.deploy_id,
+                     "rollout_id": row["id"], "target_version": target,
+                     "receipt": admitted["receipt"]}
+            if preflight:
+                proof["phase"] = "identity"
+            Path(args.out).write_text(json.dumps(proof, indent=2) + "\n")
+            print("promoted production identity verified; readiness pending" if preflight
+                  else "promoted production Worker and container digest verified")
+            return 0
+    except (OSError, ValueError, RecursionError, rollback.GateError):
+        return reject("serving: promoted production identity refused")
+    return reject("serving: promoted production identity refused; image did not converge")
+
+
 def excerpt(args):
     try:
         with open(args.body, "rb") as handle:
@@ -251,6 +453,7 @@ def main(argv=None):
     render_cmd.add_argument("--run-id", required=True)
     render_cmd.add_argument("--attempt", required=True)
     render_cmd.add_argument("--deploy-id", required=True)
+    render_cmd.add_argument("--artifact", help="admitted immutable staging artifact; never rebuild")
 
     readyz_cmd = commands.add_parser("readyz", help="judge one /readyz answer against the revision")
     readyz_cmd.add_argument("--status", required=True)
@@ -267,6 +470,22 @@ def main(argv=None):
     # canonical expectation naming the guarded SHA. Absent, the legacy
     # revision/build-ID verdicts apply unchanged (stamping transition).
     readyz_cmd.add_argument("--deploy-id", required=False, default=None)
+    readyz_cmd.add_argument("--artifact", help="judge original admitted artifact stamps")
+    readyz_cmd.add_argument("--expected-worker-version")
+    readyz_cmd.add_argument("--worker-version")
+    readyz_cmd.add_argument("--image")
+    readyz_cmd.add_argument("--headers", help="actual /readyz response headers")
+    readyz_cmd.add_argument("--health-headers", help="actual /health response headers")
+
+    serving_cmd = commands.add_parser("serving", help="verify promoted production control-plane identity")
+    serving_cmd.add_argument("--sha", required=True)
+    serving_cmd.add_argument("--deploy-id", required=True)
+    serving_cmd.add_argument("--artifact", required=True)
+    serving_cmd.add_argument("--expected-worker-version", required=True)
+    serving_cmd.add_argument("--out", required=True)
+    serving_cmd.add_argument("--preflight", action="store_true", help="identity only, before owned cold-start probes")
+    serving_cmd.add_argument("--url", help="production origin for live exact-runtime confirmations")
+    serving_cmd.add_argument("--snapshot", help="pre-deploy snapshot identifying an older rollout listing")
 
     excerpt_cmd = commands.add_parser("excerpt", help="print a remote body as one bounded escaped line")
     excerpt_cmd.add_argument("--body", required=True)
@@ -276,6 +495,8 @@ def main(argv=None):
         return render(args)
     if args.command == "excerpt":
         return excerpt(args)
+    if args.command == "serving":
+        return serving(args)
     return readyz(args)
 
 

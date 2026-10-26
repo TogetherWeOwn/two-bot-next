@@ -2,12 +2,12 @@
 
 Sole manifest: `- [Purpose](relative.md)` by area.
 
-Repo root: `python3 scripts/check_docs_index.py --json`.
-Sorted `{missing,stale,oversize}` arrays: empty = PASS (exit 0);
-else exit 1, repair rows/split docs. Bad/duplicate rows use
-`docs/README.md:<line>` in `stale`.
-Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
-and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+`python3 scripts/check_docs_index.py --json` (repo root).
+Sorted `{missing,stale,oversize}` arrays: empty = PASS/exit 0.
+Else exit 1: fix rows/split docs.
+Bad/duplicate rows: `docs/README.md:<line>` in `stale`.
+Byte budgets: index <12,000; other docs ≤65,536.
+Legacy exceptions/reasons: `LARGE_DOCS` in `scripts/check_docs_index.py`.
 
 ## References and architecture
 
@@ -115,7 +115,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
-- [Rewards design](dashboard-leveling-rewards-spec.md)
+- [Rewards](dashboard-leveling-rewards-spec.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
 - [Ready check](lfg-ready-check-spec.md)
@@ -134,14 +134,16 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [Notice proposal](event-change-notices-spec.md)
-- [Reminder design](event-reminder-preferences-spec.md)
-- [RSVP design](rsvp-capacity-spec.md)
-- [Private agenda (design only)](event-agenda-spec.md)
-- [Calendar design](event-calendar-handoff-spec.md)
-- [Event role (design only)](event-role-spec.md)
-- [Event recap (design only)](event-recap-spec.md)
+- [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
+- [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
+- [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
+- [Private agenda proposal](event-agenda-spec.md)
+- [Calendar handoff proposal](event-calendar-handoff-spec.md)
+- [Event role proposal](event-role-spec.md)
+- [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket config proposal](dashboard-ticket-config-spec.md)
+- [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
@@ -149,7 +151,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 
 ## Voice
 
-- [Room specification](voice-rooms.md)
+- [Room spec](voice-rooms.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -171,7 +173,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Assistant validation](voice-assistant-validate-core.md)
 - [Assistant build/retry](voice-assistant-build-core.md)
 - [Game aliases and nick](voice-alias-core.md)
-- [Channel-info resolution](voice-channelinfo-core.md)
+- [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Creator defaults](voice-creator-defaults-acceptance.md)
 - [Permission overrides](voice-permissions-core.md)
@@ -209,16 +211,16 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Soak entry gates](soak-entry-gates.md)
 - [Expected/processed evidence](evidence-route.md)
 - [Expected-join tests](expected-joins-acceptance.md)
-- [E2E command matrix](staging-e2e-command-matrix.md)
-- [E2E record form](staging-e2e-run-record.md)
+- [E2E matrix](staging-e2e-command-matrix.md)
+- [E2E record](staging-e2e-run-record.md)
 - [Fixture census](staging-fixture-census.md)
-- [Health-contract probe](staging-health-contract-probe.md)
+- [Health probe](staging-health-contract-probe.md)
 - [Migration claim](staging-migrate-claim.md)
-- [Rollout acceptance](staging-rollout-gate.md)
+- [Rollout gate](staging-rollout-gate.md)
 - [Slash smoke](staging-slash-smoke.md)
-- [Voice event checks](staging-voice-event-verification.md)
-- [Smoke response table](smoke-expected-responses.md)
-- [Smoke record form](smoke-run-record.md)
+- [Voice checks](staging-voice-event-verification.md)
+- [Smoke replies](smoke-expected-responses.md)
+- [Smoke record](smoke-run-record.md)
 - [Smoke surface inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
@@ -259,7 +261,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [CI security](ci-security.md)
 - [CI speed rollout](ci-speed-rollout.md)
 - [Weekly delivery metrics](dora-metrics.md)
-- [Docs-only queue timing](ci-docs-only-queue-note.md)
+- [Docs-only timing](ci-docs-only-queue-note.md)
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
