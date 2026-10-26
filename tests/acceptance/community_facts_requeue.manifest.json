@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected behavioral acceptance for lossless, bounded community-fact drain recovery",
+  "baseCommit": "b5776432c5c1df36f14af5843c17140aae07b5f7",
+  "branch": "test/community-facts-requeue",
+  "protectedFiles": [
+    {
+      "path": "crates/discord/tests/support/community_facts_requeue.rs",
+      "sha256": "a43722ab63274eeea0e37b18ccab05daa7b0739ecf28fc9740cec0a1910f7827",
+      "tests": 25
+    },
+    {
+      "path": "crates/discord/tests/run_community_facts_requeue.py",
+      "sha256": "84725b8f5e0f871bfccc0cd4591ee40573d12861e4e899c5d2f2b294f8267314"
+    }
+  ],
+  "commands": {
+    "protectedRuntime": "python3 crates/discord/tests/run_community_facts_requeue.py",
+    "healthyControls": "python3 crates/discord/tests/run_community_facts_requeue.py --controls",
+    "lint": "python3 crates/discord/tests/run_community_facts_requeue.py --clippy",
+    "workspace": "python3 crates/discord/tests/run_community_facts_requeue.py --workspace"
+  },
+  "seam": {
+    "runtime": "Actual DeferredCommunityFacts::drain and actual queue state, not a reimplementation",
+    "double": "Task-local record_fact boundary returns true, false, a typed store error, or a pending future; captures complete attempted/acknowledged FactWrite payloads",
+    "baselineExecution": "Run-owned scratch snapshot changes only the external record_fact import and cfg(test) child-module registration; no drain/capture/classification/state implementation changes",
+    "builderRegistration": "Register community_facts_requeue_acceptance at ../tests/support/community_facts_requeue.rs with cfg(test). Bind its record_fact under cfg(test), and two_bot_core::community_store::record_fact under cfg(not(test)); see runner.BINDING/REGISTRATION. Existing tests outside the task-local scope delegate to the real store.",
+    "ciRoute": "Builder must retain the module registration and test-only binding so the existing db-feature library CI/nextest lanes execute the protected corpus, rather than leaving an orphan support file",
+    "database": "Lazy passwordless test pool only; scoped test store never opens a connection. No database environment, database creation, HTTP or Discord required. Compilation always uses scripts/cargo_cache.py on the controller."
+  },
+  "contract": {
+    "storeErrors": "Fail at every one of the seven write positions: preserve failed and unattempted payloads across pending/rules/joins; consume only acknowledged prefix",
+    "timeout": "Caller drops the real drain future through Tokio timeout at first write and mid-pending, mid-rules and mid-joins; retain exactly the unacknowledged suffix",
+    "duplicates": "Ok(false) acknowledges a duplicate/privacy-suppressed write without counting it inserted; never resubmit it after a later error or timeout",
+    "noPool": "Repeated no-pool drains return zero with all previously queued payloads unchanged; arming later drains those facts exactly once",
+    "concurrency": "Arrivals captured while the taken batch is being written survive error/cancellation; prepend the unwritten old batch ahead of arrivals within each family",
+    "bounds": "Mirror the game-activity precedent: per-family cap 8192, evict oldest overflow, no cross-family capacity borrowing, no eviction at exactly the cap",
+    "observableDrops": "Expose dropped_counts() -> Result<(u64, u64, u64), CommunityFactsError> in (pending, rules, joins) order. Count exact cumulative evictions; successful/empty drains never reset counts. The baseline adapter returns truthful zero; it implements no recovery and an inherent runtime method overrides it.",
+    "poison": "Typed CommunityFactsError::Poisoned before store work or any family take; poison remains latched and every payload stays untrusted and queued",
+    "controls": "Successful all-family drain, duplicate acknowledgement/count, and typed poison preservation"
+  },
+  "handoff": [
+    "Do not merge acceptance-only RED tests. Builder consumes the immutable pushed SHA and preserves every protected file hash, registering the child module and test binding in production source.",
+    "Expected baseline result: 22 assertion failures for discarded queues and 3 passing controls. This is not an observed result; actual execution evidence belongs in the task handoff document.",
+    "Cache admission refusal (exit 75) is neither a compilation result nor acceptance RED. Never bypass the wrapper, create another target cache, clear sentinels or evict shared caches.",
+    "Builder owns runtime GREEN, ordinary exact-head CI plus independent Paperclip Review 5/5, verified squash auto-merge and combined PR delivery. Oracle corrections return to the Test Author."
+  ]
+}
