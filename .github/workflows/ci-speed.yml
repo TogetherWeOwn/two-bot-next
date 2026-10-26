@@ -66,6 +66,9 @@ jobs:
               - '.config/nextest.toml'
               - 'scripts/ci/flake_ledger.py'
               - 'scripts/ci/test_flake_ledger.py'
+              # The nextest lane executes this generator before compilation
+              # (reusable-rust-nextest.yml), so its edits must select rust.
+              - 'scripts/generate_command_reference.py'
               - '.github/workflows/reusable-rust-nextest.yml'
               - '.github/workflows/ci-speed.yml'
               # The required lane is called from check.yml (promotion): an edit
