@@ -18,25 +18,28 @@ fn generate_command_reference() -> Result<&'static str, &'static str> {
 }
 
 fn main() -> std::process::ExitCode {
-    match generate_command_reference() {
-        Ok(path) => {
-            println!(
-                "{}",
-                json!({"schema": "command_reference.v1", "status": "generated", "path": path})
-            );
-            std::process::ExitCode::SUCCESS
-        }
+    let (report, status) = match generate_command_reference() {
+        Ok(path) => (
+            json!({"schema": "command_reference.v1", "status": "generated", "path": path}),
+            std::process::ExitCode::SUCCESS,
+        ),
         Err(code) => {
             let next_action = if code.starts_with("configuration_reference_") {
                 "Review and explicitly regenerate the tracked configuration reference; then retry."
             } else {
                 "Make the generated output directory writable; then retry."
             };
-            println!(
-                "{}",
-                json!({"schema": "command_reference.v1", "status": "error", "code": code, "retryable": false, "next_action": next_action})
-            );
-            std::process::ExitCode::FAILURE
+            (
+                json!({"schema": "command_reference.v1", "status": "error", "code": code, "retryable": false, "next_action": next_action}),
+                std::process::ExitCode::FAILURE,
+            )
         }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if serde_json::to_writer(&mut stdout, &report).is_err()
+        || std::io::Write::write_all(&mut stdout, b"\n").is_err()
+    {
+        return std::process::ExitCode::FAILURE;
     }
+    status
 }
