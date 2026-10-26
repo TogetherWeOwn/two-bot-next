@@ -24,7 +24,7 @@ use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
         accepted_text_trigger, builtin_command_names, format_command_list_page,
-        format_inspect_miss, format_inspect_preview, format_inspect_summary,
+        format_draft_preview, format_inspect_miss, format_inspect_preview, format_inspect_summary,
         format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
         invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
         AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand, TemplateContext,
@@ -642,11 +642,10 @@ impl CustomCommandRuntime {
             .map_err(|_| CustomCommandError::Storage)
     }
 
-    /// Private saved-response inspection: one ephemeral content-only view,
-    /// never a public send, registration, cooldown/claim touch, definition
-    /// mutation or `command.run` fact. The only store access is a live
-    /// `get_command` read after every validation passes — no cache, so a
-    /// deleted definition immediately misses.
+    /// Private saved-response inspection or unsaved draft preview: one
+    /// ephemeral content-only view, never execution or mutation. Drafts never
+    /// access storage; saved mode reads live only after validation, so deleted
+    /// definitions immediately miss.
     async fn inspect(
         &self,
         interaction: &Interaction,
@@ -654,22 +653,29 @@ impl CustomCommandRuntime {
         guild: &str,
         guild_name: Option<&str>,
     ) -> String {
-        let name = match single_string_option(data, "name") {
-            SingleOption::Missing | SingleOption::Malformed => {
-                return invalid_inspect_option_reply(
-                    "command name",
-                    "a saved command name is required.",
-                );
-            }
-            SingleOption::Value(name) => name,
-        };
-        let name = match validate_inspect_name(name, &builtin_command_names()) {
-            Ok(name) => name,
-            Err(reason) => {
-                return invalid_inspect_option_reply("command name", &reason.to_string());
+        if data.options.iter().any(|option| {
+            !matches!(
+                option.name.as_str(),
+                "name" | "draft" | "view" | "arguments"
+            )
+        }) {
+            return invalid_inspect_option_reply(
+                "options",
+                "use only name or draft, with optional view and arguments.",
+            );
+        }
+        let (name, draft) = match (
+            single_string_option(data, "name"),
+            single_string_option(data, "draft"),
+        ) {
+            (SingleOption::Value(name), SingleOption::Missing) => (Some(name), None),
+            (SingleOption::Missing, SingleOption::Value(draft)) => (None, Some(draft)),
+            _ => {
+                return "Invalid input: pass exactly one text name or draft, never both or duplicates. Examples: /command-inspect name:faq or /command-inspect draft:Hello".to_owned();
             }
         };
         let view = match single_string_option(data, "view") {
+            SingleOption::Missing if draft.is_some() => InspectView::Preview,
             SingleOption::Missing => InspectView::Summary,
             SingleOption::Malformed => return invalid_inspect_view_reply(None),
             SingleOption::Value(raw) => match InspectView::parse(raw) {
@@ -694,6 +700,34 @@ impl CustomCommandRuntime {
                 }
             }
         }
+        // Both preview modes use invocation context, never sample arguments.
+        let context = || {
+            interaction
+                .author()
+                .zip(interaction.channel.as_ref())
+                .zip(guild_name)
+                .map(|((actor, channel), server)| TemplateContext {
+                    user: format!("<@{}>", actor.id),
+                    username: actor.name.clone(),
+                    server: server.to_owned(),
+                    channel: format!("<#{}>", channel.id),
+                })
+        };
+        if let Some(draft) = draft {
+            if view != InspectView::Preview {
+                return "Invalid draft view: only preview is available for unsaved text. Use /command-inspect draft:Hello view:preview".to_owned();
+            }
+            return match context() {
+                Some(context) => format_draft_preview(draft, &context),
+                None => "Draft preview is unavailable: command context is missing. Please try /command-inspect draft:Hello again.".to_owned(),
+            };
+        }
+        let name = match validate_inspect_name(name.unwrap_or_default(), &builtin_command_names()) {
+            Ok(name) => name,
+            Err(reason) => {
+                return invalid_inspect_option_reply("command name", &reason.to_string());
+            }
+        };
         let row = match store::get_command(&self.pool, guild, &name).await {
             Ok(row) => row,
             Err(_) => return LOOKUP_OUTAGE_REPLY.to_owned(),
@@ -704,23 +738,10 @@ impl CustomCommandRuntime {
         match view {
             InspectView::Summary => format_inspect_summary(&row),
             InspectView::Template => format_inspect_template(&row),
-            InspectView::Preview => {
-                // Same invoking member/channel/guild context as real
-                // execution; the sample arguments are never interpolated.
-                let actor = interaction.author();
-                let context = actor.zip(interaction.channel.as_ref()).zip(guild_name).map(
-                    |((actor, channel), server)| TemplateContext {
-                        user: format!("<@{}>", actor.id),
-                        username: actor.name.clone(),
-                        server: server.to_owned(),
-                        channel: format!("<#{}>", channel.id),
-                    },
-                );
-                match context {
-                    Some(context) => format_inspect_preview(&row, &context),
-                    None => inspect_preview_context_unavailable(&row.name),
-                }
-            }
+            InspectView::Preview => match context() {
+                Some(context) => format_inspect_preview(&row, &context),
+                None => inspect_preview_context_unavailable(&row.name),
+            },
         }
     }
 

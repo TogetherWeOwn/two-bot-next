@@ -11637,9 +11637,17 @@ fn setup_past_end_refusal(total: usize) -> String {
 /// errors or mentions can leak into it.
 fn setup_shape_correction(command: &str, field: &str) -> String {
     let usage = match command {
+        "create" => "name: lobby",
         "textchannels" => {
-            "channel: #voice-creator enabled: true name: lounge viewer-role: @Viewers"
+            "channel: #voice-creator enabled: true name: voice-chat viewer-role: @role"
         }
+        "position" => "channel: #voice-creator position: below first-number: 5",
+        "group" => "channel: #voice-creator enabled: true",
+        "inheritpermissions" => {
+            "channel: #voice-creator source: channel source-channel: #voice-creator"
+        }
+        "defaultlimit" => "channel: #voice-creator limit: 4",
+        "alwaysprivate" => "channel: #voice-creator enabled: true",
         _ => "channel: #voice-creator",
     };
     format!(
@@ -12018,10 +12026,12 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: AlwaysPrivateRequest,
     },
-    /// A setup command (`/textchannels`) arrived with a malformed option
-    /// shape: a known option sent twice, with the wrong wire type, or the
-    /// required `channel` missing. Answered with a private correction before
-    /// guild authority, role gates and every read or effect.
+    /// A setup command (`/create`, `/textchannels`, `/position`, `/group`,
+    /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
+    /// a malformed option shape: a known option sent twice, with the wrong
+    /// wire type, or (for `/textchannels`) the required `channel` missing.
+    /// Answered with a private correction before guild authority, role gates
+    /// and every read or effect.
     SetupShapeInvalid {
         command: &'static str,
         field: &'static str,
@@ -12131,6 +12141,7 @@ fn decode_page(options: &[CommandDataOption]) -> PageArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupOptionKind {
     String,
+    Integer,
     Boolean,
     Channel,
     Role,
@@ -12141,6 +12152,7 @@ impl SetupOptionKind {
         matches!(
             (self, value),
             (Self::String, CommandOptionValue::String(_))
+                | (Self::Integer, CommandOptionValue::Integer(_))
                 | (Self::Boolean, CommandOptionValue::Boolean(_))
                 | (Self::Channel, CommandOptionValue::Channel(_))
                 | (Self::Role, CommandOptionValue::Role(_))
@@ -12154,11 +12166,34 @@ impl SetupOptionKind {
 /// without a strict shape.
 fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
     match command {
+        "create" => Some(&[("name", SetupOptionKind::String)]),
         "textchannels" => Some(&[
             ("channel", SetupOptionKind::Channel),
             ("enabled", SetupOptionKind::Boolean),
             ("name", SetupOptionKind::String),
             ("viewer-role", SetupOptionKind::Role),
+        ]),
+        "position" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("position", SetupOptionKind::String),
+            ("first-number", SetupOptionKind::Integer),
+        ]),
+        "group" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        "inheritpermissions" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("source", SetupOptionKind::String),
+            ("source-channel", SetupOptionKind::Channel),
+        ]),
+        "defaultlimit" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("limit", SetupOptionKind::Integer),
+        ]),
+        "alwaysprivate" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
         ]),
         _ => None,
     }
@@ -12257,6 +12292,12 @@ fn parse_voice_command_with_registry(
     let name = identities.slash_name(interaction)?;
     match name.as_str() {
         "create" => {
+            if let Some(field) = setup_shape_refusal("create", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "create",
+                    field,
+                });
+            }
             let name = command
                 .options
                 .iter()
@@ -12307,6 +12348,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "position" => {
+            if let Some(field) = setup_shape_refusal("position", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "position",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = PositionRequest {
                 position: None,
@@ -12334,6 +12381,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "group" => {
+            if let Some(field) = setup_shape_refusal("group", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "group",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = GroupRequest { enabled: None };
             for option in &command.options {
@@ -12351,6 +12404,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "inheritpermissions" => {
+            if let Some(field) = setup_shape_refusal("inheritpermissions", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "inheritpermissions",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = InheritPermissionsRequest {
                 source: None,
@@ -12374,6 +12433,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "defaultlimit" => {
+            if let Some(field) = setup_shape_refusal("defaultlimit", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "defaultlimit",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = DefaultLimitRequest { limit: None };
             for option in &command.options {
@@ -12391,6 +12456,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "alwaysprivate" => {
+            if let Some(field) = setup_shape_refusal("alwaysprivate", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "alwaysprivate",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = AlwaysPrivateRequest { enabled: None };
             for option in &command.options {

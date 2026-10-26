@@ -16,6 +16,32 @@ Parity: [parity](parity.md) §1 #20–21 (`/sticky`, `/sticky-remove`) and the �
 `automationMessageAccepted` sticky re-post. Legacy `onChannelActivity` order is
 claim → post replacement → record → delete previous (best-effort).
 
+## Preview unsaved input privately
+
+Use `/sticky body:Read the rules debounce:5 preview:true` before replacing a
+working configuration. Under the same guild, feature and Manage Server gates
+as saving, it returns **Preview — not saved**, proposed content and the
+normalized debounce (1–300 seconds; omitted means 5). It validates the same raw
+body as saving: 1–2000 UTF-16 units, not empty or invisible-only. The private
+rendering uses delivery's mention sanitizer, additionally breaks user/role
+mention pills and marks content truncated to fit the response framing.
+
+Preview does **not** read or write saved stickies, audits, delivery claims,
+uncertainty fences, counters or jobs, and sends/edits/deletes no channel message.
+It does not verify actual delivery permissions or state, promise identical live
+rendering, or recover uncertain delivery. Save separately with the same body and
+debounce and `preview:false` (or omit preview); saving revalidates and retains
+its existing audit/recovery semantics. Wrong-type, duplicate and unknown options
+refuse privately before any storage access, never falling through to save.
+
+`crates/bot/src/sticky_unsaved_preview_acceptance_tests.rs` drives real dispatch
+with an unavailable pool, a live SQL-acquisition spy, whole-row state snapshots
+and mock REST. It covers validation, authority, strict flags, mention/Unicode
+bounds, registry/help discovery, zero preview effects, and real save/remove/
+uncertainty-reset controls. It runs in the normal bot unit suite; the disposable
+DB cases require the authorized test bootstrap. No live-guild execution is
+claimed by these fixtures.
+
 ## Acceptance matrix
 
 | # | Contract | Tests |
