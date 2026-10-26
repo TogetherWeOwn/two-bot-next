@@ -2,10 +2,9 @@
 
 Manifest: `- [Purpose](relative.md)` by area.
 
-`python3 scripts/check_docs_index.py --json` (repo root).
-`{missing,stale,oversize}` empty = PASS/exit 0, else exit 1.
-Fix rows/split docs; bad rows cite `docs/README.md:<line>` in `stale`.
-Budgets: index <12,000; others ≤65,536. `LARGE_DOCS` in `scripts/check_docs_index.py`.
+`python3 scripts/check_docs_index.py --json`: empty `{missing,stale,oversize}` = PASS/exit 0, else exit 1.
+Fix rows/split docs; `stale` cites `docs/README.md:<line>`.
+Budgets: index <12,000; others ≤65,536; see `LARGE_DOCS`.
 
 ## References and architecture
 
@@ -29,7 +28,7 @@ Budgets: index <12,000; others ≤65,536. `LARGE_DOCS` in `scripts/check_docs_in
 - [Readiness monitoring](container-readiness.md)
 - [Startup diagnostics](startup-diagnostics.md)
 - [Gateway recovery](gateway-recovery.md)
-- [Gateway failure rules](gateway-failure-classification.md)
+- [Gateway failures](gateway-failure-classification.md)
 - [Deferred capture poison](deferred-capture-poison.md)
 - [Backups and restores](backup.md)
 - [Backfill procedure](backfill-runbook.md)
@@ -104,7 +103,7 @@ Budgets: index <12,000; others ≤65,536. `LARGE_DOCS` in `scripts/check_docs_in
 - [Response page proposal](dashboard-custom-responses-spec.md)
 - [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
-- [Onboarding page (design only)](dashboard-onboarding-self-roles-spec.md)
+- [Onboarding page proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
@@ -123,11 +122,12 @@ Budgets: index <12,000; others ≤65,536. `LARGE_DOCS` in `scripts/check_docs_in
 - [LFG voice](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
-- [Relay move (design only)](feed-move-spec.md)
+- [Relay move proposal](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
-- [Staff game mix report](game-activity-report.md)
+- [Game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
+- [Time helper (design only)](time-helper-spec.md)
 - [Queue order](schedule-queue-order.md)
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
@@ -135,6 +135,7 @@ Budgets: index <12,000; others ≤65,536. `LARGE_DOCS` in `scripts/check_docs_in
 - [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
 - [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
+- [RSVP cutoff proposal](rsvp-registration-cutoff-spec.md)
 - [Private agenda proposal](event-agenda-spec.md)
 - [Calendar handoff proposal](event-calendar-handoff-spec.md)
 - [Event role proposal](event-role-spec.md)
@@ -219,7 +220,7 @@ Budgets: index <12,000; others ≤65,536. `LARGE_DOCS` in `scripts/check_docs_in
 - [Voice checks](staging-voice-event-verification.md)
 - [Smoke replies](smoke-expected-responses.md)
 - [Smoke record form](smoke-run-record.md)
-- [Smoke surface inventory](smoke-surface-inventory.md)
+- [Smoke inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
 - [Binary lifecycle tests](alive-acceptance.md)
@@ -258,8 +259,8 @@ Budgets: index <12,000; others ≤65,536. `LARGE_DOCS` in `scripts/check_docs_in
 - [Quality gates](quality-gates.md)
 - [CI security](ci-security.md)
 - [CI speed rollout](ci-speed-rollout.md)
-- [Weekly delivery metrics](dora-metrics.md)
-- [Docs-only queue timing](ci-docs-only-queue-note.md)
+- [Delivery metrics](dora-metrics.md)
+- [Docs queue timing](ci-docs-only-queue-note.md)
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)
