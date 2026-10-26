@@ -277,13 +277,14 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .collect();
     // 23 legacy restricted rows plus management-only command-inspect,
     // command-disable, command-enable, giveaway and welcome-preview, plus
-    // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect and game-mix.
+    // purge-preview, channel-inspect, lfg-edit, lfg-list, lfg-inspect,
+    // feed-inspect, feed-pause, feed-resume and game-mix.
     // Discord defaults never
     // replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        36,
-        "23 legacy restricted rows plus thirteen Next-only management commands"
+        37,
+        "23 legacy restricted rows plus fourteen Next-only management commands"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
@@ -1132,7 +1133,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 44 names, no partial view.
+    // endpoint: one request, all 45 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1143,8 +1144,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        44,
-        "7 core + 25 feature + 9 moderation mutations + 2 reads + 1 custom"
+        45,
+        "7 core + 26 feature + 9 moderation mutations + 2 reads + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1176,7 +1177,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 44, "no partial view");
+    assert_eq!(names.len(), 45, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1199,6 +1200,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         "lfg-close",
         "lfg-edit",
         "lfg-list",
+        "lfg-inspect",
         "feed-add",
         "feed-list",
         "feed-pause",
