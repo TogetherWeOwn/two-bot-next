@@ -12749,51 +12749,104 @@ fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
     }
 }
 
+/// Strictly decoded single-occurrence option: `Missing` when absent,
+/// `Invalid` when duplicated or carrying the wrong value type, so callers
+/// refuse before any store touch instead of guessing a value.
+enum StrictArg<T> {
+    Missing,
+    Value(T),
+    Invalid,
+}
+
+/// Strictly decode one named option: `Missing` when absent, `Invalid` when
+/// the name repeats or `decode` rejects its value type. Unrelated names are
+/// ignored, so unknown or inapplicable options never refuse a shape.
+fn decode_strict_arg<T>(
+    args: &[CommandDataOption],
+    name: &str,
+    decode: impl Fn(&CommandOptionValue) -> Option<T>,
+) -> StrictArg<T> {
+    let mut seen: Option<StrictArg<T>> = None;
+    for option in args {
+        if option.name != name {
+            continue;
+        }
+        if seen.is_some() {
+            return StrictArg::Invalid;
+        }
+        seen = Some(match decode(&option.value) {
+            Some(value) => StrictArg::Value(value),
+            None => StrictArg::Invalid,
+        });
+    }
+    seen.unwrap_or(StrictArg::Missing)
+}
+
+/// Strictly decode role slots in listed order. A duplicated slot name or a
+/// non-`Role` value refuses (`None`); well-typed ids keep slot order and
+/// drop duplicate *values* — only duplicate *names* refuse.
+fn decode_access_roles(args: &[CommandDataOption], names: &[&str]) -> Option<Vec<Snowflake>> {
+    let mut roles: Vec<Snowflake> = Vec::new();
+    for name in names {
+        match decode_strict_arg(args, name, |value| match value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        }) {
+            StrictArg::Missing => {}
+            StrictArg::Value(role) => {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+            StrictArg::Invalid => return None,
+        }
+    }
+    Some(roles)
+}
+
+/// Strictly decode one `/access` invocation: exactly one top-level option,
+/// a known `SubCommand`, whose own options decode strictly (a wrong value
+/// type or a duplicated name refuses) while unknown or inapplicable names
+/// are ignored. Refusing here keeps a malformed shape from reaching the
+/// store read in `execute_access`. An omitted `role` is still a genuine
+/// clear, and `page` keeps the strict [`decode_page`] contract.
 fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
-    let Some(sub) = options.first() else {
+    let [sub] = options else {
         return AccessAction::Invalid;
     };
     let CommandOptionValue::SubCommand(args) = &sub.value else {
         return AccessAction::Invalid;
     };
-    let roles: Vec<Snowflake> = ["role", "role2", "role3"]
-        .iter()
-        .filter_map(|name| args.iter().find(|option| option.name == *name))
-        .filter_map(|option| match option.value {
-            CommandOptionValue::Role(role) => Some(role.get()),
-            _ => None,
-        })
-        .fold(Vec::new(), |mut roles, role| {
-            if !roles.contains(&role) {
-                roles.push(role);
-            }
-            roles
-        });
-    let command = args
-        .iter()
-        .find(|option| option.name == "command")
-        .and_then(|option| match &option.value {
-            CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
-            _ => None,
-        });
+    let command = decode_strict_arg(args, "command", |value| match value {
+        CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
+        _ => None,
+    });
     match sub.name.as_str() {
         "show" => AccessAction::Show {
             page: decode_page(args),
         },
-        "creation" => args
-            .iter()
-            .find(|option| option.name == "enabled")
-            .and_then(|option| match option.value {
-                CommandOptionValue::Boolean(enabled) => Some(AccessAction::Creation(enabled)),
-                _ => None,
-            })
-            .unwrap_or(AccessAction::Invalid),
-        "role" => AccessAction::RequiredRole(roles.first().copied()),
-        "restrict" => command.map_or(AccessAction::Invalid, |command| AccessAction::Restrict {
+        "creation" => match decode_strict_arg(args, "enabled", |value| match value {
+            CommandOptionValue::Boolean(enabled) => Some(*enabled),
+            _ => None,
+        }) {
+            StrictArg::Value(enabled) => AccessAction::Creation(enabled),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
+        "role" => match decode_access_roles(args, &["role"]) {
+            Some(roles) => AccessAction::RequiredRole(roles.first().copied()),
+            None => AccessAction::Invalid,
+        },
+        "restrict" => match (
             command,
-            roles,
-        }),
-        "unrestrict" => command.map_or(AccessAction::Invalid, AccessAction::Unrestrict),
+            decode_access_roles(args, &["role", "role2", "role3"]),
+        ) {
+            (StrictArg::Value(command), Some(roles)) => AccessAction::Restrict { command, roles },
+            _ => AccessAction::Invalid,
+        },
+        "unrestrict" => match command {
+            StrictArg::Value(command) => AccessAction::Unrestrict(command),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
         _ => AccessAction::Invalid,
     }
 }
@@ -13451,6 +13504,12 @@ fn access_show_page(controls: &AccessControls, page: usize) -> String {
     lines.join("\n")
 }
 
+/// Short refusal for a malformed `/access` shape: names a copyable
+/// invocation, says nothing changed, and echoes none of the bad input.
+fn access_invalid_refusal() -> String {
+    "That /access option is not valid. Nothing was changed. Use /access show page:1 to see the current settings.".to_owned()
+}
+
 /// Short refusal for a malformed `/access show` page: names the remedy and a
 /// valid start, serves no rows and leaks no role mentions.
 fn access_page_refusal() -> String {
@@ -13506,8 +13565,11 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
-    // A malformed read page refuses before any store touch: no read cost,
+    // Malformed shapes refuse before any store touch: no read cost,
     // no save, no actor/config/audit mutation.
+    if matches!(&action, AccessAction::Invalid) {
+        return access_invalid_refusal();
+    }
     let show_page_invalid = matches!(
         &action,
         AccessAction::Show { page } if page.number().is_none()
@@ -13534,10 +13596,8 @@ async fn execute_access<S: RoomPersistence>(
             }
             return access_show_page(&controls, number);
         }
-        AccessAction::Invalid => {
-            return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
-                .to_owned()
-        }
+        // Refused before the store read above; kept for exhaustiveness.
+        AccessAction::Invalid => return access_invalid_refusal(),
         AccessAction::Creation(enabled) => {
             controls.room_creation_enabled = enabled;
             access_creation_ack(enabled)
