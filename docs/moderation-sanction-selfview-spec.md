@@ -43,6 +43,7 @@ facts, not deployed-state or demand measurements.
 | Tempban expiry | [Staging](crates/core/src/member_moderation.rs#L1406-L1440) persists `execute_at` with the prepared intent before Discord; [schema](crates/cutover/migrations/0110_moderation_member.sql#L30-L49) carries `staged/pending/running/done/superseded/cancelled/quarantined` states. Tempban bounds are 60 s–365 d ([domain](docs/member-moderation.md)) |
 | Kick/timeout | Discord mutation only; no durable rows besides the audit ([execute](crates/core/src/member_moderation.rs#L1441-L1454)). The timeout `until` is passed to Discord and never stored, so **no stored "active timeout" fact exists** |
 | Audit | All five verbs write `moderation_audit` (actor, action, target, reason, outcome, metadata): bans at the PUT boundary, others post-effect ([service](crates/core/src/member_moderation.rs#L1352-L1360)). Indexed by `(guild_id, target_id, created_at)` ([schema](crates/cutover/migrations/0110_moderation_member.sql#L66-L67)) |
+| Audit outcomes | Accepted outcomes are `banned`, `temporarily_banned`, `kicked`, `timed_out`, `warned`, `unbanned` ([vocabulary](crates/core/src/member_moderation.rs#L92-L99)). Refusals write `denied` on `{request}:denied` ([refusal](crates/core/src/member_moderation.rs#L1132-L1152)); failures write `{request}:{outcome}` with `failed` or `in_progress` ([failure](crates/core/src/member_moderation.rs#L1156-L1176)); sweep failures write `unban_failed` ([sweep](crates/core/src/member_moderation.rs#L1639-L1658)); `ban_reconcile`/`accepted_historical` is operator reconciliation evidence, not a member event ([reconcile](crates/core/src/member_moderation.rs#L441-L460)) |
 | Self-serve precedent | `/privacy` is invoker-only with no target option, ephemeral completion, a fixed `member:self-serve` actor label and a member cooldown ([handler](crates/bot/src/privacy_command.rs#L1-L21), [label](crates/bot/src/privacy_command.rs#L38-L41), [cooldown](crates/bot/src/privacy_command.rs#L52-L57)) |
 | Reply privacy | Visibility is fixed at the initial ACK, never at edit ([lifecycle](docs/interaction-replies.md)). A private read must defer ephemeral, not repair a public placeholder |
 | Actor budget | Member verbs share a process-local 5 s per-actor cooldown, 1024 actors, monotonic clock ([domain](docs/member-moderation.md)). Malformed invocations never consume it |
@@ -68,19 +69,43 @@ or API. No build or behavior-test card before the gates in §14.
 - **Content:** active ledger sanctions of any age plus the invoker's sanction
   events from the trailing 365 days, newest first, at most 25 rows plus the
   exact truncation receipt in §10. Per row: sanction type, reason as inert
-  plain text (§5), issued-at timestamp, and one terminal-or-live state word:
-  `active until <expiry>`, `expired`, `completed`, `superseded`, or `recorded`
-  (warnings, kicks and timeouts are events; only tempbans carry a stored
-  expiry). Beyond-window owned rows count into the receipt
-  ("showing 25 of 31; older entries are available from a moderator") so the
-  window never silently rewrites history.
+  plain text (§5, truncated to the per-reason share in Reply bounds),
+  issued-at timestamp, and one terminal-or-live state word: `active`
+  (permanent bans), `active until <expiry>`, `expired`, `completed`,
+  `superseded`, or `recorded` (warnings, kicks and timeouts are events; only
+  tempbans carry a stored expiry). Eligibility is closed: only the per-verb
+  sources below render, and only exact allowlisted audit pairs. Refused,
+  failed, prepared, rejected, reconciled and uncertain records never render,
+  so a denied kick or a never-accepted ban intent can never appear as a
+  sanction.
+- **Source of truth (per verb; dedup key `request_id`):** warns come from
+  the `moderation_warnings` row; the same-request audit pair
+  (`moderation.warn`, `warned`) corroborates but never creates a second row.
+  Kicks and timeouts come from the audit pairs (`moderation.kick`, `kicked`)
+  and (`moderation.timeout`, `timed_out`) only. Bans and tempbans come from
+  the newest accepted ledger generation plus its schedule; prepared and
+  rejected generations never display, older accepted generations show
+  `superseded`, and ban audit pairs corroborate but never create a row
+  (ban acceptance is audited at the PUT boundary, before confirmation).
+  Excluded audit: `denied`, `failed`, `in_progress` and `unban_failed`
+  outcomes, `ban_reconcile`/`accepted_historical` reconciliation rows, and
+  every other (action, outcome) pair. Schedule states map to `active until
+  <expiry>` (`staged`/`pending`/`running`), `expired` or `completed`
+  (`done`; `completed` only with a (`moderation.unban_scheduled`,
+  `unbanned`) marker on `{ban_request_id}:unban`), `superseded`
+  (`superseded`), or exclusion (`cancelled`/`quarantined`: uncertain or
+  never-effective, staff tooling only). Automod is out of scope: it writes no
+  member-moderation rows at the base and never appears here.
 - **Actor:** the fixed label `Moderation team` on every row. Role-derived
   labels are rejected: historical roles are not stored and live role reads
   would add a new REST surface plus a staff-presence oracle. Snowflakes,
   names and discriminators never appear.
 - **Empty state:** "No sanctions on your record in this server in the last 12
   months." An erased or never-sanctioned member sees this same shape; there
-  is no tombstone and no "erased" disclosure (§8).
+  is no tombstone and no "erased" disclosure (§8). When zero rows fall in
+  the window but older owned rows exist, the same sentence is followed by
+  the exact 0-of-N receipt (`showing 0 of 0 in the last 12 months; N older
+  entries are available from a moderator`).
 - **Unavailable shape:** DM, foreign guild, guild-less, non-member and
   lookup-failure invocations share one identical private reply: "This view is
   not available here." No existence flag, count, state word or retry hint that
@@ -88,7 +113,14 @@ or API. No build or behavior-test card before the gates in §14.
 - **Reply bounds:** ephemeral at ACK, plain text, no embeds, no DMs, no
   follow-ups, at most 1800 UTF-8 bytes of sanction content. Closed
   `allowed_mentions` on every response (empty parse/users/roles,
-  `replied_user=false`).
+  `replied_user=false`). Byte budget: labels plus the receipt compose first
+  in fixed ASCII formats; the remaining bytes split evenly across rendered
+  rows as the per-reason share; each reason truncates on a character
+  boundary to its share with a trailing `…` when cut. Reasons arrive up to
+  512 UTF-16 units ([cap](docs/member-moderation.md#L20-L22)), so truncation
+  is the rule, not the exception. Precedence is fixed: all 25 rows always
+  render, and the reply never exceeds 1800 bytes. Truncation never splits a
+  code point, so the reply is always valid UTF-8 (SS-F18).
 - **No live Discord reads.** The read path uses the authenticated interaction
   context (guild plus invoker, as `/privacy` does) and stored rows only. A
   current ban cannot be re-proven live and a current timeout cannot be
@@ -127,7 +159,12 @@ is required or permitted in this read path.
   Discord mention syntax is deterministically neutralized before display:
   `<@id>`, `<@!id>`, `<@&id>`, `@everyone` and `@here` each become the fixed
   token `[mention removed]`. No ping, no profile link, no role highlight can
-  survive. Raw snowflake digit-strings inside prose are **not** detected or
+  survive. Masked links and bare URLs are defanged just as
+  deterministically: `](` becomes `]` + U+200B + `(` and `://` becomes `:`
+  + U+200B + `//`, the same zero-width-split precedent as the reply-slot
+  sanitizer ([sanitizer](crates/bot/src/member_runtime.rs#L802-L810)).
+  Masked links render as literal text and bare URLs never autolink, so no
+  clickable link survives. Raw snowflake digit-strings inside prose are **not** detected or
   masked: there is no general personal-data recognizer here (same boundary as
   [privacy](docs/privacy.md)), and guessing would both miss and over-redact.
   Staff guidance on reason wording is out of scope; the structural guarantee
@@ -142,10 +179,12 @@ is required or permitted in this read path.
 
 ## 6. Read-audit decision (recorded)
 
-**Decision: self-view reads write no audit rows and no access log identifying
-the reader.** A read mutates nothing, so unlike an opt-out purge it needs no
-accountability receipt; the purge receipt exists because data was deleted
-([privacy](docs/privacy.md)). Reasons:
+**Decision: self-view reads write no moderation-store rows and no access log
+identifying the reader.** Identity-free aggregate invocation counters and
+telemetry may still move (SS-F15), so the claim is scoped: no audit row, no
+per-reader record, no sanction-table write. Unlike an opt-out purge the read
+needs no accountability receipt; the purge receipt exists because data was
+deleted ([privacy](docs/privacy.md)). Reasons:
 
 1. A per-read log would create a new sensitive dataset (which member checked
    their record, when) with its own retention, erasure and access rules,
@@ -213,6 +252,10 @@ The read runs as one `READ ONLY` transaction across warnings, the ban ledger
 and audit, so a single snapshot answers every row. Snapshot truth, not live
 truth, is displayed.
 
+The read captures one clock instant at snapshot start. Every derived state
+word compares `execute_at` against that instant, and the 365-day window
+bounds derive from it too. Per-row clock reads are not allowed.
+
 | Concurrent event | Read behavior |
 | --- | --- |
 | Sanction commits before the snapshot | Included in this read |
@@ -222,7 +265,7 @@ truth, is displayed.
 | New warn lands while composing the reply | Next read; no live insertion |
 | Appeal state flips mid-read | Pointer may lag one read; the reply frames status as of just now and points at the appeal entry for current state |
 | Erasure commits between snapshot and reply | The reply may show just-deleted own rows. **Accepted residual:** the recipient is the data subject, the content was true at snapshot time, and nothing persists server-side. The next read is empty |
-| Concurrent reads by any members | Independent; pure reads serialize nothing and take no locks beyond the snapshot |
+| Concurrent reads by any members | Independent; snapshot reads serialize nothing and take no locks beyond the snapshot |
 | Discord-side timeout expiry | Never observed: no live reads (§3). Timeout rows are events with issued-at plus duration, never "active now" claims |
 
 No lock is held across Discord I/O: the snapshot closes before the reply is
@@ -237,21 +280,28 @@ composed, and composition touches no database.
   invocations consume neither cooldown nor budget. The 11th read in the hour
   gets a private "try again later" reply with no sanction content and no
   queue position.
-- **Query bounds:** fenced indexed scans only; `LIMIT 26` (25 display rows
-  plus the overflow witness); a bounded statement timeout; one `READ ONLY`
-  transaction. No full-history export and no pagination cursor in this slice:
-  the receipt plus the staff pointer is the whole overflow story.
+- **Query bounds:** fenced indexed scans only, in one `READ ONLY` snapshot:
+  the 25 display rows via `LIMIT 26` (25 rows plus the overflow witness),
+  plus two bounded `COUNT(*)` queries over the same fenced, deduplicated
+  eligible set (§3): the in-window total and the beyond-window total, both
+  partitioned by the single captured clock instant. A bounded statement
+  timeout applies. No full-history export and no pagination cursor in this
+  slice: the exact receipt plus the staff pointer is the whole overflow
+  story. Receipt templates: `showing R of T in the last 12 months` (R =
+  rendered rows, T = in-window total), with `; O older entries are available
+  from a moderator` appended when the beyond-window total O is nonzero.
 - **Reply bounds:** §3 (ephemeral at ACK, plain text, ≤1800 bytes, closed
   mentions). A failed reply after a successful read retries nothing: there
   is no mutation to reconcile, and the member simply re-invokes (which
   consumes budget; that cost is disclosed in help, not negotiated per call).
 - **Zero writes, proven:** no audit row, no idempotency claim (reads need
   none), no cache insert, no prefetch, no background sweep or queue. The
-  acceptance matrix (§12) asserts table counters unchanged across reads.
+  acceptance matrix (§12) asserts table counters unchanged across reads;
+  identity-free aggregate telemetry is the only permitted movement (SS-F15).
 
 ## 11. Offline decision sketch (runnable now, stdlib only)
 
-The sketch below checks the redaction contract fragments and the matrix shape.
+The sketch below checks the redaction and byte-budget contract fragments and the matrix shape.
 It is not production code, store behavior, runtime acceptance or a security
 proof. Its functions are policy fragments; the real seam must still satisfy
 §5 end to end, including non-selection (which no string function can prove).
@@ -262,16 +312,28 @@ proof. Its functions are policy fragments; the real seam must still satisfy
 >>> def display_actor(actor_id):
 ...     return MODERATOR_LABEL
 >>> MENTION_RE = re.compile(r"<@!?\d+>|<@&\d+>|@everyone|@here")
+>>> ZWSP = chr(0x200B)
 >>> def display_reason(reason):
-...     return MENTION_RE.sub("[mention removed]", reason)
+...     text = MENTION_RE.sub("[mention removed]", reason)
+...     return text.replace("](", "]" + ZWSP + "(").replace("://", ":" + ZWSP + "//")
+>>> def fit_reason(reason, share):
+...     encoded = reason.encode("utf-8")
+...     if len(encoded) <= share:
+...         return reason
+...     return encoded[:max(share - 3, 0)].decode("utf-8", "ignore") + "…"
 >>> assert display_actor("123") == display_actor("999") == "Moderation team"
 >>> assert display_reason("Slurs toward <@123> and @everyone") == "Slurs toward [mention removed] and [mention removed]"
 >>> assert display_reason("Plain reason stays intact.") == "Plain reason stays intact."
+>>> link_out = "See [form]" + ZWSP + "(https:" + ZWSP + "//example.invalid/) or https:" + ZWSP + "//example.invalid/"
+>>> assert display_reason("See [form](https://example.invalid/) or https://example.invalid/") == link_out
+>>> assert fit_reason("x" * 100, 10) == "xxxxxxx…"
+>>> clipped = fit_reason("😀" * 10, 10)
+>>> assert clipped.endswith("…") and len(clipped.encode("utf-8")) <= 10
 >>> text = pathlib.Path("docs/moderation-sanction-selfview-spec.md").read_text()
 >>> cases = re.findall(r"^\| (SS-F\d{2}) ", text, re.M)
->>> assert cases == [f"SS-F{i:02}" for i in range(1, 17)], cases
+>>> assert cases == [f"SS-F{i:02}" for i in range(1, 19)], cases
 >>> print(json.dumps({"schema": "moderation.selfview.mock.v1", "matrix_rows": len(cases), "outcome": "offline_examples_pass"}))
-{"schema": "moderation.selfview.mock.v1", "matrix_rows": 16, "outcome": "offline_examples_pass"}
+{"schema": "moderation.selfview.mock.v1", "matrix_rows": 18, "outcome": "offline_examples_pass"}
 
 ```
 
@@ -299,14 +361,14 @@ private text in evidence. Timing bounds are acceptance targets, not SLAs.
 
 | Case | Given / when / then oracle |
 | --- | --- |
-| SS-F01 | Given an accepted tempban with future `execute_at` plus a warning, when the member reads, then one `active until <expiry>` row and one `recorded` row appear with reasons and issued-at; every actor reads `Moderation team`; no snowflake, name or ID appears in the reply |
-| SS-F02 | Given warnings across 400 days, when the member reads, then newest-first rows within the trailing 365 days appear with inert reasons; the receipt counts beyond-window owned rows and points at a moderator |
+| SS-F01 | Given an accepted tempban with future `execute_at`, an accepted permanent ban, plus a warning, when the member reads, then one `active until <expiry>` row, one `active` row and one `recorded` row appear with reasons and issued-at; every actor reads `Moderation team`; no snowflake, name or ID appears in the reply |
+| SS-F02 | Given warnings across 400 days, when the member reads, then newest-first rows within the trailing 365 days appear with inert reasons; the receipt states exact in-window and beyond-window totals (`showing R of T in the last 12 months; O older entries are available from a moderator`); given only beyond-window rows, the empty-state sentence plus the exact `showing 0 of 0` receipt appears |
 | SS-F03 | Given an expired tempban, a superseded schedule and a completed unban, when the member reads, then each shows its terminal state word and none claims `active` |
 | SS-F04 | Given kick and timeout audit events, when the member reads, then each shows as an event with issued-at (plus duration for the timeout); no row claims live-active state and no Discord member fetch runs |
 | SS-F05 | Given an erased member and a never-sanctioned member, when each reads, then both see the identical empty state; no tombstone, no "erased" disclosure, zero rows |
 | SS-F06 | Given a sanctioned member, when they opt out, read, opt in and read again, then all four reads are byte-identical apart from timestamps |
 | SS-F07 | Given two sanctioned members A and B, when A reads, then the reply, logs, traces and telemetry contain zero rows, reasons, counts or identifiers belonging to B |
-| SS-F08 | Given a reason containing `<@id>`, `<@&id>`, `@everyone` and `@here`, when the member reads, then each becomes `[mention removed]`; the reply carries closed mentions and renders no ping, link or highlight |
+| SS-F08 | Given a reason containing `<@id>`, `<@&id>`, `@everyone`, `@here`, a masked link `[form](https://example.invalid/)` and a bare `https://example.invalid/` URL, when the member reads, then mentions become `[mention removed]` and link/URL syntax renders literally with zero-width splits; the reply carries closed mentions and renders no ping, link or highlight |
 | SS-F09 | Given a departed member, a DM, a foreign guild and an injected lookup failure, when each reads, then all four receive the identical unavailable shape with zero writes and no existence signal |
 | SS-F10 | Given a staff member with own sanctions, when they read, then they see only their own rows; no target option exists and supplied IDs refuse before any read |
 | SS-F11 | Given the hourly budget, when a member reads 10 times then an 11th, then the 11th is privately refused with no sanction content and no queue; malformed taps consume nothing |
@@ -314,7 +376,9 @@ private text in evidence. Timing bounds are acceptance targets, not SLAs.
 | SS-F13 | Given expiry, sweep completion and erasure racing a read, when each lands mid-read, then the in-flight reply keeps snapshot truth and the next read converges; post-erasure reads show the empty state |
 | SS-F14 | Given appeal states mapped, unmapped and absent, when the member reads, then exact states map, others fall back to the generic pointer, and no appeal content, thread or note ever appears |
 | SS-F15 | Given table counters before a burst of reads, when members read, refuse and re-read, then every counter on all six moderation tables plus audit is unchanged; only identity-free aggregate telemetry moves |
-| SS-F16 | Given 30 owned rows in window, when the member reads, then 25 newest rows render within 1800 bytes ephemeral-at-ACK with the exact `showing 25 of 30` receipt; no cursor or second page exists |
+| SS-F16 | Given 30 owned rows in window, when the member reads, then 25 newest rows render within 1800 bytes ephemeral-at-ACK with the exact `showing 25 of 30 in the last 12 months` receipt; reasons over the per-reason share truncate on character boundaries with `…`; no cursor or second page exists |
+| SS-F17 | Given a denied kick audit, a failed timeout audit, a prepared ban intent, a rejected ban generation and a `ban_reconcile` row for the member alongside one accepted warn, when the member reads, then only the single warn renders; denied, failed, prepared, rejected and reconciled records never appear and the warn renders once (no audit double-count) |
+| SS-F18 | Given 25 sanctions with maximum-length 512-unit multibyte reasons, when the member reads, then all 25 rows render within 1800 bytes with the exact `showing 25 of 25 in the last 12 months` receipt; every reason is character-boundary truncated with `…` and the reply is valid UTF-8 |
 
 Reusable harnesses (existence is not evidence of B passing): the recording
 transport above, member-moderation DB suites, privacy self-serve suites and
@@ -332,11 +396,11 @@ dependency. No slice starts before the gates in §14.
 
 | Slice | One-day scope | Out of scope | Exit (all required) |
 | --- | --- | --- | --- |
-| S1 read model | Pure shaping/redaction: state words, mention neutralization, receipt text, empty/unavailable shapes, byte cap; unit tests only | DB, Discord, command wiring, appeal | All §11 fragments plus edge cases covered; zero I/O in the module |
-| S2 store read | One fenced snapshot seam over warnings, ban ledger and audit; `LIMIT 26`; ignored DB tests on disposable schemas | UX, budgets, appeal, migrations (none needed: existing indexes suffice) | Snapshot consistency plus fence proofs; zero-write assertion harness ready |
-| S3 command UX | `/my-sanctions` wiring: router gates, ephemeral lifecycle, 10/hour budget, help text, registry collision proof | Appeal pointer (generic fallback only), staff views, pagination | Staging-dark with S1+S2; SS-F01–F13 and SS-F15–F16 green |
+| S1 read model | Pure shaping/redaction: state words, mention plus link/URL neutralization, per-reason byte budgeting, receipt text, empty/unavailable shapes, byte cap; unit tests only | DB, Discord, command wiring, appeal | All §11 fragments plus edge cases covered; zero I/O in the module |
+| S2 store read | One fenced snapshot seam over warnings, ban ledger and audit with the §3 source-of-truth and allowlist; display rows via `LIMIT 26` plus bounded in-window/beyond-window `COUNT(*)`; one captured clock instant; ignored DB tests on disposable schemas | UX, budgets, appeal, migrations (none needed: existing indexes suffice) | Snapshot consistency plus fence proofs; zero-write assertion harness ready |
+| S3 command UX | `/my-sanctions` wiring: router gates, ephemeral lifecycle, 10/hour budget, help text, registry collision proof | Appeal pointer (generic fallback only), staff views, pagination | Staging-dark with S1+S2; SS-F01–F13 and SS-F15–F18 green |
 | S4 appeal pointer | Exact-state mapping table against landed appeal states plus fallback; mapping tests | Any appeal behavior, content or eligibility change | SS-F14 green; unknown-state fuzz green |
-| S5 matrix closeout | Full §12 execution, evidence pack, docs finalization | New behavior of any kind | 16/16 oracles disposed; spec revision bound to results |
+| S5 matrix closeout | Full §12 execution, evidence pack, docs finalization | New behavior of any kind | 18/18 oracles disposed; spec revision bound to results |
 
 S4 is blocked until the appeal design enumerates its states; S1–S3 and S5-minus-F14
 proceed without it. Any slice that cannot fit its day, needs a migration, or
@@ -350,7 +414,7 @@ this file's SHA-256. A merged design or pending review is not acceptance. Any
 spec revision invalidates earlier acceptance; no timeout approval.
 
 - **CEO/host decision:** keep A, or substantiate B's member use case and
-  accept the display window, fixed anonymous attribution, mention
+  accept the display window, fixed anonymous attribution, mention/link
   neutralization, hourly budget, zero-read-logging (§6) and the appeal
   dependency (§7). Acceptance of the list is not acceptance of the pointer:
   S4 needs the appeal states plus a second intent confirmation.
