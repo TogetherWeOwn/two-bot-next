@@ -22,11 +22,14 @@ fallback counts as the event's one delivery attempt.
 
 The existing activation-fenced automation scheduler must be enabled; its normal
 15-second cadence also handles these reminders, at most two events per tick.
-Ordinary scheduled messages run first: a failure that stops their batch also
-skips reminders for that tick. Reminder database or result-audit errors fail the
-shared job's health signal rather than being reported as a healthy tick; prior
-scheduled-message completions remain committed. Sustained scheduler/store
-trouble can therefore cause a reminder window to be missed.
+Ordinary scheduled messages run first as a separate phase: a completed
+schedule-store failure that stops their batch still permits the bounded
+reminder attempt on the same tick when activation and supervisor ownership
+remain valid, sharing one overall deadline and cancellation. Either phase
+failing reports the shared job as unhealthy (both store failures map to the
+existing database class); prior completions in either phase remain committed.
+Sustained scheduler/store trouble can therefore cause a reminder window to be
+missed.
 It reads the guild-scoped scheduled-event mirror and stored RSVPs, not a new live
 Discord lookup. A mirror update after dispatch admission cannot recall a message
 already in flight. As with other mirrored event views, a Discord cancellation

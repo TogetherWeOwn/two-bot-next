@@ -182,6 +182,16 @@ dependencies and the same minimal release profile. The budget is therefore
 rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;
 revisit if the binary approaches it. The 112 MiB image ceiling is unchanged.
 
+On 2026-10-24 the 17 MiB ceiling was nearly spent: main at `25377c8` measured
+17,806,608 bytes (16.98 MiB) in its [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40096683128),
+19,184 bytes of headroom. The feed pause/resume slice measured 17,831,440 bytes
+(17.01 MiB), 5,648 bytes over, in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40099776675/job/120889388251),
+about 24,800 bytes above main, from command, store and poller code with no new
+dependencies and the same minimal release profile (opt-level=z, lto, strip). The
+ceiling moves to 18 MiB, leaving about 1 MiB of headroom above the measured
+head; revisit if the binary approaches it. The 112 MiB image ceiling is
+unchanged (43.43 MiB measured on the same build).
+
 On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
 `cc07f31436` measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over the
 ceiling, in [its container smoke
@@ -195,9 +205,9 @@ of headroom above the measured heads; revisit if the binary approaches it.
 The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
 
 This branch's automation-only head separately measured 15,769,872 bytes
-(15.04 MiB) before the event-executor merge. This PR raises the binary
-ceiling to 17 MiB; the combined exact-head CI measurement is still
-required.
+(15.04 MiB) before the event-executor merge. The current binary ceiling is
+18 MiB following the 2026-10-24 calibration above; each combined exact-head
+CI measurement is still required.
 
 ### Docker history image measurement and immutable-ID pinning
 

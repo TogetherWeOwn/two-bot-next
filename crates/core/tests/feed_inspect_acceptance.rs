@@ -16,9 +16,9 @@
 //! Builder contract (one slice):
 //! - Register `feed-inspect` in the announcement set with a required string
 //!   `id` option (max 128), Manage Server permission, guild-only, no DMs.
-//!   The all-on union has 10 announcements, retaining LFG editing and
-//!   current-channel LFG discovery alongside feed inspection; help lists
-//!   inspect under Feed relays.
+//!   The all-on union has 12 announcements, retaining LFG editing and
+//!   current-channel LFG discovery alongside feed inspection and the
+//!   feed-pause/feed-resume lifecycle pair; help lists inspect under Feed relays.
 //! - Add `Inspect { id }` plan routing with the same enabled, configured-guild
 //!   and Manage Server gates as the existing trio, plus the same ID shape.
 //! - Render one bounded detail reply (at most 2000 UTF-16 units) with the
@@ -135,9 +135,15 @@ fn inspect_command_is_registered_with_stable_id_and_manage_guild() {
     let definitions = announcement_commands();
     assert_eq!(
         definitions.len(),
-        10,
-        "the announcement union retains LFG editing, current-channel LFG discovery, and feed inspection"
+        12,
+        "the announcement union retains LFG editing, current-channel LFG discovery, feed inspection, and feed-pause/feed-resume"
     );
+    for name in ["lfg-edit", "lfg-list", "feed-pause", "feed-resume"] {
+        assert!(
+            definitions.iter().any(|command| command.name == name),
+            "the announcement union retains {name}"
+        );
+    }
     let definition = definitions
         .iter()
         .find(|command| command.name == INSPECT_COMMAND)

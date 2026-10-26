@@ -31,20 +31,21 @@ unwanted bot volume, not more bot engagement. No spend or live experiment follow
 
 ## 2. Observed baseline and limits
 
-Source baseline: `c3af7333df80a766f5d4c229506a3bce53680828` (source inspection,
-not deployment verification). See [feed operations](feed-supervisor.md) and
+Original inspection baseline: `c3af7333df80a766f5d4c229506a3bce53680828`.
+Current-source links rechecked at `e1868d97d3519cae3f2ed91726e83e98f77dff0d`;
+not deployment verification. See [feed operations](feed-supervisor.md) and
 [domain/store contract](feeds-port.md). The model exposes a parsed title and URL,
 not a filter policy. Existing parsing, URL safety, message bounds, 20 POST-attempt
 budget and nonce recovery remain mandatory, before and after any future matcher.
 
 - [Model](../crates/core/src/feeds.rs#L65-L85) has no title-filter setting or
-  durable filtered outcome. The [parser](../crates/core/src/feeds.rs#L1076-L1091)
+  durable filtered outcome. The [parser](../crates/core/src/feeds.rs#L1153-L1168)
   substitutes `Untitled` for missing, empty, repeated or literal JS-trim-whitespace-only
   title fields, losing presence evidence. Numeric references such as `&#32;` stay
-  present as literal text: [decoding](../crates/core/src/feeds.rs#L1360-L1370) does
+  present as literal text: [decoding](../crates/core/src/feeds.rs#L1437-L1447) does
   **not** convert them to whitespace. An actual title `Untitled` is indistinguishable
   through `FeedItem.title` alone.
-  [Scalar extraction](../crates/core/src/feeds.rs#L1159-L1187) rejects repeated
+  [Scalar extraction](../crates/core/src/feeds.rs#L1236-L1264) rejects repeated
   title fields and omits nested element text. B needs a separate presence/usability
   signal before fallback; this design does not implement it.
 - [Poller](../crates/bot/src/feed_jobs.rs): recovery and new XML candidates are
@@ -60,9 +61,11 @@ budget and nonce recovery remain mandatory, before and after any future matcher.
   feed-remove refusal. This is an existing gap, not a claimed protection. B must
   reconcile this before adoption. See [privacy contract](privacy.md); titles,
   keywords and hashed item identities are not anonymous by default.
-- Pause/resume is separate work in [PR #1720](https://github.com/TogetherWeOwn/two-bot-next/pull/1720),
-  not a shipped capability assumed by this proposal. Source preview, inspection,
-  paging and dashboard designs do not implement or authorize matching.
+- Pause/resume was separate work at the original baseline;
+  [PR #1720](https://github.com/TogetherWeOwn/two-bot-next/pull/1720) is now merged
+  on main, preserving relay/delivery history without title filtering. Deployment
+  was not verified here. Source preview, inspection, paging and dashboard designs
+  do not implement or authorize matching.
 
 ## 3. Conditional B: exact matcher v1
 
@@ -204,9 +207,11 @@ storage/erasure/recovery contract has independent disposition.
 
 Future creator/member erasure, guild purge and relay removal must share a
 reviewed pending-recovery refusal under guild-scoped maintenance, then delete
-policy, skips and related snapshots with the relay once safe. **Only feed removal
-has that refusal today**; do not claim the current erasure path is safe for new
-filter state. No subject hash, hidden archive or copied keyword survives as a
+policy, skips and related snapshots with the relay once safe. Feed removal refuses
+deletion while deliveries are pending; an enabled-to-paused transition also
+refuses pending deliveries. **Member/guild erasure still lacks the feed-pending
+guard**; do not claim it is safe for new filter state. No subject hash, hidden
+archive or copied keyword survives as a
 substitute. The schema manifest, grants and receipts require explicit future
 coverage. Relay/item IDs and hashes can be linkable; do not label them anonymous.
 Deletion does not recall Discord posts. Never silently clear an unresolved send
