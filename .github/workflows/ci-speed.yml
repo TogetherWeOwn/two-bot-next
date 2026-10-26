@@ -95,6 +95,7 @@ jobs:
               - 'docs/metrics.md'
               - 'docs/startup-diagnostics.md'
               - 'docs/README.md'
+              - 'docs/index-*.md'
               - 'wrangler/wrangler.toml'
             worker:
               - 'wrangler/**'

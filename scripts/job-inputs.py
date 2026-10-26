@@ -302,7 +302,11 @@ def classify(path):
         if PARITY_SCRIPT_MARKER in Path(path).name:
             jobs.add(PARITY)
         return frozenset(jobs)
-    if path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT:
+    # The protected index control follows README-linked section fragments.
+    # Select all candidates conservatively; a fragment-only edit must not
+    # bypass the Rust discoverability assertion. Worker tests read the listing.
+    if (path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT
+            or Path(path).match("docs/index-*.md")):
         return frozenset({RUST, WORKER})
     if path.startswith(WORKER_PREFIX):
         return frozenset({WORKER})

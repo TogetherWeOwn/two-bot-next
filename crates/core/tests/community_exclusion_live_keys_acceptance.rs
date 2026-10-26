@@ -1079,13 +1079,156 @@ fn community_jobs_doc_documents_this_offline_verification() {
     );
 }
 
+// Match the manifest row contract, not arbitrary mentions of a link. Only
+// follow flat index-*.md section fragments explicitly linked by README: an
+// orphan, an unrelated guide, or a broken destination is not discoverability.
+fn community_jobs_is_indexed(read: impl Fn(&str) -> Option<String>) -> bool {
+    let Some(index) = read("docs/README.md") else {
+        return false;
+    };
+    if read("docs/community-jobs.md").is_none() {
+        return false;
+    }
+    let has_guide_row = |text: &str| {
+        text.lines()
+            .any(|line| line == "- [Community jobs](community-jobs.md)")
+    };
+    if has_guide_row(&index) {
+        return true;
+    }
+    let fragment_row = regex::Regex::new(r"^- \[([^\]\n]+)\]\((index-[A-Za-z0-9_-]+\.md)\)$")
+        .expect("index fragment row pattern");
+    index.lines().any(|line| {
+        fragment_row.captures(line).is_some_and(|row| {
+            !row[1].trim().is_empty()
+                && read(&format!("docs/{}", &row[2]))
+                    .is_some_and(|fragment| has_guide_row(&fragment))
+        })
+    })
+}
+
+fn community_jobs_fixture_is_indexed(files: &[(&str, &str)]) -> bool {
+    community_jobs_is_indexed(|path| {
+        files
+            .iter()
+            .find(|(name, _)| *name == path)
+            .map(|(_, contents)| (*contents).to_owned())
+    })
+}
+
 #[test]
 fn control_verification_doc_stays_discoverable_from_the_index() {
-    let index = read_doc("docs/README.md");
     assert!(
-        index.contains("[Community jobs](community-jobs.md)"),
-        "the verification doc must stay indexed"
+        community_jobs_is_indexed(|path| {
+            std::fs::read_to_string(repository_root().join(path)).ok()
+        }),
+        "the verification doc must exist and stay indexed directly or through a README-linked fragment"
     );
+}
+
+#[test]
+fn control_docs_index_accepts_the_direct_layout() {
+    assert!(community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", "- [Community jobs](community-jobs.md)\n"),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
+fn control_docs_index_accepts_a_readme_linked_section_fragment() {
+    assert!(community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", "- [Community](index-community.md)\n"),
+        (
+            "docs/index-community.md",
+            "# Community\n\n- [Community jobs](community-jobs.md)\n",
+        ),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
+fn control_docs_index_rejects_a_missing_community_jobs_row() {
+    assert!(!community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", "- [Community](index-community.md)\n"),
+        ("docs/index-community.md", "# Community\n"),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
+fn control_docs_index_rejects_an_unlinked_fragment() {
+    assert!(!community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", "# Documentation map\n"),
+        (
+            "docs/index-community.md",
+            "- [Community jobs](community-jobs.md)\n",
+        ),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
+fn control_docs_index_rejects_a_broken_guide_destination() {
+    for (index, fragment) in [
+        ("- [Community jobs](community-jobs.md)\n", ""),
+        (
+            "- [Community](index-community.md)\n",
+            "- [Community jobs](community-jobs.md)\n",
+        ),
+    ] {
+        assert!(!community_jobs_fixture_is_indexed(&[
+            ("docs/README.md", index),
+            ("docs/index-community.md", fragment),
+        ]));
+    }
+}
+
+#[test]
+fn control_docs_index_rejects_a_broken_fragment_destination() {
+    assert!(!community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", "- [Community](index-missing.md)\n"),
+        (
+            "docs/index-community.md",
+            "- [Community jobs](community-jobs.md)\n",
+        ),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
+fn control_docs_index_rejects_a_missing_readme() {
+    assert!(!community_jobs_fixture_is_indexed(&[
+        (
+            "docs/index-community.md",
+            "- [Community jobs](community-jobs.md)\n",
+        ),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
+fn control_docs_index_rejects_non_manifest_links() {
+    for line in [
+        "See [Community jobs](community-jobs.md).",
+        "- [Community jobs](community-jobs.md) trailing text",
+        "- [Community jobs](missing.md)",
+        "See [Community](index-community.md).",
+        "- [ ](index-community.md)",
+        "- [Community](../docs/index-community.md)",
+        "- [Community](https://example.invalid/index-community.md)",
+    ] {
+        assert!(
+            !community_jobs_fixture_is_indexed(&[
+                ("docs/README.md", line),
+                (
+                    "docs/index-community.md",
+                    "- [Community jobs](community-jobs.md)\n",
+                ),
+                ("docs/community-jobs.md", "# Community jobs\n"),
+            ]),
+            "not a discoverable manifest row: {line}"
+        );
+    }
 }
 
 #[test]

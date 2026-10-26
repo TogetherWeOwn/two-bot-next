@@ -221,6 +221,17 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
 
+    def test_docs_index_fragments_select_rust_and_worker(self):
+        # The protected discoverability control reads README-linked fragments;
+        # worker tests also observe the docs directory listing.
+        for path in ("docs/index-community.md", "docs/index-voice.md"):
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), {RUST, WORKER})
+                self.assertEqual(
+                    jobs([path]),
+                    {RUST: True, WORKER: True, PARITY: False,
+                     SUPPLY: True, DOCS: True})
+
     def test_parity_doc_selects_rust_and_parity(self):
         self.assertEqual(inputs.classify("docs/parity.md"), {RUST, PARITY})
         self.assertEqual(inputs.classify("docs/parity-baseline.json"),

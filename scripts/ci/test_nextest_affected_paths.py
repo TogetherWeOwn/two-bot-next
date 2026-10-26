@@ -120,6 +120,16 @@ class NextestAffectedPathsTests(unittest.TestCase):
                         for pattern in filters["rust"]),
                     f"{path} matches no rust paths-filter pattern")
 
+    def test_docs_index_fragments_select_both_rust_filters(self):
+        _, filters = paths_filter_step()
+        for path in ("docs/index-community.md", "docs/index-voice.md"):
+            with self.subTest(path=path):
+                self.assertIn(job_inputs.RUST, job_inputs.classify(path))
+                self.assertTrue(
+                    any(filter_pattern_matches(pattern, path)
+                        for pattern in filters["rust"]),
+                    f"{path} matches no rust paths-filter pattern")
+
     def test_rust_filter_skips_docs_only_inputs(self):
         _, filters = paths_filter_step()
         for path in DOCS_ONLY_INPUTS:
