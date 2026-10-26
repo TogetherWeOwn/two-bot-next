@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected failing-first acceptance for identifying an already-saved feed relay without rewriting it",
+  "baseCommit": "e1868d97d3519cae3f2ed91726e83e98f77dff0d",
+  "branch": "test/feed-duplicate-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/feed_duplicate_acceptance_tests.rs",
+      "sha256": "d9a4f5aa5dc40172270749af7e337584f3395fd5f4aa823cf6563f00792052b1",
+      "tests": 16
+    }
+  ],
+  "testOnlyRegistration": {
+    "path": "crates/bot/src/feed_jobs_tests.rs",
+    "module": "duplicate_acceptance_tests",
+    "productionBehaviorChanged": false,
+    "builderAdapter": "When add_feed returns a typed outcome, implement duplicate_acceptance_tests::ObserveAdd for it here. Match the actual Created/Existing outcome and copy its saved id/enabled fields into AddObservation. Do not query the database, classify errors, or emulate duplicate handling in that adapter. The protected baseline () adapter remains untouched."
+  },
+  "commands": {
+    "runtimeAndStore": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked feed_jobs::tests::duplicate_acceptance_tests:: -- --nocapture --test-threads=1",
+    "healthyCreationControl": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked feed_jobs::tests::duplicate_acceptance_tests::healthy_new_add_keeps_creation_reply_creator_and_single_creation_audit -- --exact --nocapture",
+    "pureControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test feeds --test feeds_connector --test feed_pause_resume_acceptance --locked",
+    "existingLifecycleControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked feed_jobs::tests::pause_resume_acceptance_tests:: -- --nocapture --test-threads=1"
+  },
+  "compatibleExistingPins": [
+    {
+      "path": "crates/bot/src/feed_sticky_strict_decode_acceptance_tests.rs",
+      "tests": ["feed_add_valid_relay_is_byte_identical_to_today", "feed_add_ssrf_guard_refusal_is_unchanged"],
+      "contract": "Unchanged successful creation reply and rss creation audit; existing strict-wire controls must remain."
+    },
+    {
+      "path": "crates/bot/src/command_runtime_tests.rs",
+      "tests": ["automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audits", "feed_add_plan_errors_write_nothing", "feed_add_store_failure_audits_one_rejected_row", "feed_add_insert_store_failure_audits_one_row_per_refusal"],
+      "contract": "Capacity-first including paused rows; no capacity audit; actual store failures retain safe fixed text and one bounded rejection audit when writable."
+    },
+    {
+      "path": "crates/core/tests/feeds.rs",
+      "tests": ["sources_reject_credentials_and_canonicalized_private_literals", "source_length_bound_matches_published_byte_limit_before_trimming"],
+      "contract": "Keep source normalization, SSRF, HTTPS, port and pre-trim byte-bound controls."
+    },
+    {
+      "path": "crates/core/tests/feed_pause_resume_acceptance.rs",
+      "contract": "Keep the six existing feed commands, ManageGuild/default permissions, stable string ids, bounded list and state labels. No command registry count change is required by duplicate recovery."
+    }
+  ],
+  "contract": {
+    "identity": "Existing normalized guild/channel/kind/source tuple returns original id and observed enabled state; different channels, guilds, kinds and previously distinct RSS URLs remain distinct.",
+    "preservation": "Snapshot every relay and delivery column, including timestamps, creator, last check, pending claims, delivered receipts and nonces; duplicates must be byte-identical.",
+    "reply": "One private mention-suppressed bounded completion. Name already/existing, original backticked id and enabled/paused state; give copyable /feed-inspect id:<id> and /feed-pause or /feed-resume id:<id>. Never echo raw URLs, database strings or capabilities, and never claim creation.",
+    "race": "Independent pools, simultaneous identical adds, one stored relay; exactly one Created and one Existing typed outcome and one creation reply/audit.",
+    "errorFences": "Capacity-first at 25 rows, unrelated unique index and primary-key collisions, and closed-pool outage must not become Existing.",
+    "audit": "Recognized duplicates must not produce existing successful-kind feed.create or rejected-storage audits. No particular new duplicate audit action/name is mandated. Real unique failures retain feed.create/rejected with a bounded reason.",
+    "http": "Every command invocation records exactly the ephemeral defer and completion; no Discord channel read/post or publication. Source-fetch transport is not injectable on this command harness; this is not a claim of source-network observation.",
+    "scope": "Builder includes typed store/runtime implementation and command-reference guidance together; no migration, RSS equivalence redesign, new fetch, reset or automatic resume."
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "fixture": "two_bot_testsupport::TestDatabase with the complete cutover migrations and independent pools",
+    "missingEnvironment": "Explicit failure, never an ignored or vacuously skipped acceptance test",
+    "ciRoute": "Existing check.yml workspace lib/bins step supplies the guarded disposable DB URL; registration is in an existing cfg(test) parent."
+  },
+  "verification": {
+    "behavioralRed": "Pending actual execution; a cache refusal or compilation error is not intended RED.",
+    "healthyControl": "Pending actual execution; no passing claim is made by this manifest."
+  },
+  "handoff": [
+    "Never merge deliberately RED tests alone; the implementation owner consumes the immutable handoff SHA recorded in the task document.",
+    "Do not edit protected files. Return a faulty oracle to its author for a correction.",
+    "Verify protected SHA-256 after applying the handoff. The manifest is metadata, not a self-referential protected hash.",
+    "Builder owns implementation GREEN, compatible regression pins, generated command-reference guidance, exact-head required CI, independent review and squash auto-merge in one combined PR."
+  ]
+}

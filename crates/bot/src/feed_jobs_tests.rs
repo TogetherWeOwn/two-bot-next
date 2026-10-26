@@ -3,6 +3,9 @@ use super::*;
 #[path = "feed_pause_resume_acceptance_tests.rs"]
 mod pause_resume_acceptance_tests;
 
+#[path = "feed_duplicate_acceptance_tests.rs"]
+mod duplicate_acceptance_tests;
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
