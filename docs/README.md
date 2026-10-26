@@ -1,7 +1,6 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
-No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
+`- [Purpose](relative.md)` rows. From root: `python3 scripts/check_docs_index.py --json` (empty `{missing,stale,oversize}`=PASS 0, else 1). Index <12,000, docs <=65,536 except LARGE_DOCS.
 
 ## References and architecture
 
@@ -21,14 +20,14 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 
 - [Operations and alerts](runbook.md)
 - [Observability triage](runbook-observability.md)
-- [Metrics catalog](metrics.md)
-- [Readiness monitoring](container-readiness.md)
-- [Startup diagnostics](startup-diagnostics.md)
+- [Metrics](metrics.md)
+- [Readiness](container-readiness.md)
+- [Startup](startup-diagnostics.md)
 - [Gateway recovery](gateway-recovery.md)
 - [Gateway failures](gateway-failure-classification.md)
 - [Deferred capture poison](deferred-capture-poison.md)
 - [Backups and restores](backup.md)
-- [Backfill procedure](backfill-runbook.md)
+- [Backfill](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
 - [Production deploy](production-deploy.md)
 - [Release architecture](releases.md)
@@ -87,6 +86,7 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Attribution PII tests](classifier-pii-absence.md)
 - [Channel access tests](channel-access-acceptance.md)
 - [Channel locking tests](channel-lockdown-acceptance.md)
+- [Timed lockdown: no build](time-boxed-lockdown-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
@@ -142,9 +142,10 @@ No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Ind
 - [Event recap](event-recap-spec.md)
 - [Native publish](event-native-publish-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
-- [Sticky config](dashboard-sticky-config-spec.md)
-- [Ticket config](dashboard-ticket-config-spec.md)
-- [Private subject](ticket-subject-spec.md)
+- [Sticky config proposal](dashboard-sticky-config-spec.md)
+- [Ticket config proposal](dashboard-ticket-config-spec.md)
+- [Private subject proposal](ticket-subject-spec.md)
+- [Opener copy](ticket-opener-copy-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
 - [Resolution signal](ticket-resolution-request-spec.md)
