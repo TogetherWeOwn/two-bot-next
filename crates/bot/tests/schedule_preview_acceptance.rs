@@ -478,6 +478,72 @@ async fn concurrent_previews_reach_private_completion_with_no_shared_admission_e
 }
 
 #[tokio::test]
+async fn control_retime_invalid_options_finish_privately_before_persistent_effects() {
+    let cases = [
+        (Vec::new(), "id"),
+        (vec![option("id", CommandOptionValue::Integer(1))], "id"),
+        (
+            vec![option(
+                "id",
+                CommandOptionValue::String(format!("@everyone{}", "x".repeat(128))),
+            )],
+            "id",
+        ),
+        (
+            vec![option("id", CommandOptionValue::String("saved-id".into()))],
+            "at",
+        ),
+        (
+            vec![
+                option("id", CommandOptionValue::String("saved-id".into())),
+                option("at", CommandOptionValue::Boolean(true)),
+            ],
+            "at",
+        ),
+    ];
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    for (options, invalid_option) in cases {
+        spies::reset();
+        let mock =
+            MockRest::start(Vec::new(), ScriptedResponse::json(200, json!({"id":"99"}))).await;
+        let executor = ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin()))
+            .expect("loopback executor");
+        let mut input = invocation(options);
+        let Some(InteractionData::ApplicationCommand(data)) = &mut input.data else {
+            panic!("fixture application command");
+        };
+        data.name = "schedule-retime".into();
+        subject::schedule_retime(&pool().await, &executor, "2222", &input).await;
+        let requests = mock.requests();
+        mock.shutdown().await;
+        assert_eq!(requests.len(), 1, "only the private defer completion");
+        assert_eq!(requests[0].method, "PATCH");
+        assert_eq!(
+            requests[0].path,
+            "/api/v10/webhooks/1111/preview-fixture/messages/@original"
+        );
+        let payload: Value = serde_json::from_slice(&requests[0].body).expect("reply payload");
+        assert_eq!(payload["allowed_mentions"]["parse"], json!([]));
+        for key in ["users", "roles"] {
+            assert!(payload["allowed_mentions"][key]
+                .as_array()
+                .is_none_or(Vec::is_empty));
+        }
+        let text = payload["content"].as_str().expect("private correction");
+        assert!(text.encode_utf16().count() <= 2000, "bounded Discord reply");
+        assert!(
+            text.contains(&format!("invalid or missing {invalid_option} option")),
+            "specific input correction, not a store failure or successful retime: {text}"
+        );
+        assert!(!text.contains("@everyone"), "never echo hostile input");
+        let trace = spies::snapshot();
+        assert_eq!(trace.ids, 0, "validation must precede ID generation");
+        assert!(trace.calls.is_empty(), "no store or audit I/O: {trace:?}");
+        assert!(trace.writes.is_empty() && trace.audits.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn control_existing_strict_decoders_and_list_remove_remain_live() {
     spies::reset();
     let input = invocation(proposal("control", Some(10), None, None));
