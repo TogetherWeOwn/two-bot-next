@@ -5768,8 +5768,16 @@ async fn channel_manage_channels_never_bypasses_voice_restrictions_or_configurat
         "defaultlimit",
         "alwaysprivate",
     ] {
+        // `/textchannels` strictly decodes its options before the
+        // permission check, so it needs its required `channel` option to
+        // reach the authority refusal under test.
+        let options = if name == "textchannels" {
+            vec![channel_option("channel", CREATOR)]
+        } else {
+            vec![]
+        };
         let mut interaction = voice_interaction(
-            Some(command_data(name, vec![])),
+            Some(command_data(name, options)),
             Some(Permissions::MANAGE_CHANNELS),
             true,
         );
@@ -7794,6 +7802,78 @@ fn parse_textchannels_leaves_unset_options_unset() {
             },
         })
     );
+}
+
+#[test]
+fn parse_textchannels_strict_shape_names_the_offending_field() {
+    let valid_options = || {
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(true)),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ]
+    };
+    let mut cases: Vec<(&'static str, Vec<CommandDataOption>)> = Vec::new();
+    for (field, wrong) in [
+        ("channel", CommandOptionValue::String("bad".to_owned())),
+        ("enabled", CommandOptionValue::String("bad".to_owned())),
+        ("name", CommandOptionValue::Boolean(true)),
+        ("viewer-role", CommandOptionValue::String("bad".to_owned())),
+    ] {
+        let mut options = valid_options();
+        options
+            .iter_mut()
+            .find(|option| option.name == field)
+            .expect("known field")
+            .value = wrong;
+        cases.push((field, options));
+    }
+    for (field, good) in [
+        ("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+        ("enabled", CommandOptionValue::Boolean(true)),
+        ("name", CommandOptionValue::String("lounge".to_owned())),
+        ("viewer-role", CommandOptionValue::Role(Id::new(42))),
+    ] {
+        let mut options = valid_options();
+        options.push(typed_option(field, good));
+        cases.push((field, options));
+    }
+    cases.push((
+        "channel",
+        valid_options()
+            .into_iter()
+            .filter(|option| option.name != "channel")
+            .collect(),
+    ));
+
+    for (expected, options) in cases {
+        let interaction = textchannels_interaction(options, Some(Permissions::MANAGE_CHANNELS));
+        assert_eq!(
+            parse_voice_command(&interaction),
+            Some(VoiceCommand::SetupShapeInvalid {
+                command: "textchannels",
+                field: expected,
+            }),
+            "malformed {expected} must be reported as {expected}"
+        );
+    }
+}
+
+#[test]
+fn textchannels_shape_correction_names_the_field_before_the_usage_example() {
+    for field in ["channel", "enabled", "name", "viewer-role"] {
+        let text = setup_shape_correction("textchannels", field);
+        // The usage example names every option, so only the diagnostic
+        // before it can prove which field the correction blames.
+        let (diagnostic, usage) = text.split_once("Try:").expect("copyable invocation");
+        assert!(diagnostic.contains(&format!("`{field}`")), "{text}");
+        if field != "channel" {
+            assert!(!diagnostic.contains("`channel`"), "{text}");
+        }
+        assert!(usage.contains("/textchannels channel:"), "{text}");
+        assert!(!text.contains("ambiguous"), "{text}");
+    }
 }
 
 fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
