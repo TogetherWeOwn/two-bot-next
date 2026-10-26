@@ -595,7 +595,7 @@ No options.
 
 ## `/reopen`
 
-Reopen your games or session picker in a private menu.
+Reopen your games or session picker in a private menu; games includes a no-change preview.
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
