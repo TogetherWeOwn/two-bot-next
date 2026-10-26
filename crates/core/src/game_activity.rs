@@ -432,8 +432,7 @@ pub fn render_game_activity_discord_browse(
     // Bound labels BEFORE serializing, shrinking the cap until the whole
     // reply (header, rows, notes) fits; ten minimal rows always fit.
     for cap in [None, Some(24), Some(16), Some(10), Some(6)] {
-        let content =
-            browse_page_text(&guild_id, &page_rows, total, page, pages, sort, format, cap);
+        let content = browse_page_text(&guild_id, &page_rows, total, page, sort, format, cap);
         if crate::message_safety::text_len(&content) <= crate::message_safety::CONTENT_LIMIT {
             return GameMixBrowseView::Page(content);
         }
@@ -443,7 +442,6 @@ pub fn render_game_activity_discord_browse(
         &page_rows,
         total,
         page,
-        pages,
         sort,
         format,
         Some(6),
@@ -455,11 +453,11 @@ fn browse_page_text(
     page_rows: &[&GuildGameAggregate],
     total: usize,
     page: usize,
-    pages: usize,
     sort: GameMixBrowseSort,
     format: GameMixBrowseFormat,
     cap: Option<usize>,
 ) -> String {
+    let pages = total.div_ceil(GAME_MIX_PAGE_ROWS).max(1);
     let mut shortened = false;
     let mut labels: Vec<String> = Vec::with_capacity(page_rows.len());
     for row in page_rows {
