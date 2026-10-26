@@ -37,6 +37,8 @@ mod event_voice_channels_acceptance;
 mod event_voice_channels_regression;
 #[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
 mod fair_scheduling_acceptance;
+#[path = "voice_config_full_diff_acceptance_tests.rs"]
+mod full_diff_acceptance;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
 #[path = "voice_invite_responder_wiring_tests.rs"]
@@ -65,6 +67,8 @@ mod ownership_receipt_acceptance;
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
 mod responder_admission_acceptance;
+#[path = "voice_import_review_regressions_tests.rs"]
+mod review_regressions;
 #[path = "voice_setup_access_paging_acceptance_tests.rs"]
 mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
