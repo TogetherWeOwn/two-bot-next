@@ -332,24 +332,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ...     if s["enabled"] and s["failed_at"] is None and s["streak"] >= L["min_countable_failures"] and now - anchor >= L["failed_after_ms"]:
 ...         s["failed_at"], s["notice"] = now, "claimed"; return "transition"
 ...     return "countable"
->>> s = fresh(evidence=False); assert health(s) == "unknown" and poll_action(s) == "fetch"   # FF01
->>> s = fresh(enabled=False, evidence=False); assert health(s) == "paused" and poll_action(s) == "skip"
->>> s = fresh(evidence=False); assert record(s, "success", HOUR) == "success" and health(s) == "active"
->>> s = fresh(evidence=False); assert [record(s, "parse", t) for t in (HOUR, 12*HOUR, 24*HOUR)][-1] == "transition" and health(s) == "failed" and poll_action(s) == "recovery_only"
->>> s = fresh(last_success=0)
->>> assert [record(s, "http_error", t) for t in (HOUR, 2*HOUR)] == ["countable"] * 2
->>> assert record(s, "success", 3*HOUR) == "success" and s["streak"] == 0                     # FF02
->>> s = fresh(last_success=0)
->>> assert [record(s, "too_large", t) for t in (HOUR, 2*HOUR, 3*HOUR)] == ["countable"] * 3 and health(s) == "active"  # FF03
->>> assert record(s, "http_error", 24*HOUR) == "transition" and health(s) == "failed" and poll_action(s) == "recovery_only"  # FF04/FF09
->>> assert record(s, "http_error", 25*HOUR) == "countable" and s["notice"] == "claimed"       # FF11 no second claim
->>> s = fresh(created=0)
->>> assert [record(s, "parse", t) for t in (HOUR, 12*HOUR, 24*HOUR)][-1] == "transition"      # FF05
->>> s = fresh(last_success=0)
->>> seq = [record(s, o, t) for o, t in [("http_error", 20*HOUR), ("http_error", 23*HOUR), ("success", 24*HOUR), ("http_error", 40*HOUR), ("http_error", 47*HOUR)]]
->>> assert health(s) == "active" and s["streak"] == 2                                          # FF06 flapping
->>> s = fresh(last_success=0, streak=2)
->>> assert all(record(s, o, t) == "neutral" for o, t in [("resolve", 30*HOUR), ("transport", 40*HOUR), ("recovery_required", 50*HOUR)]) and s["streak"] == 2  # FF07/FF08
 >>> def refresh(s, probe, now):
 ...     if now < s["last_attempt"]: return "stale_discarded"
 ...     if probe in m["neutral"]: return "PROBE_NEUTRAL"
@@ -360,6 +342,24 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ...         return "PROBE_SUCCEEDED"
 ...     s["streak"] += 1
 ...     return "PROBE_FAILED"
+>>> s = fresh(evidence=False); assert health(s) == "unknown" and poll_action(s) == "fetch"   # FF01
+>>> s = fresh(enabled=False, evidence=False); assert health(s) == "paused" and poll_action(s) == "skip"
+>>> s = fresh(evidence=False); assert record(s, "success", HOUR) == "success" and health(s) == "active"
+>>> s = fresh(evidence=False); assert [record(s, "parse", t) for t in (HOUR, 12*HOUR, 24*HOUR)][-1] == "transition" and health(s) == "failed" and poll_action(s) == "recovery_only"
+>>> s = fresh(last_success=0)
+>>> assert [record(s, "http_error", t) for t in (HOUR, 2*HOUR)] == ["countable"] * 2
+>>> assert record(s, "success", 3*HOUR) == "success" and s["streak"] == 0                     # FF02
+>>> s = fresh(last_success=0)
+>>> assert [record(s, "too_large", t) for t in (HOUR, 2*HOUR, 3*HOUR)] == ["countable"] * 3 and health(s) == "active"  # FF03
+>>> assert record(s, "http_error", 24*HOUR) == "transition" and health(s) == "failed" and poll_action(s) == "recovery_only"  # FF04/FF09
+>>> assert refresh(s, "http_error", 25*HOUR) == "PROBE_FAILED" and s["notice"] == "claimed"  # FF11 no second claim
+>>> s = fresh(created=0)
+>>> assert [record(s, "parse", t) for t in (HOUR, 12*HOUR, 24*HOUR)][-1] == "transition"      # FF05
+>>> s = fresh(last_success=0)
+>>> seq = [record(s, o, t) for o, t in [("http_error", 20*HOUR), ("http_error", 23*HOUR), ("success", 24*HOUR), ("http_error", 40*HOUR), ("http_error", 47*HOUR)]]
+>>> assert health(s) == "active" and s["streak"] == 2                                          # FF06 flapping
+>>> s = fresh(last_success=0, streak=2)
+>>> assert all(record(s, o, t) == "neutral" for o, t in [("resolve", 30*HOUR), ("transport", 40*HOUR), ("recovery_required", 50*HOUR)]) and s["streak"] == 2  # FF07/FF08
 >>> s = fresh(last_success=0, streak=2, evidence=False)
 >>> assert refresh(s, "http_error", 24*HOUR) == "PROBE_FAILED" and s["streak"] == 3 and health(s) == "active" and s["notice"] == "none"
 >>> assert refresh(s, "success", 23*HOUR) == "stale_discarded" and s["streak"] == 3
