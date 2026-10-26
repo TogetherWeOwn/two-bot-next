@@ -9,8 +9,8 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 43 compiled built-ins plus the voice set
-  (64 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 44 compiled built-ins plus the voice set
+  (65 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
@@ -20,9 +20,10 @@ Saved inventory: 7 core + 1 scorecard + 12 automations + 11 announcements +
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
-The test extends this saved fixture in memory with `/lfg-edit`: **43 compiled
-built-ins**, five covered and 38 deferred. The saved JSON deliberately excludes
-edit; this extension is not a live-publication or smoke-acceptance claim.
+The test extends this saved fixture in memory with `/lfg-edit` and
+`/lfg-inspect`: **44 compiled built-ins**, five covered and 39 deferred. The
+saved JSON deliberately excludes both; these extensions are not a
+live-publication or smoke-acceptance claim.
 
 ## Covered: the smoke five (one per routing family)
 

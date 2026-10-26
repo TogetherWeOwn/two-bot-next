@@ -125,6 +125,7 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "lfg-close",
             "lfg-edit",
             "lfg-list",
+            "lfg-inspect",
             "feed-add",
             "feed-remove",
             "feed-pause",

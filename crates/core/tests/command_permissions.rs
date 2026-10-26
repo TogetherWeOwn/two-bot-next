@@ -379,7 +379,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 43, "every retained builtin routes");
+    assert_eq!(routed, 44, "every retained builtin routes");
 }
 
 #[test]

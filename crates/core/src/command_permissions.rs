@@ -89,9 +89,9 @@ use PolicyHook::{
 /// `/command-disable` and `/command-enable` (parity rows 40 and 41),
 /// `/welcome-preview` admin preview (parity row 42), staff aggregate
 /// `/game-mix` (43), and feed lifecycle `/feed-pause` (44) and
-/// `/feed-resume` (45). Only `/game-mix` admits Administrator
-/// alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 46] = [
+/// `/feed-resume` (45), and private saved-roster `/lfg-inspect` (46).
+/// Only `/game-mix` admits Administrator alone; legacy masks are unchanged.
+pub const COMMAND_PERMISSIONS: [CommandPermission; 47] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),

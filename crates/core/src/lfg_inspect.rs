@@ -364,7 +364,7 @@ mod tests {
                 assert_eq!(text, PAGE_OUT_OF_RANGE);
                 break;
             }
-            seen.extend(rows);
+            seen.extend(rows.into_iter().map(str::to_owned));
         }
         assert_eq!(seen.len(), 99, "each saved signup exactly once");
     }
