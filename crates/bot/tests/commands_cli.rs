@@ -541,6 +541,9 @@ async fn ambiguous_registry_identities_fail_before_put_and_failed_put_is_not_suc
     let mut empty_name = matching_registry();
     empty_name[0]["name"] = json!("");
     let mut duplicate = matching_registry();
+    // Writable drift forces PUT if canonicalization stops rejecting duplicates;
+    // a matching snapshot would fail later cache validation and mask that bug.
+    duplicate[0]["description"] = json!("Out-of-band duplicate description.");
     let repeated = duplicate[0].clone();
     duplicate.as_array_mut().unwrap().push(repeated);
     for (current, expected_methods) in [

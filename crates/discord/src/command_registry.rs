@@ -344,6 +344,23 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_type_name_is_rejected_by_canonicalization_without_identity_cache() {
+        let first = command(json!({"name":"same", "id":"101"}));
+        for description in ["Test", "Changed duplicate"] {
+            let second = command(json!({"name":"same", "id":"102", "description":description}));
+            let duplicate = [first.clone(), second];
+            assert!(registry_snapshot(&duplicate).is_err());
+            assert!(diff_commands(&duplicate, &[]).is_err());
+            assert!(diff_commands(&[], &duplicate).is_err());
+        }
+        // Sharing a name across command types is valid, not a duplicate.
+        let mut user_command = first.clone();
+        user_command.kind = 2.into();
+        user_command.description.clear();
+        assert!(registry_snapshot(&[first, user_command]).is_ok());
+    }
+
+    #[test]
     fn reports_add_remove_and_nested_old_new_values() {
         let old = command(json!({"description":"Old"}));
         let new = command(json!({"description":"New"}));

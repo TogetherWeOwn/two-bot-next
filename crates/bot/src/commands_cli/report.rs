@@ -233,6 +233,52 @@ mod tests {
     }
 
     #[test]
+    fn json_hashes_and_counts_match_their_exact_snapshot_sources() {
+        use two_bot_discord::command_registry::registry_snapshot;
+
+        let current = vec![
+            command("changed"),
+            command("stable"),
+            command("removed-one"),
+            command("removed-two"),
+        ];
+        let mut changed = current[0].clone();
+        changed.description = "Changed fixture description.".into();
+        let desired = vec![
+            changed,
+            current[1].clone(),
+            command("added-one"),
+            command("added-two"),
+            command("added-three"),
+        ];
+        let current_hash = registry_snapshot(&current)
+            .expect("current fixture snapshot")
+            .hash;
+        let desired_hash = registry_snapshot(&desired)
+            .expect("desired fixture snapshot")
+            .hash;
+        assert_ne!(current_hash, desired_hash);
+        let diff = diff_commands(&current, &desired).expect("distinct fixture diff");
+        let json = serde_json::to_value(Report::snapshot(&current, &diff))
+            .expect("serialize distinct fixture report");
+        assert_eq!(json["current_hash"].as_str(), Some(current_hash.as_str()));
+        assert_eq!(json["desired_hash"].as_str(), Some(desired_hash.as_str()));
+        // All counts differ, so substituting another collection cannot pass.
+        assert_eq!(json["added_count"].as_u64(), Some(3));
+        assert_eq!(json["removed_count"].as_u64(), Some(2));
+        assert_eq!(json["changed_count"].as_u64(), Some(1));
+
+        let diff = diff_commands(&desired, &desired).expect("no-drift fixture diff");
+        let json = serde_json::to_value(Report::snapshot(&desired, &diff))
+            .expect("serialize no-drift fixture report");
+        assert_eq!(json["current_hash"].as_str(), Some(desired_hash.as_str()));
+        assert_eq!(json["desired_hash"].as_str(), Some(desired_hash.as_str()));
+        assert_eq!(json["added_count"].as_u64(), Some(0));
+        assert_eq!(json["removed_count"].as_u64(), Some(0));
+        assert_eq!(json["changed_count"].as_u64(), Some(0));
+    }
+
+    #[test]
     fn bounded_reports_classify_even_the_omitted_tail() {
         let mut current: Vec<_> = (0..100)
             .map(|index| command(&format!("aa-{index:03}-{}", "🦀".repeat(400))))
