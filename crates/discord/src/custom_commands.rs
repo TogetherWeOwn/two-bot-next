@@ -770,25 +770,59 @@ impl CustomCommandRuntime {
             // store read or publication.
             return self.toggle(interaction, data, guild).await;
         }
-        let Some(name) = string_option(data, "name") else {
-            return Ok("A command name is required.".to_owned());
+        // The remaining management names are the two writers. Routing has
+        // already enforced guild/application, ManageGuild and the feature
+        // gate. Strictly decode their complete option shapes before the
+        // registry lock, any store access, audit or publication: a forged
+        // duplicate, wrong type, nested or unknown option must never let a
+        // first-matching value silently win.
+        let is_define = data.name == "command";
+        let allowed: &[&str] = if is_define {
+            &["name", "template", "description", "text-trigger"]
+        } else {
+            &["name"]
         };
-        let name = name.to_lowercase();
+        if data
+            .options
+            .iter()
+            .any(|option| !allowed.contains(&option.name.as_str()))
+        {
+            return Ok(invalid_writer_option("option"));
+        }
+        let name = match single_string_option(data, "name") {
+            SingleOption::Missing => return Ok("A command name is required.".to_owned()),
+            SingleOption::Malformed => return Ok(invalid_writer_option("name")),
+            SingleOption::Value(name) => name.to_lowercase(),
+        };
+        let define = if is_define {
+            let template = match single_string_option(data, "template") {
+                SingleOption::Missing => return Ok("A template is required.".to_owned()),
+                SingleOption::Malformed => return Ok(invalid_writer_option("template")),
+                SingleOption::Value(template) => template.to_owned(),
+            };
+            let description = match single_string_option(data, "description") {
+                SingleOption::Missing => "Custom command".to_owned(),
+                SingleOption::Malformed => return Ok(invalid_writer_option("description")),
+                SingleOption::Value(description) => description.to_owned(),
+            };
+            let text_trigger = match single_string_option(data, "text-trigger") {
+                SingleOption::Missing => None,
+                SingleOption::Malformed => return Ok(invalid_writer_option("text-trigger")),
+                SingleOption::Value(trigger) => Some(trigger.to_lowercase()),
+            };
+            Some(PutCommandInput {
+                name: name.clone(),
+                description,
+                template,
+                text_trigger,
+            })
+        } else {
+            None
+        };
         let audit_id = format!("custom:manage:{}", interaction.id);
         let at = two_bot_core::now_iso();
         let _guard = self.registry.lock().await;
-        let (reply, resync) = if data.name == "command" {
-            let Some(template) = string_option(data, "template") else {
-                return Ok("A template is required.".to_owned());
-            };
-            let input = PutCommandInput {
-                name: name.clone(),
-                description: string_option(data, "description")
-                    .unwrap_or("Custom command")
-                    .to_owned(),
-                template: template.to_owned(),
-                text_trigger: string_option(data, "text-trigger").map(str::to_lowercase),
-            };
+        let (reply, resync) = if let Some(input) = define {
             match service::put(
                 &self.pool,
                 self.router.gates().automations,
@@ -929,11 +963,16 @@ fn invalid_toggle_option(command: &str) -> String {
     format!("Invalid name option: pass exactly one text name, e.g. /{command} name:faq.")
 }
 
-fn string_option<'a>(data: &'a CommandData, name: &str) -> Option<&'a str> {
-    data.options.iter().find_map(|option| match &option.value {
-        CommandOptionValue::String(value) if option.name == name => Some(value.as_str()),
-        _ => None,
-    })
+/// Writer-shape refusal: names only the trusted option at fault (or a
+/// generic `option` for an unknown key), never any submitted value.
+fn invalid_writer_option(field: &str) -> String {
+    if field == "option" {
+        "Invalid option: use only the options listed for this command.".to_owned()
+    } else if field == "name" || field == "template" {
+        format!("Invalid {field} option: pass exactly one text {field}.")
+    } else {
+        format!("Invalid {field} option: pass at most one text {field}.")
+    }
 }
 
 /// One named option read strictly: a forged type or a duplicate refuses
