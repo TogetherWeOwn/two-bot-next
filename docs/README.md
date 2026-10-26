@@ -5,7 +5,7 @@ Manifest: `- [Purpose](relative.md)`.
 `python3 scripts/check_docs_index.py --json` (repo root).
 Empty `{missing,stale,oversize}` = PASS; else exit 1.
 Bad rows land in `stale` as `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
+Budgets: index <12,000; others ≤65,536; exceptions in `LARGE_DOCS` only.
 
 ## References and architecture
 
@@ -94,16 +94,16 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
-- [Moderation disable gate](moderation-disable-preflight.md)
-- [Hierarchy refusal order](moderation-hierarchy-order.md)
+- [Disable gate](moderation-disable-preflight.md)
+- [Hierarchy order](moderation-hierarchy-order.md)
 - [Moderation MAC tests](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
-- [Response page proposal](dashboard-custom-responses-spec.md)
+- [Response proposal](dashboard-custom-responses-spec.md)
 - [Args proposal](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
-- [Onboarding page proposal](dashboard-onboarding-self-roles-spec.md)
+- [Onboarding proposal](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
 - [Live-key tests](ticket-feed-self-role-live-keys-acceptance.md)
@@ -124,6 +124,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
 - [Relay move proposal](feed-move-spec.md)
+- [Failed status proposal](feed-failed-status-spec.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Game mix report](game-activity-report.md)
@@ -133,17 +134,17 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Scheduled skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [Notice proposal](event-change-notices-spec.md)
-- [Reminder baseline/stop proposal](event-reminder-preferences-spec.md)
+- [Reminder stop proposal](event-reminder-preferences-spec.md)
 - [RSVP seats/waitlist proposal](rsvp-capacity-spec.md)
 - [RSVP withdrawal proposal](rsvp-withdrawal-spec.md)
 - [RSVP cutoff proposal](rsvp-registration-cutoff-spec.md)
 - [Private agenda proposal](event-agenda-spec.md)
-- [Calendar handoff proposal](event-calendar-handoff-spec.md)
+- [Calendar proposal](event-calendar-handoff-spec.md)
 - [Event role proposal](event-role-spec.md)
 - [Event recap proposal](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
-- [Sticky config proposal](dashboard-sticky-config-spec.md)
-- [Ticket config proposal](dashboard-ticket-config-spec.md)
+- [Sticky proposal](dashboard-sticky-config-spec.md)
+- [Ticket proposal](dashboard-ticket-config-spec.md)
 - [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
