@@ -6,7 +6,7 @@
   "protected_files": [
     {
       "path": "crates/bot/src/voice_creator_settings_read_acceptance_tests.rs",
-      "sha256": "68f72082ecceda28320c03a8da34f3dccfc0171c8c129ac4f6b64c951534352e",
+      "sha256": "82949a4d28614ae69bb86d4a944ba5580bad6b7678814fd9e6444387cf1d546d",
       "tests": 14
     }
   ],
