@@ -272,7 +272,7 @@ class StagingPackagingOutputIsolationTests(unittest.TestCase):
     """Native regression: the staging packaging dry-run must not share the
     real-deploy receipt file.
 
-    Wrangler 4.151.0 appends one wrangler-session record per invocation (and a
+    Wrangler 4.152.0 appends one wrangler-session record per invocation (and a
     deploy record for a deploy) to the file selected by
     WRANGLER_OUTPUT_FILE_PATH. The staging workflow exports that variable for
     the real deploy receipt, and staging_rollout.wrangler_sessions demands
@@ -300,7 +300,7 @@ class StagingPackagingOutputIsolationTests(unittest.TestCase):
         self.fail("packaging step missing from deploy-staging.yml")
 
     def write_npx_shim(self, bindir):
-        """Mimic Wrangler 4.151.0 output-file selection, nothing else."""
+        """Mimic Wrangler 4.152.0 output-file selection, nothing else."""
         bindir = Path(bindir)
         bindir.mkdir(parents=True, exist_ok=True)
         shim = bindir / "npx"
@@ -333,7 +333,7 @@ class StagingPackagingOutputIsolationTests(unittest.TestCase):
             "if [ -n \"$target\" ]; then\n"
             "  now=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
             "  printf '%s\\n' '{\"version\":1,\"type\":\"wrangler-session\","
-            "\"wrangler_version\":\"4.151.0\",\"command_line_args\":"
+            "\"wrangler_version\":\"4.152.0\",\"command_line_args\":"
             "[\"deploy\",\"--config\",\"staging-deploy.json\",\"--env\",\"staging\"]}' >> \"$target\"\n"
             "  printf '%s\\n' \"{\\\"version\\\":1,\\\"type\\\":\\\"deploy\\\","
             "\\\"worker_name\\\":\\\"two-bot-next-staging\\\","
@@ -476,9 +476,9 @@ class StagingPackagingOutputIsolationTests(unittest.TestCase):
     def real_deploy_records(self):
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return [
-            {"version": 1, "type": "wrangler-session", "wrangler_version": "4.151.0",
+            {"version": 1, "type": "wrangler-session", "wrangler_version": "4.152.0",
              "command_line_args": ["--version"]},
-            {"version": 1, "type": "wrangler-session", "wrangler_version": "4.151.0",
+            {"version": 1, "type": "wrangler-session", "wrangler_version": "4.152.0",
              "command_line_args": ["deploy", "--config", "staging-deploy.json",
                                    "--env", "staging"]},
             {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
