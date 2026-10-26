@@ -11632,6 +11632,27 @@ fn setup_past_end_refusal(total: usize) -> String {
     format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
 }
 
+/// Private correction for an ambiguous setup option: names the option and a
+/// copyable invocation. Static per (command, field): no payload bytes, store
+/// errors or mentions can leak into it.
+fn setup_shape_correction(command: &str, field: &str) -> String {
+    let usage = match command {
+        "create" => "name: lobby",
+        "position" => "channel: #voice-creator position: below first-number: 5",
+        "group" => "channel: #voice-creator enabled: true",
+        "inheritpermissions" => {
+            "channel: #voice-creator source: channel source-channel: #voice-creator"
+        }
+        "defaultlimit" => "channel: #voice-creator limit: 4",
+        "alwaysprivate" => "channel: #voice-creator enabled: true",
+        _ => "channel: #voice-creator",
+    };
+    format!(
+        "That `/{command}` call has an ambiguous `{field}` option: send each option once, \
+         with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
+    )
+}
+
 /// Voice definitions for the guild command merge, gated on `TWO_VOICE=1`.
 /// Production publication runs through `InteractionRouter::publish_set`
 /// (`RouterGates::voice`), which merges `voice_commands()` first-wins after
@@ -12002,6 +12023,15 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: AlwaysPrivateRequest,
     },
+    /// A setup command (`/create`, `/position`, `/group`,
+    /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
+    /// an ambiguous option shape: a known option sent twice or with the wrong
+    /// wire type. Answered with a private correction before guild authority,
+    /// role gates and every read or effect.
+    SetupShapeInvalid {
+        command: &'static str,
+        field: &'static str,
+    },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
     /// Owner (or admin) hands the room to an occupant, who becomes the
@@ -12103,6 +12133,80 @@ fn decode_page(options: &[CommandDataOption]) -> PageArg {
     }
 }
 
+/// Expected wire type of one known setup option, for strict shape decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupOptionKind {
+    String,
+    Integer,
+    Boolean,
+    Channel,
+}
+
+impl SetupOptionKind {
+    fn matches(self, value: &CommandOptionValue) -> bool {
+        match (self, value) {
+            (Self::String, CommandOptionValue::String(_))
+            | (Self::Integer, CommandOptionValue::Integer(_))
+            | (Self::Boolean, CommandOptionValue::Boolean(_))
+            | (Self::Channel, CommandOptionValue::Channel(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Known options of one setup command as `(name, expected wire type)`.
+/// Unknown names stay ignored; only these refuse when duplicated or
+/// mistyped. `None` for commands without a strict shape.
+fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
+    match command {
+        "create" => Some(&[("name", SetupOptionKind::String)]),
+        "position" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("position", SetupOptionKind::String),
+            ("first-number", SetupOptionKind::Integer),
+        ]),
+        "group" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        "inheritpermissions" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("source", SetupOptionKind::String),
+            ("source-channel", SetupOptionKind::Channel),
+        ]),
+        "defaultlimit" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("limit", SetupOptionKind::Integer),
+        ]),
+        "alwaysprivate" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        _ => None,
+    }
+}
+
+/// Strictly decode one setup command's option shape: each known option at
+/// most once and with its registered wire type. Returns the first ambiguous
+/// known option in payload order. Unknown names (even duplicated, even with
+/// nested known names beneath them) stay ignored, and value validation stays
+/// in the handlers, so omission semantics are unchanged.
+fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&'static str> {
+    let fields = setup_shape_fields(command)?;
+    let mut seen: Vec<&'static str> = Vec::new();
+    for option in options {
+        let Some(&(name, kind)) = fields.iter().find(|field| option.name.as_str() == field.0)
+        else {
+            continue;
+        };
+        if seen.contains(&name) || !kind.matches(&option.value) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    None
+}
+
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
 /// is answered, never silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12160,6 +12264,12 @@ fn parse_voice_command_with_registry(
     let name = identities.slash_name(interaction)?;
     match name.as_str() {
         "create" => {
+            if let Some(field) = setup_shape_refusal("create", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "create",
+                    field,
+                });
+            }
             let name = command
                 .options
                 .iter()
@@ -12204,6 +12314,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "position" => {
+            if let Some(field) = setup_shape_refusal("position", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "position",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = PositionRequest {
                 position: None,
@@ -12231,6 +12347,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "group" => {
+            if let Some(field) = setup_shape_refusal("group", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "group",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = GroupRequest { enabled: None };
             for option in &command.options {
@@ -12248,6 +12370,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "inheritpermissions" => {
+            if let Some(field) = setup_shape_refusal("inheritpermissions", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "inheritpermissions",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = InheritPermissionsRequest {
                 source: None,
@@ -12271,6 +12399,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "defaultlimit" => {
+            if let Some(field) = setup_shape_refusal("defaultlimit", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "defaultlimit",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = DefaultLimitRequest { limit: None };
             for option in &command.options {
@@ -12288,6 +12422,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "alwaysprivate" => {
+            if let Some(field) = setup_shape_refusal("alwaysprivate", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "alwaysprivate",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = AlwaysPrivateRequest { enabled: None };
             for option in &command.options {
@@ -12671,6 +12811,7 @@ impl VoiceCommand {
             Self::InheritPermissions { .. } => "inheritpermissions",
             Self::DefaultLimit { .. } => "defaultlimit",
             Self::AlwaysPrivate { .. } => "alwaysprivate",
+            Self::SetupShapeInvalid { command, .. } => *command,
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Private => "private",
@@ -13614,6 +13755,12 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Ambiguous setup options refuse before guild authority, role gates and
+    // every read or effect: the parser already proved the shape unusable.
+    if let VoiceCommand::SetupShapeInvalid { command, field } = &command {
+        reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+        return true;
+    }
     // Cold guild-role facts are not a permanent denial: a command that
     // needs that authority gets the retryable warming-up reply and fails
     // closed before any gate read or protected effect. Missing-member
@@ -14056,6 +14203,13 @@ where
                 },
             };
             reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::SetupShapeInvalid { command, field } => {
+            // Unreachable through the shared handler (answered above before
+            // any read), but a second dispatch path must still refuse here,
+            // never run.
+            reply(ephemeral_response(&setup_shape_correction(command, field))).await;
             true
         }
         VoiceCommand::Reclaim => {
