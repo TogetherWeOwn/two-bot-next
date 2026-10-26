@@ -29,6 +29,7 @@ use two_bot_core::{
     automation_quota::QuotaWriteError,
     commands::MAX_RESOURCE_ID_CHARS,
     funnel::now_millis_for_test,
+    message_safety::{text_len, truncate},
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
         schedule_cancelled_text, schedule_confirm_text, schedule_list_first_pages,
@@ -66,6 +67,8 @@ const NO_CHANNEL_REPLY: &str = "This command only works in a channel.";
 /// validation, exactly like legacy, so the trail names the attempted row.
 /// Malformed options refuse before any store read or audit via
 /// [`schedule_options_strict`]: no row, no audit, one private correction.
+/// `preview:true` renders the proposal privately instead and returns before
+/// any id, store or audit effect; omitted or false keeps create unchanged.
 pub(crate) async fn schedule_create(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -83,6 +86,13 @@ pub(crate) async fn schedule_create(
             return;
         }
     };
+    let preview = match schedule_preview_option_strict(interaction) {
+        Ok(preview) => preview,
+        Err(refusal) => {
+            finish(executor, interaction, refusal).await;
+            return;
+        }
+    };
     let now = now_millis();
     let absolute_due = match schedule_absolute_due(interaction, in_minutes, every_minutes, now) {
         Ok(due) => due,
@@ -91,18 +101,46 @@ pub(crate) async fn schedule_create(
             return;
         }
     };
-    let actor = actor_id(interaction);
-    let id = new_id();
-    let now_iso = format_iso_ms(now);
 
     // The relative validator owns the unchanged body/mention and interval
     // checks. An already validated absolute one-shot supplies its minimum
     // delay only to select that branch; its due instant never uses the delay.
-    let validated = match validate_schedule(&ScheduleInput {
+    // Pure: a preview resolves the same result without minting an attempt id
+    // or auditing, while create keeps its id-first rejection trail below.
+    let validated_result = validate_schedule(&ScheduleInput {
         body: body.as_deref().unwrap_or_default(),
         in_minutes: absolute_due.map(|_| IN_MINUTES_MIN).or(in_minutes),
         every_minutes,
-    }) {
+    });
+    if preview == Some(true) {
+        match validated_result {
+            Ok(validated) => {
+                let due_ms =
+                    absolute_due.unwrap_or_else(|| next_run_at_ms(now, validated.delay_minutes));
+                finish(
+                    executor,
+                    interaction,
+                    render_schedule_preview(
+                        &channel_id,
+                        due_ms,
+                        validated.interval_seconds,
+                        &validated.body,
+                    ),
+                )
+                .await;
+            }
+            Err(err) => {
+                finish(executor, interaction, err.to_string()).await;
+            }
+        }
+        return;
+    }
+
+    let actor = actor_id(interaction);
+    let id = new_id();
+    let now_iso = format_iso_ms(now);
+
+    let validated = match validated_result {
         Ok(validated) => validated,
         Err(err) => {
             audit(
@@ -616,6 +654,51 @@ fn schedule_confirmation(
     text
 }
 
+/// Discord's message ceiling in UTF-16 units, shared with the body validator.
+const PREVIEW_MAX_UNITS: usize = 2000;
+
+/// Display-only cut marker. The body the staff member typed is untouched —
+/// only this rendering is shortened — so the note names the cut explicitly
+/// instead of silently dropping the tail.
+const PREVIEW_TRUNCATED_NOTE: &str = "…(truncated for preview; create uses your full text)";
+
+/// Render a proposed schedule without saving it: the invoking channel, the
+/// first due instant in canonical UTC plus a Discord-local timestamp, the
+/// one-off versus recurring shape, and the already-neutralized body as data.
+///
+/// Pure text in, text out: no id, no store read, no audit, no quota. The
+/// caller runs the same validators as create first, so the due instant and
+/// body shown here match what create would persist under the same clock —
+/// but a later create still revalidates timing and availability, which this
+/// reply says outright. It names no saved id, links no message and promises
+/// no delivery. Metadata is never dropped to fit the cap; only the body is
+/// cut, and only with the explicit truncation note above.
+fn render_schedule_preview(
+    channel_id: &str,
+    due_ms: u64,
+    interval_seconds: Option<i64>,
+    body: &str,
+) -> String {
+    let repeats = match interval_seconds.map(|seconds| seconds / 60) {
+        Some(every_minutes) => format!("every {every_minutes} minutes"),
+        None => "one-off".to_owned(),
+    };
+    let head = format!(
+        "Preview — not scheduled\nChannel: {channel_id}\nFirst run: {} (<t:{}:F>)\nRepeats: {repeats}\nBody: ",
+        format_iso_ms(due_ms),
+        due_ms / 1000,
+    );
+    let foot = "\nCreating this schedule later revalidates timing and availability; this preview reserves nothing.";
+    let budget = PREVIEW_MAX_UNITS.saturating_sub(text_len(&head) + text_len(foot));
+    let shown = if text_len(body) <= budget {
+        body.to_owned()
+    } else {
+        let room = budget.saturating_sub(text_len(PREVIEW_TRUNCATED_NOTE));
+        format!("{}{PREVIEW_TRUNCATED_NOTE}", truncate(body, room))
+    };
+    format!("{head}{shown}{foot}")
+}
+
 fn schedule_list_line_localized(
     id: &str,
     channel_id: &str,
@@ -802,6 +885,10 @@ const SCHEDULE_INVALID_EVERY_MINUTES: &str =
     "Invalid every-minutes option. Use /schedule body:<text> every-minutes:<minutes>.";
 const SCHEDULE_DUPLICATE_EVERY_MINUTES: &str =
     "Duplicate every-minutes option. Use /schedule body:<text> every-minutes:<minutes>.";
+const SCHEDULE_INVALID_PREVIEW: &str =
+    "Invalid preview option. Use /schedule body:<text> in-minutes:<minutes> preview:<true|false>.";
+const SCHEDULE_DUPLICATE_PREVIEW: &str =
+    "Duplicate preview option. Use /schedule body:<text> in-minutes:<minutes> preview:<true|false>.";
 const SCHEDULE_REMOVE_INVALID_ID: &str =
     "Invalid id option. Use /schedule-remove id:<schedule-id>.";
 const SCHEDULE_REMOVE_DUPLICATE_ID: &str =
@@ -859,6 +946,32 @@ pub(crate) fn schedule_options_strict(
         Some(_) => return Err(SCHEDULE_INVALID_EVERY_MINUTES),
     };
     Ok((body, in_minutes, every_minutes))
+}
+
+/// Strictly decode `/schedule`'s `preview` option. A wrong wire type or a
+/// duplicated name refuses — even `false` twice, which would otherwise read
+/// as an ordinary create — while a missing option decodes to `None` so
+/// omitted preview keeps today's create behavior byte-identical.
+pub(crate) fn schedule_preview_option_strict(
+    interaction: &Interaction,
+) -> Result<Option<bool>, &'static str> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return Ok(None);
+    };
+    let mut previews: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        if option.name.as_str() == "preview" {
+            previews.push(&option.value);
+        }
+    }
+    if previews.len() > 1 {
+        return Err(SCHEDULE_DUPLICATE_PREVIEW);
+    }
+    match previews.first() {
+        None => Ok(None),
+        Some(CommandOptionValue::Boolean(value)) => Ok(Some(*value)),
+        Some(_) => Err(SCHEDULE_INVALID_PREVIEW),
+    }
 }
 
 /// Strictly decode `/schedule-remove`'s `id` option. A wrong wire type or a
