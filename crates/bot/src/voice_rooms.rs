@@ -68,8 +68,9 @@ use two_bot_core::{
         VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
-        diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
-        DIFF_HASH_CHARS,
+        diff_configuration, diff_content_hash, render_preview, render_review_preview,
+        serialize_full_review, skip_unknown_channels, ConfigDiff, FullReviewError, DIFF_HASH_CHARS,
+        FULL_REVIEW_BYTE_LIMIT,
     },
     voice_create_admission::{
         CreateAdmissionConfig, RefusalReason, MAX_CREATE_COOLDOWN_SECS, MAX_ROOMS_PER_GUILD,
@@ -11706,12 +11707,13 @@ pub enum ImportDecision {
     /// Nothing to confirm (empty diff, cancel, expiry): reply with `text`
     /// alone and store nothing.
     Notice { text: String },
-    /// Show `text` with Confirm/Cancel bound to (`member_id`, `hash`) and
-    /// remember `candidate` for Confirm.
+    /// Show `text` and the complete `review` attachment with Confirm/Cancel
+    /// bound to (`member_id`, `hash`); remember `candidate` for Confirm.
     Preview {
         candidate: VoiceConfiguration,
         hash: String,
         text: String,
+        review: Vec<u8>,
     },
     /// Confirm verified against fresh state: apply `candidate`, then reply
     /// with `message`.
@@ -11772,14 +11774,43 @@ pub fn plan_import_preview(
     // report an empty skipped list and an unknown-channels-only file would
     // read as `No changes`. The pruned `remaining` stays the candidate.
     let diff = diff_configuration(current, &incoming, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    plan_reviewable_import(current, remaining, &diff)
+}
+
+/// One admitted snapshot supplies the summary, full review and pending hash.
+/// Serialize before a Preview can exist, so no failure path can offer Confirm
+/// or insert temporary pending state for an unreviewable diff.
+fn plan_reviewable_import(
+    current: &VoiceConfiguration,
+    candidate: VoiceConfiguration,
+    diff: &ConfigDiff,
+) -> ImportDecision {
     if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
+        return ImportDecision::Notice {
+            text: render_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        };
     }
+    let hash = diff_content_hash(current, &candidate);
+    let review = match serialize_full_review(diff, &candidate.guild_id, &hash) {
+        Ok(bytes) => bytes,
+        Err(FullReviewError::TooLarge) => {
+            return ImportDecision::Refuse {
+                message: format!(
+                    "The complete review diff is too large (limit: {FULL_REVIEW_BYTE_LIMIT} serialized bytes). Reduce the proposed changes in the file and try again. Nothing was changed.",
+                ),
+            };
+        }
+        Err(FullReviewError::Serialization) => {
+            return ImportDecision::Refuse {
+                message: "Could not build the complete review diff. Nothing was changed; try uploading the file again.".to_owned(),
+            };
+        }
+    };
     ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
+        hash,
+        candidate,
+        text: render_review_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        review,
     }
 }
 
@@ -11817,16 +11848,10 @@ pub fn plan_import_confirm(
             ),
         };
     }
-    let diff = diff_configuration(current, &remaining, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
-    if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
-    }
-    ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
-    }
+    // Retain facts about channels newly skipped by this inventory. The
+    // remembered candidate is already pruned by the original preview.
+    let diff = diff_configuration(current, candidate, inventory);
+    plan_reviewable_import(current, remaining, &diff)
 }
 
 /// How many creator channels `candidate` adds over `current`.
@@ -11910,11 +11935,22 @@ fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> Inte
 /// Ephemeral `/import` preview reply with Confirm/Cancel buttons. Mentions
 /// are disabled: the preview quotes uploaded template text, which must never
 /// ping.
-fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
+fn import_preview_response(
+    text: &str,
+    member_id: Snowflake,
+    hash: &str,
+    guild_id: Snowflake,
+    review: Vec<u8>,
+) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             content: Some(text.to_owned()),
+            attachments: Some(vec![Attachment::from_bytes(
+                format!("voice-config-diff-guild-{guild_id}-v1.json"),
+                review,
+                0,
+            )]),
             components: Some(import_preview_components(member_id, hash)),
             flags: Some(MessageFlags::EPHEMERAL),
             allowed_mentions: Some(AllowedMentions {
@@ -14593,13 +14629,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { .. } => {
             warn!(
@@ -14711,13 +14751,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { candidate, message } => {
             if let Some(refusal) = import_creator_gate(&current, &candidate, permissions) {
@@ -14748,11 +14792,15 @@ where
                                     candidate,
                                     hash,
                                     text,
+                                    review,
                                 } => {
                                     runtime.remember_pending_import(
                                         guild_id, member_id, &hash, candidate,
                                     );
-                                    reply(import_preview_response(&text, member_id, &hash)).await;
+                                    reply(import_preview_response(
+                                        &text, member_id, &hash, guild_id, review,
+                                    ))
+                                    .await;
                                 }
                                 ImportDecision::Apply {
                                     candidate: retry,
