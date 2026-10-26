@@ -21,7 +21,9 @@ dashboard write.
 **Recommend read-first, not a post editor over today's verbs.** Inventory
 at source commit `1441cbef76a1c8237a3a91a8944e2d25b66c4ce4` finds four
 shipped organizer operations, but no guild configuration, no signed LFG
-verb, no revision/CAS column, and advisory-lock-only concurrency. After
+verb or revision/CAS column. Writes use advisory locks, and metadata
+edit also takes a row lock (`lfg_store.rs:166`); neither supplies a stale
+snapshot token. After
 intent acceptance, the smallest eventual page can list channel-scoped
 open-post rows read-only (slice S1 below). Edit and close wait for LG-W2
 (CAS) plus LG-W3 (least-scope write verbs) plus LG-W4 (count-only
@@ -52,6 +54,9 @@ needs a new verb (LG-W1/LG-W3).
 `revision`/`version`). Ordering comes from three advisory locks:
 `lfg:{guild}:{id}` for domain writes, `lfg-runtime:{guild}:{id}` for
 mutation-plus-refresh, and `lfg-select:{interaction}` for replay identity.
+Metadata edit additionally locks the post row with `SELECT ... FOR UPDATE`
+(`lfg_store.rs:166`); seat increase locks both post and role rows
+(`:241`, `:254`). These serialize writes, not a browser's observed version.
 Every dashboard write is read-then-act until LG-W2 lands; see
 `VERSION_UNKNOWN` below.
 
@@ -231,9 +236,9 @@ entries name doctest absence assertions, not line anchors.
   "source_sha": "1441cbef76a1c8237a3a91a8944e2d25b66c4ce4",
   "controls": [
     {"id":"LG-C1","op":"lfg_create","present":"slash_only","state":"not_exposed","gate":[],"evidence":["E-CREATE","E-PERM","E-ROUTE","E-QUOTA","E-PUT","E-DELETE"]},
-    {"id":"LG-C2","op":"lfg_close","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3","LG-W4"],"evidence":["E-CLOSE-DEF","E-PERM","E-ROUTE","E-CLOSE","E-CLOSE-REPLY","E-AUDIT","E-REFRESH"]},
-    {"id":"LG-C3","op":"lfg_edit","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3","LG-W4"],"evidence":["E-EDIT-DEF","E-PERM","E-ROUTE","E-EDIT","E-SEAT-EDIT","E-VALID-ID","E-VALID-TITLE","E-STARTS","E-AUDIT","E-REFRESH"]},
-    {"id":"LG-C4","op":"lfg_list","present":"slash","state":"candidate_read","gate":["LG-W1"],"evidence":["E-LIST-DEF","E-PERM","E-ROUTE","E-LIST","E-CURSOR","E-CURSOR-KEY","E-CURSOR-MINT","E-RENDER","E-PAST","E-UNKNOWN","E-LIST-HANDLER"]},
+    {"id":"LG-C2","op":"lfg_close","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3","LG-W4"],"evidence":["E-CLOSE-DEF","E-PERM","E-CLOSE-ROUTE","E-CLOSE","E-CLOSE-REPLY","E-AUDIT","E-REFRESH"]},
+    {"id":"LG-C3","op":"lfg_edit","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3","LG-W4"],"evidence":["E-EDIT-DEF","E-PERM","E-EDIT-ROUTE","E-EDIT","E-SEAT-EDIT","E-VALID-ID","E-VALID-TITLE","E-STARTS","E-AUDIT","E-REFRESH"]},
+    {"id":"LG-C4","op":"lfg_list","present":"slash","state":"candidate_read","gate":["LG-W1"],"evidence":["E-LIST-DEF","E-PERM","E-LIST-ROUTE","E-LIST","E-CURSOR","E-CURSOR-KEY","E-CURSOR-MINT","E-CURSOR-SHAPE","E-CURSOR-DECODE","E-RENDER","E-PAST","E-UNKNOWN","E-LIST-HANDLER"]},
     {"id":"LG-C5","op":"member_select_leave","present":"component","state":"member_only","gate":[],"evidence":["E-SIGNUP","E-ADJUDICATE"]},
     {"id":"LG-C6","op":"lifecycle_sweep","present":"job","state":"automatic","gate":[],"evidence":["E-EXPIRY","E-SWEEP","E-CLOSE"]}
   ],
@@ -253,6 +258,9 @@ entries name doctest absence assertions, not line anchors.
     "E-LIST-DEF":{"path":"crates/core/src/feature_commands.rs","line":519,"contains":"CommandDefinition::new(\"lfg-list\", \"List open game posts in this channel\")"},
     "E-PERM":{"path":"crates/core/src/commands.rs","line":287,"contains":"pub const PERM_MANAGE_EVENTS: u64 = 8589934592;"},
     "E-ROUTE":{"path":"crates/core/src/router.rs","line":734,"contains":"\"lfg\" => Row {"},
+    "E-CLOSE-ROUTE":{"path":"crates/core/src/router.rs","line":739,"contains":"\"lfg-close\" => Row {"},
+    "E-EDIT-ROUTE":{"path":"crates/core/src/router.rs","line":744,"contains":"\"lfg-edit\" => Row {"},
+    "E-LIST-ROUTE":{"path":"crates/core/src/router.rs","line":749,"contains":"\"lfg-list\" => Row {"},
     "E-VALID-ID":{"path":"crates/core/src/lfg.rs","line":608,"contains":"pub fn valid_post_id(post_id: &str) -> bool {"},
     "E-VALID-TITLE":{"path":"crates/core/src/lfg.rs","line":222,"contains":"pub fn validate_title(title: &str) -> Result<String, TitleError> {"},
     "E-STARTS":{"path":"crates/core/src/lfg.rs","line":247,"contains":"pub fn normalize_starts_at(value: &str, now_unix_ms: i64) -> Result<String, StartsAtError> {"},
@@ -269,6 +277,8 @@ entries name doctest absence assertions, not line anchors.
     "E-CURSOR":{"path":"crates/core/src/lfg_list.rs","line":11,"contains":"pub const PAGE_ROWS: usize = 5;"},
     "E-CURSOR-KEY":{"path":"crates/core/src/lfg_list.rs","line":21,"contains":"static CURSOR_KEY: OnceLock<Secret<[u8; 32]>> = OnceLock::new();"},
     "E-CURSOR-MINT":{"path":"crates/core/src/lfg_list.rs","line":42,"contains":"fn encode(&self, guild: &str, channel: &str) -> String {"},
+    "E-CURSOR-SHAPE":{"path":"crates/core/src/lfg_list.rs","line":61,"contains":"if bytes.len() < 51 || bytes.len() > 305 || bytes[0] != 1 {"},
+    "E-CURSOR-DECODE":{"path":"crates/core/src/lfg_list.rs","line":65,"contains":"cursor_mac(guild, channel, payload).verify_slice(tag).ok()?;"},
     "E-RENDER":{"path":"crates/core/src/lfg_list.rs","line":157,"contains":"pub fn render_page("},
     "E-PAST":{"path":"crates/core/src/lfg_list.rs","line":177,"contains":"(past)"},
     "E-UNKNOWN":{"path":"crates/core/src/lfg_list.rs","line":179,"contains":"Start time unknown"},
@@ -404,9 +414,9 @@ or require a new credential/data grant.
 
 ### No-build alternative
 
-Organizers already hold every operation in Discord under the same
-permission: list, edit, close, plus member signup. A dashboard page adds a
-new PII-adjacent read surface and — without LG-W2 — a last-writer-wins
+Organizers already list, edit and close in Discord under Manage Events;
+signup and leave are separate component operations available to any
+member. A dashboard page adds a new PII-adjacent read surface and — without LG-W2 — a last-writer-wins
 write path, for organizers who can already do the work in-channel. The
 default recommendation is therefore **no-build until S1 prerequisites are
 proven**, and no writes until LG-W2 through LG-W4 are proven.
