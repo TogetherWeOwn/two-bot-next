@@ -72,15 +72,20 @@ async fn inspect_without_current_dispatch_facts_says_unknown_not_enabled() {
         eligibility.contains("unknown") || eligibility.contains("unavailable"),
         "missing authoritative facts are not a passing configuration: {content}"
     );
-    assert!(!eligibility.contains("eligible ("));
+    assert!(
+        !eligibility
+            .split_once(':')
+            .is_some_and(|(_, state)| state.trim_start().starts_with("eligible")),
+        "unknown dispatch facts must not be presented as a passing state: {content}"
+    );
     assert!(!content.contains("SAVED BODY MUST STAY SEPARATE"));
     assert!(content.contains("/command-inspect name:faq view:template"));
     assert!(content.contains("/command-inspect name:faq view:preview"));
     for claim in [
-        "will execute",
-        "will run",
-        "registration synchronized",
-        "registration synced",
+        "execution: guaranteed",
+        "delivery: guaranteed",
+        "registration: synchronized",
+        "registration: synced",
     ] {
         assert!(
             !content.to_lowercase().contains(claim),
