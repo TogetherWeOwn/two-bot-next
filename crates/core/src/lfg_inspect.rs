@@ -102,7 +102,7 @@ fn render_lines(
     rows: &[String],
 ) -> Result<String, &'static str> {
     let header = message_safety::neutralize_mentions(&header(post));
-    let intro = intro.map(|line| message_safety::neutralize_mentions(line));
+    let intro = intro.map(message_safety::neutralize_mentions);
     let rows: Vec<String> = rows
         .iter()
         .map(|row| message_safety::neutralize_mentions(row))

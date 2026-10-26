@@ -10,7 +10,7 @@
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
 //!    `twilight_http` bulk-set endpoint against the mock Discord double in
-//!    `common`: one request, all 43 names, guild-only, permission bits as
+//!    `common`: one request, all 44 names, guild-only, permission bits as
 //!    decimal strings. The REST executor ([TOG-10076]) owns the production
 //!    call; this proves the payload it will send.
 //!

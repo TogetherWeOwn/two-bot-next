@@ -5,7 +5,7 @@
 //! `fixtures/smoke_surface_inventory.json` exactly, in publish order. The
 //! fixture additionally marks the five smoke-covered commands (one per
 //! routing family, matching `crates/discord/tests/top5_reply_fixtures.rs`)
-//! versus the 37 saved deferrals (38 with the compiled-only LFG edit).
+//! versus the 37 saved deferrals (39 with compiled-only LFG edit/inspect).
 //!
 //! Offline only: no staging guild, no live Discord, no network, no database.
 
