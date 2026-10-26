@@ -18,7 +18,7 @@
 #![cfg(test)]
 
 use super::*;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -317,8 +317,7 @@ fn race_harness(
     Arc<RaceShared>,
 ) {
     let shared = Arc::new(Mutex::new(config));
-    let queue: Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>> =
-        Arc::new(Mutex::new(downloads.into_iter().collect()));
+    let queue: DownloadResults = Arc::new(Mutex::new(downloads.into_iter().collect()));
     let race = Arc::new(RaceShared {
         fresh: Mutex::new(fresh),
         raced: AtomicBool::new(false),
