@@ -100,8 +100,11 @@ with no ticket-ID selector, reason, force or admin-override option:
    performs no mutation. The actor comes only from the authenticated Discord
    interaction, never options, custom IDs or agent-supplied JSON. The recipient
    is the one explicit member option on offer; it grants no authority by itself.
-2. Offer requires ticket `open`, a nonempty bound channel and **current**
-   `claimed_by == actor`. Accept/refuse require actor equality with the offer's
+2. Offer requires ticket `open`, a nonempty bound channel, **current**
+   `claimed_by == actor`, and a recipient distinct from the actor
+   (`offered_to != offered_by`); a self-handoff is denied, never a no-op
+   transfer that returns saved. Accept/refuse require actor equality with the
+   offer's
    named recipient; cancel requires actor equality with the offeror. Pending
    shows only rows naming the actor. Re-evaluate the existing staff predicate
    from the current configured staff role and fresh invoking-member evidence at
@@ -246,6 +249,7 @@ offers. If this cannot fit a bounded reviewed follow-up, choose A.
 | `stale / offer_changed / refresh_private_preview` | "This handoff is out of date. No change was made. Refresh before continuing." Covers expiry, revision advance, duplicate and terminal state; never names the other party's new state |
 | `denied / not_participant_or_staff / ask_authorized_staff` | "Only the current staff claimant can offer, and only the named staff recipient can accept." No assignment details |
 | `denied / offer_pending / cancel_or_await_settlement` | "An offer is already pending for this ticket. Cancel it or wait for it to settle." First offer intact; nothing terminal |
+| `denied / self_handoff / name_another_recipient` | "You cannot hand a ticket to yourself. Name another staff recipient." No row, no audit |
 | `unavailable / context_unavailable / verify_access` | "Handoff is unavailable here. No change was saved." Collapses absent/foreign/unproven context and the dark-generation gate; reveals no IDs |
 | `unavailable / store_unavailable / retry_private_preview` | "Handoff could not be saved. Refresh and try again." Proven pre-commit failure/rollback only |
 | `unavailable / commit_unknown / inspect_current_assignment` | "The handoff result is unconfirmed. Check current assignment before trying again." Never asserts rollback or success |
@@ -261,7 +265,11 @@ actor_id = offeror (prior claimant), target_id = recipient (new claimant),
 explicit ticket_id FK derived from the locked parent, and metadata containing
 only `revision_before`, `revision_after`, `outcome=saved`, `reason=accepted`
 and `offer_id` (<=512 UTF-8 bytes). Entry ID is
-`th1:<guild>:<ticket>:<revision_after>` (<=77 ASCII characters). No raw
+`th1:<guild>:<ticket>:<revision_after>` (<=77 ASCII characters). Handoff admits
+only 32-lowercase-hex ticket IDs (the runtime generator in §2); legacy IDs
+return unavailable at preview, never a composed key, guessed ID or new mapping
+table. With guild as a Discord snowflake (<=19 digits), ticket 32 hex and
+revision <=19 digits, the longest key is 76 ASCII characters. No raw
 interaction ID/token, custom ID, body, names, channel IDs, transcript, free
 text or other claimant history. The typed decoder supports the kind;
 `mirror_channel_id=NULL`, `delivery_state=none` permanently. Audit failure
@@ -277,9 +285,12 @@ delete handoff audit by actor OR target (offeror/recipient) and offers by
 either principal, plus opener linkage via the parent. The ticket FK cascades
 offer and handoff-audit rows on parent deletion/guild purge. Numeric revision
 holds no actor and is never reset by erasure. Terminal-offer retention needs
-the same 45-day operational integration proven before build; pending offers
-cannot outlive `expires_at` plus read-time grace, but crash-before-expiry rows
-still need the purge path, not a new timer. Restore re-applies erasure before
+the same 45-day operational integration proven before build; until it is
+proven, B stays dark. Pending offers have no grace period: `expires_at <=
+database time` is expired at every read. A lazily expired row is marked
+expired in the next offer transaction for that ticket; rows never touched
+again are removed only by the proven 45-day purge, never an ad-hoc delete or
+a new timer. Restore re-applies erasure before
 reads; no backup or Discord-side destruction is claimed. Transcript
 erasure/retention is unchanged; no transcript is created or rewritten.
 
@@ -300,9 +311,10 @@ foreign/unavailable context. `mode=dry_run` is a typed read-only path: same
 checks, no INSERT/UPDATE, audit, revision increment, reservation, send or job
 beyond the private preview; it predicts eligibility at read time, never
 reserves it. Commit-unknown has `retryable=false`: inspect, never blindly
-reapply. Handoff also includes exact source commit/spec hash and the check
-below; examples use synthetic IDs only. No activation follows a passing
-document check.
+reapply. The exact source commit/spec hash binding stays in the out-of-band
+intent review request in §7; `tickets.handoff.v1` carries no commit or hash
+fields. The check below uses synthetic IDs only. No activation follows a
+passing document check.
 
 Fixture base: configured guild g1, channel c1, open ticket T, claimant A,
 revision 7; B is another staffer and the named recipient, N a nonstaff
@@ -316,9 +328,11 @@ row.
 | offer_accept | A offers T@7 to B -> pending; B accepts -> saved, B@8, exactly one audit; A responsible until commit |
 | nonclaimant_offer | B (not claimant) offers -> denied, A@7 unchanged, no offer row |
 | nonstaff_offer | N offers, or A after staff removal offers -> denied, unchanged |
+| self_offer | A offers T@7 to A -> denied/self_handoff, A@7 unchanged, no offer row, no audit |
 | nonstaff_accept | B loses staff before accept -> denied, A@7, pending row left for expiry/cancel |
 | foreign_guild | g2/DM/application mismatch -> unavailable, no IDs or writes |
 | wrong_binding | Foreign channel/message/private recipient, or C accepts B's offer -> unavailable/denied, unchanged |
+| legacy_id | Legacy non-32-hex ticket ID -> unavailable at preview, no offer row/audit, no composed key |
 | pending_visibility | With A->B pending: A and B `pending` reads show that row privately; third staffer C reads -> no rows, learns nothing; no writes anywhere |
 | unclaimed_offer | Offer on NULL@8 -> denied, no row/control/audit; B uses the normal claim path |
 | refuse | B refuses -> no_op, A@7, offer terminal refused, no audit row |
@@ -341,7 +355,7 @@ row.
 | reply_failure | Confirm commit then fail private edit -> B@8 and one audit, no compensation/retry |
 | proof_timeout | Row lock held past proof deadline -> rollback/unavailable, no Discord I/O while locked |
 | erasure | Erase A or B through each path: offer rows and handoff audit gone; parent erasure cascades; g2 untouched |
-| retention_expiry | 45-day audit purge and terminal-offer purge leave witness/ticket intact; stale offers never valid again |
+| retention_expiry | Proven 45-day purge removes terminal and lazily expired offers plus aged audit; witness/ticket intact; stale never valid; unproven purge keeps B dark |
 | dark_without_generation | Missing/NULL witness/trigger or unaccepted generation contract -> unavailable/dark, no default revision |
 | overflow | Revision at i64 MAX refuses mutation; never wraps or resets |
 
@@ -363,21 +377,22 @@ reply failures and the shared Discord double. No live tests here.
 >>> text = pathlib.Path("docs/ticket-claim-handoff-spec.md").read_text()
 >>> rows = text.split("| Case |", 1)[1].split("\n\n", 1)[0].splitlines()[2:]
 >>> cases = [row.split("|")[1].strip() for row in rows]
->>> assert len(cases) == len(set(cases)) == 31
->>> assert {"offer_accept", "refuse", "expiry", "close_first", "same_actor_aba", "duplicate_accept", "restart_after", "erasure"} <= set(cases)
+>>> assert len(cases) == len(set(cases)) == 33
+>>> assert {"offer_accept", "refuse", "expiry", "close_first", "same_actor_aba", "duplicate_accept", "restart_after", "erasure", "self_offer", "legacy_id"} <= set(cases)
 >>> # Abstract witness arithmetic, not a runtime or database implementation.
 >>> offered, accepted = 7, 7 + 1
 >>> assert offered == 7 and accepted == 8 and offered != accepted
 >>> assert not (1800 < 1800) and not (300 < 300)  # equality is expired
 >>> token = "two:th:1:" + "b" * 32 + ":" + str(2**63 - 1) + ":253402300799:" + "B" * 22
 >>> assert len(token) == 97 and len(token) <= 100
+>>> assert 4 + 19 + 1 + 32 + 1 + 19 == 76  # longest audit entry ID, 32-hex tickets only
 >>> sample = json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
 >>> assert sample["schema"] == "tickets.handoff.v1" and sample["retryable"] is False
 >>> assert sample["claim_id"]["revision"] == "7" and sample["reason"] == "confirm_required"
 >>> assert not {"actor_id", "content", "token"} & sample.keys()
 >>> result = {"schema": "tickets.handoff.design-check.v1", "cases": len(cases), "outcome": "checked", "reason": "offline_oracle_only", "next_action": "request_exact_spec_intent_alignment"}
 >>> print(json.dumps(result, sort_keys=True))
-{"cases": 31, "next_action": "request_exact_spec_intent_alignment", "outcome": "checked", "reason": "offline_oracle_only", "schema": "tickets.handoff.design-check.v1"}
+{"cases": 33, "next_action": "request_exact_spec_intent_alignment", "outcome": "checked", "reason": "offline_oracle_only", "schema": "tickets.handoff.design-check.v1"}
 
 ```
 
@@ -403,7 +418,7 @@ not host alignment; no implementation, protected acceptance or build cards
 before both records. Any material spec edit needs a new hash-bound request,
 not carried approval.
 
-By 2026-11-02, measure **31/31 fixture outcomes explicitly accepted or
+By 2026-11-02, measure **33/33 fixture outcomes explicitly accepted or
 revised, CEO/host disposition recorded, and incremental value over
 self-release plus queue proven or B deferred/killed**. No demand/engagement
 success is claimed. At expiry, default A (no build); unanswered intent never
