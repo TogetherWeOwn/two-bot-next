@@ -63,17 +63,20 @@ Two 503s that are truthful, never acceptance:
 
 ## 3. Top command-surface presence
 
-The publish set (`InteractionRouter::publish_set`,
-`crates/core/src/router.rs:817-855`) with all gates on is **32 built-ins**,
-guild-only (`dm_permission` false throughout), in legacy publish order
-(pinned `crates/core/src/router.rs:1412-1440`):
+The publish set (`InteractionRouter::publish_set`) with all gates on is
+**44 built-ins**, guild-only (`dm_permission` false throughout), in legacy
+publish order (pinned by `publish_set_is_the_complete_merged_view` in
+`crates/core/src/router.rs`):
 
-`rank`, `leaderboard`, `help`, `privacy`, `reopen` (core), `attendance` (scorecard), `command`,
-`command-remove`, `command-list`, `command-inspect`, `schedule`, `schedule-remove`,
-`schedule-list`, `sticky`, `sticky-remove` (automation), `rsvp`,
-`rsvp-attendance`, `lfg`, `lfg-close`, `feed-add`, `feed-remove`,
-`feed-list`, `feed-inspect` (announcements), `ban`, `tempban`, `kick`,
-`timeout`, `warn`, `purge`, `slowmode`, `lockdown`, `unlock` (moderation).
+`rank`, `leaderboard`, `help`, `privacy`, `reopen`, `welcome-preview`,
+`game-mix` (core), `attendance` (scorecard), `command`, `command-remove`,
+`command-list`, `command-inspect`, `command-disable`, `command-enable`,
+`schedule`, `schedule-remove`, `schedule-retime`, `schedule-list`, `sticky`,
+`sticky-remove`, `giveaway` (automation), `rsvp`, `rsvp-attendance`, `lfg`,
+`lfg-close`, `lfg-edit`, `lfg-list`, `feed-add`, `feed-remove`, `feed-pause`,
+`feed-resume`, `feed-list`, `feed-inspect` (announcements), `ban`, `tempban`,
+`kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown`, `unlock`
+(moderation), `purge-preview`, `channel-inspect` (reads).
 
 First definition wins, built-in names are reserved, Discord's 100-command
 ceiling applies; DB-backed custom commands are dynamic and not listed.
@@ -152,7 +155,7 @@ with the observed value. Any NO-GO row aborts to the rollback path in
 - [ ] Gateway component `ready` (Connected); 503 parked is truthful, never
   acceptance (§2).
 - [ ] No `token_invalid: down`; no `gateway_failure` class present (§2).
-- [ ] All 28 commands present in publish order, guild-only (§3).
+- [ ] All 44 built-in commands present in publish order, guild-only (§3).
 - [ ] Top five route: `rank`/`leaderboard`/`rsvp` open, `lfg` needs Manage
   Events, `ban` needs Ban Members (§3).
 - [ ] Unknown name → re-pick copy; stale control → expired-control copy (§4).
