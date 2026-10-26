@@ -175,17 +175,17 @@ async fn seed(pool: &PgPool, name: &str, trigger: Option<&str>, enabled: bool) {
 
 fn assert_saved_and_eligibility(content: &str, enabled: bool) -> String {
     let lower = content.to_lowercase();
-    let saved = lower
-        .lines()
-        .find(|line| {
-            line.contains("saved")
-                && (line.contains("enabled")
-                    || line.contains("disabled")
-                    || line.contains("paused"))
-                && !line.contains("template")
-                && !line.contains("eligib")
-        })
-        .unwrap_or_else(|| panic!("separate saved-definition state is required: {content}"));
+    let saved = lower.lines().find(|line| {
+        line.contains("saved")
+            && (line.contains("enabled") || line.contains("disabled") || line.contains("paused"))
+            && !line.contains("template")
+            && !line.contains("eligib")
+    });
+    assert!(
+        saved.is_some(),
+        "separate saved-definition state is required: {content}"
+    );
+    let saved = saved.expect("saved-state line was asserted present");
     assert!(
         saved.contains(if enabled { "enabled" } else { "disabled" })
             || (!enabled && saved.contains("paused")),
@@ -206,12 +206,15 @@ fn assert_saved_and_eligibility(content: &str, enabled: bool) -> String {
             "eligibility is not delivery or Discord registry evidence: {content}"
         );
     }
-    lower
+    let eligibility = lower
         .lines()
-        .find(|line| line.contains("text") && line.contains("eligib"))
-        .unwrap_or_else(|| {
-            panic!("separate current text-trigger eligibility is required: {content}")
-        })
+        .find(|line| line.contains("text") && line.contains("eligib"));
+    assert!(
+        eligibility.is_some(),
+        "separate current text-trigger eligibility is required: {content}"
+    );
+    eligibility
+        .expect("eligibility line was asserted present")
         .to_owned()
 }
 
@@ -387,16 +390,20 @@ async fn inspect_eligibility_help_details_explain_saved_state_versus_conditional
     let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new().host("agent-testdb"));
     pool.close().await;
     let (mock, origin) = MockRest::start(vec![]).await;
-    let runtime = configured_runtime(
+    let runtime = CommandRuntime::new(
         pool,
-        origin,
-        Flags {
-            automations: true,
-            text: false,
-            voice: false,
-            assistant: false,
-        },
+        executor_at(origin),
+        router_with_commands(gates(true, false)),
+        GUILD,
+        true,
     );
+    // Help describes the last confirmed registry, never an unpublished guess.
+    // Publication is fixture setup through loopback, not an inspect side effect.
+    runtime
+        .publish_registry_checked(Some(1111))
+        .await
+        .expect("confirmed help fixture publication");
+    let confirmed = runtime.published_commands().expect("confirmed snapshot");
     let guard = runtime.dispatch_guard();
     let mut input = from_member(
         slash(
@@ -412,6 +419,12 @@ async fn inspect_eligibility_help_details_explain_saved_state_versus_conditional
     );
     input.id = Id::new(9500);
     let requests = dispatch(&runtime, &mock, input).await;
+    assert!(Arc::ptr_eq(
+        &confirmed,
+        &runtime
+            .published_commands()
+            .expect("same confirmed snapshot")
+    ));
     drop(guard);
     drop(runtime);
     mock.shutdown().await;
