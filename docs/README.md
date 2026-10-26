@@ -1,11 +1,7 @@
 # Documentation map
 
-Manifest: `- [Purpose](relative.md)`.
-
-`python3 scripts/check_docs_index.py --json` (repo root).
-Empty `{missing,stale,oversize}` = PASS; else exit 1.
-Bad rows land in `stale` as `docs/README.md:<line>`.
-Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
+Manifest: `- [Purpose](relative.md)`. Root: `python3 scripts/check_docs_index.py --json`.
+No `{missing,stale,oversize}` = PASS (0), else 1; bad rows in stale by line. Index <12,000; others <=65,536; except LARGE_DOCS.
 
 ## References and architecture
 
@@ -150,6 +146,7 @@ Budgets: index <12,000; others ≤65,536; exceptions only in `LARGE_DOCS`.
 - [Private subject proposal](ticket-subject-spec.md)
 - [Ticket runtime](tickets.md)
 - [Claim release design](ticket-claim-release-spec.md)
+- [Resolution signal](ticket-resolution-request-spec.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
 - [Suggestions triage](suggestions-triage-box.md)
 
