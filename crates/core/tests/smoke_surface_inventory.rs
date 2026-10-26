@@ -72,7 +72,31 @@ fn fixture() -> Value {
         "expected_response": null,
         "deferral_reason": "Compiled-only metadata companion; live publication and smoke remain unapproved."
     }));
-    fixture["count"] = serde_json::json!(43);
+    // Schedule-retime overlay: independently constructed from the acceptance
+    // contract (guild-only ManageGuild, required id/at with runtime caps),
+    // not copied from the production builder. Saved fixture predates it.
+    assert!(rows.iter().all(|row| row["name"] != "schedule-retime"));
+    let after_remove = rows
+        .iter()
+        .position(|row| row["name"] == "schedule-remove")
+        .expect("inventory retains schedule-remove")
+        + 1;
+    rows.insert(after_remove, serde_json::json!({
+        "name": "schedule-retime",
+        "description": "Correct an unsent one-off's time in this channel",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "id", "description": "Full scheduled message id from /schedule-list",
+             "type": "string", "required": true, "max_length": 128, "choices": []},
+            {"name": "at", "description": "Future RFC3339 time with Z or numeric offset, within 365 days",
+             "type": "string", "required": true, "max_length": 64, "choices": []}
+        ],
+        "smoke": "deferred",
+        "expected_response": null,
+        "deferral_reason": "Mutates a saved one-off deadline (DB write) with no live invocation; covered by disposable-database acceptance rather than the live smoke five."
+    }));
+    fixture["count"] = serde_json::json!(44);
     fixture
 }
 
@@ -92,14 +116,14 @@ fn option_type_name(kind: u8) -> &'static str {
 fn inventory_matches_registry_output_in_publish_order() {
     let published = all_on_router().publish_set(&[]).expect("publish set");
     let fixture = fixture();
-    assert_eq!(fixture["count"], 43, "43 built-ins");
+    assert_eq!(fixture["count"], 44, "44 built-ins");
     assert_eq!(
         fixture["dm_permission_all_false"], true,
         "fixture claims guild-only"
     );
     let rows = fixture["commands"].as_array().expect("command rows");
     assert_eq!(published.len(), rows.len(), "registry row count matches");
-    assert_eq!(published.len(), 43, "43 built-ins in the registry");
+    assert_eq!(published.len(), 44, "44 built-ins in the registry");
 
     for (definition, row) in published.iter().zip(rows.iter()) {
         let name = row["name"].as_str().expect("row name");
@@ -245,8 +269,8 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
     assert_eq!(covered.len(), 5, "exactly the top five");
-    assert_eq!(deferred.len(), 38, "every non-smoke row deferred");
-    assert_eq!(covered.len() + deferred.len(), 43, "every row marked");
+    assert_eq!(deferred.len(), 39, "every non-smoke row deferred");
+    assert_eq!(covered.len() + deferred.len(), 44, "every row marked");
 
     let mut covered_names: Vec<&str> = covered
         .iter()

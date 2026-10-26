@@ -47,6 +47,7 @@
     {"name": "command-enable", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "schedule-retime", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "sticky", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "sticky-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},

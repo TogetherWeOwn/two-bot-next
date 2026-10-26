@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
-        assert_eq!(automation_commands().len(), 12);
+        assert_eq!(automation_commands().len(), 13);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -765,6 +765,7 @@ mod tests {
                 "command-enable",
                 "schedule",
                 "schedule-remove",
+                "schedule-retime",
                 "schedule-list",
                 "sticky",
                 "sticky-remove",
@@ -788,8 +789,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 7 core + 1 scorecard + 12 automation + 12 announcements.
-        assert_eq!(merged.len(), 32);
+        // 7 core + 1 scorecard + 13 automation + 12 announcements.
+        assert_eq!(merged.len(), 33);
         assert_eq!(
             &names(&merged)[..8],
             [
@@ -828,6 +829,7 @@ mod tests {
             "command-enable",
             "schedule",
             "schedule-remove",
+            "schedule-retime",
             "schedule-list",
             "sticky",
             "sticky-remove",
@@ -878,6 +880,8 @@ mod tests {
             ("command-enable", 0, 32),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
+            ("schedule-retime", 0, 128),
+            ("schedule-retime", 1, 64),
             ("sticky", 0, 2000),
         ] {
             assert_eq!(
@@ -899,6 +903,20 @@ mod tests {
             (Some(60), Some(525600))
         );
         assert!(sched[1].required.is_none() && sched[2].required.is_none());
+        // Retime accepts only an existing id and an explicit future timestamp.
+        let retime = get(&auto, "schedule-retime");
+        assert!(!retime.dm_permission);
+        assert_eq!(retime.default_member_permissions.as_deref(), Some("32"));
+        assert_eq!(retime.options.len(), 2);
+        for (option, name, max_length) in [
+            (&retime.options[0], "id", 128),
+            (&retime.options[1], "at", 64),
+        ] {
+            assert_eq!(option.name, name);
+            assert_eq!(option.kind, CommandOptionType::String.as_u8());
+            assert_eq!(option.required, Some(true));
+            assert_eq!(option.max_length, Some(max_length));
+        }
         // /sticky debounce 1–300, optional.
         let sticky = get(&auto, "sticky").options.clone();
         assert_eq!(
@@ -1149,11 +1167,13 @@ mod tests {
         assert_eq!(json[6]["name"], "command-enable");
         assert_eq!(json[6]["default_member_permissions"], "32");
         assert_eq!(json[6]["options"].as_array().expect("options").len(), 1);
-        assert_eq!(json[12]["name"], "giveaway");
-        assert_eq!(json[12]["default_member_permissions"], "32");
-        assert_eq!(json[14]["name"], "rsvp-attendance");
-        assert!(json[14].get("default_member_permissions").is_none());
-        assert_eq!(json[14]["options"][0]["name"], "event-id");
+        assert_eq!(json[9]["name"], "schedule-retime");
+        assert_eq!(json[9]["default_member_permissions"], "32");
+        assert_eq!(json[13]["name"], "giveaway");
+        assert_eq!(json[13]["default_member_permissions"], "32");
+        assert_eq!(json[15]["name"], "rsvp-attendance");
+        assert!(json[15].get("default_member_permissions").is_none());
+        assert_eq!(json[15]["options"][0]["name"], "event-id");
     }
 
     #[test]

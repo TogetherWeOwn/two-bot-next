@@ -591,9 +591,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 43 all-gate builtins: 7 core + 1 scorecard + 12 automation
+            // 44 all-gate builtins: 7 core + 1 scorecard + 13 automation
             // + 12 announcements + 9 moderation mutations + 2 private reads.
-            43
+            44
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -606,6 +606,10 @@ mod tests {
         assert!(
             all_on.iter().any(|def| def.name == "giveaway"),
             "giveaway survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "schedule-retime"),
+            "schedule-retime survives the all-on registry"
         );
         assert!(
             all_on.iter().any(|def| def.name == "lfg-edit"),
@@ -633,7 +637,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 64);
+        assert_eq!(with_voice.len(), 65);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -645,6 +649,10 @@ mod tests {
         assert!(
             with_voice.iter().any(|def| def.name == "giveaway"),
             "giveaway survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "schedule-retime"),
+            "schedule-retime survives the voice registry"
         );
         assert!(
             with_voice.iter().any(|def| def.name == "lfg-edit"),
@@ -719,7 +727,7 @@ mod tests {
                     }
                     let definitions =
                         desired_definitions(2222, &env).expect("desired registry assembles");
-                    for name in ["command-inspect", "giveaway"] {
+                    for name in ["command-inspect", "schedule-retime", "giveaway"] {
                         assert_eq!(
                             definitions.iter().filter(|def| def.name == name).count(),
                             usize::from(automations == Some("1")),

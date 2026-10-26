@@ -33,15 +33,24 @@ fn manifest_names(key: &str) -> Vec<String> {
                 .to_owned()
         })
         .collect();
-    // Compiled-only companion: keep the saved publication fixture immutable.
-    // This expectation does not authorize a staging or production publish.
+    // Compiled-only companions: keep the saved publication fixture immutable.
+    // These expectations do not authorize a staging or production publish.
+    // Saved manifest predates both lfg-edit and schedule-retime; extend the
+    // in-memory overlay truthfully in publish order.
     assert!(!names.iter().any(|name| name == "lfg-edit"));
+    assert!(!names.iter().any(|name| name == "schedule-retime"));
     let after_close = names
         .iter()
         .position(|name| name == "lfg-close")
         .expect("saved manifest retains close")
         + 1;
     names.insert(after_close, "lfg-edit".to_owned());
+    let after_remove = names
+        .iter()
+        .position(|name| name == "schedule-remove")
+        .expect("saved manifest retains schedule-remove")
+        + 1;
+    names.insert(after_remove, "schedule-retime".to_owned());
     names
 }
 
@@ -120,8 +129,9 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 43 all-on builtins minus 12 automation-gated commands, including
-    // command-inspect, pause/resume and giveaway; announcements-gated lfg-edit and
+    // 44 all-on builtins minus 13 automation-gated commands, including
+    // command-inspect, pause/resume, schedule-retime and giveaway;
+    // announcements-gated lfg-edit and
     // feed-inspect still publish, and read-only current-channel discovery
     // lfg-list stays published. welcome-preview is core-always and survives too.
     // The stored dynamic row stays unpublished:
@@ -163,6 +173,7 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "command-enable",
         "schedule",
         "schedule-remove",
+        "schedule-retime",
         "schedule-list",
         "sticky",
         "sticky-remove",
