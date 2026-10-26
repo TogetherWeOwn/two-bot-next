@@ -24,7 +24,8 @@ shipped organizer operations, but no guild configuration, no signed LFG
 verb, no revision/CAS column, and advisory-lock-only concurrency. After
 intent acceptance, the smallest eventual page can list channel-scoped
 open-post rows read-only (slice S1 below). Edit and close wait for LG-W2
-(CAS) plus LG-W3 (least-scope write verbs). If prerequisites cannot be
+(CAS) plus LG-W3 (least-scope write verbs) plus LG-W4 (count-only
+readback). If prerequisites cannot be
 proved, choose **no-build**, not a form that silently last-writer-wins. Nothing
 is built by this spec, including S1.
 
@@ -40,9 +41,9 @@ needs a new verb (LG-W1/LG-W3).
 | Shipped op and source | Permission and gates | Store, audit and consumer | Proposed page state |
 | --- | --- | --- | --- |
 | `/lfg` create (`crates/core/src/feature_commands.rs:438-462`): title, future-only starts-at, role spec, preview flag | Manage Events (`crates/core/src/commands.rs:287`) + Announcements row gate (`crates/core/src/router.rs:734-738`) + configured-guild fence; quota 20 open posts per guild (`crates/core/src/automation_quota.rs:9-16`) | `put_lfg` upsert with guild fence and quota lock (`crates/core/src/lfg_store.rs:54-138`); audit `lfg.create`/`posted`; Discord post with signup Select; nonce recovery; `delete_lfg` cascade only on failed-post cleanup (`:335-346`) | `not_exposed`: create needs quota/nonce/Discord post; stays slash-only |
-| `/lfg-close` (`feature_commands.rs:463-471`): post id | Same Manage Events + Announcements + guild gates (`router.rs:739-743`) | `close_lfg` open-only update, signups and roles retained (`lfg_store.rs:493-515`); audit `lfg.close`/`closed` or `already_closed_or_missing`; refresh removes the Select (`crates/discord/src/lfg_interactions.rs:717-741`); reply `LFG closed.` / `LFG was already closed or missing.` (`crates/core/src/lfg.rs:691-699`) | `gated_write` after LG-W2/LG-W3; dry-run plus explicit confirm |
-| `/lfg-edit` (`feature_commands.rs:472-489`): post id plus title and/or starts-at | Same gates (`router.rs:744-748`); at least one metadata field required (`lfg_interactions.rs:416-423`) | `edit_lfg_metadata` under advisory + row lock; Missing/Closed/Unchanged/Updated; roles/signups/ids preserved; never reopens (`lfg_store.rs:153-203`); audit `lfg.edit`/`updated`; no-op writes nothing (`lfg_interactions.rs:460-465`) | `gated_write` after LG-W2/LG-W3; signup preservation is the confirm copy |
-| `/lfg-list` (`feature_commands.rs:490-500`): optional cursor | Same gates (`router.rs:749-753`); current channel only; no pause gate exists on this path | `list_lfg_channel`: open + confirmed canonical message id, keyset order, no signup/role/member columns (`lfg_store.rs:291-330`); cursor MAC-bound to guild/channel/query with a process-local key (`crates/core/src/lfg_list.rs:11-66`); past/unknown labels, never fabricated (`:157-179`) | `candidate_read` after LG-W1: read-only rows, same predicates |
+| `/lfg-close` (`feature_commands.rs:463-471`): post id | Same Manage Events + Announcements + guild gates (`router.rs:739-743`) | `close_lfg` open-only update, signups and roles retained (`lfg_store.rs:493-515`); audit `lfg.close`/`closed` or `already_closed_or_missing`; refresh removes the Select (`crates/discord/src/lfg_interactions.rs:717-741`); reply `LFG closed.` / `LFG was already closed or missing.` (`crates/core/src/lfg.rs:691-699`) | `gated_write` after LG-W2 through LG-W4; dry-run plus explicit confirm |
+| `/lfg-edit` (`feature_commands.rs:472-489`): post id plus title and/or starts-at | Same gates (`router.rs:744-748`); at least one metadata field required (`lfg_interactions.rs:416-423`) | `edit_lfg_metadata` under advisory + row lock; Missing/Closed/Unchanged/Updated; roles/signups/ids preserved; never reopens (`lfg_store.rs:153-203`); audit `lfg.edit`/`updated`; no-op writes nothing (`lfg_interactions.rs:460-465`) | `gated_write` after LG-W2 through LG-W4; signup preservation is the confirm copy |
+| `/lfg-list` (`feature_commands.rs:490-500`): optional cursor | Same gates (`router.rs:749-753`); current channel only; no pause gate exists on this path | `list_lfg_channel`: open + confirmed canonical message id, keyset order, no signup/role/member columns (`lfg_store.rs:291-330`); cursor MAC-bound to guild/channel/query with a process-local key (`crates/core/src/lfg_list.rs:11-66`); each process mints its own key, so restarts and other instances invalidate issued pages (`:19-30`); past/unknown labels, never fabricated (`:157-179`) | `candidate_read` after LG-W1: read-only rows, same predicates |
 | Member Select signup/leave (component surface) | Any member; 5 s signup cooldown; capacity adjudication order missing/closed/role/same/full/moved/joined (`lfg.rs:392-423`) | `signup_lfg` treats `starts_at <= joined_at` as closed (`lfg_store.rs:415-429`); receipt `lfg:signup:<interaction>` with versioned binding; leave is id-only after a guild-fence read | `member_only`: the dashboard never signs members up or removes them |
 | Lifecycle sweep (`lfg_sweep` job) | Supervisor-only caller; bounded 20 rows; try-lock leaves contended rows (`lfg_interactions.rs:606-714`) | Signups stop at start; sweep closes after a 15-minute grace (`:76`); orphans reconciled by nonce, unrecovered retained rows closed; expired posts lose signup controls on refresh | `automatic`: no control; the page surfaces `expired` truthfully |
 
@@ -92,7 +93,7 @@ send and no page affordance.
 
 | Proposed control | Validator (reused, never reimplemented) | Permission chain | Store call | Audit action | Consumers of the write |
 | --- | --- | --- | --- | --- | --- |
-| Channel list read (S1) | `ListCursor::decode` shape/MAC/scope; canonical snowflakes (`lfg_list.rs:56-66`, `:157-164`) | Web admin + same-guild Manage Events + Announcements + configured guild + channel-visible, all server-side | `list_lfg_channel` | none (read; matches `/lfg-list`) | Organizer browser only; same columns as the slash list |
+| Channel list read (S1) | `ListCursor::decode` shape/MAC/scope; canonical snowflakes (`lfg_list.rs:56-66`, `:157-164`); decode failure surfaces `STALE_CURSOR`, never an empty list | Web admin + same-guild Manage Events + Announcements + configured guild + channel-visible, all server-side | `list_lfg_channel` | none (read; matches `/lfg-list`) | Organizer browser only; same columns as the slash list |
 | Edit title / starts-at | `valid_post_id` (`lfg.rs:608`), `validate_title` trimmed 1-100 UTF-16 (`:222`), `normalize_starts_at` future-only with the server clock at confirm (`:247`) | Same chain plus a fresh read before confirm; LG-W2 token once it exists | `edit_lfg_metadata` | `lfg.edit`/`updated` (no-op: no audit) | Message refresh; signup adjudication (new starts-at); sweep |
 | Close post | `valid_post_id`; dry-run plus explicit confirm naming the observed snapshot | Same chain plus fresh read; close frees one of 20 quota slots | `close_lfg` open-only | `lfg.close`/`closed` or `already_closed_or_missing` | Refresh (Select removed); sweep skips closed; quota release |
 | No control: create, delete, role edit, member signup/remove | absent by design | not exposed | `put_lfg` / `delete_lfg` / `signup_lfg` / `leave_lfg` stay slash/component/sweep-only | no dashboard rows | none |
@@ -165,7 +166,7 @@ example dry-run close: {"schema":"dashboard.lfg_config.v1","guild_id":"771111111
 
 ```text
 example agent result: {"schema":"dashboard.lfg_config.v1","source_sha":"a6fa0fb7d40e2ee4eaa6bfce9834d639a25c166c",
-"guild_id":"771111111111111111","post_id":"lfg-1401","reason":"SAVED_UNVERIFIED",
+"guild_id":"771111111111111111","post_id":"lfg-1401","request_id":"example-request-1","reason":"SAVED_UNVERIFIED",
 "retryable":false,"next_action":"reread_before_edit"}
 ```
 
@@ -180,6 +181,7 @@ Snowflakes above are illustrative fixtures, not live guilds.
 | `PREVIEW_ONLY` | "Preview only. Nothing sent or saved." | `confirm_or_edit` |
 | `VERSION_UNKNOWN` | No CAS token exists: "This post has no revision. Re-read right before saving." | `reread_then_reconfirm` |
 | `STALE_OBSERVATION` | Fresh read differs from the snapshot: "Someone changed this post. Your draft is kept; review before saving." | `reread_then_reconfirm` |
+| `STALE_CURSOR` | List page token invalid or stale (restart or another instance served this page): "This list page is invalid or stale. Start the list again." | `restart_from_first_page` |
 | `ALREADY_CLOSED` | Wire `already_closed_or_missing` or fresh read closed: "This post is already closed. Nothing was changed." | `reread_before_edit` |
 | `POST_MISSING` | Missing/wrong-guild id: "No such post in this server." | `fix_or_reread` |
 | `EXPIRED_START` | Start passed: "Signups already stopped. A future start re-opens them; the sweep may still close this post." | `confirm_or_edit` |
@@ -218,9 +220,9 @@ entries name doctest absence assertions, not line anchors.
   "source_sha": "a6fa0fb7d40e2ee4eaa6bfce9834d639a25c166c",
   "controls": [
     {"id":"LG-C1","op":"lfg_create","present":"slash_only","state":"not_exposed","gate":[],"evidence":["E-CREATE","E-PERM","E-ROUTE","E-QUOTA","E-PUT","E-DELETE"]},
-    {"id":"LG-C2","op":"lfg_close","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3"],"evidence":["E-CLOSE-DEF","E-PERM","E-ROUTE","E-CLOSE","E-CLOSE-REPLY","E-AUDIT","E-REFRESH"]},
-    {"id":"LG-C3","op":"lfg_edit","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3"],"evidence":["E-EDIT-DEF","E-PERM","E-ROUTE","E-EDIT","E-VALID-ID","E-VALID-TITLE","E-STARTS","E-AUDIT","E-REFRESH"]},
-    {"id":"LG-C4","op":"lfg_list","present":"slash","state":"candidate_read","gate":["LG-W1"],"evidence":["E-LIST-DEF","E-PERM","E-ROUTE","E-LIST","E-CURSOR","E-RENDER","E-PAST","E-UNKNOWN","E-LIST-HANDLER"]},
+    {"id":"LG-C2","op":"lfg_close","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3","LG-W4"],"evidence":["E-CLOSE-DEF","E-PERM","E-ROUTE","E-CLOSE","E-CLOSE-REPLY","E-AUDIT","E-REFRESH"]},
+    {"id":"LG-C3","op":"lfg_edit","present":"slash","state":"gated_write","gate":["LG-W2","LG-W3","LG-W4"],"evidence":["E-EDIT-DEF","E-PERM","E-ROUTE","E-EDIT","E-VALID-ID","E-VALID-TITLE","E-STARTS","E-AUDIT","E-REFRESH"]},
+    {"id":"LG-C4","op":"lfg_list","present":"slash","state":"candidate_read","gate":["LG-W1"],"evidence":["E-LIST-DEF","E-PERM","E-ROUTE","E-LIST","E-CURSOR","E-CURSOR-KEY","E-CURSOR-MINT","E-RENDER","E-PAST","E-UNKNOWN","E-LIST-HANDLER"]},
     {"id":"LG-C5","op":"member_select_leave","present":"component","state":"member_only","gate":[],"evidence":["E-SIGNUP","E-ADJUDICATE"]},
     {"id":"LG-C6","op":"lifecycle_sweep","present":"job","state":"automatic","gate":[],"evidence":["E-EXPIRY","E-SWEEP","E-CLOSE"]}
   ],
@@ -253,6 +255,8 @@ entries name doctest absence assertions, not line anchors.
     "E-SIGNUP":{"path":"crates/core/src/lfg_store.rs","line":402,"contains":"pub async fn signup_lfg("},
     "E-CLOSE":{"path":"crates/core/src/lfg_store.rs","line":493,"contains":"pub async fn close_lfg("},
     "E-CURSOR":{"path":"crates/core/src/lfg_list.rs","line":11,"contains":"pub const PAGE_ROWS: usize = 5;"},
+    "E-CURSOR-KEY":{"path":"crates/core/src/lfg_list.rs","line":21,"contains":"static CURSOR_KEY: OnceLock<Secret<[u8; 32]>> = OnceLock::new();"},
+    "E-CURSOR-MINT":{"path":"crates/core/src/lfg_list.rs","line":42,"contains":"fn encode(&self, guild: &str, channel: &str) -> String {"},
     "E-RENDER":{"path":"crates/core/src/lfg_list.rs","line":157,"contains":"pub fn render_page("},
     "E-PAST":{"path":"crates/core/src/lfg_list.rs","line":177,"contains":"(past)"},
     "E-UNKNOWN":{"path":"crates/core/src/lfg_list.rs","line":179,"contains":"Start time unknown"},
@@ -271,6 +275,7 @@ entries name doctest absence assertions, not line anchors.
     "PREVIEW_ONLY":{"retryable":false,"next_action":"confirm_or_edit"},
     "VERSION_UNKNOWN":{"retryable":false,"next_action":"reread_then_reconfirm"},
     "STALE_OBSERVATION":{"retryable":false,"next_action":"reread_then_reconfirm"},
+    "STALE_CURSOR":{"retryable":false,"next_action":"restart_from_first_page"},
     "ALREADY_CLOSED":{"retryable":false,"next_action":"reread_before_edit"},
     "POST_MISSING":{"retryable":false,"next_action":"fix_or_reread"},
     "EXPIRED_START":{"retryable":false,"next_action":"confirm_or_edit"},
@@ -292,7 +297,7 @@ A source/hash mismatch requires re-inventory, not optimistic editing.
 
 | Fixture | Deterministic oracle for future protected acceptance tests |
 | --- | --- |
-| `LG-F01` | Channel list read returns exactly the `list_lfg_channel` predicates in SQL before LIMIT, keyset order, five rows plus lookahead; `past`/`unknown` labels match `render_page`; query text selects no signup/role/member column. |
+| `LG-F01` | Channel list read returns exactly the `list_lfg_channel` predicates in SQL before LIMIT, keyset order, five rows plus lookahead; `past`/`unknown` labels match `render_page`; query text selects no signup/role/member column; a cursor minted before a restart or by another process decodes to None and surfaces `STALE_CURSOR`, never an empty list or a generic error. |
 | `LG-F02` | Interleave a member signup with a metadata edit: both apply; roles, signups and every `joined_at` are byte-identical after the edit; the edit touches title/starts-at only. |
 | `LG-F03` | Close a post with signups: all signup/role rows retained; refresh removes the Select; reply `LFG closed.`; a second close surfaces `already_closed_or_missing`, never silent success. |
 | `LG-F04` | Observe open, then slash-close: dashboard close surfaces `ALREADY_CLOSED`; dashboard edit refuses without resurrection; the draft is kept for review. |
@@ -320,12 +325,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ```
 
 This checks control inventory, evidence file/line anchors, absence pins,
-state/gate structure and reason remediations. It runs **none** of LG-F01–F12,
+state/gate structure and reason remediations. Evidence anchors must match
+both at `source_sha` (read via `git show`) and in the working tree, so a
+stale manifest fails either way. It runs **none** of LG-F01–F12,
 performs no runtime/DB test, and proves no apply latency or web authority.
 Changed source anchors intentionally require re-inventory, not a waiver.
 
 ```pycon
->>> import json, pathlib, re
+>>> import json, pathlib, re, subprocess
 >>> doc = pathlib.Path("docs/dashboard-lfg-config-spec.md").read_text()
 >>> fence = "`" * 3
 >>> m = json.loads(re.search(fence + r"json\n(.*?)\n" + fence, doc, re.S).group(1))
@@ -333,7 +340,7 @@ Changed source anchors intentionally require re-inventory, not a waiver.
 >>> assert [r["id"] for r in rows] == ["LG-C1","LG-C2","LG-C3","LG-C4","LG-C5","LG-C6"]
 >>> assert [r["state"] for r in rows] == ["not_exposed","gated_write","gated_write","candidate_read","member_only","automatic"]
 >>> assert all(r["evidence"] and all(e in m["evidence"] for e in r["evidence"]) for r in rows)
->>> assert rows[1]["gate"] == rows[2]["gate"] == ["LG-W2","LG-W3"] and rows[3]["gate"] == ["LG-W1"]
+>>> assert rows[1]["gate"] == rows[2]["gate"] == ["LG-W2","LG-W3","LG-W4"] and rows[3]["gate"] == ["LG-W1"]
 >>> assert [s["id"] for s in states] == ["LG-S1","LG-S2","LG-S3","LG-S4","LG-S5","LG-S6","LG-S7"]
 >>> assert all(("check" in s) != ("evidence" in s) for s in states)
 >>> assert all(e in m["evidence"] for s in states if "evidence" in s for e in s["evidence"])
@@ -344,6 +351,10 @@ Changed source anchors intentionally require re-inventory, not a waiver.
 >>> assert "edit_lfg_roles" not in (s := pathlib.Path("crates/core/src/lfg_store.rs").read_text()) and "update_lfg_roles" not in s
 >>> assert "revision" not in (d := pathlib.Path("crates/cutover/migrations/0170_lfg.sql").read_text()) and "version" not in d
 >>> assert all(e["contains"] in pathlib.Path(e["path"]).read_text().splitlines()[e["line"]-1] for e in m["evidence"].values())
+>>> _commit = subprocess.run(["git","rev-parse","--verify",m["source_sha"]+"^{commit}"],check=True,capture_output=True,text=True).stdout.strip()
+>>> assert _commit == m["source_sha"]
+>>> _at = lambda p: subprocess.run(["git","show",_commit+":"+p],check=True,capture_output=True,text=True).stdout.splitlines()
+>>> assert all(e["contains"] in _at(e["path"])[e["line"]-1] for e in m["evidence"].values())
 >>> assert all(isinstance(r["retryable"], bool) and r["next_action"] for r in m["reasons"].values())
 >>> assert set(m["reasons"]) == set(re.findall(r'^\| `([A-Z_]+)` \|', doc, re.M))
 >>> assert len(set(re.findall(r'^\| `(LG-F\d+)` \|', doc, re.M))) == 12
@@ -357,14 +368,16 @@ Changed source anchors intentionally require re-inventory, not a waiver.
 
 | ID | Recommendation, not a build card or API |
 | --- | --- |
-| `LG-W1` | Add one signed LFG read verb reusing `list_lfg_channel` predicates, plus web private-admin/guild/channel checks. Fail closed on unvalidated channels; no new data beyond the slash list. S1 prerequisite. |
+| `LG-W1` | Add one signed LFG read verb reusing `list_lfg_channel` predicates, plus web private-admin/guild/channel checks. Fail closed on unvalidated channels; no new data beyond the slash list. Reuse the `ListCursor` shape/MAC with process affinity (single-container deployment); expose a crate-visible mint for the verb (`encode` is module-private today); decode failure maps to `STALE_CURSOR`. S1 prerequisite. |
 | `LG-W2` | Add a revision token to `lfg_posts` with conditional edit/close (last-writer-wins ends here), ordered with slash/select/sweep locks. Independent acceptance tests first. Write prerequisite. |
 | `LG-W3` | Add signed least-scope write verbs (close + metadata edit only) reusing the exact validators, with server-derived attribution and shipped audit actions. No create/delete/role/member verbs. |
 | `LG-W4` | Add count-only readback (`COUNT(*)`, no identities) plus refresh/application-unknown surfacing, so write confirmations prove signup preservation without PII. |
 
 Smallest future build slice (S1, at most one day, after intent
 acceptance): LG-W1 plus a read-only channel list with
-saved/open/closed/expired/unknown states and keyset pagination. Zero
+saved/open/expired/unknown states and keyset pagination. `saved_closed`
+arrives only with the gated-write readback (LG-W2 through LG-W4), never
+by inferring close from disappearance. Zero
 writes, zero new data, zero migrations. Edit/close builds wait for LG-W2
 through LG-W4 with their own acceptance.
 
