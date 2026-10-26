@@ -11,6 +11,8 @@ mod game_role_preview_acceptance;
 mod game_role_preview_manageability;
 #[path = "onboarding_presubmit_clarity_acceptance_tests.rs"]
 mod presubmit_clarity_acceptance;
+#[path = "goodbye_preview_acceptance_tests.rs"]
+mod goodbye_preview_acceptance;
 #[path = "onboarding_reopen_identity_review_acceptance_tests.rs"]
 mod reopen_identity_review_acceptance;
 #[path = "onboarding_reopen_picker_acceptance_tests.rs"]
