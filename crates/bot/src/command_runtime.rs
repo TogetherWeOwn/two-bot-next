@@ -69,6 +69,7 @@ use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
+    custom_command_store,
     feeds::{
         feed_already_paused_text, feed_already_resumed_text, feed_list_page,
         feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
@@ -293,6 +294,9 @@ pub struct CommandRuntime {
     automations: bool,
     /// Serialize publication and remember a successful sync for this process.
     /// Repeated RESUMED events need no work; READY still replaces the full set.
+    /// A durable pending marker overrides the RESUMED no-op so a reconnect
+    /// heals a failed publication; the governed path republishes on reconnect
+    /// only through [`Self::publish_registry_if_resync_pending`].
     registry_synced: tokio::sync::Mutex<bool>,
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
@@ -696,10 +700,27 @@ impl CommandRuntime {
                     );
                 }
                 self.dispatch_ticket_connection(event);
+                // A reconnect still heals a failed publication: republish the
+                // full set when a durable pending marker says the picker is
+                // stale. Without a marker this spawns no REST work, so the
+                // boot sync stays the single writer.
+                let runtime = Arc::clone(self);
+                let application_id = ready.application.id.get();
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime
+                        .publish_registry_if_resync_pending(Some(application_id))
+                        .await;
+                });
                 return;
             }
             Event::Resumed => {
                 self.dispatch_ticket_connection(event);
+                // Same reconnect-time healing as READY: the marker read keeps
+                // this publication-free unless a publication actually failed.
+                let runtime = Arc::clone(self);
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime.publish_registry_if_resync_pending(None).await;
+                });
                 return;
             }
             Event::InteractionCreate(interaction)
@@ -1226,12 +1247,33 @@ impl CommandRuntime {
         }
     }
 
+    /// Reconnect-triggered resync for the governed path: republish the full
+    /// set only when a durable pending marker says a previous publication
+    /// failed. Without a marker this is one SELECT and no REST work, so the
+    /// boot sync stays the single writer.
+    async fn publish_registry_if_resync_pending(&self, application_id: Option<u64>) {
+        if !self.registry_resync_pending().await {
+            return;
+        }
+        self.publish_registry(application_id).await;
+    }
+
+    /// Best-effort pending-marker read. An unreadable marker counts as no
+    /// pending work: a store outage keeps reconnects publication-free, and a
+    /// later management publish or the boot resync still heals.
+    async fn registry_resync_pending(&self) -> bool {
+        custom_command_store::is_registry_resync_pending(&self.pool, &self.guild_id.to_string())
+            .await
+            .unwrap_or(false)
+    }
+
     /// Publish the ONE complete merged registry (legacy `CommandRegistry::sync`
     /// on `ready`). `publish_set` assembles every gated builtin plus DB custom
     /// rows. Unknown custom rows defer publication rather than deleting commands.
     /// `set_guild_commands` is a full replace, making duplicate READY idempotent.
     /// RESUMED supplies no application id: resolve it through the same executor
-    /// and synchronize once per process. Failed syncs remain eligible to retry
+    /// and synchronize once per process. A durable pending marker is the one
+    /// reconnect-time exception. Failed syncs remain eligible to retry
     /// on a later gateway connection event, never a polling timer.
     pub(crate) async fn publish_registry(&self, application_id: Option<u64>) {
         if self.publish_registry_checked(application_id).await.is_err() {
@@ -1242,13 +1284,21 @@ impl CommandRuntime {
     /// [`Self::publish_registry`] with the outcome returned. `Ok(())` covers a
     /// completed sync and a deferred one (custom-command rows unknown, nothing
     /// sent); `Err` means an attempted sync failed and a later READY/RESUMED retries it.
+    /// A durable pending marker overrides the already-synced RESUMED no-op so
+    /// a reconnect heals a failed publication.
     pub(crate) async fn publish_registry_checked(
         &self,
         application_id: Option<u64>,
     ) -> Result<(), RegistrySyncError> {
         let mut synced = self.registry_synced.lock().await;
         if application_id.is_none() && *synced {
-            return Ok(());
+            // A management publication failed after this flag was set, so the
+            // picker is stale and this reconnect republishes. An absent or
+            // unreadable marker keeps the no-op; a later management publish
+            // or the boot resync still heals.
+            if !self.registry_resync_pending().await {
+                return Ok(());
+            }
         }
         // Once bootstrapped, custom commands own the full-set publisher: it
         // loads persisted rows and serializes add/remove republication.

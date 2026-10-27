@@ -302,6 +302,23 @@ pub async fn clear_registry_resync_pending<'c>(
     Ok(())
 }
 
+/// Whether one guild has a pending-publication marker. Reconnect handling
+/// consults this before republishing; callers treat an error as no pending
+/// work, so a store outage keeps reconnects publication-free instead of
+/// forcing redundant PUTs.
+pub async fn is_registry_resync_pending<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let pending = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM automation_command_registry_resync WHERE guild_id = $1)",
+    )
+    .bind(guild_id)
+    .fetch_one(executor)
+    .await?;
+    Ok(pending)
+}
+
 /// Serialize a guild's capacity check + write inside the supplied transaction.
 /// Unrelated guilds use different advisory keys.
 pub async fn lock_command_capacity(

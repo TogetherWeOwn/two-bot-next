@@ -316,3 +316,43 @@ async fn registry_resync_marker_is_one_row_per_guild_until_cleared() -> Result<(
     pool.close().await;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn registry_resync_pending_read_tracks_mark_and_clear() -> Result<(), sqlx::Error> {
+    let ci_service = std::env::var("CI").as_deref() == Ok("true")
+        && std::env::var("TWO_CUSTOM_COMMAND_TEST_CI").as_deref() == Ok("1");
+    let options = PgConnectOptions::new()
+        .host(if ci_service {
+            "127.0.0.1"
+        } else {
+            "agent-testdb"
+        })
+        .port(5432)
+        .username("agent_test")
+        .password("")
+        .database("agent_test")
+        .options([("statement_timeout", "5000ms")]);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(options)
+        .await?;
+
+    // pg_temp shadows persistent tables; the transaction rolls everything back.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL search_path = pg_temp")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(RESYNC_MIGRATION).execute(&mut *tx).await?;
+
+    assert!(!store::is_registry_resync_pending(&mut *tx, "test-guild-one").await?);
+    store::mark_registry_resync_pending(&mut *tx, "test-guild-one", AT).await?;
+    assert!(store::is_registry_resync_pending(&mut *tx, "test-guild-one").await?);
+    assert!(!store::is_registry_resync_pending(&mut *tx, "test-guild-two").await?);
+    store::clear_registry_resync_pending(&mut *tx, "test-guild-one").await?;
+    assert!(!store::is_registry_resync_pending(&mut *tx, "test-guild-one").await?);
+    tx.rollback().await?;
+    pool.close().await;
+    Ok(())
+}
