@@ -178,7 +178,7 @@ admin API token registry (`admin_api_tokens`: 0456/0457, named-holder and
 configuration, distinct starrers and post state (`starboard_config`,
 `starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
 entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461),
-plus voice configuration attribution/revision history (`voice_settings_audit`: 0467).
+plus voice configuration attribution/revision history (`voice_settings_audit`: 0468).
 The [registry contract](admin-registry.md) adds no table or archive version:
 new dumps discover `holder_id` / `holder_kind` dynamically. Populated
 pre-holder archives refuse transactionally on the required authority columns

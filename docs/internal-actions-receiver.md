@@ -167,7 +167,7 @@ and if they differ redeploy the intended SHA through the workflow first (full ru
 in `docs/production-deploy.md`).
 
 For a binary containing voice configuration actions, the authorized migration
-executor must apply `0467_voice_settings_versions.sql` and the reviewed role
+executor must apply `0468_voice_settings_versions.sql` and the reviewed role
 plan **before** that binary can serve, including with the receiver or voice
 capability dark. Existing Discord writers use the new audit schema regardless
 of those gates. The original receiver enablement sequence below is not a
@@ -274,7 +274,7 @@ validates configuration values/reference syntax and fixes the target guild; it
 trusted inventory from submitted IDs. Signing keys remain trusted control-plane
 capabilities. Do not enable a dashboard client without those caller-side checks.
 
-Apply migration `0467_voice_settings_versions.sql` through the authorized
+Apply migration `0468_voice_settings_versions.sql` through the authorized
 migration executor **before** deploying this binary: existing Discord
 configuration writers also use the new revision/audit transaction. It adds
 `version`/`updated_by`/`updated_at` to voice configuration tables, an append-only
