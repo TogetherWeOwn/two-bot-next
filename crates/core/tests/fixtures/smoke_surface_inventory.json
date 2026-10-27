@@ -389,6 +389,16 @@
           "max_value": null,
           "max_length": null,
           "choices": []
+        },
+        {
+          "name": "name-prefix",
+          "description": "Filter by command name prefix, a-z 0-9 _ -",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
         }
       ],
       "smoke": "deferred",
