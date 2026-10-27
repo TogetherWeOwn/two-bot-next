@@ -272,14 +272,22 @@ async fn role_grant_reconciliation_adds_no_extra_message_and_rank_composes() {
         .find(|r| r.path.starts_with("/api/v10/interactions/7/"))
         .expect("the rank callback");
     let body: Value = serde_json::from_slice(&callback.body).unwrap();
+    assert_eq!(body["type"], 5, "rank acknowledges with a defer");
+    assert_eq!(body["data"]["flags"], 64);
+    let edit = requests
+        .iter()
+        .find(|r| {
+            r.method == "PATCH" && r.path == "/api/v10/webhooks/8/mock-callback/messages/@original"
+        })
+        .expect("the completed rank reply");
+    let body: Value = serde_json::from_slice(&edit.body).unwrap();
     let profile = store::profile(&db.pool, &GUILD.to_string(), &MEMBER.to_string())
         .await
         .unwrap();
     assert_eq!(
-        body["data"]["content"],
+        body["content"],
         json!(rank_reply(&profile, "Global name").content)
     );
-    assert_eq!(body["data"]["flags"], 64);
     mock.shutdown().await;
     db.close().await;
 }
