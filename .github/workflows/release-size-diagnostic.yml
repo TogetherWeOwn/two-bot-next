@@ -1,0 +1,152 @@
+name: release-size-diagnostic
+
+# Diagnostic only; never merged. Builds the release binary at two commits of
+# main with symbols kept (CARGO_PROFILE_RELEASE_STRIP=false) inside the exact
+# digest-pinned builder image of the Dockerfile, at one source path, and
+# attributes the growth by symbol and crate. Codegen is identical to the
+# stripped release build; only the symbol table differs.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release-size-diagnostic.yml
+
+permissions: {}
+
+jobs:
+  attribute:
+    name: release size attribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      BUILDER: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+      OLD_REF: b2f8adb250875d67c722c1c29bcba6f23a35e05c
+      NEW_REF: 1a87869f898cbe4e3c9171a4fcf9885119202ade
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          path: src
+          persist-credentials: false
+      - name: Build both commits with symbols
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          for label in old new; do
+            if [ "$label" = old ]; then ref="$OLD_REF"; else ref="$NEW_REF"; fi
+            git -C src checkout --detach --quiet "$ref"
+            mkdir -p "$RUNNER_TEMP/tgt-$label"
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp/home -e CARGO_HOME=/tmp/cargo-home \
+              -v "$PWD/src:/app:ro" \
+              -v "$RUNNER_TEMP/tgt-$label:/tgt" \
+              -v "$RUNNER_TEMP/out:/out" \
+              -w /app \
+              -e CARGO_TARGET_DIR=/tgt \
+              -e CARGO_PROFILE_RELEASE_STRIP=false \
+              -e LABEL="$label" \
+              "$BUILDER" sh -c '
+                set -eu
+                cargo build --release --locked -p two-bot --bin two-bot
+                nm -S --defined-only -C /tgt/release/two-bot > /out/nm-$LABEL.txt
+                strip -o /out/two-bot-$LABEL.stripped /tgt/release/two-bot
+                readelf -SW /tgt/release/two-bot > /out/sections-$LABEL.txt
+                rustc -Vv > /out/rustc-$LABEL.txt
+              '
+            git -C src rev-parse HEAD > "$RUNNER_TEMP/out/sha-$label.txt"
+            rm -rf "$RUNNER_TEMP/tgt-$label"
+          done
+          ls -l "$RUNNER_TEMP/out"
+      - name: Attribute growth
+        run: |
+          python3 - <<'PY'
+          import collections, os, re, sys
+          out = os.environ["RUNNER_TEMP"] + "/out"
+          HASH = re.compile(r"::h[0-9a-f]{16}$")
+          def load(label):
+              syms = collections.Counter()
+              for line in open(f"{out}/nm-{label}.txt", errors="replace"):
+                  parts = line.rstrip("\n").split(" ", 3)
+                  if len(parts) < 4:
+                      continue
+                  try:
+                      size = int(parts[1], 16)
+                  except ValueError:
+                      continue
+                  if parts[2] not in "tTwWrRdD":
+                      continue
+                  syms[HASH.sub("", parts[3])] += size
+              return syms
+          def strip_generics(name):
+              depth, res = 0, []
+              for ch in name:
+                  if ch == "<":
+                      depth += 1
+                  elif ch == ">":
+                      depth = max(0, depth - 1)
+                  elif depth == 0:
+                      res.append(ch)
+              return "".join(res)
+          def crate(name):
+              m = re.match(r"(?:<)*(?:&)?(?:mut )?(?:dyn )?([A-Za-z_][A-Za-z0-9_]*)::", name)
+              return m.group(1) if m else "(other)"
+          old, new = load("old"), load("new")
+          size = lambda l: os.path.getsize(f"{out}/two-bot-{l}.stripped")
+          lines = []
+          w = lines.append
+          w(f"old {open(out+'/sha-old.txt').read().strip()[:9]} stripped {size('old')} B, symbol bytes {sum(old.values())}")
+          w(f"new {open(out+'/sha-new.txt').read().strip()[:9]} stripped {size('new')} B, symbol bytes {sum(new.values())}")
+          w(f"stripped delta {size('new') - size('old')} B, symbol delta {sum(new.values()) - sum(old.values())}")
+          w("")
+          w("== by leading path segment (crate or std/core/alloc/dependency) ==")
+          co, cn = collections.Counter(), collections.Counter()
+          for k, v in old.items(): co[crate(k)] += v
+          for k, v in new.items(): cn[crate(k)] += v
+          for k in sorted(set(co) | set(cn), key=lambda k: -(cn[k] - co[k]))[:40]:
+              w(f"{cn[k]-co[k]:>9} {co[k]:>9} -> {cn[k]:>9}  {k}")
+          w("")
+          w("== top 80 grown/new symbols (hash stripped, same name merged) ==")
+          for k in sorted(set(old) | set(new), key=lambda k: -(new.get(k, 0) - old.get(k, 0)))[:80]:
+              d = new.get(k, 0) - old.get(k, 0)
+              w(f"{d:>8} {old.get(k,0):>8}->{new.get(k,0):>8}  {k[:170]}")
+          w("")
+          w("== top 40 shrunk/removed symbols ==")
+          for k in sorted(set(old) | set(new), key=lambda k: new.get(k, 0) - old.get(k, 0))[:40]:
+              d = new.get(k, 0) - old.get(k, 0)
+              w(f"{d:>8} {old.get(k,0):>8}->{new.get(k,0):>8}  {k[:170]}")
+          w("")
+          w("== instantiation groups (generic args stripped): most bytes in new ==")
+          go, gn = collections.defaultdict(lambda: [0, 0]), collections.defaultdict(lambda: [0, 0])
+          for k, v in old.items():
+              g = go[strip_generics(k)]; g[0] += 1; g[1] += v
+          for k, v in new.items():
+              g = gn[strip_generics(k)]; g[0] += 1; g[1] += v
+          for k in sorted(gn, key=lambda k: -gn[k][1])[:50]:
+              w(f"{gn[k][1]:>9} B {gn[k][0]:>4} inst (old {go.get(k,[0,0])[1]:>9} B {go.get(k,[0,0])[0]:>4})  {k[:150]}")
+          w("")
+          w("== instantiation groups with most growth in bytes ==")
+          for k in sorted(set(go) | set(gn), key=lambda k: -(gn.get(k, [0, 0])[1] - go.get(k, [0, 0])[1]))[:50]:
+              a, b = go.get(k, [0, 0]), gn.get(k, [0, 0])
+              w(f"{b[1]-a[1]:>9} B inst {a[0]:>4}->{b[0]:>4}  {k[:150]}")
+          text = "\n".join(lines)
+          open(f"{out}/attribution.txt", "w").write(text)
+          print(text[:120000])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
+              f.write("```\n" + text[:900000] + "\n```\n")
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-size-attribution
+          path: |
+            ${{ runner.temp }}/out/attribution.txt
+            ${{ runner.temp }}/out/nm-old.txt
+            ${{ runner.temp }}/out/nm-new.txt
+            ${{ runner.temp }}/out/sections-old.txt
+            ${{ runner.temp }}/out/sections-new.txt
+            ${{ runner.temp }}/out/rustc-new.txt
+            ${{ runner.temp }}/out/sha-old.txt
+            ${{ runner.temp }}/out/sha-new.txt
+          retention-days: 7
+          if-no-files-found: error
