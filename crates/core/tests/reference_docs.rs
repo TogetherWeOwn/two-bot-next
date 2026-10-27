@@ -183,6 +183,18 @@ not capture; the scorecard command surface publishes at boot\n\
 a boot-parked community job needs a restart to start ticking, like the parked\n\
 audit runtime. Every other\n\
 storable row's stored value is unwired.\n\n\
+The five existing onboarding destination keys validate before settings writes:\n\
+`DISCORD_ANCHOR_WELCOME_CHANNEL_ID`, `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID`\n\
+and `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` accept optional nonzero u64 IDs;\n\
+`DISCORD_LANDING_CHANNEL_IDS` and `DISCORD_GOODBYE_CHANNEL_IDS` accept CSV IDs,\n\
+trimming whitespace and omitting empty segments. Validation shares the runtime\n\
+parsers and existing JSON-to-env rendering (including booleans, integral numbers\n\
+and flat arrays). Stored JSON null is refused; explicit row deletion restores\n\
+boot fallback. Repair invalid values or delete the override. Empty syntax does\n\
+not satisfy mode-required destinations. Syntax proves no channel existence or\n\
+permission and does not change hot wiring or dry-run behavior. See\n\
+[settings actions](internal-action-settings.md#onboarding-destinations) for\n\
+rendering, typed refusal and no-effect guarantees.\n\n\
 Gateway boot reads process environment only, through a fixed set of loaders:\n\
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),\n\
 `FeatureGates::from_env` (`TWO_AUTOMATIONS`, `TWO_ANNOUNCEMENTS`,\n\
