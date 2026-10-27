@@ -581,4 +581,50 @@ mod tests {
             );
         }
     }
+
+    fn lookup(subcommand: &str, children: Vec<(&str, &str)>) -> Interaction {
+        let children = children
+            .into_iter()
+            .map(|(name, value)| CommandDataOption {
+                name: name.to_owned(),
+                value: CommandOptionValue::String(value.to_owned()),
+            })
+            .collect();
+        crate::command_runtime_tests::slash(
+            "privacy",
+            None,
+            vec![CommandDataOption {
+                name: subcommand.to_owned(),
+                value: CommandOptionValue::SubCommand(children),
+            }],
+        )
+    }
+
+    #[test]
+    fn lookup_decode_rejects_wrong_named_and_spaces_only_request_ids() {
+        for subcommand in ["deletion-status", "deletion-receipt"] {
+            // Control: the one correctly named, valid child decodes.
+            assert_ne!(
+                privacy_action(&lookup(
+                    subcommand,
+                    vec![("request-id", "del-0123456789abcdef")]
+                )),
+                PrivacyAction::Invalid
+            );
+            // A single String child under any other name is not the request
+            // id, however valid its text; it never reaches the service.
+            for name in ["request", "request_id", "Request-Id", "member", "status"] {
+                let interaction = lookup(subcommand, vec![(name, "del-0123456789abcdef")]);
+                assert_eq!(privacy_action(&interaction), PrivacyAction::Invalid);
+                assert_eq!(deletion_request_id(&interaction), None);
+            }
+            // Spaces-only text is blank by the service's trimmed bound; it has
+            // no control character, so the blank clause alone must refuse it.
+            for blank in [" ", "   ", "\u{a0}", "\u{2003}"] {
+                let interaction = lookup(subcommand, vec![("request-id", blank)]);
+                assert_eq!(privacy_action(&interaction), PrivacyAction::Invalid);
+                assert_eq!(deletion_request_id(&interaction), None);
+            }
+        }
+    }
 }
