@@ -57,7 +57,7 @@ PUBLISH_SET = ROOT / "crates/core/tests/fixtures/staging_published_commands.json
 # The "always" rows of docs/staging-e2e-command-matrix.md: published with no
 # staging env gate, so a missing one is a failure, not an unset flag. The unit
 # tests cross-check this tuple against the matrix doc.
-CORE_SURFACES = ("rank", "leaderboard", "help", "privacy", "reopen")
+CORE_SURFACES = ("rank", "leaderboard", "help", "privacy", "reopen", "welcome-preview", "game-mix")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 BUILD_ID_RE = re.compile(r"([0-9]+)-[0-9]+")
 RUN_ID_RE = re.compile(r"[0-9]+")

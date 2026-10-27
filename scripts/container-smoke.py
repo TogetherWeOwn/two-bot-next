@@ -72,6 +72,21 @@ IMAGE_MAX_BYTES = 112 * MIB
 # e07140dd repairs) measures 17,854,776 bytes (17.03 MiB) in hosted CI
 # (run 40094727805), 28,984 over 17 MiB. 18 MiB stands on merged-tree
 # evidence with no new dependencies and no release-profile change.
+# 2026-10-24: the feed pause/resume slice (~24,800 bytes of command, store
+# and poller code, no new dependencies, same minimal release profile)
+# measured 17,831,440 bytes (5,648 over 17 MiB) on its pre-giveaway base
+# (CI run 40099776675 job 120889388251). The giveaway+feed union below the
+# 18 MiB ceiling still requires a fresh combined-head container-smoke run.
+#
+# On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
+# cc07f31436 measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over, in
+# [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
+# The staff game-mix slice head (6a412c6a86) measured 17,862,000 bytes
+# (17.03 MiB), 36,208 over, in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40040240318/job/120711266282),
+# with no new dependencies and the same minimal release profile (opt-level=z,
+# lto, strip). The binary ceiling moves to 18 MiB, leaving about 1 MiB of
+# headroom above the measured heads; revisit if the binary approaches it.
+# The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
 BINARY_MAX_BYTES = 18 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a
@@ -345,12 +360,12 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 ["token_invalid", "ready"],
             ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
             # The runtime always reports informational job status alongside
-            # readiness; with no credentials all fifteen jobs must be parked,
+            # readiness; with no credentials all sixteen jobs must be parked,
             # non-running and never started. Jobs never flip the 503 above. The
             # audit-retry, scheduled-messages, self-role recovery, feeds,
             # settings-poll, member-unban-sweep, LFG sweep, retention and
-            # giveaway-countdown entries are always listed (parked when their
-            # services are unregistered).
+            # giveaway-countdown/draw entries are always listed (parked when
+            # their services are unregistered).
             parked = {"parked": True, "running": False, "last_start": None,
                       "last_success": None, "last_error_class": None,
                       "consecutive_failures": 0}
@@ -360,8 +375,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                     "community_scorecard", "inactivity", "audit_retry",
                     "self_role_recovery", "scheduled_messages", "feeds",
                     "member_unban_sweep", "retention", "lfg_sweep", "giveaway_countdown",
+                    "giveaway_draw",
                 )
-            }, "/readyz body must report all fifteen jobs parked, non-running, never started")
+            }, "/readyz body must report all sixteen jobs parked, non-running, never started")
             # Check PID 1, not merely Docker's configured user or an exec helper.
             uid = pid1_uids(name)
             require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")

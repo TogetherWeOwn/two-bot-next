@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION,
-    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_GUILD, PRIVACY_DESCRIPTION,
-    REOPEN_DESCRIPTION,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, EVENT_REFERENCE_MAX_CHARS,
+    HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_GUILD,
+    PRIVACY_DESCRIPTION, REOPEN_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -28,8 +28,11 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command", "docs/parity.md §1 #14 caps"),
     ("command-remove", "docs/parity.md §1 #15 caps"),
     ("schedule", "docs/parity.md §1 #17 caps"),
+    ("schedule", "docs/parity.md §1 #17 absolute-time"),
+    ("schedule", "docs/parity.md §1 #17 preview"),
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
+    ("sticky", "docs/parity.md §1 #20 preview"),
     ("lfg", "docs/parity.md §1 #26 caps"),
     ("lfg", "docs/parity.md §1 #26 preview"),
     ("lfg-close", "docs/parity.md §1 #27 caps"),
@@ -40,11 +43,22 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
     ("reopen", "docs/parity.md §1 reopen"),
+    ("feed-inspect", "docs/parity.md §1 feed-inspect"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("command-clone", "docs/parity.md §1 command-clone"),
+    ("game-mix", "docs/parity.md §1 game-mix"),
+    ("lfg-edit", "docs/parity.md §1 #26 Next-only companion"),
+    ("command-disable", "docs/parity.md §1 command-disable"),
+    ("command-enable", "docs/parity.md §1 command-enable"),
     ("giveaway", "docs/parity.md §1 giveaway"),
+    ("feed-pause", "docs/parity.md §1 feed-pause"),
+    ("feed-resume", "docs/parity.md §1 feed-resume"),
+    ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("lfg-list", "docs/parity.md §1 lfg-list"),
+    ("rsvp", "docs/parity.md §1 #24 caps"),
+    ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -268,24 +282,75 @@ pub fn expected_registry() -> Value {
     )
     .expect("reopen serializes");
     commands.insert(4, reopen);
-    // Next-only saved-response inspection. This independent literal pins the
-    // whole publication contract; never manufacture it from production shapes.
+    let welcome_preview = serde_json::to_value(
+        CommandDefinition::new(
+            "welcome-preview",
+            "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+        )
+        .permissions(32),
+    )
+    .expect("welcome preview serializes");
+    commands.insert(5, welcome_preview);
+    // Next-only private staff aggregate, immediately after welcome-preview. Keep the
+    // legacy snapshot frozen and pin the whole additive definition literally,
+    // including the optional browse selectors (never a guild/member override).
+    commands.insert(
+        6,
+        json!({
+            "name": "game-mix",
+            "description": "Show this server's aggregate game activity.",
+            "dm_permission": false,
+            "default_member_permissions": "32",
+            "options": [
+                {
+                    "name": "page",
+                    "description": "Page of saved games to show (10 per page). Default: 1.",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 10000
+                },
+                {
+                    "name": "sort",
+                    "description": "Order games by play time or in-voice time. Default: play.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "Play time", "value": "play"},
+                        {"name": "In-voice time", "value": "voice"}
+                    ]
+                },
+                {
+                    "name": "format",
+                    "description": "Show raw JSON or a readable summary. Default: JSON.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "JSON", "value": "json"},
+                        {"name": "Summary", "value": "summary"}
+                    ]
+                }
+            ]
+        }),
+    );
+    // Next-only saved-response inspection or unsaved draft preview. This
+    // independent literal pins the whole publication contract; never
+    // manufacture it from production shapes.
     let inspect = json!({
         "name": "command-inspect",
-        "description": "Inspect or privately preview a saved custom command",
+        "description": "Inspect a saved command or privately preview an unsaved draft",
         "dm_permission": false,
         "default_member_permissions": "32",
         "options": [
-            {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
-             "required": true, "max_length": 32},
-            {"name": "view", "description": "Private view (summary by default)", "type": 3,
+            {"name": "name", "description": "Saved command name, a-z 0-9 _ - (choose name or draft)", "type": 3,
+             "max_length": 32},
+            {"name": "view", "description": "Private view (saved: summary by default; draft: preview only)", "type": 3,
              "choices": [
                  {"name": "Summary", "value": "summary"},
                  {"name": "Saved template", "value": "template"},
                  {"name": "Preview", "value": "preview"}
              ]},
             {"name": "arguments", "description": "Sample invocation arguments (ignored by current templates)",
-             "type": 3, "max_length": 500}
+             "type": 3, "max_length": 500},
+            {"name": "draft", "description": "Proposed template to preview without saving (choose name or draft)",
+             "type": 3, "max_length": 2000}
         ]
     });
     let after_list = commands
@@ -310,6 +375,56 @@ pub fn expected_registry() -> Value {
             ]
         }),
     );
+    // Next-only metadata and increase-only seat editing reuse LFG's parity row,
+    // never the frozen legacy snapshot. Pin the wire shape independently of production.
+    assert!(commands.iter().all(|command| command["name"] != "lfg-edit"));
+    let edit = json!({
+        "name": "lfg-edit",
+        "description": "Update LFG metadata or increase one role's seats",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+             "required": true, "max_length": 128},
+            {"name": "title", "description": "Event or group title", "type": 3,
+             "max_length": 100},
+            {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+             "type": 3},
+            {"name": "role", "description": "Existing signup role key (use with seats)",
+             "type": 3, "max_length": 32},
+            {"name": "seats", "description": "Absolute seat target, increase only (1-99; use with role)",
+             "type": 4, "min_value": 1, "max_value": 99}
+        ]
+    });
+    let after_close = commands
+        .iter()
+        .position(|command| command["name"] == "lfg-close")
+        .expect("legacy lfg-close remains published")
+        + 1;
+    commands.insert(after_close, edit);
+    // Saved-response lifecycle is intentionally independent of replacement.
+    for (offset, name, description) in [
+        (
+            2,
+            "command-disable",
+            "Pause a saved custom command without deleting it",
+        ),
+        (3, "command-enable", "Resume a saved custom command"),
+    ] {
+        commands.insert(
+            after_list + offset,
+            json!({
+                "name": name,
+                "description": description,
+                "dm_permission": false,
+                "default_member_permissions": "32",
+                "options": [
+                    {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
+                     "required": true, "max_length": 32}
+                ]
+            }),
+        );
+    }
     // Next-only current-channel discovery has its own independent literal.
     // No production constants or registry builders supply either expectation.
     let lfg_list = json!({
@@ -322,17 +437,18 @@ pub fn expected_registry() -> Value {
              "max_length": 512}
         ]
     });
-    let lfg_close_pos = commands
+    let after_edit = commands
         .iter()
-        .position(|c| c["name"] == "lfg-close")
-        .expect("lfg-close is published");
-    commands.insert(lfg_close_pos + 1, lfg_list);
+        .position(|c| c["name"] == "lfg-edit")
+        .expect("lfg-edit is published")
+        + 1;
+    commands.insert(after_edit, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 16, after sticky-remove and the
-    // clone/inspect/help/privacy/reopen inserts above) as the exact published
-    // definition, so parity pins its shape too.
+    // publish position (index 20, immediately after sticky-remove, with
+    // game-mix, welcome-preview, clone, pause/resume and inspection inserts above)
+    // as the exact published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
-        CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+        CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
                 CommandOption::new(
@@ -389,10 +505,117 @@ pub fn expected_registry() -> Value {
                 )
                 .required()
                 .max_length(64)]),
+                CommandOption::new(
+                    "end",
+                    "Draw now, before the deadline",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "pause",
+                    "Pause entry without drawing",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "resume",
+                    "Resume a paused giveaway",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+                CommandOption::new(
+                    "extend",
+                    "Add minutes to the deadline",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                        .required()
+                        .max_length(64),
+                    CommandOption::new(
+                        "duration-minutes",
+                        "Minutes to add (1–43200)",
+                        CommandOptionType::Integer,
+                    )
+                    .required()
+                    .int_range(1, 43200),
+                ]),
+                CommandOption::new(
+                    "reroll",
+                    "Redraw the winners",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                        .required()
+                        .max_length(64),
+                    CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
+                ]),
+                CommandOption::new(
+                    "inspect",
+                    "Privately inspect saved giveaway details in this channel",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(16, giveaway);
+    commands.insert(20, giveaway);
+    // Next-only feed lifecycle pair. These independent literals pin the whole
+    // publication contract; never manufacture them from production shapes.
+    // The feed-remove lookup stays dynamic so the giveaway insert above does
+    // not shift the pair's expected position.
+    let pause = json!({
+        "name": "feed-pause",
+        "description": "Pause a feed relay without deleting its history",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "id", "description": "Feed id", "type": 3,
+             "required": true, "max_length": 128}
+        ]
+    });
+    let resume = json!({
+        "name": "feed-resume",
+        "description": "Resume a paused feed relay",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "id", "description": "Feed id", "type": 3,
+             "required": true, "max_length": 128}
+        ]
+    });
+    let after_remove = commands
+        .iter()
+        .position(|command| command["name"] == "feed-remove")
+        .expect("legacy feed-remove remains published")
+        + 1;
+    commands.insert(after_remove, pause);
+    commands.insert(after_remove + 1, resume);
     // Next-only read surfaces follow the nine historical mutations. Literal
     // payloads keep the frozen snapshot intact and compare every read field.
     let after_unlock = commands
@@ -433,12 +656,12 @@ pub fn expected_registry() -> Value {
         (
             "attendance",
             "/options/0/description",
-            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+            "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
         ),
         (
             "rsvp",
             "/options/0/description",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
         ),
         (
             "rsvp-attendance",
@@ -448,7 +671,7 @@ pub fn expected_registry() -> Value {
         (
             "rsvp-attendance",
             "/options/0/description",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
         ),
         (
             "lfg",
@@ -524,6 +747,18 @@ pub fn expected_registry() -> Value {
             MAX_RESOURCE_ID_CHARS,
             "docs/parity.md §1 #29 caps",
         ),
+        (
+            "rsvp",
+            "event-id",
+            EVENT_REFERENCE_MAX_CHARS,
+            "docs/parity.md §1 #24 caps",
+        ),
+        (
+            "rsvp-attendance",
+            "event-id",
+            EVENT_REFERENCE_MAX_CHARS,
+            "docs/parity.md §1 #25 caps",
+        ),
     ] {
         let _ = INTENTIONAL_DIFFERENCES
             .iter()
@@ -544,6 +779,24 @@ pub fn expected_registry() -> Value {
             "legacy {name}/{option_name}"
         );
         option["max_length"] = json!(max_length);
+    }
+    // Sticky preview adds only an optional Boolean to the legacy setup fields.
+    {
+        let reference = "docs/parity.md §1 #20 preview";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("sticky", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "sticky")
+            .expect(reference);
+        let options = command["options"].as_array_mut().expect("sticky options");
+        assert_eq!(options.len(), 2, "legacy body and debounce stay intact");
+        assert_eq!(options[0]["name"], json!("body"));
+        assert_eq!(options[1]["name"], json!("debounce"));
+        options.push(json!({
+            "name": "preview",
+            "description": "Privately preview without saving",
+            "type": 5
+        }));
     }
     // LFG private preview: the Next-only additive fourth `preview` boolean
     // keeps the signup form submittable without posting. The three legacy
@@ -581,6 +834,53 @@ pub fn expected_registry() -> Value {
         options.push(json!({
             "name": "preview",
             "description": "Privately preview without posting",
+            "type": 5
+        }));
+    }
+    // Absolute-time scheduling adds ONLY one optional string to the legacy
+    // body / in-minutes / every-minutes options, leaving their fields intact.
+    // Keep this independent of the compiled production registry.
+    {
+        let reference = "docs/parity.md §1 #17 absolute-time";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("schedule", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule")
+            .expect(reference);
+        let options = command["options"]
+            .as_array_mut()
+            .expect("schedule options array");
+        assert_eq!(options.len(), 3, "legacy schedule has three options");
+        assert_eq!(options[0]["name"], json!("body"));
+        assert_eq!(options[1]["name"], json!("in-minutes"));
+        assert_eq!(options[2]["name"], json!("every-minutes"));
+        options.push(json!({
+            "name": "at",
+            "description": "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+            "type": 3,
+            "max_length": 64
+        }));
+    }
+    // Proposed-post preview adds ONLY one optional boolean after `at`: the
+    // picker shows the post and its first firing without saving anything.
+    // The four earlier options and their bounds stay untouched; the option
+    // itself is optional (`required` omitted, which the canonical form
+    // normalizes to false) with no bounds or choices.
+    {
+        let reference = "docs/parity.md §1 #17 preview";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("schedule", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule")
+            .expect(reference);
+        let options = command["options"]
+            .as_array_mut()
+            .expect("schedule options array");
+        assert_eq!(options.len(), 4, "legacy schedule plus absolute-time");
+        assert_eq!(options[3]["name"], json!("at"));
+        options.push(json!({
+            "name": "preview",
+            "description": "Preview the proposed post and its first firing without saving it",
             "type": 5
         }));
     }
@@ -675,6 +975,31 @@ pub fn expected_registry() -> Value {
         .expect("page option serializes");
         command["options"] = json!([page]);
     }
+    // Next-only saved-relay inspection has no frozen legacy counterpart.
+    // Pin the documented shape independently: guild-only, Manage Server, and
+    // exactly one required stable-id string capped at 128.
+    let feed_inspect_position = commands
+        .iter()
+        .position(|command| command["name"] == "feed-list")
+        .expect("feed-list anchors the announcement set")
+        + 1;
+    commands.insert(
+        feed_inspect_position,
+        json!({
+            "name": "feed-inspect",
+            "description": "Show a saved feed relay's source and last attempt",
+            "type": 1,
+            "default_member_permissions": "32",
+            "dm_permission": false,
+            "options": [{
+                "name": "id",
+                "description": "Feed id",
+                "type": 3,
+                "required": true,
+                "max_length": 128
+            }]
+        }),
+    );
     canonical_registry(json!(commands))
 }
 

@@ -3,7 +3,11 @@
 // Operator CLI intentionally emits diff/publish reports and help to stdout.
 #![allow(clippy::print_stdout)]
 
-use std::collections::HashMap;
+mod report;
+
+use std::collections::{HashMap, HashSet};
+
+use report::{Report, REGISTRY_OWNER_ACTION, REQUEST_ACTION};
 use std::sync::Arc;
 
 use two_bot_core::commands::CommandDefinition;
@@ -17,8 +21,8 @@ use two_bot_discord::executor::DiscordError;
 use two_bot_discord::{publish_commands, ActionExecutor};
 
 pub const USAGE: &str = "\
-  two-bot commands diff [--guild-id ID] [--application-id ID] [--allow-live-guild]
-  two-bot commands publish [--apply] [--guild-id ID] [--application-id ID] [--allow-live-guild]
+  two-bot commands diff [--json] [--guild-id ID] [--application-id ID] [--allow-live-guild]
+  two-bot commands publish [--apply] [--json] [--guild-id ID] [--application-id ID] [--allow-live-guild]
       Fetch and compare the guild command list against the compiled, feature-gated
       builtins. Both commands are read-only unless publish receives --apply.
       Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot
@@ -72,9 +76,14 @@ fn parse(args: &[String], vars: &HashMap<String, String>) -> Result<Options, Str
     let mut application = vars.get("DISCORD_APPLICATION_ID").cloned();
     let mut apply = false;
     let mut allow_live = false;
+    let mut seen = HashSet::new();
     let mut i = 1;
     while i < args.len() {
+        if !seen.insert(args[i].as_str()) {
+            return Err("duplicate commands option".into());
+        }
         match args[i].as_str() {
+            "--json" => {}
             "--apply" if verb == "publish" => apply = true,
             "--allow-live-guild" => allow_live = true,
             "--guild-id" | "--application-id" => {
@@ -90,7 +99,7 @@ fn parse(args: &[String], vars: &HashMap<String, String>) -> Result<Options, Str
                     application = Some(value.clone());
                 }
             }
-            other => return Err(format!("unknown commands option {other:?}\n{USAGE}")),
+            _ => return Err(format!("unknown commands option\n{USAGE}")),
         }
         i += 1;
     }
@@ -171,58 +180,120 @@ async fn executor(token: &str, vars: &HashMap<String, String>) -> Result<ActionE
     ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
 }
 
+fn configuration_failure(json: bool, error: &str) -> i32 {
+    if json {
+        println!("{}", serde_json::json!(Report::failure(
+            "configuration_error",
+            "Check command usage, guild acknowledgement, feature gates and secret bindings; no registry request was sent.",
+        )));
+    } else {
+        eprintln!("{error}");
+    }
+    2
+}
+
+fn render_removals(report: &Report) {
+    for removal in &report.removals {
+        println!(
+            "removal {}: {}/{} (id={})",
+            removal.removal_class,
+            removal.kind,
+            removal.name,
+            removal.id.as_deref().unwrap_or("unknown")
+        );
+    }
+    if report.removals_truncated {
+        println!("Removal report truncated; classification covered all removals.");
+    }
+}
+
 pub async fn dispatch(args: &[String]) -> i32 {
+    let json = args.iter().any(|arg| arg == "--json");
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        if json {
+            return configuration_failure(true, "--help cannot be combined with --json");
+        }
         print!("{USAGE}");
         return 0;
     }
     let vars: HashMap<String, String> = std::env::vars().collect();
     let options = match parse(args, &vars) {
         Ok(options) => options,
-        Err(error) => {
-            eprintln!("{error}");
-            return 2;
-        }
+        Err(error) => return configuration_failure(json, &error),
     };
     let defs = match desired_definitions(options.guild, &vars) {
         Ok(defs) => defs,
-        Err(error) => {
-            eprintln!("{error}");
-            return 2;
-        }
+        Err(error) => return configuration_failure(json, &error),
     };
     let executor = match executor(vars.get("DISCORD_TOKEN").map_or("", String::as_str), &vars).await
     {
         Ok(executor) => executor,
         Err(error) => {
-            eprintln!("cannot configure command REST client: {error}");
-            return 2;
+            return configuration_failure(
+                json,
+                &format!("cannot configure command REST client: {error}"),
+            )
         }
     };
-    match executor
-        .sync_guild_commands(
+    let mut report = Report::failure("registry_request_failed", REQUEST_ACTION);
+    let result = executor
+        .sync_guild_commands_checked(
             options.application,
             options.guild,
             &publish_commands(&defs),
             options.apply,
+            |current, diff| {
+                report = Report::snapshot(current, diff);
+                if options.apply
+                    && diff.current_hash != diff.compiled_hash
+                    && report.has_unrecognized_removals
+                {
+                    report.reject("unrecognized_command_removal", REGISTRY_OWNER_ACTION);
+                    return Err(DiscordError::Rejected(
+                        "unrecognized command removal".into(),
+                    ));
+                }
+                Ok(())
+            },
         )
-        .await
-    {
+        .await;
+    match result {
         Ok((diff, applied)) => {
-            print!("{}", diff.render());
-            if applied {
-                println!("Published full guild registry.");
-            } else if options.apply {
-                println!("Skipped PUT: registry hash matches.");
+            report.applied = applied;
+            if json {
+                println!("{}", serde_json::json!(report));
             } else {
-                println!(
-                    "Dry run: no commands written. Use commands publish --apply to overwrite."
-                );
+                print!("{}", report::human_diff(&diff));
+                render_removals(&report);
+                if applied {
+                    println!("Published full guild registry.");
+                } else if options.apply {
+                    println!("Skipped PUT: registry hash matches.");
+                } else {
+                    println!(
+                        "Dry run: no commands written. Use commands publish --apply to overwrite."
+                    );
+                }
+                if report.has_unrecognized_removals {
+                    println!("{REGISTRY_OWNER_ACTION}");
+                }
             }
             0
         }
         Err(_) => {
-            eprintln!("command registry request failed; no successful publication claimed");
+            if report.ok {
+                report.reject("registry_request_failed", REQUEST_ACTION);
+            }
+            if json {
+                println!("{}", serde_json::json!(report));
+            } else if report.has_unrecognized_removals {
+                render_removals(&report);
+                eprintln!(
+                    "Refusing unrecognized command removal; no PUT sent. {REGISTRY_OWNER_ACTION}"
+                );
+            } else {
+                eprintln!("command registry request failed; no successful publication claimed");
+            }
             1
         }
     }
@@ -499,10 +570,18 @@ mod tests {
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
         let default = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(default.len(), 5);
+        assert_eq!(default.len(), 7);
         assert!(
             default.iter().any(|def| def.name == "reopen"),
             "reopen is core-always in the default registry"
+        );
+        assert!(
+            default.iter().any(|def| def.name == "welcome-preview"),
+            "welcome-preview is core-always in the default registry"
+        );
+        assert!(
+            default.iter().any(|def| def.name == "game-mix"),
+            "game-mix is core-always in the default registry"
         );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
@@ -512,31 +591,112 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 34 all-gate builtins (31 plus automations-gated `/giveaway`
-            // and `/command-clone`, and announcement-gated `/lfg-list`)
-            // plus the moderation-gated reads `/purge-preview` and
-            // `/channel-inspect`; no new feature gate.
-            36
+            // 44 all-gate builtins: 7 core + 1 scorecard + 13 automation
+            // + 12 announcements + 9 moderation mutations + 2 private reads.
+            44
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
             "reopen survives the all-on registry"
         );
         assert!(
+            all_on.iter().any(|def| def.name == "game-mix"),
+            "game-mix survives the all-on registry"
+        );
+        assert!(
             all_on.iter().any(|def| def.name == "giveaway"),
             "giveaway survives the all-on registry"
         );
+        assert!(
+            all_on.iter().any(|def| def.name == "lfg-edit"),
+            "lfg-edit survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "welcome-preview"),
+            "welcome-preview survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-pause"),
+            "feed-pause survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-resume"),
+            "feed-resume survives the all-on registry"
+        );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 57);
+        assert_eq!(with_voice.len(), 65);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
         );
         assert!(
+            with_voice.iter().any(|def| def.name == "game-mix"),
+            "game-mix survives the voice registry"
+        );
+        assert!(
             with_voice.iter().any(|def| def.name == "giveaway"),
             "giveaway survives the voice registry"
         );
+        assert!(
+            with_voice.iter().any(|def| def.name == "lfg-edit"),
+            "lfg-edit survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "welcome-preview"),
+            "welcome-preview survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-pause"),
+            "feed-pause survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-resume"),
+            "feed-resume survives the voice registry"
+        );
+    }
+
+    #[test]
+    fn desired_registry_gates_lfg_edit_only_on_announcements() {
+        for (announcements, other_features, expected_count) in
+            [("0", "0", 0), ("0", "1", 0), ("1", "0", 1), ("1", "1", 1)]
+        {
+            let mut env = vars();
+            env.insert("TWO_ANNOUNCEMENTS".into(), announcements.into());
+            for gate in [
+                "TWO_AUTOMATIONS",
+                "TWO_COMMUNITY_SCORECARD",
+                "TWO_MODERATION",
+            ] {
+                env.insert(gate.into(), other_features.into());
+            }
+            env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+            let definitions = desired_definitions(2222, &env).expect("desired registry assembles");
+            assert_eq!(
+                definitions
+                    .iter()
+                    .filter(|definition| definition.name == "lfg-edit")
+                    .count(),
+                expected_count,
+                "announcements={announcements} other_features={other_features}"
+            );
+        }
     }
 
     #[test]

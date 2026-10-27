@@ -238,6 +238,8 @@ pub enum CommandError {
     InvalidTextTrigger,
     #[error("Text trigger must be lowercase.")]
     TextTriggerNotLowercase,
+    #[error("Text trigger \"{0}\" is reserved by Owen.")]
+    ReservedTextTrigger(String),
     #[error("Write would define more than {0} custom commands, but that is the guild limit.")]
     OverCapacity(usize),
     #[error("Automations are disabled on this server.")]
@@ -254,6 +256,7 @@ pub fn error_code(err: &CommandError) -> &'static str {
         CommandError::InvalidTemplate(_) => "invalid_template",
         CommandError::InvalidTextTrigger => "invalid_text_trigger",
         CommandError::TextTriggerNotLowercase => "text_trigger_not_lowercase",
+        CommandError::ReservedTextTrigger(_) => "reserved_text_trigger",
         CommandError::OverCapacity(_) => "over_capacity",
         CommandError::AutomationsDisabled => "automations_disabled",
     }
@@ -424,6 +427,27 @@ impl AuditRecord {
         }
     }
 
+    /// One content-free fact per actual pause/resume transition. The action
+    /// names the saved state (`command.disable` / `command.enable`), never
+    /// removal or a run: pausing is not deletion and must not mint
+    /// `command.run` / `command.text_attempt` facts.
+    #[must_use]
+    pub fn toggle(guild_id: &str, actor_id: &str, name: &str, enabled: bool) -> Self {
+        Self {
+            guild_id: guild_id.to_owned(),
+            actor_id: Some(actor_id.to_owned()),
+            action: (if enabled {
+                "command.enable"
+            } else {
+                "command.disable"
+            })
+            .to_owned(),
+            target_key: Some(bounded_audit_name(name)),
+            outcome: "ok".to_owned(),
+            reason: None,
+        }
+    }
+
     #[must_use]
     pub fn run(guild_id: &str, actor_id: &str, name: &str, ok: bool, reason: Option<&str>) -> Self {
         Self {
@@ -487,6 +511,99 @@ pub fn adjudicate_delete(
         audit: AuditRecord::delete(guild_id, actor_id, name, deleted),
         resync_registry: deleted,
     }
+}
+
+/// Outcome of a `/command-disable` / `/command-enable` request against the
+/// stored row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToggleOutcome {
+    /// The enabled flag flipped; the caller must republish the registry.
+    Changed,
+    /// The row already held the requested state: an explicit no-op, never an
+    /// implicit registry repair.
+    Unchanged,
+    /// No such row in this guild: a zero-write refusal, never an upsert.
+    Missing,
+}
+
+/// Outcome of a pause/resume request: the outcome, the resulting (or, for a
+/// no-op or miss, the requested) enabled state, the audit row when a
+/// transition committed, and whether the caller must republish the merged
+/// registry (only on a real flip — legacy `syncCommands?.()` runs only when
+/// the set actually changes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToggleDecision {
+    pub outcome: ToggleOutcome,
+    pub enabled: bool,
+    pub audit: Option<AuditRecord>,
+    pub resync_registry: bool,
+}
+
+/// Adjudicate a pause/resume request against the stored row. Missing rows
+/// refuse without writing, current-state requests are explicit no-ops, and
+/// only a real flip audits and republishes.
+#[must_use]
+pub fn adjudicate_toggle(
+    guild_id: &str,
+    actor_id: &str,
+    name: &str,
+    existing: Option<&StoredCommand>,
+    enabled: bool,
+) -> ToggleDecision {
+    match existing {
+        None => ToggleDecision {
+            outcome: ToggleOutcome::Missing,
+            enabled,
+            audit: None,
+            resync_registry: false,
+        },
+        Some(row) if row.enabled == enabled => ToggleDecision {
+            outcome: ToggleOutcome::Unchanged,
+            enabled,
+            audit: None,
+            resync_registry: false,
+        },
+        Some(_) => ToggleDecision {
+            outcome: ToggleOutcome::Changed,
+            enabled,
+            audit: Some(AuditRecord::toggle(guild_id, actor_id, name, enabled)),
+            resync_registry: true,
+        },
+    }
+}
+
+/// Validate a stored definition for re-enable: the same write rules as
+/// `/command` (name shape, write reservation, description/template/trigger
+/// bounds) plus the dispatch rule that a stored trigger must not shadow a
+/// builtin name. Capacity is intentionally unchecked: resuming an existing
+/// row never grows the guild past its ceiling, and rival-trigger conflicts
+/// are impossible — the unique trigger index forbids two rows from holding
+/// one trigger, so a conflicting seed cannot exist to re-enable.
+///
+/// The name follows the write-reservation set while the trigger follows the
+/// dispatch set: a grandfathered voice-named trigger still fires while voice
+/// is off, but a builtin-named trigger can never fire (`is_builtin_trigger`
+/// excludes it), so enabling such a row would claim to restore dead text.
+pub fn validate_toggle_enable(
+    row: &StoredCommand,
+    reserved: &HashSet<String>,
+    dispatch: &HashSet<String>,
+) -> Result<(), CommandError> {
+    validate_put_input(
+        &PutCommandInput {
+            name: row.name.clone(),
+            description: row.description.clone(),
+            template: row.template.clone(),
+            text_trigger: row.text_trigger.clone(),
+        },
+        reserved,
+    )?;
+    if let Some(trigger) = row.text_trigger.as_deref() {
+        if is_builtin_trigger(trigger, dispatch) {
+            return Err(CommandError::ReservedTextTrigger(trigger.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 /// Outcome of a dynamic `/<custom>` invocation (legacy `InteractionCreate`
@@ -867,8 +984,7 @@ pub fn format_inspect_summary(row: &StoredCommand) -> String {
 /// Heading plus full escaped body when it fits; otherwise the heading, the
 /// longest fitting escape-boundary prefix and an explicit truncation marker.
 /// Total stays within Discord's content ceiling.
-fn format_bounded_view(view: InspectView, name: &str, escaped: &str) -> String {
-    let heading = view.heading(name);
+fn format_bounded_view(heading: &str, escaped: &str) -> String {
     let head_units = heading.encode_utf16().count() + 1;
     let total_units = escaped.encode_utf16().count();
     if head_units + total_units <= MAX_RENDERED_CHARS {
@@ -893,8 +1009,7 @@ fn format_bounded_view(view: InspectView, name: &str, escaped: &str) -> String {
 #[must_use]
 pub fn format_inspect_template(row: &StoredCommand) -> String {
     format_bounded_view(
-        InspectView::Template,
-        &row.name,
+        &InspectView::Template.heading(&row.name),
         &escape_inspect_text(&row.template),
     )
 }
@@ -938,10 +1053,33 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
         }
     };
     format_bounded_view(
-        InspectView::Preview,
-        &row.name,
+        &InspectView::Preview.heading(&row.name),
         &escape_inspect_text(&rendered),
     )
+}
+
+/// Validate and preview proposed text without constructing or saving a command.
+/// Uses the saved preview's single-pass renderer, escaping and framing; raw
+/// expansion overflow refuses rather than presenting a partial successful render.
+#[must_use]
+pub fn format_draft_preview(template: &str, ctx: &TemplateContext) -> String {
+    match validate_template(template).and_then(|()| render_template(template, ctx)) {
+        Ok(rendered) => format_bounded_view(
+            "Draft preview — not saved or published",
+            &escape_inspect_text(&rendered),
+        ),
+        Err(error) => {
+            let detail = escape_inspect_text(&error.to_string());
+            let detail = if detail.encode_utf16().count() > 256 {
+                format!("{}…[truncated]", truncate_escaped_units(&detail, 256))
+            } else {
+                detail
+            };
+            format!(
+                "Draft cannot be previewed: {detail} Correct or shorten the draft and retry /command-inspect draft:Hello. Nothing was saved or published."
+            )
+        }
+    }
 }
 
 /// Preview refused for missing render context (no invoking member, channel
@@ -1493,6 +1631,88 @@ mod tests {
     }
 
     #[test]
+    fn toggle_decision_flips_audit_and_resync_and_nothing_else_does() {
+        let mut paused = stored("faq");
+        paused.enabled = false;
+        for (row, enabled, outcome, resync) in [
+            (None, true, ToggleOutcome::Missing, false),
+            (None, false, ToggleOutcome::Missing, false),
+            (Some(&paused), false, ToggleOutcome::Unchanged, false),
+            (Some(&stored("faq")), true, ToggleOutcome::Unchanged, false),
+            (Some(&paused), true, ToggleOutcome::Changed, true),
+            (Some(&stored("faq")), false, ToggleOutcome::Changed, true),
+        ] {
+            let d = adjudicate_toggle(GUILD, ACTOR, "faq", row, enabled);
+            assert_eq!(d.outcome, outcome, "enabled={enabled}");
+            assert_eq!(d.enabled, enabled);
+            assert_eq!(d.resync_registry, resync);
+            assert_eq!(d.audit.is_some(), resync, "only flips audit");
+        }
+        let d = adjudicate_toggle(GUILD, ACTOR, "faq", Some(&paused), true);
+        assert_eq!(
+            d.audit.expect("changed toggle audits"),
+            AuditRecord {
+                guild_id: GUILD.to_owned(),
+                actor_id: Some(ACTOR.to_owned()),
+                action: "command.enable".to_owned(),
+                target_key: Some("faq".to_owned()),
+                outcome: "ok".to_owned(),
+                reason: None,
+            }
+        );
+        let d = adjudicate_toggle(GUILD, ACTOR, "faq", Some(&stored("faq")), false);
+        let audit = d.audit.expect("changed toggle audits");
+        assert_eq!(audit.action, "command.disable");
+        assert_eq!(audit.outcome, "ok");
+    }
+
+    #[test]
+    fn toggle_enable_revalidates_the_stored_definition() {
+        let reserved = reserved_command_names();
+        let dispatch = builtin_command_names();
+        let mut valid = stored("faq");
+        valid.text_trigger = Some("!faq".to_owned());
+        valid.enabled = false;
+        assert!(validate_toggle_enable(&valid, &reserved, &dispatch).is_ok());
+        // A slash-only row has no trigger to collide.
+        let mut slash_only = valid.clone();
+        slash_only.text_trigger = None;
+        assert!(validate_toggle_enable(&slash_only, &reserved, &dispatch).is_ok());
+        // Reserved names stay reserved, like writes.
+        for name in ["help", "command", "command-enable", "setup"] {
+            let mut row = valid.clone();
+            row.name = name.to_owned();
+            assert_eq!(
+                validate_toggle_enable(&row, &reserved, &dispatch),
+                Err(CommandError::ReservedName(name.to_owned())),
+                "{name} refused"
+            );
+        }
+        // Invalid stored content refuses without reactivating.
+        let mut broken = valid.clone();
+        broken.template = "Unknown {args}".to_owned();
+        assert!(matches!(
+            validate_toggle_enable(&broken, &reserved, &dispatch),
+            Err(CommandError::InvalidTemplate(_))
+        ));
+        // A builtin-named trigger can never fire, so it must not resume.
+        for trigger in ["!rank", "!ban"] {
+            let mut row = valid.clone();
+            row.text_trigger = Some(trigger.to_owned());
+            assert_eq!(
+                validate_toggle_enable(&row, &reserved, &dispatch),
+                Err(CommandError::ReservedTextTrigger(trigger.to_owned())),
+                "{trigger} refused"
+            );
+        }
+        // A grandfathered voice-named trigger still fires while voice is
+        // off, so dispatch — not the write set — judges triggers.
+        let mut voice_trigger = valid.clone();
+        voice_trigger.text_trigger = Some("!setup".to_owned());
+        assert!(validate_toggle_enable(&voice_trigger, &reserved, &dispatch).is_ok());
+    }
+
+    #[test]
     fn rejected_and_absent_audits_bound_untrusted_names() {
         let name = "😀".repeat(MAX_COMMAND_NAME_CHARS + 17);
         let expected = "😀".repeat(MAX_COMMAND_NAME_CHARS);
@@ -1510,7 +1730,7 @@ mod tests {
     fn successful_audits_expecting_target(
         name: &str,
         target: &str,
-    ) -> [(&'static str, AuditRecord, AuditRecord); 5] {
+    ) -> [(&'static str, AuditRecord, AuditRecord); 7] {
         let expect = |action: &str, outcome: &str, reason: Option<&str>| AuditRecord {
             guild_id: GUILD.to_owned(),
             actor_id: Some(ACTOR.to_owned()),
@@ -1544,6 +1764,16 @@ mod tests {
                 "run failed",
                 AuditRecord::run(GUILD, ACTOR, name, false, Some("delivery_failed")),
                 expect("command.run", "failed", Some("delivery_failed")),
+            ),
+            (
+                "toggle enable",
+                AuditRecord::toggle(GUILD, ACTOR, name, true),
+                expect("command.enable", "ok", None),
+            ),
+            (
+                "toggle disable",
+                AuditRecord::toggle(GUILD, ACTOR, name, false),
+                expect("command.disable", "ok", None),
             ),
         ]
     }
@@ -1826,6 +2056,17 @@ mod tests {
         assert!(view.starts_with("Template for /faq is invalid: Unknown placeholder"));
         assert!(view.contains("…[truncated]"));
         assert!(view.ends_with(" Replace it with /command name:faq template:..."));
+    }
+
+    #[test]
+    fn draft_long_invalid_template_preserves_bounded_detail_and_correction() {
+        let template = format!("{{{}}}", "a".repeat(1998));
+        let view = format_draft_preview(&template, &inspect_ctx());
+        assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        assert!(view.starts_with("Draft cannot be previewed: Unknown placeholder"));
+        assert!(view.contains("…[truncated]"));
+        assert!(view.contains("retry /command-inspect draft:Hello."));
+        assert!(view.ends_with("Nothing was saved or published."));
     }
 
     #[test]

@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
         matrix_names, published_names,
         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
     );
-    assert_eq!(matrix.len(), 36, "contract covers the 36 built-in commands");
+    assert_eq!(matrix.len(), 44, "contract covers the 44 built-in commands");
 }
 
 #[test]
@@ -77,48 +77,68 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "/{} permission row drifted from the permission table",
             row.command
         );
+        assert_eq!(
+            row.parity_row, table.parity_row,
+            "/{} parity row drifted from the permission table",
+            row.command
+        );
         assert!(
             !def.dm_permission,
             "/{} must stay guild-only (dm_permission false)",
             row.command
         );
-        let expected_gate =
-            if ["rank", "leaderboard", "help", "privacy", "reopen"].contains(&row.command) {
-                E2eGate::Always
-            } else if row.command == "attendance" {
-                E2eGate::Scorecard
-            } else if [
-                "command",
-                "command-remove",
-                "command-list",
-                "command-inspect",
-                "command-clone",
-                "schedule",
-                "schedule-remove",
-                "schedule-list",
-                "sticky",
-                "sticky-remove",
-                "giveaway",
-            ]
-            .contains(&row.command)
-            {
-                E2eGate::Automations
-            } else if [
-                "rsvp",
-                "rsvp-attendance",
-                "lfg",
-                "lfg-close",
-                "lfg-list",
-                "feed-add",
-                "feed-remove",
-                "feed-list",
-            ]
-            .contains(&row.command)
-            {
-                E2eGate::Announcements
-            } else {
-                E2eGate::Moderation
-            };
+        let expected_gate = if [
+            "rank",
+            "leaderboard",
+            "help",
+            "privacy",
+            "reopen",
+            "welcome-preview",
+            "game-mix",
+        ]
+        .contains(&row.command)
+        {
+            E2eGate::Always
+        } else if row.command == "attendance" {
+            E2eGate::Scorecard
+        } else if [
+            "command",
+            "command-remove",
+            "command-list",
+            "command-inspect",
+            "command-clone",
+            "command-disable",
+            "command-enable",
+            "schedule",
+            "schedule-remove",
+            "schedule-list",
+            "sticky",
+            "sticky-remove",
+            "giveaway",
+        ]
+        .contains(&row.command)
+        {
+            E2eGate::Automations
+        } else if [
+            "rsvp",
+            "rsvp-attendance",
+            "lfg",
+            "lfg-close",
+            "lfg-edit",
+            "lfg-list",
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+        ]
+        .contains(&row.command)
+        {
+            E2eGate::Announcements
+        } else {
+            E2eGate::Moderation
+        };
         assert_eq!(
             row.gate, expected_gate,
             "/{} gate drifted from the publish wiring",

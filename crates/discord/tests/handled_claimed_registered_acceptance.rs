@@ -66,12 +66,12 @@ impl InteractionHandler for Stub {
 /// - `router_with_commands` (`command_runtime.rs`): channel handlers while
 ///   `moderation`, sticky `AutomationAdmin` + custom commands while
 ///   `automations`, feeds while `announcements`, rank/leaderboard/help/
-///   privacy always. The channel and custom registrations below call the
+///   privacy/game-mix always. The channel and custom registrations below call the
 ///   real public functions; the rest are marker ids, as in production.
 /// - `CommandRuntime::build` member verbs (`command_runtime.rs`): the five
 ///   member moderation ids while a member consumer exists.
 /// - `InteractionRuntime::with_router` (`interactions.rs`, public, ungated):
-///   the `Lfg`/`LfgClose` pair.
+///   the `Lfg`/`LfgClose`/`LfgEdit` handlers.
 /// - Missing on the baseline: `Rsvp`, `RsvpAttendance`,
 ///   `ScorecardAttendance` — the RED this file pins.
 trait ProductionRegistrations {
@@ -94,6 +94,7 @@ impl ProductionRegistrations for InteractionRouter {
                 HandlerId::FeedAdd,
                 HandlerId::FeedRemove,
                 HandlerId::FeedList,
+                HandlerId::FeedInspect,
             ] {
                 router.register(Box::new(Stub(id)));
             }
@@ -103,6 +104,7 @@ impl ProductionRegistrations for InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::GameMix,
         ] {
             router.register(Box::new(Stub(id)));
         }
@@ -119,6 +121,7 @@ impl ProductionRegistrations for InteractionRouter {
         }
         router.register(Box::new(Stub(HandlerId::Lfg)));
         router.register(Box::new(Stub(HandlerId::LfgClose)));
+        router.register(Box::new(Stub(HandlerId::LfgEdit)));
         // Next-only `/lfg-list`: name-based so the baseline still compiles
         // before the production `HandlerId::LfgList` arm lands. Resolve the
         // handler from the routing table when the builder lands it instead of
@@ -185,12 +188,14 @@ fn ctx(name: &str, custom_row: Option<bool>) -> SlashContext<'_> {
 fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
     match name {
         "privacy" => Some(HandlerId::Privacy),
+        "game-mix" => Some(HandlerId::GameMix),
         "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
             Some(HandlerId::AutomationAdmin)
         }
         "feed-add" => Some(HandlerId::FeedAdd),
         "feed-remove" => Some(HandlerId::FeedRemove),
         "feed-list" => Some(HandlerId::FeedList),
+        "feed-inspect" => Some(HandlerId::FeedInspect),
         "ban" if member_present => Some(HandlerId::Moderation(ModerationAction::Ban)),
         "tempban" if member_present => Some(HandlerId::Moderation(ModerationAction::TempBan)),
         "kick" if member_present => Some(HandlerId::Moderation(ModerationAction::Kick)),
@@ -238,7 +243,12 @@ fn claiming_surfaces(
     if is_channel_claim(name, handler) && admitted {
         claims.push("channel");
     }
-    if (matches!(handler, HandlerId::Lfg | HandlerId::LfgClose) || name == "lfg-list") && admitted {
+    if (matches!(
+        handler,
+        HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit
+    ) || name == "lfg-list")
+        && admitted
+    {
         claims.push("lfg");
     }
     if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) && admitted {
@@ -253,7 +263,11 @@ fn claiming_surfaces(
     let earlier_arm_matches = is_channel_claim(name, handler)
         || matches!(
             handler,
-            HandlerId::Lfg | HandlerId::LfgClose | HandlerId::Rank | HandlerId::Leaderboard
+            HandlerId::Lfg
+                | HandlerId::LfgClose
+                | HandlerId::LfgEdit
+                | HandlerId::Rank
+                | HandlerId::Leaderboard
         )
         || name == "lfg-list"
         || (name == "help" && handler == HandlerId::Help)

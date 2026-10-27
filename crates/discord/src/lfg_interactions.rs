@@ -1,6 +1,6 @@
 //! LFG interaction handlers using the shared router, store and REST executor.
 
-use crate::{automation_admission::ActorCooldowns, ActionExecutor, DiscordError};
+use crate::{automation_admission::ActorCooldowns, ActionExecutor, CloseRefreshEdit, DiscordError};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use two_bot_core::lfg::{self, LfgPost, LfgRole, LfgSelectAction, LfgSignup, LfgStatus};
@@ -24,6 +24,16 @@ pub enum LfgRequest {
     },
     Close {
         post_id: String,
+    },
+    Edit {
+        post_id: String,
+        title: Option<String>,
+        starts_at: Option<String>,
+    },
+    EditSeats {
+        post_id: String,
+        role_key: String,
+        seats: u8,
     },
     Select(LfgSelectAction),
 }
@@ -197,6 +207,8 @@ impl LfgInteractions {
                 return Err(LfgError::Invalid("Invalid LFG preview.".into()));
             }
             LfgRequest::Close { post_id }
+            | LfgRequest::Edit { post_id, .. }
+            | LfgRequest::EditSeats { post_id, .. }
             | LfgRequest::Select(
                 LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
             ) => {
@@ -267,6 +279,7 @@ impl LfgInteractions {
         // execution, not at arrival; a saved interaction receipt still wins.
         let now = time::OffsetDateTime::now_utc();
         let at = lfg::iso_millis_utc(now);
+        let seat_edit = matches!(&request, LfgRequest::EditSeats { .. });
         let (action, outcome, reply, refresh) = match request {
             LfgRequest::Create {
                 title,
@@ -407,6 +420,119 @@ impl LfgInteractions {
                     !fresh,
                 )
             }
+            LfgRequest::Edit {
+                title, starts_at, ..
+            } => {
+                if title.is_none() && starts_at.is_none() {
+                    return Err(LfgError::Invalid(
+                        "Provide title or starts-at to edit.".into(),
+                    ));
+                }
+                let title = title
+                    .as_deref()
+                    .map(lfg::validate_title)
+                    .transpose()
+                    .map_err(|error| LfgError::Invalid(error.to_string()))?;
+                // Use the clock after waiting for the post lock, not admission.
+                let starts_at = starts_at
+                    .as_deref()
+                    .map(|value| {
+                        lfg::normalize_starts_at(
+                            value,
+                            (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                                as i64,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| LfgError::Invalid(error.to_string()))?;
+                let starts_at = match store::edit_lfg_metadata(
+                    &self.pool,
+                    guild_id,
+                    &id,
+                    title.as_deref(),
+                    starts_at.as_deref(),
+                )
+                .await?
+                {
+                    store::LfgEditOutcome::Missing => {
+                        return Err(LfgError::Invalid(
+                            "LFG post is missing in this server.".into(),
+                        ));
+                    }
+                    store::LfgEditOutcome::Closed => {
+                        return Err(LfgError::Invalid(
+                            "LFG post is closed and cannot be edited.".into(),
+                        ));
+                    }
+                    store::LfgEditOutcome::Unchanged { starts_at } => {
+                        guard.commit().await?;
+                        return Ok(format!("LFG unchanged. Starts at {starts_at}."));
+                    }
+                    store::LfgEditOutcome::Updated { starts_at } => starts_at,
+                };
+                (
+                    "lfg.edit",
+                    "updated".into(),
+                    format!("LFG edit saved. Starts at {starts_at}."),
+                    true,
+                )
+            }
+            LfgRequest::EditSeats {
+                role_key, seats, ..
+            } => {
+                let audit = RsvpAudit {
+                    id: format!("lfg:seats:{interaction_id}:{}", now.unix_timestamp_nanos()),
+                    guild_id: guild_id.into(),
+                    actor_id: Some(actor_id.into()),
+                    action: "lfg.edit.seats".into(),
+                    target_key: Some(id.clone()),
+                    outcome: "increased".into(),
+                    reason: None,
+                    created_at: at.clone(),
+                };
+                // Storage failures roll back the capacity transaction, so no
+                // seat count changed. Surface Database here; the runtime
+                // renders seat-edit storage failures without success language.
+                let result =
+                    store::increase_lfg_seats(&self.pool, guild_id, &id, &role_key, seats, &audit)
+                        .await?;
+                let refusal = match result {
+                    store::LfgSeatEditOutcome::Missing => {
+                        Some("LFG post is missing in this server.")
+                    }
+                    store::LfgSeatEditOutcome::Closed => {
+                        Some("LFG post is closed and cannot be edited.")
+                    }
+                    store::LfgSeatEditOutcome::Started => {
+                        Some("This LFG has already started; seats cannot be edited.")
+                    }
+                    store::LfgSeatEditOutcome::MissingRole => {
+                        Some("LFG role is missing; use an existing signup role key.")
+                    }
+                    store::LfgSeatEditOutcome::InvalidSeats => {
+                        Some("Seats must be an integer from 1-99.")
+                    }
+                    store::LfgSeatEditOutcome::Shrink => {
+                        Some("Seats can only increase; check the current capacity before retrying.")
+                    }
+                    store::LfgSeatEditOutcome::Unchanged => {
+                        guard.commit().await?;
+                        return Ok(
+                            "LFG seats unchanged; the role already has that capacity.".into()
+                        );
+                    }
+                    store::LfgSeatEditOutcome::Updated => None,
+                };
+                if let Some(refusal) = refusal {
+                    return Err(LfgError::Invalid(refusal.into()));
+                }
+                (
+                    "lfg.edit.seats",
+                    "increased".into(),
+                    format!("LFG seats saved. The role now has {seats} seats."),
+                    true,
+                )
+            }
             // Preview returns before admission; reaching the store would be a
             // routing defect, so fail closed without touching it.
             LfgRequest::Preview { .. } => {
@@ -469,7 +595,8 @@ impl LfgInteractions {
                 ("lfg.leave", outcome, reply, true)
             }
         };
-        let audited = if replay_outcome.is_some() {
+        // Seat edits commit their required audit atomically with capacity.
+        let audited = if replay_outcome.is_some() || seat_edit {
             true
         } else {
             let audit = if let Some(identity) = select_identity {
@@ -513,10 +640,22 @@ impl LfgInteractions {
         let result = if !audited {
             // Store calls committed independently of this lock-only transaction.
             // Do not turn applied state into a bare failure or claim an audit.
-            format!("{reply} Audit could not be recorded; check the saved state before retrying.")
+            if action == "lfg.edit" {
+                format!("{reply} Audit could not be recorded; the visible post could not be refreshed. Check the saved state before retrying.")
+            } else {
+                format!(
+                    "{reply} Audit could not be recorded; check the saved state before retrying."
+                )
+            }
         } else if refresh {
             match self.refresh(executor, guild_id, &id).await {
                 Ok(()) => reply,
+                Err(_) if seat_edit => {
+                    format!("{reply} The visible post could not be refreshed. Check the saved state before retrying; an equal seat target is a no-op, not a refresh retry.")
+                }
+                Err(_) if action == "lfg.edit" => {
+                    format!("{reply} The visible post could not be refreshed.")
+                }
                 Err(_) => {
                     format!("{reply} Message refresh failed; the saved result above still applies.")
                 }
@@ -531,6 +670,10 @@ impl LfgInteractions {
     /// Process a bounded lifecycle batch for one configured guild. The jobs
     /// supervisor is the only production caller; row-local failures are logged
     /// without aborting later rows. The count includes failed row attempts.
+    /// Besides expiring open posts, each tick retries the durable
+    /// close-refresh intents that failed edits left behind: closed rows whose
+    /// pending flag is armed and whose backoff has elapsed share the same
+    /// 20-row cap and per-tick budget as expiry work.
     pub async fn sweep_lifecycle(
         &self,
         executor: &ActionExecutor,
@@ -550,13 +693,17 @@ impl LfgInteractions {
         let expired_before = now.saturating_sub(LFG_EXPIRY_GRACE);
         let orphan_before = now.saturating_sub(LFG_ORPHAN_AGE);
         let candidates: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM lfg_posts WHERE guild_id = $1 AND status = 'open'
-             AND (starts_at <= $2 OR (message_id IS NULL AND created_at <= $3))
-             ORDER BY created_at, id LIMIT $4",
+            "SELECT id FROM lfg_posts WHERE guild_id = $1
+             AND ((status = 'open'
+                   AND (starts_at <= $2 OR (message_id IS NULL AND created_at <= $3)))
+                  OR (status = 'closed' AND close_refresh_pending
+                      AND (close_refresh_next_at IS NULL OR close_refresh_next_at <= $4)))
+             ORDER BY created_at, id LIMIT $5",
         )
         .bind(guild_id)
         .bind(expired_before)
         .bind(orphan_before)
+        .bind(now)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
@@ -602,8 +749,8 @@ impl LfgInteractions {
         let Some(post) = store::get_lfg(&self.pool, guild_id, id).await? else {
             return Ok(false);
         };
-        if post.status != LfgStatus::Open {
-            return Ok(false);
+        if post.status == LfgStatus::Closed {
+            return self.repair_closed_row(executor, guild_id, &post, now).await;
         }
         let parse = |at: &str| {
             time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
@@ -642,6 +789,90 @@ impl LfgInteractions {
         Ok(true)
     }
 
+    /// Retry one durable close-message edit under the runtime lock already
+    /// held by [`Self::sweep_lifecycle_row`]. Repairs only the exact saved
+    /// message of a still-pending closed post: a confirmed edit or a
+    /// definitive Unknown Message outcome settles the intent, while any other
+    /// failure defers it with durable backoff. Never recreates a message,
+    /// sends, deletes or reopens. Returns `true` when an attempt ran.
+    async fn repair_closed_row(
+        &self,
+        executor: &ActionExecutor,
+        guild_id: &str,
+        post: &LfgPost,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, LfgError> {
+        // The candidate scan already filtered to pending, due rows; re-check
+        // under the held runtime lock so a concurrent repair cannot double-PATCH.
+        let state = store::get_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+        let eligible =
+            state.is_some_and(|state| state.pending && state.next_at.is_none_or(|due| due <= now));
+        if !eligible {
+            return Ok(false);
+        }
+        let attempts = state.map(|state| state.attempts).unwrap_or(0);
+        let Some(message_id) = post.message_id.as_deref() else {
+            // No saved message to repair: settle quietly without wire work.
+            // Uncertainty never authorizes a replacement send.
+            store::clear_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+            return Ok(false);
+        };
+        let roles = store::list_lfg_roles(&self.pool, &post.id).await?;
+        let signups = store::list_lfg_signups(&self.pool, &post.id).await?;
+        // Rebuilt from current saved state, never a stale open snapshot: a
+        // closed post always renders with its controls removed.
+        let payload = message_payload(post, &roles, &signups);
+        match executor
+            .edit_message_for_close_refresh(
+                &post.channel_id,
+                message_id,
+                payload["content"].as_str().unwrap_or_default(),
+                Self::payload_components(&payload),
+            )
+            .await
+        {
+            CloseRefreshEdit::Edited => {
+                store::clear_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+                tracing::info!(
+                    outcome = "repaired",
+                    post_id = %post.id,
+                    "lfg close repair removed stale controls"
+                );
+                Ok(true)
+            }
+            CloseRefreshEdit::UnknownMessage => {
+                store::clear_lfg_close_refresh(&self.pool, guild_id, &post.id).await?;
+                tracing::info!(
+                    outcome = "settled_missing",
+                    error_class = "unknown_message",
+                    post_id = %post.id,
+                    "lfg close repair settled a deleted message without recreating it"
+                );
+                Ok(true)
+            }
+            CloseRefreshEdit::Retryable(error) => {
+                let attempts = attempts.saturating_add(1);
+                store::defer_lfg_close_refresh(
+                    &self.pool,
+                    guild_id,
+                    &post.id,
+                    attempts,
+                    now.saturating_add(close_refresh_backoff(attempts)),
+                )
+                .await?;
+                // Fixed-vocabulary classification only: never the error text
+                // (it can carry transport detail), member text or SQL.
+                tracing::warn!(
+                    outcome = "retry_scheduled",
+                    error_class = error.cause(),
+                    post_id = %post.id,
+                    "lfg close repair deferred; retry stays bounded"
+                );
+                Ok(true)
+            }
+        }
+    }
+
     async fn refresh(
         &self,
         executor: &ActionExecutor,
@@ -652,6 +883,10 @@ impl LfgInteractions {
             return Ok(());
         };
         let Some(message_id) = post.message_id.as_deref() else {
+            // A closed post with no saved message has nothing to repair.
+            if post.status == LfgStatus::Closed {
+                store::clear_lfg_close_refresh(&self.pool, guild_id, id).await?;
+            }
             return Ok(());
         };
         let roles = store::list_lfg_roles(&self.pool, id).await?;
@@ -665,6 +900,11 @@ impl LfgInteractions {
                 Self::payload_components(&payload),
             )
             .await?;
+        // A confirmed edit of a closed message satisfies any pending
+        // close-refresh intent armed by its close transition.
+        if post.status == LfgStatus::Closed {
+            store::clear_lfg_close_refresh(&self.pool, guild_id, id).await?;
+        }
         Ok(())
     }
 
@@ -707,6 +947,16 @@ impl LfgInteractions {
 // One callsite for both constant warnings keeps tracing metadata shared.
 fn lifecycle_warning(message: &'static str) {
     tracing::warn!(message = message);
+}
+
+/// Delay before the next close-refresh attempt after `attempts` recorded
+/// failures: a 5-minute base doubled per failure, capped at 6 hours (10 minutes
+/// after the first failure). Same-tick restarts never hammer Discord; a
+/// day-separated tick is always eligible.
+fn close_refresh_backoff(attempts: i32) -> time::Duration {
+    let shift = (attempts.max(0) as u32).min(7);
+    let minutes = 5_i64.saturating_mul(1_i64 << shift);
+    time::Duration::minutes(minutes).min(time::Duration::hours(6))
 }
 
 /// Versioned, length-delimited request binding. Hashing keeps the audit reason
@@ -926,6 +1176,22 @@ mod tests {
                 "2"
             )
         );
+    }
+
+    #[test]
+    fn close_refresh_backoff_suppresses_same_tick_and_allows_next_day() {
+        assert_eq!(close_refresh_backoff(0), time::Duration::minutes(5));
+        assert_eq!(close_refresh_backoff(1), time::Duration::minutes(10));
+        assert_eq!(close_refresh_backoff(-3), time::Duration::minutes(5));
+        for attempts in 0..1000 {
+            let backoff = close_refresh_backoff(attempts);
+            assert!(backoff > time::Duration::ZERO, "same-tick retries wait");
+            assert!(
+                backoff <= time::Duration::hours(6),
+                "a day-later tick is eligible"
+            );
+        }
+        assert_eq!(close_refresh_backoff(1000), time::Duration::hours(6));
     }
 
     #[test]

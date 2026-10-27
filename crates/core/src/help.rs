@@ -66,6 +66,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Welcome preview",
+        requires: Some("Manage Server"),
+        commands: &["welcome-preview"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Community check-in",
         requires: Some("Manage Events"),
         commands: &["attendance"],
@@ -80,6 +86,8 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-list",
             "command-inspect",
             "command-clone",
+            "command-disable",
+            "command-enable",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -103,13 +111,20 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Looking for group",
         requires: Some("Manage Events"),
-        commands: &["lfg", "lfg-close", "lfg-list"],
+        commands: &["lfg", "lfg-close", "lfg-edit", "lfg-list"],
         anchor: None,
     },
     HelpGroup {
         title: "Feed relays",
         requires: Some("Manage Server"),
-        commands: &["feed-add", "feed-remove", "feed-list"],
+        commands: &[
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+        ],
         anchor: None,
     },
     HelpGroup {
@@ -140,6 +155,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "Channel slowmode and locks",
         requires: Some("Manage Channels"),
         commands: &["slowmode", "lockdown", "unlock", "channel-inspect"],
+        anchor: None,
+    },
+    HelpGroup {
+        title: "Game activity (private, live guild unavailable)",
+        requires: Some("Manage Server"),
+        commands: &["game-mix"],
         anchor: None,
     },
     HelpGroup {
@@ -215,6 +236,7 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         out.push_str(&names.join(" · "));
         out.push('\n');
         if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
+            out.push_str("Paste the event id or its link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
             out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
         }
     }
@@ -742,9 +764,13 @@ mod tests {
             .publish_set(&[])
             .expect("full set assembles");
         let text = help_text(&defs);
+        // The RSVP note carries a copyable event-link example whose slashes
+        // tokenize as path fragments, not commands; exclude it from the
+        // exact-once command count.
+        let without_example = text.replace("https://discord.com/events/<server-id>/<event-id>", "");
         // Exact slash tokens: a substring count would triple-count `/command`
         // inside `/command-remove` and `/command-list`.
-        let tokens: Vec<&str> = text
+        let tokens: Vec<&str> = without_example
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
             .filter(|t| t.starts_with('/') && t.len() > 1)
             .collect();
@@ -757,13 +783,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 36 non-voice commands (5 core + 20 feature + 9 moderation + 2 reads),
-        // including inspection, clone, reopen, giveaway, lfg-list, purge-preview
-        // and channel-inspect, plus 21 additional voice commands (voice
-        // `kick` loses first-wins to moderation `/kick`).
-        // `/templateassistant` stays unpublished until its slice lands:
-        // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (57 live)"));
+        // 44 non-voice commands (7 core + 26 feature + 9 moderation + 2 reads),
+        // including inspection, clone, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
+        // purge-preview and channel-inspect, plus 21 additional voice commands (voice
+        // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
+        // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (65 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -819,7 +844,7 @@ mod tests {
         });
         let defs = off.publish_set(&[]).expect("core-only set");
         let text = help_text(&defs);
-        assert!(text.contains("**Server commands** (5 live)"));
+        assert!(text.contains("**Server commands** (7 live)"));
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
@@ -889,19 +914,23 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 36 non-voice names, including inspection, clone, reopen, giveaway,
-        // lfg-list, purge-preview and channel-inspect, plus 21 additional
-        // voice names (voice `kick` shares the Kick group).
+        // 44 non-voice names, including inspection, clone, reopen, welcome-preview, pause/resume,
+        // giveaway, lfg-edit, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
+        // 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 57);
+        assert_eq!(grouped.len(), 65);
         for name in [
             "rank",
             "leaderboard",
             "help",
             "privacy",
             "reopen",
+            "welcome-preview",
+            "game-mix",
             "attendance",
             "command",
+            "command-disable",
+            "command-enable",
             "command-inspect",
             "command-clone",
             "schedule-list",
@@ -911,8 +940,10 @@ mod tests {
             "giveaway",
             "lfg",
             "lfg-close",
+            "lfg-edit",
             "lfg-list",
             "feed-add",
+            "feed-inspect",
             "ban",
             "tempban",
             "kick",

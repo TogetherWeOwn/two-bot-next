@@ -24,11 +24,12 @@ use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
         accepted_text_trigger, builtin_command_names, format_command_list_page,
-        format_inspect_miss, format_inspect_preview, format_inspect_summary,
+        format_draft_preview, format_inspect_miss, format_inspect_preview, format_inspect_summary,
         format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
         invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
         AutomationMessageAcceptance, CloneCommandInput, CommandError, InspectView, PutCommandInput,
-        StoredCommand, TemplateContext, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        StoredCommand, TemplateContext, ToggleOutcome, INVALID_COMMAND_LIST_PAGE,
+        MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -202,7 +203,13 @@ impl CustomCommandRuntime {
         };
         let management = matches!(
             data.name.as_str(),
-            "command" | "command-remove" | "command-list" | "command-inspect" | "command-clone"
+            "command"
+                | "command-remove"
+                | "command-list"
+                | "command-inspect"
+                | "command-clone"
+                | "command-disable"
+                | "command-enable"
         );
         let builtin = builtin_command_names().contains(&data.name);
         if builtin && !management {
@@ -637,11 +644,10 @@ impl CustomCommandRuntime {
             .map_err(|_| CustomCommandError::Storage)
     }
 
-    /// Private saved-response inspection: one ephemeral content-only view,
-    /// never a public send, registration, cooldown/claim touch, definition
-    /// mutation or `command.run` fact. The only store access is a live
-    /// `get_command` read after every validation passes — no cache, so a
-    /// deleted definition immediately misses.
+    /// Private saved-response inspection or unsaved draft preview: one
+    /// ephemeral content-only view, never execution or mutation. Drafts never
+    /// access storage; saved mode reads live only after validation, so deleted
+    /// definitions immediately miss.
     async fn inspect(
         &self,
         interaction: &Interaction,
@@ -649,22 +655,29 @@ impl CustomCommandRuntime {
         guild: &str,
         guild_name: Option<&str>,
     ) -> String {
-        let name = match single_string_option(data, "name") {
-            SingleOption::Missing | SingleOption::Malformed => {
-                return invalid_inspect_option_reply(
-                    "command name",
-                    "a saved command name is required.",
-                );
-            }
-            SingleOption::Value(name) => name,
-        };
-        let name = match validate_inspect_name(name, &builtin_command_names()) {
-            Ok(name) => name,
-            Err(reason) => {
-                return invalid_inspect_option_reply("command name", &reason.to_string());
+        if data.options.iter().any(|option| {
+            !matches!(
+                option.name.as_str(),
+                "name" | "draft" | "view" | "arguments"
+            )
+        }) {
+            return invalid_inspect_option_reply(
+                "options",
+                "use only name or draft, with optional view and arguments.",
+            );
+        }
+        let (name, draft) = match (
+            single_string_option(data, "name"),
+            single_string_option(data, "draft"),
+        ) {
+            (SingleOption::Value(name), SingleOption::Missing) => (Some(name), None),
+            (SingleOption::Missing, SingleOption::Value(draft)) => (None, Some(draft)),
+            _ => {
+                return "Invalid input: pass exactly one text name or draft, never both or duplicates. Examples: /command-inspect name:faq or /command-inspect draft:Hello".to_owned();
             }
         };
         let view = match single_string_option(data, "view") {
+            SingleOption::Missing if draft.is_some() => InspectView::Preview,
             SingleOption::Missing => InspectView::Summary,
             SingleOption::Malformed => return invalid_inspect_view_reply(None),
             SingleOption::Value(raw) => match InspectView::parse(raw) {
@@ -689,6 +702,34 @@ impl CustomCommandRuntime {
                 }
             }
         }
+        // Both preview modes use invocation context, never sample arguments.
+        let context = || {
+            interaction
+                .author()
+                .zip(interaction.channel.as_ref())
+                .zip(guild_name)
+                .map(|((actor, channel), server)| TemplateContext {
+                    user: format!("<@{}>", actor.id),
+                    username: actor.name.clone(),
+                    server: server.to_owned(),
+                    channel: format!("<#{}>", channel.id),
+                })
+        };
+        if let Some(draft) = draft {
+            if view != InspectView::Preview {
+                return "Invalid draft view: only preview is available for unsaved text. Use /command-inspect draft:Hello view:preview".to_owned();
+            }
+            return match context() {
+                Some(context) => format_draft_preview(draft, &context),
+                None => "Draft preview is unavailable: command context is missing. Please try /command-inspect draft:Hello again.".to_owned(),
+            };
+        }
+        let name = match validate_inspect_name(name.unwrap_or_default(), &builtin_command_names()) {
+            Ok(name) => name,
+            Err(reason) => {
+                return invalid_inspect_option_reply("command name", &reason.to_string());
+            }
+        };
         let row = match store::get_command(&self.pool, guild, &name).await {
             Ok(row) => row,
             Err(_) => return LOOKUP_OUTAGE_REPLY.to_owned(),
@@ -699,23 +740,10 @@ impl CustomCommandRuntime {
         match view {
             InspectView::Summary => format_inspect_summary(&row),
             InspectView::Template => format_inspect_template(&row),
-            InspectView::Preview => {
-                // Same invoking member/channel/guild context as real
-                // execution; the sample arguments are never interpolated.
-                let actor = interaction.author();
-                let context = actor.zip(interaction.channel.as_ref()).zip(guild_name).map(
-                    |((actor, channel), server)| TemplateContext {
-                        user: format!("<@{}>", actor.id),
-                        username: actor.name.clone(),
-                        server: server.to_owned(),
-                        channel: format!("<#{}>", channel.id),
-                    },
-                );
-                match context {
-                    Some(context) => format_inspect_preview(&row, &context),
-                    None => inspect_preview_context_unavailable(&row.name),
-                }
-            }
+            InspectView::Preview => match context() {
+                Some(context) => format_inspect_preview(&row, &context),
+                None => inspect_preview_context_unavailable(&row.name),
+            },
         }
     }
 
@@ -822,25 +850,66 @@ impl CustomCommandRuntime {
                 .map_err(|_| CustomCommandError::Storage)?;
             return Ok(format_command_list_page(&rows, page).unwrap_or_else(str::to_owned));
         }
-        let Some(name) = string_option(data, "name") else {
-            return Ok("A command name is required.".to_owned());
+        if data.name == "command-disable" || data.name == "command-enable" {
+            // Routing already enforced guild/application, ManageGuild and the
+            // feature gate. The lifecycle takes exactly one text `name`:
+            // forged types, duplicates and extra options refuse before any
+            // store read or publication.
+            return self.toggle(interaction, data, guild).await;
+        }
+        // The remaining management names are the two writers. Routing has
+        // already enforced guild/application, ManageGuild and the feature
+        // gate. Strictly decode their complete option shapes before the
+        // registry lock, any store access, audit or publication: a forged
+        // duplicate, wrong type, nested or unknown option must never let a
+        // first-matching value silently win.
+        let is_define = data.name == "command";
+        let allowed: &[&str] = if is_define {
+            &["name", "template", "description", "text-trigger"]
+        } else {
+            &["name"]
         };
-        let name = name.to_lowercase();
+        if data
+            .options
+            .iter()
+            .any(|option| !allowed.contains(&option.name.as_str()))
+        {
+            return Ok(invalid_writer_option("option"));
+        }
+        let name = match single_string_option(data, "name") {
+            SingleOption::Missing => return Ok("A command name is required.".to_owned()),
+            SingleOption::Malformed => return Ok(invalid_writer_option("name")),
+            SingleOption::Value(name) => name.to_lowercase(),
+        };
+        let define = if is_define {
+            let template = match single_string_option(data, "template") {
+                SingleOption::Missing => return Ok("A template is required.".to_owned()),
+                SingleOption::Malformed => return Ok(invalid_writer_option("template")),
+                SingleOption::Value(template) => template.to_owned(),
+            };
+            let description = match single_string_option(data, "description") {
+                SingleOption::Missing => "Custom command".to_owned(),
+                SingleOption::Malformed => return Ok(invalid_writer_option("description")),
+                SingleOption::Value(description) => description.to_owned(),
+            };
+            let text_trigger = match single_string_option(data, "text-trigger") {
+                SingleOption::Missing => None,
+                SingleOption::Malformed => return Ok(invalid_writer_option("text-trigger")),
+                SingleOption::Value(trigger) => Some(trigger.to_lowercase()),
+            };
+            Some(PutCommandInput {
+                name: name.clone(),
+                description,
+                template,
+                text_trigger,
+            })
+        } else {
+            None
+        };
         let audit_id = format!("custom:manage:{}", interaction.id);
         let at = two_bot_core::now_iso();
         let _guard = self.registry.lock().await;
-        let (reply, resync) = if data.name == "command" {
-            let Some(template) = string_option(data, "template") else {
-                return Ok("A template is required.".to_owned());
-            };
-            let input = PutCommandInput {
-                name: name.clone(),
-                description: string_option(data, "description")
-                    .unwrap_or("Custom command")
-                    .to_owned(),
-                template: template.to_owned(),
-                text_trigger: string_option(data, "text-trigger").map(str::to_lowercase),
-            };
+        let (reply, resync) = if let Some(input) = define {
             match service::put(
                 &self.pool,
                 self.router.gates().automations,
@@ -890,6 +959,77 @@ impl CustomCommandRuntime {
         }
         Ok(reply)
     }
+
+    /// Pause or resume one saved definition without deleting it. Only the
+    /// enabled flag and update metadata change, and only on a real flip;
+    /// missing rows, current-state requests and validation refusals never
+    /// publish. The flip commits before the one full-set publication, so an
+    /// invocation racing a stale picker reads the saved state.
+    async fn toggle(
+        &self,
+        interaction: &Interaction,
+        data: &CommandData,
+        guild: &str,
+    ) -> Result<String, CustomCommandError> {
+        let target = data.name == "command-enable";
+        let raw = match single_string_option(data, "name") {
+            SingleOption::Missing => {
+                return Ok("A command name is required.".to_owned());
+            }
+            SingleOption::Malformed => return Ok(invalid_toggle_option(&data.name)),
+            SingleOption::Value(name) => name,
+        };
+        if data.options.iter().any(|option| option.name != "name") {
+            return Ok(invalid_toggle_option(&data.name));
+        }
+        let actor = interaction
+            .author_id()
+            .ok_or(CustomCommandError::Context)?
+            .to_string();
+        let name = raw.to_lowercase();
+        let audit_id = format!("custom:manage:{}", interaction.id);
+        let at = two_bot_core::now_iso();
+        let _guard = self.registry.lock().await;
+        let decision = service::set_enabled(
+            &self.pool,
+            self.router.gates().automations,
+            &service::ToggleRequest {
+                guild,
+                actor: &actor,
+                name: &name,
+                enabled: target,
+                audit_id: &audit_id,
+                at: &at,
+            },
+        )
+        .await;
+        let (reply, resync) = match decision {
+            Ok(decision) => {
+                let reply = match decision.outcome {
+                    ToggleOutcome::Missing => format!("No command /{name} found."),
+                    ToggleOutcome::Unchanged if target => {
+                        format!("/{name} is already enabled.")
+                    }
+                    ToggleOutcome::Unchanged => format!("/{name} is already disabled."),
+                    ToggleOutcome::Changed if target => format!("Enabled /{name}."),
+                    ToggleOutcome::Changed => format!("Disabled /{name}."),
+                };
+                (reply, decision.resync_registry)
+            }
+            Err(service::ServiceError::Storage(_)) => return Err(CustomCommandError::Storage),
+            Err(error) => return Ok(error.to_string()),
+        };
+        if resync && self.publish_locked().await.is_err() {
+            // The flip is committed. Report the saved-but-not-synchronized
+            // state with a safe next action: never a delete recommendation,
+            // and never a claim that a later no-op repaired the picker.
+            tracing::error!("custom-command toggle committed but registry publication failed");
+            return Ok(format!(
+                "{reply} The definition is saved but the command picker is not yet synchronized because registry publication failed. Repeating this command will not resync it; restart the bot after Discord recovers to resync."
+            ));
+        }
+        Ok(reply)
+    }
 }
 
 /// Proven pre-wire refusals and guard failures map to `Delivery`; anything
@@ -904,11 +1044,22 @@ fn delivery_error(error: crate::DiscordError) -> CustomCommandError {
     }
 }
 
-fn string_option<'a>(data: &'a CommandData, name: &str) -> Option<&'a str> {
-    data.options.iter().find_map(|option| match &option.value {
-        CommandOptionValue::String(value) if option.name == name => Some(value.as_str()),
-        _ => None,
-    })
+/// Toggle-option refusal: the lifecycle commands take exactly one text
+/// `name`, never a replacement/editor option set.
+fn invalid_toggle_option(command: &str) -> String {
+    format!("Invalid name option: pass exactly one text name, e.g. /{command} name:faq.")
+}
+
+/// Writer-shape refusal: names only the trusted option at fault (or a
+/// generic `option` for an unknown key), never any submitted value.
+fn invalid_writer_option(field: &str) -> String {
+    if field == "option" {
+        "Invalid option: use only the options listed for this command.".to_owned()
+    } else if field == "name" || field == "template" {
+        format!("Invalid {field} option: pass exactly one text {field}.")
+    } else {
+        format!("Invalid {field} option: pass at most one text {field}.")
+    }
 }
 
 /// One named option read strictly: a forged type or a duplicate refuses

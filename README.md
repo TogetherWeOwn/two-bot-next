@@ -88,8 +88,9 @@ Browse the [documentation map](docs/README.md) for every guide, contract and evi
   generation fencing, atomic audit and preserved lockdown recovery.
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
-- [Game-activity aggregate report](docs/game-activity-report.md): on-demand
-  read-only per-game play/in-voice/session JSON for one guild.
+- [Game-activity aggregate report](docs/game-activity-report.md): private staff
+  `/game-mix` and read-only per-game play/in-voice/session CLI JSON for one guild;
+  Discord reads remain unavailable in the live guild.
 - [Automod operator guide](docs/automod-operator-guide.md): filter/effect
   semantics, repeat expiry, corpus management, failure signals and triage.
 

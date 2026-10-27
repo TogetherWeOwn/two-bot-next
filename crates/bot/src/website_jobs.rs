@@ -374,6 +374,13 @@ pub async fn serve(
                 } else {
                     parked.push(crate::giveaway_runtime::REFRESH_JOB);
                 }
+                if let Some(job) =
+                    crate::giveaway_runtime::register_draw(context.clone(), &activation)
+                {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::giveaway_runtime::DRAW_JOB);
+                }
                 // The unban sweep shares the boot-composed member consumer:
                 // one guild store across commands and sweep, never a second
                 // same-guild consumer with its own local queues.
@@ -523,7 +530,7 @@ async fn registered_statuses(
     parked: &[&str],
 ) -> Result<jobs::SharedStatus, jobs::UnregisteredJob> {
     // NAMES already carries the DB-only settings poll alongside the
-    // REST-backed domains, so the status map lists all fifteen jobs.
+    // REST-backed domains, so the status map lists all sixteen jobs.
     let mut names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)
@@ -533,6 +540,7 @@ async fn registered_statuses(
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
         .chain([crate::giveaway_runtime::REFRESH_JOB])
+        .chain([crate::giveaway_runtime::DRAW_JOB])
         .chain([crate::lfg_jobs::NAME])
         .chain([crate::retention_jobs::NAME])
         .collect();

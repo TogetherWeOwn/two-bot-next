@@ -23,7 +23,7 @@ fn manifest() -> Value {
 }
 
 fn manifest_names(key: &str) -> Vec<String> {
-    manifest()[key]
+    let mut names: Vec<String> = manifest()[key]
         .as_array()
         .unwrap_or_else(|| panic!("manifest must list {key}"))
         .iter()
@@ -32,7 +32,17 @@ fn manifest_names(key: &str) -> Vec<String> {
                 .unwrap_or_else(|| panic!("manifest {key} entries are command names"))
                 .to_owned()
         })
-        .collect()
+        .collect();
+    // Compiled-only companion: keep the saved publication fixture immutable.
+    // This expectation does not authorize a staging or production publish.
+    assert!(!names.iter().any(|name| name == "lfg-edit"));
+    let after_close = names
+        .iter()
+        .position(|name| name == "lfg-close")
+        .expect("saved manifest retains close")
+        + 1;
+    names.insert(after_close, "lfg-edit".to_owned());
+    names
 }
 
 /// Staging enables every publish gate; the guild id here is a placeholder —
@@ -110,14 +120,31 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 36 all-on builtins minus 11 automation-gated commands, including
-    // command-inspect, command-clone and giveaway. The stored dynamic row stays unpublished:
+    // 44 all-on builtins minus 13 automation-gated commands, including
+    // command-inspect, clone, pause/resume and giveaway; announcements-gated lfg-edit and
+    // feed-inspect still publish, and read-only current-channel discovery
+    // lfg-list stays published. welcome-preview is core-always and survives too.
+    // The stored dynamic row stays unpublished:
     // every such invocation refuses at dispatch while gated off, so publishing
     // would burn the ceiling.
-    assert_eq!(names.len(), 25, "automations-off staging set: {names:?}");
+    assert_eq!(names.len(), 31, "automations-off staging set: {names:?}");
+    assert!(names.contains(&"reopen".to_owned()));
+    assert!(names.contains(&"game-mix".to_owned()));
+    assert!(
+        names.iter().any(|name| name == "lfg-edit"),
+        "lfg-edit is announcements-gated and survives automations-off: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "welcome-preview"),
+        "welcome-preview is core-always and survives automations-off: {names:?}"
+    );
     assert!(
         names.iter().any(|name| name == "lfg-list"),
         "read-only current-channel discovery stays published while automations are off"
+    );
+    assert!(
+        names.iter().any(|name| name == "feed-inspect"),
+        "feed-inspect is announcements-gated and survives automations-off: {names:?}"
     );
     assert!(
         names.iter().any(|name| name == "reopen"),
@@ -133,6 +160,8 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "command-list",
         "command-inspect",
         "command-clone",
+        "command-disable",
+        "command-enable",
         "schedule",
         "schedule-remove",
         "schedule-list",

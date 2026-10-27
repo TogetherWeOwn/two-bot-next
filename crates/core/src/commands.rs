@@ -57,6 +57,13 @@ pub const STICKY_DEBOUNCE_DEFAULT_SECONDS: i64 = 5;
 /// limit. Builders advertise it via `max_length`; `crate::rsvp` refuses
 /// longer IDs before any record operation.
 pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
+/// `/rsvp` + `/rsvp-attendance` `event-id` bound (UTF-16 units, the same
+/// shared bound as occurrences): the event id itself or a pasted
+/// `https://discord.com/events/` link, optionally `<...>`-wrapped. The
+/// longest such link (20-digit guild + 20-digit event) is 68 units, far under
+/// the bound; builders advertise it via `max_length`, and anything longer
+/// refuses as an invalid id before any lookup or write.
+pub const EVENT_REFERENCE_MAX_CHARS: usize = 128;
 /// Maximum user-supplied resource ID or prefix accepted by an admin command.
 pub const MAX_RESOURCE_ID_CHARS: usize = 128;
 
@@ -283,7 +290,9 @@ pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 /// plus the Next-only `/help` discovery surface — legacy has no help command,
 /// see the `help` row in the registry golden exceptions — plus the Next-only
 /// `/privacy` member self-serve for analytics privacy and deletion requests,
-/// plus the Next-only `/reopen` self-service picker recovery).
+/// the Next-only `/reopen` self-service picker recovery,
+/// `/welcome-preview` read-only admin rendering, and
+/// `/game-mix` private staff aggregate read).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -369,6 +378,58 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                     },
                 ]),
         ]),
+        CommandDefinition::new(
+            "welcome-preview",
+            "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+        )
+        .permissions(PERM_MANAGE_GUILD),
+        // Optional browse selectors only: every call stays scoped to the
+        // invoking guild; there is deliberately no guild, member or
+        // live-guild override. The page ceiling mirrors
+        // `game_activity::GAME_MIX_MAX_PAGE` (pinned there for the runtime).
+        CommandDefinition::new(
+            "game-mix",
+            "Show this server's aggregate game activity.",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "page",
+                "Page of saved games to show (10 per page). Default: 1.",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, crate::game_activity::GAME_MIX_MAX_PAGE),
+            CommandOption::new(
+                "sort",
+                "Order games by play time or in-voice time. Default: play.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "Play time".to_owned(),
+                    value: "play".to_owned(),
+                },
+                CommandChoice {
+                    name: "In-voice time".to_owned(),
+                    value: "voice".to_owned(),
+                },
+            ]),
+            CommandOption::new(
+                "format",
+                "Show raw JSON or a readable summary. Default: JSON.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "JSON".to_owned(),
+                    value: "json".to_owned(),
+                },
+                CommandChoice {
+                    name: "Summary".to_owned(),
+                    value: "summary".to_owned(),
+                },
+            ]),
+        ]),
     ]
 }
 
@@ -380,7 +441,8 @@ pub const PRIVACY_DESCRIPTION: &str =
     "Manage your analytics privacy and deletion requests for this server.";
 
 /// Self-service picker-recovery description, shared by the registry fixtures.
-pub const REOPEN_DESCRIPTION: &str = "Reopen your games or session picker in a private menu.";
+pub const REOPEN_DESCRIPTION: &str =
+    "Reopen your games or session picker in a private menu; games includes a no-change preview.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -581,10 +643,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            // 5 core (rank, leaderboard, help, privacy, reopen) plus the
-            // generated builtins; the duplicated slice adds no new names.
-            if builtin_count + 5 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 5)));
+            // 7 core (rank, leaderboard, help, privacy, reopen, welcome-preview,
+            // game-mix) plus generated builtins; duplicates add no new names.
+            if builtin_count + 7 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 7)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -622,6 +684,8 @@ mod tests {
                 "help",
                 "privacy",
                 "reopen",
+                "welcome-preview",
+                "game-mix",
                 "rsvp",
                 "faq"
             ]
@@ -638,8 +702,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 6); // rank, leaderboard, help, privacy, reopen, attendance×1
-        assert_eq!(merged[5].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 8); // seven core plus attendance once
+        assert_eq!(merged[7].description, "Record a verified attendee");
     }
 
     #[test]
@@ -670,14 +734,23 @@ mod tests {
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "reopen", "faq"]
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview",
+                "game-mix",
+                "faq"
+            ]
         );
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        // 5 core + 96 fillers = 101: one past the ceiling.
-        let extra: Vec<CommandDefinition> = (0..96)
+        // 7 core + 94 fillers = 101: one past the ceiling.
+        let extra: Vec<CommandDefinition> = (0..94)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");

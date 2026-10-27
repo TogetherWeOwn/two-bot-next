@@ -10,7 +10,7 @@ Fail-closed rules, each pinned by scripts/test_staging_rollback_drill.py:
 - The rollback is one Cloudflare deployment POST that never sends `force`, so a
   target whose secrets changed since it was deployed is refused instead of
   being auto-confirmed (Wrangler's non-interactive prompt answers yes).
-- `code_update_strategy` is `immediate`. Wrangler 4.151's default is `deferred`
+- `code_update_strategy` is `immediate`. Wrangler 4.152's default is `deferred`
   with a 300 s maximum delay, which would keep the old Durable Object code
   running for up to five minutes and make any time-to-ready figure meaningless.
 - A 401/403 from ownership control or Cloudflare stops the run. The restore leg

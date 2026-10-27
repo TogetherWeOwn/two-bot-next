@@ -23,6 +23,8 @@ mod drop_poison_test_serial;
 pub mod executor;
 mod executor_metrics;
 pub mod funnel_invites;
+#[cfg(feature = "db")]
+pub mod giveaway;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{
@@ -70,9 +72,10 @@ pub use leveling_runtime::{
 pub use adapter::event_to_core;
 pub use executor::{
     is_definitive_rejection, lockdown_masks, pace_delay_ms, paced_step, throw_for_status,
-    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall,
-    DiscordError, EveryoneOverwrite, PacedStep, RawResponse, RewardRoleReport, KICK_INTERVAL_MS,
-    MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS, MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
+    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome,
+    CloseRefreshEdit, DiscordCall, DiscordError, EveryoneOverwrite, PacedStep, RawResponse,
+    RewardRoleReport, KICK_INTERVAL_MS, MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS,
+    MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{

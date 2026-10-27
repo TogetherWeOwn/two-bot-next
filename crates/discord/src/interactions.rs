@@ -264,6 +264,79 @@ fn decode_lfg_preview(
     }
 }
 
+/// Decode the entire edit before executing either mode. Unknown/duplicate fields
+/// cannot silently turn a malformed capacity request into a metadata mutation.
+#[cfg(feature = "db")]
+fn decode_lfg_edit(
+    options: &[twilight_model::application::interaction::application_command::CommandDataOption],
+) -> Result<crate::lfg_interactions::LfgRequest, crate::lfg_interactions::LfgError> {
+    use crate::lfg_interactions::{LfgError, LfgRequest};
+    use twilight_model::application::interaction::application_command::CommandOptionValue;
+    let mut seen = std::collections::HashSet::new();
+    for option in options {
+        if !matches!(
+            option.name.as_str(),
+            "id" | "title" | "starts-at" | "role" | "seats"
+        ) {
+            return Err(LfgError::Invalid("Invalid LFG edit option.".into()));
+        }
+        if !seen.insert(option.name.as_str()) {
+            return Err(LfgError::Invalid("Duplicate LFG edit option.".into()));
+        }
+    }
+    let text = |name: &str| -> Result<Option<String>, LfgError> {
+        match options.iter().find(|option| option.name == name) {
+            None => Ok(None),
+            Some(option) => match &option.value {
+                CommandOptionValue::String(value) => Ok(Some(value.clone())),
+                _ => Err(LfgError::Invalid(format!("{name} must be text."))),
+            },
+        }
+    };
+    let post_id = text("id")?.ok_or_else(|| LfgError::Invalid("Missing id option.".into()))?;
+    let title = text("title")?;
+    let starts_at = text("starts-at")?;
+    let role = text("role")?;
+    let seats = options.iter().find(|option| option.name == "seats");
+    match (role, seats) {
+        (None, None) => Ok(LfgRequest::Edit {
+            post_id,
+            title,
+            starts_at,
+        }),
+        (Some(role_key), Some(seats)) => {
+            let CommandOptionValue::Integer(seats) = &seats.value else {
+                return Err(LfgError::Invalid(
+                    "Seats must be an integer from 1-99.".into(),
+                ));
+            };
+            if !(1..=i64::from(two_bot_core::lfg::MAX_ROLE_SLOTS)).contains(seats) {
+                return Err(LfgError::Invalid(
+                    "Seats must be an integer from 1-99.".into(),
+                ));
+            }
+            if !two_bot_core::lfg::valid_role_key(&role_key) {
+                return Err(LfgError::Invalid(
+                    "Use an existing signup role key, not its label.".into(),
+                ));
+            }
+            if title.is_some() || starts_at.is_some() {
+                return Err(LfgError::Invalid(
+                    "Edit role/seats separately from title or starts-at.".into(),
+                ));
+            }
+            Ok(LfgRequest::EditSeats {
+                post_id,
+                role_key,
+                seats: *seats as u8,
+            })
+        }
+        _ => Err(LfgError::Invalid(
+            "Provide role and seats together to increase capacity.".into(),
+        )),
+    }
+}
+
 #[must_use]
 pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse> {
     match outcome {
@@ -277,9 +350,10 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
 }
 
 /// Shared execution runtime: route once, acknowledge promptly, then run the
-/// registered feature (RSVP/attendance totals and host check-in, LFG, and the
-/// other wired slices) through the shared REST executor. Unsupported features
-/// remain owned by their integration slices, not by a second dispatcher.
+/// registered feature (RSVP/attendance totals and host check-in, LFG,
+/// giveaways, and the other wired slices) through the shared REST executor.
+/// Unsupported features remain owned by their integration slices, not by a
+/// second dispatcher.
 #[cfg(feature = "db")]
 #[derive(Debug)]
 pub struct InteractionRuntime {
@@ -292,6 +366,7 @@ pub struct InteractionRuntime {
     pub classifier: two_bot_core::ClassifierConfig,
     classifier_provider: Option<std::sync::Arc<dyn crate::rsvp::ClassifierProvider>>,
     lfg: crate::lfg_interactions::LfgInteractions,
+    giveaway: crate::giveaway::GiveawayRuntime,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
 }
@@ -323,6 +398,7 @@ impl InteractionRuntime {
                 outcome: SlashOutcome::Handled {
                     handler: two_bot_core::HandlerId::Lfg
                         | two_bot_core::HandlerId::LfgClose
+                        | two_bot_core::HandlerId::LfgEdit
                         | two_bot_core::HandlerId::LfgList,
                 },
                 ..
@@ -334,6 +410,22 @@ impl InteractionRuntime {
             }
         ) {
             return self.handle_routed(interaction, routed).await;
+        }
+        if matches!(
+            &routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: two_bot_core::HandlerId::Giveaway,
+                },
+                ..
+            } | RoutedInteraction::Component {
+                outcome: two_bot_core::ComponentOutcome::Handled {
+                    handler: two_bot_core::ComponentHandler::GiveawayEntry,
+                },
+                ..
+            }
+        ) {
+            return self.handle_giveaway(interaction, routed).await;
         }
         // A refusal for a non-RSVP command (LFG permission or feature gates)
         // must still be answered. The RSVP path ignores those names, so it
@@ -357,6 +449,54 @@ impl InteractionRuntime {
             interaction,
         )
         .await
+    }
+
+    /// Run one routed giveaway interaction: defer ephemerally, then execute
+    /// the slash command or the entry button through the shared giveaway
+    /// runtime. A failed defer owns the interaction without running, exactly
+    /// like the bot dispatch path.
+    async fn handle_giveaway(
+        &self,
+        interaction: &Interaction,
+        routed: RoutedInteraction,
+    ) -> Result<bool, crate::DiscordError> {
+        if self
+            .executor
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &deferred_response(true),
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!(interaction_id = %interaction.id, "giveaway defer failed; details withheld");
+            return Ok(true);
+        }
+        match routed {
+            RoutedInteraction::Slash { .. } => self.giveaway.command(interaction).await,
+            RoutedInteraction::Component { custom_id, .. } => {
+                self.giveaway.enter(interaction, &custom_id).await;
+            }
+            RoutedInteraction::Modal { .. } | RoutedInteraction::Ignore => {}
+        }
+        Ok(true)
+    }
+
+    /// One giveaway due-scan tick over the configured guild: draw what is due
+    /// and re-announce what is drawn but unannounced. No configured guild
+    /// means no work. Inherent and zero-argument by contract: the timed-draw
+    /// acceptance calls this unqualified, shadowing its baseline adapter.
+    pub async fn tick_giveaways(
+        &self,
+    ) -> Result<crate::giveaway::GiveawayTickSummary, crate::giveaway::GiveawayJobError> {
+        let Some(guild) = self.router.gates().configured_guild else {
+            return Ok(crate::giveaway::GiveawayTickSummary {
+                drawn: 0,
+                announced: 0,
+            });
+        };
+        self.giveaway.tick(&guild.to_string()).await
     }
 
     /// True when this interaction can reach RSVP admission: the same
@@ -482,14 +622,16 @@ impl InteractionRuntime {
         }
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgEdit)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgList)));
         Self {
             router: std::sync::Arc::new(router),
             pool: pool.clone(),
-            executor,
+            executor: executor.clone(),
             classifier,
             classifier_provider: None,
-            lfg: crate::lfg_interactions::LfgInteractions::new(pool),
+            lfg: crate::lfg_interactions::LfgInteractions::new(pool.clone()),
+            giveaway: crate::giveaway::GiveawayRuntime::new(pool.clone(), executor.clone()),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
         }
@@ -650,7 +792,7 @@ impl InteractionRuntime {
             RoutedInteraction::Slash {
                 outcome:
                     SlashOutcome::Handled {
-                        handler: HandlerId::Lfg | HandlerId::LfgClose,
+                        handler: HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit,
                     },
                 ..
             } => {
@@ -697,6 +839,8 @@ impl InteractionRuntime {
                             }
                         })
                     })
+                } else if data.name == "lfg-edit" {
+                    decode_lfg_edit(&data.options)
                 } else {
                     option("id").map(|post_id| LfgRequest::Close { post_id })
                 }
@@ -778,6 +922,7 @@ impl InteractionRuntime {
                 &deferred,
             )
             .await?;
+        let seat_edit_request = matches!(&request, Ok(LfgRequest::EditSeats { .. }));
         let result = match request {
             Ok(request) => {
                 // Only create/nonce recovery needs the bot identity. Signup
@@ -809,6 +954,18 @@ impl InteractionRuntime {
             )) => quota.to_string(),
             Err(LfgError::Uncertain) => {
                 "LFG post acceptance is uncertain; saved state retained for nonce recovery.".into()
+            }
+            // A seat increase rolls back its own transaction on storage
+            // failure, but a later lock-release failure can surface after the
+            // increase committed. Refuse without success language and without
+            // claiming either outcome; the generic copy mentions saved state
+            // and would mislead when nothing was saved.
+            Err(LfgError::Database(_)) if seat_edit_request => {
+                tracing::warn!(
+                    interaction_id = interaction.id.get().to_string(),
+                    "LFG seat increase failed; details withheld"
+                );
+                "LFG seat increase failed; check the current capacity before retrying.".into()
             }
             Err(_) => {
                 tracing::warn!(
@@ -1116,7 +1273,12 @@ mod help_response_tests {
                 .as_str()
                 .expect("embed description");
             assert_eq!(description, text, "no truncation at the REST boundary");
-            let tokens: Vec<_> = description
+            // The RSVP note carries a copyable event-link example whose
+            // slashes tokenize as path fragments, not commands; exclude it
+            // from the exact-once command count.
+            let without_example =
+                description.replace("https://discord.com/events/<server-id>/<event-id>", "");
+            let tokens: Vec<_> = without_example
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
                 .filter(|token| token.starts_with('/') && token.len() > 1)
                 .collect();
