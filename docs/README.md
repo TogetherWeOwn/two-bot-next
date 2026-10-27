@@ -1,6 +1,7 @@
 # Documentation map
 
-Rows: `- [Purpose](relative.md)`. Check: `python3 scripts/check_docs_index.py --json` (exit 0 = pass).
+Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
+Empty `{missing,stale,oversize}` = 0; else 1.
 Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References
@@ -38,9 +39,9 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Event catalog](observability-event-catalog.md)
 - [Pool gauge](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
-- [Keepalive-gap](keepalive-gap-detector.md)
+- [Keepalive](keepalive-gap-detector.md)
 - [Gateway alerts](worker-gateway-failure-alerts.md)
-- [EventSub](eventsub-subscription-health-queries.md)
+- [Sub health](eventsub-subscription-health-queries.md)
 - [Oct 1 tabletop](incident-tabletop-2026-10-01.md)
 - [Oct 6 tabletop](incident-tabletop-2026-10-06.md)
 - [Incident](production-incident-2026-10-15-postmortem.md)
@@ -65,12 +66,12 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Action signing v2](internal-action-signing-v2.md)
 - [Action persistence](internal-action-store.md)
 - [Action ingress](internal-actions-receiver.md)
-- [Announce exec](internal-action-executor.md)
+- [Announcement executor](internal-action-executor.md)
 - [Settings actions](internal-action-settings.md)
 - [Channel executor](internal-channel-moderation.md)
 - [Event executors](internal-event-executors.md)
 - [Member executors](internal-member-execution.md)
-- [Mod executor](internal-member-moderation.md)
+- [Moderation executor](internal-member-moderation.md)
 
 ## Commands, moderation and community
 
@@ -88,7 +89,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution PII](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
-- [Lockdown](time-boxed-lockdown-decision.md)
+- [Timed lockdown](time-boxed-lockdown-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
@@ -104,7 +105,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Self-role storage](self-roles.md)
 - [Self-role panels](dashboard-self-roles-spec.md)
 - [Onboarding](dashboard-onboarding-self-roles-spec.md)
-- [Settings parser](internal-settings-acceptance.md)
+- [Settings tests](internal-settings-acceptance.md)
 - [Settings refresh](settings-catalog-acceptance.md)
 - [Live keys](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
@@ -123,14 +124,15 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Reuse](lfg-reuse-spec.md)
 - [Threads](lfg-thread-spec.md)
 - [LFG voice](lfg-voice-room-spec.md)
+- [LFG page (design only)](dashboard-lfg-config-spec.md)
 - [Signup reminder](lfg-reminder-spec.md)
 - [Play-now](lfg-play-now-spec.md)
-- [Feed operations](feed-supervisor.md)
+- [Feed ops](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
 - [Private sample](feed-preview-spec.md)
 - [Title filter](feed-title-filter-spec.md)
 - [Relay move](feed-move-spec.md)
-- [EventSub operations](eventsub-runbook.md)
+- [EventSub ops](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
 - [Game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
@@ -176,7 +178,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Access corpus](voice-access-golden.md)
 - [Vote-kick](voice-vote-kick-core.md)
 - [Vote tests](voice-vote-cooldown-acceptance.md)
-- [Vote checklist](voice-vote-kick-cooldown-checklist.md)
+- [Vote cooldown](voice-vote-kick-cooldown-checklist.md)
 - [Template composition](voice-template-core.md)
 - [Template styling](voice-style-core.md)
 - [Template conditions](voice-conditions-core.md)
@@ -190,10 +192,9 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Defaults](voice-creator-defaults-acceptance.md)
-- [Copy proposal](voice-creator-copy-spec.md)
 - [Permission overrides](voice-permissions-core.md)
-- [Perm health](voice-permission-health-core.md)
-- [Placement/numbering](voice-placement-core.md)
+- [Permission health](voice-permission-health-core.md)
+- [Placement](voice-placement-core.md)
 - [Companion text](voice-text-channel-core.md)
 - [Companion lifecycle](voice-companion-lifecycle.md)
 - [Join lifecycle](voice-join-request-lifecycle.md)
@@ -213,10 +214,11 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Staging synthetic](voice-synthetic.md)
 - [Alert drill](voice-lifecycle-alert-drill.md)
 - [Cutover rehearsal](voice-cutover-rehearsal.md)
-- [Triggers](voice-cutover-rollback-triggers.md)
+- [Rollbacks](voice-cutover-rollback-triggers.md)
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
-- [Readback](voice-t5-freeze-readback-receipt.md)
-- [Pub diff](voice/publish-diff-record-template.md)
+- [Copy proposal](voice-creator-copy-spec.md)
+- [Freeze](voice-t5-freeze-readback-receipt.md)
+- [Publish diff](voice/publish-diff-record-template.md)
 - [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
@@ -237,10 +239,10 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Smoke replies](smoke-expected-responses.md)
 - [Smoke record](smoke-run-record.md)
 - [Smoke inventory](smoke-surface-inventory.md)
-- [T0 smoke](t0-acceptance-smoke-contract.md)
+- [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
 - [Binary lifecycle tests](alive-acceptance.md)
-- [Probe tests](presence-probe-acceptance.md)
+- [Presence tests](presence-probe-acceptance.md)
 - [REST pacing tests](pacing-backoff-acceptance.md)
 - [Retention](testing/retention-runtime.md)
 
