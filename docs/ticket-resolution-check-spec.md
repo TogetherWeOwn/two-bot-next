@@ -61,7 +61,7 @@ One marker per ticket incarnation, monotonic, never a queue:
 | Marker | Meaning | Next |
 | --- | --- | --- |
 | `none / 0` | no check | `asked / 1` |
-| `asked / 1` | a named staff member asked; no answer | `resolved / 2` or `needs_help / 2` |
+| `asked / 1` | a staff member asked; no answer | `resolved / 2` or `needs_help / 2` |
 | `resolved / 2`, `needs_help / 2` | opener's single answer, final for this check | none |
 
 Expiry is a **derived display** (`asked` older than a fixed 48 h, injected
@@ -76,7 +76,7 @@ close, inside a five-second metadata proof (no Discord I/O inside the lock):
   `ticket_id` is a runtime-generated incarnation ID; callers cannot supply or
   reuse it, and a recreated channel is a new ticket with marker `none`.
 - Ask: actor is current staff (existing predicate) with fresh channel access and
-  the ticket is `open`. The asker's ID is not stored; only `asked_at`.
+  the ticket is `open`. The asker's ID is not stored; the ask writes only the marker and `asked_at`.
 - Answer: actor equals the current opener, with fresh ViewChannel + SendMessages.
   Staff, collaborators and administrators cannot answer for them.
 - `creating`, `closing`, `cleanup_pending` and `closed` refuse as unavailable
@@ -86,7 +86,8 @@ close, inside a five-second metadata proof (no Discord I/O inside the lock):
   Close. The custom ID carries only an opaque ticket ID and revision.
 - Restart reloads the committed marker; a lost reply leaves state intact; lost
   commit acknowledgement reads as unknown, never as success.
-- Retention: the marker and two timestamps are personal data on the parent row,
+- Retention: the marker and two timestamps (`asked_at`, written by the ask, and
+  `answered_at`, written by the answer) are personal data on the parent row,
   removed by member erasure. Transcript purge does not remove parent rows
   (`crates/cutover/src/tickets.rs:338-372`), so no 90-day ceiling is claimable
   for them. That open lifetime gap is a further reason for A, and not a license
@@ -106,10 +107,10 @@ Private replies are plain text, at most 300 characters, mentions disabled.
 | `unavailable / context_unavailable / contact_staff` | "This check is unavailable here. Ask staff if you need help." |
 
 ```json
-{"schema":"tickets.resolution_check.v1","mode":"diagnostic","guild_id":"g1","ticket_generation":"0123456789abcdef0123456789abcdef","revision":"2","outcome":"saved","reason":"needs_help","retryable":false,"next_action":"await_staff_reply"}
+{"schema":"tickets.resolution_check.v1","mode":"diagnostic","guild_id":"g1","ticket_id":"0123456789abcdef0123456789abcdef","revision":2,"outcome":"saved","reason":"needs_help","retryable":false,"next_action":"await_staff_reply"}
 ```
 
-IDs and revision are strings; generation and revision are null for
+IDs are strings and revision is an integer; `ticket_id` and `revision` are null for
 unavailable or foreign context. The sample has no actor, opener, channel or
 content field and is a handoff shape, not authority.
 
