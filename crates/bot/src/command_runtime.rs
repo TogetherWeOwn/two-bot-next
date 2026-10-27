@@ -70,14 +70,15 @@ use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
-        feed_already_paused_text, feed_already_resumed_text, feed_list_page,
+        feed_already_paused_text, feed_already_resumed_text, feed_existing_text, feed_list_page,
         feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
         feed_pending_evidence_refusal_text, feed_removed_text, feed_resumed_text, plan_command,
         FeedCommand, FeedCommandContext, FeedCommandPlan, FeedKind, FeedPendingEvidenceOperation,
     },
     feeds_store::{
         add_feed, list_feeds, pause_feed_with_evidence, remove_feed_with_evidence, resume_feed,
-        write_audit, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence, FeedResumeOutcome,
+        write_audit, FeedAddOutcome, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence,
+        FeedResumeOutcome,
     },
     funnel::now_millis_for_test,
     help::{canonical_help_selector, unknown_help_correction},
@@ -2141,8 +2142,10 @@ impl CommandRuntime {
     /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
     /// audit → ephemeral confirmation. The relay id is generated here (legacy
     /// `randomUUID()`); plan errors reply with the domain text and write
-    /// neither a row nor an audit (legacy parity). A store failure audits one
-    /// `feed.create`/`rejected` refusal row, then replies safe. The relay
+    /// neither a row nor an audit (legacy parity). An exact saved tuple replies
+    /// with its original id/state, without a write or creation/rejection audit.
+    /// A store failure audits one `feed.create`/`rejected` refusal row, then
+    /// replies safe. The relay
     /// binds to the invoking channel. Malformed options refuse before any
     /// store read or audit via [`feed_add_options_strict`].
     async fn feed_add(&self, interaction: &Interaction) {
@@ -2172,24 +2175,28 @@ impl CommandRuntime {
             source,
         };
         match plan_command(&context, command) {
-            Ok(FeedCommandPlan::Add(relay)) => {
-                if let Err(err) = add_feed(&self.pool, &relay).await {
-                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
-                        self.finish(interaction, quota.to_string()).await;
-                    } else {
-                        let class = feed_store_class(&err);
-                        warn!(reason = class, "feed insert failed");
-                        self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
-                            .await;
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
-                    }
-                    return;
+            Ok(FeedCommandPlan::Add(relay)) => match add_feed(&self.pool, &relay).await {
+                Ok(FeedAddOutcome::Created) => {
+                    self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
+                        .await;
+                    self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
+                        .await;
                 }
-                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
-                    .await;
-                self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
-                    .await;
-            }
+                Ok(FeedAddOutcome::Existing { id, enabled }) => {
+                    self.finish(interaction, feed_existing_text(&id, enabled))
+                        .await;
+                }
+                Err(two_bot_core::feeds_store::FeedStoreError::Capacity(quota)) => {
+                    self.finish(interaction, quota.to_string()).await;
+                }
+                Err(err) => {
+                    let class = feed_store_class(&err);
+                    warn!(reason = class, "feed insert failed");
+                    self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
+                        .await;
+                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                }
+            },
             // `FeedCommand::Add` can only plan to `Add`; the other arms are
             // unreachable, not silently wrong.
             Ok(plan) => {

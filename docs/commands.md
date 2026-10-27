@@ -34,6 +34,18 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
+## Saved feed relays
+
+Repeating `/feed-add` for the same channel, kind and normalized source privately
+returns the original relay ID and its observed enabled/paused state. It creates
+and changes nothing, fetches nothing, and never resumes a paused relay. Use the
+copyable `/feed-inspect id:<id>` and `/feed-pause id:<id>` (enabled) or
+`/feed-resume id:<id>` (paused) guidance in the reply; do not delete/re-add.
+A YouTube channel ID and its canonical videos feed URL identify the same source.
+Previously distinct RSS URLs stay distinct; another channel is a separate relay.
+The 25-relay guild cap still refuses first, including paused relays and repeated
+adds at capacity. Genuine storage failures retain the fixed failure reply.
+
 Built-in commands: 65.
 
 ## `/access`
