@@ -1079,22 +1079,53 @@ fn community_jobs_doc_documents_this_offline_verification() {
     );
 }
 
-// Lines a Markdown renderer shows as text: fenced code blocks (``` or ~~~)
-// are examples, not index rows, so a link inside one is not discoverable.
+// A CommonMark fence line: up to three spaces of indent, then a run of three
+// or more backticks or tildes. Returns (marker, run length, remainder).
+fn fence_marker(line: &str) -> Option<(char, usize, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let marker = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let run = rest.chars().take_while(|c| *c == marker).count();
+    (run >= 3).then(|| (marker, run, &rest[run..]))
+}
+
+// Lines a Markdown renderer shows as text. Fenced code blocks (``` or ~~~)
+// and HTML comment blocks are not index rows, so a link inside one is not
+// discoverable. A fence closes only on the same marker at least as long as
+// its opener with nothing but whitespace after it; a backtick opener may not
+// carry a backtick in its info string.
 fn rendered_lines(text: &str) -> Vec<&str> {
-    let mut fence: Option<char> = None;
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_comment = false;
     let mut rendered = Vec::new();
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        let marker = ['`', '~']
-            .into_iter()
-            .find(|c| trimmed.starts_with(&c.to_string().repeat(3)));
-        match (fence, marker) {
-            (None, Some(c)) => fence = Some(c),
-            (Some(open), Some(c)) if open == c => fence = None,
-            (None, None) => rendered.push(line),
-            _ => {}
+        if let Some((open, len)) = fence {
+            if fence_marker(line)
+                .is_some_and(|(c, run, rest)| c == open && run >= len && rest.trim().is_empty())
+            {
+                fence = None;
+            }
+            continue;
         }
+        if in_comment {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if let Some((c, run, rest)) = fence_marker(line) {
+            if c == '~' || !rest.contains('`') {
+                fence = Some((c, run));
+                continue;
+            }
+        }
+        let body = line.trim_start_matches(' ');
+        if line.len() - body.len() <= 3 && body.starts_with("<!--") {
+            in_comment = !body[4..].contains("-->");
+            continue;
+        }
+        rendered.push(line);
     }
     rendered
 }
@@ -1117,7 +1148,7 @@ fn community_jobs_is_indexed(read: impl Fn(&str) -> Option<String>) -> bool {
     if has_guide_row(&index) {
         return true;
     }
-    let fragment_row = regex::Regex::new(r"^- \[([^\]\n]+)\]\((index-[A-Za-z0-9_-]+\.md)\)$")
+    let fragment_row = regex::Regex::new(r"^- \[([^\]\n]+)\]\((index-[A-Za-z0-9_.-]+\.md)\)$")
         .expect("index fragment row pattern");
     rendered_lines(&index).into_iter().any(|line| {
         fragment_row.captures(line).is_some_and(|row| {
@@ -1256,12 +1287,89 @@ fn control_docs_index_rejects_rows_inside_fenced_code_blocks() {
         ]),
         "fenced fragment guide row must not count"
     );
+    // Fence closing follows CommonMark: a shorter run, a different marker or an
+    // info string does not close; a longer run does.
+    let guide = "- [Community jobs](community-jobs.md)";
+    for readme in [
+        format!("````\n```\n{guide}\n````\n"),
+        format!("```\n```md\n{guide}\n```\n"),
+        format!("~~~~\n~~~\n{guide}\n~~~~\n"),
+        format!("~~~\n~~~md\n{guide}\n~~~\n"),
+        format!("```\n~~~\n{guide}\n~~~\n"),
+        format!("```md\n{guide}\n"),
+    ] {
+        assert!(
+            !community_jobs_fixture_is_indexed(&[
+                ("docs/README.md", &readme),
+                ("docs/community-jobs.md", "# Community jobs\n"),
+            ]),
+            "row still inside an unclosed fence must not count: {readme}"
+        );
+    }
+    for readme in [
+        format!("```\nexample\n````\n{guide}\n"),
+        format!("```\nexample\n```   \n{guide}\n"),
+        format!("   ```\nexample\n   ```\n{guide}\n"),
+        // Four spaces of indent is an indented code line, not a fence.
+        format!("    ```\n\n{guide}\n"),
+    ] {
+        assert!(
+            community_jobs_fixture_is_indexed(&[
+                ("docs/README.md", &readme),
+                ("docs/community-jobs.md", "# Community jobs\n"),
+            ]),
+            "row after a properly closed fence is rendered: {readme}"
+        );
+    }
     // A row after a closed fence is rendered again.
     assert!(community_jobs_fixture_is_indexed(&[
         (
             "docs/README.md",
             "```\nexample\n```\n- [Community jobs](community-jobs.md)\n",
         ),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
+fn control_docs_index_rejects_rows_inside_html_comments() {
+    let guide = "- [Community jobs](community-jobs.md)";
+    let fragment_row = "- [Community](index-community.md)";
+    let fragment = format!("{guide}\n");
+    let hidden = |row: &str| format!("<!--\n{row}\n-->\n");
+    assert!(!community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", &hidden(guide)),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+    assert!(!community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", &hidden(fragment_row)),
+        ("docs/index-community.md", &fragment),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+    assert!(!community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", &format!("{fragment_row}\n")),
+        ("docs/index-community.md", &hidden(guide)),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+    // A comment opened on the same line as other text still hides what follows.
+    assert!(!community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", &format!("<!-- hidden\n\n{guide}\n-->\n"),),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+    // Rows after a closed comment (single- or multi-line) are rendered again.
+    for readme in [
+        format!("<!-- note -->\n{guide}\n"),
+        format!("<!--\nnote\n-->\n{guide}\n"),
+    ] {
+        assert!(community_jobs_fixture_is_indexed(&[
+            ("docs/README.md", &readme),
+            ("docs/community-jobs.md", "# Community jobs\n"),
+        ]));
+    }
+    // A dotted flat fragment name is a valid link target.
+    assert!(community_jobs_fixture_is_indexed(&[
+        ("docs/README.md", "- [Community](index-community.v2.md)\n"),
+        ("docs/index-community.v2.md", &fragment),
         ("docs/community-jobs.md", "# Community jobs\n"),
     ]));
 }
