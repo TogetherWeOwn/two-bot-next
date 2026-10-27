@@ -20,7 +20,33 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+## Private command help
+
+Use `/help` for the grouped index of this server's last confirmed publication.
+Use `/help command:rank` for a command's description, usage and optional member
+argument; `/help command:privacy` explains its subcommands and required inputs.
+The optional `command` selector trims surrounding whitespace, accepts one
+leading slash and compares ASCII case-insensitively. It does not expand aliases
+or name prefixes. Unknown or unpublished names return a correction to `/help`,
+never unpublished definitions. Custom commands appear only after publication
+is confirmed; failed or in-flight changes do not replace the confirmed help.
+Help is ephemeral and does not execute the selected command. The command picker
+hides gated commands you cannot use; help explains published requirements but
+does not evaluate every effective Discord permission or guarantee authorization.
+
+## Saved feed relays
+
+Repeating `/feed-add` for the same channel, kind and normalized source privately
+returns the original relay ID and its observed enabled/paused state. It creates
+and changes nothing, fetches nothing, and never resumes a paused relay. Use the
+copyable `/feed-inspect id:<id>` and `/feed-pause id:<id>` (enabled) or
+`/feed-resume id:<id>` (paused) guidance in the reply; do not delete/re-add.
+A YouTube channel ID and its canonical videos feed URL identify the same source.
+Previously distinct RSS URLs stay distinct; another channel is a separate relay.
+The 25-relay guild cap still refuses first, including paused relays and repeated
+adds at capacity. Genuine storage failures retain the fixed failure reply.
+
+Built-in commands: 64.
 
 ## `/access`
 
@@ -32,6 +58,7 @@ Set who can create voice rooms and use room commands
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `show` | subcommand | false | — | — | — | — | Show the current voice-room access settings |
+| `show page` | integer | false | 1 | — | — | — | Page of access settings to show (starts at 1) |
 | `creation` | subcommand | false | — | — | — | — | Turn temporary room creation on or off |
 | `creation enabled` | boolean | true | — | — | — | — | On allows new rooms, off stops them (existing rooms keep working) |
 | `role` | subcommand | false | — | — | — | — | Set or clear the role required to use room commands |
@@ -54,7 +81,7 @@ Start new rooms from one creator as private
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Start new rooms private (default on) |
+| `enabled` | boolean | false | — | — | — | — | Start new rooms private (required: choose on or off) |
 
 ## `/attendance`
 
@@ -65,7 +92,7 @@ Check in a verified human attendee for a scheduled event (scorecard)
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly |
+| `event-occurrence` | string | true | — | — | 128 | — | Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
@@ -80,6 +107,15 @@ Ban a member
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
+## `/channel-inspect`
+
+Privately inspect saved lockdown and live slowmode
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+No options.
+
 ## `/command`
 
 Define or replace a custom command
@@ -93,6 +129,42 @@ Define or replace a custom command
 | `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
 | `description` | string | false | — | — | 100 | — | Shown in the command picker |
 | `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
+
+## `/command-disable`
+
+Pause a saved custom command without deleting it
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+
+## `/command-enable`
+
+Resume a saved custom command
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+
+## `/command-inspect`
+
+Inspect a saved command or privately preview an unsaved draft
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | false | — | — | 32 | — | Saved command name, a-z 0-9 _ - (choose name or draft) |
+| `view` | string | false | — | — | — | Summary = `"summary"`; Saved template = `"template"`; Preview = `"preview"` | Private view (saved: summary by default; draft: preview only) |
+| `arguments` | string | false | — | — | 500 | — | Sample invocation arguments (ignored by current templates) |
+| `draft` | string | false | — | — | 2000 | — | Proposed template to preview without saving (choose name or draft) |
 
 ## `/command-list`
 
@@ -160,6 +232,17 @@ Relay an RSS, YouTube, or Twitch feed into this channel
 | `kind` | string | true | — | — | — | RSS = `"rss"`; YouTube = `"youtube"`; Twitch = `"twitch"` | Feed kind |
 | `source` | string | true | — | — | 2048 | — | HTTPS URL or YouTube channel id |
 
+## `/feed-inspect`
+
+Show a saved feed relay's source and last attempt
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
+
 ## `/feed-list`
 
 List this server's feed relays
@@ -170,6 +253,17 @@ List this server's feed relays
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `page` | integer | false | 1 | — | — | — | Page of the feed relay list (1-based) |
+
+## `/feed-pause`
+
+Pause a feed relay without deleting its history
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
 
 ## `/feed-remove`
 
@@ -182,17 +276,75 @@ Remove a feed relay
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | Feed id |
 
+## `/feed-resume`
+
+Resume a paused feed relay
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
+
+## `/game-mix`
+
+Show this server's aggregate game activity.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | 10000 | — | — | Page of saved games to show (10 per page). Default: 1. |
+| `sort` | string | false | — | — | — | Play time = `"play"`; In-voice time = `"voice"` | Order games by play time or in-voice time. Default: play. |
+| `format` | string | false | — | — | — | JSON = `"json"`; Summary = `"summary"` | Show raw JSON or a readable summary. Default: JSON. |
+
+## `/giveaway`
+
+Create, draw, reroll or cancel a giveaway
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `create` | subcommand | false | — | — | — | — | Create a giveaway in this channel |
+| `create prize` | string | true | — | — | 200 | — | Prize text (up to 200 characters) |
+| `create duration` | integer | true | 1 | 43200 | — | — | Entry window in minutes (1–43200) |
+| `create winners` | integer | true | 1 | 100 | — | — | Number of winners |
+| `create required-role` | role | false | — | — | — | — | Role every entrant must hold |
+| `create min-account-age-days` | integer | false | 0 | 3650 | — | — | Minimum account age in days |
+| `create min-server-age-days` | integer | false | 0 | 3650 | — | — | Minimum time in this server in days |
+| `list` | subcommand | false | — | — | — | — | List open giveaways |
+| `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
+| `cancel id` | string | true | — | — | 64 | — | Giveaway id |
+| `end` | subcommand | false | — | — | — | — | Draw now, before the deadline |
+| `end id` | string | true | — | — | 64 | — | Giveaway id |
+| `pause` | subcommand | false | — | — | — | — | Pause entry without drawing |
+| `pause id` | string | true | — | — | 64 | — | Giveaway id |
+| `resume` | subcommand | false | — | — | — | — | Resume a paused giveaway |
+| `resume id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend` | subcommand | false | — | — | — | — | Add minutes to the deadline |
+| `extend id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend duration-minutes` | integer | true | 1 | 43200 | — | — | Minutes to add (1–43200) |
+| `reroll` | subcommand | false | — | — | — | — | Redraw the winners |
+| `reroll id` | string | true | — | — | 64 | — | Giveaway id |
+| `reroll user` | user | false | — | — | — | — | Replace only this winner |
+| `inspect` | subcommand | false | — | — | — | — | Privately inspect saved giveaway details in this channel |
+| `inspect id` | string | true | — | — | 64 | — | Giveaway id |
+
 ## `/group`
 
-Toggle shared numbering per category for one creator channel
+Toggle shared numbering per category for one creator channel; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (default on) |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
+| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (leave empty to show current settings) |
 
 ## `/help`
 
@@ -201,7 +353,9 @@ Show this server's live commands, grouped by who can use them.
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `command` | string | false | — | — | 32 | — | Command name (case-insensitive; optional leading /) |
 
 ## `/import`
 
@@ -269,6 +423,7 @@ Post a raid/LFG signup with role slots
 | `title` | string | true | — | — | 100 | — | Event or group title |
 | `starts-at` | string | true | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
 | `roles` | string | true | — | — | 2339 | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
+| `preview` | boolean | false | — | — | — | — | Privately preview without posting |
 
 ## `/lfg-close`
 
@@ -280,6 +435,32 @@ Close a raid/LFG signup
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+
+## `/lfg-edit`
+
+Update LFG metadata or increase one role's seats
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+| `title` | string | false | — | — | 100 | — | Event or group title |
+| `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
+| `role` | string | false | — | — | 32 | — | Existing signup role key (use with seats) |
+| `seats` | integer | false | 1 | 99 | — | — | Absolute seat target, increase only (1-99; use with role) |
+
+## `/lfg-list`
+
+List open game posts in this channel
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cursor` | string | false | — | — | 512 | — | Continue a current-channel list |
 
 ## `/limit`
 
@@ -340,14 +521,14 @@ No options.
 
 ## `/position`
 
-Set where new rooms appear and the first room number
+Set where new rooms appear and the first room number; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
 | `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
 | `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
 
@@ -399,6 +580,17 @@ Delete recent messages
 | `count` | integer | true | 1 | 100 | — | — | Messages to delete (1-100) |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
+## `/purge-preview`
+
+Privately preview a purge without deleting messages
+
+- Default permissions: ManageMessages (`8192`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `count` | integer | true | 1 | 100 | — | — | Newest messages to sample (1-100) |
+
 ## `/rank`
 
 Show your XP, level and server rank.
@@ -419,6 +611,17 @@ Take back ownership of your temporary voice room
 
 No options.
 
+## `/reopen`
+
+Reopen your games or session picker in a private menu; games includes a no-change preview.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kind` | string | true | — | — | — | Games = `"games"`; Session = `"session"` | Which picker to reopen. |
+
 ## `/rsvp`
 
 RSVP to a Discord scheduled event
@@ -428,19 +631,19 @@ RSVP to a Discord scheduled event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 | `status` | string | true | — | — | — | Going = `"going"`; Interested = `"interested"`; Declined = `"declined"` | Your response |
 
 ## `/rsvp-attendance`
 
-Show RSVP totals for a scheduled event
+Show RSVP totals and your saved response for an event
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 
 ## `/schedule`
 
@@ -454,6 +657,8 @@ Schedule a message, once or recurring
 | `body` | string | true | — | — | 2000 | — | Message text |
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
+| `at` | string | false | — | — | 64 | — | One-off RFC3339 time with Z or offset; cannot combine with other timing |
+| `preview` | boolean | false | — | — | — | — | Preview the proposed post and its first firing without saving it |
 
 ## `/schedule-list`
 
@@ -484,7 +689,9 @@ Show voice-room status, health and creator channels
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of creator channels to show (starts at 1) |
 
 ## `/slowmode`
 
@@ -509,6 +716,7 @@ Set this channel's sticky message
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `body` | string | true | — | — | 2000 | — | Sticky text |
 | `debounce` | integer | false | 1 | 300 | — | — | Quiet seconds before re-posting (default 5, max 300) |
+| `preview` | boolean | false | — | — | — | — | Privately preview without saving |
 
 ## `/sticky-remove`
 
@@ -534,15 +742,15 @@ Temporarily ban a member
 
 ## `/textchannels`
 
-Toggle companion text channels for one creator channel
+Toggle companion text channels for one creator channel; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (default on) |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
+| `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (leave empty to keep the stored value) |
 | `name` | string | false | — | — | 100 | — | Companion channel name (default voice-chat) |
 | `viewer-role` | role | false | — | — | — | — | Extra role that may view companions (@everyone for all) |
 
@@ -601,3 +809,12 @@ Record a warning for a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/welcome-preview`
+
+Privately preview the current welcome for a synthetic newcomer. No delivery.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.

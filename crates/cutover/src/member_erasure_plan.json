@@ -1,6 +1,11 @@
 {
   "tables": [
     {
+      "table": "starboard_starrers",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1::bigint AND user_id = $2::bigint"
+    },
+    {
       "table": "internal_action_log",
       "columns": ["actor_id", "target_id", "intent_id"],
       "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR intent_id IN (SELECT intent_id FROM internal_idempotency WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR resource_id = $2)))"
@@ -22,6 +27,21 @@
     },
     {
       "table": "lfg_posts",
+      "columns": ["created_by"],
+      "predicate": "guild_id = $1 AND created_by = $2"
+    },
+    {
+      "table": "giveaway_entries",
+      "columns": ["user_id", "giveaway_id"],
+      "predicate": "guild_id = $1 AND (user_id = $2 OR giveaway_id IN (SELECT id FROM giveaways WHERE guild_id = $1 AND created_by = $2))"
+    },
+    {
+      "table": "giveaway_draws",
+      "columns": ["giveaway_id", "winner_ids", "reroll_kind"],
+      "predicate": "guild_id = $1 AND (giveaway_id IN (SELECT id FROM giveaways WHERE guild_id = $1 AND created_by = $2) OR winner_ids ? $2 OR reroll_kind = 'single:' || $2)"
+    },
+    {
+      "table": "giveaways",
       "columns": ["created_by"],
       "predicate": "guild_id = $1 AND created_by = $2"
     },
@@ -259,9 +279,19 @@
       "table": "retention_deletion_requests",
       "columns": ["user_id"],
       "predicate": "guild_id = $1 AND user_id = $2"
+    },
+    {
+      "table": "event_voice_presence",
+      "columns": ["user_id"],
+      "predicate": "user_id = $2 AND event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1)"
     }
   ],
   "allowlist": [
+    {
+      "table": "starboard_config",
+      "column": "updated_by",
+      "reason": "Guild configuration attribution is retained with the active board settings; member activity erasure removes starrers, not guild policy or its operator attribution."
+    },
     {
       "table": "guild_settings",
       "column": "updated_by",
@@ -331,6 +361,16 @@
       "table": "self_role_exchanges",
       "column": "superseded_by",
       "reason": "Replacement-ticket reference on self-role acknowledgement tickets: holds the opaque gen_random_uuid exchange_id of the superseding ticket, never a member identity, so there is no member PII to erase. The value is deleted with its ticket row by the self_role_exchanges plan predicate."
+    },
+    {
+      "table": "admin_api_tokens",
+      "column": "issued_by",
+      "reason": "Operator attribution for admin API token issuance: names the issuing operator, never a guild member. Retained like member_erasure_audit.actor; guild-local member erasure must never rewrite credential issuance accountability."
+    },
+    {
+      "table": "admin_api_tokens",
+      "column": "holder_id",
+      "reason": "Named human or AI credential principal, potentially identifying a member, retained as credential authority independently of guild activity. Guild-local member erasure must not rewrite holders or silently alter cross-guild grants; revocation and credential retention require a separate authorized operator action. No holder is inferred from an erased subject."
     }
   ]
 }

@@ -169,7 +169,7 @@ KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"}
 #   self_role_recovery: 30s cadence + 25s timeout (recovery_job,
 #     self_role_handlers.rs:303-310) -> warn 55, max 85
 #   automod_expiry: 60s cadence (EXPIRY_CADENCE, automod_gateway.rs:44) + 5s
-#     timeout (expiry_job, automod_gateway.rs:327-332) -> warn 65, max 125
+#     timeout (expiry_job, automod_gateway.rs:339-344) -> warn 65, max 125
 #   scheduled_messages: 15s cadence (SCHEDULER_TICK_MS, scheduled.rs:49)
 #     + 120s timeout (scheduled_jobs.rs) -> warn 135, max 150
 #   settings: 15s cadence (POLL_SECONDS, settings.rs:47) + 10s timeout

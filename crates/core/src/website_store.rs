@@ -429,6 +429,18 @@ pub async fn replace_events(
     .bind(guild_id)
     .execute(&mut *tx)
     .await?;
+    // Event voice presence is guild-scoped through this mirror (neither
+    // event voice table carries a guild column): an event leaving the
+    // snapshot would orphan its spans past member erasure and the guild
+    // purge, so spans with no mirror row left go in the same transaction.
+    // Event ids are Discord-global, so a mirror row in any guild protects
+    // the event.
+    sqlx::query(
+        "DELETE FROM event_voice_presence p
+         WHERE NOT EXISTS (SELECT 1 FROM scheduled_events s WHERE s.event_id = p.event_id)",
+    )
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("UPDATE web_contract_meta SET guild_id = $1 WHERE singleton = TRUE")
         .bind(guild_id)
         .execute(&mut *tx)

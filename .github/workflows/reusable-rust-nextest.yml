@@ -234,13 +234,32 @@ jobs:
 
       - name: Start sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          # The explicit advisory stats step below owns reporting. The action's
+          # post hook otherwise fails the job if the cache server is unavailable.
+          disable_annotations: true
+
+      # A shared-cache outage must not prevent the required suite from running.
+      # --zero-stats connects to or starts the server, validating backend setup
+      # before Cargo's first rustc probe. Do not print startup errors: remote
+      # cache diagnostics can contain signed URLs.
+      - name: Verify sccache availability (uncached fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if sccache --zero-stats >/dev/null 2>&1; then
+            echo "sccache ready"
+          else
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            echo "::warning::sccache unavailable; compiling without cache. Compiler and test failures remain fatal."
+          fi
 
       # Restore-only: the warm `check` entry in check.yml owns the registry
       # write, so this step never saves. sccache is the only shared-cache
       # writer left, and only on push to main or workflow_dispatch (R2 or
       # GitHub cache; local disk everywhere else per the backend step above).
       - name: Restore cargo registry cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           shared-key: check
@@ -376,7 +395,12 @@ jobs:
 
       - name: sccache stats (advisory speed evidence)
         shell: bash
-        run: sccache --show-stats
+        run: |
+          if stats=$(sccache --show-stats 2>/dev/null); then
+            printf '%s\n' "$stats"
+          else
+            echo "::warning::sccache statistics unavailable; compiler and test results are unchanged."
+          fi
 
       - name: Parse JUnit into the flake ledger
         if: always()

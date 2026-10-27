@@ -21,9 +21,10 @@ use two_bot_core::{
     backup::guild_config::TWO_STAGING_GUILD_ID,
     self_roles::{
         event_order_for_event_id, event_order_from_snowflake, is_snowflake,
-        parse_self_role_custom_id, reaction_option_key, self_role_reply, PanelMode, SelfRoleGates,
-        SelfRolePanel, SettledOutcome,
+        parse_self_role_custom_id, parse_self_role_panels, reaction_option_key, self_role_reply,
+        PanelMode, SafeRefusal, SelfRoleGates, SelfRolePanel, SettledOutcome,
     },
+    settings::{to_env_string, LiveSettings, SettingsCache},
 };
 use two_bot_cutover::self_role_store::SelfRoleStore;
 use two_bot_discord::ActionExecutor;
@@ -44,6 +45,43 @@ pub(crate) fn staging_allowlist() -> HashSet<String> {
     HashSet::from([TWO_STAGING_GUILD_ID.to_owned()])
 }
 
+/// The panel catalogue key served from the live settings snapshot. Service
+/// existence stays boot-gated (an empty boot catalogue builds no service);
+/// every dispatch and recovery sweep re-resolves the catalogue, so a stored
+/// catalogue replaces the boot one within one poll while enabling from a
+/// boot-empty deployment needs a restart.
+pub(crate) const PANELS_KEY: &str = "TWO_SELF_ROLE_PANELS";
+
+/// Effective panel catalogue: the live snapshot wins over the boot catalogue,
+/// an absent or unparsable row falls back to boot (a bypassed write guard
+/// must not blank live pickers). A stored empty array resolves to no panels.
+/// Pure for tests via `live`.
+pub(crate) fn live_panels_with(
+    guild: &str,
+    boot: &[SelfRolePanel],
+    live: Option<&LiveSettings>,
+) -> Vec<SelfRolePanel> {
+    let snapshot = live.map(LiveSettings::snapshot);
+    panels_from_snapshot(guild, boot, snapshot.as_deref())
+}
+
+fn panels_from_snapshot(
+    guild: &str,
+    boot: &[SelfRolePanel],
+    snapshot: Option<&SettingsCache>,
+) -> Vec<SelfRolePanel> {
+    let Some(live) = snapshot else {
+        return boot.to_vec();
+    };
+    let Some(value) = live.get(guild, PANELS_KEY) else {
+        return boot.to_vec();
+    };
+    let Some(rendered) = to_env_string(value) else {
+        return boot.to_vec();
+    };
+    parse_self_role_panels(&rendered).unwrap_or_else(|_| boot.to_vec())
+}
+
 pub(crate) struct SelfRoleInput {
     pub panel: SelfRolePanel,
     pub request: SelfRoleRequest,
@@ -55,7 +93,10 @@ pub(crate) enum SelfRoleResult {
     DryRun,
     Duplicate,
     Ignored,
+    /// A definitive pre-mutation refusal without a member-explainable category.
     Rejected,
+    /// A definitive pre-mutation refusal with a vetted reason and next action.
+    Refused(SafeRefusal),
     Pending,
 }
 
@@ -65,9 +106,13 @@ impl SelfRoleResult {
             Self::Settled(outcome) => self_role_reply(outcome, color),
             Self::DryRun => "Dry run recorded; no roles were changed.",
             Self::Duplicate => "This selection is already being handled or was handled earlier.",
-            Self::Ignored | Self::Rejected => "This role selection could not be applied.",
+            Self::Ignored => "This role selection could not be applied.",
+            Self::Rejected => {
+                "This role selection could not be applied. Try again later, or contact a server admin to check this panel."
+            }
+            Self::Refused(refusal) => refusal.reply(),
             Self::Pending => {
-                "This role selection is unresolved; no successful change has been confirmed."
+                "This role selection is unresolved; no successful change has been confirmed. Please wait a moment and try again; if it keeps failing, contact a server admin."
             }
         }
     }
@@ -169,6 +214,17 @@ impl SelfRoleService {
         Self::new(runtime, gates, staging_allowlist).map(Arc::new)
     }
 
+    /// Catalogue for this operation: the live snapshot layered over the boot
+    /// catalogue. Resolved once per entry point so a poll racing dispatch
+    /// cannot pair a panel from one catalogue with options from another.
+    fn live_panels(&self) -> Vec<SelfRolePanel> {
+        live_panels_with(
+            &self.runtime.guild_id,
+            &self.panels,
+            crate::settings_jobs::live().as_ref(),
+        )
+    }
+
     /// Only actual button/text-select input on the configured source message.
     /// The shared router has already selected ComponentHandler::SelfRole.
     #[allow(deprecated)]
@@ -182,7 +238,8 @@ impl SelfRoleService {
             return None;
         };
         let parsed = parse_self_role_custom_id(&data.custom_id)?;
-        let panel = self.panels.iter().find(|p| p.id == parsed.panel_id)?;
+        let panels = self.live_panels();
+        let panel = panels.iter().find(|p| p.id == parsed.panel_id)?;
         let channel = interaction
             .channel
             .as_ref()
@@ -280,7 +337,8 @@ impl SelfRoleService {
         if member.bot || member.id.get().to_string() == self.runtime.bot_id {
             return false;
         }
-        let Some(panel) = self.panels.iter().find(|p| p.id == parsed.panel_id) else {
+        let panels = self.live_panels();
+        let Some(panel) = panels.iter().find(|p| p.id == parsed.panel_id) else {
             // Parses, but names no live panel: the panel was removed.
             return true;
         };
@@ -333,7 +391,8 @@ impl SelfRoleService {
         {
             return None;
         }
-        let panel = self.panels.iter().find(|p| {
+        let panels = self.live_panels();
+        let panel = panels.iter().find(|p| {
             p.mode == PanelMode::Reaction
                 && p.channel_id == reaction.channel_id.get().to_string()
                 && p.message_id == reaction.message_id.get().to_string()
@@ -365,11 +424,19 @@ impl SelfRoleService {
     }
 
     pub async fn handle(&self, input: &SelfRoleInput) -> SelfRoleResult {
-        if !self.panels.contains(&input.panel) {
+        // Pin the catalogue and revision together. The store rechecks this
+        // revision under the settings writer lock before creating durable work.
+        let snapshot = crate::settings_jobs::live().map(|live| live.snapshot());
+        let panels =
+            panels_from_snapshot(&self.runtime.guild_id, &self.panels, snapshot.as_deref());
+        if !panels.contains(&input.panel) {
             return SelfRoleResult::Ignored;
         }
+        let revision = snapshot.as_ref().map_or(0, |snapshot| snapshot.revision());
         self.handle_admission(
-            self.runtime.prepare(&input.request, &input.panel).await,
+            self.runtime
+                .prepare_at_revision(&input.request, &input.panel, revision)
+                .await,
             &input.panel,
             &input.request.event_id,
         )
@@ -407,12 +474,21 @@ impl SelfRoleService {
     /// queue priority and panel start rotate before any await so cancellation
     /// cannot permanently favor processing over terminal repair. Dry-run never
     /// claims terminal work. Renewed expiry supplies durable restart backoff.
+    /// The sweep resolves the live catalogue once, so a stored empty array
+    /// sweeps nothing instead of dividing by the boot length.
     pub async fn recover_once(&self) -> Result<usize, RuntimeError> {
+        self.recover_panels(&self.live_panels()).await
+    }
+
+    async fn recover_panels(&self, panels: &[SelfRolePanel]) -> Result<usize, RuntimeError> {
+        if panels.is_empty() {
+            return Ok(0);
+        }
         let mut considered = 0;
         let sweep = self.recovery_cursor.fetch_add(1, Ordering::Relaxed);
-        let start = sweep % self.panels.len();
-        for offset in 0..self.panels.len().min(8) {
-            let panel = &self.panels[(start + offset) % self.panels.len()];
+        let start = sweep % panels.len();
+        for offset in 0..panels.len().min(8) {
+            let panel = &panels[(start + offset) % panels.len()];
             let budget = (32 - considered).min(4);
             let mut processing = self
                 .runtime
@@ -428,7 +504,7 @@ impl SelfRoleService {
             for slot in 0..budget {
                 // Alternate each complete start-panel rotation, not sweep
                 // parity (which would pin a panel's priority for even counts).
-                let terminal_first = (sweep / self.panels.len() + slot) % 2 == 1;
+                let terminal_first = (sweep / panels.len() + slot) % 2 == 1;
                 let next = if terminal_first {
                     terminal
                         .next()
@@ -471,7 +547,10 @@ impl SelfRoleService {
             Ok(Admission::Ready(prepared)) => prepared,
             Ok(Admission::Duplicate) => return SelfRoleResult::Duplicate,
             Ok(Admission::Ignored) => return SelfRoleResult::Ignored,
-            Ok(Admission::Rejected(_)) => return SelfRoleResult::Rejected,
+            Ok(Admission::Rejected(code)) => {
+                return SafeRefusal::from_code(code)
+                    .map_or(SelfRoleResult::Rejected, SelfRoleResult::Refused)
+            }
             Err(error) => {
                 warn!(?error, event_id = %event_id, "self-role admission unresolved");
                 return SelfRoleResult::Pending;

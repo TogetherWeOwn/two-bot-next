@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed staging gate for Wrangler 4.151.0's rolling Containers API.
+"""Fail-closed staging gate for Wrangler 4.152.0's rolling Containers API.
 
 Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
@@ -22,7 +22,7 @@ from build_identity import is_deploy_id_shape, parse_deploy_id
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
-WRANGLER = "4.151.0"
+WRANGLER = "4.152.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024

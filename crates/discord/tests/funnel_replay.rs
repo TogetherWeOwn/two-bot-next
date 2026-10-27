@@ -19,6 +19,12 @@
 //! then paste the JSON array into `ORACLE_ROWS` (key order + spacing must be
 //! canonical — the test re-canonicalizes both sides before comparing).
 
+#[cfg(feature = "db")]
+#[path = "support/deferred_capture_compat.rs"]
+mod deferred_capture_compat;
+#[cfg(feature = "db")]
+use deferred_capture_compat::Healthy;
+
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -716,12 +722,12 @@ fn pipeline_gate_clear_buffers_one_rules_fact_per_member() {
 
     // Pending arrival buffers nothing.
     pipeline.handle_at(&join_event(B, true, "12:30:00"), &observed_at);
-    assert!(buffer.is_empty());
+    assert!(buffer.is_empty().healthy());
 
     // Pending true→false buffers one fact on the receipt stamp.
     pipeline.handle_at(&member_update(B, false, "12:30:00", None), &observed_at);
-    assert_eq!(buffer.len(), 1);
-    let write = buffer.take().pop().expect("one buffered fact");
+    assert_eq!(buffer.len().healthy(), 1);
+    let write = buffer.take().healthy().pop().expect("one buffered fact");
     assert_eq!((write.guild_id, write.member_id), (GUILD, B));
     assert!(!write.is_bot);
     assert_eq!(write.occurred_at, observed_at);
@@ -736,7 +742,7 @@ fn pipeline_gate_clear_buffers_one_rules_fact_per_member() {
             &observed_at,
         );
     }
-    assert!(buffer.is_empty());
+    assert!(buffer.is_empty().healthy());
     assert_eq!(
         pipeline
             .handlers()
@@ -766,7 +772,7 @@ fn pipeline_instant_gate_clear_buffers_rules_fact_on_join_stamp() {
     }
     pipeline.handle_at(&bot_join, &observed_at);
 
-    let writes = buffer.take();
+    let writes = buffer.take().healthy();
     assert_eq!(writes.len(), 2);
     assert_eq!(writes[0].occurred_at, stamp("12:00:00"));
     assert_eq!(writes[0].source, "gateway");
@@ -792,7 +798,7 @@ fn pipeline_first_sighting_of_cleared_member_buffers_rules_fact() {
         &member_update(C, false, "12:30:00", None),
         &stamp("12:35:00"),
     );
-    assert_eq!(buffer.len(), 1);
+    assert_eq!(buffer.len().healthy(), 1);
 }
 
 #[test]

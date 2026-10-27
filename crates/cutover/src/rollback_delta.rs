@@ -69,6 +69,10 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
+    // Admin API token registry (0456/0457): issuance plus the revocation and
+    // last-use lifecycle writes; expires_at is a future deadline, not a
+    // write time, so it stays out of the measure.
+    TableSpec { table: "admin_api_tokens", measure: TableMeasure::Columns(&["issued_at", "revoked_at", "last_used_at"]) },
     TableSpec { table: "announcements_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
@@ -109,6 +113,14 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // per row; the maximum across both is the row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
+    // Event voice idempotency rows (0455): the claim stamps created_at once;
+    // bind/clear/orphan transitions rewrite updated_at without touching
+    // created_at, so the maximum across both is the row's last write.
+    TableSpec { table: "event_voice_channels", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
+    // Event voice presence spans (0455): the join stamps joined_at once; the
+    // leave rewrites left_at from NULL without touching joined_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "event_voice_presence", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -118,6 +130,13 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Timed-entry giveaways (0460/0461): every definition mutation stamps
+    // updated_at (create, claim, release, status, draw, announce), so its
+    // maximum is the row's last write. Entries and draws are insert-only;
+    // their insert stamps are the last write.
+    TableSpec { table: "giveaways", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "giveaway_entries", measure: TableMeasure::Columns(&["entered_at"]) },
+    TableSpec { table: "giveaway_draws", measure: TableMeasure::Columns(&["drawn_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
     TableSpec { table: "guild_analytics_settings", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -236,6 +255,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
     },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
+    TableSpec { table: "starboard_config", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "starboard_starrers", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec { table: "starboard_posts", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     // Claim/start/stamp/takeover transitions rewrite claimed_at,
     // send_started_at and delivered_at without touching the others, so the

@@ -1,6 +1,14 @@
 {
   "version": 1,
   "migrations": {
+    "crates/store/migrations/0458_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
+    },
+    "crates/cutover/migrations/0459_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Mirror the starboard foundation in the deployed cutover migration chain."
+    },
     "crates/cutover/migrations/0001_funnel.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "45d9bc7e665ac79f43e4e43ac6a87fcbeb877c5396fb4dcb5ca3d81a738d5158"
@@ -468,6 +476,50 @@
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
+    },
+    "crates/cutover/migrations/0455_event_voice_channels.sql": {
+      "sha256": "3495774bcc64661f8dd70e99f0159a54890a2bd19f40637623577a85b6997704",
+      "justification": "Event voice channel idempotency key plus presence spans: event_voice_channels keyed UNIQUE (event_id, instance_starts_at) with timestamptz starts/ends, lease plus UNIQUE channel binding, and event_voice_presence spans (natural PK, one open span per member via inline EXCLUDE). Additive, IF NOT EXISTS, constraints inline; numbered 0455 because the merged sticky delivery fence owns 0454; rollback drops the tables."
+    },
+    "crates/cutover/migrations/0456_admin_api_tokens.sql": {
+      "sha256": "3452a9adac7ee312a3f10f4150d34effff441e3fac32931a1e8bc08860ac4be2",
+      "justification": "Admin API scoped-token registry (slice 0): new table with shaped token id, 64-lowercase-hex secret_hash CHECK, closed-set scopes, non-empty guild_ids with NULL elements refused, ordered issued/expires bounds and nullable revoked/last_used; live-lookup index on (revoked_at, expires_at). Hardened before first merge; additive IF NOT EXISTS, no binary reads it yet; rollback drops the table. Numbered 0456 after main claimed 0452/0453 for tombstones and 0454 for sticky uncertainty during review; never merged or deployed under the old numbers. SQL body unchanged."
+    },
+    "crates/store/migrations/0457_admin_api_tokens.sql": {
+      "sha256": "622bcbc5cfc2561432290c293e15d30d89997435970088c6e4c01f37e20f962d",
+      "justification": "Store-chain mirror of cutover 0456, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0457 because cutover owns 0456; global migration numbers remain unique across both chains. Renumbered before first merge after main claimed 0454; SQL body unchanged."
+    },
+    "crates/cutover/migrations/0460_giveaways.sql": {
+      "sha256": "366727f74b8cd77d29de430063ad77def44edd9982e25352b2e5d108e0243314",
+      "justification": "Giveaways slice 1: additive IF NOT EXISTS definitions, entries and draws with composite foreign keys. Renumbered only the unmerged pair to cutover 0460/store 0461 after main claimed 0458/0459 for starboard. Never merged or deployed under earlier numbers; SQL body unchanged; only migration-number comments changed."
+    },
+    "crates/store/migrations/0461_giveaways.sql": {
+      "sha256": "5309afc33d9e77216a6aa2d53c077bc6a3917355f1d7541b0e32016cac4eda1d",
+      "justification": "Giveaways slice 1: additive IF NOT EXISTS definitions, entries and draws with composite foreign keys. Renumbered only the unmerged pair to cutover 0460/store 0461 after main claimed 0458/0459 for starboard. Never merged or deployed under earlier numbers; SQL body unchanged; only migration-number comments changed."
+    },
+    "crates/cutover/migrations/0464_admin_api_token_authority.sql": {
+      "sha256": "10adf3c188396efa6444ed6c41b5065c91f2356ec99196a2aef29cd4f80466ab",
+      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0460 to 0462 after main claimed 0460/0461 for giveaways, then cutover 0462 to 0464 after main claimed 0462 for the audit cursor. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints. Before first merge, remove the unsupported TEMPORARY prerequisite: create an empty same-server canonical CHECK reference in the registry schema using existing CREATE, then drop it within the file transaction; collisions refuse, failure rolls back, and no helper or new grant persists."
+    },
+    "crates/store/migrations/0463_admin_api_token_authority.sql": {
+      "sha256": "88610896bf299c958449eb02b9d91cfb6bc92f5cd627168c499916040a2c4722",
+      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0461 to 0463 after main claimed 0460/0461 for giveaways; sync mirror comment after cutover 0462 moved to 0464. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints. Before first merge, remove the unsupported TEMPORARY prerequisite: create an empty same-server canonical CHECK reference in the registry schema using existing CREATE, then drop it within the file transaction; collisions refuse, failure rolls back, and no helper or new grant persists."
+    },
+    "crates/cutover/migrations/0462_audit_reconcile_cursor.sql": {
+      "sha256": "5c0ddbb7a347f3cf0c23e3e5216fe30aa276d6dbe5747dbbaae358fec6d9ee02",
+      "justification": "Nullable durable audit reconciliation floor: checkpoint only fully inspected pages, resume across bounded claims without another POST, and preserve the original boundary and acceptance evidence. Additive IF NOT EXISTS; previous-binary rollback retains this column. Renumbered before first merge to 0462 because main owns 0458/0459 starboard and 0460/0461 giveaways; SQL bytes unchanged and no live migration performed."
+    },
+    "crates/store/migrations/0465_pause_resume_marker.sql": {
+      "sha256": "9bcdd51d56fcc640f31f12896a3a8f618f2e7321426a0a2e7503e4e527d598ac",
+      "justification": "Giveaways pause/resume: nullable paused_at marker so resume extends ends_at by the paused span; additive ADD COLUMN IF NOT EXISTS mirrored as cutover 0466. Neutral stem before first merge: the slice-1 acceptance scan bans ALTER in giveaway-named files."
+    },
+    "crates/cutover/migrations/0466_pause_resume_marker.sql": {
+      "sha256": "c8a89d2216fddc78613252613701d96b43f905e8433b5409ca71d4d387ec05ef",
+      "justification": "Cutover mirror of the store 0465 giveaway paused_at marker; additive ADD COLUMN IF NOT EXISTS so both chains cross-run in either order. Neutral stem before first merge: the slice-1 acceptance scan bans ALTER in giveaway-named files."
+    },
+    "crates/cutover/migrations/0467_lfg_close_refresh_retry.sql": {
+      "sha256": "e87c72b263549eacd4b56bad5aa66ca7c5c99351bf76509e2a0bac7c7f74a8e3",
+      "justification": "Persist the pending close-message edit atomically with LFG close transitions so the lifecycle worker can retry the exact saved message after failed edits and restarts; historical closed rows read back not pending."
     }
   }
 }

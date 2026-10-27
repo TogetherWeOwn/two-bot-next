@@ -56,7 +56,7 @@ async fn all_behind_cursor_pass_attempts_zero_tickets() {
         (1..=7).map(cursor_ticket).collect(),
         |ticket| async {
             attempted.lock().unwrap().push(ticket.id);
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -82,7 +82,7 @@ async fn skip_all_pass_records_the_skipped_row_count() {
         (1..=15).map(cursor_ticket).collect(),
         |ticket| async {
             attempted.lock().unwrap().push(ticket.id);
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -109,7 +109,7 @@ async fn second_pass_with_unchanged_rows_is_a_noop() {
     let first = TaskMutex::new(Vec::new());
     let failed = recovery_batch(&cursor, rows(), |ticket| async {
         first.lock().unwrap().push(ticket.id);
-        Ok(())
+        (Ok(()), None)
     })
     .await;
     assert!(failed.is_none());
@@ -126,7 +126,7 @@ async fn second_pass_with_unchanged_rows_is_a_noop() {
     let second = TaskMutex::new(Vec::new());
     let failed = recovery_batch(&cursor, rows(), |ticket| async {
         second.lock().unwrap().push(ticket.id);
-        Ok(())
+        (Ok(()), None)
     })
     .await;
     assert!(failed.is_none(), "a pure skip must not fail");
@@ -152,7 +152,7 @@ async fn mid_batch_cursor_resumes_past_the_cursor_without_over_skip() {
         (1..=11).map(cursor_ticket).collect(),
         |ticket| async {
             attempted.lock().unwrap().push(ticket.id);
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -192,7 +192,7 @@ async fn budget_exhaustion_logs_the_truncation_with_the_dropped_count() {
         |ticket| async {
             attempted.lock().unwrap().push(ticket.id);
             tokio::time::sleep(Duration::from_secs(50)).await;
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -228,7 +228,7 @@ async fn fresh_cursor_attempts_every_row_in_sorted_order() {
         [3, 1, 2].into_iter().map(cursor_ticket).collect(),
         |ticket| async {
             attempted.lock().unwrap().push(ticket.id);
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -252,7 +252,7 @@ async fn empty_batch_attempts_nothing() {
     let attempted = TaskMutex::new(Vec::new());
     let failed = recovery_batch(&cursor, Vec::new(), |ticket| async {
         attempted.lock().unwrap().push(ticket.id);
-        Ok(())
+        (Ok(()), None)
     })
     .await;
     assert!(failed.is_none());

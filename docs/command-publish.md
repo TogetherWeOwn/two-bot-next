@@ -37,14 +37,25 @@ Without these gates, only the always-enabled core commands are included. Other
 router surfaces have no additional published command definitions here. Invalid
 feature configuration fails before a request.
 
-**This is a complete replacement, not a per-command patch.** Remote commands
-absent from the desired set are removed, including disabled feature commands,
-legacy commands, and dynamic/custom slash commands. These tools deliberately
-compare against the *compiled* registry; they do not load custom commands from a
-database. Review every removal before applying. Do not enable boot publication
-for a guild that must preserve a separate dynamic/custom registry. Global
-application commands and per-guild user/role command permission overrides are
-not read or modified by this workflow.
+**This is a complete replacement, not a per-command patch.** The CLI refuses
+`publish --apply` with exit `1` before PUT if any removal is **unrecognized**:
+its raw command type/name is absent from both the desired set and the complete
+compiled builtin namespace. The namespace comes from the same core, feature,
+moderation and voice definition catalogs as the router, independent of feature
+gates; `/templateassistant` is not published and is not included. A user/message
+context command sharing a builtin slash name is a different identity. Unknown
+response fields cannot turn off this guard. Known disabled builtins retain their
+ordinary removal semantics; a custom command squatting a known builtin identity
+cannot be distinguished by this name-based guard. Review every removal.
+
+The CLI does not load custom commands from a database or blindly echo remote
+definitions. There is **no force/allow-delete flag**. Reconcile unknown/legacy/
+dynamic commands through the existing complete registry owner and approved
+cutover workflow, which owns the full desired set; do not acquire another token
+or use boot publication as a workaround. This CLI guard does not redesign boot
+or gateway publication. Do not enable boot publication for a guild that must
+preserve a separate dynamic/custom registry. Global application commands and
+per-guild user/role permission overrides are not read or modified here.
 
 ## Inspect and publish
 
@@ -68,7 +79,7 @@ counts, `+` additions, `-` removals, and `~` changed commands. Commands are name
 nested paths such as `options[0].choices[1].value`, `description`, and
 `default_member_permissions`. No token is printed. Exit codes: `0` successful
 comparison/publication (including drift in a dry run), `2` usage/configuration or
-live-guild refusal, `1` REST/read/publication failure.
+live-guild refusal, `1` omission-guard refusal or REST/read/publication failure.
 
 `--apply` is valid only for `publish`. Without it, no PUT is sent. With it, a
 matching hash also sends no PUT. When drift exists, one successful full bulk
@@ -76,7 +87,61 @@ replacement is requested at
 `/applications/{application}/guilds/{guild}/commands`; transient status retries
 use the existing bounded paced executor policy. Failed, forbidden, timed-out,
 or malformed reads are never treated as an empty registry and never proceed to
-PUT. A failed PUT does not claim successful publication.
+PUT. Duplicate type/name identities and empty names are ambiguous and also fail
+closed. A failed PUT does not claim successful publication.
+
+The omission guard inspects the **same fetched snapshot** used to compute the
+applied diff, inside the existing sync/read-to-PUT path. There is no disconnected
+preflight GET. This is **not Discord compare-and-swap**: an external writer can
+change the registry after that read, including during existing transport retry
+backoff. Coordinate the complete registry owner during cutover; this change adds
+no read/retry/write reconciliation loop or concurrency guarantee.
+
+## Agent JSON mode (schema version 1)
+
+Append the boolean `--json` flag to `diff` or `publish` for exactly one JSON
+document on stdout, including errors. Existing human output and exit codes stay
+the default, with removal classifications added. JSON dry-run drift still exits
+`0` with `ok: true`, even when apply would refuse. No registry request is made for
+invalid flags/configuration. Duplicate flags, `diff --apply`, `--json=true`,
+`--json` with a value, and combining `--json` with help are usage errors (`2`).
+
+```sh
+two-bot commands diff --json
+two-bot commands publish --apply --json
+```
+
+The fixed contract is:
+
+- `schema_version: 1`, `ok`, and `applied` (only true on confirmed publication).
+- `current_hash` and `desired_hash`: canonical 64-character SHA-256 hex digests
+  from the read snapshot and desired set. Both are `null` if classification could
+  not run; unknown is **not** an empty registry. A failed PUT can retain the
+  pre-write hashes; `applied: false` alone is not proof of no remote effect.
+- `added_count`, `removed_count`, `changed_count`: complete diff counts, or `null`
+  when unavailable. JSON omits raw definitions/field values and remote bodies.
+  The human mode still shows nested field changes, bounded to 16,384 characters
+  plus a truncation notice; identity/path control characters are escaped and
+  terminal escapes and mentions neutralized.
+- `removals`: at most 100 records in type/name order, each with `id` (decimal
+  string or `null` when Discord omitted metadata), numeric `type`, display `name`,
+  `name_truncated`, and `removal_class` (`known_builtin` or `unrecognized`). Names
+  are limited to 64 Unicode characters, with controls/mentions neutralized.
+  These labels are not input for classification; raw identities and hashes are.
+  `removals_truncated` explicitly signals an omitted tail. The JSON document is
+  below 64 KiB; **all** removals are classified regardless of reporting limits.
+- `has_unrecognized_removals` and a constant, bounded `next_action`. This boolean
+  is meaningful only when hashes/counts are available.
+- `error: null` on success, otherwise `{code, next_action}`. Stable codes are
+  `configuration_error` (exit `2`, no REST), `registry_request_failed` (exit `1`,
+  failed/malformed read, admission or publication), and
+  `unrecognized_command_removal` (exit `1`, classified refusal, **zero PUT**).
+  Error text never echoes arguments, credentials, URLs or remote error bodies.
+
+For an unrecognized removal, `next_action` directs the complete registry
+owner/cutover workflow, not a bypass or a production test. Repeated refused
+invocations remain read-only. Read-only diff/publish identify the same removals
+without treating inspection as permission to apply.
 
 ## Optional boot publication
 
@@ -173,6 +238,8 @@ On the persistent controller, compiling tests must use the bounded Cargo pool:
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --lib command_registry
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test command_registry_sync
 python3 scripts/cargo_cache.py run -- test -p two-bot --test commands_cli
+python3 scripts/cargo_cache.py run -- test -p two-bot --test commands_registry_removal_guard_acceptance
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot commands_cli::
 ```
 
 If pool admission is unavailable, stop local compilation and use hosted CI;

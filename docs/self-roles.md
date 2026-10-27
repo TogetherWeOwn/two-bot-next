@@ -338,6 +338,23 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   Failed acknowledgement performs no database admission or role mutation.
   Replies distinguish final settlement, simulation, duplicate and unresolved
   work; provisional execution or stale repair never produces a success reply.
+- Pre-mutation refusals are explained to the member. Live validation runs
+  before any role write, and three definitive categories keep a typed audit code
+  from validation through admission (`Admission::Rejected`) to the ephemeral
+  reply (`SafeRefusal`): `missing_manage_roles`, `missing_role` and
+  `role_hierarchy` (a managed role, or one not below the bot). Each reply is
+  static text: the vetted reason, a "contact a server admin" step for the member
+  and what an admin can change (grant Manage Roles, update or replace the missing
+  panel role, move the bot's role above the target; managed integration roles
+  cannot be changed that way). Any other validation failure (unsafe permissions,
+  drifted masks, unverifiable state) and any unknown code returns the generic
+  "could not be applied; try again later or contact a server admin" reply.
+  Unresolved work (an unavailable Discord read or store, a failure after a role
+  write, a timed-out write) keeps the "unresolved" reply with a retry and
+  contact-admin step; it is never relabeled as one of the refusals above. No
+  reply interpolates Discord or store text, ids, role names or mentions, stays
+  within 2000 UTF-16 units and sends empty allowed mentions. A refusal leaves the
+  stored selection, receipts and acknowledgement fences unchanged.
 - `settle_dry_run` writes a live-event-fenced `rejected` audit with code `dry_run`
   and immutable proposed intent, without role mutations or publishing a simulated
   panel target. Recovered attempted effects, compensation and pending exchanges

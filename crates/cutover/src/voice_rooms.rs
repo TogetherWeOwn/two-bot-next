@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
 use two_bot_core::voice_create_admission::{
-    decide_admission, AcceptedReservation, AdmissionDecision, AdmissionRequest,
+    decide_admission_counts, AcceptedReservation, AdmissionDecision, AdmissionRequest,
     CreateAdmissionConfig, RefusalReason, CREATE_BURST_WINDOW_SECS,
 };
 use two_bot_core::voice_logging::{parse_detail_level, LoggingSettings};
@@ -24,6 +24,15 @@ use two_bot_core::voice_vote_kick_audit::KickAuditRow;
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 use super::voice_config_store::PgVoiceConfigStore;
+
+/// Newest-first TOP-25 burst history; `truncated` is the fixed-vocabulary
+/// receipt for additional rows. Admission uses exact SQL counts, not this
+/// diagnostic prefix, so truncation cannot change its refusal reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurstHistoryPage {
+    pub reservations: Vec<AcceptedReservation>,
+    pub truncated: bool,
+}
 
 /// The verdict of [`PgRoomStore::claim_create`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +99,12 @@ impl PgRoomStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// This store's pool, for sibling persistence modules (event voice).
+    #[must_use]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// V11 configuration persistence (`/export` reads, `/import` writes)
@@ -760,8 +775,43 @@ impl PgRoomStore {
             .transpose()
     }
 
-    /// Claim one room create: serialize per guild, read the persisted history,
-    /// run [`decide_admission`] and, when allowed, durably record the accepted
+    /// TOP-25 history plus one lookahead, never an unbounded history Vec.
+    /// The window uses integer seconds just like the core admission function.
+    pub async fn burst_history_page(
+        &self,
+        guild_id: Snowflake,
+        now_secs: i64,
+    ) -> Result<BurstHistoryPage, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT user_id, floor(extract(epoch FROM created_at))::bigint
+             FROM voice_create_reservations
+             WHERE guild_id = $1
+               AND created_at >= to_timestamp($2::double precision) + interval '1 second'
+             ORDER BY created_at DESC, id DESC LIMIT 26",
+        )
+        .bind(guild_id.to_string())
+        .bind(now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS))
+        .fetch_all(&self.pool)
+        .await?;
+        let truncated = rows.len() > 25;
+        let reservations = rows
+            .into_iter()
+            .take(25)
+            .map(|(user_id, created_at_secs)| {
+                Ok(AcceptedReservation {
+                    user_id: user_id.parse().map_err(invalid_argument)?,
+                    created_at_secs,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()?;
+        Ok(BurstHistoryPage {
+            reservations,
+            truncated,
+        })
+    }
+
+    /// Claim one room create: serialize per guild, count the persisted history,
+    /// run [`decide_admission_counts`] and, when allowed, durably record the accepted
     /// reservation, all in one transaction. Nothing is written on a refusal.
     ///
     /// The per-guild advisory lock makes concurrent claims (two joins, two
@@ -823,30 +873,23 @@ impl PgRoomStore {
                      WHERE guild_id = $1 AND user_id = $2 AND settled_at IS NULL) AS owned_by_user,
                (SELECT floor(extract(epoch FROM max(created_at)))::bigint
                   FROM voice_create_reservations
-                 WHERE guild_id = $1 AND user_id = $2) AS last_created_secs",
+                 WHERE guild_id = $1 AND user_id = $2) AS last_created_secs,
+               (SELECT COUNT(*) FROM voice_create_reservations
+                 WHERE guild_id = $1 AND user_id = $2
+                   AND created_at >= to_timestamp($4::double precision) + interval '1 second') AS user_burst,
+               (SELECT COUNT(*) FROM voice_create_reservations
+                 WHERE guild_id = $1
+                   AND created_at >= to_timestamp($4::double precision) + interval '1 second') AS guild_burst",
         )
         .bind(&guild)
         .bind(&user)
         .bind(&leaving)
+        .bind(now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS))
         .fetch_one(&mut *tx)
         .await?;
-        let history = sqlx::query(
-            "SELECT user_id, floor(extract(epoch FROM created_at))::bigint AS created_at_secs
-             FROM voice_create_reservations
-             WHERE guild_id = $1 AND created_at > to_timestamp($2::double precision)",
-        )
-        .bind(&guild)
-        .bind(now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS))
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(|row| {
-            Ok(AcceptedReservation {
-                user_id: decode_id(row, "user_id")?,
-                created_at_secs: row.try_get("created_at_secs")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        // Exact aggregate counts under the same advisory lock avoid both an
+        // unbounded history allocation and undercounting a user outside a
+        // newest-first guild prefix.
         let count = |column: &str| -> Result<u32, sqlx::Error> {
             Ok(u32::try_from(counts.try_get::<i64, _>(column)?).unwrap_or(u32::MAX))
         };
@@ -855,9 +898,17 @@ impl PgRoomStore {
             owned_by_user: count("owned_by_user")?,
             rooms_in_guild: count("rooms_in_guild")?,
             last_created_at_secs: counts.try_get("last_created_secs")?,
-            accepted_reservations: &history,
+            accepted_reservations: &[],
         };
-        match decide_admission(config, &request, now_secs).map_err(invalid_argument)? {
+        match decide_admission_counts(
+            config,
+            &request,
+            now_secs,
+            count("user_burst")?,
+            count("guild_burst")?,
+        )
+        .map_err(invalid_argument)?
+        {
             AdmissionDecision::Deny { reason } => Ok(CreateClaim::Refused(reason)),
             AdmissionDecision::Allow => {
                 let reservation_id: String = sqlx::query_scalar(

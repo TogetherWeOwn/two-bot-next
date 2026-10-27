@@ -105,6 +105,15 @@ pub fn content(text: &str) -> String {
     truncate(&neutralize_mentions(text), CONTENT_LIMIT)
 }
 
+/// Bound without neutralizing mentions: only for ephemeral management views
+/// (saved-response inspection) whose mention safety comes from the reply's
+/// explicit empty `allowed_mentions`, never from text mutation — the admin
+/// must see the saved text exactly as stored. Every public or execution
+/// send must keep using [`content`].
+pub fn content_without_mention_neutralization(text: &str) -> String {
+    truncate(text, CONTENT_LIMIT)
+}
+
 /// Render custom-command placeholders, then sanitize the complete output.
 /// Binding names omit braces (for example `user`, `username`, `server`,
 /// `channel`). Replacement values are text, never a second template.
@@ -140,6 +149,17 @@ mod tests {
         assert!(!safe.contains("@here"));
         assert!(safe.contains("<@&123>"));
         assert_eq!(content(&safe), safe);
+    }
+
+    #[test]
+    fn literal_mentions_variant_keeps_text_and_still_bounds() {
+        let text = "@everyone @here <@&123> <@456>";
+        assert_eq!(content_without_mention_neutralization(text), text);
+        let long = "x".repeat(CONTENT_LIMIT + 10);
+        assert_eq!(
+            content_without_mention_neutralization(&long),
+            "x".repeat(CONTENT_LIMIT)
+        );
     }
 
     #[test]

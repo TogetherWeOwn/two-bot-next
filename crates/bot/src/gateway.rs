@@ -17,6 +17,7 @@ use std::sync::{
     Arc,
 };
 
+use crate::community_classifier::classifier_config_from_live;
 use crate::onboarding::OnboardingJob;
 
 use futures_util::StreamExt as _;
@@ -33,7 +34,8 @@ use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflak
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_cutover::{db::connect_voice, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
-    gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
+    gateway_intents, needs_message_content, AwardRequest, CommunityFactsError, InviteSource,
+    LevelingRuntime, LevelingRuntimeError, OrderedLevelingPipeline,
 };
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
@@ -279,6 +281,50 @@ struct Hello {
     heartbeat_interval: u64,
 }
 
+/// Why an op-9 session flag was refused. No variant carries frame bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFlagError {
+    /// The frame is not JSON.
+    InvalidPacket,
+    /// The `d` flag is missing or not a bool.
+    InvalidFlag,
+    /// The frame repeats an object key.
+    DuplicateKeys,
+}
+
+impl std::fmt::Display for SessionFlagError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            SessionFlagError::InvalidPacket => "invalid gateway session packet",
+            SessionFlagError::InvalidFlag => "invalid gateway session flag",
+            SessionFlagError::DuplicateKeys => {
+                "gateway session flag contains a duplicate JSON object key"
+            }
+        })
+    }
+}
+
+impl std::error::Error for SessionFlagError {}
+
+impl Header {
+    /// Decode the op-9 `d` session flag, refusing frames that repeat an
+    /// object key at any depth instead of silently last-winning into a
+    /// resume-vs-`Clear` decision. Pre-existing failures keep their own
+    /// vocabulary; only a positively identified repeat carries the fixed
+    /// duplicate-key refusal.
+    fn parse_session_resumable(text: &str) -> Result<bool, SessionFlagError> {
+        let packet: serde_json::Value =
+            serde_json::from_str(text).map_err(|_| SessionFlagError::InvalidPacket)?;
+        // Bytes already parsed: a repeated key is the only refusal left.
+        two_bot_core::duplicate_keys::reject_duplicate_keys(text.as_bytes())
+            .map_err(|_| SessionFlagError::DuplicateKeys)?;
+        packet
+            .get("d")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(SessionFlagError::InvalidFlag)
+    }
+}
+
 /// Client-side bound from pool acquisition through COMMIT, including stalled
 /// responses on an acquired connection. Never restore readiness during drain.
 /// A successful call restores only the snapshot it armed itself: a newer Ready
@@ -374,6 +420,40 @@ impl Drop for AckPermit {
     }
 }
 
+/// Cap on admitted in-flight RSVP work per shard runner: spawned-but-
+/// uncompleted prepares plus queued drain entries.
+const RSVP_IN_FLIGHT_LIMIT: usize = 32;
+
+/// Drop guard for the bounded RSVP admission counter
+/// (`RSVP_IN_FLIGHT_LIMIT`), in the [`AckPermit`] fail-closed shape. The
+/// permit travels with its [`AcceptedRsvp`] and releases when the serial
+/// drain completes it — including by panic unwind — so a stalled drain
+/// refuses new interactions instead of buffering them forever.
+struct RsvpPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl RsvpPermit {
+    /// Admit one RSVP interaction, or `None` at capacity. A refused
+    /// admission rolls its optimistic increment back immediately; the
+    /// caller counts the refusal via `gateway_rsvp_refused`.
+    fn try_acquire(in_flight: &Arc<AtomicUsize>) -> Option<Self> {
+        if in_flight.fetch_add(1, Ordering::AcqRel) >= RSVP_IN_FLIGHT_LIMIT {
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            in_flight: Arc::clone(in_flight),
+        })
+    }
+}
+
+impl Drop for RsvpPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Dispatch-worker failures are recorded errors, never worker panics: the
 /// worker stops, already-accepted commands drain, and the runner surfaces
 /// these typed errors instead of a bare "dispatch worker failed". Each
@@ -382,6 +462,25 @@ impl Drop for AckPermit {
 /// a successful commit, so it says `; checkpoint committed` instead.
 fn leveling_dispatch_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("leveling gateway dispatch failed; checkpoint unchanged".into())
+}
+
+fn leveling_poison_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument(
+        "leveling buffer poisoned (deferred_leveling_poisoned); supervisor_restart_inspection; checkpoint unchanged"
+            .into(),
+    )
+}
+
+/// A poisoned community-facts buffer holds the cursor like any other
+/// pre-commit failure: the buffer never heals in place, so warn-and-continue
+/// would recur forever while silently losing capture. The reason code and
+/// next action match the discord-crate contract verbatim
+/// (`docs/deferred-capture-poison.md`).
+fn community_facts_poison_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument(
+        "community facts buffer poisoned (deferred_community_facts_poisoned); supervisor_restart_inspection; checkpoint unchanged"
+            .into(),
+    )
 }
 
 fn interaction_drain_failure() -> sqlx::Error {
@@ -536,6 +635,9 @@ async fn complete_acknowledgement(
 struct AcceptedRsvp {
     acknowledgement: RsvpAcknowledgement,
     completed: tokio::sync::oneshot::Sender<bool>,
+    /// Admission guard: releases when the drain completes this entry, so
+    /// in-flight RSVP work stays within [`RSVP_IN_FLIGHT_LIMIT`].
+    permit: RsvpPermit,
 }
 
 /// Reception acknowledges immediately; completion stays serial and supervised
@@ -556,6 +658,9 @@ fn start_rsvp_drain(
         while let Some(accepted) = receiver.recv().await {
             let acknowledged = complete_acknowledgement(&runtime, accepted.acknowledgement).await;
             let _ = accepted.completed.send(acknowledged);
+            // Release admission only after the serial drain completes the
+            // entry; the drop is the in-flight accounting.
+            drop(accepted.permit);
         }
     });
     (sender, task, Arc::new(std::sync::Mutex::new(Vec::new())))
@@ -687,6 +792,56 @@ fn count_community_facts_drain_failure<T, E>(
     metrics.community_facts_drain_failure(reason);
 }
 
+/// Split a funnel collection into drainable award requests. A poisoned
+/// buffer refuses typed instead of an empty batch: log the sanitized
+/// refusal and hold the cursor, so the worker stops and the supervisor
+/// surfaces the failure instead of committing past lost capture. The
+/// first held failure wins, like every other pre-commit error.
+fn requests_or_hold_cursor(
+    collected: Result<Vec<AwardRequest>, LevelingRuntimeError>,
+    dispatch_error: &mut Option<sqlx::Error>,
+) -> Vec<AwardRequest> {
+    match collected {
+        Ok(requests) => requests,
+        Err(error) => {
+            // Runtime Display is sanitized; never log its SQL/HTTP source.
+            tracing::warn!(
+                error = %error,
+                committed_awards = error.committed_awards().len(),
+                "gateway leveling collect failed"
+            );
+            if dispatch_error.is_none() {
+                *dispatch_error = Some(match error {
+                    LevelingRuntimeError::LevelingPoisoned => leveling_poison_failure(),
+                    LevelingRuntimeError::CommunityFactsPoisoned => {
+                        community_facts_poison_failure()
+                    }
+                    _ => leveling_dispatch_failure(),
+                });
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Hold the cursor on a poisoned facts buffer; ordinary store failures
+/// keep their warn-and-continue precedent and return `false` so the
+/// caller logs them on the existing line. Returns `true` when the
+/// poison refusal was recorded.
+fn hold_cursor_on_facts_poison(
+    error: &CommunityFactsError,
+    dispatch_error: &mut Option<sqlx::Error>,
+) -> bool {
+    if !error.is_poison() {
+        return false;
+    }
+    tracing::warn!(error = %error, "gateway community facts buffer poisoned");
+    if dispatch_error.is_none() {
+        *dispatch_error = Some(community_facts_poison_failure());
+    }
+    true
+}
+
 /// Serial retention lifecycle for one gateway dispatch, ahead of the
 /// checkpoint commit. A real `GUILD_DELETE` queues a guild-data purge with
 /// the dispatch's `unavailable` flag preserved (`None`/available queues,
@@ -782,54 +937,39 @@ fn event_guild_id(event: &Event) -> String {
     }
 }
 
-/// Per-message channel-classifier refresh from the poller-published
-/// snapshot: the deployment environment is the base, stored human/welcome
-/// channel sets overlay it (both are `HOT_WIRED`, so only they can arrive
-/// from the snapshot). Parked or pre-first-poll readers layer nothing and
-/// the refresh is a no-op once the config compares equal.
+/// Per-fact classifier refresh from the poller-published snapshot: the
+/// deployment environment is the base, stored channel and exclusion sets
+/// overlay it (all seven are `HOT_WIRED`, so only they can arrive from the
+/// snapshot). Parked or pre-first-poll readers layer nothing and the
+/// refresh is a no-op once the config compares equal.
 fn refresh_channel_classifier_from_poller<I: InviteSource>(
     pipeline: &GatewayPipeline<I>,
     event: &Event,
 ) {
-    let Event::MessageCreate(msg) = event else {
-        return;
+    let guild_id = match event {
+        Event::MessageCreate(message) => message.guild_id,
+        Event::VoiceStateUpdate(update) => update.guild_id,
+        Event::MemberAdd(member) => Some(member.guild_id),
+        Event::MemberUpdate(member) => Some(member.guild_id),
+        Event::MemberRemove(member) => Some(member.guild_id),
+        _ => None,
     };
-    let Some(guild_id) = msg.guild_id else {
+    let Some(guild_id) = guild_id else {
         return;
     };
     let Some(live) = crate::settings_jobs::live() else {
         return;
     };
     let deployment: HashMap<String, String> = std::env::vars().collect();
-    pipeline.refresh_classifier_config(classifier_config_from_live(
+    // A refused refresh changes neither the sink nor the classifier, and the
+    // same dispatch already surfaces the poison typed at collection and at
+    // the facts drain (cursor held); a warn here would repeat once per
+    // message while the buffer stays poisoned.
+    let _ = pipeline.refresh_classifier_config(classifier_config_from_live(
         &deployment,
         &guild_id.get().to_string(),
         &live,
     ));
-}
-
-/// Classifier config with one guild's stored channel sets layered over
-/// the deployment environment: stored rows win, deleted rows fall back
-/// to the boot value (the automod `layered_vars` shape). Only the two
-/// channel keys overlay, so the paired facts-sink config keeps its
-/// environment values for every other field.
-fn classifier_config_from_live(
-    deployment: &HashMap<String, String>,
-    guild_id: &str,
-    live: &two_bot_core::settings::LiveSettings,
-) -> two_bot_core::ClassifierConfig {
-    let mut vars = deployment.clone();
-    vars.extend(
-        live.env_snapshot(Some(guild_id))
-            .into_iter()
-            .filter(|(key, _)| {
-                matches!(
-                    key.as_str(),
-                    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS" | "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"
-                )
-            }),
-    );
-    two_bot_core::ClassifierConfig::from_map(&vars)
 }
 
 /// One blocking-worker dispatch step: run the funnel/leveling drain, await the
@@ -889,7 +1029,7 @@ fn apply_dispatch<I: InviteSource>(
             (None, Some(dispatch)) => (
                 two_bot_discord::automod::event_to_automod(
                     &dispatch.event,
-                    crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                    crate::automod_gateway::received_at_ms(&dispatch.observed_at)?,
                 )?,
                 dispatch.observed_at.clone(),
             ),
@@ -929,25 +1069,28 @@ fn apply_dispatch<I: InviteSource>(
             &dispatch.observed_at,
             checkpoint.sequence,
         );
-        // Stored human/welcome channel sets reclassify live: refresh
-        // before the funnel stamps this message's channel class.
+        // Stored channel and exclusion sets reclassify live: refresh
+        // before the funnel and deferred writers classify this dispatch's facts.
         refresh_channel_classifier_from_poller(pipeline, &dispatch.event);
         // Exactly one funnel call per dispatch, then drain deferred
         // XP awards through the leveling runtime under the
         // checkpoint deadline before the cursor commits. Without a
         // leveling runtime the drain is a no-op.
-        let requests = match disposition {
-            Some(verdict) => pipeline.collect_at_with_message_disposition(
-                &dispatch.event,
-                &dispatch.observed_at,
-                verdict.funnel,
-            ),
-            None => pipeline.collect_at(
-                &dispatch.event,
-                &dispatch.observed_at,
-                two_bot_discord::MessageEligibility::default(),
-            ),
-        };
+        let requests = requests_or_hold_cursor(
+            match disposition {
+                Some(verdict) => pipeline.collect_at_with_message_disposition(
+                    &dispatch.event,
+                    &dispatch.observed_at,
+                    verdict.funnel,
+                ),
+                None => pipeline.collect_at(
+                    &dispatch.event,
+                    &dispatch.observed_at,
+                    two_bot_discord::MessageEligibility::default(),
+                ),
+            },
+            &mut dispatch_error,
+        );
         // Voice after the cache update, so snapshots are complete.
         // Handling never blocks (actor inbox). A transport loss seen
         // at reception after this dispatch must still win over any
@@ -1035,10 +1178,17 @@ fn apply_dispatch<I: InviteSource>(
         count_community_facts_drain_failure(two_bot_core::metrics::global(), &drained);
         match drained {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::warn!(
-                error = %error,
-                "gateway community facts dispatch failed"
-            ),
+            Ok(Err(error)) => {
+                // Poison holds the cursor (the buffer never heals, so
+                // warn-and-continue would recur forever); ordinary write
+                // failures keep the audit precedent below.
+                if !hold_cursor_on_facts_poison(&error, &mut dispatch_error) {
+                    tracing::warn!(
+                        error = %error,
+                        "gateway community facts dispatch failed"
+                    );
+                }
+            }
             Err(_) => {
                 tracing::warn!("gateway community facts dispatch timed out");
             }
@@ -1321,6 +1471,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let receive_state = Arc::clone(&state);
     let receive_onboarding = onboarding.clone();
     let in_flight_acks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let in_flight_rsvp = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let receive_pipeline = Arc::clone(&pipeline);
     let receive_voice = voice.clone();
     // Twilight owns reconnect backoff; add only a small decorrelation spread,
@@ -1344,6 +1495,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let ack_tracker = Arc::clone(&receive_acks);
             let onboarding = receive_onboarding.clone();
             let in_flight_acks = Arc::clone(&in_flight_acks);
+            let in_flight_rsvp = Arc::clone(&in_flight_rsvp);
             let pipeline = Arc::clone(&receive_pipeline);
             let voice = receive_voice.clone();
             let opening_tx = opening_tx.clone();
@@ -1413,8 +1565,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             deadline = CHECKPOINT_IO_MAX.min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
                         }
                         if header.op == 9 {
-                            let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
-                            let resumable = packet["d"].as_bool().ok_or_else(|| sqlx::Error::InvalidArgument("invalid gateway session flag".into()))?;
+                            let resumable = Header::parse_session_resumable(&text).map_err(|error| {
+                                sqlx::Error::InvalidArgument(
+                                    match error {
+                                        SessionFlagError::DuplicateKeys => {
+                                            "duplicate JSON object key in gateway session flag"
+                                        }
+                                        SessionFlagError::InvalidPacket => {
+                                            "invalid gateway session packet"
+                                        }
+                                        SessionFlagError::InvalidFlag => {
+                                            "invalid gateway session flag"
+                                        }
+                                    }
+                                    .into(),
+                                )
+                            })?;
                             transport_disconnected(&state, &generation, &generation_wake).await;
                             voice_disconnected(voice.as_ref());
                             if invalidates_session(resumable) { received = None; return Ok(Some(ReceivedWork::Clear(deadline))); }
@@ -1441,18 +1607,42 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if missed > 0 {
                             two_bot_core::metrics::global().gateway_missed_events(missed);
                         }
+                        // A duplicate key in a MESSAGE_UPDATE refuses the
+                        // automod edit below; selection is by decoded `t` so
+                        // escaped spellings still match. The same bytes must
+                        // neither route through last-wins Twilight parsing (the
+                        // event path would still produce a verdict input) nor
+                        // fail the runner (the checkpoint would never advance
+                        // past a deterministic refusal). Skip the parse and
+                        // dispatch nothing; the checkpoint still commits.
+                        let duplicate_refused = automod_enabled
+                            && crate::automod_gateway::is_message_update_dispatch(&text)
+                            && two_bot_core::duplicate_keys::reject_duplicate_keys(
+                                text.as_bytes(),
+                            )
+                            .is_err();
+                        if duplicate_refused {
+                            tracing::debug!(
+                                sequence,
+                                "gateway dispatch refused: duplicate JSON key"
+                            );
+                        }
                         // A partial MESSAGE_UPDATE omits fields a full Twilight
                         // Message needs: decode its raw IDs before parsing.
-                        let edit = if automod_enabled {
-                            crate::automod_gateway::partial_edit(&text, crate::automod_gateway::receipt_ms(&observed_at))
+                        let edit = if automod_enabled && !duplicate_refused {
+                            crate::automod_gateway::partial_edit_received(&text, &observed_at)
                                 .map(|delivery| Box::new((delivery, observed_at.clone())))
                         } else {
                             None
                         };
-                        let parsed = match twilight_gateway::parse(text, EventTypeFlags::all()) {
-                            Ok(parsed) => parsed,
-                            Err(_) if edit.is_some() => None,
-                            Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                        let parsed = if duplicate_refused {
+                            None
+                        } else {
+                            match twilight_gateway::parse(text, EventTypeFlags::all()) {
+                                Ok(parsed) => parsed,
+                                Err(_) if edit.is_some() => None,
+                                Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                            }
                         };
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
@@ -1494,47 +1684,80 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         }
                         if let (Some(runtime), Some(sender), Some(dispatch)) = (interactions.as_ref(), rsvp_sender.as_ref(), dispatch.as_mut()) {
                             if let Event::InteractionCreate(interaction) = &dispatch.event {
-                                let interaction = interaction.0.clone();
-                                let runtime = Arc::clone(runtime);
-                                let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
-                                // Track owned acknowledgement work so the bounded
-                                // completion policy can cancel it on timeout or
-                                // shard cancellation instead of detaching it.
-                                if let Ok(mut owned) = ack_tracker.lock() {
-                                    owned.retain(|handle| !handle.is_finished());
-                                    owned.push(acknowledgement.abort_handle());
+                                // Only RSVP interactions reach RSVP admission:
+                                // a non-RSVP interaction would consume a permit
+                                // for a `prepare` that returns `ignored()`, and
+                                // a non-RSVP burst at capacity would starve RSVP
+                                // traffic while polluting the refusal counter.
+                                // Bypassed interactions advance with no RSVP
+                                // completion, like a refused one.
+                                let candidate = runtime.is_rsvp_candidate(&interaction.0);
+                                let admitted = if candidate {
+                                    RsvpPermit::try_acquire(&in_flight_rsvp)
+                                } else {
+                                    None
+                                };
+                                match admitted {
+                                    Some(permit) => {
+                                        let interaction = interaction.0.clone();
+                                        let runtime = Arc::clone(runtime);
+                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                        // Track owned acknowledgement work so the bounded
+                                        // completion policy can cancel it on timeout or
+                                        // shard cancellation instead of detaching it.
+                                        if let Ok(mut owned) = ack_tracker.lock() {
+                                            owned.retain(|handle| !handle.is_finished());
+                                            owned.push(acknowledgement.abort_handle());
+                                        }
+                                        let (completed, completion) = tokio::sync::oneshot::channel();
+                                        sender.send(AcceptedRsvp { acknowledgement, completed, permit })
+                                            .map_err(|_| {
+                                                sqlx::Error::InvalidArgument("interaction drain stopped".into())
+                                            })?;
+                                        dispatch.completion = Some(completion);
+                                    }
+                                    None => {
+                                        // At capacity an RSVP interaction refuses
+                                        // without spawning or queueing. The dispatch
+                                        // advances with no RSVP completion (same as
+                                        // a non-interaction event) instead of wedging
+                                        // the funnel, checkpoint or dispatch worker.
+                                        // Bypassed non-RSVP interactions never count.
+                                        if candidate {
+                                            two_bot_core::metrics::global().gateway_rsvp_refused();
+                                        }
+                                    }
                                 }
-                                let (completed, completion) = tokio::sync::oneshot::channel();
-                                sender.send(AcceptedRsvp { acknowledgement, completed })
-                                    .map_err(|_| {
-                                        sqlx::Error::InvalidArgument("interaction drain stopped".into())
-                                    })?;
-                                dispatch.completion = Some(completion);
                             }
                         }
                         // The only onboarding effect at reception is a bounded
                         // initial ACK via the shared executor; the memory-only
                         // ticket is consumed after the ordered COMMIT.
-                        let acknowledgement = match (onboarding.as_ref(), dispatch.as_deref()) {
-                            (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. }))
-                                if runtime.accepts_interaction(&interaction.0) =>
-                            {
-                                // The permit is a drop guard held by the spawned
-                                // task: a panicking `acknowledge` releases it
-                                // during unwind instead of leaking capacity.
-                                let permit = match AckPermit::try_acquire(&in_flight_acks) {
-                                    Some(permit) => permit,
-                                    None => return Err(ingress_capacity_failure()),
-                                };
-                                let (send, receive) = tokio::sync::oneshot::channel();
-                                let runtime = Arc::clone(runtime);
-                                let interaction = interaction.0.clone();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let confirmed = runtime.acknowledge(&interaction, received_at).await;
-                                    let _ = send.send(confirmed);
-                                });
-                                Some(receive)
+                        let acknowledgement = match (onboarding.as_ref(), dispatch.as_deref_mut()) {
+                            (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. })) => {
+                                match runtime.resolve_interaction(&interaction.0).map(|resolved| resolved.into_owned()) {
+                                    Some(resolved) => {
+                                        // Preserve registered slash identity in the
+                                        // post-commit job as well as this ACK task.
+                                        interaction.0 = resolved.clone();
+                                        // The permit is a drop guard held by the spawned
+                                        // task: a panicking `acknowledge` releases it
+                                        // during unwind instead of leaking capacity.
+                                        let permit = match AckPermit::try_acquire(&in_flight_acks) {
+                                            Some(permit) => permit,
+                                            None => return Err(ingress_capacity_failure()),
+                                        };
+                                        let (send, receive) = tokio::sync::oneshot::channel();
+                                        let runtime = Arc::clone(runtime);
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            let confirmed = runtime.acknowledge(&resolved, received_at).await;
+                                            let _ = send.send(confirmed);
+                                        });
+                                        Some(receive)
+                                    }
+                                    None => None,
+                                }
                             }
                             _ => None,
                         };
@@ -2145,6 +2368,13 @@ pub async fn build_voice_runtime(
     }
 }
 
+// Duplicate-key refusal acceptance (paired Test Author file; test-only,
+// production unchanged). Child module so the tests can reach the private
+// frame structs. The builder must preserve this wiring.
+#[cfg(test)]
+#[path = "gateway_duplicate_key_acceptance_tests.rs"]
+mod gateway_duplicate_key_acceptance_tests;
+
 #[cfg(test)]
 #[path = "gateway_drop_poison_acceptance_tests.rs"]
 mod drop_poison_acceptance_tests;
@@ -2156,6 +2386,14 @@ mod drop_poison_counter_acceptance_tests;
 #[cfg(test)]
 #[path = "gateway_tests/leveling_announcements.rs"]
 mod leveling_announcements;
+
+#[cfg(test)]
+#[path = "gateway_live_exclusions_acceptance_tests.rs"]
+mod live_exclusions_acceptance_tests;
+
+#[cfg(test)]
+#[path = "gateway_deferred_poison_acceptance_tests.rs"]
+mod deferred_poison_acceptance;
 
 #[cfg(test)]
 mod tests {
@@ -2196,12 +2434,13 @@ mod tests {
     }
 
     #[test]
-    fn stored_channel_sets_overlay_env_for_the_classifier() {
+    fn stored_classifier_sets_overlay_env_for_the_classifier() {
         use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
         use two_bot_core::ChannelClass;
 
         const HUMAN: u64 = 200_000_000_000_000_001;
         const WELCOME: u64 = 300_000_000_000_000_001;
+        const TESTER: &str = "tester-1";
         let deployment: HashMap<String, String> = [(
             "TWO_COMMUNITY_HUMAN_CHANNEL_IDS".to_owned(),
             WELCOME.to_string(),
@@ -2214,9 +2453,11 @@ mod tests {
         let boot = classifier_config_from_live(&deployment, "22", &live);
         assert_eq!(boot.channel_class(WELCOME), ChannelClass::Human);
         assert_eq!(boot.channel_class(HUMAN), ChannelClass::Other);
+        assert!(boot.test_actor_ids.is_empty());
 
         // Stored rows win over the boot value for the same key, and a
         // stored welcome set classifies welcome (winning over human).
+        // The stored exclusion row exercises the exclusion overlay arms.
         writer.publish(&SettingsSnapshot {
             revision: 1,
             rows: vec![
@@ -2232,16 +2473,27 @@ mod tests {
                     value: serde_json::json!([WELCOME.to_string()]),
                     version: 1,
                 },
+                SettingRow {
+                    guild_id: "22".to_owned(),
+                    key: "TWO_COMMUNITY_TEST_ACTOR_IDS".to_owned(),
+                    value: serde_json::json!([TESTER]),
+                    version: 1,
+                },
             ],
         });
         let stored = classifier_config_from_live(&deployment, "22", &live);
         assert_eq!(stored.channel_class(HUMAN), ChannelClass::Human);
         assert_eq!(stored.channel_class(WELCOME), ChannelClass::Welcome);
+        assert_eq!(
+            stored.test_actor_ids,
+            std::collections::HashSet::from([TESTER.to_owned()])
+        );
 
         // Another guild's stored rows never layer onto this guild.
         let other = classifier_config_from_live(&deployment, "23", &live);
         assert_eq!(other.channel_class(HUMAN), ChannelClass::Other);
         assert_eq!(other.channel_class(WELCOME), ChannelClass::Human);
+        assert!(other.test_actor_ids.is_empty());
     }
 
     #[test]
@@ -3057,6 +3309,114 @@ mod tests {
         );
     }
 
+    /// A poisoned collection refuses typed instead of an empty batch: no
+    /// requests reach the drain and the cursor holds, so the supervisor
+    /// surfaces the failure instead of committing past lost capture. A
+    /// healthy collection passes through untouched, and the first held
+    /// failure wins.
+    #[test]
+    fn gateway_poisoned_collect_holds_checkpoint_without_requests() {
+        for (poison, reason) in [
+            (
+                LevelingRuntimeError::LevelingPoisoned,
+                "deferred_leveling_poisoned",
+            ),
+            (
+                LevelingRuntimeError::CommunityFactsPoisoned,
+                "deferred_community_facts_poisoned",
+            ),
+        ] {
+            let mut held = None;
+            let requests = requests_or_hold_cursor(Err(poison), &mut held);
+            assert!(requests.is_empty(), "poison must not yield requests");
+            assert!(
+                matches!(&held, Some(sqlx::Error::InvalidArgument(_))),
+                "poison must hold the cursor as a typed checkpoint refusal, got {held:?}"
+            );
+            let terminal = crate::db_log::failure_reason(held.as_ref().expect("held poison"));
+            assert!(
+                terminal.contains(reason),
+                "final supervisor reason lost {reason}: {terminal}"
+            );
+            assert!(terminal.contains("supervisor_restart_inspection"));
+            assert!(terminal.contains("checkpoint unchanged"));
+            assert!(terminal.len() <= 256);
+            assert!(!terminal.contains("leveling gateway dispatch failed"));
+        }
+        let mut held = None;
+        let requests = requests_or_hold_cursor(Ok(Vec::new()), &mut held);
+        assert!(requests.is_empty());
+        assert!(held.is_none(), "healthy collect must not hold the cursor");
+        let requests =
+            requests_or_hold_cursor(Err(LevelingRuntimeError::InvalidInteraction), &mut held);
+        assert!(requests.is_empty(), "non-poison failure still refuses work");
+        assert_eq!(
+            crate::db_log::failure_reason(held.as_ref().expect("non-poison failure holds cursor")),
+            "leveling gateway dispatch failed; checkpoint unchanged"
+        );
+        let mut held = Some(leveling_dispatch_failure());
+        let requests =
+            requests_or_hold_cursor(Err(LevelingRuntimeError::LevelingPoisoned), &mut held);
+        assert!(requests.is_empty());
+        assert!(
+            matches!(
+                &held,
+                Some(sqlx::Error::InvalidArgument(message))
+                    if message.as_str()
+                        == "leveling gateway dispatch failed; checkpoint unchanged"
+            ),
+            "first held failure must win, got {held:?}"
+        );
+    }
+
+    /// A poisoned facts drain holds the cursor with the stable reason code
+    /// and next action: the buffer never heals, so warn-and-continue would
+    /// recur forever. Ordinary store failures return `false` so the caller
+    /// keeps the audit precedent, and the first held failure wins.
+    #[test]
+    fn gateway_facts_poison_holds_cursor_while_store_failures_continue() {
+        let mut held = None;
+        assert!(
+            hold_cursor_on_facts_poison(&CommunityFactsError::Poisoned, &mut held),
+            "poison must be recorded"
+        );
+        assert!(
+            matches!(
+                &held,
+                Some(sqlx::Error::InvalidArgument(message))
+                    if message.as_str().contains("deferred_community_facts_poisoned")
+                        && message.as_str().contains("supervisor_restart_inspection")
+                        && message.as_str().contains("checkpoint unchanged")
+            ),
+            "poison failure must carry reason, action and contract, got {held:?}"
+        );
+        let mut held = None;
+        assert!(
+            !hold_cursor_on_facts_poison(
+                &CommunityFactsError::Store(
+                    two_bot_core::community_store::CommunityStoreError::Build("boom".into())
+                ),
+                &mut held
+            ),
+            "store failures must keep warn-and-continue"
+        );
+        assert!(held.is_none());
+        let mut held = Some(leveling_dispatch_failure());
+        assert!(hold_cursor_on_facts_poison(
+            &CommunityFactsError::Poisoned,
+            &mut held
+        ));
+        assert!(
+            matches!(
+                &held,
+                Some(sqlx::Error::InvalidArgument(message))
+                    if message.as_str()
+                        == "leveling gateway dispatch failed; checkpoint unchanged"
+            ),
+            "first held failure must win, got {held:?}"
+        );
+    }
+
     /// A dropped interaction completion is a typed recorded error holding the
     /// cursor, never a worker panic that discards accepted commands.
     #[tokio::test]
@@ -3359,6 +3719,7 @@ mod tests {
                     &two_bot_core::now_iso(),
                     two_bot_discord::MessageEligibility::default(),
                 )
+                .expect("healthy collect")
                 .is_empty(),
             "fixture message must queue a leveling award"
         );
@@ -3830,7 +4191,9 @@ mod tests {
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
         let pipeline = build_pipeline(vec![], None);
-        pipeline.enable_community_facts(broken);
+        pipeline
+            .enable_community_facts(broken)
+            .expect("healthy fixture arming");
         // Gate-clearing join: `pending: false` buffers two facts, one
         // `member_joined` via `on_join` plus one `rules_accepted` via
         // `on_gate_cleared`, so the drain has work to fail on. A
@@ -3886,12 +4249,16 @@ mod tests {
         // path instead of the failure site.
         {
             let scratch = build_pipeline(vec![], None);
-            scratch.enable_community_facts(pool.clone());
-            scratch.collect_at(
-                &join(),
-                &two_bot_core::now_iso(),
-                two_bot_discord::MessageEligibility::default(),
-            );
+            scratch
+                .enable_community_facts(pool.clone())
+                .expect("healthy scratch arming");
+            scratch
+                .collect_at(
+                    &join(),
+                    &two_bot_core::now_iso(),
+                    two_bot_discord::MessageEligibility::default(),
+                )
+                .expect("scratch collect");
             assert_eq!(
                 scratch.drain_facts().await.expect("scratch drain"),
                 2,
@@ -4141,6 +4508,24 @@ mod tests {
             ),
             "capacity refusal must stay typed, got {error:?}"
         );
+    }
+
+    /// At capacity, RSVP admission refuses instead of spawning unbounded
+    /// prepare work; releasing one permit admits exactly one more.
+    #[test]
+    fn gateway_rsvp_permit_refuses_past_capacity() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut held: Vec<_> = (0..RSVP_IN_FLIGHT_LIMIT)
+            .map(|_| RsvpPermit::try_acquire(&in_flight).expect("capacity must admit 32"))
+            .collect();
+        assert!(RsvpPermit::try_acquire(&in_flight).is_none());
+        assert_eq!(in_flight.load(Ordering::Acquire), RSVP_IN_FLIGHT_LIMIT);
+        held.pop();
+        let readmitted = RsvpPermit::try_acquire(&in_flight).expect("release must admit one more");
+        assert!(RsvpPermit::try_acquire(&in_flight).is_none());
+        drop(readmitted);
+        drop(held);
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 
     /// Every dispatch-worker failure site surfaces its own typed message, so an

@@ -24,6 +24,7 @@ pub mod migrations;
 pub mod pool;
 pub mod retry;
 pub mod snapshots;
+pub mod starboard;
 pub mod store;
 pub mod web;
 
