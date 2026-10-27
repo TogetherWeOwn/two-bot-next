@@ -980,6 +980,10 @@ fn text_blockers(row: &StoredCommand, gate: Option<bool>) -> Vec<TextBlocker> {
 fn text_eligibility_lines(row: &StoredCommand, gate: Option<bool>) -> String {
     let blockers = text_blockers(row, gate);
     let name = &row.name;
+    // Stored names predate validation on raw rows, so display echoes go
+    // through the same escape as the summary examples; the reservation
+    // check below keeps the raw stored value.
+    let shown = escape_inspect_text(name);
     // Resume revalidates against the wider write reservation, so a paused
     // grandfathered voice/assistant-named row can never be resumed: offering
     // /command-enable would promise an action that deterministically refuses.
@@ -1008,18 +1012,18 @@ fn text_eligibility_lines(row: &StoredCommand, gate: Option<bool>) -> String {
     for blocker in &blockers {
         match blocker {
             TextBlocker::NoTrigger => out.push_str(&format!(
-                "\nNext: add a trigger with /command name:{name} template:... text-trigger:!word (replaces the definition)."
+                "\nNext: add a trigger with /command name:{shown} template:... text-trigger:!word (replaces the definition)."
             )),
             TextBlocker::Builtin => out.push_str(&format!(
-                "\nNext: choose a non-builtin trigger with /command name:{name} template:... text-trigger:!word (replaces the definition)."
+                "\nNext: choose a non-builtin trigger with /command name:{shown} template:... text-trigger:!word (replaces the definition)."
             )),
             TextBlocker::Paused => {
                 if name_reserved {
                     out.push_str(&format!(
-                        "\nNext: the name \"{name}\" is reserved, so this definition cannot be resumed. Recreate it under a different name with /command, or delete it with /command-remove name:{name}."
+                        "\nNext: the name \"{shown}\" is reserved, so this definition cannot be resumed. Recreate it under a different name with /command, or delete it with /command-remove name:{shown}."
                     ));
                 } else {
-                    out.push_str(&format!("\nNext: resume it with /command-enable name:{name}."));
+                    out.push_str(&format!("\nNext: resume it with /command-enable name:{shown}."));
                 }
             }
             TextBlocker::GateOff => out.push_str(
