@@ -679,6 +679,10 @@ pub(crate) async fn schedule_list(
 /// verbatim, with no header budget loss. Read-only including audits: no
 /// inspect path writes a schedule or audit row, and every refusal echoes
 /// no user input.
+// Integration targets that path-include this file (e.g.
+// `schedule_preview_acceptance`) do not exercise the management handlers;
+// the bin dispatch does. Allowed so `-D warnings` stays green there.
+#[allow(dead_code)]
 pub(crate) async fn schedule_inspect(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -768,6 +772,9 @@ pub(crate) async fn schedule_inspect(
 /// content-free audit under one row lock, so a racing ticker sees either
 /// the old or the new body and racing edits produce exactly one winner.
 /// Every refusal leaves the entire row unchanged and audits nothing.
+// Path-including integration targets (e.g. `schedule_preview_acceptance`)
+// do not exercise the management handlers; the bin dispatch does.
+#[allow(dead_code)]
 pub(crate) async fn schedule_edit(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -1151,6 +1158,9 @@ async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: i
 /// `allowed_mentions` is the mention safety, and the admin must see the
 /// saved body exactly as stored (legacy rows predate creation-time
 /// neutralization). Every other schedule reply keeps the neutralizing path.
+// Used only by the inspect body view, which path-including integration
+// targets do not exercise (see above).
+#[allow(dead_code)]
 async fn finish_verbatim(
     executor: &ActionExecutor,
     interaction: &Interaction,
