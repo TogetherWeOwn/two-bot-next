@@ -222,8 +222,9 @@ fn routing_order_and_denials_match_the_frozen_contract_in_every_gate_set() {
                 }
             } else {
                 let denied = refuse(f.denial.expect("restricted command has a refusal"));
-                // Every other bit, Administrator included, still denies.
-                for permissions in [None, Some(0), Some(u64::MAX & !f.mask & !ADMINISTRATOR)] {
+                // Every other bit except Administrator still denies;
+                // Administrator alone is checked below.
+                for permissions in [None, Some(0), Some(!f.mask & !ADMINISTRATOR)] {
                     assert_eq!(
                         route(&router, f.name, Some(GUILD), permissions, None),
                         denied,
