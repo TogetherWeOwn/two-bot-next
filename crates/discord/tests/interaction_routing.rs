@@ -277,13 +277,13 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .collect();
     // 23 legacy restricted rows plus management-only command-inspect,
     // command-disable, command-enable, giveaway and welcome-preview, plus
-    // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect and game-mix.
-    // Discord defaults never
+    // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect, game-mix
+    // and tempban-list. Discord defaults never
     // replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        36,
-        "23 legacy restricted rows plus thirteen Next-only management commands"
+        37,
+        "23 legacy restricted rows plus fourteen Next-only management commands"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
