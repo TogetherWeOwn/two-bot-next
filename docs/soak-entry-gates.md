@@ -65,7 +65,7 @@ checks between the Gate 1 readiness probe and the final pre-`T` probe:
 
 | Check | Verification | Expected value |
 |---|---|---|
-| No readiness failures | Every `synthetic-user-flow` staging-job run that executed between the two probes (read-only `gh run list --workflow synthetic-user-flow.yml --branch main`; each run reads `/readyz` and `/health`). Staging has no keepalive, so the Worker never emits `container_unready_alert` there ([staging idle sleep](container-readiness.md#staging-idle-sleep)) | At least one run in the interval and every one `success`; an empty or unreadable listing closes the gate |
+| No readiness failures | Every `synthetic-user-flow` staging-job run that executed between the two probes (read-only `gh run list --workflow synthetic-user-flow.yml --branch main --created ">=$GATE1_UTC" --limit 500`; the default 20-run page covers only ~100 minutes and truncates silently; each run reads `/readyz` and `/health`). Staging has no keepalive, so the Worker never emits `container_unready_alert` there ([staging idle sleep](container-readiness.md#staging-idle-sleep)) | At least one run in the interval and every one `success`; an empty or unreadable listing closes the gate |
 | No deployment | Existing authorized workflow execution-attempt verification for `main` over the recorded probe interval, including reruns and executions spanning either probe | `0` deployment executions; missing or incomplete attempt evidence closes the gate |
 | Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | `200` with all three components `ready` |
 
