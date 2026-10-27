@@ -241,8 +241,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Smoke inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
-- [Binary lifecycle](alive-acceptance.md)
-- [Presence probe tests](presence-probe-acceptance.md)
 - [Binary lifecycle tests](alive-acceptance.md)
 - [Presence tests](presence-probe-acceptance.md)
 - [REST pacing tests](pacing-backoff-acceptance.md)
