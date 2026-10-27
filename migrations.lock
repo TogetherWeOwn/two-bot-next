@@ -2,7 +2,7 @@
   "version": 1,
   "migrations": {
     "crates/cutover/migrations/0469_member_reports.sql": {
-      "sha256": "2078078ae2f0db9cbce89e6d2091859be34c3248e06772d3bdd9555636ef3329",
+      "sha256": "8856e2d15f774cbd56935931f040bb44b19c7ccc23625d24bb73108867d8a433",
       "justification": "Add private member-report storage: bounded single-message snapshots, a ten-reporter cap, one active group per message, and cascade children for 90-day retention and reasoned erasure."
     },
     "crates/store/migrations/0458_starboard.sql": {

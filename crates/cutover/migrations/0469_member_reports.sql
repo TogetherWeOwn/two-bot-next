@@ -21,13 +21,13 @@
 -- reasons. These tables are excluded from backups on purpose, so a restore can
 -- never resurrect erased or expired evidence.
 --
--- Additive: `IF NOT EXISTS` throughout, matching the S6 convention. Cutover
+-- Additive: new tables with guarded indexes. Cutover
 -- chain only. Rollback is `DROP TABLE report_reporters, report_snapshots,
 -- member_reports; DROP FUNCTION report_reporters_cap()` (no earlier binary
 -- reads them).
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 
-CREATE TABLE IF NOT EXISTS member_reports (
+CREATE TABLE member_reports (
     id                 TEXT PRIMARY KEY CHECK (id ~ '^[0-9]{1,20}$'),
     guild_id           TEXT NOT NULL CHECK (guild_id ~ '^[0-9]{1,20}$'),
     channel_id         TEXT CHECK (channel_id ~ '^[0-9]{1,20}$'),
@@ -66,7 +66,7 @@ CREATE INDEX IF NOT EXISTS member_reports_guild_reporter
 CREATE INDEX IF NOT EXISTS member_reports_guild_reported
     ON member_reports (guild_id, reported_member_id);
 
-CREATE TABLE IF NOT EXISTS report_snapshots (
+CREATE TABLE report_snapshots (
     report_id           TEXT PRIMARY KEY REFERENCES member_reports (id) ON DELETE CASCADE,
     -- NULL for missing-deleted / missing-unreadable: nothing was fetched.
     author_id           TEXT CHECK (author_id ~ '^[0-9]{1,20}$'),
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS report_snapshots (
 CREATE INDEX IF NOT EXISTS report_snapshots_author
     ON report_snapshots (author_id) WHERE author_id IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS report_reporters (
+CREATE TABLE report_reporters (
     report_id   TEXT NOT NULL REFERENCES member_reports (id) ON DELETE CASCADE,
     reporter_id TEXT NOT NULL CHECK (reporter_id ~ '^[0-9]{1,20}$'),
     reported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
