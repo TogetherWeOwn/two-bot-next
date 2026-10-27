@@ -1702,7 +1702,7 @@ impl CommandRuntime {
                 .await;
             }
             "schedule-inspect" => {
-                crate::schedule_runtime::schedule_inspect(
+                crate::schedule_management::schedule_inspect(
                     &self.pool,
                     &self.executor,
                     &self.guild_id.to_string(),
@@ -1711,7 +1711,7 @@ impl CommandRuntime {
                 .await;
             }
             "schedule-edit" => {
-                crate::schedule_runtime::schedule_edit(
+                crate::schedule_management::schedule_edit(
                     &self.pool,
                     &self.executor,
                     &self.guild_id.to_string(),

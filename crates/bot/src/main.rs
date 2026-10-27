@@ -131,6 +131,7 @@ mod retention_error_chain_acceptance_tests;
 mod retention_jobs;
 #[cfg(test)]
 mod retention_runtime_tests;
+mod schedule_management;
 mod schedule_runtime;
 mod scheduled_jobs;
 mod server;
