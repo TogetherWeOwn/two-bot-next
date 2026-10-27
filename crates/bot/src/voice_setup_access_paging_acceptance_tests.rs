@@ -441,8 +441,11 @@ fn registry_adds_optional_page_only_to_setup_and_access_show() {
 
 #[test]
 fn reference_docs_regenerate_the_new_page_options() {
-    let path = format!("{}/../../docs/commands.md", env!("CARGO_MANIFEST_DIR"));
-    let docs = std::fs::read_to_string(&path).expect("docs/commands.md is readable");
+    let path = format!(
+        "{}/../../docs/generated/commands.md",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let docs = std::fs::read_to_string(&path).expect("docs/generated/commands.md is readable");
     let section = |header: &str| {
         let start = docs
             .find(header)
