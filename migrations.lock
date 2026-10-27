@@ -510,7 +510,7 @@
       "sha256": "5c0ddbb7a347f3cf0c23e3e5216fe30aa276d6dbe5747dbbaae358fec6d9ee02",
       "justification": "Nullable durable audit reconciliation floor: checkpoint only fully inspected pages, resume across bounded claims without another POST, and preserve the original boundary and acceptance evidence. Additive IF NOT EXISTS; previous-binary rollback retains this column. Renumbered before first merge to 0462 because main owns 0458/0459 starboard and 0460/0461 giveaways; SQL bytes unchanged and no live migration performed."
     },
-    "crates/cutover/migrations/0468_voice_settings_versions.sql": {
+    "crates/cutover/migrations/0469_voice_settings_versions.sql": {
       "sha256": "581fbee8e2769a57b4a61f1cef47a74fb2bb264d4b28cf2bbd8fbdf3c10f1ffa",
       "justification": "Version and attribute voice configuration rows; append-only per-guild change audit, transactional row stamping, voice action allowlist and durable first-save revision. Existing attribution remains unknown; migration is additive apart from replacing the action CHECK with a superset. Renumbered before merge to 0468 because main owns starboard 0458/0459, giveaways 0460/0461, the audit cursor 0462, admin-token authority 0463/0464, the pause/resume marker 0465/0466 and the LFG close-refresh retry 0467; SQL is unchanged."
     },

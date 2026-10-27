@@ -139,7 +139,7 @@ BEGIN
         IF obj.kind = 'function' THEN
             target := to_regprocedure(obj.schema_name || '.' || obj.name)::text;
             IF target IS NULL THEN
-                -- Migration 0468 creates these functions with its audit table.
+                -- Migration 0469 creates these functions with its audit table.
                 -- Bootstrap can precede that migration; a partial migration
                 -- with the table present must still fail closed. Full already
                 -- requires the audit table earlier in the reviewed matrix.

@@ -273,7 +273,7 @@ their login status or silently removing memberships. It contains no passwords.
    plan after migrations and view updates, then `verify` reads 0 findings.
    `sql/web_v1.sql` is applied with `public` as the bot-table search
    path before the bootstrap phase; its functions stay strict in both phases.
-   The two voice-audit trigger functions from migration 0468 may be absent only
+   The two voice-audit trigger functions from migration 0469 may be absent only
    while `voice_settings_audit` is absent. Once that table exists, either missing
    function fails closed. The full plan requires the audit table before reaching
    those functions, so an unapplied migration cannot pass full provisioning.
