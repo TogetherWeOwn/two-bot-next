@@ -53,6 +53,7 @@ Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
 """
 
 import argparse
+import re
 import subprocess
 from pathlib import Path
 
@@ -195,6 +196,9 @@ WORKER_DOCS = frozenset({
     "docs/container-readiness.md",
 })
 DOCS_PREFIX = "docs/"
+# Flat root-level section fragments only; a relative Path.match would also
+# capture nested paths such as deploy/docs/index-x.md and skip fail-closed.
+DOCS_INDEX_FRAGMENT = re.compile(r"docs/index-[^/]+\.md")
 
 # Exact workflow files whose offline verifications run in the worker job
 # (kept as documentation of that coupling; classification of any
@@ -306,7 +310,7 @@ def classify(path):
     # Select all candidates conservatively; a fragment-only edit must not
     # bypass the Rust discoverability assertion. Worker tests read the listing.
     if (path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT
-            or Path(path).match("docs/index-*.md")):
+            or DOCS_INDEX_FRAGMENT.fullmatch(path)):
         return frozenset({RUST, WORKER})
     if path.startswith(WORKER_PREFIX):
         return frozenset({WORKER})

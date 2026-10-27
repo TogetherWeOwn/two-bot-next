@@ -232,6 +232,14 @@ class SelectionTests(unittest.TestCase):
                     {RUST: True, WORKER: True, PARITY: False,
                      SUPPLY: True, DOCS: True})
 
+    def test_nested_docs_index_paths_stay_fail_closed(self):
+        # Only the root docs/ fragments are exempt; nested look-alikes must
+        # still hit the deploy/ and .github/ fail-closed rules.
+        for path in ("deploy/docs/index-note.md", ".github/docs/index-note.md",
+                     "deploy/docs/index-a/b.md"):
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), inputs.ALL_JOBS, path)
+
     def test_parity_doc_selects_rust_and_parity(self):
         self.assertEqual(inputs.classify("docs/parity.md"), {RUST, PARITY})
         self.assertEqual(inputs.classify("docs/parity-baseline.json"),

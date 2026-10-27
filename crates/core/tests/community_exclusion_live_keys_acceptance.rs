@@ -1079,6 +1079,26 @@ fn community_jobs_doc_documents_this_offline_verification() {
     );
 }
 
+// Lines a Markdown renderer shows as text: fenced code blocks (``` or ~~~)
+// are examples, not index rows, so a link inside one is not discoverable.
+fn rendered_lines(text: &str) -> Vec<&str> {
+    let mut fence: Option<char> = None;
+    let mut rendered = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let marker = ['`', '~']
+            .into_iter()
+            .find(|c| trimmed.starts_with(&c.to_string().repeat(3)));
+        match (fence, marker) {
+            (None, Some(c)) => fence = Some(c),
+            (Some(open), Some(c)) if open == c => fence = None,
+            (None, None) => rendered.push(line),
+            _ => {}
+        }
+    }
+    rendered
+}
+
 // Match the manifest row contract, not arbitrary mentions of a link. Only
 // follow flat index-*.md section fragments explicitly linked by README: an
 // orphan, an unrelated guide, or a broken destination is not discoverability.
@@ -1090,7 +1110,8 @@ fn community_jobs_is_indexed(read: impl Fn(&str) -> Option<String>) -> bool {
         return false;
     }
     let has_guide_row = |text: &str| {
-        text.lines()
+        rendered_lines(text)
+            .into_iter()
             .any(|line| line == "- [Community jobs](community-jobs.md)")
     };
     if has_guide_row(&index) {
@@ -1098,7 +1119,7 @@ fn community_jobs_is_indexed(read: impl Fn(&str) -> Option<String>) -> bool {
     }
     let fragment_row = regex::Regex::new(r"^- \[([^\]\n]+)\]\((index-[A-Za-z0-9_-]+\.md)\)$")
         .expect("index fragment row pattern");
-    index.lines().any(|line| {
+    rendered_lines(&index).into_iter().any(|line| {
         fragment_row.captures(line).is_some_and(|row| {
             !row[1].trim().is_empty()
                 && read(&format!("docs/{}", &row[2]))
@@ -1207,6 +1228,45 @@ fn control_docs_index_rejects_a_missing_readme() {
 }
 
 #[test]
+fn control_docs_index_rejects_rows_inside_fenced_code_blocks() {
+    let fragment = "- [Community jobs](community-jobs.md)\n";
+    for readme in [
+        "```\n- [Community jobs](community-jobs.md)\n```\n",
+        "~~~\n- [Community jobs](community-jobs.md)\n~~~\n",
+        "```md\n- [Community](index-community.md)\n```\n",
+        "~~~\n- [Community](index-community.md)\n~~~\n",
+    ] {
+        assert!(
+            !community_jobs_fixture_is_indexed(&[
+                ("docs/README.md", readme),
+                ("docs/index-community.md", fragment),
+                ("docs/community-jobs.md", "# Community jobs\n"),
+            ]),
+            "fenced README row must not count: {readme}"
+        );
+    }
+    assert!(
+        !community_jobs_fixture_is_indexed(&[
+            ("docs/README.md", "- [Community](index-community.md)\n"),
+            (
+                "docs/index-community.md",
+                "```\n- [Community jobs](community-jobs.md)\n```\n",
+            ),
+            ("docs/community-jobs.md", "# Community jobs\n"),
+        ]),
+        "fenced fragment guide row must not count"
+    );
+    // A row after a closed fence is rendered again.
+    assert!(community_jobs_fixture_is_indexed(&[
+        (
+            "docs/README.md",
+            "```\nexample\n```\n- [Community jobs](community-jobs.md)\n",
+        ),
+        ("docs/community-jobs.md", "# Community jobs\n"),
+    ]));
+}
+
+#[test]
 fn control_docs_index_rejects_non_manifest_links() {
     for line in [
         "See [Community jobs](community-jobs.md).",
@@ -1216,6 +1276,9 @@ fn control_docs_index_rejects_non_manifest_links() {
         "- [ ](index-community.md)",
         "- [Community](../docs/index-community.md)",
         "- [Community](https://example.invalid/index-community.md)",
+        // Boundary anchors of the fragment row: prefix-only and suffix-only.
+        "See - [Community](index-community.md)",
+        "- [Community](index-community.md) trailing text",
     ] {
         assert!(
             !community_jobs_fixture_is_indexed(&[
