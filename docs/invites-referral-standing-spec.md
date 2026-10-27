@@ -44,10 +44,20 @@ test callers; its module doc leaves wiring `ReferralInput` and delivering
   from funnel facts.
 - One existing DM seam can deliver a private notice with mentions
   disabled: `direct_notice` (`crates/discord/src/voice_rooms.rs:1206-1228`).
-- Privacy already governs the inputs: a suppressed inviter's `inviterId`
-  is scrubbed from join metadata (`crates/core/src/privacy.rs:108-129`),
-  membership lifecycle rows persist unconditionally while activity-family
-  rows are toggle/opt-out gated (:13-23).
+- Privacy already governs the inputs, in two different ways that this
+  spec must not conflate. **Guild analytics toggles** never gate joins,
+  leaves or `gate_cleared` (`crates/core/src/privacy.rs:13-23`). A
+  **per-member opt-out** gates every per-member write: `ingestion_blocked_in`
+  returns true for a suppressed pair before looking at the event type
+  (:143-157), so a suppressed member files no `member_join`,
+  `member_leave` or `gate_cleared` row at all. For new joins, the store
+  strips a suppressed *inviter's* `inviterId` at insert time while keeping
+  the joiner's row (`crates/store/src/store.rs:165-178`). The opt-out
+  purge, by contrast, **deletes** rows (no scrub of existing rows): it
+  removes `events` rows that name the member or merely mention their
+  snowflake in metadata (`crates/cutover/src/privacy.rs:5-8`,
+  `member_erasure_plan.json:49-52`), which includes *other* members' past
+  `member_join` rows carrying that `inviterId`.
 
 Two baseline corrections to the engine's own copy, decided here:
 
@@ -115,17 +125,23 @@ completely is never rendered as zero.
 
 No new tracking. Every input already persists for the funnel; the caller
 seam is a projection from funnel facts to `ReferralInput`
-(`referral_rewards.rs:61-75`), run per guild:
+(`referral_rewards.rs:61-75`), run per guild. The projection retains
+`events.id` alongside each join until ordering is complete: ascending
+`(occurred_at, events.id)` is the first-attribution-wins order, including
+when timestamps tie. The existing `AttributedJoin` has no event-ID field;
+keep that key in the caller's projection envelope, sort before converting
+to `AttributedJoin`, and preserve the order in `ReferralInput.joins`.
+No engine type change is required:
 
 | `ReferralInput` field | Existing source | Projection rule |
 | --- | --- | --- |
-| `joins[].member_id, joined_at_ms` | `member_join` funnel rows (`handlers.rs:642-653`) | Only rows carrying `metadata["inviterId"]` enter; others cannot credit anyone and are excluded |
-| `joins[].source` | row `source` | Must be `invite:CODE` (the live writer pairs it with `inviterId`); a mismatched row is excluded and logged as data-quality, never guessed |
-| `joins[].exact` | — (not persisted) | `exact := inviterId present`. The live writer sets `inviter_id` only when a single code grew for that join event (`pipeline.rs:800-804`), so presence is the persisted form of single-code proof. Known corner: two joins through one code between snapshots attribute the growth to the first processed join and file the second unattributed — under-credit, never over-credit. Accepted; see §5 |
-| `code_inviter` | the same rows | Synthesized as `CODE -> inviterId`, first (chronological) row wins per code. Current `invite_snapshots` lose deleted codes, so rows are the only complete source. A code later recreated by a different inviter collides in this map: first-seen wins and the conflict is logged; Discord codes are random and `rotate_code` preserves the inviter (`invites.rs:438-478`), so a genuine collision needs manual review, not silent re-credit |
+| `joins[].member_id, joined_at_ms` | `member_join` funnel rows (`handlers.rs:642-653`) | **Every** `member_join` row of a candidate member enters, whatever its source or whether it carries `inviterId`, in `(occurred_at, events.id)` order. The engine's leave-rejoin guard (`evaluate_one`'s `already_seen`, `:326`) only sees joins it is fed: a friend whose first join was unattributed or via another inviter, then rejoined through the invoker's code, must show the earlier row or the rejoin would credit the invoker as a "first" join. Rows that cannot credit are fed with `exact=false` (below), which makes them `NotProven` — they occupy the first-join slot and are never rendered as a count |
+| `joins[].source` | row `source` | The persisted `source`. A row that fails the `exact` conditions below keeps its source string but cannot credit; a `source` that is not `invite:CODE` while `inviterId` is present is logged as data-quality, never guessed |
+| `joins[].exact` | — (not persisted) | `exact := true` only when **all** hold: (a) `inviterId` present and `source = invite:CODE`; (b) `inviterId` equals the code's canonical inviter (next row); (c) the burst guard is clear. **`inviterId` presence alone is not proof.** The live writer sets it whenever *one* code grew since the last snapshot (`pipeline.rs:788-805`); it never counts how many joins happened in that window. A vanity or otherwise unattributed join processed first sees the personal code's growth and takes its credit; the real personal-link joiner then sees no growth and files `vanity`/`unknown`. **Burst guard:** a join is exact only if no *other* `member_join` row in the same guild (any source, including unattributed, vanity, `unknown`, `ambiguous:*`) falls within ±`W` of it. `W` is a build-slice constant sized to the gateway's snapshot latency and pinned with fixtures (proposal: 120 s; shorter risks mis-credit, longer under-credits), and the guard counts joins, not codes. Joins that left no row (a suppressed member's join is never filed, §1; an erased member's rows are gone) are invisible to the guard — a named residual, bounded by the experiential-only tiers. Two joins through one code in a window therefore both lose credit: under-credit, never the old "first one credits" shape (RF-08, RF-27) |
+| `code_inviter` | the same rows | For each candidate code, read its guild-scoped attribution history and select the earliest `(occurred_at, events.id)` row's `inviterId` as canonical. A candidate join whose persisted `inviterId` differs from that canonical inviter is **fed with `exact=false`** (it cannot credit, still occupies its first-join slot) **before** `code_inviter` is built; then build `CODE -> inviterId` from the canonical rows only. Current `invite_snapshots` lose deleted codes, so persisted rows supply the history. A recreated code's second-era joins are logged as a conflict and never credited to the first-seen inviter or to the new one; manual review is diagnostic, not a safety control |
 | `standings[].left_at_ms` | `member_leave` rows (`funnel.rs:45-46`) | First leave after the member's attributed join; absent = still present |
-| `standings[].engaged` | funnel rows for that member | Any of `gate_cleared`, `first_message`, `first_voice_session` (`funnel.rs:23-39`). `gate_cleared` persists unconditionally (`privacy.rs:19-23`), so a privacy-opted-out member can still credit their inviter through the rules gate without any analytics row (§4) |
-| `known_referrals`, `prior_credits` | the credit ledger, once §7 slice 3 lands | Until then: empty, with all joins evaluated as one chronological batch (input order = `occurred_at`, so first-attribution-wins means the earliest join). After banking: prior edges/totals load from the ledger, and "unbanked" means every join whose member has no credited edge — **including previously rejected or pending joins**, re-fed in chronological order. Only credits bank; rejections never do. Anything narrower breaks RF-04: fed alone, a genuine rejoin after a rejected temporary first stay would credit, because cross-batch duplicate detection sees only credited edges (`:64-75,325-327`) |
+| `standings[].engaged` | funnel rows for that member | Any of `gate_cleared`, `first_message`, `first_voice_session` (`funnel.rs:23-39`). `gate_cleared` is exempt from the guild analytics *toggles* (`privacy.rs:19-23`), so a guild that disables activity or voice analytics can still credit through the rules gate. It is **not** exempt from a per-member opt-out: a suppressed member files no join, leave or gate row at all (§1), so they produce no credit, no pending count and no engagement evidence for their inviter (§4, RF-15) |
+| `known_referrals`, `prior_credits` | the credit ledger, once §7 slice 3 lands | Until then: empty, with all joins evaluated as one chronological batch (input order = `(occurred_at, events.id)`, so first-attribution-wins means the earliest join with a stable tie-breaker). After banking: prior edges/totals load from the ledger, and "unbanked" means every join whose member has no credited edge — **including previously rejected or pending joins**, re-fed in chronological order. Only credits bank; rejections never do. Anything narrower breaks RF-04: fed alone, a genuine rejoin after a rejected temporary first stay would credit, because cross-batch duplicate detection sees only credited edges (`:64-75,325-327`) |
 | `now_ms`, `min_tenure_days` | clock; engine default | `MIN_TENURE_DAYS_DEFAULT` (7) unchanged in v1; per-guild tuning is out of scope |
 
 Sequencing keeps one source of truth for counts:
@@ -136,9 +152,18 @@ Sequencing keeps one source of truth for counts:
   read it fetches only: rows with `inviterId = invoker`, rows with
   `inviterId` in the set of members the invoker was credited for (2nd-hop
   candidates), the invoker's own `member_join` row (referred-in state),
-  and leave/engagement rows for those member IDs. A proposed hard cap of
-  5,000 projected rows returns "unavailable" instead of a partial count;
-  the build slice pins the real bound with fixtures.
+  **every** `member_join` row of each candidate member regardless of
+  `inviterId` or source (the dedupe history; an inviter-scoped filter alone
+  would lose a friend's earlier join), a bounded count of other-member
+  joins within `W` of each candidate join (the burst guard), and
+  leave/engagement rows for **the invoker and those member IDs**.
+  `ReferralInput.standings` includes the invoker too, so their own join
+  can be rejected as temporary or credited after tenure and engagement.
+  The read also resolves canonical inviters from history for each
+  candidate code before filtering mismatches as above. A proposed hard
+  cap of 5,000 projected rows, including that history, returns
+  "unavailable" instead of a partial count; the build slice pins the real
+  bound with fixtures.
 - **Notices = a daily evaluator job plus a small ledger** (§7 slice 3),
   because compute-on-read has nowhere to record what was already sent. The job runs
   under the existing community-jobs supervisor (`docs/community-jobs.md`),
@@ -158,9 +183,9 @@ Sequencing keeps one source of truth for counts:
 ## 4. Notices, anti-farm and privacy decisions
 
 **Notices.** When a referral credits or a tier unlocks, the recipient
-gets **exactly one DM per daily batch**, coalescing every event that
-batch produced for them (direct credits + bonus credits + any tier
-unlock) into one counts-only message via the `direct_notice` seam
+gets **at most one DM per daily batch, with one when delivery succeeds**,
+coalescing every event that batch produced for them (direct credits +
+bonus credits + any tier unlock) into one counts-only message via the `direct_notice` seam
 (mentions disabled). v1 sends no other referral DM:
 
 - No referred-in DM to the new member. It would arrive ≥7 days after
@@ -220,9 +245,10 @@ temporary, unproven — §1). Decisions on what remains:
 
 | Event | Standing / notice consequence |
 | --- | --- |
-| Inviter runs `/privacy opt-out` | Existing scrub removes their `inviterId` from join metadata (`privacy.rs:108-129`), so compute-on-read credits vanish; ledger credit/notice rows for that inviter must join the erasure plan in the same build slice that creates them. No further notices |
-| Referred member opts out / is deleted | Their stored activity is deleted by the existing flow; if the `member_join` row goes, the credit drops out of recomputed standing (counts can go down — standing is current truth). Already-sent DMs are not unsent; nothing new is sent about them |
-| Referred member opted out *before* joining activity | Gated activity rows never persist, but `gate_cleared` does; engagement can still be proven via the rules gate alone (§3). No new tracking is added to compensate |
+| Inviter runs `/privacy opt-out` | The purge **deletes** existing `events` rows that mention their snowflake, including other members' past `member_join` rows carrying their `inviterId` (not a metadata scrub; `member_erasure_plan.json:49-52`). Only joins filed *after* the opt-out are scrubbed at insert time (§1). Credits vanish from compute-on-read either way; ledger credit/notice rows for that inviter must join the erasure plan in the same build slice that creates them. No further notices. Side effect, accepted: a referred friend's deleted join row also deletes their first-join history, so a later rejoin through another inviter's code looks like a first join and can credit that inviter once. Bounded to one credit per erased edge, same cost as any referral (7 days + engagement); the credit ledger (§7 slice 3) does not prevent it because the deleted edge was never banked as another inviter's. Changing the purge to scrub instead of delete is a separate privacy decision, out of scope here |
+| Referred member opts out / is deleted | The opt-out purge deletes their stored rows and suppression stops all future per-member rows, including joins, leaves and gate clears (§1). The credit drops out of recomputed standing (counts can go down — standing is current truth). Already-sent DMs are not unsent; nothing new is sent about them |
+| Referred member opted out *before* joining | No `member_join`, `member_leave` or `gate_cleared` row persists, so there is nothing to project: no credit, no pending count, no notice. The inviter sees only a smaller count; the copy never explains why. This is a deliberate consequence of honoring the opt-out; no new tracking is added to compensate (RF-15) |
+| Guild disables activity or voice analytics | Joins, leaves and `gate_cleared` still persist (toggles do not gate them), so credits still resolve through the rules gate; only message/voice engagement evidence is lost (RF-15a) |
 | Member leaves (no erasure) | A stay that earned credit keeps it (engine: genuine-then-left still credits); a leaver before tenure is rejected permanently — a later rejoin does not resurrect it (first stay decides; accepted limitation, §5) |
 | Inviter leaves | Banked credits survive in facts/ledger; notices are only attempted for current members; standing is readable again if they rejoin |
 | Member is banned without erasure | Facts stand; credit already earned stands. Moderation interplay (e.g. raid joins) is out of scope: unproven burst attribution already files `ambiguous`/unknown and credits nobody |
@@ -246,31 +272,39 @@ surface this spec adds.
 | RF-02 | Friend joins, day 6, engaged | Pending "joined recently"; no credit, no DM; credits when re-evaluated after day 7 |
 | RF-03 | Friend joins, day 30, never engaged | Pending "not active here yet"; never credits early; no DM |
 | RF-04 | Friend joins, leaves day 3, rejoins day 20 via same code, stays | Rejected temporary on first stay; rejoin is a duplicate; 0 credits forever (documented limitation) |
-| RF-05 | Friend joins, stays 25d engaged, then leaves | Credits; leaving afterwards does not revoke |
+| RF-05 | Friend joins, stays 25d engaged, then leaves | Credits; leaving afterward does not revoke |
 | RF-06 | Invoker joins their own code on an alt, stays, engages | Self-referral only if same account; true alt credits — accepted residual (§4), visible only as a count |
 | RF-07 | Six friends join in one snapshot window; two codes grew | `ambiguous` files; 0 credits; nobody notified |
-| RF-08 | Two friends join through one code between snapshots | First processed join carries `inviterId`, second files unattributed: at most 1 credit (under-credit corner, §3) |
+| RF-08 | Two friends join through one code between snapshots | First processed join carries `inviterId`, second files unattributed; the burst guard sees another join within `W`, so **neither** is exact: 0 credits (under-credit, §3) |
 | RF-09 | Friend joins via vanity/public link | No attribution; 0 credits; what-counts copy explains |
 | RF-10 | Credited friend later refers their own friend, who credits | Middle member: direct +1; invoker: bonus +1; both count toward tiers; bonus folds into invoker's next coalesced DM |
 | RF-11 | Invoker banks 4 credits; 5th lands | Tier crosses to role in that batch only; exactly one tier DM; standing shows "Top tier reached" |
 | RF-12 | Repeat credit inside the same tier | Credit count grows; no tier DM (engine: milestone fires once per tier) |
-| RF-13 | Inviter opts out after 2 credits | Scrubbed metadata + erased ledger rows; standing recomputes without them; no DM |
+| RF-13 | Inviter opts out after 2 credits | Opt-out purge deletes the two friends' past join rows that carry their `inviterId`; new joins via their links are scrubbed at insert; ledger rows erased; standing recomputes without them; no DM |
 | RF-14 | Referred member is erased after crediting | Edge removed; invoker's credited count drops by 1 on next read; sent DMs unchanged; tier shown is recomputed truth |
-| RF-15 | Referred member is privacy-opted-out; only `gate_cleared` persists | Engaged via rules gate; credits after tenure; no analytics row created |
-| RF-16 | Daily batch credits 12 joins for one invoker | One DM total for that invoker in that batch, counts only; 12 credit rows, 12 notice keys marked sent |
+| RF-15 | Referred member is privacy-opted-out before joining | No join, leave or gate row persists; 0 credits, no pending count, no notice; inviter's count simply excludes them |
+| RF-15a | Guild disables activity and voice analytics; friend clears the rules gate, stays 10d | Join and `gate_cleared` persist; engaged via the gate; credits after tenure |
+| RF-16 | Daily batch credits 12 joins for one invoker; delivery succeeds | One DM total for that invoker in that batch, counts only; 12 credit rows, 12 notice keys marked sent |
 | RF-17 | Evaluator crashes after claiming notices, before send | At-most-once: those keys never re-send; credits stand; next batch sends nothing stale |
 | RF-18 | Recipient has DMs closed | Notice marked undeliverable; no retry; standing still shows the credit |
 | RF-19 | Same batch re-run (restart, replay) | `ON CONFLICT DO NOTHING` yields 0 new credits, 0 new notice keys, 0 DMs |
-| RF-20 | Code deleted, same string recreated by another member, both eras have joins | First-seen inviter wins in the synthesized map; conflict logged; second era's joins credit first-seen inviter until an operator reviews — never silently split |
+| RF-20 | Code deleted, same string recreated by another member, both eras have joins | First-era inviter stays canonical; second-era rows with a different persisted `inviterId` are excluded before evaluation and logged; 0 credits or notices from those excluded rows to either inviter, without waiting for manual review |
 | RF-21 | Bot account joins via a code | No funnel join row exists; nothing to credit |
 | RF-22 | Member with zero attributed joins runs `/invites` | Zeros + what-counts copy; not an error |
 | RF-23 | Projection read fails mid-way | One "unavailable" ephemeral; no partial counts; no DM side effects |
+| RF-24 | Invoker's first attributed stay ends on day 3; standing is read after rejoining | Invoker's leave row is projected; temporary first join rejected, rejoin duplicate; no referred-in line |
+| RF-25 | Invoker's own attributed join is current, 10d old and engaged | Invoker's engagement is projected; own join credits; referred-in line appears without naming the inviter |
+| RF-26 | Same member has two attributed join rows with equal timestamps; loader returns them in either order | Projection orders by numeric persisted `events.id` after `occurred_at`; lower ID is first, later row is duplicate; verdicts and inviter credit are identical on every read |
+| RF-27 | Vanity join processed first, personal-link join in the same window (one personal code grew) | Burst guard sees two joins within `W`: neither is exact; 0 credits; the vanity joiner is never credited to the personal-link owner |
+| RF-28 | Friend's first join unattributed (or via another inviter), later rejoins through the invoker's code and stays | Earlier row is fed (`exact=false`); the rejoin is a `DuplicateJoin`; 0 credits for the invoker |
 
 ## 6. Offline oracle
 
-Pins the standing arithmetic and reply spine. The Python mirrors the
-engine's thresholds (`referral_rewards.rs:35-37,156-175`) so a threshold
-or title change fails here until both move together.
+Pins the standing arithmetic and reply spine. The Python thresholds and
+titles are **manually synchronized** with the engine
+(`referral_rewards.rs:35-37,156-175`). This doctest checks only the Python
+example; it does not detect Rust threshold or title drift. Reviewers must
+compare both sources when either changes.
 
 ```pycon
 >>> TIERS = [(1, "Member spotlight"), (3, "Profile flair"), (5, "Referrer status role")]
@@ -297,7 +331,7 @@ untouched: tiers stay experiential, never paid.
    recommend alternative A and stop. Doubles as the before-picture for
    the metric below.
 2. **Acceptance tests** for the funnel→`ReferralInput` projection and
-   standing rendering (RF-01…RF-15, RF-20…RF-23), written against this
+   standing rendering (RF-01…RF-15a, RF-20…RF-28), written against this
    spec by the test author; then **`/invites` compute-on-read handler**
    plus commands-doc regeneration and the normal command-publish gates.
 3. **Credit + notice ledger and daily evaluator job** (RF-16…RF-19):
@@ -315,7 +349,8 @@ untouched: tiers stay experiential, never paid.
 **Metric and review.** Primary: credited referrals/week versus the slice-1
 baseline; secondary: movement in weekly-active humans; guardrails: DM
 undeliverable rate and any member complaints, rejected share of attributed
-joins (a rising share suggests farming pressure). Credits lag joins by at
+joins and the burst-guard share (a rising share suggests farming pressure
+or a `W` set too wide). Credits lag joins by at
 least 7 days, so reviews run **weekly starting 14 days after launch**;
 a 7-day review would judge an empty pipe.
 
