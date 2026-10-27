@@ -89,7 +89,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution PII](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
-- [Timed lockdown](time-boxed-lockdown-decision.md)
 - [Lockdown](time-boxed-lockdown-decision.md)
 - [Slowmode](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
@@ -166,8 +165,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Giveaway leave](giveaway-withdrawal-spec.md)
 - [Lifecycle](ticket-lifecycle-observability.md)
 - [Triage](suggestions-triage-box.md)
-- [Ticket life](ticket-lifecycle-observability.md)
-- [Suggestions triage](suggestions-triage-box.md)
 
 ## Voice
 
@@ -190,9 +187,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Template lint](voice-template-lint-core.md)
 - [Assistant config](voice-assistant-core.md)
 - [Assistant cap ledger](voice-assistant-cap-core.md)
-- [Assistant requests](voice-assistant-request-core.md)
-- [Assistant validation](voice-assistant-validate-core.md)
-- [Assistant retry](voice-assistant-build-core.md)
 - [Assist requests](voice-assistant-request-core.md)
 - [Assist validate](voice-assistant-validate-core.md)
 - [Assist build](voice-assistant-build-core.md)
@@ -249,9 +243,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
 - [Binary lifecycle](alive-acceptance.md)
-- [Presence probe tests](presence-probe-acceptance.md)
-- [REST pacing tests](pacing-backoff-acceptance.md)
-- [Retention acceptance](testing/retention-runtime.md)
 - [Presence probe](presence-probe-acceptance.md)
 - [REST pacing](pacing-backoff-acceptance.md)
 - [Retention runtime](testing/retention-runtime.md)
