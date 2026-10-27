@@ -70,8 +70,9 @@ ABSENT = (
 )
 
 # The full leg list in .github/workflows/check.yml at 817707990 (the
-# pre-shard patch-coverage job): two workspace sweeps plus every dedicated
-# ignored/DB cov leg, as (package, target, selected-via---test-flag).
+# pre-shard patch-coverage job), plus the serial invite-saturation store
+# leg added since: two workspace sweeps plus every dedicated cov leg, as
+# (package, target, selected-via---test-flag).
 EXPECTED_DEDICATED_LEGS = [
     ("two-bot-core", "stream_live_store", True),
     ("two-bot-discord", "mutation_429_proves_no_effect_channel", True),
@@ -87,6 +88,7 @@ EXPECTED_DEDICATED_LEGS = [
     ("two-bot-cutover", "reengagement_list_db", True),
     ("two-bot-cutover", "game_activity_report_db", True),
     ("two-bot-core", "member_moderation_db", True),
+    ("two-bot-store", "invite_uses_saturation_acceptance", True),
 ]
 EXPECTED_WORKSPACE_SWEEPS = 2
 EXPECTED_TOTAL_LEGS = len(EXPECTED_DEDICATED_LEGS) + EXPECTED_WORKSPACE_SWEEPS
@@ -437,6 +439,7 @@ class ChangedCrateSelectionTests(unittest.TestCase):
     def test_store_change_selects_dependents_not_dependencies(self):
         planner = load_planner(self)
         selected = self.selected(planner, ["crates/store/src/lib.rs"])
+        self.assert_pkg_legs(planner, selected, "two-bot-store", True)
         self.assert_pkg_legs(planner, selected, "two-bot-cutover", True)
         self.assert_pkg_legs(planner, selected, "two-bot-core", False)
         self.assert_pkg_legs(planner, selected, "two-bot-discord", False)
@@ -448,6 +451,7 @@ class ChangedCrateSelectionTests(unittest.TestCase):
         self.assert_pkg_legs(planner, selected, "two-bot-discord", True)
         self.assert_pkg_legs(planner, selected, "two-bot-cutover", True)
         self.assert_pkg_legs(planner, selected, "two-bot-core", False)
+        self.assert_pkg_legs(planner, selected, "two-bot-store", False)
 
     def test_core_change_selects_everything_without_widening(self):
         planner = load_planner(self)
@@ -458,7 +462,8 @@ class ChangedCrateSelectionTests(unittest.TestCase):
     def test_leaf_crate_change_selects_no_dedicated_legs(self):
         planner = load_planner(self)
         selected = self.selected(planner, ["crates/bot/src/main.rs"])
-        for pkg in ("two-bot-core", "two-bot-discord", "two-bot-cutover"):
+        for pkg in ("two-bot-core", "two-bot-discord", "two-bot-cutover",
+                    "two-bot-store"):
             self.assert_pkg_legs(planner, selected, pkg, False)
         self.assertTrue(set(planner.ALWAYS_ON_LEGS) <= selected)
 
