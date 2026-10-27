@@ -412,6 +412,9 @@ async fn dry_run_guild_projection_counts_report_rows_exactly_as_execute_removes_
     )
     .await;
     reporter(pool, "840000000000000052", SUBJECT).await.unwrap();
+    // The other reporter survives user erasure because the parent is redacted,
+    // not deleted; its row must still count toward the guild purge.
+    reporter(pool, "840000000000000052", OTHER).await.unwrap();
     group(
         pool,
         "840000000000000053",
@@ -493,6 +496,11 @@ async fn author_erasure_clears_a_lone_overflow_flag_and_keeps_trailing_digit_nei
         .execute(pool)
         .await
         .unwrap();
+    // A message can literally contain '[erased]'; attachment metadata alone
+    // must still select it even when the overflow flag is false.
+    let attached = "840000000000000064";
+    group(pool, attached, GUILD, REPORTER, SUBJECT, "closed", Some(1)).await;
+    snapshot(pool, attached, SUBJECT, "[erased]", false).await;
     // The erased ID followed by another digit is a different number.
     let neighbour = "840000000000000062";
     let prose = format!("Synthetic order {SUBJECT}9 is a different number");
@@ -527,6 +535,10 @@ async fn author_erasure_clears_a_lone_overflow_flag_and_keeps_trailing_digit_nei
         "the lone overflow flag is cleared"
     );
     assert_eq!(snap["content"], "[erased]");
+    let snap = row(pool, "report_snapshots", "report_id", attached).await;
+    assert_eq!(snap["content"], "[erased]");
+    assert_eq!(snap["attachments"], json!([]), "lone metadata is cleared");
+    assert_eq!(snap["attachment_overflow"], false);
     assert_eq!(
         row(pool, "member_reports", "id", neighbour).await["reason"],
         prose,
@@ -535,6 +547,25 @@ async fn author_erasure_clears_a_lone_overflow_flag_and_keeps_trailing_digit_nei
     assert_eq!(
         row(pool, "member_reports", "id", mention).await["reason"],
         "Synthetic mention <@[erased]> and [erased]."
+    );
+    let remaining = erase_member(pool, GUILD, SUBJECT, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    assert!(
+        remaining.iter().all(|row| row.rows == 0),
+        "no predicate may keep selecting redacted rows or trailing-digit neighbours: {remaining:?}"
+    );
+    let repeated = erase_member(
+        pool,
+        GUILD,
+        SUBJECT,
+        ErasureMode::Execute { actor: "hardening" },
+    )
+    .await
+    .unwrap();
+    assert!(
+        repeated.iter().all(|row| row.rows == 0),
+        "repeated author erasure changes no rows: {repeated:?}"
     );
     db.close().await.unwrap();
 }
