@@ -129,7 +129,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Bans",
         requires: Some("Ban Members"),
-        commands: &["ban", "tempban"],
+        commands: &["ban", "tempban", "tempban-list"],
         anchor: None,
     },
     HelpGroup {
@@ -318,7 +318,7 @@ pub fn unknown_help_correction() -> String {
 /// markup, links or mentions. Reply-level mention suppression stays the
 /// mention backstop. Generated framing (usage brackets, section headers)
 /// never passes through here.
-fn inert(text: &str) -> String {
+pub(crate) fn inert(text: &str) -> String {
     text.chars()
         .filter_map(|ch| match ch {
             '*' | '`' | '<' | '>' | '[' | ']' | '(' | ')' | '\\' => None,
@@ -782,12 +782,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 43 non-voice commands (7 core + 25 feature + 9 moderation + 2 reads),
+        // 44 non-voice commands (7 core + 25 feature + 9 moderation + 3 reads),
         // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
         // purge-preview and channel-inspect, plus 22 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (65 live)"));
+        assert!(text.contains("**Server commands** (66 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -816,6 +816,7 @@ mod tests {
             );
         }
         for line in [
+            "**Bans** — needs Ban Members\n/ban · /tempban · /tempban-list\n",
             "**Giveaways** — needs Manage Server\n/giveaway\n",
             "**Message cleanup** — needs Manage Messages\n/purge · /purge-preview\n",
             "**Channel slowmode and locks** — needs Manage Channels\n/slowmode · /lockdown · /unlock · /channel-inspect\n",
@@ -913,11 +914,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 43 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
-        // giveaway, lfg-edit, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
+        // 44 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
+        // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview and channel-inspect, plus
         // 22 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 65);
+        assert_eq!(grouped.len(), 66);
         for name in [
             "rank",
             "leaderboard",
@@ -944,6 +945,7 @@ mod tests {
             "feed-inspect",
             "ban",
             "tempban",
+            "tempban-list",
             "kick",
             "timeout",
             "warn",

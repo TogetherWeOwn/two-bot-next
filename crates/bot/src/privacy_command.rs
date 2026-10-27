@@ -22,7 +22,8 @@
 
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::{
-    application_command::CommandOptionValue, Interaction,
+    application_command::{CommandDataOption, CommandOptionValue},
+    Interaction,
 };
 use two_bot_cutover::{
     db::CutoverDb,
@@ -56,19 +57,34 @@ const USAGE_REPLY: &str = "Use `/privacy opt-out`, `/privacy opt-in`, `/privacy 
 /// unaffected.
 const OPT_OUT_COOLDOWN_MINUTES: i32 = 10;
 
+/// The scope notice every analytics reply carries verbatim: the choice is
+/// per-member, per-server analytics only, the server's analytics switches
+/// still gate collection, and moderation, safety and delivery records are
+/// never touched by an opt-out, opt-in or status read (see
+/// `docs/privacy.md`). Repeating it on fresh, repeat, cooldown, opt-in and
+/// status replies keeps one reply from implying a broader erasure than
+/// another.
+const ANALYTICS_SCOPE_NOTICE: &str = "Analytics settings apply only to your analytics in this \
+     server; server switches still apply, and moderation, safety and delivery records are unchanged.";
+
 const ALREADY_OPTED_OUT_REPLY: &str = "You are already opted out of analytics for this server. \
      Your stored activity here was deleted and future activity will not be stored. \
+     Analytics settings apply only to your analytics in this server; server switches still \
+     apply, and moderation, safety and delivery records are unchanged. \
      Use `/privacy opt-in` to resume.";
 
 const OPT_OUT_COOLDOWN_REPLY: &str = "You recently changed your privacy setting; \
-     try `/privacy opt-out` again in a few minutes.";
+     try `/privacy opt-out` again in a few minutes. \
+     Analytics settings apply only to your analytics in this server; server switches still \
+     apply, and moderation, safety and delivery records are unchanged.";
 
 fn opt_out_reply(outcome: &OptOutOutcome) -> &'static str {
     match outcome {
         OptOutOutcome::OptedOut(_) => {
             "You are opted out of analytics for this server. \
              Your stored activity here was deleted and future activity will not be stored. \
-             Moderation, safety and delivery records are unchanged. \
+             Analytics settings apply only to your analytics in this server; server switches \
+             still apply, and moderation, safety and delivery records are unchanged. \
              Use `/privacy opt-in` to resume."
         }
         OptOutOutcome::AlreadyOptedOut => ALREADY_OPTED_OUT_REPLY,
@@ -88,8 +104,39 @@ pub(crate) enum PrivacyAction {
     Invalid,
 }
 
-/// Decode the invoked subcommand. Anything missing or unknown refuses before
-/// database access.
+/// Request-id byte bound enforced by the deletion service; mirrored here so
+/// a malformed id is corrected at decode, before any database access.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// The deletion service treats the request id as opaque text with exactly
+/// these bounds: nonblank, at most [`MAX_REQUEST_ID_LEN`] bytes, no control
+/// characters (`two_bot_cutover::deletion_intake`). No prefix or hash grammar
+/// is imposed and the value is never trimmed before it reaches the service.
+fn valid_request_id(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_REQUEST_ID_LEN
+        && !value.chars().any(|c| c.is_control())
+}
+
+/// The one accepted nested shape on the two lookup subcommands: exactly one
+/// `request-id` option holding valid text. Absent, duplicated, additional or
+/// wrong-typed options are all malformed.
+fn nested_request_id(children: &[CommandDataOption]) -> Option<&str> {
+    let [only] = children else { return None };
+    if only.name != "request-id" {
+        return None;
+    }
+    let CommandOptionValue::String(value) = &only.value else {
+        return None;
+    };
+    valid_request_id(value).then_some(value.as_str())
+}
+
+/// Decode the invoked subcommand from the complete published shape: exactly
+/// one recognized subcommand, no nested options on the optionless actions,
+/// and exactly the required request-id option on the two lookups. Anything
+/// missing, additional, duplicated or mistyped is ambiguous and refuses
+/// before any database access.
 pub(crate) fn privacy_action(interaction: &Interaction) -> PrivacyAction {
     let Interaction {
         data:
@@ -99,24 +146,27 @@ pub(crate) fn privacy_action(interaction: &Interaction) -> PrivacyAction {
     else {
         return PrivacyAction::Invalid;
     };
-    let Some(first) = data.options.first() else {
+    let [only] = data.options.as_slice() else {
         return PrivacyAction::Invalid;
     };
-    if !matches!(first.value, CommandOptionValue::SubCommand(_)) {
+    let CommandOptionValue::SubCommand(children) = &only.value else {
         return PrivacyAction::Invalid;
-    }
-    match first.name.as_str() {
-        "opt-out" => PrivacyAction::OptOut,
-        "opt-in" => PrivacyAction::OptIn,
-        "status" => PrivacyAction::Status,
-        "delete" => PrivacyAction::DeletionRequest,
-        "deletion-status" => PrivacyAction::DeletionStatus,
-        "deletion-receipt" => PrivacyAction::DeletionReceipt,
+    };
+    match only.name.as_str() {
+        "opt-out" if children.is_empty() => PrivacyAction::OptOut,
+        "opt-in" if children.is_empty() => PrivacyAction::OptIn,
+        "status" if children.is_empty() => PrivacyAction::Status,
+        "delete" if children.is_empty() => PrivacyAction::DeletionRequest,
+        "deletion-status" if nested_request_id(children).is_some() => PrivacyAction::DeletionStatus,
+        "deletion-receipt" if nested_request_id(children).is_some() => {
+            PrivacyAction::DeletionReceipt
+        }
         _ => PrivacyAction::Invalid,
     }
 }
 
-/// Read the nested request id from a deletion-status or deletion-receipt interaction.
+/// Read the nested request id from a deletion-status or deletion-receipt
+/// interaction, under the same complete shape [`privacy_action`] requires.
 pub(crate) fn deletion_request_id(interaction: &Interaction) -> Option<&str> {
     let Interaction {
         data:
@@ -126,20 +176,16 @@ pub(crate) fn deletion_request_id(interaction: &Interaction) -> Option<&str> {
     else {
         return None;
     };
-    let first = data.options.first()?;
-    if !matches!(first.name.as_str(), "deletion-status" | "deletion-receipt") {
-        return None;
-    }
-    let CommandOptionValue::SubCommand(options) = &first.value else {
+    let [only] = data.options.as_slice() else {
         return None;
     };
-    options
-        .iter()
-        .find(|option| option.name == "request-id")
-        .and_then(|option| match &option.value {
-            CommandOptionValue::String(value) => Some(value.as_str()),
-            _ => None,
-        })
+    if !matches!(only.name.as_str(), "deletion-status" | "deletion-receipt") {
+        return None;
+    }
+    let CommandOptionValue::SubCommand(children) = &only.value else {
+        return None;
+    };
+    nested_request_id(children)
 }
 
 /// Complete the original ephemeral defer with `content`.
@@ -209,8 +255,11 @@ pub(crate) async fn privacy_command(
                 finish(
                     executor,
                     interaction,
-                    "Analytics persistence is back on for this server. \
-                     Rows deleted while you were opted out are not restored.",
+                    format!(
+                        "Analytics persistence is back on for this server. \
+                         Rows deleted while you were opted out are not restored. \
+                         {ANALYTICS_SCOPE_NOTICE}"
+                    ),
                 )
                 .await;
             }
@@ -218,7 +267,10 @@ pub(crate) async fn privacy_command(
                 finish(
                     executor,
                     interaction,
-                    "You were not opted out; analytics persistence was already on for this server.",
+                    format!(
+                        "You were not opted out; analytics persistence was already on for this server. \
+                         {ANALYTICS_SCOPE_NOTICE}"
+                    ),
                 )
                 .await;
             }
@@ -240,7 +292,8 @@ pub(crate) async fn privacy_command(
                         interaction,
                         format!(
                             "Analytics for you in this server: {}. \
-                             Server switches: presence {}, activity {}, voice {}.",
+                             Server switches: presence {}, activity {}, voice {}. \
+                             {ANALYTICS_SCOPE_NOTICE}",
                             if suppressed { "opted out" } else { "on" },
                             on_off(presence),
                             on_off(activity),
@@ -515,5 +568,63 @@ mod tests {
         );
         assert_ne!(fresh, ALREADY_OPTED_OUT_REPLY);
         assert_ne!(fresh, OPT_OUT_COOLDOWN_REPLY);
+        // Every opt-out outcome carries the shared scope notice verbatim, so
+        // no reply implies a broader erasure than another.
+        for outcome in [
+            OptOutOutcome::OptedOut(Vec::new()),
+            OptOutOutcome::AlreadyOptedOut,
+            OptOutOutcome::Cooldown,
+        ] {
+            assert!(
+                opt_out_reply(&outcome).contains(ANALYTICS_SCOPE_NOTICE),
+                "{outcome:?} reply lost the scope notice"
+            );
+        }
+    }
+
+    fn lookup(subcommand: &str, children: Vec<(&str, &str)>) -> Interaction {
+        let children = children
+            .into_iter()
+            .map(|(name, value)| CommandDataOption {
+                name: name.to_owned(),
+                value: CommandOptionValue::String(value.to_owned()),
+            })
+            .collect();
+        crate::command_runtime_tests::slash(
+            "privacy",
+            None,
+            vec![CommandDataOption {
+                name: subcommand.to_owned(),
+                value: CommandOptionValue::SubCommand(children),
+            }],
+        )
+    }
+
+    #[test]
+    fn lookup_decode_rejects_wrong_named_and_spaces_only_request_ids() {
+        for subcommand in ["deletion-status", "deletion-receipt"] {
+            // Control: the one correctly named, valid child decodes.
+            assert_ne!(
+                privacy_action(&lookup(
+                    subcommand,
+                    vec![("request-id", "del-0123456789abcdef")]
+                )),
+                PrivacyAction::Invalid
+            );
+            // A single String child under any other name is not the request
+            // id, however valid its text; it never reaches the service.
+            for name in ["request", "request_id", "Request-Id", "member", "status"] {
+                let interaction = lookup(subcommand, vec![(name, "del-0123456789abcdef")]);
+                assert_eq!(privacy_action(&interaction), PrivacyAction::Invalid);
+                assert_eq!(deletion_request_id(&interaction), None);
+            }
+            // Spaces-only text is blank by the service's trimmed bound; it has
+            // no control character, so the blank clause alone must refuse it.
+            for blank in [" ", "   ", "\u{a0}", "\u{2003}"] {
+                let interaction = lookup(subcommand, vec![("request-id", blank)]);
+                assert_eq!(privacy_action(&interaction), PrivacyAction::Invalid);
+                assert_eq!(deletion_request_id(&interaction), None);
+            }
+        }
     }
 }
