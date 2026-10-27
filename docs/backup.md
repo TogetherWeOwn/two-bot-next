@@ -247,11 +247,13 @@ An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-Three application tables are excluded, each with its reason inline in
+Four application tables are excluded, each with its reason inline in
 `EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
 target cooldowns), `discord_send_admission` (per-credential lane state that a
-recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
-queue bound to a gateway session). The store chain's `rollback_journal` and
+recovered process re-learns), `gateway_onboarding_jobs` (a restart-recovery
+queue bound to a gateway session) and `automation_command_registry_resync`
+(the pending registry-publication marker; a recovered process republishes
+the complete custom-command set on boot regardless). The store chain's `rollback_journal` and
 `rollback_watermarks` are excluded too: the journal is append-only
 cutover evidence (the `PgFunnelStore` funnel append and the production
 gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each

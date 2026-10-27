@@ -383,11 +383,53 @@ pub fn core_commands() -> Vec<CommandDefinition> {
             "Privately preview the current welcome for a synthetic newcomer. No delivery.",
         )
         .permissions(PERM_MANAGE_GUILD),
+        // Optional browse selectors only: every call stays scoped to the
+        // invoking guild; there is deliberately no guild, member or
+        // live-guild override. The page ceiling mirrors
+        // `game_activity::GAME_MIX_MAX_PAGE` (pinned there for the runtime).
         CommandDefinition::new(
             "game-mix",
             "Show this server's aggregate game activity.",
         )
-        .permissions(PERM_MANAGE_GUILD),
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "page",
+                "Page of saved games to show (10 per page). Default: 1.",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, crate::game_activity::GAME_MIX_MAX_PAGE),
+            CommandOption::new(
+                "sort",
+                "Order games by play time or in-voice time. Default: play.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "Play time".to_owned(),
+                    value: "play".to_owned(),
+                },
+                CommandChoice {
+                    name: "In-voice time".to_owned(),
+                    value: "voice".to_owned(),
+                },
+            ]),
+            CommandOption::new(
+                "format",
+                "Show raw JSON or a readable summary. Default: JSON.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "JSON".to_owned(),
+                    value: "json".to_owned(),
+                },
+                CommandChoice {
+                    name: "Summary".to_owned(),
+                    value: "summary".to_owned(),
+                },
+            ]),
+        ]),
     ]
 }
 
@@ -399,7 +441,8 @@ pub const PRIVACY_DESCRIPTION: &str =
     "Manage your analytics privacy and deletion requests for this server.";
 
 /// Self-service picker-recovery description, shared by the registry fixtures.
-pub const REOPEN_DESCRIPTION: &str = "Reopen your games or session picker in a private menu.";
+pub const REOPEN_DESCRIPTION: &str =
+    "Reopen your games or session picker in a private menu; games includes a no-change preview.";
 
 /// Merge the authoritative guild command set.
 ///

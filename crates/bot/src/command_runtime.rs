@@ -69,25 +69,26 @@ use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
+    custom_command_store,
     feeds::{
-        feed_already_paused_text, feed_already_resumed_text, feed_list_page,
+        feed_already_paused_text, feed_already_resumed_text, feed_existing_text, feed_list_page,
         feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
-        feed_removed_text, feed_resumed_text, plan_command, FeedCommand, FeedCommandContext,
-        FeedCommandPlan, FeedKind, FEED_PAUSE_RECOVERY_REQUIRED_TEXT,
-        FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        feed_pending_evidence_refusal_text, feed_removed_text, feed_resumed_text, plan_command,
+        FeedCommand, FeedCommandContext, FeedCommandPlan, FeedKind, FeedPendingEvidenceOperation,
     },
     feeds_store::{
-        add_feed, list_feeds, pause_feed, remove_feed, resume_feed, write_audit, FeedAudit,
-        FeedPauseOutcome, FeedRemoval, FeedResumeOutcome,
+        add_feed, list_feeds, pause_feed_with_evidence, remove_feed_with_evidence, resume_feed,
+        write_audit, FeedAddOutcome, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence,
+        FeedResumeOutcome,
     },
     funnel::now_millis_for_test,
     help::{canonical_help_selector, unknown_help_correction},
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
-        activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
-        sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
-        RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
+        activity_eligible, decide_activity, sticky_removed_reply, sticky_set_reply, store,
+        ActivityDecision, ActivityOutcome, PutSticky, RemoveOutcome, StickyAudit,
+        StickyAuditAction, StickyAuditOutcome, StickySetup,
     },
     tickets::TicketAction,
     ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
@@ -294,6 +295,9 @@ pub struct CommandRuntime {
     automations: bool,
     /// Serialize publication and remember a successful sync for this process.
     /// Repeated RESUMED events need no work; READY still replaces the full set.
+    /// A durable pending marker overrides the RESUMED no-op so a reconnect
+    /// heals a failed publication; the governed path republishes on reconnect
+    /// only through [`Self::publish_registry_if_resync_pending`].
     registry_synced: tokio::sync::Mutex<bool>,
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
@@ -697,10 +701,27 @@ impl CommandRuntime {
                     );
                 }
                 self.dispatch_ticket_connection(event);
+                // A reconnect still heals a failed publication: republish the
+                // full set when a durable pending marker says the picker is
+                // stale. Without a marker this spawns no REST work, so the
+                // boot sync stays the single writer.
+                let runtime = Arc::clone(self);
+                let application_id = ready.application.id.get();
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime
+                        .publish_registry_if_resync_pending(Some(application_id))
+                        .await;
+                });
                 return;
             }
             Event::Resumed => {
                 self.dispatch_ticket_connection(event);
+                // Same reconnect-time healing as READY: the marker read keeps
+                // this publication-free unless a publication actually failed.
+                let runtime = Arc::clone(self);
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime.publish_registry_if_resync_pending(None).await;
+                });
                 return;
             }
             Event::InteractionCreate(interaction)
@@ -1227,12 +1248,33 @@ impl CommandRuntime {
         }
     }
 
+    /// Reconnect-triggered resync for the governed path: republish the full
+    /// set only when a durable pending marker says a previous publication
+    /// failed. Without a marker this is one SELECT and no REST work, so the
+    /// boot sync stays the single writer.
+    async fn publish_registry_if_resync_pending(&self, application_id: Option<u64>) {
+        if !self.registry_resync_pending().await {
+            return;
+        }
+        self.publish_registry(application_id).await;
+    }
+
+    /// Best-effort pending-marker read. An unreadable marker counts as no
+    /// pending work: a store outage keeps reconnects publication-free, and a
+    /// later management publish or the boot resync still heals.
+    async fn registry_resync_pending(&self) -> bool {
+        custom_command_store::is_registry_resync_pending(&self.pool, &self.guild_id.to_string())
+            .await
+            .unwrap_or(false)
+    }
+
     /// Publish the ONE complete merged registry (legacy `CommandRegistry::sync`
     /// on `ready`). `publish_set` assembles every gated builtin plus DB custom
     /// rows. Unknown custom rows defer publication rather than deleting commands.
     /// `set_guild_commands` is a full replace, making duplicate READY idempotent.
     /// RESUMED supplies no application id: resolve it through the same executor
-    /// and synchronize once per process. Failed syncs remain eligible to retry
+    /// and synchronize once per process. A durable pending marker is the one
+    /// reconnect-time exception. Failed syncs remain eligible to retry
     /// on a later gateway connection event, never a polling timer.
     pub(crate) async fn publish_registry(&self, application_id: Option<u64>) {
         if self.publish_registry_checked(application_id).await.is_err() {
@@ -1243,13 +1285,21 @@ impl CommandRuntime {
     /// [`Self::publish_registry`] with the outcome returned. `Ok(())` covers a
     /// completed sync and a deferred one (custom-command rows unknown, nothing
     /// sent); `Err` means an attempted sync failed and a later READY/RESUMED retries it.
+    /// A durable pending marker overrides the already-synced RESUMED no-op so
+    /// a reconnect heals a failed publication.
     pub(crate) async fn publish_registry_checked(
         &self,
         application_id: Option<u64>,
     ) -> Result<(), RegistrySyncError> {
         let mut synced = self.registry_synced.lock().await;
         if application_id.is_none() && *synced {
-            return Ok(());
+            // A management publication failed after this flag was set, so the
+            // picker is stale and this reconnect republishes. An absent or
+            // unreadable marker keeps the no-op; a later management publish
+            // or the boot resync still heals.
+            if !self.registry_resync_pending().await {
+                return Ok(());
+            }
         }
         // Once bootstrapped, custom commands own the full-set publisher: it
         // loads persisted rows and serializes add/remove republication.
@@ -1554,25 +1604,52 @@ impl CommandRuntime {
             "game-mix" => {
                 let guild_id = self.guild_id.to_string();
                 // The CLI requires an explicit live-guild opt-in. This
-                // optionless Discord read has no rollout approval mechanism.
+                // Discord read has no rollout approval mechanism, and the
+                // browse selectors never become one.
                 if guild_id == two_bot_core::backup::guild_config::LIVE_GUILD_ID {
                     self.finish(interaction, "Game activity reports are not enabled for the live guild. This command does not authorize production reporting.").await;
                     return;
                 }
+                // Strict selector decode before any storage read: an
+                // invalid, duplicated, unknown or type-confused option is
+                // one private correction, never a silently served report.
+                let browse = match game_mix_browse_request(interaction) {
+                    Ok(browse) => browse,
+                    Err(correction) => {
+                        self.finish(interaction, correction).await;
+                        return;
+                    }
+                };
                 match two_bot_core::game_activity_store::read_guild_aggregates(
                     &self.pool, &guild_id,
                 )
                 .await
                 {
                     Ok(rows) => {
-                        self.finish(
-                            interaction,
-                            two_bot_core::game_activity::render_game_activity_discord_report(
-                                self.guild_id,
-                                &rows,
-                            ),
-                        )
-                        .await;
+                        let reply = match browse {
+                            // The optionless default render is byte-stable:
+                            // browse rendering applies only once a selector
+                            // was explicitly chosen.
+                            None => {
+                                two_bot_core::game_activity::render_game_activity_discord_report(
+                                    self.guild_id,
+                                    &rows,
+                                )
+                            }
+                            Some((page, sort, format)) => {
+                                match two_bot_core::game_activity::render_game_activity_discord_browse(
+                                    self.guild_id, &rows, page, sort, format,
+                                ) {
+                                    two_bot_core::game_activity::GameMixBrowseView::Page(text) => {
+                                        text
+                                    }
+                                    two_bot_core::game_activity::GameMixBrowseView::OutOfRange {
+                                        ..
+                                    } => game_mix_page_range_correction(page),
+                                }
+                            }
+                        };
+                        self.finish(interaction, reply).await;
                     }
                     Err(two_bot_core::game_activity_store::GameActivityStoreError::Db(err)) => {
                         warn!(
@@ -1929,7 +2006,9 @@ impl CommandRuntime {
     /// row already exists — the read only names the audit action). A store
     /// failure audits that same refusal shape with the `db_class` token.
     /// Malformed options refuse before any store read or audit via
-    /// [`sticky_options_strict`]: no row, no audit, one private correction.
+    /// [`sticky_preview_option`] and [`sticky_options_strict`]: no row, no audit,
+    /// one private correction. Preview validates and renders before all store
+    /// access, including rejected-input auditing; it never enters delivery.
     async fn sticky_set(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1937,6 +2016,13 @@ impl CommandRuntime {
             return;
         };
         let actor_id = actor_id(interaction);
+        let preview = match sticky_preview_option(interaction) {
+            Ok(preview) => preview,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
         let (body, debounce_option) = match sticky_options_strict(interaction) {
             Ok(decoded) => decoded,
             Err(refusal) => {
@@ -1945,9 +2031,17 @@ impl CommandRuntime {
             }
         };
 
-        let debounce = match validate_body(&body).and_then(|()| normalize_debounce(debounce_option))
-        {
-            Ok(debounce) => debounce,
+        let setup = StickySetup::validate(&body, debounce_option);
+        if preview {
+            let reply = match setup {
+                Ok(setup) => setup.preview_reply(),
+                Err(err) => err.to_string(),
+            };
+            self.finish(interaction, reply).await;
+            return;
+        }
+        let setup = match setup {
+            Ok(setup) => setup,
             Err(err) => {
                 let existed = store::get_sticky(&self.pool, &guild_id, &channel_id)
                     .await
@@ -1977,8 +2071,8 @@ impl CommandRuntime {
             &PutSticky {
                 guild_id: &guild_id,
                 channel_id: &channel_id,
-                body: &body,
-                debounce_seconds: debounce,
+                body: setup.body,
+                debounce_seconds: setup.debounce_seconds,
                 enabled: true,
                 actor_id: &actor_id,
                 now_ms: now_millis_for_test(),
@@ -2000,7 +2094,8 @@ impl CommandRuntime {
                     None,
                 )
                 .await;
-                let reply = sticky_set_reply(&channel_id, debounce_option.map(|_| debounce));
+                let reply =
+                    sticky_set_reply(&channel_id, debounce_option.map(|_| setup.debounce_seconds));
                 self.finish(interaction, reply).await;
             }
             Err(err) => {
@@ -2089,8 +2184,10 @@ impl CommandRuntime {
     /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
     /// audit → ephemeral confirmation. The relay id is generated here (legacy
     /// `randomUUID()`); plan errors reply with the domain text and write
-    /// neither a row nor an audit (legacy parity). A store failure audits one
-    /// `feed.create`/`rejected` refusal row, then replies safe. The relay
+    /// neither a row nor an audit (legacy parity). An exact saved tuple replies
+    /// with its original id/state, without a write or creation/rejection audit.
+    /// A store failure audits one `feed.create`/`rejected` refusal row, then
+    /// replies safe. The relay
     /// binds to the invoking channel. Malformed options refuse before any
     /// store read or audit via [`feed_add_options_strict`].
     async fn feed_add(&self, interaction: &Interaction) {
@@ -2120,24 +2217,28 @@ impl CommandRuntime {
             source,
         };
         match plan_command(&context, command) {
-            Ok(FeedCommandPlan::Add(relay)) => {
-                if let Err(err) = add_feed(&self.pool, &relay).await {
-                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
-                        self.finish(interaction, quota.to_string()).await;
-                    } else {
-                        let class = feed_store_class(&err);
-                        warn!(reason = class, "feed insert failed");
-                        self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
-                            .await;
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
-                    }
-                    return;
+            Ok(FeedCommandPlan::Add(relay)) => match add_feed(&self.pool, &relay).await {
+                Ok(FeedAddOutcome::Created) => {
+                    self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
+                        .await;
+                    self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
+                        .await;
                 }
-                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
-                    .await;
-                self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
-                    .await;
-            }
+                Ok(FeedAddOutcome::Existing { id, enabled }) => {
+                    self.finish(interaction, feed_existing_text(&id, enabled))
+                        .await;
+                }
+                Err(two_bot_core::feeds_store::FeedStoreError::Capacity(quota)) => {
+                    self.finish(interaction, quota.to_string()).await;
+                }
+                Err(err) => {
+                    let class = feed_store_class(&err);
+                    warn!(reason = class, "feed insert failed");
+                    self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
+                        .await;
+                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                }
+            },
             // `FeedCommand::Add` can only plan to `Add`; the other arms are
             // unreachable, not silently wrong.
             Ok(plan) => {
@@ -2150,9 +2251,10 @@ impl CommandRuntime {
     /// `/feed-remove`: decode `id` → plan → guild-scoped delete → `feed.remove`
     /// audit (`removed`/`missing`/`recovery_required` outcome) → ephemeral
     /// confirmation. A relay carrying unresolved pending delivery evidence is
-    /// retained with a fixed recovery reply, never claimed removed. A store
-    /// failure audits one `feed.remove`/`rejected` refusal row, then replies
-    /// safe. Malformed `id` options refuse before any store read or audit via
+    /// retained with a snapshot reply carrying the fenced pending count,
+    /// never claimed removed. A store failure audits one
+    /// `feed.remove`/`rejected` refusal row, then replies safe. Malformed `id`
+    /// options refuse before any store read or audit via
     /// [`feed_remove_option_strict`].
     async fn feed_remove(&self, interaction: &Interaction) {
         // Remove does not bind to the invoking channel; `channel_id` is only
@@ -2170,14 +2272,23 @@ impl CommandRuntime {
         let command = FeedCommand::Remove { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Remove { guild_id, id }) => {
-                match remove_feed(&self.pool, &guild_id, &id).await {
+                match remove_feed_with_evidence(&self.pool, &guild_id, &id).await {
                     Ok(outcome) => {
                         let (audit_outcome, reply) = match outcome {
-                            FeedRemoval::Removed => ("removed", feed_removed_text(true)),
-                            FeedRemoval::Missing => ("missing", feed_removed_text(false)),
-                            FeedRemoval::RecoveryRequired => {
-                                ("recovery_required", FEED_REMOVAL_RECOVERY_REQUIRED_TEXT)
+                            FeedRemovalEvidence::Removed => {
+                                ("removed", feed_removed_text(true).to_owned())
                             }
+                            FeedRemovalEvidence::Missing => {
+                                ("missing", feed_removed_text(false).to_owned())
+                            }
+                            FeedRemovalEvidence::RecoveryRequired { pending } => (
+                                "recovery_required",
+                                feed_pending_evidence_refusal_text(
+                                    FeedPendingEvidenceOperation::Remove,
+                                    &id,
+                                    pending,
+                                ),
+                            ),
                         };
                         self.feed_audit(&inputs, "feed.remove", &id, audit_outcome, None)
                             .await;
@@ -2204,10 +2315,11 @@ impl CommandRuntime {
     /// outcome) → ephemeral confirmation. URL, destination, seen-item and
     /// delivery history are preserved; only lifecycle state changes. An enabled
     /// relay carrying unresolved pending delivery evidence stays enabled with a
-    /// fixed retry-after-recovery reply, so recovery is never stranded behind
-    /// disabled discovery. Already-admitted work is not cancelled, and no
-    /// fresh post claim may begin after a successful pause. A store failure
-    /// audits one `feed.pause`/`rejected` refusal row, then replies safe.
+    /// snapshot reply carrying the fenced pending count, so recovery is never
+    /// stranded behind disabled discovery. Already-admitted work is not
+    /// cancelled, and no fresh post claim may begin after a successful pause.
+    /// A store failure audits one `feed.pause`/`rejected` refusal row, then
+    /// replies safe.
     async fn feed_pause(&self, interaction: &Interaction) {
         // Pause does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
@@ -2229,19 +2341,23 @@ impl CommandRuntime {
         let command = FeedCommand::Pause { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Pause { guild_id, id }) => {
-                match pause_feed(&self.pool, &guild_id, &id, inputs.now_ms).await {
+                match pause_feed_with_evidence(&self.pool, &guild_id, &id, inputs.now_ms).await {
                     Ok(outcome) => {
                         let (audit_outcome, reply) = match outcome {
-                            FeedPauseOutcome::Paused => ("paused", feed_paused_text(&id)),
-                            FeedPauseOutcome::AlreadyPaused => {
+                            FeedPauseEvidence::Paused => ("paused", feed_paused_text(&id)),
+                            FeedPauseEvidence::AlreadyPaused => {
                                 ("already_paused", feed_already_paused_text(&id))
                             }
-                            FeedPauseOutcome::Missing => {
+                            FeedPauseEvidence::Missing => {
                                 ("missing", feed_removed_text(false).to_owned())
                             }
-                            FeedPauseOutcome::RecoveryRequired => (
+                            FeedPauseEvidence::RecoveryRequired { pending } => (
                                 "recovery_required",
-                                FEED_PAUSE_RECOVERY_REQUIRED_TEXT.to_owned(),
+                                feed_pending_evidence_refusal_text(
+                                    FeedPendingEvidenceOperation::Pause,
+                                    &id,
+                                    pending,
+                                ),
                             ),
                         };
                         self.feed_audit(&inputs, "feed.pause", &id, audit_outcome, None)
@@ -2326,8 +2442,9 @@ impl CommandRuntime {
     /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
     /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
     /// only) and writes no audit row. An omitted `page` means page 1; a
-    /// present-but-unusable option refuses without a store read, and
-    /// out-of-range refuses after the same bounded read every list uses.
+    /// duplicated, wrong-typed, unknown or nested option refuses without a
+    /// store read, and out-of-range refuses after the same bounded read
+    /// every list uses.
     async fn feed_list(&self, interaction: &Interaction) {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
@@ -2336,6 +2453,8 @@ impl CommandRuntime {
             Ok(FeedCommandPlan::List { guild_id }) => {
                 let reply = match feed_list_page_request(interaction) {
                     FeedListPage::Invalid => feed_list_page_invalid_text().to_owned(),
+                    FeedListPage::Duplicate => FEED_LIST_DUPLICATE_PAGE.to_owned(),
+                    FeedListPage::Unknown => FEED_LIST_UNKNOWN_OPTION.to_owned(),
                     FeedListPage::Default => self.list_feed_page(&guild_id, 1).await,
                     FeedListPage::Page(page) if page < 1 => {
                         feed_list_page_underflow_text().to_owned()
@@ -2356,12 +2475,18 @@ impl CommandRuntime {
     /// mutation, audit write, claim renewal or delivery reset on any path,
     /// including store failure (legacy list parity). Absent, invalid-id and
     /// store-failure replies stay distinct; the raw source never reaches logs.
+    /// Malformed `id` options refuse before any store read via
+    /// [`feed_inspect_options_strict`].
     async fn feed_inspect(&self, interaction: &Interaction) {
         // Inspect does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
+        if let Err(refusal) = feed_inspect_options_strict(interaction) {
+            self.finish(interaction, refusal).await;
+            return;
+        }
         let command = FeedCommand::Inspect {
             id: feed_id_option(interaction).unwrap_or_default(),
         };
@@ -2694,7 +2819,7 @@ pub(crate) fn new_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-/// Refusal literals for malformed `/feed-add` and `/feed-remove` options.
+/// Refusal literals for malformed feed command options.
 /// Each names the offending option and carries a copyable corrected
 /// invocation, echoes no user input (mention-safe), and stays far under
 /// Discord's 2,000-unit cap (bounded). Handlers reply with these before any
@@ -2715,6 +2840,12 @@ const FEED_PAUSE_MISSING_ID: &str = "Missing id. Use /feed-pause id:<relay-id>."
 const FEED_RESUME_INVALID_ID: &str = "Invalid id. Use /feed-resume id:<relay-id>.";
 const FEED_RESUME_DUPLICATE_ID: &str = "Duplicate id. Use /feed-resume id:<relay-id>.";
 const FEED_RESUME_MISSING_ID: &str = "Missing id. Use /feed-resume id:<relay-id>.";
+const FEED_INSPECT_INVALID_ID: &str = "Invalid id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_DUPLICATE_ID: &str = "Duplicate id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_MISSING_ID: &str = "Missing id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-inspect id:<relay-id>.";
+const FEED_LIST_DUPLICATE_PAGE: &str = "Duplicate page. Use /feed-list page:<number>.";
+const FEED_LIST_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-list page:<number>.";
 
 /// Strictly decode `/feed-add`'s options: `kind` and `source` must each
 /// appear exactly once with a string value. Duplicates win over wrong types
@@ -2811,9 +2942,38 @@ fn feed_id_option_strict(
     }
 }
 
-/// `/feed-inspect`'s `id` option; `None` plans against an empty id, which
-/// `validate_id` rejects with `InvalidId` and inspect's distinct recovery
-/// copy (`/feed-remove` decodes strictly via [`feed_remove_option_strict`]).
+/// Guard the complete `/feed-inspect` option namespace before extracting
+/// `id` with [`feed_id_option`]: exactly one string `id` and no other
+/// options. An unknown name (including a nested group) wins over a
+/// duplicated `id`, which wins over a wrong wire type, which wins over a
+/// missing `id` — the same namespace-first layering as
+/// [`sticky_preview_option`], with the `id` checks themselves delegated to
+/// [`feed_id_option_strict`]. Unlike the writer decoders, unknown names
+/// refuse here, so a malformed read never silently inspects an arbitrarily
+/// chosen relay. A non-command interaction refuses as a missing `id`.
+fn feed_inspect_options_strict(interaction: &Interaction) -> Result<(), &'static str> {
+    if let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(
+        data,
+    )) = &interaction.data
+    {
+        if data.options.iter().any(|option| option.name != "id") {
+            return Err(FEED_INSPECT_UNKNOWN_OPTION);
+        }
+    }
+    feed_id_option_strict(
+        interaction,
+        FEED_INSPECT_INVALID_ID,
+        FEED_INSPECT_DUPLICATE_ID,
+        FEED_INSPECT_MISSING_ID,
+    )
+    .map(|_| ())
+}
+
+/// `/feed-inspect`'s `id` option. The handler runs
+/// [`feed_inspect_options_strict`] first, so a missing, duplicated or
+/// wrong-typed `id` never reaches this extractor; a present-but-empty id
+/// still extracts as `Some("")`, which `validate_id` rejects with
+/// `InvalidId` and inspect's distinct recovery copy.
 pub(crate) fn feed_id_option(interaction: &Interaction) -> Option<String> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
@@ -2848,14 +3008,19 @@ pub(crate) fn help_command_selector(interaction: &Interaction) -> Option<String>
     }
 }
 
-/// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
-/// omitted option means page 1, while a present option with a non-integer
-/// wire value is unusable and must refuse rather than silently list page 1.
+/// `/feed-list`'s optional 1-based `page` option, decoded over the complete
+/// option shape: an omitted option means page 1, while a duplicated,
+/// wrong-typed, unknown or nested option must refuse rather than silently
+/// list an arbitrarily chosen page. An unknown name wins over a duplicated
+/// `page`, which wins over a wrong wire type; range stays the reply
+/// composer's refusal, not the decoder's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeedListPage {
     Default,
     Page(i64),
     Invalid,
+    Duplicate,
+    Unknown,
 }
 
 pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage {
@@ -2864,13 +3029,113 @@ pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage 
     else {
         return FeedListPage::Default;
     };
-    let Some(page) = data.options.iter().find(|option| option.name == "page") else {
-        return FeedListPage::Default;
-    };
-    match &page.value {
-        CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
-        _ => FeedListPage::Invalid,
+    let mut pages: Vec<&CommandOptionValue> = Vec::new();
+    let mut unknown = false;
+    for option in &data.options {
+        match option.name.as_str() {
+            "page" => pages.push(&option.value),
+            _ => unknown = true,
+        }
     }
+    if unknown {
+        return FeedListPage::Unknown;
+    }
+    if pages.len() > 1 {
+        return FeedListPage::Duplicate;
+    }
+    match pages.first() {
+        None => FeedListPage::Default,
+        Some(CommandOptionValue::Integer(value)) => FeedListPage::Page(*value),
+        Some(_) => FeedListPage::Invalid,
+    }
+}
+
+/// Strict `/game-mix` browse selectors, decoded before any storage read.
+///
+/// Every option must be one of the published selectors, appear at most
+/// once, and carry the published wire type: `page` is an integer within
+/// the published bounds, `sort` is `play` or `voice`, `format` is `json`
+/// or `summary`. Anything else — an unknown name such as a guild, member
+/// or live-guild override, a duplicate, a wrong-typed value — returns one
+/// bounded correction naming the offending selector. `Ok(None)` is the
+/// optionless legacy call, which keeps the default JSON render.
+pub(crate) fn game_mix_browse_request(
+    interaction: &Interaction,
+) -> Result<
+    Option<(
+        usize,
+        two_bot_core::game_activity::GameMixBrowseSort,
+        two_bot_core::game_activity::GameMixBrowseFormat,
+    )>,
+    String,
+> {
+    use two_bot_core::game_activity::{GameMixBrowseFormat, GameMixBrowseSort};
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Ok(None);
+    };
+    if data.options.is_empty() {
+        return Ok(None);
+    }
+    let correction = |selector: &'static str| {
+        format!(
+            "That {selector} value is not valid for /game-mix. Use page 1 to {}, \
+             sort play or voice, and format json or summary — and no other options.",
+            two_bot_core::game_activity::GAME_MIX_MAX_PAGE
+        )
+    };
+    let mut page = 1usize;
+    let mut sort = GameMixBrowseSort::Play;
+    let mut format = GameMixBrowseFormat::Json;
+    let mut seen: Vec<&str> = Vec::new();
+    for option in &data.options {
+        if seen.contains(&option.name.as_str()) {
+            return Err(correction(match option.name.as_str() {
+                "page" => "page",
+                "sort" => "sort",
+                "format" => "format",
+                _ => "game-mix",
+            }));
+        }
+        seen.push(option.name.as_str());
+        match (option.name.as_str(), &option.value) {
+            ("page", CommandOptionValue::Integer(value))
+                if (1..=two_bot_core::game_activity::GAME_MIX_MAX_PAGE).contains(value) =>
+            {
+                page = usize::try_from(*value).map_err(|_| correction("page"))?;
+            }
+            ("page", _) => return Err(correction("page")),
+            ("sort", CommandOptionValue::String(value)) => {
+                sort = match value.as_str() {
+                    "play" => GameMixBrowseSort::Play,
+                    "voice" => GameMixBrowseSort::Voice,
+                    _ => return Err(correction("sort")),
+                };
+            }
+            ("sort", _) => return Err(correction("sort")),
+            ("format", CommandOptionValue::String(value)) => {
+                format = match value.as_str() {
+                    "json" => GameMixBrowseFormat::Json,
+                    "summary" => GameMixBrowseFormat::Summary,
+                    _ => return Err(correction("format")),
+                };
+            }
+            ("format", _) => return Err(correction("format")),
+            _ => return Err(correction("game-mix")),
+        }
+    }
+    Ok(Some((page, sort, format)))
+}
+
+/// Bounded correction for a well-formed page past the saved games. The
+/// saved totals stay out of the reply: page bounds follow from the
+/// request, never from data a refused-at-decode call could not see.
+fn game_mix_page_range_correction(page: usize) -> String {
+    format!(
+        "Page {page} is past the saved games for this server. \
+         Run /game-mix with page 1 to start from the first saved games."
+    )
 }
 
 /// Shared sticky/feed/channel/leveling registrations over the narrowed boot
@@ -2983,11 +3248,35 @@ const STICKY_INVALID_DEBOUNCE: &str =
 const STICKY_DUPLICATE_DEBOUNCE: &str =
     "Duplicate debounce. Use /sticky body:<text> debounce:<seconds>.";
 
+/// Guard the complete setup option namespace before decoding body/debounce.
+/// Unknown names (including misspelled preview flags) must never silently save.
+/// Keep the existing body/debounce decoder and its refusal precedence unchanged.
+fn sticky_preview_option(interaction: &Interaction) -> Result<bool, &'static str> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Err(STICKY_MISSING_BODY);
+    };
+    let mut preview = None;
+    for option in &data.options {
+        match option.name.as_str() {
+            "body" | "debounce" => {}
+            "preview" => match (&option.value, preview) {
+                (CommandOptionValue::Boolean(value), None) => preview = Some(*value),
+                _ => return Err("Invalid preview. Use /sticky body:<text> [debounce:<seconds>] preview:true or preview:false; supply preview only once."),
+            },
+            _ => return Err("Unknown option. Use /sticky body:<text> [debounce:<seconds>] [preview:true|false]."),
+        }
+    }
+    Ok(preview.unwrap_or(false))
+}
+
 /// Strictly decode `/sticky`'s options: `body` must appear exactly once with
 /// a string value, while `debounce` stays optional (an omitted option means
 /// the default quiet window). Duplicates win over wrong types win over a
-/// missing `body`, and `body` wins over `debounce` within a phase; unknown
-/// names stay ignored. A non-command interaction carries no options, so it
+/// missing `body`, and `body` wins over `debounce` within a phase. This helper
+/// decodes only these two fields; [`sticky_preview_option`] must run first to
+/// reject unknown names and malformed preview flags. A non-command interaction
 /// refuses as a missing `body`. Present-but-empty and out-of-range values
 /// still decode (validation owns those refusals), so valid invocations
 /// decode byte-identically to before.

@@ -93,6 +93,13 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_invalid",
                     );
                 }
+                WriteRefusal::InvalidOnboardingDestination(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        reason.to_string(),
+                        "settings_value_invalid",
+                    );
+                }
             };
             ActionError::new(
                 ErrorCode::ActionNotAllowed,

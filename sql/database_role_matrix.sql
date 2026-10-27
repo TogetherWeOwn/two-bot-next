@@ -19,6 +19,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'moderation_channel_executions', 'table'),
     ('public', 'sticky_messages', 'table'),
     ('public', 'automation_commands', 'table'),
+    ('public', 'automation_command_registry_resync', 'table'),
     ('public', 'scheduled_messages', 'table'),
     ('public', 'automation_audit_log', 'table'),
     ('public', 'event_rsvps', 'table'),

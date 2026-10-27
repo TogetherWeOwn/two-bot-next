@@ -30,6 +30,16 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   the source. Twitch is **not** a Helix API
   integration and does not require a Twitch credential. YouTube also
   accepts a 20–32-character channel ID and expands it into the videos Atom URL.
+- Repeating add for the same guild/channel/kind/normalized-source tuple returns
+  the saved ID and observed enabled/paused state privately, with copyable inspect
+  and pause/resume commands. It creates and updates nothing: creator, timestamps,
+  cadence/high-water and all delivery/nonce evidence remain unchanged. No fetch,
+  auto-resume, replacement or `feed.create` audit occurs for that non-creation.
+  YouTube channel IDs expand as above; no new RSS URL equivalence is introduced.
+  The same source in another channel remains a distinct relay. The guild's
+  25-relay capacity check still precedes duplicate discovery, including paused
+  rows. Unrelated unique violations and outages remain genuine storage failures
+  with the existing bounded rejection auditing, not saved-relay recovery.
 - RSS item/guid and Atom entry/id parsing, alternate-link preference, title,
   published/pubDate/updated fields, 200-item ceiling. No external entity resolver;
   DTD disabled, XML node count bounded. An iterative, allocation-free preflight
@@ -136,22 +146,24 @@ claims; missing in a bounded 100-message search is not authoritative absence.
 Relay removal and delivery admission share one bounded guild/feed-scoped
 database fence (`pg_advisory_xact_lock`, held only across short statements,
 never across network IO, with `lock_timeout = '5s'` / `statement_timeout =
-'15s'`). Removal atomically refuses with a fixed recovery-required reply and
-audit outcome while any pending delivery row for that guild/feed is unresolved,
-retaining relay and ledger; a stale polled relay revalidates existence under
-the same fence, so it can never POST after removal has confirmed. Ordinary
-settled/no-pending removal, not-found and foreign-guild behavior are unchanged.
-No blind resend, history-based absence claim or operator release authority is
-introduced: the member waits for the existing nonce reconciliation, then
-removes again.
+'15s'`). Removal atomically refuses with a private evidence snapshot (stable
+id, guild/relay-scoped unresolved count, no-change statement, wait plus
+`/feed-inspect` guidance) and the `recovery_required` audit outcome while any
+pending delivery row for that guild/feed is unresolved, retaining relay and
+ledger; a stale polled relay revalidates existence under the same fence, so
+it can never POST after removal has confirmed. Ordinary settled/no-pending
+removal, not-found and foreign-guild behavior are unchanged. No blind resend,
+history-based absence claim or operator release authority is introduced: the
+member waits for the existing nonce reconciliation, then removes again.
 
 Pause and resume share that same fence and change only the relay's
 lifecycle state (`enabled`/`updated_at`): URL, destination, seen-item
 high-water and the delivery/nonce ledger are preserved verbatim, and pending
 or uncertain-send settlement is untouched. An enabled-to-paused transition
-refuses — leaving the relay enabled with a fixed retry-after-recovery reply —
-while any pending delivery row for that guild/feed is unresolved, because
-pending discovery only reads enabled relays and pausing would strand recovery.
+refuses — leaving the relay enabled with the same private evidence snapshot
+and retry-after-recovery guidance — while any pending delivery row for that
+guild/feed is unresolved, because pending discovery only reads enabled relays
+and pausing would strand recovery.
 An already-paused relay returns the idempotent already-paused outcome before
 checking pending evidence, without changing any stored state. If a restored
 paused relay carries pending evidence, resume it to restore recovery discovery.

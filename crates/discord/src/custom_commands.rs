@@ -24,11 +24,11 @@ use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
         accepted_text_trigger, builtin_command_names, format_command_list_page,
-        format_inspect_miss, format_inspect_preview, format_inspect_summary,
+        format_draft_preview, format_inspect_miss, format_inspect_preview, format_inspect_summary,
         format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
-        invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
-        AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand, TemplateContext,
-        ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        invalid_inspect_view_reply, render_template, validate_inspect_name, validate_template,
+        AuditRecord, AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand,
+        TemplateContext, ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -36,6 +36,7 @@ use two_bot_core::{
 
 use crate::{
     automation_admission::ActorCooldowns,
+    custom_command_prefix_render::{render_prefix_response, PrefixRenderRefusal},
     interactions::{
         publish_commands, refusal_response, route_interaction, text_response, RoutedInteraction,
     },
@@ -92,6 +93,17 @@ type PublishedCommands = Option<Arc<[two_bot_core::CommandDefinition]>>;
 const LOOKUP_OUTAGE_REPLY: &str =
     "Custom commands are temporarily unavailable. Please try again shortly.";
 
+/// Saved-but-pending suffix for a committed management mutation whose
+/// registry publication failed. Names the durable pending state and the
+/// automatic resync, and deliberately carries no restart instruction and
+/// no advice to repeat or delete the saved mutation: repeating it would be
+/// a no-op that never republishes, and the pending marker already records
+/// the work. Pinned by the resync acceptance suite and the runtime suffix
+/// pin; keep every copy identical.
+const PENDING_RESYNC_SUFFIX: &str = "Registry publication failed; the command picker is not yet \
+    synchronized. Synchronization is pending and will resync automatically on the next \
+    publication; no further action is needed.";
+
 #[derive(Clone)]
 pub struct CustomCommandRuntime {
     pool: PgPool,
@@ -146,10 +158,51 @@ impl CustomCommandRuntime {
         self.publish_locked().await
     }
 
+    /// Runs under the registry lock held by every caller. A failed
+    /// publication persists one durable per-guild pending marker; a confirmed
+    /// publication clears it. The marker is recovery state, not a second
+    /// write of record: persisting or clearing it is best-effort and must
+    /// never mask the publication outcome itself, and retrying only ever
+    /// republishes the saved set — a committed mutation is not replayed.
     async fn publish_locked(&self) -> Result<(), CustomCommandError> {
         let gates = self.router.gates();
         let guild = gates.configured_guild.ok_or(CustomCommandError::Context)?;
-        let rows = if gates.automations {
+        let outcome = self.publish_full_set(guild, gates.automations).await;
+        let guild = guild.to_string();
+        match outcome {
+            Ok(()) => {
+                if store::clear_registry_resync_pending(&self.pool, &guild)
+                    .await
+                    .is_err()
+                {
+                    // The picker IS synchronized; a surviving marker only
+                    // costs one redundant republish at the next opportunity.
+                    tracing::error!(
+                        "custom-command registry published but pending resync marker was not cleared"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if store::mark_registry_resync_pending(&self.pool, &guild, &two_bot_core::now_iso())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        "custom-command registry publication failed and pending resync marker was not recorded"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn publish_full_set(
+        &self,
+        guild: u64,
+        automations: bool,
+    ) -> Result<(), CustomCommandError> {
+        let rows = if automations {
             store::list_commands(&self.pool, &guild.to_string())
                 .await
                 .map_err(|_| CustomCommandError::Storage)?
@@ -317,9 +370,17 @@ impl CustomCommandRuntime {
                             server: server.to_owned(),
                             channel: format!("<#{}>", channel.id),
                         });
-                let rendered = context
-                    .as_ref()
-                    .and_then(|context| render_template(&row.template, context).ok());
+                // A stored row can predate or bypass definition-time
+                // validation (import, corruption): re-validate before
+                // rendering, so invalid text never renders literally in
+                // front of members. The pure renderer stays literal; this
+                // boundary is what refuses. A refusal takes the existing
+                // content-free unavailable completion and `render_failed`
+                // fact below, and the saved row is left untouched.
+                let rendered = context.as_ref().and_then(|context| {
+                    validate_template(&row.template).ok()?;
+                    render_template(&row.template, context).ok()
+                });
                 let (result, reason) = match rendered {
                     Some(content) => (self.complete(interaction, &content).await, None),
                     None => (
@@ -449,20 +510,24 @@ impl CustomCommandRuntime {
         // The committed attempt is never cleared, including on cancellation,
         // rendering/audit failure, or an ambiguous network response. Nonce
         // enforcement is additional protection, not our durable replay guard.
-        let rendered = guild_name
-            .ok_or(CustomCommandError::Context)
-            .and_then(|server| {
-                render_template(
-                    &row.template,
-                    &TemplateContext {
-                        user: format!("<@{}>", message.author.id),
-                        username: message.author.name.clone(),
-                        server: server.to_owned(),
-                        channel: format!("<#{}>", message.channel_id),
-                    },
-                )
-                .map_err(|_| CustomCommandError::Render)
-            });
+        // Same stored-row re-validation as the slash boundary: an imported
+        // or corrupt template refuses as `Render` before any send, keeping
+        // the durable attempt/result pair and leaving the row untouched.
+        // The context check stays first, preserving `context_unavailable`;
+        // that ordering is pinned by the helper's unit tests.
+        let user_mention = format!("<@{}>", message.author.id);
+        let channel_mention = format!("<#{}>", message.channel_id);
+        let rendered = render_prefix_response(
+            guild_name,
+            &row.template,
+            &user_mention,
+            &message.author.name,
+            &channel_mention,
+        )
+        .map_err(|refusal| match refusal {
+            PrefixRenderRefusal::Context => CustomCommandError::Context,
+            PrefixRenderRefusal::Render => CustomCommandError::Render,
+        });
         let (result, reason) = match rendered {
             Ok(content) => {
                 let result = match self
@@ -642,11 +707,10 @@ impl CustomCommandRuntime {
             .map_err(|_| CustomCommandError::Storage)
     }
 
-    /// Private saved-response inspection: one ephemeral content-only view,
-    /// never a public send, registration, cooldown/claim touch, definition
-    /// mutation or `command.run` fact. The only store access is a live
-    /// `get_command` read after every validation passes — no cache, so a
-    /// deleted definition immediately misses.
+    /// Private saved-response inspection or unsaved draft preview: one
+    /// ephemeral content-only view, never execution or mutation. Drafts never
+    /// access storage; saved mode reads live only after validation, so deleted
+    /// definitions immediately miss.
     async fn inspect(
         &self,
         interaction: &Interaction,
@@ -654,22 +718,29 @@ impl CustomCommandRuntime {
         guild: &str,
         guild_name: Option<&str>,
     ) -> String {
-        let name = match single_string_option(data, "name") {
-            SingleOption::Missing | SingleOption::Malformed => {
-                return invalid_inspect_option_reply(
-                    "command name",
-                    "a saved command name is required.",
-                );
-            }
-            SingleOption::Value(name) => name,
-        };
-        let name = match validate_inspect_name(name, &builtin_command_names()) {
-            Ok(name) => name,
-            Err(reason) => {
-                return invalid_inspect_option_reply("command name", &reason.to_string());
+        if data.options.iter().any(|option| {
+            !matches!(
+                option.name.as_str(),
+                "name" | "draft" | "view" | "arguments"
+            )
+        }) {
+            return invalid_inspect_option_reply(
+                "options",
+                "use only name or draft, with optional view and arguments.",
+            );
+        }
+        let (name, draft) = match (
+            single_string_option(data, "name"),
+            single_string_option(data, "draft"),
+        ) {
+            (SingleOption::Value(name), SingleOption::Missing) => (Some(name), None),
+            (SingleOption::Missing, SingleOption::Value(draft)) => (None, Some(draft)),
+            _ => {
+                return "Invalid input: pass exactly one text name or draft, never both or duplicates. Examples: /command-inspect name:faq or /command-inspect draft:Hello".to_owned();
             }
         };
         let view = match single_string_option(data, "view") {
+            SingleOption::Missing if draft.is_some() => InspectView::Preview,
             SingleOption::Missing => InspectView::Summary,
             SingleOption::Malformed => return invalid_inspect_view_reply(None),
             SingleOption::Value(raw) => match InspectView::parse(raw) {
@@ -694,6 +765,34 @@ impl CustomCommandRuntime {
                 }
             }
         }
+        // Both preview modes use invocation context, never sample arguments.
+        let context = || {
+            interaction
+                .author()
+                .zip(interaction.channel.as_ref())
+                .zip(guild_name)
+                .map(|((actor, channel), server)| TemplateContext {
+                    user: format!("<@{}>", actor.id),
+                    username: actor.name.clone(),
+                    server: server.to_owned(),
+                    channel: format!("<#{}>", channel.id),
+                })
+        };
+        if let Some(draft) = draft {
+            if view != InspectView::Preview {
+                return "Invalid draft view: only preview is available for unsaved text. Use /command-inspect draft:Hello view:preview".to_owned();
+            }
+            return match context() {
+                Some(context) => format_draft_preview(draft, &context),
+                None => "Draft preview is unavailable: command context is missing. Please try /command-inspect draft:Hello again.".to_owned(),
+            };
+        }
+        let name = match validate_inspect_name(name.unwrap_or_default(), &builtin_command_names()) {
+            Ok(name) => name,
+            Err(reason) => {
+                return invalid_inspect_option_reply("command name", &reason.to_string());
+            }
+        };
         let row = match store::get_command(&self.pool, guild, &name).await {
             Ok(row) => row,
             Err(_) => return LOOKUP_OUTAGE_REPLY.to_owned(),
@@ -704,23 +803,10 @@ impl CustomCommandRuntime {
         match view {
             InspectView::Summary => format_inspect_summary(&row),
             InspectView::Template => format_inspect_template(&row),
-            InspectView::Preview => {
-                // Same invoking member/channel/guild context as real
-                // execution; the sample arguments are never interpolated.
-                let actor = interaction.author();
-                let context = actor.zip(interaction.channel.as_ref()).zip(guild_name).map(
-                    |((actor, channel), server)| TemplateContext {
-                        user: format!("<@{}>", actor.id),
-                        username: actor.name.clone(),
-                        server: server.to_owned(),
-                        channel: format!("<#{}>", channel.id),
-                    },
-                );
-                match context {
-                    Some(context) => format_inspect_preview(&row, &context),
-                    None => inspect_preview_context_unavailable(&row.name),
-                }
-            }
+            InspectView::Preview => match context() {
+                Some(context) => format_inspect_preview(&row, &context),
+                None => inspect_preview_context_unavailable(&row.name),
+            },
         }
     }
 
@@ -770,25 +856,59 @@ impl CustomCommandRuntime {
             // store read or publication.
             return self.toggle(interaction, data, guild).await;
         }
-        let Some(name) = string_option(data, "name") else {
-            return Ok("A command name is required.".to_owned());
+        // The remaining management names are the two writers. Routing has
+        // already enforced guild/application, ManageGuild and the feature
+        // gate. Strictly decode their complete option shapes before the
+        // registry lock, any store access, audit or publication: a forged
+        // duplicate, wrong type, nested or unknown option must never let a
+        // first-matching value silently win.
+        let is_define = data.name == "command";
+        let allowed: &[&str] = if is_define {
+            &["name", "template", "description", "text-trigger"]
+        } else {
+            &["name"]
         };
-        let name = name.to_lowercase();
+        if data
+            .options
+            .iter()
+            .any(|option| !allowed.contains(&option.name.as_str()))
+        {
+            return Ok(invalid_writer_option("option"));
+        }
+        let name = match single_string_option(data, "name") {
+            SingleOption::Missing => return Ok("A command name is required.".to_owned()),
+            SingleOption::Malformed => return Ok(invalid_writer_option("name")),
+            SingleOption::Value(name) => name.to_lowercase(),
+        };
+        let define = if is_define {
+            let template = match single_string_option(data, "template") {
+                SingleOption::Missing => return Ok("A template is required.".to_owned()),
+                SingleOption::Malformed => return Ok(invalid_writer_option("template")),
+                SingleOption::Value(template) => template.to_owned(),
+            };
+            let description = match single_string_option(data, "description") {
+                SingleOption::Missing => "Custom command".to_owned(),
+                SingleOption::Malformed => return Ok(invalid_writer_option("description")),
+                SingleOption::Value(description) => description.to_owned(),
+            };
+            let text_trigger = match single_string_option(data, "text-trigger") {
+                SingleOption::Missing => None,
+                SingleOption::Malformed => return Ok(invalid_writer_option("text-trigger")),
+                SingleOption::Value(trigger) => Some(trigger.to_lowercase()),
+            };
+            Some(PutCommandInput {
+                name: name.clone(),
+                description,
+                template,
+                text_trigger,
+            })
+        } else {
+            None
+        };
         let audit_id = format!("custom:manage:{}", interaction.id);
         let at = two_bot_core::now_iso();
         let _guard = self.registry.lock().await;
-        let (reply, resync) = if data.name == "command" {
-            let Some(template) = string_option(data, "template") else {
-                return Ok("A template is required.".to_owned());
-            };
-            let input = PutCommandInput {
-                name: name.clone(),
-                description: string_option(data, "description")
-                    .unwrap_or("Custom command")
-                    .to_owned(),
-                template: template.to_owned(),
-                text_trigger: string_option(data, "text-trigger").map(str::to_lowercase),
-            };
+        let (reply, resync) = if let Some(input) = define {
             match service::put(
                 &self.pool,
                 self.router.gates().automations,
@@ -829,12 +949,11 @@ impl CustomCommandRuntime {
             }
         };
         if resync && self.publish_locked().await.is_err() {
-            // The write is committed. Report the partial outcome, never tell the
-            // admin to retry a destructive mutation as if nothing happened.
+            // The write is committed and a durable pending marker is saved.
+            // Report the partial outcome, never tell the admin to retry a
+            // destructive mutation as if nothing happened.
             tracing::error!("custom-command definition committed but registry publication failed");
-            return Ok(format!(
-                "{reply} Registry publication failed; the command picker is not yet synchronized."
-            ));
+            return Ok(format!("{reply} {PENDING_RESYNC_SUFFIX}"));
         }
         Ok(reply)
     }
@@ -899,13 +1018,12 @@ impl CustomCommandRuntime {
             Err(error) => return Ok(error.to_string()),
         };
         if resync && self.publish_locked().await.is_err() {
-            // The flip is committed. Report the saved-but-not-synchronized
-            // state with a safe next action: never a delete recommendation,
-            // and never a claim that a later no-op repaired the picker.
+            // The flip is committed and a durable pending marker is saved.
+            // Report the saved-but-not-yet-synchronized state: never a delete
+            // or restart recommendation, and never a claim that repeating
+            // this no-op toggle repaired the picker.
             tracing::error!("custom-command toggle committed but registry publication failed");
-            return Ok(format!(
-                "{reply} The definition is saved but the command picker is not yet synchronized because registry publication failed. Repeating this command will not resync it; restart the bot after Discord recovers to resync."
-            ));
+            return Ok(format!("{reply} {PENDING_RESYNC_SUFFIX}"));
         }
         Ok(reply)
     }
@@ -929,11 +1047,16 @@ fn invalid_toggle_option(command: &str) -> String {
     format!("Invalid name option: pass exactly one text name, e.g. /{command} name:faq.")
 }
 
-fn string_option<'a>(data: &'a CommandData, name: &str) -> Option<&'a str> {
-    data.options.iter().find_map(|option| match &option.value {
-        CommandOptionValue::String(value) if option.name == name => Some(value.as_str()),
-        _ => None,
-    })
+/// Writer-shape refusal: names only the trusted option at fault (or a
+/// generic `option` for an unknown key), never any submitted value.
+fn invalid_writer_option(field: &str) -> String {
+    if field == "option" {
+        "Invalid option: use only the options listed for this command.".to_owned()
+    } else if field == "name" || field == "template" {
+        format!("Invalid {field} option: pass exactly one text {field}.")
+    } else {
+        format!("Invalid {field} option: pass at most one text {field}.")
+    }
 }
 
 /// One named option read strictly: a forged type or a duplicate refuses

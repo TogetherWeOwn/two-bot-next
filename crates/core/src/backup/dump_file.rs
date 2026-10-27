@@ -323,6 +323,12 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // into a recovered process; welcome/goodbye state of record lives in the
     // onboarding stores, which are archived.
     "gateway_onboarding_jobs",
+    // Custom-command pending-publication marker (0468): which guilds still
+    // owe Discord a full registry republish. A recovered process republishes
+    // the complete saved set on boot regardless, so a restored marker could
+    // only cost one redundant republish; the definitions themselves are in
+    // `automation_commands`, which is archived.
+    "automation_command_registry_resync",
     // Durable cutover rollback journal and per-table watermarks (store chain
     // 0406). The journal is append-only cutover evidence: the PgFunnelStore
     // funnel append and the production gateway batch writer journal each

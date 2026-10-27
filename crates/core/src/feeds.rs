@@ -908,14 +908,80 @@ pub fn feed_removed_text(removed: bool) -> &'static str {
 /// Fixed reply when removal is refused: the relay exists but carries
 /// unresolved pending delivery evidence, so relay and ledger are retained
 /// for nonce reconciliation. The member waits for recovery; no repost.
+///
+/// Legacy fixed text. New pause/removal refusals render through
+/// [`feed_pending_evidence_refusal_text`], which carries the fenced
+/// pending-evidence count; this constant stays for backward compatibility.
 pub const FEED_REMOVAL_RECOVERY_REQUIRED_TEXT: &str =
     "Feed relay kept: unresolved deliveries are still pending recovery.";
 
 /// Fixed reply when pause is refused: the relay stays enabled so its pending
 /// delivery recovery remains discoverable. Already-admitted work is not
 /// cancelled; the member retries after recovery settles.
+///
+/// Legacy fixed text. New pause/removal refusals render through
+/// [`feed_pending_evidence_refusal_text`]; this constant stays for backward
+/// compatibility.
 pub const FEED_PAUSE_RECOVERY_REQUIRED_TEXT: &str =
     "Feed relay kept enabled: deliveries are still pending recovery. Retry after recovery settles.";
+
+/// Lifecycle operation refused for pending delivery evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedPendingEvidenceOperation {
+    /// `/feed-pause`: the relay stays enabled.
+    Pause,
+    /// `/feed-remove`: the relay stays saved.
+    Remove,
+}
+
+/// Shared safe renderer for pause/removal refusals carrying a fenced
+/// pending-evidence count.
+///
+/// The reply keeps the saved relay addressable by its stable id, calls the
+/// count a snapshot of unresolved delivery evidence (never failed deliveries
+/// or successful posts), states explicitly that no pause/removal occurred,
+/// and gives the safe next action: wait for reconciliation and inspect the
+/// saved relay via `/feed-inspect`; do not delete/re-add, blindly retry
+/// sends, or promise a completion time. It carries exactly one number (the
+/// guild/relay-scoped pending count) and no item bodies, source URLs, item
+/// keys, nonces, lease/claim tokens, or other-guild evidence. The single
+/// summary stays within Discord's 2,000 UTF-16-unit cap for the maximum
+/// 128-character relay id.
+#[must_use]
+pub fn feed_pending_evidence_refusal_text(
+    operation: FeedPendingEvidenceOperation,
+    id: &str,
+    pending: usize,
+) -> String {
+    let unchanged = match operation {
+        FeedPendingEvidenceOperation::Pause => "was not paused and remains enabled",
+        FeedPendingEvidenceOperation::Remove => "was not removed and remains saved",
+    };
+    format!(
+        "Feed relay `{id}` {unchanged}: snapshot of {pending} unresolved delivery evidence. \
+         Wait for reconciliation and recovery to settle, then inspect via /feed-inspect. \
+         Retry after recovery settles."
+    )
+}
+
+/// Private duplicate-add receipt. Only a command-safe saved id and the observed
+/// lifecycle state leave the store; no source or delivery capability is echoed.
+/// A malformed restored id is not truncated into a different command target.
+#[must_use]
+pub fn feed_existing_text(id: &str, enabled: bool) -> String {
+    let state = if enabled { "enabled" } else { "paused" };
+    if validate_id(id).is_err() {
+        return format!(
+            "A feed relay is already saved and {state}. No relay was created or changed. \
+             Use /feed-list to inspect saved relays."
+        );
+    }
+    let command = if enabled { "feed-pause" } else { "feed-resume" };
+    format!(
+        "Feed relay already saved: `{id}` is {state}. No relay was created or changed. \
+         Inspect with `/feed-inspect id:{id}` or use `/{command} id:{id}`."
+    )
+}
 
 /// Pause/resume confirmations. The relay id is interpolated by the caller so
 /// the member can copy the stable id back into `/feed-resume`, `/feed-remove`
