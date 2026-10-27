@@ -770,7 +770,7 @@ impl LevelingRuntime {
                 request.channel_id,
                 request.duration.is_some(),
             );
-            let outcome = self.award(request).await;
+            let outcome = self.award(&request).await;
             // A role failure still carries this request's committed XP.
             // Only fresh message crossings can create a celebration;
             // voice, decay and reconciliation never enter this path.
