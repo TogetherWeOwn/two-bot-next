@@ -21,7 +21,8 @@
 //! 3. post insert-or-select: concurrent inserts yield exactly one row per
 //!    `(guild_id, source_message_id)` (UNIQUE), with the post state lifecycle
 //!    columns (`posted` | `below_threshold` | `source_deleted`);
-//! 4. PR-1 adds exactly the three tables — no posting/editing behavior yet.
+//! 4. the schema contains exactly the three foundation tables plus the runtime
+//!    reaction replay cursor table.
 //!
 //! Only agent-testdb or a CI service container is admitted, with the
 //! agent_test identity. DATABASE_URL is never consulted.
@@ -620,9 +621,9 @@ async fn post_state_lifecycle_columns() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires authorized TEST_DATABASE_URL"]
-async fn starboard_surface_is_exactly_three_tables() {
-    // AC5: PR-1 is tables only — exactly config/starrers/posts, no posting or
-    // runtime tables smuggled in early.
+async fn starboard_surface_is_exactly_four_tables() {
+    // The runtime adds only replay cursors to the three foundation tables;
+    // keep the exact inventory so unrelated tables cannot slip in.
     let f = Fixture::new().await;
     let mut tables: Vec<String> = sqlx::query_scalar(
         "SELECT tablename FROM pg_tables
@@ -638,9 +639,10 @@ async fn starboard_surface_is_exactly_three_tables() {
         vec![
             "starboard_config".to_owned(),
             "starboard_posts".to_owned(),
+            "starboard_reaction_cursors".to_owned(),
             "starboard_starrers".to_owned(),
         ],
-        "PR-1 must create exactly the three starboard tables"
+        "starboard must contain exactly the foundation and replay cursor tables"
     );
     f.finish().await;
 }

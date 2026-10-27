@@ -693,3 +693,8 @@ VALUES (100000000000000001, 100000000000000003, 100000000000000006,
         100000000000000010, 100000000000000020, 2, 'posted'),
        (100000000000000001, 100000000000000003, 100000000000000007,
         100000000000000010, NULL, 1, 'below_threshold');
+-- Starboard replay cursors (v15) survive backups even after a reaction removal.
+INSERT INTO starboard_reaction_cursors
+    (guild_id, source_message_id, user_id, session_key, event_order, updated_at)
+VALUES (100000000000000001, 100000000000000007, 100000000000000004,
+        'backup-starboard-session', '00000000000000000042', '2026-08-03T10:00:00.123456Z');
