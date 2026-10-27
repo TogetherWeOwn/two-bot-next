@@ -4715,6 +4715,7 @@ mod tests {
             key: TokenKey,
             entered: Arc<AtomicUsize>,
             dropped: Arc<AtomicUsize>,
+            started: Arc<tokio::sync::Notify>,
         }
         impl SendAdmission for PendingAdmission {
             fn token_key(&self) -> &TokenKey {
@@ -4725,6 +4726,7 @@ mod tests {
                 Box::pin(async move {
                     let _drop = AdmissionDrop(self.dropped.clone());
                     self.entered.fetch_add(1, Ordering::SeqCst);
+                    self.started.notify_one();
                     std::future::pending().await
                 })
             }
@@ -4733,6 +4735,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let entered = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
         let token = "fixture-lazy-send-token";
         let executor = ActionExecutor::with_admission(
             token.to_owned(),
@@ -4741,6 +4744,7 @@ mod tests {
                 key: TokenKey::for_bot_token(token).expect("fixture token key"),
                 entered: entered.clone(),
                 dropped: dropped.clone(),
+                started: started.clone(),
             }),
         )
         .expect("fixture executor");
@@ -4755,16 +4759,41 @@ mod tests {
         let mut pending = Box::pin(executor.send_admitted_for(&request, budget));
         // Construction must not start the deadline or durable admission.
         tokio::time::advance(budget * 2).await;
+        assert_eq!(executor.requests(), 0);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
         std::future::poll_fn(|cx| {
             assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
             Poll::Ready(())
         })
         .await;
         assert_eq!(executor.requests(), 1);
+        // A governed GET owns admission independently of its awaiting caller.
+        // Wait for the owner rather than requiring admission in the first poll.
+        tokio::time::timeout(budget, started.notified())
+            .await
+            .expect("governed read owner entered admission");
         assert_eq!(entered.load(Ordering::SeqCst), 1);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(pending);
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "caller cancellation must not abandon the admission before its deadline"
+        );
+        // The original attempt gets at most one extra second for settlement.
+        tokio::time::advance(Duration::from_millis(1) + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "pending admission must be dropped by the read settlement bound"
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "no detached retry");
+        assert_eq!(executor.requests(), 1);
     }
 
     fn boot_executor() -> ActionExecutor {
