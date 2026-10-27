@@ -809,8 +809,11 @@ pub fn format_command_list_page(
 /// `prefix` must already be normalized via [`normalize_list_prefix`]: lowercase
 /// `^[a-z0-9_-]{1,32}$`. Name matching is start-only (`starts_with`), never
 /// substring, description, template or trigger; disabled rows stay visible with
-/// their existing fields. Every success page shows the active prefix, the
-/// filtered total and `Page N of M`; non-final pages carry a copyable
+/// their existing fields. Rows and the echoed prefix render literally (no
+/// Markdown escaping): names are alphabet-constrained, rows start with `/` so
+/// a leading `-` cannot open a block, and a copied name must pass validation.
+/// Every success page shows the active prefix, the filtered total and
+/// `Page N of M`; non-final pages carry a copyable
 /// `Next: /command-list name-prefix:<prefix> page:<next>` hint retaining the
 /// filter. An empty guild, zero matches and an out-of-range filtered page stay
 /// distinguishable; all replies fit Discord's 2,000 UTF-16-unit ceiling with
@@ -826,8 +829,7 @@ pub fn format_command_list_page_with_prefix(
     if rows.is_empty() {
         return if page == 1 {
             Ok(format!(
-                "No custom commands defined matching prefix \"{}\".",
-                escape_inspect_text(prefix)
+                "No custom commands defined matching prefix \"{prefix}\"."
             ))
         } else {
             Err(INVALID_COMMAND_LIST_PAGE)
@@ -840,8 +842,7 @@ pub fn format_command_list_page_with_prefix(
     if filtered.is_empty() {
         return if page == 1 {
             Ok(format!(
-                "No matching names for prefix \"{}\". Run /command-list to browse all commands.",
-                escape_inspect_text(prefix)
+                "No matching names for prefix \"{prefix}\". Run /command-list to browse all commands."
             ))
         } else {
             Err(INVALID_COMMAND_LIST_PAGE)
@@ -854,11 +855,11 @@ pub fn format_command_list_page_with_prefix(
             let trigger = row
                 .text_trigger
                 .as_deref()
-                .map(|trigger| format!(" (or {})", escape_inspect_text(trigger)))
+                .map(|trigger| format!(" (or {trigger})"))
                 .unwrap_or_default();
             format!(
                 "/{}{} — {}",
-                escape_inspect_text(&row.name),
+                row.name,
                 trigger,
                 if row.enabled { "on" } else { "off" }
             )
@@ -869,10 +870,7 @@ pub fn format_command_list_page_with_prefix(
     } else {
         "commands"
     };
-    let header = format!(
-        "Matching \"{}\": {total_matches} {noun}",
-        escape_inspect_text(prefix)
-    );
+    let header = format!("Matching \"{prefix}\": {total_matches} {noun}");
     let single_page = format!("{header}\n{}\n\nPage 1 of 1", lines.join("\n"));
     if single_page.encode_utf16().count() <= MAX_RENDERED_CHARS {
         return if page == 1 {
@@ -2047,6 +2045,21 @@ mod tests {
         assert!(page.contains("Page 1 of 1"));
         assert!(!page.contains("/command-list name-prefix:"));
         assert!(page.encode_utf16().count() <= MAX_RENDERED_CHARS);
+    }
+
+    #[test]
+    fn filtered_list_renders_underscore_and_dash_names_literally() {
+        let mut under = stored("_under");
+        under.enabled = false;
+        let mut dash = stored("-dash");
+        dash.enabled = false;
+        let rows = vec![dash.clone(), under.clone()];
+        for (prefix, expected) in [("_", "/_under — off"), ("-", "/-dash — off")] {
+            let page = format_command_list_page_with_prefix(&rows, prefix, 1).expect("filtered");
+            let lines: Vec<_> = page.lines().filter(|line| line.starts_with('/')).collect();
+            assert_eq!(lines, [expected], "prefix {prefix} stays copyable");
+            assert!(page.contains(&format!("Matching \"{prefix}\": 1 command")));
+        }
     }
 
     #[test]
