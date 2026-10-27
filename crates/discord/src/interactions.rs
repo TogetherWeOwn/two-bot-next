@@ -742,9 +742,11 @@ impl InteractionRuntime {
             )
             .await?;
         // Discord signs the payload, so the message is the bot's own post
-        // button only when its author is this application's bot user.
+        // button only when its author is this bot user. An unresolved bot
+        // user (0) matches nothing, so the lookup is refused, not waved through.
+        let bot_user_id = self.bot_user_id().await;
         let genuine = interaction.message.as_ref().filter(|message| {
-            message.author.bot && message.author.id.get() == interaction.application_id.get()
+            bot_user_id != 0 && message.author.bot && message.author.id.get() == bot_user_id
         });
         let reply = match (two_bot_core::parse_lfg_mine(custom_id), genuine) {
             (Some(post_id), Some(message)) => {
