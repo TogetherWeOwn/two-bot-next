@@ -2568,12 +2568,16 @@ impl Metrics {
             values.audit_delivery_halt
         )
         .unwrap();
-        scalar(
-            &mut out,
-            "two_bot_gateway_drain_skips_total",
-            "counter",
-            values.gateway_drain_skips,
-        );
+        // Empty HELP: main sits within 131 bytes of the scrape byte budget
+        // (`eventsub_classification_growth_fits_the_scrape_byte_budget`), and
+        // this counter's three lines must fit without relaxing that headroom.
+        header(&mut out, "two_bot_gateway_drain_skips_total", "counter", "");
+        writeln!(
+            out,
+            "two_bot_gateway_drain_skips_total {}",
+            values.gateway_drain_skips
+        )
+        .unwrap();
         scalar(
             &mut out,
             "two_bot_retention_replay_needed_total",
