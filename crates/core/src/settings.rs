@@ -1026,6 +1026,11 @@ pub enum WriteRefusal {
          store a plain count or delete the row to fall back to the boot value"
     )]
     InvalidInactivityDays(String),
+    #[error(
+        "refused: {0} requires nonzero Discord IDs in its single-ID or CSV format; \
+         repair the destination or delete the row to fall back to the boot value"
+    )]
+    InvalidOnboardingDestination(String),
 }
 
 /// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
@@ -1084,6 +1089,27 @@ pub fn validate_write(
     }
     if value.as_ref().is_some_and(contains_json_nul) {
         return Err(WriteRefusal::NullCharacter);
+    }
+    // Render exactly as snapshots do, then use the runtime's syntax parsers.
+    // Stored JSON null is ignored by rendering, not an explicit deletion.
+    // Optional emptiness is valid here; mode-specific requiredness stays in
+    // the runtime, even for currently unwired destination keys.
+    if let Some(value) = value.as_ref() {
+        let valid = match key {
+            "DISCORD_ANCHOR_WELCOME_CHANNEL_ID"
+            | "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID"
+            | "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID" => to_env_string(value).is_some_and(|v| {
+                crate::onboarding_destination::parse_optional_id(Some(&v)).is_ok()
+            }),
+            "DISCORD_LANDING_CHANNEL_IDS" | "DISCORD_GOODBYE_CHANNEL_IDS" => to_env_string(value)
+                .is_some_and(|v| {
+                    crate::onboarding_destination::parse_channel_ids(Some(&v)).is_ok()
+                }),
+            _ => true,
+        };
+        if !valid {
+            return Err(WriteRefusal::InvalidOnboardingDestination(key.to_owned()));
+        }
     }
     if ZERO_ONE_GATE_KEYS.contains(&key)
         && value
