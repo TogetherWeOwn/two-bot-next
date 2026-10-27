@@ -147,6 +147,41 @@ authoritative exact-intent evidence. Mutations are dry-run by default
 (`--execute` writes), staging-guild only, and claim tokens never print.
 `TWO_MODERATION` stays default-off and staging-only until soak.
 
+## Private saved-expiry inventory
+
+`/tempban-list [page:1..10000]` privately lists saved temporary-ban expiry work,
+not observed Discord bans. It shares the configured-guild, moderation and
+staging-only member-runtime gates. Both routing and a fresh server-side actor
+membership/role check require Ban Members-class authority. No self/member lookup
+permission is introduced. This is not live activation or production clearance.
+
+Page one is the default. Pages contain ten complete rows (except the final
+page), ordered by exact saved `execute_at`, then work/request ID in PostgreSQL
+`C` collation. SQL reads at most eleven rows including lookahead, with a bounded
+offset; the next-page invocation is shown when available. Separate invocations
+are not a snapshot: concurrent expiry work can shift page boundaries. Page 10000
+is the browse ceiling; further inspection belongs to the operator.
+
+Rows show full work and member IDs, a Discord-localized saved timestamp, due or
+future timing, and the actual state: `pending`, `staged/prepared`, `running` or
+`quarantined`, plus `dispatch uncertain` when saved. Done, cancelled and
+superseded history is excluded. A prepared permanent-ban intent without a saved
+expiry is not included. **Saved/due does not confirm a Discord unban; running is
+not completion.** Neither elapsed time nor this inventory resolves uncertainty.
+
+The reply is ephemeral with mentions suppressed and at most 2000 UTF-16 units.
+Unsafe identity characters are percent-encoded as UTF-8 bytes (including `%`),
+not clipped; decode those bytes to recover the exact identity. A page whose
+complete safe IDs cannot fit fails closed with an operator next action, rather
+than dropping rows. Empty inventory, an empty higher page and unavailable reads
+have distinct corrective replies. Invalid, duplicated, unknown or wrong-typed
+selectors refuse before any expiry read; use `/tempban-list page:1` to restart.
+
+This path performs only SELECTs and authority GETs. It never claims, sweeps,
+retries, repairs, deletes, unbans or writes an applied-mutation audit, and never
+looks up Discord bans. Reasons, attribution and claim capabilities are not
+selected or displayed. Existing reconciliation remains separately authorized.
+
 ## Durability
 
 Migrations 0110–0114 stay in `crates/cutover/migrations`, the directory embedded
