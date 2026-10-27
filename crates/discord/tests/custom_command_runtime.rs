@@ -6,6 +6,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "support/invalid_saved_templates_acceptance.rs"]
+mod invalid_saved_templates_acceptance;
+
 use std::sync::Arc;
 
 use common::{MockRest, ScriptedResponse};
