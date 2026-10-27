@@ -32,6 +32,8 @@ mod member_authority_cause_acceptance;
 mod member_dispatch_authority_acceptance;
 #[path = "member_strict_decode_acceptance.rs"]
 mod member_strict_decode_acceptance;
+#[path = "moderation_recent_acceptance.rs"]
+mod moderation_recent_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
 mod sticky_uncertain_acceptance_tests;
 #[path = "sticky_unsaved_preview_acceptance_tests.rs"]
