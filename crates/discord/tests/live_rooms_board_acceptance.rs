@@ -151,7 +151,7 @@ fn no_disclosure(reply: &Reply, id: u64, name: &str, game: &str) {
         id.to_string(),
         name.to_owned(),
         game.to_owned(),
-        "private room",
+        "private room".to_owned(),
     ] {
         assert!(
             !reply.content.contains(&forbidden),

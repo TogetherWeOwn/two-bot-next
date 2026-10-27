@@ -4,7 +4,7 @@
   "baseCommit": "92d85042527b756062bfc9e19c8d77aed0cee0b3",
   "branch": "test/live-rooms-board-core-acceptance",
   "protectedFiles": [
-    {"path": "crates/discord/tests/live_rooms_board_acceptance.rs", "sha256": "ac0a1215b98b56baa587fd0f256e798c929246c6a026b3f7c4f0c0eb94c3df30", "tests": 26},
+    {"path": "crates/discord/tests/live_rooms_board_acceptance.rs", "sha256": "382ea0fb004d40853db73b86145726e666ed49a4e666a7bf2669574530753da3", "tests": 26},
     {"path": "crates/discord/tests/support/live_rooms_board_contract.rs", "sha256": "716980bbe610f091b8b28957af1b83737ea01345ac454d9ad2ef4024930c0ef2", "tests": 0}
   ],
   "editableBridge": {
