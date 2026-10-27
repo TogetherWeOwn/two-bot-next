@@ -456,12 +456,27 @@ impl Drop for RsvpPermit {
 
 /// Dispatch-worker failures are recorded errors, never worker panics: the
 /// worker stops, already-accepted commands drain, and the runner surfaces
-/// these typed errors instead of a bare "dispatch worker failed". Each
-/// message names its stage. Pre-commit failures keep the
+/// these typed errors instead of a bare "dispatch worker failed". Database
+/// causes pass through without formatting; non-database messages name their
+/// stage. Synthesized pre-commit failures keep the
 /// `; checkpoint unchanged` suffix; the missing-ticket error is raised after
 /// a successful commit, so it says `; checkpoint committed` instead.
-fn leveling_dispatch_failure() -> sqlx::Error {
-    sqlx::Error::InvalidArgument("leveling gateway dispatch failed; checkpoint unchanged".into())
+fn leveling_dispatch_failure(
+    error: two_bot_discord::leveling_runtime::LevelingRuntimeError,
+) -> sqlx::Error {
+    use two_bot_core::leveling_store::LevelingStoreError;
+    use two_bot_discord::leveling_runtime::{LevelingRuntimeError, RoleApplicationError};
+
+    match error {
+        LevelingRuntimeError::Store(LevelingStoreError::Db(error))
+        | LevelingRuntimeError::RoleApplication {
+            cause: RoleApplicationError::Store(LevelingStoreError::Db(error)),
+            ..
+        } => error,
+        _ => sqlx::Error::InvalidArgument(
+            "leveling gateway dispatch failed; checkpoint unchanged".into(),
+        ),
+    }
 }
 
 fn leveling_poison_failure() -> sqlx::Error {
@@ -816,7 +831,7 @@ fn requests_or_hold_cursor(
                     LevelingRuntimeError::CommunityFactsPoisoned => {
                         community_facts_poison_failure()
                     }
-                    _ => leveling_dispatch_failure(),
+                    _ => leveling_dispatch_failure(error),
                 });
             }
             Vec::new()
@@ -1143,23 +1158,43 @@ fn apply_dispatch<I: InviteSource>(
                 failures,
                 deadline,
                 async {
-                    pipeline.drain(requests).await.map(drop).map_err(|error| {
-                        // Runtime Display is sanitized; never
-                        // log its SQL/HTTP source.
-                        tracing::warn!(
-                            error = %error,
-                            committed_awards = error.committed_awards().len(),
-                            "gateway leveling dispatch failed"
-                        );
-                        leveling_dispatch_failure()
-                    })
+                    match pipeline.drain(requests).await {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            let committed_awards = error.committed_awards().len();
+                            let cause = crate::db_log::leveling_class(&error);
+                            let error = leveling_dispatch_failure(error);
+                            let code = crate::db_log::error_code(&error);
+                            if crate::gateway_failure::is_schema_gap(&error) {
+                                tracing::warn!(
+                                    drain = "leveling",
+                                    cause,
+                                    error_code = code.as_deref().unwrap_or("none"),
+                                    committed_awards,
+                                    "gateway leveling dispatch skipped; schema gap"
+                                );
+                                two_bot_core::metrics::global().gateway_drain_skip();
+                                Ok(())
+                            } else {
+                                tracing::warn!(
+                                    drain = "leveling",
+                                    cause,
+                                    error_code = code.as_deref().unwrap_or("none"),
+                                    committed_awards,
+                                    "gateway leveling dispatch failed"
+                                );
+                                Err(error)
+                            }
+                        }
+                    }
                 },
             ));
-            if drain_outcome.is_err() {
-                // A failed drain or its checkpoint deadline
-                // holds the cursor via `dispatch_error`
-                // instead of panicking away accepted work.
-                dispatch_error = Some(leveling_dispatch_failure());
+            if let Err(error) = drain_outcome {
+                // Non-gap errors and checkpoint deadlines still hold the
+                // cursor. Preserve both the source and any earlier failure.
+                if dispatch_error.is_none() {
+                    dispatch_error = Some(error);
+                }
             }
         }
         // Community facts: drain buffered voice_session_started/ended,
@@ -1402,7 +1437,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // slash rows until a later management republish. Resolve the token
     // identity once through the shared executor, arm the ordered fence from
     // the same lookup, then publish the merged set. READY/RESUMED dispatch
-    // stays publication-free, so this boot sync is the single writer.
+    // stays publication-free unless a pending resync marker says the picker
+    // is stale, so this boot sync is otherwise the single writer.
     // Without the command runtime, keep the ordered builtins-only sync.
     match (interactions.as_ref(), runtime.as_ref()) {
         (Some(ordered), Some(commands)) => {
@@ -3290,7 +3326,9 @@ mod tests {
     /// never a bare worker panic: the message carries the checkpoint contract.
     #[test]
     fn gateway_leveling_drain_failure_holds_checkpoint_as_typed_error() {
-        let error = leveling_dispatch_failure();
+        let error = leveling_dispatch_failure(
+            two_bot_discord::leveling_runtime::LevelingRuntimeError::InvalidInteraction,
+        );
         assert!(
             matches!(
                 &error,
@@ -3298,6 +3336,39 @@ mod tests {
                     if message.as_str() == "leveling gateway dispatch failed; checkpoint unchanged"
             ),
             "leveling failure must stay typed, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_leveling_drain_preserves_direct_and_post_award_store_causes() {
+        use two_bot_core::leveling_store::LevelingStoreError;
+        use two_bot_discord::leveling_runtime::{LevelingRuntimeError, RoleApplicationError};
+
+        let direct = LevelingRuntimeError::Store(LevelingStoreError::Db(sqlx::Error::PoolClosed));
+        assert!(matches!(
+            leveling_dispatch_failure(direct),
+            sqlx::Error::PoolClosed
+        ));
+        let post_award = LevelingRuntimeError::RoleApplication {
+            cause: RoleApplicationError::Store(LevelingStoreError::Db(sqlx::Error::RowNotFound)),
+            awards: vec![],
+        };
+        assert!(matches!(
+            leveling_dispatch_failure(post_award),
+            sqlx::Error::RowNotFound
+        ));
+        let failure = crate::gateway_failure::step_failure(
+            crate::gateway_failure::FailureClass::GatewayRuntimeFailed,
+            "gateway_run",
+            leveling_dispatch_failure(LevelingRuntimeError::Store(LevelingStoreError::Db(
+                sqlx::Error::PoolTimedOut,
+            ))),
+        );
+        assert!(matches!(failure.error, sqlx::Error::PoolTimedOut));
+        assert_eq!(crate::db_log::error_code(&failure.error), None);
+        assert_eq!(
+            crate::db_log::failure_reason(&failure.error),
+            "pool_timeout"
         );
     }
 
@@ -3346,7 +3417,9 @@ mod tests {
             crate::db_log::failure_reason(held.as_ref().expect("non-poison failure holds cursor")),
             "leveling gateway dispatch failed; checkpoint unchanged"
         );
-        let mut held = Some(leveling_dispatch_failure());
+        let mut held = Some(leveling_dispatch_failure(
+            LevelingRuntimeError::InvalidInteraction,
+        ));
         let requests =
             requests_or_hold_cursor(Err(LevelingRuntimeError::LevelingPoisoned), &mut held);
         assert!(requests.is_empty());
@@ -3393,7 +3466,9 @@ mod tests {
             "store failures must keep warn-and-continue"
         );
         assert!(held.is_none());
-        let mut held = Some(leveling_dispatch_failure());
+        let mut held = Some(leveling_dispatch_failure(
+            LevelingRuntimeError::InvalidInteraction,
+        ));
         assert!(hold_cursor_on_facts_poison(
             &CommunityFactsError::Poisoned,
             &mut held
@@ -3774,7 +3849,7 @@ mod tests {
             matches!(
                 &outcome,
                 Err(sqlx::Error::InvalidArgument(message))
-                    if message.as_str() == "leveling gateway dispatch failed; checkpoint unchanged"
+                    if message.as_str() == "gateway checkpoint deadline exceeded"
             ),
             "worker must record a typed error, got {outcome:?}"
         );
@@ -4525,7 +4600,9 @@ mod tests {
     #[test]
     fn gateway_dispatch_worker_failures_are_distinct_typed_errors() {
         let messages = [
-            leveling_dispatch_failure(),
+            leveling_dispatch_failure(
+                two_bot_discord::leveling_runtime::LevelingRuntimeError::InvalidInteraction,
+            ),
             interaction_drain_failure(),
             invalid_onboarding_job_failure(),
             missing_ingress_ticket_failure(),
