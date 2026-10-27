@@ -176,6 +176,38 @@ fn router_construction_paths_agree_in_every_gate_set() {
 }
 
 #[test]
+fn router_construction_uses_the_supplied_registry_in_every_gate_set() {
+    let reg = DescriptorRegistry::builtin().without("rank");
+    for gates in gate_sets() {
+        let direct = InteractionRouter::new(gates);
+        let derived = InteractionRouter::with_registry(gates, &reg);
+        assert!(
+            direct
+                .publish_set(&[])
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "rank"),
+            "positive control: the default router publishes /rank with {gates:?}"
+        );
+        assert!(!derived
+            .publish_set(&[])
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "rank"));
+        assert_eq!(
+            route(&direct, "rank", Some(GUILD), Some(u64::MAX)),
+            "Handled { handler: Rank }",
+            "positive control: the default router routes /rank with {gates:?}"
+        );
+        assert_eq!(
+            route(&derived, "rank", Some(GUILD), Some(u64::MAX)),
+            "Unknown",
+            "the supplied registry removed /rank with {gates:?}"
+        );
+    }
+}
+
+#[test]
 fn help_is_rendered_from_the_registry_with_the_legacy_text() {
     let reg = DescriptorRegistry::builtin();
     for gates in gate_sets() {
@@ -199,6 +231,17 @@ fn every_routed_handler_is_registered_or_a_blessed_gap() {
                 .map(|id| format!("{id:?}"))
                 .collect();
         let missing = reg.unregistered_handlers(&router);
+        let expected: std::collections::BTreeSet<_> = FROZEN
+            .iter()
+            .filter(|f| blessed.iter().any(|b| *b == f.handler))
+            .map(|f| f.name)
+            .collect();
+        let actual: std::collections::BTreeSet<_> = missing.iter().copied().collect();
+        assert_eq!(
+            actual, expected,
+            "the complete registration gap set for member_present={member_present}"
+        );
+        assert_eq!(missing.len(), expected.len(), "each gap appears once");
         // `unregistered_handlers` names commands; every one must be a command
         // whose owner is a blessed gap, and nothing else may be missing.
         for name in missing {
