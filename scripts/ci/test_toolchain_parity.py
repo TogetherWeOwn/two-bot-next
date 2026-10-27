@@ -3,8 +3,8 @@
 `rust-toolchain.toml` is the single source of truth (currently 1.99.1).
 Every `dtolnay/rust-toolchain` step in `check.yml`, `nightly.yml`,
 `pipeline-benchmark.yml` and `reusable-rust-nextest.yml` must request that
-exact channel (the fuzz-compile job alone uses pinned nightly), `Dockerfile`
-must build
+exact channel (the fuzz-compile job alone uses pinned nightly), every covered
+Dockerfile (`Dockerfile` and `crates/voice-probe/Dockerfile`) must build
 `FROM rust:<major>.<minor>-trixie`, and the selected workflow job containers
 must use the matching pinned Rust trixie image. Runs offline via the existing
 `Source-level CI gate regressions` discover step in check.yml.
@@ -29,7 +29,7 @@ CONTAINER_WORKFLOWS = {
     "production-migrate.yml": ("plan", "apply"),
     "nightly.yml": ("sweep",),
 }
-DOCKERFILES = ("Dockerfile",)
+DOCKERFILES = ("Dockerfile", "crates/voice-probe/Dockerfile")
 # libFuzzer needs nightly; pinned date, not floating stable.
 FUZZ_TOOLCHAIN = "nightly-2026-10-01"
 MATCH_COMMENT = "Match rust-toolchain.toml"
@@ -98,7 +98,7 @@ def _rust_stages(text):
 
 
 def dockerfile_parity_errors(root):
-    """Every rust stage in the Dockerfile builds FROM rust:<major>.<minor>-trixie."""
+    """Every rust stage in each covered Dockerfile builds FROM rust:<major>.<minor>-trixie."""
     errors = []
     try:
         channel = read_channel(root)
@@ -127,7 +127,8 @@ def container_image_errors(root):
     """Selected job containers use the pinned Rust trixie image tag and digest.
 
     The tag must match rust-toolchain.toml and the digest must match the
-    Dockerfile builder digest, so a digest-only roll on either side fails.
+    shared builder digest of the covered Dockerfiles, so a digest-only roll
+    on either side fails.
     """
     errors = []
     try:
@@ -221,7 +222,9 @@ def make_fixture_root(parent, channel="1.99.1", workflow_toolchain="1.99.1", doc
         with path.open("a") as fixture:
             fixture.write(job_text + "\n")
     for name in DOCKERFILES:
-        (root / name).write_text(PINNED_DOCKERFILE.format(tag=docker_tag, digest=docker_digest))
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(PINNED_DOCKERFILE.format(tag=docker_tag, digest=docker_digest))
     return root
 
 
@@ -229,9 +232,10 @@ class ToolchainParityTests(unittest.TestCase):
     def test_pinned_tree_passes(self):
         self.assertEqual(toolchain_parity_errors(ROOT), [])
 
-    def test_only_default_dockerfile_is_covered(self):
-        self.assertEqual(DOCKERFILES, ("Dockerfile",))
-        self.assertTrue((ROOT / "Dockerfile").is_file())
+    def test_all_rust_builder_dockerfiles_are_covered(self):
+        self.assertEqual(DOCKERFILES, ("Dockerfile", "crates/voice-probe/Dockerfile"))
+        for name in DOCKERFILES:
+            self.assertTrue((ROOT / name).is_file(), name)
 
     def test_pinned_fixture_passes(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
@@ -250,6 +254,23 @@ class ToolchainParityTests(unittest.TestCase):
             root = make_fixture_root(scratch, workflow_toolchain="1.100.0")
             errors = workflow_toolchain_errors(root)
             self.assertTrue(errors, "1.100.0 against a 1.99.1 pin must fail")
+
+    def test_each_pinned_workflow_drift_fails_independently(self):
+        # Independently enumerated: dropping a WORKFLOWS entry must fail here
+        # instead of silently shrinking the fixture inventory and the drift
+        # loop together.
+        expected = ("check.yml", "nightly.yml", "pipeline-benchmark.yml", "reusable-rust-nextest.yml")
+        self.assertEqual(WORKFLOWS, expected)
+        for drifted in expected:
+            with self.subTest(workflow=drifted):
+                with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                    root = make_fixture_root(scratch)
+                    (root / ".github/workflows" / drifted).write_text(
+                        PINNED_WORKFLOW.format(toolchain="1.100.0")
+                    )
+                    errors = workflow_toolchain_errors(root)
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertIn(drifted, errors[0])
 
     def test_drifted_dockerfile_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
@@ -355,6 +376,19 @@ class ToolchainParityTests(unittest.TestCase):
                     errors = dockerfile_parity_errors(root)
                     self.assertEqual(len(errors), 1, errors)
                     self.assertIn(drifted, errors[0])
+
+    def test_probe_builder_revert_fails_independently(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            (root / "crates/voice-probe/Dockerfile").write_text(
+                "FROM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder\n"
+            )
+            errors = dockerfile_parity_errors(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("crates/voice-probe/Dockerfile", errors[0])
+            wired = toolchain_parity_errors(root)
+            self.assertTrue(wired, "probe builder revert must fail through the CI entry point")
+            self.assertTrue(any("voice-probe" in error for error in wired))
 
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
