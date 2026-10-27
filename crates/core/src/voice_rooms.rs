@@ -1917,6 +1917,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         )
         .int_range(0, MAX_USER_LIMIT)]),
         CommandDefinition::new("unlimit", "Remove your room's user limit"),
+        CommandDefinition::new("myroom", "Show the live temporary voice rooms you own"),
     ]
 }
 
@@ -3077,7 +3078,8 @@ mod tests {
                 "private",
                 "public",
                 "limit",
-                "unlimit"
+                "unlimit",
+                "myroom"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -3262,6 +3264,12 @@ mod tests {
         let unlimit = defs.iter().find(|def| def.name == "unlimit").unwrap();
         assert_eq!(unlimit.default_member_permissions, None);
         assert!(unlimit.options.is_empty());
+        // `/myroom` is a read-only member listing: open in the definition,
+        // no options (the caller is the authenticated invoker), and the
+        // worker filters to their currently owned live rooms.
+        let myroom = defs.iter().find(|def| def.name == "myroom").unwrap();
+        assert_eq!(myroom.default_member_permissions, None);
+        assert!(myroom.options.is_empty());
         // `/name` is open to every member with no options: the panel and modal
         // carry the name, and the worker refuses everyone but the owner or an
         // admin.

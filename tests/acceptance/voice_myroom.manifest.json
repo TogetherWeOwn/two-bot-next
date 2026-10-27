@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only handoff for private discovery of a member's own live voice rooms and actionable per-user-cap refusal",
+  "baseCommit": "dffb6755937ee3c6a4b8c967d3fe9e8408a39257",
+  "branch": "test/voice-myroom-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/voice_myroom_acceptance_tests.rs",
+      "sha256": "6044b829e9574a52863a8a5cd6a928ea6dd787030984346b744a5c9ed093db01",
+      "tests": 9
+    },
+    {
+      "path": "crates/core/tests/voice_myroom_acceptance.rs",
+      "sha256": "073154c4eb1897c172a63fcbdc39e8dc3285548231c72fb5b6dccaf08193031b",
+      "tests": 4
+    },
+    {
+      "path": "crates/bot/src/voice_rooms_tests.rs",
+      "sha256": "32c99d7aa1bfd597a2d8e42e0f880b99c4372969292ed4d5acc615632423b5d1",
+      "change": "Only the myroom_acceptance child-module registration was added; existing tests unchanged"
+    }
+  ],
+  "commands": {
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib --locked voice_rooms::tests::myroom_acceptance:: -- --nocapture --test-threads=1",
+    "discovery": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_myroom_acceptance --locked -- --nocapture",
+    "compatibility": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest --test smoke_surface_inventory --test registry_golden --test reference_docs --locked",
+    "format": "cargo fmt --all -- --check"
+  },
+  "expectedBaseline": {
+    "runtime": {"tests": 9, "missingBehaviorFailures": 5, "controls": 4},
+    "discovery": {"tests": 4, "missingBehaviorFailures": 3, "controls": 1},
+    "note": "Expected counts are a contract, not a claim that a Rust run was observed. Consult the task handoff for actual execution evidence."
+  },
+  "boundaries": {
+    "externalServices": "No database, Discord, staging or production access; only stateful persistence and Discord doubles",
+    "runtime": "Real parser, authority/access gates, runtime actor channel, production apply_command and response rendering; the command-only actor driver excludes unrelated timer maintenance",
+    "liveState": "The loaded worker owns two caller rooms and one other-owner room; stored room rows and privacy are deliberately changed after load, and a room-store read is scripted to fail",
+    "readOnly": "Before-read snapshots pin persisted and runtime room/privacy state, the pending mutation queue, create claims, overwrite writes and effect trace"
+  },
+  "contract": {
+    "cap": "UserCap messages link all known caller-owned tracked rooms, not rooms merely created originally by the caller; unknown-room fallback and all four non-cap messages remain byte-identical",
+    "admission": "Pure reason codes/messages remain context-free; a refusal claims once, precedes every Discord write, binds/settles nothing and never retries",
+    "memberRead": "One ephemeral /myroom reply lists only authenticated current-owner live tracked rooms, including channel links and associated public/private state; being outside voice is allowed",
+    "empty": "No owned live room is stated truthfully, with joining a creator lobby as the next action",
+    "discovery": "Exactly one guild-only no-option ordinary-member command with voice on; voice sink owns dispatch before custom rows; help lists it with the member voice commands",
+    "compatibility": "Builder owns staging voice publish manifest, help/count pins and rendered docs/commands.md. Existing voice-off smoke/legacy registry fixtures must remain truthful; do not increase voice-off counts for a voice-only surface."
+  },
+  "handoff": [
+    "Do not merge this deliberately failing test-only branch by itself.",
+    "Consume the immutable handoff SHA, preserve every protected file byte-for-byte and return test corrections to the test author.",
+    "The Builder owns the implementation and compatibility pins/docs, exact-head green required checks, independent review and squash auto-merge.",
+    "The acceptance task remains open until the intended assertion failures and passing controls have been observed; a cache admission refusal is not RED evidence."
+  ]
+}

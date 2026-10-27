@@ -31,6 +31,7 @@ pub const VOICE_COMMANDS: &[&str] = &[
     "kick",
     "limit",
     "logging",
+    "myroom",
     "name",
     "nick",
     "ping",

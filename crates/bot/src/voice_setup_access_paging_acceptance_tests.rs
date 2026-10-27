@@ -356,7 +356,7 @@ fn maximal_controls() -> AccessControls {
 #[test]
 fn registry_adds_optional_page_only_to_setup_and_access_show() {
     let defs = voice_command_set(&VoiceGates { enabled: true });
-    assert_eq!(defs.len(), 22, "no new commands: {defs:?}");
+    assert_eq!(defs.len(), 23, "no new commands: {defs:?}");
     let integer = two_bot_core::commands::CommandOptionType::Integer.as_u8();
 
     let setup = defs
@@ -724,7 +724,7 @@ async fn access_show_pages_cover_every_restriction_with_maximal_roles() {
     let (_, total) = page_meta(&first).expect("page/total must be visible");
     assert!(
         total > 1,
-        "26 maximal restrictions cannot fit one bounded reply"
+        "27 maximal restrictions cannot fit one bounded reply"
     );
     let mut seen_names = Vec::new();
     let mut seen_roles: std::collections::BTreeMap<String, Vec<u64>> =

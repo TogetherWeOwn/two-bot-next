@@ -2,8 +2,9 @@
 
 use proptest::prelude::*;
 use two_bot_core::voice_utilities::{
-    invite_render, is_valid_invite_code, ping_render, INVALID_INVITE_CODE, MAX_INVITE_CODE_CHARS,
-    MAX_PING_DISPLAY_MS, MIN_INVITE_CODE_CHARS, NO_INVITE_CONFIGURED,
+    invite_render, is_valid_invite_code, myroom_render, ping_render, INVALID_INVITE_CODE,
+    MAX_INVITE_CODE_CHARS, MAX_PING_DISPLAY_MS, MIN_INVITE_CODE_CHARS, MYROOM_EMPTY,
+    NO_INVITE_CONFIGURED,
 };
 
 #[test]
@@ -111,4 +112,33 @@ proptest! {
             prop_assert_eq!(out, INVALID_INVITE_CODE);
         }
     }
+}
+
+#[test]
+fn myroom_empty_names_no_room_and_the_next_action() {
+    let out = myroom_render(&[]);
+    assert_eq!(out, MYROOM_EMPTY);
+    let lower = out.to_ascii_lowercase();
+    assert!(lower.contains("no") && lower.contains("own"));
+    assert!(lower.contains("room"));
+    assert!(
+        lower.contains("creator") && lower.contains("join"),
+        "next action is join a creator lobby: {out}"
+    );
+    assert!(!lower.contains("<#"), "no channel may be invented: {out}");
+}
+
+#[test]
+fn myroom_lists_each_room_with_its_runtime_privacy() {
+    let out = myroom_render(&[(500, false), (501, true)]);
+    assert_eq!(
+        out,
+        "You own 2 live voice rooms:\n<#500> — public\n<#501> — private"
+    );
+}
+
+#[test]
+fn myroom_singular_counts_one_room() {
+    let out = myroom_render(&[(502, true)]);
+    assert_eq!(out, "You own 1 live voice room:\n<#502> — private");
 }

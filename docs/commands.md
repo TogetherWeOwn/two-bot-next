@@ -46,7 +46,7 @@ Previously distinct RSS URLs stay distinct; another channel is a separate relay.
 The 25-relay guild cap still refuses first, including paused relays and repeated
 adds at capacity. Genuine storage failures retain the fixed failure reply.
 
-Built-in commands: 64.
+Built-in commands: 65.
 
 ## `/access`
 
@@ -500,6 +500,15 @@ Set where room health notices go and how much they say
 | `channel channel` | channel | false | — | — | — | — | Notice channel; leave empty to use the automatic fallback |
 | `mention` | subcommand | false | — | — | — | — | Set or clear the role mentioned on errors |
 | `mention role` | role | false | — | — | — | — | Role to mention; leave empty to clear it |
+
+## `/myroom`
+
+Show the live temporary voice rooms you own
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/name`
 
