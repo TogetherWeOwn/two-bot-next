@@ -1594,6 +1594,16 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "Extra role that may view companions (@everyone for all)",
                 CommandOptionType::Role,
             ),
+            CommandOption::new(
+                "reset-name",
+                "Reset the companion name to the default voice-chat (false or empty keeps it)",
+                CommandOptionType::Boolean,
+            ),
+            CommandOption::new(
+                "reset-viewer-role",
+                "Reset to the default audience, occupants and admins only (false or empty keeps it)",
+                CommandOptionType::Boolean,
+            ),
         ]),
         CommandDefinition::new(
             "access",
@@ -3103,7 +3113,7 @@ mod tests {
             assert!(def.options.is_empty());
         }
         // `/textchannels` is admin-gated like `/create`: a required creator
-        // channel plus optional toggle, name and viewer role.
+        // channel plus optional toggle, name, viewer role and their two resets.
         assert_eq!(
             defs[4].default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
@@ -3126,6 +3136,12 @@ mod tests {
                 ("enabled", CommandOptionType::Boolean.as_u8(), false),
                 ("name", CommandOptionType::String.as_u8(), false),
                 ("viewer-role", CommandOptionType::Role.as_u8(), false),
+                ("reset-name", CommandOptionType::Boolean.as_u8(), false),
+                (
+                    "reset-viewer-role",
+                    CommandOptionType::Boolean.as_u8(),
+                    false
+                ),
             ]
         );
         assert_eq!(

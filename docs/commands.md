@@ -753,6 +753,8 @@ Toggle companion text channels for one creator channel
 | `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (leave empty to keep the stored value) |
 | `name` | string | false | — | — | 100 | — | Companion channel name (default voice-chat) |
 | `viewer-role` | role | false | — | — | — | — | Extra role that may view companions (@everyone for all) |
+| `reset-name` | boolean | false | — | — | — | — | Reset the companion name to the default voice-chat (false or empty keeps it) |
+| `reset-viewer-role` | boolean | false | — | — | — | — | Reset to the default audience, occupants and admins only (false or empty keeps it) |
 
 ## `/timeout`
 
