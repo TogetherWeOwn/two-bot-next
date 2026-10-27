@@ -3584,6 +3584,88 @@ fn help_focus_selector_rejects_duplicate_command_with_a_path() {
     assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
 }
 
+#[tokio::test]
+async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let runtime = CommandRuntime::new(
+        pool,
+        executor,
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    runtime.set_identity(1111, 1111);
+    runtime
+        .publish_registry_checked(Some(1111))
+        .await
+        .expect("confirmed registry");
+    let command = |root: &str| option("command", CommandOptionValue::String(root.to_owned()));
+    let focus = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    // A valid control ensures the confirmed snapshot can actually render the
+    // focused detail that a first-root-wins regression would leak.
+    for roots in [
+        vec!["privacy"],
+        vec!["privacy", "rank"],
+        vec!["rank", "privacy"],
+    ] {
+        let mut options: Vec<_> = roots.iter().map(|root| command(root)).collect();
+        options.push(focus.clone());
+        let mut interaction = slash("help", Some(CHANNEL), options);
+        interaction.member.as_mut().expect("member").permissions = Some(Permissions::empty());
+        let before = mock.requests().len();
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            runtime.on_interaction(&interaction),
+        )
+        .await
+        .expect("help cannot wait on the closed pool");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), before + 1, "only one help callback");
+        let callback = &requests[before];
+        assert_eq!(callback.method, "POST");
+        assert!(callback.path.ends_with("/callback"));
+        let reply: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback JSON");
+        assert_eq!(reply["type"], 4, "immediate response, never defer");
+        assert_eq!(reply["data"]["flags"], 64, "private response");
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        let content = reply["data"]["content"].as_str().expect("help content");
+        if roots.len() == 1 {
+            assert!(
+                content.contains("Usage: /privacy deletion-status <request-id>"),
+                "{content}"
+            );
+        } else {
+            assert!(content.contains("/help"), "{content}");
+            assert!(content.contains("confirmed"), "{content}");
+            assert!(content.contains("Unknown subcommand"), "{content}");
+            assert!(content.encode_utf16().count() <= 2000, "finite correction");
+            assert!(
+                !content.contains("/privacy"),
+                "no focused detail: {content}"
+            );
+            assert!(!content.contains("/rank"), "no root detail: {content}");
+            assert!(
+                !content.contains("deletion-status"),
+                "no input echo: {content}"
+            );
+        }
+    }
+    mock.shutdown().await;
+}
+
 #[test]
 fn new_id_is_unique_hex_that_validate_id_accepts() {
     let first = new_id();

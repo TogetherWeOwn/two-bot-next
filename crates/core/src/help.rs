@@ -1290,16 +1290,59 @@ mod tests {
         use crate::commands::{CommandOption, CommandOptionType};
         let def = CommandDefinition::new("proj", "Project tools")
             .options(vec![
-                CommandOption::new("alpha", "Alpha", CommandOptionType::SubCommand),
+                CommandOption::new("alpha", "Alpha", CommandOptionType::SubCommand).sub_options(
+                    vec![CommandOption::new(
+                        "member",
+                        "Member",
+                        CommandOptionType::String,
+                    )],
+                ),
                 CommandOption::new("beta", "Beta", CommandOptionType::SubCommand),
+                CommandOption {
+                    kind: 2,
+                    ..CommandOption::new("team", "Team tools", CommandOptionType::SubCommand)
+                }
+                .sub_options(vec![CommandOption::new(
+                    "alpha",
+                    "Team alpha",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "member",
+                    "Member",
+                    CommandOptionType::String,
+                )])]),
             ])
             .examples(vec![
                 "/proj alpha".to_owned(),
+                "/proj alpha member:42".to_owned(),
                 "/proj beta".to_owned(),
                 "/proj alphabet".to_owned(),
+                "/proj team alpha".to_owned(),
+                "/proj team alpha member:42".to_owned(),
+                "/proj team beta member:42".to_owned(),
+                "/proj team alphabet member:42".to_owned(),
             ]);
         let alpha = def.help_branch_text("alpha").expect("alpha resolves");
         assert!(alpha.contains("Examples:\n- /proj alpha\n"), "{alpha}");
+        assert!(alpha.contains("Usage: /proj alpha [member]"), "{alpha}");
+        assert!(alpha.contains("- /proj alpha member:42\n"), "{alpha}");
+        for (path, expected) in [
+            ("alpha", vec!["- /proj alpha", "- /proj alpha member:42"]),
+            (
+                "team alpha",
+                vec!["- /proj team alpha", "- /proj team alpha member:42"],
+            ),
+        ] {
+            let focused = def.help_branch_text(path).expect("branch resolves");
+            let examples: Vec<_> = focused
+                .lines()
+                .skip_while(|line| *line != "Examples:")
+                .skip(1)
+                .take_while(|line| line.starts_with("- "))
+                .collect();
+            assert_eq!(examples, expected, "{focused}");
+        }
         assert!(!alpha.contains("/proj beta"), "{alpha}");
         // A shared name prefix is not a match: the example must be exact or
         // continue after a space.
