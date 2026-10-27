@@ -2015,6 +2015,56 @@ pub struct LiveGuild {
 }
 
 impl LiveGuild {
+    /// Fence a REST category observation to an authoritative gateway session.
+    pub(crate) fn event_voice_category_generation(&self, guild: Snowflake) -> Option<u64> {
+        let live = self.read_state();
+        (self.guild_id == guild && live.ready && live.bot.is_some()).then_some(live.generation)
+    }
+
+    /// Combine fresh category overwrites with the current bot roles. Missing
+    /// overwrites are unknown, even for an administrator; a disconnected or
+    /// rebuilt gateway snapshot cannot authorize a read started in its past.
+    pub(crate) fn event_voice_category_snapshot(
+        &self,
+        generation: u64,
+        category: &Channel,
+    ) -> Option<crate::event_voice_category::CategorySnapshot> {
+        let live = self.read_state();
+        if !live.ready
+            || live.generation != generation
+            || category.guild_id.map(Id::get) != Some(self.guild_id)
+            || category.kind != ChannelType::GuildCategory
+        {
+            return None;
+        }
+        let bot = live.bot.as_ref()?;
+        let overwrites = category.permission_overwrites.as_deref()?;
+        let bot_permissions = effective_permissions(
+            self.guild_id,
+            bot.guild_owner_id,
+            bot.member_id,
+            &bot.member_roles,
+            &bot.roles,
+            overwrites,
+        );
+        // Zero is not a Discord member id: evaluate only @everyone's grant,
+        // without inheriting the bot's roles or member-specific overwrite.
+        let everyone_can_view = effective_permissions(
+            self.guild_id,
+            bot.guild_owner_id,
+            0,
+            &[],
+            &bot.roles,
+            overwrites,
+        )
+        .is_some_and(|permissions| permissions.contains(Permissions::VIEW_CHANNEL));
+        Some(crate::event_voice_category::CategorySnapshot {
+            id: category.id.get(),
+            bot_permissions,
+            everyone_can_view,
+        })
+    }
+
     pub fn new(guild_id: Snowflake) -> Self {
         Self {
             guild_id,
@@ -7606,6 +7656,14 @@ pub trait VoiceEventSink: Send + Sync {
         let _ = interaction;
         Box::pin(async { false })
     }
+    /// The guild's live evidence handle for event-voice preflight, if this
+    /// sink owns one. The default fails closed to `None`; only the lifecycle
+    /// runtime returns `Some`, and the preflight treats `None` as
+    /// unavailable, never as an empty grant.
+    fn event_voice_live(&self, guild: Snowflake) -> Option<LiveGuild> {
+        let _ = guild;
+        None
+    }
 }
 
 /// The gateway shares only live evidence; the actor owns the mutable queue.
@@ -9446,6 +9504,10 @@ where
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.enabled && cache.current_user().is_none()
+    }
+
+    fn event_voice_live(&self, guild: Snowflake) -> Option<LiveGuild> {
+        self.live_actor(guild).map(|actor| actor.live.clone())
     }
 }
 
@@ -15396,6 +15458,10 @@ where
         let runtime = Arc::clone(&self.runtime);
         let replies = Arc::clone(&self.replies);
         Box::pin(async move { Self::start_kick_vote(&runtime, &replies, &interaction).await })
+    }
+
+    fn event_voice_live(&self, guild: Snowflake) -> Option<LiveGuild> {
+        self.runtime.event_voice_live(guild)
     }
 }
 

@@ -551,6 +551,9 @@ async fn run(cli_args: &[String]) {
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
+    // Cloned before the gateway task owns the sink: the website jobs read
+    // live gateway evidence for event-voice preflight through this handle.
+    let website_voice = voice.clone();
     let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
         let url = url.to_owned();
@@ -941,6 +944,7 @@ async fn run(cli_args: &[String]) {
         receiver,
         eventsub_receiver,
         member,
+        website_voice,
     );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,

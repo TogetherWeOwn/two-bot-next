@@ -48,6 +48,10 @@ fn wired_context(mock: &MockRest) -> Context {
         guild: GUILD.to_owned(),
         observation: Mutex::new(()),
         events_gate: JobGate::default(),
+        event_voice: event_voice_preflight::Tick::default(),
+        event_voice_source: event_voice_source::Reader::default(),
+        event_voice_reconcile: event_voice_reconcile::Reconciler::default(),
+        voice: None,
     }
 }
 

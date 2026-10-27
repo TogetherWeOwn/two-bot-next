@@ -11,10 +11,11 @@ use two_bot_core::{
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
     diagnose_rank_roles, match_rank_roles, normalize_events, now_iso, plan_rank_heal,
-    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, JobGate,
-    RankHeal, RankRungProblem, RawScheduledEvent, RosterMember, ScheduledEventsSkip,
-    WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS,
-    SCHEDULED_EVENTS_INTERVAL_MS,
+    read_raid_windows, replace_events,
+    voice_create_admission::CreateAdmissionConfig,
+    write_counter, write_rank_snapshot, Config, JobGate, RankHeal, RankRungProblem,
+    RawScheduledEvent, RosterMember, ScheduledEventsSkip, WebsiteStoreError,
+    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
@@ -32,16 +33,39 @@ use crate::{
 /// Every supervised job name, in `/readyz` order. The settings poll needs
 /// only the database, so it is registered separately from the REST-backed
 /// jobs below.
-pub const NAMES: [&str; 4] = [
+pub const NAMES: [&str; 5] = [
     "counter",
     "rank",
     "scheduled_events",
+    "event_voice",
     crate::settings_jobs::NAME,
 ];
+
+#[path = "event_voice_create_runtime.rs"]
+mod event_voice_create_runtime;
+#[path = "event_voice_preflight.rs"]
+mod event_voice_preflight;
+#[path = "event_voice_reconcile.rs"]
+mod event_voice_reconcile;
+#[path = "event_voice_source.rs"]
+mod event_voice_source;
+
+#[cfg(test)]
+#[path = "event_voice_production_tick_tests.rs"]
+mod event_voice_production_tick_tests;
+#[cfg(test)]
+#[path = "event_voice_reconcile_runtime_tests.rs"]
+mod event_voice_reconcile_runtime_tests;
+#[path = "event_voice_ticker.rs"]
+mod event_voice_ticker;
 
 #[cfg(test)]
 #[path = "website_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "event_voice_category_runtime_tests.rs"]
+mod event_voice_category_runtime_tests;
 
 #[cfg(test)]
 #[path = "website_snapshot_tests.rs"]
@@ -63,14 +87,60 @@ mod jobgate_acceptance_tests;
 #[path = "website_events_dispatch_tests.rs"]
 mod events_dispatch_tests;
 
+#[cfg(test)]
+#[path = "website_event_voice_plumbing_tests.rs"]
+mod event_voice_plumbing_tests;
+
+#[cfg(test)]
+#[path = "event_voice_preflight_tests.rs"]
+mod event_voice_preflight_tests;
+
+#[cfg(test)]
+#[path = "event_voice_context_tests.rs"]
+mod event_voice_context_tests;
+
+#[cfg(test)]
+#[path = "event_voice_create_runtime_tests.rs"]
+mod event_voice_create_runtime_tests;
+
+#[cfg(test)]
+#[path = "event_voice_source_tests.rs"]
+mod event_voice_source_tests;
+
+#[cfg(test)]
+#[path = "event_voice_source_runtime_tests.rs"]
+mod event_voice_source_runtime_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
     Rank,
     Events,
+    EventVoice,
 }
 
 impl Kind {
+    /// Snapshot tick seam; the production adapter supplies durable claims and
+    /// worker-guarded deletes through the same decision engine.
+    ///
+    /// Test-only: the pinned acceptance tests drive this entry. Production
+    /// drives the same engine via `run_claimed` with durable claims (the
+    /// card-1 claim-before-Discord procedure), which this snapshot signature
+    /// cannot express: it takes no pool, and the production continuation
+    /// already holds the preflight gate this seam would re-acquire.
+    #[cfg(test)]
+    pub async fn run_event_voice_tick(
+        rest: &ActionExecutor,
+        guild: &str,
+        events: &[Value],
+        category_id: Option<&str>,
+        now_ms: i64,
+        shutdown: &watch::Receiver<bool>,
+        gate: &JobGate,
+    ) -> Result<Value, ErrorClass> {
+        event_voice_ticker::run(rest, guild, events, category_id, now_ms, shutdown, gate).await
+    }
+
     /// Whole-tick Events entry point with [`JobGate`] single-flight: a tick
     /// that cannot acquire the gate skips at once (`Ok`, no fetch, no
     /// publish, no queue, no error); otherwise the guard is held across the
@@ -107,6 +177,7 @@ fn cadence(kind: Kind) -> Duration {
         Kind::Counter => LIVE_COUNTER_INTERVAL_MS,
         Kind::Rank => RANK_SNAPSHOT_INTERVAL_MS,
         Kind::Events => SCHEDULED_EVENTS_INTERVAL_MS,
+        Kind::EventVoice => event_voice_ticker::INTERVAL_MS,
     };
     #[cfg(test)]
     let millis = {
@@ -114,6 +185,7 @@ fn cadence(kind: Kind) -> Duration {
             Kind::Counter => "TWO_TEST_COUNTER_INTERVAL_MS",
             Kind::Rank => "TWO_TEST_RANK_INTERVAL_MS",
             Kind::Events => "TWO_TEST_EVENTS_INTERVAL_MS",
+            Kind::EventVoice => "TWO_TEST_EVENT_VOICE_INTERVAL_MS",
         };
         std::env::var(name)
             .ok()
@@ -134,6 +206,16 @@ pub(crate) struct Context {
     pub(crate) guild: String,
     observation: Mutex<()>,
     events_gate: JobGate,
+    event_voice: event_voice_preflight::Tick,
+    /// Supervised-guild 429 pacing for the fresh source read; a source GET's
+    /// backoff must survive across ticks without pausing other routes.
+    event_voice_source: event_voice_source::Reader,
+    /// Supervised-guild 429 pacing for binding reconciliation GETs.
+    event_voice_reconcile: event_voice_reconcile::Reconciler,
+    /// The boot-composed voice sink, cloned before `main` moves it into the
+    /// gateway task. The T-15 ticker reads live gateway evidence through it;
+    /// `None` (voice off) fails closed, never as an empty grant.
+    voice: Option<Arc<dyn two_bot::voice_rooms::VoiceEventSink>>,
 }
 
 impl Context {
@@ -152,10 +234,48 @@ impl Context {
             .await
     }
 
+    /// The gateway's live evidence handle for event-voice preflight, if the
+    /// boot-composed voice sink owns one. `None` (voice off, no actor) fails
+    /// closed; the tick treats it as unavailable, never as an empty grant.
+    pub(crate) fn event_voice_live_guild(
+        &self,
+        guild: two_bot_core::Snowflake,
+    ) -> Option<two_bot::voice_rooms::LiveGuild> {
+        self.voice
+            .as_ref()
+            .and_then(|voice| voice.event_voice_live(guild))
+    }
+
+    /// Run the production event-voice continuation only after live category
+    /// preflight; the same guard spans its database scan, claims and REST.
+    async fn with_event_voice_tick<F, Fut>(
+        &self,
+        settings: event_voice_preflight::Settings,
+        shutdown: &watch::Receiver<bool>,
+        action: F,
+    ) -> Result<(), ErrorClass>
+    where
+        F: FnOnce(u64) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), ErrorClass>> + Send,
+    {
+        let guild = self.guild.parse().map_err(|_| ErrorClass::Configuration)?;
+        self.event_voice
+            .run(
+                &self.rest,
+                guild,
+                self.event_voice_live_guild(guild),
+                settings,
+                shutdown,
+                action,
+            )
+            .await
+    }
+
     /// One supervised website tick: Events ticks run through the shared
     /// [`JobGate`] single-flight entry point, so overlapping Events ticks
-    /// cannot both run; every other kind runs direct via [`run_once`] and
-    /// never touches the gate. The scheduler closure calls this instead of
+    /// cannot both run; EventVoice ticks run the guarded production
+    /// composition below; every other kind runs direct via [`run_once`] and
+    /// never touches a gate. The scheduler closure calls this instead of
     /// branching itself, so the routing stays unit-testable next to the tick
     /// it guards.
     async fn run_tick(
@@ -176,6 +296,9 @@ impl Context {
             )
             .await;
         }
+        if matches!(kind, Kind::EventVoice) {
+            return self.run_event_voice_production_tick(shutdown).await;
+        }
         run_once(
             kind,
             self.pool().await?,
@@ -185,6 +308,121 @@ impl Context {
             shutdown,
             rank_heal,
         )
+        .await
+    }
+
+    /// Production EventVoice tick: live category preflight, fresh binding
+    /// reconciliation, a fresh source read with live occupancy overlay, then
+    /// the durable decision pass. Environment-sourced settings stay in this
+    /// thin wrapper so the composition below is directly testable.
+    async fn run_event_voice_production_tick(
+        &self,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<(), ErrorClass> {
+        let settings = event_voice_preflight::Settings {
+            category: two_bot::event_voice_category::configured_event_voice_category(|key| {
+                std::env::var(key).ok()
+            }),
+            staff_channel: crate::raid_runtime::staff_alert_channel(|key| std::env::var(key).ok()),
+        };
+        let admission = two_bot::voice_rooms::configured_admission(|key| std::env::var(key).ok());
+        self.run_event_voice_tick_guarded(settings, admission, shutdown)
+            .await
+    }
+
+    /// The guarded production composition: the preflight gate spans the
+    /// reconcile, scan, claims and REST below, so overlapping ticks cannot
+    /// both run. The decision core takes no gate of its own here; passing the
+    /// held preflight gate into the snapshot seam would self-skip every tick.
+    async fn run_event_voice_tick_guarded(
+        &self,
+        settings: event_voice_preflight::Settings,
+        admission: CreateAdmissionConfig,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<(), ErrorClass> {
+        self.with_event_voice_tick(settings, shutdown, |category| async move {
+            let pool = self.pool().await?;
+            let guild_id: u64 = self.guild.parse().map_err(|_| ErrorClass::Configuration)?;
+            let report = self
+                .event_voice_reconcile
+                .run(pool, &self.rest, guild_id, shutdown)
+                .await?;
+            for missing in &report.missing {
+                tracing::info!(
+                    event_id = missing.event_id.as_str(),
+                    instance_start = %missing.instance,
+                    channel_id = missing.channel_id.as_str(),
+                    "event voice binding 404s; row orphaned for one retry"
+                );
+            }
+            tracing::info!(
+                missing = report.missing.len(),
+                perm_denied = report.perm_denied,
+                rate_limited = report.rate_limited,
+                unavailable = report.unavailable,
+                "event voice reconcile pass finished"
+            );
+            let Some(mut snapshot) = self
+                .event_voice_source
+                .read(pool, &self.rest, &self.guild, shutdown)
+                .await?
+            else {
+                return Ok(());
+            };
+            event_voice_source::overlay_live_state(pool, &mut snapshot.events).await?;
+            let actor = self
+                .rest
+                .current_bot_user_id()
+                .await
+                .map_err(|_| ErrorClass::Rest)?;
+            let now = i64::try_from(
+                time::OffsetDateTime::now_utc()
+                    .unix_timestamp_nanos()
+                    .div_euclid(1_000_000),
+            )
+            .map_err(|_| ErrorClass::Rest)?;
+            let io = event_voice_create_runtime::DurableTickIo {
+                pool,
+                rest: &self.rest,
+                guild: &self.guild,
+                snapshot: &snapshot,
+                actor,
+                admission,
+            };
+            let category_id = category.to_string();
+            let outcome = event_voice_ticker::run_claimed(
+                &io,
+                &self.guild,
+                &snapshot.events,
+                Some(category_id.as_str()),
+                now,
+                shutdown,
+            )
+            .await?;
+            let counter = |key: &str| outcome["counters"][key].as_u64().unwrap_or_default();
+            let (created, rate_limited, perm_denied, no_category, deleted) = (
+                counter("created"),
+                counter("rate_limited"),
+                counter("perm_denied"),
+                counter("no_category"),
+                counter("deleted"),
+            );
+            if perm_denied > 0 {
+                tracing::warn!(
+                    perm_denied,
+                    "event voice tick saw permission denials; preflight pages staff once per gap"
+                );
+            }
+            tracing::info!(
+                created,
+                rate_limited,
+                perm_denied,
+                no_category,
+                deleted,
+                "event voice tick finished"
+            );
+            Ok(())
+        })
         .await
     }
 }
@@ -210,6 +448,10 @@ impl Context {
             guild,
             observation: Mutex::new(()),
             events_gate: JobGate::default(),
+            event_voice: event_voice_preflight::Tick::default(),
+            event_voice_source: event_voice_source::Reader::default(),
+            event_voice_reconcile: event_voice_reconcile::Reconciler::default(),
+            voice: None,
         }
     }
 }
@@ -288,8 +530,10 @@ fn admission_pool(url: &str) -> Result<PgPool, String> {
     admission_pool_with_tls(url, tls).map_err(|_| "invalid admission authority".to_owned())
 }
 
-/// Boot-composed single call: the eight parameters are the full supervised
+/// Boot-composed single call: the nine parameters are the full supervised
 /// surface (config, listener, gateway, shutdown plus one slot per consumer).
+/// `voice` is the gateway sink cloned before the gateway task owns it; the
+/// T-15 ticker reads live gateway evidence through it.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &Config,
@@ -301,6 +545,7 @@ pub async fn serve(
     receiver: Option<crate::internal_action_http::BoundReceiver>,
     eventsub_receiver: Option<crate::eventsub_http::BoundEventsubReceiver>,
     member: Option<Arc<MemberRuntime>>,
+    voice: Option<Arc<dyn two_bot::voice_rooms::VoiceEventSink>>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
@@ -325,6 +570,10 @@ pub async fn serve(
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
                     events_gate: JobGate::default(),
+                    event_voice: event_voice_preflight::Tick::default(),
+                    event_voice_source: event_voice_source::Reader::default(),
+                    event_voice_reconcile: event_voice_reconcile::Reconciler::default(),
+                    voice: voice.clone(),
                 });
                 // The rank tick is the only website job with a Discord write
                 // path: the ladder self-heal grants roles under the bot
@@ -333,10 +582,12 @@ pub async fn serve(
                 // at runtime). A refused identity keeps the old non-nested
                 // refusal and never grants.
                 let rank_heal = activation.rank_heal_permitted();
-                for (name, kind) in NAMES
-                    .into_iter()
-                    .zip([Kind::Counter, Kind::Rank, Kind::Events])
-                {
+                for (name, kind) in NAMES.into_iter().zip([
+                    Kind::Counter,
+                    Kind::Rank,
+                    Kind::Events,
+                    Kind::EventVoice,
+                ]) {
                     let context = context.clone();
                     let shutdown = shutdown.subscribe();
                     let cadence = cadence(kind);

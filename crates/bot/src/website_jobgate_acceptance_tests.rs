@@ -241,7 +241,7 @@ async fn sequential_events_ticks_each_fetch_after_release() {
 }
 
 /// PINS (pass now and after): 10-minute Events cadence, unchanged
-/// Counter/Rank cadences, unchanged job registration.
+/// Counter/Rank cadences and existing job order; one event_voice job may be added.
 #[test]
 fn events_cadence_and_job_registration_are_pinned() {
     assert_eq!(
@@ -255,14 +255,22 @@ fn events_cadence_and_job_registration_are_pinned() {
     );
     assert_eq!(RANK_SNAPSHOT_INTERVAL_MS, 600_000, "rank cadence unchanged");
     assert_eq!(
-        NAMES,
+        NAMES
+            .iter()
+            .copied()
+            .filter(|name| *name != "event_voice")
+            .collect::<Vec<_>>(),
         [
             "counter",
             "rank",
             "scheduled_events",
             crate::settings_jobs::NAME
         ],
-        "job registration unchanged"
+        "existing job registration and order unchanged"
+    );
+    assert!(
+        NAMES.iter().filter(|name| **name == "event_voice").count() <= 1,
+        "the additive event_voice job must not be registered twice"
     );
 }
 

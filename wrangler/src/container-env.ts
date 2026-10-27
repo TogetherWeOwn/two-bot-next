@@ -384,6 +384,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.
   TWO_GUILD_INVITE_CODE: "store-only guild setting; read from the live settings snapshot, never from the process environment",
+  TWO_EVENT_VOICE_OPT_OUT_EVENT_IDS: "store-only admin setting; the event-voice ticker reads persisted guild overrides directly, never from the process environment",
+  TWO_TEST_EVENT_VOICE_INTERVAL_MS: TEST,
   // /ops override enforcement (Slice 0a): the Rust settings poll GETs this
   // URL on every tick for the DO ops record. URL-shaped values are never
   // flags (the allowlist test rejects `_URL`), so it travels only here.

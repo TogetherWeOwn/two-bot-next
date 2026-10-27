@@ -962,7 +962,8 @@ impl PgRoomStore {
     /// the channel exists (or may still exist) on Discord, its persist or
     /// compensation never finished, and the claim still holds its cap slot.
     /// Returns `(reservation id, channel id)` for worker load, so compensation
-    /// survives a restart.
+    /// survives a restart. Event bindings own their reserved channels separately:
+    /// they retain capacity, but never enter ordinary room compensation.
     pub async fn orphaned_create_channels(
         &self,
         guild_id: Snowflake,
@@ -972,6 +973,8 @@ impl PgRoomStore {
              WHERE r.guild_id = $1 AND r.settled_at IS NULL AND r.channel_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM voice_rooms v
                                 WHERE v.guild_id = r.guild_id AND v.channel_id = r.channel_id)
+               AND NOT EXISTS (SELECT 1 FROM event_voice_channels e
+                                WHERE e.voice_channel_id = r.channel_id)
              ORDER BY r.created_at, r.id",
         )
         .bind(guild_id.to_string())
@@ -992,14 +995,18 @@ impl PgRoomStore {
     /// delete. Unknown outcomes stay held. The row stays for burst/cooldown
     /// history. A claim whose channel is a tracked live room never settles
     /// here: that transfer is [`Self::persist_create`], not a separate room
-    /// insert and settlement. Returns false when already settled or live.
+    /// insert and settlement. An event-bound channel also retains capacity
+    /// until its binding is cleared after verified absence/deletion or handed
+    /// to the ordinary room worker. Returns false when already settled or live.
     pub async fn settle_create(&self, reservation_id: &str) -> Result<bool, sqlx::Error> {
         Ok(sqlx::query(
             "UPDATE voice_create_reservations r
              SET settled_at = now()
              WHERE r.id = $1 AND r.settled_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM voice_rooms v
-                                WHERE v.guild_id = r.guild_id AND v.channel_id = r.channel_id)",
+                                WHERE v.guild_id = r.guild_id AND v.channel_id = r.channel_id)
+               AND NOT EXISTS (SELECT 1 FROM event_voice_channels e
+                                WHERE e.voice_channel_id = r.channel_id)",
         )
         .bind(reservation_id)
         .execute(&self.pool)

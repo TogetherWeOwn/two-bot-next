@@ -278,6 +278,12 @@ impl VoiceEventSink for MusicVoiceTap {
             None => Box::pin(async { false }),
         }
     }
+
+    fn event_voice_live(&self, guild: Snowflake) -> Option<two_bot::voice_rooms::LiveGuild> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.event_voice_live(guild))
+    }
 }
 
 #[cfg(test)]
@@ -817,6 +823,46 @@ mod tests {
         tap.disconnect();
         tap.set_command_identities(two_bot_discord::command_identity::CommandIdentities::default());
         assert!(!tap.needs_bootstrap(&cache));
+    }
+
+    struct LiveSink {
+        live: two_bot::voice_rooms::LiveGuild,
+    }
+
+    impl VoiceEventSink for LiveSink {
+        fn handle(&self, _event: &Event, _cache: &DefaultInMemoryCache) {}
+        fn presence(&self, _update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {}
+        fn disconnect(&self) {}
+        fn needs_bootstrap(&self, _cache: &DefaultInMemoryCache) -> bool {
+            false
+        }
+        fn event_voice_live(&self, guild: Snowflake) -> Option<two_bot::voice_rooms::LiveGuild> {
+            (guild == STAGING).then(|| self.live.clone())
+        }
+    }
+
+    #[test]
+    fn event_voice_live_forwards_to_inner() {
+        let inner = Arc::new(LiveSink {
+            live: two_bot::voice_rooms::LiveGuild::new(STAGING),
+        });
+        let decorated = MusicVoiceTap::new(
+            Some(Arc::clone(&inner) as Arc<dyn VoiceEventSink>),
+            Some(STAGING),
+        );
+        assert!(
+            decorated.event_voice_live(STAGING).is_some(),
+            "tap must forward the inner sink's live guild"
+        );
+        assert!(
+            decorated.event_voice_live(OTHER_GUILD).is_none(),
+            "tap must forward the inner sink's fail-closed answer"
+        );
+        let music_only = tap(None);
+        assert!(
+            music_only.event_voice_live(STAGING).is_none(),
+            "without an inner sink there is no live evidence"
+        );
     }
 
     #[tokio::test]

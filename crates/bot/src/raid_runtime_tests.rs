@@ -447,3 +447,33 @@ async fn raid_runtime_store_tuning_and_channel_are_live() {
     assert_eq!(kept, back);
     db.close().await;
 }
+
+#[test]
+fn staff_alert_channel_reads_the_shared_key_and_degrades_to_log_only() {
+    let vars = HashMap::from([(
+        "DISCORD_STAFF_ALERT_CHANNEL_ID".to_owned(),
+        "123456789012345678".to_owned(),
+    )]);
+    assert_eq!(
+        raid_runtime::staff_alert_channel(|key| vars.get(key).cloned()),
+        Some("123456789012345678".to_owned())
+    );
+    assert_eq!(raid_runtime::staff_alert_channel(|_| None), None);
+    let bad = HashMap::from([(
+        "DISCORD_STAFF_ALERT_CHANNEL_ID".to_owned(),
+        "not-a-snowflake".to_owned(),
+    )]);
+    assert_eq!(
+        raid_runtime::staff_alert_channel(|key| bad.get(key).cloned()),
+        None,
+        "a malformed channel degrades to log-only instead of refusing the tick"
+    );
+    let blank = HashMap::from([(
+        "DISCORD_STAFF_ALERT_CHANNEL_ID".to_owned(),
+        "   ".to_owned(),
+    )]);
+    assert_eq!(
+        raid_runtime::staff_alert_channel(|key| blank.get(key).cloned()),
+        None
+    );
+}

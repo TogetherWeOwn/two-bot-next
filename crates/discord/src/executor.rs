@@ -38,6 +38,8 @@
 
 mod tickets;
 pub use tickets::{ChannelPresence, TicketChannelRequest, TicketMessage};
+mod event_voice;
+pub use event_voice::EventVoiceResponse;
 
 use crate::ratelimit_guard::{process_guard, GuardError, RateLimitGuard};
 use std::sync::Arc;

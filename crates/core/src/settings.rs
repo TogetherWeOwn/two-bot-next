@@ -50,6 +50,28 @@ use tokio::sync::watch;
 /// maxima cannot detect writes that commit out of allocation order.
 pub const POLL_SECONDS: u64 = 15;
 
+/// Audited admin setting: event ids whose automatic voice creation is disabled.
+/// Stored separately from the replaceable Discord mirror; no environment fallback.
+pub const EVENT_VOICE_OPT_OUT_KEY: &str = "TWO_EVENT_VOICE_OPT_OUT_EVENT_IDS";
+
+/// Parse the entire opt-out setting, never a partial prefix. A malformed stored
+/// override must stop the ticker, not silently opt events back in. At most 100
+/// canonical Discord ids fit the bounded event source; duplicates are harmless.
+#[must_use]
+pub fn parse_event_voice_opt_outs(value: &Value) -> Option<std::collections::BTreeSet<String>> {
+    let ids = value.as_array()?;
+    if ids.len() > 100 {
+        return None;
+    }
+    ids.iter()
+        .map(|value| {
+            let raw = value.as_str()?;
+            let id = raw.parse::<u64>().ok()?;
+            (id != 0 && id.to_string() == raw).then(|| raw.to_owned())
+        })
+        .collect()
+}
+
 /// How long an applied /ops override layer survives without a fresh record
 /// (Slice 0a staleness bound).
 ///
@@ -266,6 +288,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_REDIRECT_FALLBACK_CODE", SettingClass::Hot),
     ("TWO_FEED_POLL_SECONDS", SettingClass::Hot),
     ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Hot),
+    (EVENT_VOICE_OPT_OUT_KEY, SettingClass::Hot),
     ("TWO_GUILD_INVITE_CODE", SettingClass::Hot),
 ];
 
@@ -1160,6 +1183,7 @@ mod tests {
     // from the implementation but present here fails the lookup; a reclassified
     // key fails the equality. Duplication is the point.
     const EXPECTED_HOT: &[&str] = &[
+        "TWO_EVENT_VOICE_OPT_OUT_EVENT_IDS",
         "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
         "DISCORD_AUDIT_LOG_CHANNEL_ID",
         "DISCORD_GOODBYE_CHANNEL_IDS",

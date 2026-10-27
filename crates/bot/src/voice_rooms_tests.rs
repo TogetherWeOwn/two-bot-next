@@ -31,6 +31,8 @@ mod disconnect_loud_acceptance_tests;
 mod drop_poison_acceptance_tests;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "voice_event_sink_live_tests.rs"]
+mod event_sink_live;
 #[path = "event_voice_category_acceptance_tests.rs"]
 mod event_voice_category_acceptance;
 #[path = "event_voice_channels_acceptance_tests.rs"]

@@ -56,6 +56,17 @@ fn is_snowflake(value: &str) -> bool {
     (17..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The shared staff alert channel for event-voice preflight gaps. Unlike the
+/// raid tuning read (which refuses the whole observation on a malformed
+/// value), a malformed or unset channel degrades to log-only: a preflight gap
+/// must stay visible in logs when nobody configured the channel.
+pub fn staff_alert_channel(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    match env(CHANNEL_KEY).map(|raw| raw.trim().to_owned()) {
+        Some(raw) if is_snowflake(&raw) => Some(raw),
+        _ => None,
+    }
+}
+
 /// The raid configuration for one observation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RaidSettings {

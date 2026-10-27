@@ -70,6 +70,7 @@
   "TWO_EVENTSUB_DELIVERY": "Delivery gate for EventSub go-live posts; exactly 1 requires the announcements channel, invite URL and broadcaster allowlist, any other enabled state refuses startup.",
   "TWO_EVENTSUB_INVITE_URL": "Discord invite URL rendered into the go-live post; validated with the renderer's rule while TWO_EVENTSUB_DELIVERY is exactly 1.",
   "TWO_EVENT_VOICE_CATEGORY_ID": "Category for auto-created event voice channels; required, with no default: while unset the feature stays inactive.",
+  "TWO_EVENT_VOICE_OPT_OUT_EVENT_IDS": "Store-only admin setting: JSON array of at most 100 canonical event IDs whose voice creation is disabled. Empty or absent means none; malformed values stop creation. The pending event-voice ticker reads it directly before claiming and after admission; no environment fallback.",
   "TWO_FEED_POLL_SECONDS": "Feed polling interval (validated from 60 to 86400 seconds).",
   "TWO_GUILD_INVITE_CODE": "Stored per-guild invite code; wins over the gateway vanity code on the /invite path, invalid rows fail closed to the fallback.",
   "TWO_HEALTH_BIND_HOST": "Legacy health listener interface; environment-only network bind.",

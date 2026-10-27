@@ -105,6 +105,7 @@ async fn isolated_boot_probe() {
             None,
             None,
             None,
+            None,
         )
         .await
     });

@@ -7,8 +7,9 @@ use time::{Duration, OffsetDateTime};
 use two_bot_cutover::event_voice::{
     bind_event_voice_channel, bound_event_voice_channels, bound_event_voice_channels_for_guild,
     claim_event_voice_channel, clear_event_voice_lease, close_event_voice_spans_absent,
-    flush_event_voice_presence, mark_event_voice_orphaned, record_event_voice_join,
-    record_event_voice_leave, revive_event_voice_orphan, stale_event_voice_claims,
+    count_live_event_voice_channels_for_guild, flush_event_voice_presence,
+    mark_event_voice_orphaned, record_event_voice_join, record_event_voice_leave,
+    revive_event_voice_orphan, stale_event_voice_claims,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -637,5 +638,104 @@ async fn close_absent_stamps_only_the_missing_members() {
         .expect("empty close-absent runs");
     assert_eq!(closed_all, 1);
     assert_eq!(span_counts(pool, "3111").await, (1, 0));
+    db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
+async fn live_cap_counts_only_attributable_guild_bindings() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let at = instance(2);
+    // Ten live bindings with reservation guild evidence for guild 100.
+    for i in 0..10 {
+        let event = format!("ev-cap-live-{i:02}");
+        let channel = format!("810{}", i);
+        assert!(claim(pool, &event, at, "tick-cap").await);
+        assert!(bind_event_voice_channel(pool, &event, at, &channel)
+            .await
+            .expect("bind runs"));
+        sqlx::query(
+            "INSERT INTO voice_create_reservations (guild_id, user_id, created_at, channel_id) \
+             VALUES ('100', '9991', NOW(), $1)",
+        )
+        .bind(&channel)
+        .execute(pool)
+        .await
+        .expect("reservation seeds");
+    }
+    // Mirror-only evidence also attributes (no reservation row).
+    assert!(claim(pool, "ev-cap-mirror", at, "tick-cap").await);
+    assert!(bind_event_voice_channel(pool, "ev-cap-mirror", at, "8110")
+        .await
+        .expect("bind runs"));
+    sqlx::query(
+        "INSERT INTO scheduled_events (guild_id, event_id, name, starts_at, updated_at) \
+         VALUES ('100', 'ev-cap-mirror', 'show', '2026-11-01T20:00:00.000Z', \
+         '2026-10-22T00:00:00.000Z')",
+    )
+    .execute(pool)
+    .await
+    .expect("mirror seeds");
+    // Orphaned (dead channel awaiting retry) is not live.
+    assert!(claim(pool, "ev-cap-orphan", at, "tick-cap").await);
+    assert!(bind_event_voice_channel(pool, "ev-cap-orphan", at, "8111")
+        .await
+        .expect("bind runs"));
+    sqlx::query(
+        "INSERT INTO voice_create_reservations (guild_id, user_id, created_at, channel_id) \
+         VALUES ('100', '9991', NOW(), '8111')",
+    )
+    .execute(pool)
+    .await
+    .expect("reservation seeds");
+    mark_event_voice_orphaned(pool, "ev-cap-orphan", at)
+        .await
+        .expect("orphan runs");
+    // Settled reservation without mirror evidence cannot attribute.
+    assert!(claim(pool, "ev-cap-settled", at, "tick-cap").await);
+    assert!(bind_event_voice_channel(pool, "ev-cap-settled", at, "8112")
+        .await
+        .expect("bind runs"));
+    sqlx::query(
+        "INSERT INTO voice_create_reservations (guild_id, user_id, created_at, channel_id, \
+         settled_at) VALUES ('100', '9991', NOW(), '8112', NOW())",
+    )
+    .execute(pool)
+    .await
+    .expect("reservation seeds");
+    // Foreign guild reservation attributes to guild 200 only.
+    assert!(claim(pool, "ev-cap-foreign", at, "tick-cap").await);
+    assert!(bind_event_voice_channel(pool, "ev-cap-foreign", at, "8113")
+        .await
+        .expect("bind runs"));
+    sqlx::query(
+        "INSERT INTO voice_create_reservations (guild_id, user_id, created_at, channel_id) \
+         VALUES ('200', '9991', NOW(), '8113')",
+    )
+    .execute(pool)
+    .await
+    .expect("reservation seeds");
+    // No reservation and no mirror: unattributable, never counted.
+    assert!(claim(pool, "ev-cap-ghost", at, "tick-cap").await);
+    assert!(bind_event_voice_channel(pool, "ev-cap-ghost", at, "8114")
+        .await
+        .expect("bind runs"));
+
+    let live = count_live_event_voice_channels_for_guild(pool, "100", "ev-cap-new")
+        .await
+        .expect("cap count runs");
+    assert_eq!(live, 11, "ten reservation-bound plus one mirror-bound");
+    let excluding_self = count_live_event_voice_channels_for_guild(pool, "100", "ev-cap-live-00")
+        .await
+        .expect("cap count runs");
+    assert_eq!(excluding_self, 10, "the caller's own binding never counts");
+    let foreign = count_live_event_voice_channels_for_guild(pool, "200", "ev-cap-new")
+        .await
+        .expect("cap count runs");
+    assert_eq!(foreign, 1, "foreign guild sees only its own reservation");
+    let empty = count_live_event_voice_channels_for_guild(pool, "999", "ev-cap-new")
+        .await
+        .expect("cap count runs");
+    assert_eq!(empty, 0, "guild without evidence counts zero");
     db.close().await.expect("fixture teardown");
 }

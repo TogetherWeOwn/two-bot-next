@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0468_event_voice_recreation_budget.sql": {
+      "sha256": "f376ff4005a52a947230ef103a2142534a558d22ffff57bbed5f3cf8d3c34923",
+      "justification": "Persist the one-replacement budget across event reschedules and process restarts."
+    },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."

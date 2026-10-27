@@ -110,6 +110,42 @@ pub trait CategoryReader: Send + Sync {
     ) -> impl Future<Output = Result<CategorySnapshot, RoomHttpError>> + Send;
 }
 
+/// Live preflight adapter: the category itself is re-read on every attempt,
+/// while role membership comes from the gateway's complete guild snapshot.
+/// Missing gateway evidence, including a disconnect during the GET, fails closed.
+/// This reader never invents empty overwrites or falls back to guild grants.
+pub struct LiveCategoryReader<'a> {
+    rest: &'a two_bot_discord::ActionExecutor,
+    live: &'a crate::voice_rooms::LiveGuild,
+}
+
+impl<'a> LiveCategoryReader<'a> {
+    #[must_use]
+    pub fn new(
+        rest: &'a two_bot_discord::ActionExecutor,
+        live: &'a crate::voice_rooms::LiveGuild,
+    ) -> Self {
+        Self { rest, live }
+    }
+}
+
+impl CategoryReader for LiveCategoryReader<'_> {
+    async fn category_grant(
+        &self,
+        guild: Snowflake,
+        category: Snowflake,
+    ) -> Result<CategorySnapshot, RoomHttpError> {
+        let generation = self
+            .live
+            .event_voice_category_generation(guild)
+            .ok_or(RoomHttpError::Cancelled)?;
+        let channel = self.rest.read_event_voice_channel(guild, category).await?;
+        self.live
+            .event_voice_category_snapshot(generation, &channel)
+            .ok_or(RoomHttpError::Cancelled)
+    }
+}
+
 /// One staff alert per episode. `category` is the configured id staff must
 /// fix (`None` when nothing is configured).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
