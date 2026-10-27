@@ -1,8 +1,10 @@
 # Events: host-written play expectations — Decision
 
 Status: **Decision, design only: no build.** Written 2026-10-27; review
-**2026-11-03**. No command, storage, migration, RSVP field, permission, send or
-runtime test is added, and no outreach, experiment or activation is authorized.
+**2026-11-03**. No product or runtime command is added (section 8 adds only an
+offline documentation check); no storage, migration, RSVP field, permission,
+send or runtime test is added, and no outreach, experiment or activation is
+authorized.
 Merge accepts documentation, not host intent or a privacy boundary. This file is
 the single repository contract; review requests bind its commit and SHA-256.
 
@@ -164,7 +166,8 @@ is recorded here, and a revision invalidates a prior exact-spec acceptance.
 Run from the repo root **after committing**. Python standard library only; no
 network, Discord or database. It checks the committed file's relative links, the
 finite matrix and that the section 4 template fits the description cap and
-contains no mention, link or control character. It does not check behavior, demand
+contains no mention, bare or Markdown link, or control character. It does not
+check behavior, demand
 or privacy acceptance.
 
 ```sh
@@ -191,7 +194,7 @@ try:
             raise ValueError('MISSING_PATH')
     block = re.search(r'```text\n(.*?)```', text, re.S).group(1)
     units = len(block.encode('utf-16-le')) // 2
-    if units > 1000 or re.search(r'[@<>]|https?:|[\x00-\x08\x0b-\x1f\u200b-\u200f\u202a-\u202e]', block):
+    if units > 1000 or re.search(r'[@<>]|https?:|\[[^\]\n]*\]\([^)\n]*\)|[\x00-\x08\x0b-\x1f\u200b-\u200f\u202a-\u202e]', block):
         raise ValueError('TEMPLATE_INVALID')
     print(json.dumps({'version': 1, 'outcome': 'documentation_checked',
         'reason': 'LINKS_MATRIX_TEMPLATE_ONLY', 'next_action': 'exact_spec_disposition',
