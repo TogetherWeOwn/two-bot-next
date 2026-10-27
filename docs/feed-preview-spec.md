@@ -134,8 +134,9 @@ client certificate, credential retry, proxy, HTML scraper or fallback client.
 | Concurrency | One in-flight sample per authenticated caller, one per guild, **one globally** across admitting runtimes; immediate busy refusal, no queue |
 | Sliding 60-second admission | Caller 1, guild 3, global 6 sample attempts; admit all three atomically before DNS; include failures/cancellation; no token refund or automatic retry |
 | Limiter memory | At most 64 caller records, 16 guild records and 6 global timestamps; expire only after their full 60-second window; refuse capacity rather than evict an unexpired record |
-| Restarts / overlap | No sample admission for the first 60 seconds after start; prove a single admitting owner with the existing runtime fence for the entire request. Process-local counters alone are **not** a global limit across overlapping owners; unknown ownership keeps sample dark |
-| HTTP/DNS | Preserve three same-host redirect follows / at most four GETs, no application retries or fallback client; connector address racing stays within checked pins. Proposed 32 DNS answers per hop, 64 response headers / 16 KiB total; overflow refuses rather than truncates/filtering to a safe-looking subset. These caps are absent today and must apply before unbounded collection |
+| Interaction freshness | Proposed sample-admission lifetime: **60 seconds from authenticated interaction creation**, not local receipt or defer. Require age >= 0 and < 60 seconds at admission and recheck before DNS; unknown/future/expired age refuses. This is a narrower candidate policy, not Discord token validity |
+| Restarts / overlap | No sample admission for the first **60 monotonic seconds** after start, covering the entire supported interaction lifetime and rate window. Prove a single admitting owner with the existing runtime fence for the entire request. Process-local counters alone are **not** a global limit across overlapping owners; unknown ownership or untrustworthy age keeps sample dark |
+| HTTP/DNS | Preserve three same-host redirect follows / at most four GETs, no application retries or fallback client; connector address racing stays within checked pins. Proposed inclusive maxima: **32 DNS answers per hop, 64 response headers and 16,384 aggregate header bytes (16 KiB)**. Exactly each maximum passes that size gate; any excess refuses rather than truncates/filtering to a safe-looking subset. These caps are absent today and must apply before unbounded collection |
 | Total time | Eight-second monotonic budget from admission through DNS/connect/TLS/headers/all hops/body/decode/parse/render; each phase receives remaining time, never resets the overall deadline |
 | Parse/input | Existing byte, XML depth/attribute/node and 200-entry rejection limits still apply to the **whole document**, not merely the three displayed entries |
 | Memory | One sample total; no response cache or retained raw source/body. Preserve independent 2,000,000-byte wire/decoded caps; proposed 16 MiB incremental request-allocation ceiling (including DNS/headers/parser/output) must be proved with adversarial offline fixtures, not inferred from byte size |
@@ -243,10 +244,15 @@ source hash or an agent-supplied ID. Omit identity fields before authorization;
 no relay ID is invented. A `sample` result additionally reports actual
 `fetched_at` UTC and `entry_count` 0–3; JSON diagnostics carry no raw titles or
 links. Repeated validate is idempotent/no-effect. Repeated authenticated sample
-interaction is admitted at most once within its valid lifetime; keep bounded
-content-free dedup alongside rate state, reject expired interactions, and after
-restart keep cold-start refusal long enough to outlive old interactions. No
-retry after unknown fetch/reply result. Dedup is not a durable delivery claim.
+interaction is admitted at most once within its 60-second admission lifetime
+(section 4); keep at most six content-free admitted IDs for a full 60 monotonic
+seconds after admission alongside rate state. A full dedup map refuses rather
+than evicting an unexpired ID. Reject expired interactions even if their IDs
+have expired from memory. The 60-second restart quarantine outlives every
+pre-start interaction's supported admission lifetime; neither defer nor replay
+renews that lifetime. Keep all quarantine/dedup state in memory, with no
+persisted epoch or claim. No retry after unknown fetch/reply result. Dedup is
+not a durable delivery claim.
 
 Future tests use injected DNS/dial/TLS/clock/body/decoder/cancellation and reply
 captures, never real providers. Every case has a zero-domain-effect oracle:
@@ -266,7 +272,7 @@ this docs PR**.
 | FP-06 | Mixed public/private DNS answers, empty/oversized answers and rebinding between resolve/dial: refuse or pin exact checked address, no second ambient lookup |
 | FP-07 | Redirect to forbidden/credentialed/cross-host target, relative redirect, bad scheme, fourth follow: revalidate each hop, bounded closes and no forbidden dial |
 | FP-08 | Missing/blank media keeps existing acceptance then XML parsing; wrong media, HTML disguised as XML, non-success response: classified refusal, no raw body/status error leak |
-| FP-09 | DNS count 32/33, headers at/over 64 or 16 KiB, content length and streamed body exactly 2,000,000/+1 bytes: bounded refusal, no truncation or unlimited collection |
+| FP-09 | Inclusive size gates: 32 DNS answers, 64 headers, 16,384 aggregate header bytes, and declared/streamed bodies of exactly 2,000,000 bytes pass their respective size checks; 33 answers, 65 headers, 16,385 header bytes or 2,000,001 body bytes refuse. Passing size alone never overrides address/media/XML/other gates; no truncation or unlimited collection |
 | FP-10 | Gzip inflation, truncated gzip, multiple members, oversized decoded body and both wire/decoded boundaries: bounded failure, no decoder bypass |
 | FP-11 | Slow DNS/TLS/headers/body and cumulative redirects: one eight-second budget, no per-hop renewal or retry |
 | FP-12 | Cancel at every phase / shutdown / policy disable: work stopped, buffers freed, slot released only after stop, no follow-up fetch |
@@ -274,7 +280,7 @@ this docs PR**.
 | FP-14 | RSS/Atom/YouTube fixtures with 0, 1, 3, 4 entries, duplicate keys, malformed times and unsafe links: document order, at most three eligible unique titles, no link fetch |
 | FP-15 | HTML/Markdown, mass mentions, pills, bidi/zero-width/control text, URL embedded in title: inert redacted text; empty allowed mentions; no embeds; output ceilings |
 | FP-16 | Caller/guild/global limits and simultaneous admissions: exact 1/3/6 per sliding minute, concurrency 1/1/1; no queue/refund, full maps fail closed |
-| FP-17 | Restart/overlapping owners/unknown fence, expired or duplicate interaction: cold-start/ownership/dedup refuses, no doubled global quota |
+| FP-17 | Restart/overlapping owners/unknown fence and untrustworthy age refuse. At age just under 60 seconds a fresh ID may admit if all gates pass; age exactly 60 seconds, future age and duplicate IDs refuse. Restart elapsed <60 seconds refuses; at exactly 60 seconds every pre-start interaction is expired. Full dedup memory refuses without eviction; no persisted epoch or doubled global quota |
 | FP-18 | Failed/uncertain private defer or final edit: no fetch after failed defer; no repeat after edit error; no public/DM fallback |
 | FP-19 | Source unavailable/unsupported/unsafe/timeout/resource exhaustion: closed reasons and next actions only; sentinel URL/provider text absent from logs/replies/JSON |
 | FP-20 | Paused relay plus scheduled pending delivery, cursor and last-attempt snapshots: all preview outcomes preserve every domain byte; no add/enable/claim/audit/public send |
