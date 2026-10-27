@@ -1437,7 +1437,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // slash rows until a later management republish. Resolve the token
     // identity once through the shared executor, arm the ordered fence from
     // the same lookup, then publish the merged set. READY/RESUMED dispatch
-    // stays publication-free, so this boot sync is the single writer.
+    // stays publication-free unless a pending resync marker says the picker
+    // is stale, so this boot sync is otherwise the single writer.
     // Without the command runtime, keep the ordered builtins-only sync.
     match (interactions.as_ref(), runtime.as_ref()) {
         (Some(ordered), Some(commands)) => {
