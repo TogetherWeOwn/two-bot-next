@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Protected socket-level witness: a real shard receives a slash, never a leave.
 use super::*;
 
