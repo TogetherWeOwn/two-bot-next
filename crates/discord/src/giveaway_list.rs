@@ -59,14 +59,15 @@ fn saved_snowflake(id: &str) -> bool {
 /// At most 33 display characters are needed to detect the 32-character cut.
 /// Removing line separators prevents a prize from forging an additional row.
 pub(super) fn list_prize(prize: &str, budget: usize) -> String {
-    let visible: String = prize
+    let displayable: String = prize
         .chars()
         .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
-        .take(PRIZE_CHARS + 1)
         .collect();
-    if visible.is_empty() {
+    // Invisible-only text carries no displayable prize, like control-only text.
+    if !message_safety::has_message_text(&displayable) {
         return "?".into();
     }
+    let visible: String = displayable.chars().take(PRIZE_CHARS + 1).collect();
     let shortened = visible.chars().count() > PRIZE_CHARS;
     let visible = message_safety::neutralize_mentions(&visible);
     let count = visible.chars().count();

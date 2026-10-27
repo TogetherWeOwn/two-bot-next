@@ -130,6 +130,20 @@ fn prize_elision_counts_escaping_astral_units_and_mention_growth() {
     assert_eq!(list_prize("x".repeat(32).as_str(), 100), "x".repeat(32));
     assert_eq!(list_prize("\n\r\u{2028}\u{2029}", 10), "?");
     assert_eq!(list_prize("a\n\r\u{2028}\u{2029}b", 10), "ab");
+    // Invisible-only and control-plus-space prizes have no displayable text.
+    assert_eq!(list_prize("\u{200b}\u{2060}", 10), "?");
+    assert_eq!(list_prize("\u{200b} \n\u{feff}\t", 10), "?");
+    // Mention neutralization may shrink the preview to exactly the bound; the
+    // cut remainder must still carry the explicit ellipsis.
+    let split_mention: String = "@"
+        .chars()
+        .chain("everyone".chars().flat_map(|c| ['\u{200b}', c]))
+        .collect();
+    assert_eq!(split_mention.chars().count(), 17);
+    assert_eq!(
+        list_prize(&format!("{split_mention}abcdefghijklmnopTAIL"), 100),
+        "@\u{200b}everyoneabcdefghijklmnop…"
+    );
     for prize in [
         "🎁".repeat(200),
         "`\\*".repeat(70),
@@ -156,6 +170,20 @@ fn empty_list_and_damaged_unrenderable_identity_are_not_partial_successes() {
         render_active_list(&(0..11).map(saved_row).collect::<Vec<_>>()),
         FAILURE
     );
+    // Short rows fit the budget, so only the row cap can refuse these.
+    let short_rows: Vec<_> = (0..11)
+        .map(|index| {
+            let mut row = saved_row(index);
+            row.id = format!("d{index}");
+            row.prize = "x".into();
+            row.guild_id = "1".into();
+            row.channel_id = "2".into();
+            row.message_id = "3".into();
+            row
+        })
+        .collect();
+    assert_eq!(render_active_list(&short_rows), FAILURE);
+    assert_ne!(render_active_list(&short_rows[..10]), FAILURE);
     let mut row = saved_row(0);
     row.status = "damaged".into();
     assert_eq!(render_active_list(&[row]), FAILURE);
