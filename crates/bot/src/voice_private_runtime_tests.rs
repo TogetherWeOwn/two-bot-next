@@ -1239,3 +1239,30 @@ async fn myroom_read_fails_closed_without_authoritative_live_evidence() {
     assert_eq!(worker.live_owned_rooms(OWNER), None);
     assert_eq!(worker.owned_rooms(OWNER), owned);
 }
+
+#[tokio::test]
+async fn myroom_through_a_running_actor_never_lists_rooms_while_disconnected() {
+    // Pins the actor dispatch to `live_owned_rooms`: handing the actor the raw
+    // `owned_rooms` read would list stale tracked rows as live here.
+    let (live, store, http, _) = parts();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let stale = worker.owned_rooms(OWNER);
+    assert_eq!(stale.len(), 1);
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let actor = GuildActor {
+        live: worker.live.clone(),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    worker.live.disconnect();
+    let handle = tokio::spawn(async move {
+        run_actor(&mut worker, rx, Duration::from_millis(100)).await;
+    });
+    let replies = myroom_replies(&runtime, Some(actor)).await;
+    assert_eq!(replies, [WORKER_LOST_REPLY]);
+    assert_ne!(replies[0], myroom_render(&stale));
+    assert_ne!(replies[0], myroom_render(&[]));
+    runtime.actors.lock().unwrap().clear();
+    handle.abort();
+}
