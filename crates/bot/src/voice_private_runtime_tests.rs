@@ -845,6 +845,27 @@ async fn public_on_a_room_that_is_open_on_discord_writes_nothing() {
 }
 
 #[tokio::test]
+async fn myroom_calls_an_alwaysprivate_closed_room_private() {
+    let (live, store, http, _) = parts();
+    // `/alwaysprivate` rooms are created with @everyone Connect already
+    // denied while their stored flag still reads public: /myroom reports
+    // the effective closed state, not the flag alone.
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(!worker.privacy.contains_key(&ROOM));
+    assert_eq!(worker.owned_rooms(OWNER), vec![(ROOM, true)]);
+    assert!(worker.owned_rooms(GUEST).is_empty());
+}
+
+#[tokio::test]
+async fn myroom_calls_an_open_room_public() {
+    let (live, store, http, _) = parts();
+    set_room_overwrites(&live, bot_and_everyone_overwrites(false));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(worker.owned_rooms(OWNER), vec![(ROOM, false)]);
+}
+
+#[tokio::test]
 async fn a_stop_between_the_connect_write_and_the_join_delete_keeps_the_join_id() {
     let (mut worker, trace) = worker().await;
     private_cmd(&mut worker, OWNER);

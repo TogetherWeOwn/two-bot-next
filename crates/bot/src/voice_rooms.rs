@@ -3939,19 +3939,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
 
     /// The member's currently owned live rooms as `(room channel, runtime
     /// private)` pairs in channel order. Ownership is the current
-    /// `owner_id`, never the original creator; privacy is the live worker
-    /// state, with rooms missing from it reading as the public default.
-    /// Pure in-memory read: no store, queue or Discord touch.
+    /// `owner_id`, never the original creator. Privacy is the effective
+    /// closed state: the live worker flag, or Connect denied to @everyone
+    /// on Discord (an `/alwaysprivate` creator closes rooms the flag still
+    /// reads as public). Pure in-memory read: no store, queue or Discord
+    /// touch.
     pub fn owned_rooms(&self, member: Snowflake) -> Vec<(Snowflake, bool)> {
         let mut rooms: Vec<(Snowflake, bool)> = self
             .rooms
             .iter()
             .filter(|(_, room)| room.owner_id == member)
             .map(|(channel, _)| {
-                (
-                    *channel,
-                    self.privacy.get(channel).is_some_and(|room| room.private),
-                )
+                let private = self.privacy.get(channel).is_some_and(|room| room.private)
+                    || self.live_everyone_denies_connect(*channel);
+                (*channel, private)
             })
             .collect();
         rooms.sort_unstable();
