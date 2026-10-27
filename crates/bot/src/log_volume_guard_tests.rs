@@ -763,13 +763,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 86, "rendered HELP family count changed");
-    assert_eq!(type_headers, 86, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 87, "rendered HELP family count changed");
+    assert_eq!(type_headers, 87, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 787,
-        "exposition grew past the 787-sample budget (4 process-incarnation + 21 events + 4 scalars + 1 rsvp-refused + 1 latency \
-         + 22 histograms + 180 rest + 11 REST guard + 68 jobs + 119 job-last-error-class + 58 voice + 8 join-occupancy + 26 vote-kick + 6 event-voice-tick + 16 voice-names + 2 db-errors + 2 containment-store-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 raid-dropped-joins + 2 join-risk-dropped-joins + 2 checkpoint-failures + 7 drop-poison + 72 internal-actions + 45 moderation-enforcements + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 19 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 1 retention-replay-needed + 1 ticket-component-drops + 4 feed-fetches + 12 feed-fetch-errors + 1 voice-inbox-overflow + 1 voice-queue-overflow + 22 ticket-lifecycle (2 retire + 3 abandon + 13 purge + 2 claim + 2 close subsets)); \
+        series, 788,
+        "exposition grew past the 788-sample budget (4 process-incarnation + 21 events + 4 scalars + 1 rsvp-refused + 1 latency \
+         + 22 histograms + 180 rest + 11 REST guard + 68 jobs + 119 job-last-error-class + 58 voice + 8 join-occupancy + 26 vote-kick + 6 event-voice-tick + 16 voice-names + 2 db-errors + 2 containment-store-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 raid-dropped-joins + 2 join-risk-dropped-joins + 2 checkpoint-failures + 7 drop-poison + 72 internal-actions + 45 moderation-enforcements + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 19 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 1 gateway-drain-skips + 1 retention-replay-needed + 1 ticket-component-drops + 4 feed-fetches + 12 feed-fetch-errors + 1 voice-inbox-overflow + 1 voice-queue-overflow + 22 ticket-lifecycle (2 retire + 3 abandon + 13 purge + 2 claim + 2 close subsets)); \
          update docs/log-volume-guard.md with the new series"
     );
 }
