@@ -62,7 +62,7 @@ async fn invoke(runtime: &VoiceRuntime<Store, Http>, options: Vec<CommandDataOpt
     );
     let responses = Arc::new(Mutex::new(Vec::new()));
     let captured = responses.clone();
-    let owned = handle_voice_interaction(&runtime, &interaction, move |response| {
+    let owned = handle_voice_interaction(runtime, &interaction, move |response| {
         captured.lock().unwrap().push(response);
         async {}
     })
