@@ -134,7 +134,10 @@ def _prepare_worktree_dirs(slot, ws_name):
     for parent_name, veto_fn in (('target', preservation_veto),
                                  ('scratch', scratch_preservation_veto)):
         parent = slot / parent_name
-        entries = list(parent.iterdir())
+        try:
+            entries = list(parent.iterdir())
+        except OSError as error:
+            raise Refusal(f'cannot list {parent_name} in {slot.name}: {error}') from error
         if not entries:
             plans.append((parent, parent_name, [], False))
             continue

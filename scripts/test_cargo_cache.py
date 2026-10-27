@@ -361,6 +361,88 @@ class CacheTests(unittest.TestCase):
             os.close(fd)
         self.assertIn('slot_worktree_unpreparable', err.getvalue())
 
+    def test_unreadable_slot_listing_skips_slot_instead_of_aborting(self):
+        # An unreadable target/ listing refuses that slot (not the pool).
+        work = self.root / 'work'
+        work.mkdir()
+        slot = self.pool / 'slot-0'
+        real_iterdir = Path.iterdir
+
+        def fail_slot0_target(path):
+            if path == slot / 'target':
+                raise PermissionError('injected unreadable target')
+            return real_iterdir(path)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.object(Path, 'iterdir', fail_slot0_target):
+            got, _, fd = cache.acquire(self.pool, self.policy, work)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+
+    def test_unmeasurable_slot_skipped_with_finding(self):
+        # A deep symlink in the requester's own kept subdir makes usage()
+        # refuse after preparation; acquire must skip the slot, not abort.
+        work = self.root / 'work'
+        work.mkdir()
+        ws = cache.workspace_subdir_name(work)
+        slot = self.pool / 'slot-0'
+        link = slot / 'target' / ws / 'debug' / 'link'
+        link.parent.mkdir(parents=True)
+        link.symlink_to(self.root)
+        (slot / 'scratch' / ws).mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_unmeasurable', err.getvalue())
+
+    def test_symlinked_own_subdir_refuses_without_evicting_others(self):
+        # The requester's own ws-* entry being a symlink must refuse the
+        # slot in preflight, before another worktree's subdir is evicted.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        ws_b = cache.workspace_subdir_name(work_b)
+        slot = self.pool / 'slot-0'
+        other = slot / 'target' / ws_a / 'debug' / 'libfixture.rlib'
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b'x' * 64)
+        (slot / 'target' / ws_b).symlink_to(self.root)
+        (slot / 'scratch' / ws_a).mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertEqual(other.read_bytes(), b'x' * 64)
+
+    def test_lease_rewrite_tmp_never_at_scratch_top_level(self):
+        # A crash between the tmp write and os.replace must not leave a
+        # top-level scratch entry that wedges the slot as mixed contents.
+        real_replace = os.replace
+
+        def crash(src, dst):
+            self.assertEqual(Path(src).parent.parent.name, 'scratch')
+            raise OSError('injected crash before replace')
+
+        with patch.object(cache.os, 'replace', crash):
+            with self.assertRaises(OSError):
+                cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
+        scratch = self.pool / 'slot-0' / 'scratch'
+        self.assertTrue(all(cache.WS_DIR_RE.fullmatch(p.name) for p in scratch.iterdir()))
+        self.assertFalse(list(scratch.glob('lease.json.tmp')))
+
     def test_guard_stops_growth_and_retains_lease(self):
         self.policy['slot_budget_bytes'] = 24 * 1024
         self.save_policy()
