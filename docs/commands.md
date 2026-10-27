@@ -348,15 +348,15 @@ Create, draw, reroll or cancel a giveaway
 
 ## `/group`
 
-Toggle shared numbering per category for one creator channel
+Toggle shared numbering per category for one creator channel; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (required: choose on or off) |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
+| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (leave empty to show current settings) |
 
 ## `/help`
 
@@ -533,14 +533,14 @@ No options.
 
 ## `/position`
 
-Set where new rooms appear and the first room number
+Set where new rooms appear and the first room number; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
 | `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
 | `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
 
@@ -754,14 +754,14 @@ Temporarily ban a member
 
 ## `/textchannels`
 
-Toggle companion text channels for one creator channel
+Toggle companion text channels for one creator channel; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
 | `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (leave empty to keep the stored value) |
 | `name` | string | false | — | — | 100 | — | Companion channel name (default voice-chat) |
 | `viewer-role` | role | false | — | — | — | — | Extra role that may view companions (@everyone for all) |
