@@ -232,7 +232,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .map(|channel| channel.permission_overwrites.clone().unwrap_or_default())
     }
 
-    fn live_everyone_denies_connect(&self, room: Snowflake) -> bool {
+    pub(super) fn live_everyone_denies_connect(&self, room: Snowflake) -> bool {
         self.live_overwrites(room).is_some_and(|overwrites| {
             overwrites.iter().any(|overwrite| {
                 overwrite.kind == PermissionOverwriteType::Role
