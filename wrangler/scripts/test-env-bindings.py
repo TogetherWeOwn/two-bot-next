@@ -243,6 +243,41 @@ class AlertBindingTests(unittest.TestCase):
                     )
         self.assertEqual(self.check_config(BASE), [])
 
+    def test_idle_sleep_is_staging_only(self):
+        # Staging idle sleep: production keeps the always-on keepalive, so
+        # neither switch may appear at the top level (required everywhere)
+        # or in the production vars table.
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('KEEPALIVE_ENABLED = "0"', staging)
+        self.assertIn('IDLE_SLEEP_AFTER = "15m"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for key, value in [("KEEPALIVE_ENABLED", '"0"'), ("IDLE_SLEEP_AFTER", '"15m"')]:
+            for section in ["vars", "env.production.vars"]:
+                with self.subTest(key=key, section=section):
+                    config = BASE.replace(f"[{section}]", f"[{section}]\n{key} = {value}", 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(any(f"{key} is staging-only" in e for e in errors), errors)
+        # Absent from staging is fine: the keepalive simply stays on (rollback).
+        rollback = BASE.replace('KEEPALIVE_ENABLED = "0"\n', "").replace('IDLE_SLEEP_AFTER = "15m"\n', "")
+        self.assertEqual(self.check_config(rollback), [])
+
+    def test_idle_sleep_values_are_exact(self):
+        for value in ['"1"', '"false"', '"off"', '""', '"0 "', "0", "false"]:
+            with self.subTest(value=value):
+                config = BASE.replace('KEEPALIVE_ENABLED = "0"', f"KEEPALIVE_ENABLED = {value}")
+                self.assertTrue(any('KEEPALIVE_ENABLED must be exactly "0"' in e for e in self.check_config(config)))
+        for value in ['"4m"', '"61m"', '"1h"', '"900s"', '"15"', '""', '"015m"', "15"]:
+            with self.subTest(value=value):
+                config = BASE.replace('IDLE_SLEEP_AFTER = "15m"', f"IDLE_SLEEP_AFTER = {value}")
+                self.assertTrue(any("IDLE_SLEEP_AFTER must be" in e for e in self.check_config(config)))
+        for value in ['"5m"', '"60m"']:
+            with self.subTest(value=value):
+                config = BASE.replace('IDLE_SLEEP_AFTER = "15m"', f"IDLE_SLEEP_AFTER = {value}")
+                self.assertEqual(self.check_config(config), [])
+        # The idle window means nothing while the keepalive runs.
+        orphan = BASE.replace('KEEPALIVE_ENABLED = "0"\n', "")
+        self.assertTrue(any("IDLE_SLEEP_AFTER needs KEEPALIVE_ENABLED" in e for e in self.check_config(orphan)))
+
     def test_dashboard_secrets_are_never_toml_vars(self):
         # TOG-22861: the dashboard service-token pair gates human access; a
         # committed value would hand out that access. Both keys must stay

@@ -127,6 +127,29 @@ This alert covers a running keepalive loop, not a missing Worker/alarm or a tota
 monitoring outage. Separate external uptime checks are still needed for those
 failure modes. See [staging soak](staging-soak.md) for deployment readiness gates.
 
+### Staging idle sleep
+
+Staging does not run the keepalive (owner decision 2026-10-27: staging can shut
+down when idle). Its vars set `KEEPALIVE_ENABLED = "0"` and
+`IDLE_SLEEP_AFTER = "15m"`; production and the top level carry neither, so
+production keeps the 60-second keepalive and the 30-minute `sleepAfter`
+unchanged. `wrangler/scripts/check-env-bindings.py` refuses either key outside
+staging, any `KEEPALIVE_ENABLED` value other than `"0"`, and an idle window
+outside whole minutes 5-60.
+
+With the keepalive off, nothing arms or rearms the schedule, and a chain left by
+an earlier version drains on its next tick without probing. Only inbound
+requests renew activity, so the container stops 15 minutes after the last one.
+The next owned request (`/health`, `/readyz`, the ops reads) starts it again;
+deploy verify and the drills poll `/readyz` and wake it the same way. A cold
+start answers `503` until the gateway connects (about two minutes). 15 minutes
+outlasts the post-deploy voice synthetic, a 10-minute job that sends no Worker
+traffic. While staging sleeps it has no readiness or metrics alerts, and the
+bot is offline in the staging guild until something wakes it. An armed
+remediation drill drops both vars from the generated staging config
+(`scripts/staging_rollout.py`), because its fault injector runs on keepalive
+ticks. Rollback: delete both vars from `[env.staging.vars]` and redeploy.
+
 ### Offline verification
 
 From the repository root:

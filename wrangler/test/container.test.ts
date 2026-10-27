@@ -2780,3 +2780,83 @@ test("background metrics: metrics storage failure cannot notify and retains the 
   assert.ok(h.logs.includes(SCRAPE_FAILURE));
   assert.equal(h.schedules.mock.callCount(), 1);
 });
+
+// Staging idle sleep: KEEPALIVE_ENABLED = "0" (staging vars only, enforced by
+// scripts/check-env-bindings.py) turns the self-rearming keepalive off and
+// shortens sleepAfter, so an idle staging container stops. Every other value,
+// absence included (production), keeps the always-on behaviour.
+const STAGING_IDLE_ENV = { ...WORKER_ENV, KEEPALIVE_ENABLED: "0", IDLE_SLEEP_AFTER: "15m" };
+
+test("keepalive on by default: production-shaped env keeps the 30m belt and arms the chain", async (t) => {
+  const h = await harness(t);
+  assert.equal(h.bot.sleepAfter, "30m");
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
+  await response.arrayBuffer();
+  assert.equal(h.starts.length, 1);
+  assert.equal(h.pending().length, 1, "the always-on chain is armed exactly as before");
+});
+
+for (const value of ["1", "", "false", "off", "no", " 0", "0 ", "00"]) {
+  test(`keepalive stays on unless KEEPALIVE_ENABLED is exactly "0" (${JSON.stringify(value)})`, async (t) => {
+    const h = await harness(t, { ...WORKER_ENV, KEEPALIVE_ENABLED: value, IDLE_SLEEP_AFTER: "5m" });
+    assert.equal(h.bot.sleepAfter, "30m", "IDLE_SLEEP_AFTER is ignored while the keepalive runs");
+    const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    await response.arrayBuffer();
+    assert.equal(h.pending().length, 1);
+  });
+}
+
+test("keepalive off: a cold /readyz still wakes the container but arms no chain", async (t) => {
+  const h = await harness(t, STAGING_IDLE_ENV);
+  assert.equal(h.bot.sleepAfter, "15m");
+  for (const path of ["/readyz", "/health"]) {
+    const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+    await response.arrayBuffer();
+  }
+  assert.equal(h.starts.length, 1, "on-demand wake starts the container once");
+  assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV, "idle-sleep vars are never forwarded to the container");
+  assert.ok(h.requests.some((r) => r.pathname === "/readyz"));
+  assert.equal(h.pending().length, 0, "no self-rearming keepalive while it is off");
+  await h.bot.onStart();
+  assert.equal(h.pending().length, 0, "a restart does not arm it either");
+});
+
+test("keepalive off: a leftover chain from a keepalive-on version drains without probing or rearming", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, STAGING_IDLE_ENV);
+  await h.bot.schedule(60, "keepalive", KEEPALIVE);
+  await h.bot.schedule(3600, "onStop", {});
+  assert.equal(h.pending().length, 1);
+  const renew = t.mock.method(h.bot, "renewActivityTimeout");
+  t.mock.timers.tick(60_000);
+  await fireSdkAlarm(t, h.bot);
+  assert.equal(h.pending().length, 0, "the old chain is not re-armed");
+  assert.equal((await h.bot.listSchedules("onStop")).length, 1, "unrelated SDK schedules are preserved");
+  assert.equal(h.starts.length, 0, "a drained tick never starts the container");
+  assert.equal(h.requests.length, 0, "a drained tick never probes");
+  assert.equal(renew.mock.calls.length, 0, "a drained tick never renews the idle window");
+  assert.equal(h.values.has("two-bot:readiness"), false);
+});
+
+test("keepalive off: a direct keepalive callback is a no-op that clears the chain", async (t) => {
+  const h = await harness(t, STAGING_IDLE_ENV);
+  await h.bot.schedule(60, "keepalive", KEEPALIVE);
+  await h.bot.keepalive(KEEPALIVE, { taskId: "leftover" });
+  assert.equal(h.pending().length, 0);
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.starts.length, 0);
+});
+
+for (const value of [undefined, "", "15", "0m", "1m", "4m", "61m", "1h", "30s", "15M", " 15m", "15m ", "015m", "1e1m"]) {
+  test(`keepalive off: unusable IDLE_SLEEP_AFTER ${JSON.stringify(value)} falls back to 15m`, async (t) => {
+    const h = await harness(t, { ...WORKER_ENV, KEEPALIVE_ENABLED: "0", IDLE_SLEEP_AFTER: value });
+    assert.equal(h.bot.sleepAfter, "15m");
+  });
+}
+
+for (const value of ["5m", "10m", "20m", "60m"]) {
+  test(`keepalive off: IDLE_SLEEP_AFTER ${value} is honoured`, async (t) => {
+    const h = await harness(t, { ...WORKER_ENV, KEEPALIVE_ENABLED: "0", IDLE_SLEEP_AFTER: value });
+    assert.equal(h.bot.sleepAfter, value);
+  });
+}

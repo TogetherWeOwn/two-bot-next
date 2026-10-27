@@ -138,6 +138,16 @@ BOT_PORT = "8080"
 # Keepalive tick: renews the activity timeout so the gateway WebSocket
 # (outbound-only, invisible to Container idle billing) never sleeps.
 KEEPALIVE_SECONDS = "60"
+# Staging idle sleep (owner decision 2026-10-27: staging can shut down when
+# idle). "0" turns the keepalive above off, so the container stops after
+# IDLE_SLEEP_AFTER without inbound requests and the next /health, /readyz or
+# ops read starts it again (deploy verify included). 15m outlasts the
+# post-deploy voice synthetic (10-minute job, no Worker traffic) and avoids
+# cold-start thrash (about two minutes to a connected gateway). Staging-only:
+# scripts/check-env-bindings.py refuses either key at the top level or in
+# production. Rollback: delete both lines, redeploy (keepalive back on).
+KEEPALIVE_ENABLED = "0"
+IDLE_SLEEP_AFTER = "15m"
 TWO_GUILD_NAME = "TWO Staging"
 # Deployment-environment marker for the staging rollback-drill fence
 # (docs/staging-rollout-gate.md): forwarded into the container via

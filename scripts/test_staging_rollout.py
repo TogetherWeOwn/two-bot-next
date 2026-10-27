@@ -1195,6 +1195,23 @@ class OrchestrationTests(OfflineTestCase):
                          {"TWO_DEPLOY_ENV": "staging",
                           rollout.VOICE_STALL_FAULT_VAR: "1",
                           rollout.UNPAIRED_FAULT_VAR: "1"})
+        # The injector is evaluated on keepalive ticks only, so an armed drill
+        # deploys with staging idle sleep off (keepalive back on); a plain
+        # deploy keeps the committed idle-sleep vars untouched.
+        idle = {"TWO_DEPLOY_ENV": "staging", rollout.KEEPALIVE_SWITCH_VAR: "0",
+                rollout.IDLE_SLEEP_AFTER_VAR: "15m"}
+        plain = cfg(staging_vars=dict(idle))
+        rollout.apply_remediation_fault_injection(plain, False, False)
+        self.assertEqual(plain["env"]["staging"]["vars"], idle)
+        for voice_stall, unpaired in ((True, False), (False, True), (True, True)):
+            with self.subTest(voice_stall=voice_stall, unpaired=unpaired):
+                armed = cfg(staging_vars=dict(idle), production_vars={"PRESERVED": "1"})
+                rollout.apply_remediation_fault_injection(armed, voice_stall, unpaired)
+                staging_vars = armed["env"]["staging"]["vars"]
+                self.assertNotIn(rollout.KEEPALIVE_SWITCH_VAR, staging_vars)
+                self.assertNotIn(rollout.IDLE_SLEEP_AFTER_VAR, staging_vars)
+                self.assertEqual(staging_vars["TWO_DEPLOY_ENV"], "staging")
+                self.assertEqual(armed["env"]["production"]["vars"], {"PRESERVED": "1"})
         # Enabled without the exact staging marker refuses.
         for staging_vars in (None, {}, {"TWO_DEPLOY_ENV": "production"}):
             with self.subTest(staging_vars=staging_vars):

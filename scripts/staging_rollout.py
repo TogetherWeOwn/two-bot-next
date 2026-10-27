@@ -702,6 +702,11 @@ GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
 CONTAINER_RELEASE_VAR = "CONTAINER_RELEASE"
 VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
 UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
+# Staging idle sleep (wrangler/wrangler.toml [env.staging.vars]). The fault
+# injector runs on keepalive ticks only, so an armed remediation drill drops
+# both from the GENERATED staging vars: that deploy keeps the keepalive on.
+KEEPALIVE_SWITCH_VAR = "KEEPALIVE_ENABLED"
+IDLE_SLEEP_AFTER_VAR = "IDLE_SLEEP_AFTER"
 
 
 def apply_gateway_fail_injection(config, enabled):
@@ -745,6 +750,8 @@ def apply_remediation_fault_injection(config, voice_stall, unpaired_disconnect):
     be exactly "staging" and only the staging vars of the generated config
     gain the requested switches — top-level, production and every other
     environment stay untouched, and the checked-in file is never modified.
+    An armed drill also drops the staging idle-sleep vars from the generated
+    staging config, because the injector only runs on keepalive ticks.
     When neither drill is requested nothing is added, so a plain push deploy
     is byte-identical in behavior to before the injector existed.
     """
@@ -765,6 +772,9 @@ def apply_remediation_fault_injection(config, voice_stall, unpaired_disconnect):
     variables = staging.get("vars")
     require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
             "remediation_fault_fence_missing")
+    # The injector is evaluated on keepalive ticks: the drill build stays awake.
+    variables.pop(KEEPALIVE_SWITCH_VAR, None)
+    variables.pop(IDLE_SLEEP_AFTER_VAR, None)
     if voice_stall:
         variables[VOICE_STALL_FAULT_VAR] = "1"
     if unpaired_disconnect:
