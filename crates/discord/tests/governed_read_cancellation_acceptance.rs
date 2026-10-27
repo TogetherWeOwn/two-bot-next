@@ -698,6 +698,118 @@ async fn cancelled_body_stall_remains_bounded_and_releases_the_read_lane() {
     assert_eq!(published.load(Ordering::SeqCst), 0);
 }
 
+// Unlike caller(), these exchanges deliberately omit the caller deadline. A
+// one-hour None fallback must fail inside the observation budget, not hang CI.
+#[tokio::test]
+async fn omitted_deadline_header_stall_times_out_and_completes_admission_once() {
+    default_deadline_header_stall(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_omitted_deadline_header_stall_settles_once_without_publication() {
+    default_deadline_header_stall(true).await;
+}
+
+async fn default_deadline_header_stall(cancelled: bool) {
+    let _serial = serial().lock().await;
+    let db = database().await;
+    let probe = Probe::new(false, false);
+    let peer = Peer::start(200, "", "[]", true, false).await;
+    let wire = transport(&peer, lane(&db, &probe));
+    let published = Arc::new(AtomicUsize::new(0));
+    let publication = Arc::clone(&published);
+    // Real time throughout: pausing Tokio while doing SQL/socket I/O can
+    // auto-advance timers before the request has actually reached the peer.
+    let began = std::time::Instant::now();
+    let mut read = tokio::spawn(async move {
+        let result = wire.send_request(&get(), None).await;
+        if result.is_ok() {
+            publication.fetch_add(1, Ordering::SeqCst);
+        }
+        matches!(result, Err(ref detail) if detail == "read headers timed out")
+    });
+    assert!(signal(&probe.acquired).await, "durable admission committed");
+    assert!(
+        signal(&peer.received).await,
+        "admitted GET reached the peer"
+    );
+    let held = state(&db).await;
+    if cancelled {
+        read.abort();
+        assert!((&mut read)
+            .await
+            .expect_err("caller cancellation")
+            .is_cancelled());
+    }
+    // The peer never sends headers during this observation. Both the live
+    // caller and a detached cancelled read must settle at the five-second
+    // default, well before the durable lane's stale-lease recovery.
+    let settled = match tokio::time::timeout(Duration::from_secs(8), probe.settled.acquire()).await
+    {
+        Ok(Ok(permit)) => {
+            permit.forget();
+            true
+        }
+        _ => false,
+    };
+    let elapsed = began.elapsed();
+    let after = state(&db).await;
+    let cooldowns = probe.cooldowns.lock().await.clone();
+    let requests = peer.requests.lock().await.clone();
+    let returned_timeout = if !cancelled && settled {
+        Some(
+            tokio::time::timeout(OBSERVE, &mut read)
+                .await
+                .expect("settled read returns promptly")
+                .expect("caller joined"),
+        )
+    } else {
+        None
+    };
+    // Failure cleanup only: release a surviving long-deadline mutant so it
+    // cannot leave a detached worker or fixture DB behind. This happens AFTER
+    // recording every observation used by the deadline/settlement assertions.
+    if !settled {
+        peer.headers.add_permits(1);
+        let _ = signal(&probe.settled).await;
+    }
+    if !cancelled && returned_timeout.is_none() {
+        read.abort();
+        let _ = read.await;
+    }
+    peer.close().await;
+    db.close().await.expect("fixture teardown");
+    assert!(held.in_flight && held.age_ms < 60_000, "{held:?}");
+    assert!(
+        settled,
+        "omitted deadline did not settle within eight seconds of wire receipt: {after:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "default deadline fired early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "default deadline/settlement exceeded its bound: {elapsed:?}"
+    );
+    assert!(!after.in_flight && !after.indefinite, "{after:?}");
+    assert_eq!(
+        after.generation, held.generation,
+        "not stale-lease recovery"
+    );
+    assert_eq!(cooldowns, vec![None], "exactly one completed admission");
+    assert_eq!(requests.len(), 1, "one GET, never a detached retry");
+    assert!(requests[0].starts_with("GET /api/v10/guilds/2222/roles "));
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        0,
+        "no success publication"
+    );
+    if !cancelled {
+        assert_eq!(returned_timeout, Some(true), "caller sees Timeout");
+    }
+}
+
 #[tokio::test]
 async fn cancelled_admission_wait_has_no_unbounded_detached_owner() {
     let _serial = serial().lock().await;
