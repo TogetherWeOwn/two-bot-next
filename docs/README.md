@@ -111,6 +111,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Community jobs](community-jobs.md)
 - [Giveaways](giveaways.md)
 - [Snapshot edges](community-snapshot-edges.md)
+- [Stats counters](stats-counters-spec.md)
 - [Member journey](member-journey-parity.md)
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
