@@ -20,8 +20,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## Operations
 
-- [Ops runbook](runbook.md)
-- [Triage](runbook-observability.md)
 - [Runbook](runbook.md)
 - [Observability triage](runbook-observability.md)
 - [Metrics](metrics.md)
@@ -143,7 +141,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Notice proposal](event-change-notices-spec.md)
 - [Reminder prefs](event-reminder-preferences-spec.md)
 - [Seat proposal](rsvp-capacity-spec.md)
-- [Withdrawal](rsvp-withdrawal-spec.md)
+- [Withdrawal proposal](rsvp-withdrawal-spec.md)
 - [RSVP cutoff](rsvp-registration-cutoff-spec.md)
 - [Agenda](event-agenda-spec.md)
 - [Calendar](event-calendar-handoff-spec.md)
@@ -151,9 +149,9 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Event recap](event-recap-spec.md)
 - [Native publish](event-native-publish-spec.md)
 - [Sticky debounce](sticky-debounce-acceptance.md)
-- [Sticky config proposal](dashboard-sticky-config-spec.md)
-- [Ticket config proposal](dashboard-ticket-config-spec.md)
+- [Sticky config](dashboard-sticky-config-spec.md)
 - [Giveaway proposal](dashboard-giveaway-spec.md)
+- [Ticket config](dashboard-ticket-config-spec.md)
 - [Private subject](ticket-subject-spec.md)
 - [Priority](ticket-priority-spec.md)
 - [Opener copy](ticket-opener-copy-spec.md)
@@ -183,7 +181,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Template styling](voice-style-core.md)
 - [Template conditions](voice-conditions-core.md)
 - [Template lint/preview](voice-template-lint-core.md)
-- [Assistant gate](voice-assistant-core.md)
+- [Assistant config](voice-assistant-core.md)
 - [Assistant caps](voice-assistant-cap-core.md)
 - [Assistant requests](voice-assistant-request-core.md)
 - [Assistant validation](voice-assistant-validate-core.md)
