@@ -89,7 +89,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
 - [Lockdown preview](lockdown-preview-spec.md)
-- [Timed lockdown](time-boxed-lockdown-decision.md)
 - [Lockdown](time-boxed-lockdown-decision.md)
 - [Slowmode](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
