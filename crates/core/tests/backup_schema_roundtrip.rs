@@ -407,7 +407,7 @@ async fn triggers(pool: &PgPool) -> Vec<(String, String, String, String)> {
     .unwrap()
 }
 
-/// Migrated settings triggers. Restore suspends only the two guards; the CAS
+/// Migrated triggers. Restore suspends only the two settings guards; the CAS
 /// allocator stays enabled so restored rows receive fresh tokens.
 fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
     assert_eq!(
@@ -422,8 +422,11 @@ fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
                 "guild_settings_audit",
                 "trg_guild_settings_audit_append_only"
             ),
+            // Member-report reporter cap (0469): the table is excluded from
+            // backups, so restore neither suspends nor replays this trigger.
+            ("report_reporters", "report_reporters_cap"),
         ],
-        "every migrated settings trigger exists"
+        "every migrated trigger exists"
     );
 }
 
