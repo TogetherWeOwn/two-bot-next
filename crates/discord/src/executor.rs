@@ -222,6 +222,16 @@ impl DiscordError {
     }
 }
 
+/// Outcome of [`ActionExecutor::edit_message_for_close_refresh`]: a confirmed
+/// edit, a definitively deleted message, or a retryable failure whose
+/// [`DiscordError::cause`] stays in fixed vocabulary for content-free logs.
+#[derive(Debug)]
+pub enum CloseRefreshEdit {
+    Edited,
+    UnknownMessage,
+    Retryable(DiscordError),
+}
+
 /// One moderation mutation the executor carries out (legacy
 /// `ModerationDiscordClient` member methods; mirrors the sibling
 /// `MemberDiscord` contract so the follow-up wiring needs no domain change).
@@ -2933,6 +2943,19 @@ impl ActionExecutor {
         content: &str,
         components: &[serde_json::Value],
     ) -> Result<(), DiscordError> {
+        let req = Self::update_message_request(channel_id, message_id, content, components)?;
+        self.call_once_raw_paced(req, &[200]).await?;
+        Ok(())
+    }
+
+    /// Shared PATCH builder for message edits: the same ceiling, snowflake,
+    /// body and route validation for refreshes and close-repair retries.
+    fn update_message_request(
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> Result<Request, DiscordError> {
         if utf16_len(content) > MAX_MESSAGE_CHARS {
             return Err(DiscordError::Rejected(
                 "message exceeds Discord's ceiling".into(),
@@ -2944,15 +2967,51 @@ impl ActionExecutor {
             "content": content, "components": components, "allowed_mentions": {"parse": []}
         }))
         .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
-        let req = Request::builder(&Route::UpdateMessage {
+        Request::builder(&Route::UpdateMessage {
             channel_id: channel.get(),
             message_id: message.get(),
         })
         .body(body)
         .build()
-        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
-        self.call_once_raw_paced(req, &[200]).await?;
-        Ok(())
+        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))
+    }
+
+    /// Retry one already-authorized close edit, distinguishing a definitively
+    /// deleted message from a retryable refusal. Unlike
+    /// [`Self::edit_message_with_components`], a 404 is accepted so its body
+    /// can prove (Discord code 10008) or refuse to prove that the message is
+    /// gone; the remote body never surfaces in the outcome.
+    pub async fn edit_message_for_close_refresh(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> CloseRefreshEdit {
+        let req = match Self::update_message_request(channel_id, message_id, content, components) {
+            Ok(req) => req,
+            Err(error) => return CloseRefreshEdit::Retryable(error),
+        };
+        match self.call_once_raw_paced(req, &[200, 404]).await {
+            Ok(mut res) if res.status == 200 => {
+                // Definite effect on an idempotent edit: the 200 is the full
+                // receipt, so release the lane for the next repair row.
+                res.complete().await;
+                CloseRefreshEdit::Edited
+            }
+            Ok(mut res) => {
+                let unknown = is_unknown_message_response(&res);
+                // A 404 already released on receipt; explicit for symmetry
+                // with reads that validate the body before completing.
+                res.complete().await;
+                if unknown {
+                    CloseRefreshEdit::UnknownMessage
+                } else {
+                    CloseRefreshEdit::Retryable(throw_for_status(&res))
+                }
+            }
+            Err(error) => CloseRefreshEdit::Retryable(error),
+        }
     }
 
     /// Bounded nonce reconciliation. An unreadable/denied history is NOT an empty history.
@@ -4221,6 +4280,21 @@ pub fn is_definitive_rejection(status: u16) -> bool {
     matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422)
 }
 
+/// Discord JSON error code for a deleted message. Only this code — never a
+/// bare 404 — proves the message is gone and settles a close-repair retry.
+const DISCORD_CODE_UNKNOWN_MESSAGE: i64 = 10008;
+
+/// True only for a 404 whose JSON body carries [`DISCORD_CODE_UNKNOWN_MESSAGE`].
+/// Any other code, a non-numeric code or an unreadable body is not proof of
+/// absence, so the repair stays retryable. Never copies the remote body.
+fn is_unknown_message_response(res: &RawResponse) -> bool {
+    res.status == 404
+        && serde_json::from_slice::<serde_json::Value>(&res.body)
+            .ok()
+            .and_then(|body| body.get("code").and_then(serde_json::Value::as_i64))
+            == Some(DISCORD_CODE_UNKNOWN_MESSAGE)
+}
+
 /// Only documented no-effect rejections are retry-safe. An unexpected success,
 /// redirect, timeout status or other ambiguous response may follow a mutation.
 #[must_use]
@@ -5084,5 +5158,43 @@ mod tests {
         // Reason validation happens before any I/O: an empty reason is a
         // terminal Failed value with zero attempts, not a panic.
         assert!(audit_reason("").is_err());
+    }
+
+    #[test]
+    fn unknown_message_needs_404_with_code_10008() {
+        let coded = RawResponse {
+            status: 404,
+            retry_after_header: None,
+            body: br#"{"code": 10008, "message": "Unknown Message"}"#.to_vec(),
+            completion: None,
+        };
+        assert!(is_unknown_message_response(&coded));
+        let bodies: [&[u8]; 5] = [
+            br#"{"message": "REMOTE_BODY_SENTINEL"}"#,
+            br#"{"code": 50001, "message": "Missing Access"}"#,
+            br#"{"code": "10008"}"#,
+            b"not json",
+            b"",
+        ];
+        for body in bodies {
+            let unclassified = RawResponse {
+                status: 404,
+                retry_after_header: None,
+                body: body.to_vec(),
+                completion: None,
+            };
+            assert!(
+                !is_unknown_message_response(&unclassified),
+                "unclassified 404 stays retryable: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let wrong_status = RawResponse {
+            status: 403,
+            retry_after_header: None,
+            body: br#"{"code": 10008}"#.to_vec(),
+            completion: None,
+        };
+        assert!(!is_unknown_message_response(&wrong_status));
     }
 }

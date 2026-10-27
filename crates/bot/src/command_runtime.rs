@@ -70,14 +70,15 @@ use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
-        feed_already_paused_text, feed_already_resumed_text, feed_list_page,
+        feed_already_paused_text, feed_already_resumed_text, feed_existing_text, feed_list_page,
         feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
         feed_pending_evidence_refusal_text, feed_removed_text, feed_resumed_text, plan_command,
         FeedCommand, FeedCommandContext, FeedCommandPlan, FeedKind, FeedPendingEvidenceOperation,
     },
     feeds_store::{
         add_feed, list_feeds, pause_feed_with_evidence, remove_feed_with_evidence, resume_feed,
-        write_audit, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence, FeedResumeOutcome,
+        write_audit, FeedAddOutcome, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence,
+        FeedResumeOutcome,
     },
     funnel::now_millis_for_test,
     help::{canonical_help_selector, unknown_help_correction},
@@ -1553,25 +1554,52 @@ impl CommandRuntime {
             "game-mix" => {
                 let guild_id = self.guild_id.to_string();
                 // The CLI requires an explicit live-guild opt-in. This
-                // optionless Discord read has no rollout approval mechanism.
+                // Discord read has no rollout approval mechanism, and the
+                // browse selectors never become one.
                 if guild_id == two_bot_core::backup::guild_config::LIVE_GUILD_ID {
                     self.finish(interaction, "Game activity reports are not enabled for the live guild. This command does not authorize production reporting.").await;
                     return;
                 }
+                // Strict selector decode before any storage read: an
+                // invalid, duplicated, unknown or type-confused option is
+                // one private correction, never a silently served report.
+                let browse = match game_mix_browse_request(interaction) {
+                    Ok(browse) => browse,
+                    Err(correction) => {
+                        self.finish(interaction, correction).await;
+                        return;
+                    }
+                };
                 match two_bot_core::game_activity_store::read_guild_aggregates(
                     &self.pool, &guild_id,
                 )
                 .await
                 {
                     Ok(rows) => {
-                        self.finish(
-                            interaction,
-                            two_bot_core::game_activity::render_game_activity_discord_report(
-                                self.guild_id,
-                                &rows,
-                            ),
-                        )
-                        .await;
+                        let reply = match browse {
+                            // The optionless default render is byte-stable:
+                            // browse rendering applies only once a selector
+                            // was explicitly chosen.
+                            None => {
+                                two_bot_core::game_activity::render_game_activity_discord_report(
+                                    self.guild_id,
+                                    &rows,
+                                )
+                            }
+                            Some((page, sort, format)) => {
+                                match two_bot_core::game_activity::render_game_activity_discord_browse(
+                                    self.guild_id, &rows, page, sort, format,
+                                ) {
+                                    two_bot_core::game_activity::GameMixBrowseView::Page(text) => {
+                                        text
+                                    }
+                                    two_bot_core::game_activity::GameMixBrowseView::OutOfRange {
+                                        ..
+                                    } => game_mix_page_range_correction(page),
+                                }
+                            }
+                        };
+                        self.finish(interaction, reply).await;
                     }
                     Err(two_bot_core::game_activity_store::GameActivityStoreError::Db(err)) => {
                         warn!(
@@ -2106,8 +2134,10 @@ impl CommandRuntime {
     /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
     /// audit → ephemeral confirmation. The relay id is generated here (legacy
     /// `randomUUID()`); plan errors reply with the domain text and write
-    /// neither a row nor an audit (legacy parity). A store failure audits one
-    /// `feed.create`/`rejected` refusal row, then replies safe. The relay
+    /// neither a row nor an audit (legacy parity). An exact saved tuple replies
+    /// with its original id/state, without a write or creation/rejection audit.
+    /// A store failure audits one `feed.create`/`rejected` refusal row, then
+    /// replies safe. The relay
     /// binds to the invoking channel. Malformed options refuse before any
     /// store read or audit via [`feed_add_options_strict`].
     async fn feed_add(&self, interaction: &Interaction) {
@@ -2137,24 +2167,28 @@ impl CommandRuntime {
             source,
         };
         match plan_command(&context, command) {
-            Ok(FeedCommandPlan::Add(relay)) => {
-                if let Err(err) = add_feed(&self.pool, &relay).await {
-                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
-                        self.finish(interaction, quota.to_string()).await;
-                    } else {
-                        let class = feed_store_class(&err);
-                        warn!(reason = class, "feed insert failed");
-                        self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
-                            .await;
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
-                    }
-                    return;
+            Ok(FeedCommandPlan::Add(relay)) => match add_feed(&self.pool, &relay).await {
+                Ok(FeedAddOutcome::Created) => {
+                    self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
+                        .await;
+                    self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
+                        .await;
                 }
-                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
-                    .await;
-                self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
-                    .await;
-            }
+                Ok(FeedAddOutcome::Existing { id, enabled }) => {
+                    self.finish(interaction, feed_existing_text(&id, enabled))
+                        .await;
+                }
+                Err(two_bot_core::feeds_store::FeedStoreError::Capacity(quota)) => {
+                    self.finish(interaction, quota.to_string()).await;
+                }
+                Err(err) => {
+                    let class = feed_store_class(&err);
+                    warn!(reason = class, "feed insert failed");
+                    self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
+                        .await;
+                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                }
+            },
             // `FeedCommand::Add` can only plan to `Add`; the other arms are
             // unreachable, not silently wrong.
             Ok(plan) => {
@@ -2903,6 +2937,94 @@ pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage 
         CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
         _ => FeedListPage::Invalid,
     }
+}
+
+/// Strict `/game-mix` browse selectors, decoded before any storage read.
+///
+/// Every option must be one of the published selectors, appear at most
+/// once, and carry the published wire type: `page` is an integer within
+/// the published bounds, `sort` is `play` or `voice`, `format` is `json`
+/// or `summary`. Anything else — an unknown name such as a guild, member
+/// or live-guild override, a duplicate, a wrong-typed value — returns one
+/// bounded correction naming the offending selector. `Ok(None)` is the
+/// optionless legacy call, which keeps the default JSON render.
+pub(crate) fn game_mix_browse_request(
+    interaction: &Interaction,
+) -> Result<
+    Option<(
+        usize,
+        two_bot_core::game_activity::GameMixBrowseSort,
+        two_bot_core::game_activity::GameMixBrowseFormat,
+    )>,
+    String,
+> {
+    use two_bot_core::game_activity::{GameMixBrowseFormat, GameMixBrowseSort};
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Ok(None);
+    };
+    if data.options.is_empty() {
+        return Ok(None);
+    }
+    let correction = |selector: &'static str| {
+        format!(
+            "That {selector} value is not valid for /game-mix. Use page 1 to {}, \
+             sort play or voice, and format json or summary — and no other options.",
+            two_bot_core::game_activity::GAME_MIX_MAX_PAGE
+        )
+    };
+    let mut page = 1usize;
+    let mut sort = GameMixBrowseSort::Play;
+    let mut format = GameMixBrowseFormat::Json;
+    let mut seen: Vec<&str> = Vec::new();
+    for option in &data.options {
+        if seen.contains(&option.name.as_str()) {
+            return Err(correction(match option.name.as_str() {
+                "page" => "page",
+                "sort" => "sort",
+                "format" => "format",
+                _ => "game-mix",
+            }));
+        }
+        seen.push(option.name.as_str());
+        match (option.name.as_str(), &option.value) {
+            ("page", CommandOptionValue::Integer(value))
+                if (1..=two_bot_core::game_activity::GAME_MIX_MAX_PAGE).contains(value) =>
+            {
+                page = usize::try_from(*value).map_err(|_| correction("page"))?;
+            }
+            ("page", _) => return Err(correction("page")),
+            ("sort", CommandOptionValue::String(value)) => {
+                sort = match value.as_str() {
+                    "play" => GameMixBrowseSort::Play,
+                    "voice" => GameMixBrowseSort::Voice,
+                    _ => return Err(correction("sort")),
+                };
+            }
+            ("sort", _) => return Err(correction("sort")),
+            ("format", CommandOptionValue::String(value)) => {
+                format = match value.as_str() {
+                    "json" => GameMixBrowseFormat::Json,
+                    "summary" => GameMixBrowseFormat::Summary,
+                    _ => return Err(correction("format")),
+                };
+            }
+            ("format", _) => return Err(correction("format")),
+            _ => return Err(correction("game-mix")),
+        }
+    }
+    Ok(Some((page, sort, format)))
+}
+
+/// Bounded correction for a well-formed page past the saved games. The
+/// saved totals stay out of the reply: page bounds follow from the
+/// request, never from data a refused-at-decode call could not see.
+fn game_mix_page_range_correction(page: usize) -> String {
+    format!(
+        "Page {page} is past the saved games for this server. \
+         Run /game-mix with page 1 to start from the first saved games."
+    )
 }
 
 /// Shared sticky/feed/channel/leveling registrations over the narrowed boot
