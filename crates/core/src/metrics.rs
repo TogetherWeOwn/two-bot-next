@@ -1870,7 +1870,7 @@ impl Metrics {
             &mut out,
             "two_bot_process_incarnation",
             "gauge",
-            "Process identity (4 u32).",
+            "Process identity.",
         );
         for (part, value) in incarnation.iter().enumerate() {
             writeln!(
@@ -1942,7 +1942,7 @@ impl Metrics {
             &mut out,
             "two_bot_feed_fetches_total",
             "counter",
-            "Fetch attempts by outcome.",
+            "Fetch attempts.",
         );
         for (outcome, count) in FEED_FETCH_OUTCOMES.iter().zip(values.feed_fetch) {
             writeln!(
@@ -2012,7 +2012,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_join_occupancy_total",
             "counter",
-            "Joins by prior occupancy.",
+            "Joins by occupancy.",
         );
         for (bucket, count) in VOICE_JOIN_OCCUPANCY_BUCKETS
             .iter()
@@ -2028,7 +2028,7 @@ impl Metrics {
             &mut out,
             "two_bot_rest_requests_total",
             "counter",
-            "REST attempts by route/result.",
+            "REST attempts.",
         );
         for (route, results) in REST_ROUTES.iter().zip(values.rest) {
             for (result, count) in RESULTS.iter().zip(results) {
@@ -2043,7 +2043,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_runs_total",
             "counter",
-            "Attempts by job/outcome.",
+            "Job attempts.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             for (outcome, count) in JOB_OUTCOMES.iter().zip(current.runs) {
@@ -2086,7 +2086,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_last_error_class",
             "gauge",
-            "Last error class (one-hot).",
+            "Last error class.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             for class in JOB_ERROR_CLASSES {
@@ -2103,7 +2103,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_operations_total",
             "counter",
-            "Terminal room outcomes.",
+            "Room outcomes.",
         );
         for (op, outcomes) in VOICE_OPERATIONS.iter().zip(values.voice_ops) {
             for (outcome, count) in VOICE_OUTCOMES.iter().zip(outcomes) {
@@ -2144,7 +2144,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_tracked_rooms",
             "gauge",
-            "Tracked rooms (may be ghosts).",
+            "Rooms (may be ghosts).",
         );
         writeln!(out, "two_bot_voice_tracked_rooms {}", values.voice_tracked).unwrap();
         header(
@@ -2223,7 +2223,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_queue_pending",
             "gauge",
-            "Queued actions by lane.",
+            "Queued actions.",
         );
         for (lane, count) in VOICE_QUEUE_LANES.iter().zip(voice_queue_pending) {
             writeln!(
@@ -2247,7 +2247,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_live_not_ready_seconds",
             "gauge",
-            "Max unready seconds; 0 none.",
+            "Max unready; 0 none.",
         );
         writeln!(
             out,
@@ -2264,7 +2264,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_rest_in_flight_age_seconds",
             "gauge",
-            "Oldest REST age; 0 idle.",
+            "REST age; 0 idle.",
         );
         writeln!(
             out,
@@ -2390,7 +2390,7 @@ impl Metrics {
             &mut out,
             "two_bot_db_errors_total",
             "counter",
-            "Storage failures by operation.",
+            "Storage failures.",
         );
         for (op, count) in DB_ERROR_OPS.iter().zip(values.db_errors) {
             writeln!(out, "two_bot_db_errors_total{{op=\"{op}\"}} {count}").unwrap();
@@ -2590,7 +2590,7 @@ impl Metrics {
             &mut out,
             "two_bot_event_store_consumer_lag_seconds",
             "gauge",
-            "Capture lag; 0 unseen.",
+            "Lag; 0 unseen.",
         );
         writeln!(
             out,
@@ -2608,7 +2608,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_classified_total",
             "counter",
-            "Receiver classifications.",
+            "Classifications.",
         );
         for (kind, count) in EVENTSUB_DELIVERY_KINDS
             .iter()
@@ -2624,7 +2624,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_posts_total",
             "counter",
-            "Go-live post attempts.",
+            "Go-live posts.",
         );
         for (outcome, count) in EVENTSUB_POST_OUTCOMES.iter().zip(values.eventsub_posts) {
             writeln!(
@@ -2669,7 +2669,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_errors_total",
             "counter",
-            "Failures by error_class.",
+            "Failures.",
         );
         for (error_class, count) in EVENTSUB_RECONCILE_ERROR_CLASSES
             .iter()
@@ -2685,7 +2685,7 @@ impl Metrics {
             &mut out,
             "two_bot_ticket_lifecycle_total",
             "counter",
-            "Terminal ticket outcomes.",
+            "Ticket outcomes.",
         );
         for (event, outcomes) in TICKET_LIFECYCLE_EVENTS.iter().zip(values.ticket_lifecycle) {
             for (outcome, count) in TICKET_LIFECYCLE_OUTCOMES.iter().zip(outcomes) {

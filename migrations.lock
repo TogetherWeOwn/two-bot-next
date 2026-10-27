@@ -1,7 +1,7 @@
 {
   "version": 1,
   "migrations": {
-    "crates/cutover/migrations/0468_event_voice_recreation_budget.sql": {
+    "crates/cutover/migrations/0469_event_voice_recreation_budget.sql": {
       "sha256": "92286f54fcd537285c42a76f7ec454bc10b57f0b54e0735dcbe08ca0ad4de3c3",
       "justification": "Persist the one-replacement budget across event reschedules and process restarts."
     },
