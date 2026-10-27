@@ -14,7 +14,7 @@ seeing a member identity. A stored toggle row is **not** stopped capture, and an
 aggregate count is **not** a member list.
 
 **Recommend aggregate-first, toggles-once-live, never per-member.** Inventory at
-source commit `c6e5213b516d5ef62b357cc2f5feeaf8f59889a8` finds three toggle
+source commit `261541d2c9bdfaf995157d7f50bfec3a8af301a6` finds three toggle
 columns behind an unaudited, CAS-less writer with no production caller, no signed
 dashboard verb and no web read path — plus suppression and receipt tables whose
 rows always carry a member ID. After intent acceptance, the smallest eventual
@@ -43,7 +43,7 @@ the narrowed read-only page.
   whole file, and the set region contains neither `audit` nor `actor`.
 - The writer has **no production caller**: only tests call it. No slash command
   writes toggles: `/privacy status` reads through `analytics_settings` only
-  (`crates/bot/src/privacy_command.rs:234`), and the member command acts solely
+  (`crates/bot/src/privacy_command.rs:286`), and the member command acts solely
   on the invoker.
 - No signed privacy verb exists: `crates/core/src/internal_settings.rs:37`
   accepts only `settings.get` / `settings.set`, and the word `privacy` is absent
@@ -69,7 +69,7 @@ the narrowed read-only page.
   (`crates/cutover/src/member_erasure_plan.json:348`).
 - Actor labels carry attribution only, never a subject ID, count, content or
   secret. Member self-serve uses the fixed `member:self-serve` constant
-  (`crates/bot/src/privacy_command.rs:41`); the staging verify read publishes
+  (`crates/bot/src/privacy_command.rs:42`); the staging verify read publishes
   only that label plus `operator:fixture-check` and fails closed on any other
   (`docs/privacy.md:249`).
 - The existing PII-safe read pattern is the `staging-privacy-verify-read`
@@ -311,11 +311,13 @@ Stable manifest IDs are proposal-local, not new bot keys or wire enums.
 `read_only_blocked` is conditional, not launch authorization. Evidence anchors
 below name real source readers; the offline check validates their presence,
 not runtime effects. Classification `never_per_member` has no control to send.
+For `PV-K1`–`PV-K3`, `gate` applies to writes. Toggle reads and read-only rows
+require `PV-W2` and `PV-W3`; toggle writes additionally require `PV-W1`.
 
 ```json
 {
   "schema": "dashboard.privacy_config.v1",
-  "source_sha": "c6e5213b516d5ef62b357cc2f5feeaf8f59889a8",
+  "source_sha": "261541d2c9bdfaf995157d7f50bfec3a8af301a6",
   "keys": [
     {"id":"PV-K1","column":"presence_enabled","family":"presence","class":"dedicated_table","state":"read_only_blocked","apply":"next_write_per_transaction","gate":["PV-W1","PV-W2","PV-W3"],"evidence":["E-WRITE","E-READ","E-DEFAULT","E-FAMILY","E-COLUMN","E-CUTOVER-GATE","E-STORE-GATE","E-BATCH","E-GAME-PRESENCE"]},
     {"id":"PV-K2","column":"activity_enabled","family":"activity","class":"dedicated_table","state":"read_only_blocked","apply":"next_write_per_transaction","gate":["PV-W1","PV-W2","PV-W3"],"evidence":["E-WRITE","E-READ","E-DEFAULT","E-FAMILY","E-COLUMN","E-CUTOVER-GATE","E-STORE-GATE","E-STORE-TOUCH","E-BATCH","E-COMMUNITY","E-FACTS-GATE"]},
@@ -350,8 +352,8 @@ not runtime effects. Classification `never_per_member` has no control to send.
     "E-RESIDUAL-TOUCH":{"path":"crates/cutover/src/db.rs","line":518,"contains":"suppressed_in"},
     "E-RESIDUAL-MARK":{"path":"crates/cutover/src/db.rs","line":546,"contains":"suppressed_in"},
     "E-BATCH":{"path":"crates/cutover/src/gateway_session.rs","line":277,"contains":"LEFT JOIN guild_analytics_settings"},
-    "E-STATUS":{"path":"crates/bot/src/privacy_command.rs","line":234,"contains":"analytics_settings"},
-    "E-SELF-SERVE":{"path":"crates/bot/src/privacy_command.rs","line":41,"contains":"member:self-serve"},
+    "E-STATUS":{"path":"crates/bot/src/privacy_command.rs","line":286,"contains":"analytics_settings"},
+    "E-SELF-SERVE":{"path":"crates/bot/src/privacy_command.rs","line":42,"contains":"member:self-serve"},
     "E-SUPPRESSION":{"path":"crates/cutover/migrations/0433_privacy_opt_out.sql","line":35,"contains":"CREATE TABLE IF NOT EXISTS privacy_opt_outs"},
     "E-TOGGLES":{"path":"crates/cutover/migrations/0433_privacy_opt_out.sql","line":42,"contains":"CREATE TABLE IF NOT EXISTS guild_analytics_settings"},
     "E-RECEIPTS":{"path":"crates/cutover/migrations/0433_privacy_opt_out.sql","line":50,"contains":"CREATE TABLE IF NOT EXISTS privacy_opt_out_audit"},

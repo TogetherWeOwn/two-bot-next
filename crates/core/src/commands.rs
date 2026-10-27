@@ -571,6 +571,7 @@ mod tests {
                 .chain(crate::feature_commands::automation_commands()).collect::<Vec<_>>();
             for (command, option, min, max, required) in [
                 ("tempban", "duration_seconds", 60, Some(31_536_000), true),
+                ("tempban-list", "page", 1, Some(10_000), false),
                 ("timeout", "duration_seconds", 60, Some(2_419_200), true),
                 ("purge", "count", 1, Some(100), true),
                 ("purge-preview", "count", 1, Some(100), true),
@@ -599,7 +600,7 @@ mod tests {
                 // still requires one.
                 if !matches!(
                     definition.name.as_str(),
-                    "purge-preview" | "channel-inspect"
+                    "purge-preview" | "channel-inspect" | "tempban-list"
                 ) {
                     let reason = definition
                         .options
