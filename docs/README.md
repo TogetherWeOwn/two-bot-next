@@ -180,7 +180,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Vote-kick](voice-vote-kick-core.md)
 - [Vote cooldown tests](voice-vote-cooldown-acceptance.md)
 - [Vote-kick decisions](voice-vote-kick-core.md)
-- [Vote cooldown](voice-vote-cooldown-acceptance.md)
+- [Vote cooldown tests](voice-vote-cooldown-acceptance.md)
 - [Vote cooldown](voice-vote-kick-cooldown-checklist.md)
 - [Template composition](voice-template-core.md)
 - [Template styling](voice-style-core.md)

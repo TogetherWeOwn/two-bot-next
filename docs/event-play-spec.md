@@ -18,7 +18,8 @@ proposal, not a request from a host.
 
 [sesh's manual](https://sesh.fyi/manual/) (read 2026-10-27) documents a
 free-text event description ("Limited to 4096 characters"), Custom RSVP Options,
-and edit/delete limited to event managers. That is vendor capability evidence of
+and edit/delete limited to event
+managers and the creator. That is vendor capability evidence of
 organizer-written text, not of TWO demand, and it shows no accessibility feature.
 
 | Option | Value and cost | Disposition |
@@ -31,7 +32,7 @@ organizer-written text, not of TWO demand, and it shows no accessibility feature
 
 Inspected repository head: `1a87869f8`. Facts only; none is permission to widen.
 
-- `crates/core/src/scheduled_events.rs:33-41,93-112,152-172`: the mirror keeps one
+- `crates/core/src/scheduled_events.rs:31,33-41,93-112,152-172`: the mirror keeps one
   optional `description`, counted in Unicode scalars (`chars().count()`) with a
   **1,000 cap**. One violation refuses the **whole snapshot**, never a clipped
   field, and the poll cadence is 10 minutes.
@@ -43,13 +44,13 @@ Inspected repository head: `1a87869f8`. Facts only; none is permission to widen.
   description is therefore not expressible through this action; the host edits it
   in Discord. Whether Discord treats a present-and-null field as a clear was not
   tested here.
-- `crates/discord/src/internal_events.rs:130-133`: events are created with
+- `crates/discord/src/internal_events.rs:134`: events are created with
   `privacy_level: 2`, guild-only. `crates/cutover/migrations/0300_website_contract.sql:120-135`
   mirrors `description` as plain nullable text beside a status; only scheduled
   and active rows reach the contract views.
 - `crates/core/src/rsvp.rs:36-67`: RSVP stays Going / Interested / Declined with no
-  free text. Authority to write an event is the existing `event.upsert` admin
-  scope and the host's own Discord edit rights. This decision adds none.
+  free text. Authority to write an event is the existing `event.upsert` `moderate`
+  admin-API scope (`internal_actions.rs:2056-2061`) and the host's own Discord edit rights. This decision adds none.
 - Related specs own the neighbouring seams and are not changed here:
   [calendar handoff](event-calendar-handoff-spec.md) already **excludes** the
   description because it can carry links, mentions or private detail;
