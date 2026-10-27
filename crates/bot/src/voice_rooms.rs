@@ -7854,6 +7854,14 @@ enum ActorCommand {
         command: PrivacyCommand,
         reply: oneshot::Sender<String>,
     },
+    /// `/room-access-inspect`: read the caller's room privacy lists. Pure
+    /// read; the reply is the ephemeral text.
+    RoomAccess {
+        actor_id: Snowflake,
+        is_admin: bool,
+        page: PageArg,
+        reply: oneshot::Sender<String>,
+    },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
         vote_id: Snowflake,
@@ -8798,6 +8806,34 @@ where
                 is_admin,
                 actor_display,
                 command,
+                reply,
+            })
+            .ok()?;
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
+    }
+
+    /// Run one `/room-access-inspect` read on the live worker and return the
+    /// ephemeral reply text. `None` when the guild has no live actor, when its
+    /// inbox already drained, or when no answer arrived within
+    /// `WORKER_ACK_WAIT`.
+    pub async fn run_room_access(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        page: PageArg,
+    ) -> Option<String> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::RoomAccess {
+                actor_id,
+                is_admin,
+                page,
                 reply,
             })
             .ok()?;
@@ -10402,6 +10438,14 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             reply,
         } => {
             let _ = reply.send(worker.apply_privacy(actor_id, is_admin, &actor_display, command));
+        }
+        ActorCommand::RoomAccess {
+            actor_id,
+            is_admin,
+            page,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_room_access(actor_id, is_admin, page));
         }
         ActorCommand::KickStart {
             vote_id,
@@ -12122,6 +12166,9 @@ pub enum VoiceCommand {
     /// V3 `/name`: the owner's panel to set a custom name or restore the
     /// template name.
     Name,
+    /// `/room-access-inspect [page]`: the owner's read-only list of blocked,
+    /// granted and pending members for the room they are in.
+    RoomAccessInspect(PageArg),
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -12582,6 +12629,9 @@ fn parse_voice_command_with_registry(
         ))),
         "unlimit" => Some(VoiceCommand::Unlimit),
         "name" => Some(VoiceCommand::Name),
+        "room-access-inspect" => Some(VoiceCommand::RoomAccessInspect(decode_page(
+            &command.options,
+        ))),
         _ => None,
     }
 }
@@ -13029,6 +13079,7 @@ impl VoiceCommand {
             Self::Limit(_) => "limit",
             Self::Unlimit => "unlimit",
             Self::Name => "name",
+            Self::RoomAccessInspect(_) => "room-access-inspect",
         }
     }
 }
@@ -14590,6 +14641,27 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::RoomAccessInspect(page) => {
+            let Some(actor_id) = invoker_member_id(interaction) else {
+                reply(ephemeral_response(
+                    "I couldn't tell who invoked /room-access-inspect — try again.",
+                ))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_room_access(guild_id, actor_id, member.is_admin, page)
+                .await
+                .unwrap_or_else(|| {
+                    if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY.to_owned()
+                    } else {
+                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    }
+                });
+            reply(ephemeral_response(&text)).await;
+            true
+        }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
                 reply(ephemeral_response(
@@ -15513,6 +15585,7 @@ mod presence;
 pub use limit::{LimitArg, LimitCommand};
 mod private_runtime;
 pub use private_runtime::PrivacyCommand;
+mod room_access;
 
 mod join_requests;
 use join_requests::{

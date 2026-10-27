@@ -1917,6 +1917,16 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         )
         .int_range(0, MAX_USER_LIMIT)]),
         CommandDefinition::new("unlimit", "Remove your room's user limit"),
+        CommandDefinition::new(
+            "room-access-inspect",
+            "See who is blocked, granted and waiting to join your voice room",
+        )
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of a long list (starting at 1)",
+            CommandOptionType::Integer,
+        )
+        .min_value(1)]),
     ]
 }
 
@@ -3077,7 +3087,8 @@ mod tests {
                 "private",
                 "public",
                 "limit",
-                "unlimit"
+                "unlimit",
+                "room-access-inspect"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.

@@ -106,7 +106,8 @@ ship separately and are untouched here.
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
   /transfer /logging /export /import /position /group /inheritpermissions
-  /defaultlimit /alwaysprivate /kick /name /private /public /limit /unlimit`
+  /defaultlimit /alwaysprivate /kick /name /private /public /limit /unlimit
+  /room-access-inspect`
   (separate `TWO_VOICE` slice; its
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
   The published voice set is pinned separately by the `voice` section of

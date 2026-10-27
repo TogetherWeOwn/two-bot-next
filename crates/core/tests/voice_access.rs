@@ -185,6 +185,7 @@ fn command_list_covers_every_spec_command() {
         "private",
         "public",
         "reclaim",
+        "room-access-inspect",
         "setup",
         "template",
         "templateassistant",

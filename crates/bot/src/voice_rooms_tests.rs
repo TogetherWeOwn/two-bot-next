@@ -5071,7 +5071,8 @@ fn voice_command_set_is_gated_on_two_voice() {
             "private",
             "public",
             "limit",
-            "unlimit"
+            "unlimit",
+            "room-access-inspect"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
