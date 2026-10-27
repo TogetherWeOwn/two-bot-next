@@ -197,7 +197,13 @@ pub fn expected_registry() -> Value {
                 "Command name (case-insensitive; optional leading /)",
                 CommandOptionType::String,
             )
-            .max_length(32)],
+            .max_length(32),
+            CommandOption::new(
+                "subcommand",
+                "Subcommand path, space-separated (requires command)",
+                CommandOptionType::String,
+            )
+            .max_length(96)],
     ))
     .expect("help serializes");
     commands.insert(2, help);
