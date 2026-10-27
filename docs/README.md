@@ -174,8 +174,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Private rooms](voice-private-core.md)
 - [Room access gate](voice-access-core.md)
 - [Access corpus](voice-access-golden.md)
-- [Vote-kick decisions](voice-vote-kick-core.md)
-- [Cooldown tests](voice-vote-cooldown-acceptance.md)
 - [Vote-kick](voice-vote-kick-core.md)
 - [Vote cooldown tests](voice-vote-cooldown-acceptance.md)
 - [Vote cooldown](voice-vote-kick-cooldown-checklist.md)
