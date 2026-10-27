@@ -465,10 +465,9 @@ fn page_footer(content: &str) -> Option<(usize, usize)> {
 }
 
 fn line_for<'a>(content: &'a str, marker: &str) -> &'a str {
-    content
-        .lines()
-        .find(|line| line.contains(marker))
-        .unwrap_or_else(|| panic!("reply names {marker}: {content}"))
+    let line = content.lines().find(|line| line.contains(marker));
+    assert!(line.is_some(), "reply names {marker}: {content}");
+    line.unwrap_or_default()
 }
 
 async fn dispatch_recent(
