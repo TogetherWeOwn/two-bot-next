@@ -702,8 +702,8 @@ async fn guild_moderation_and_member_self_boundaries_refuse_before_reads() {
     for case in ["disabled", "foreign", "dm", "nonstaff", "missing-actor"] {
         let mut request = interaction(vec![]);
         match case {
-            "foreign" => request.guild_id = Some(Id::new(9999)),
-            "dm" => request.guild_id = None,
+            "foreign" => set_guild(&mut request, Some(Id::new(9999))),
+            "dm" => set_guild(&mut request, None),
             "nonstaff" => {
                 request.member.as_mut().expect("actor").permissions = Some(Permissions::empty())
             }
@@ -722,6 +722,27 @@ async fn guild_moderation_and_member_self_boundaries_refuse_before_reads() {
                 .all(|r| r.path.ends_with("/callback") || r.path.ends_with("/messages/@original")),
             "routing refusal never fetches authority or Discord state"
         );
+    }
+}
+
+#[tokio::test]
+async fn mismatched_registration_guild_is_silently_refused_without_any_effects() {
+    // Deliberately do not use set_guild: this malformed identity must stop
+    // before the router, unlike coherent foreign/DM invocations above.
+    // Removing the registration/invocation fence would emit a callback.
+    for invocation_guild in [Some(Id::new(9999)), None] {
+        let mut request = interaction(vec![]);
+        request.guild_id = invocation_guild;
+        let Some(InteractionData::ApplicationCommand(command)) = request.data.as_ref() else {
+            panic!("slash fixture required");
+        };
+        assert_eq!(command.guild_id, Some(Id::new(GUILD)));
+        assert_ne!(command.guild_id, request.guild_id);
+        let rest = Rest::start(Authority::Staff).await;
+        let runtime = runtime_with_member(member_gates(), rest.origin.clone(), lazy_pool());
+        let (_, queries) = Queries::capture(runtime.on_interaction(&request)).await;
+        assert!(rest.requests().is_empty(), "no callback or Discord effects");
+        assert!(queries.is_empty(), "no storage reads or writes");
     }
 }
 

@@ -1,12 +1,23 @@
 {
   "schemaVersion": 1,
-  "purpose": "Protected test-only acceptance for privately inspecting saved temporary-ban expiry work. This branch is not a product implementation and must not merge while intentionally RED.",
+  "purpose": "Immutable author-owned acceptance correction for privately inspecting saved temporary-ban expiry work. Consume the test-only correction in the existing product PR; do not open or merge a standalone failing PR.",
   "sourceBaseline": "92d85042527b756062bfc9e19c8d77aed0cee0b3",
-  "executionBase": "5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
-  "branch": "test/tempban-expiry-inventory-acceptance",
+  "previousExecutionBase": "5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
+  "executionBase": "af442599e00cb839f6e349d9bf100fe054a0d1fe",
+  "branch": "test/tempban-expiry-identity-correction",
   "protectedFiles": [
-    {"path": "crates/bot/src/tempban_inventory_acceptance_tests.rs", "sha256": "299b49ea3259b9a29eaeebd5d8328b3dd6765267c9bdd4dbe6901a898dfc0d86", "tests": 9}
+    {"path": "crates/bot/src/tempban_inventory_acceptance_tests.rs", "sha256": "d63bb41a849864fd3a936628900461070447e67aed12bc3ddd2913e647919b00", "tests": 10}
   ],
+  "publicationPinFiles": [
+    {"path": "crates/bot/src/commands_cli.rs", "sha256": "fba9da7bd9cc5efbf17907930afd98a4c35dd4083adbad4c6f676be2390c38e2", "scope": "Existing cfg(test) module only; 44 non-voice and 65 with-voice definitions, three private moderation reads, explicit tempban-list presence in both registries. All unrelated assertions retained."}
+  ],
+  "oracleCorrection": {
+    "previousProtectedSha256": "299b49ea3259b9a29eaeebd5d8328b3dd6765267c9bdd4dbe6901a898dfc0d86",
+    "reason": "The original foreign/DM fixture changed interaction.guild_id alone, leaving the configured registration guild in CommandData.guild_id. command_identity.rs:108-109 correctly silently rejects that mismatch before routing; the one-callback helper therefore failed before observing the intended guild refusal. Use the existing set_guild helper for coherent foreign/DM fixtures, retaining every assertion. A separate negative control deliberately preserves mismatched registration and invocation guilds and asserts zero REST callbacks/effects and zero storage queries. Never weaken the production identity fence.",
+    "evidence": "Initial product PR #1853 run 40426084820 at fa31b6930f30bbd1580532f21eb09fe846ed49cd, as recorded in the correction assignment: eight inventory tests PASS; guild_moderation_and_member_self_boundaries_refuse_before_reads fails at the callback count (0 versus 1), and desired_registry_uses_existing_feature_gates fails at 44 versus 43. These are historical results, not fresh execution of this correction.",
+    "ownership": "Only the independent Test Author changes protected bytes. Builder owns combined-head product code, PR, CI and pre-review. No production source, permission gate, schema, CI route or live action changed by this correction.",
+    "supplements": "Only the required registration-mismatch negative control was added. Optional oversized-ID/UTF-16, full page-10000 lookahead, exact percent-roundtrip and subsecond-order supplements remain outside this bounded correction. Existing coverage limits remain explicit below."
+  },
   "registration": {
     "path": "crates/bot/src/command_runtime_tests.rs",
     "module": "tempban_inventory_acceptance_tests",
@@ -14,7 +25,8 @@
   },
   "commands": {
     "publication": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked tempban_inventory_is_a_private_staff_moderation_command_with_bounded_pages -- --nocapture && python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked existing_tempban_mutation_definition_remains_a_positive_control -- --nocapture",
-    "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot tempban_inventory_acceptance_tests -- --nocapture --test-threads=1",
+    "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked tempban_inventory_acceptance_tests -- --nocapture --test-threads=1",
+    "cliPins": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked commands_cli::tests::desired_registry_uses_existing_feature_gates -- --nocapture",
     "unbanControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test moderation_tempban_path --test unban_sweep_bounds_acceptance -- --nocapture --test-threads=1",
     "authorityControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot member_dispatch_authority_acceptance -- --nocapture --test-threads=1",
     "workspace": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test --workspace --features two-bot-core/db --locked",
@@ -34,13 +46,16 @@
   "database": {
     "guard": "two_bot_testsupport::TestDatabase with current cutover migrations; each test owns its disposable database and explicitly closes it.",
     "missingEnvironment": "Fails fixture setup; never count missing DB, compile failure or cache refusal as behavioral RED.",
-    "ciRoute": "check.yml workspace lib/bins step runs all 9 registered tests with TWO_TEST_DATABASE_URL; the 2 registry-shape tests need no DB. Nothing depends on the workspace integration step, which CI skips while any unit test is RED by design. No ignored tests or bespoke CI route."
+    "ciRoute": "check.yml workspace lib/bins step runs all 10 registered tests with TWO_TEST_DATABASE_URL and two-bot-core/db; the 2 registry-shape tests, guild-boundary test and registration-mismatch negative control need no DB. Nothing depends on the workspace integration step, which CI skips while any unit test is RED by design. No ignored tests or bespoke CI route."
   },
   "verification": {
-    "localCompiled": "NOT RUN: publication, runtime and workspace wrapper attempts were refused before Cargo, each exit 75: no idle, below-budget slot; no per-worktree fallback. Two further contract-target attempts (22:35 and 22:37 UTC) were likewise refused after an 80 s cooldown.",
+    "localCompiled": "CURRENT CORRECTION NOT RUN: corrected inventory acceptance, workspace test command and focused commands_cli::tests::desired_registry_uses_existing_feature_gates were each refused before Cargo, exit 75: no idle, below-budget slot; no per-worktree fallback. No fresh compiled, RED or GREEN claim. Builder must verify the combined head in existing product CI.",
+    "historicalLocalCompiled": "Original publication, runtime and workspace wrapper attempts were refused before Cargo, each exit 75: no idle, below-budget slot; no per-worktree fallback. Two further original contract-target attempts (22:35 and 22:37 UTC) were likewise refused after an 80 s cooldown.",
+    "correctionOffline": "cargo fmt --all -- --check, git diff --check, secret Debug guard and 23 self-tests, docs index, floor guard against af442599e00cb839f6e349d9bf100fe054a0d1fe, and test inventory PASS. Protected hash matched the prior HEAD before editing; new protected SHA-256 and ten-test count verified programmatically. Original assertions retained; only coherent foreign/DM fixture construction changed, plus the separate negative control and additive CLI pins.",
+    "redScope": "The behavioralRed and baselineCompatibility entries below are historical original-acceptance evidence, not runs of the corrected oracle. Baseline intended-RED evidence remains historical; cache refusal is neither RED nor GREEN. No new behavioral RED is invented or required to justify correcting a malformed test vehicle.",
     "behavioralRed": "PARTIAL (7 of 9). Hosted run 40405157395 at e1cb457938645fe3a68d9dd3c2f60d765f296297: all 7 runtime tests fail behaviorally (\"I don't recognize that command\" for /tempban-list; 1857 passed, 462 ignored in the same binary; nextest retries both FAIL), with existing tempban/unban tests PASSing as unchanged controls. The 2 registry-shape tests lived in crates/core/tests/, whose workspace integration step CI skips while unit tests are RED, and the local cache pool refused admission; they were compile-verified only (clippy --all-targets green). This correction moves those 2 assertions (same checks, crate-qualified paths, no new logic) into the unit-test module so one hosted run observes all 9. Full 9-test RED is unverified until the new head's run completes.",
     "offline": "cargo fmt --all -- --check, git diff --check, floor guard, test inventory, secret Debug guard (including 23 self-tests), and docs index passed before publication.",
     "baselineCompatibility": "git diff sourceBaseline..executionBase for member_runtime.rs, member_moderation_store.rs and moderation.rs was empty. This static check is not compiled verification."
   },
-  "handoff": "Builder must consume these exact protected bytes unchanged in the single product PR after Test Author records actual behavior-specific RED and unchanged controls on the task. Hash manifest itself is not self-hashed; its SHA-256 and immutable commit are recorded in the task handoff. Do not merge this intentionally failing branch alone."
+  "handoff": "Builder consumes the exact corrected protected bytes and test-only CLI pin changes from executionBase to the immutable handoff commit, unchanged, in existing product PR #1853. The branch inherits product work; the correction commit itself touches only the protected suite, existing commands_cli cfg(test) module and this manifest. The Builder-owned unstaged e2e_matrix.rs row/header is deliberately excluded. No standalone PR or live action. Hash manifest itself is not self-hashed; its SHA-256 and immutable commit are recorded on the correction task. Historical intended-RED evidence is preserved, not replaced by cache refusals. Builder owns fresh combined-head CI and pre-review. Static count/coverage audit found no further stale pins outside the known CLI pins and Builder-owned matrix; saved smoke inventory remains 43 plus the compiled-only lfg-edit extension, while the full non-voice registry is 44."
 }
