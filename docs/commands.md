@@ -154,7 +154,7 @@ Resume a saved custom command
 
 ## `/command-inspect`
 
-Inspect a saved command or privately preview an unsaved draft
+Inspect saved state and text-trigger eligibility, or preview an unsaved draft
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false

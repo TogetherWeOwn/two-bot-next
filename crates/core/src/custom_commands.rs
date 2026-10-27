@@ -936,15 +936,114 @@ pub fn format_inspect_miss(name: &str) -> String {
     format!("No command /{name} found in this server. List saved commands with /command-list.")
 }
 
-/// Private definition summary: saved description, existing enabled state,
-/// text trigger and usable template/preview/correction examples. Never the
-/// template body or a preview — those are their own views. Disabled rows
-/// stay inspectable; nothing here enables them.
+/// Why a saved row is not currently a prefix-dispatch candidate. Each reason is
+/// derived from the same inputs as the live text path: the row, the effective
+/// text-command gate and [`builtin_command_names`] (never the wider write
+/// reservation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextBlocker {
+    NoTrigger,
+    Paused,
+    GateOff,
+    Builtin,
+}
+
+/// Current text-trigger eligibility for one saved row. `gate` is the effective
+/// automations-and-text-commands flag; `None` means the caller could not read
+/// it, which is reported as unknown, never as enabled.
+fn text_blockers(row: &StoredCommand, gate: Option<bool>) -> Vec<TextBlocker> {
+    let mut blockers = Vec::new();
+    match row.text_trigger.as_deref() {
+        None => blockers.push(TextBlocker::NoTrigger),
+        Some(trigger) => {
+            if trigger_word(trigger)
+                .is_some_and(|word| is_builtin_trigger(&word, &builtin_command_names()))
+            {
+                blockers.push(TextBlocker::Builtin);
+            }
+        }
+    }
+    if !row.enabled {
+        blockers.push(TextBlocker::Paused);
+    }
+    if gate == Some(false) {
+        blockers.push(TextBlocker::GateOff);
+    }
+    blockers
+}
+
+fn text_eligibility_lines(row: &StoredCommand, gate: Option<bool>) -> String {
+    let blockers = text_blockers(row, gate);
+    let name = &row.name;
+    if blockers.is_empty() {
+        return if gate.is_some() {
+            "\nText-trigger eligibility: Eligible, subject to normal per-message permission checks and automod. This is not a delivery guarantee and says nothing about slash-command registration.".to_owned()
+        } else {
+            "\nText-trigger eligibility: Unknown (the current text commands gate is unavailable to this view; the saved definition itself has no blocker). Nothing here is a delivery guarantee.".to_owned()
+        };
+    }
+    let reasons = blockers
+        .iter()
+        .map(|blocker| match blocker {
+            TextBlocker::NoTrigger => "no text trigger",
+            TextBlocker::Paused => "paused definition",
+            TextBlocker::GateOff => "text commands gate off",
+            TextBlocker::Builtin => "builtin-reserved trigger",
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut out = format!("\nText-trigger eligibility: Not eligible ({reasons})");
+    if gate.is_none() {
+        out.push_str("; text commands gate unknown");
+    }
+    for blocker in &blockers {
+        match blocker {
+            TextBlocker::NoTrigger => out.push_str(&format!(
+                "\nNext: add a trigger with /command name:{name} template:... text-trigger:!word (replaces the definition)."
+            )),
+            TextBlocker::Builtin => out.push_str(&format!(
+                "\nNext: choose a non-builtin trigger with /command name:{name} template:... text-trigger:!word (replaces the definition)."
+            )),
+            TextBlocker::Paused => {
+                out.push_str(&format!("\nNext: resume it with /command-enable name:{name}."));
+            }
+            TextBlocker::GateOff => out.push_str(
+                "\nNext: text commands follow the TWO_TEXT_COMMANDS configuration; ask the bot operator to review it. Inspecting changes nothing.",
+            ),
+        }
+    }
+    out
+}
+
+/// Private definition summary with the current text-trigger eligibility
+/// unknown: the caller has no effective text-command gate to report.
 #[must_use]
 pub fn format_inspect_summary(row: &StoredCommand) -> String {
+    format_inspect_summary_with_gate(row, None)
+}
+
+/// Private definition summary: saved description, saved enabled state (kept
+/// separate from live dispatch), text trigger, current text-trigger
+/// eligibility with a safe next action per blocker, and usable
+/// template/preview/correction examples. Never the template body or a
+/// preview — those are their own views. Disabled rows stay inspectable;
+/// nothing here enables them. `text_commands_gate` is the effective
+/// automations-and-text-commands flag the text path uses, or `None` when
+/// unavailable. A passing result stays subject to per-message permission
+/// checks and automod.
+#[must_use]
+pub fn format_inspect_summary_with_gate(
+    row: &StoredCommand,
+    text_commands_gate: Option<bool>,
+) -> String {
     let heading = InspectView::Summary.heading(&row.name);
-    let status = if row.enabled { "Enabled" } else { "Disabled" };
+    let status = if row.enabled {
+        "Enabled"
+    } else {
+        "Disabled (paused)"
+    };
     let trigger = escape_inspect_text(row.text_trigger.as_deref().unwrap_or("none (slash-only)"));
+    let eligibility = text_eligibility_lines(row, text_commands_gate);
     let examples = format!(
         "\nSaved template: /command-inspect name:{} view:template\nPrivate preview: /command-inspect name:{} view:preview\nReplace the definition: /command name:{} template:...",
         row.name, row.name, row.name
@@ -954,10 +1053,13 @@ pub fn format_inspect_summary(row: &StoredCommand) -> String {
     // marker, never a silent partial.
     let fixed_units = heading.encode_utf16().count()
         + "\nDescription: ".encode_utf16().count()
-        + "\nStatus: ".encode_utf16().count()
+        + "\nSaved definition \u{2014} Status: "
+            .encode_utf16()
+            .count()
         + status.encode_utf16().count()
         + "\nText trigger: ".encode_utf16().count()
         + trigger.encode_utf16().count()
+        + eligibility.encode_utf16().count()
         + examples.encode_utf16().count();
     let mut description = escape_inspect_text(&row.description);
     let budget = MAX_RENDERED_CHARS.saturating_sub(fixed_units);
@@ -969,7 +1071,7 @@ pub fn format_inspect_summary(row: &StoredCommand) -> String {
         );
         description = format!("{cut}{MARKER}");
     }
-    let reply = format!("{heading}\nDescription: {description}\nStatus: {status}\nText trigger: {trigger}{examples}");
+    let reply = format!("{heading}\nDescription: {description}\nSaved definition \u{2014} Status: {status}\nText trigger: {trigger}{eligibility}{examples}");
     debug_assert!(reply.encode_utf16().count() <= MAX_RENDERED_CHARS);
     reply
 }
@@ -1952,6 +2054,38 @@ mod tests {
         assert!(summary.contains("Disabled"));
         assert!(!summary.to_lowercase().contains("enabled"));
         assert!(summary.contains("none (slash-only)"));
+    }
+
+    #[test]
+    fn inspect_summary_eligibility_follows_gate_trigger_state_and_reservation() {
+        let eligibility = |row: &StoredCommand, gate| {
+            format_inspect_summary_with_gate(row, gate)
+                .lines()
+                .find(|line| line.starts_with("Text-trigger eligibility:"))
+                .expect("eligibility line")
+                .to_owned()
+        };
+        let row = inspect_row();
+        assert!(eligibility(&row, Some(true)).contains("Eligible, subject to"));
+        assert!(eligibility(&row, Some(true)).contains("automod"));
+        assert!(eligibility(&row, Some(false)).contains("text commands gate off"));
+        assert!(eligibility(&row, None).contains("Unknown"));
+        let mut paused = inspect_row();
+        paused.enabled = false;
+        assert!(eligibility(&paused, Some(true)).contains("paused definition"));
+        let mut reserved = inspect_row();
+        reserved.text_trigger = Some("!HELP".to_owned());
+        assert!(eligibility(&reserved, Some(true)).contains("builtin-reserved trigger"));
+        // Dispatch reserves builtin names only, not the wider write set.
+        let mut write_only = inspect_row();
+        write_only.text_trigger = Some("!setup".to_owned());
+        assert!(eligibility(&write_only, Some(true)).contains("Eligible"));
+        let mut slash_only = inspect_row();
+        slash_only.text_trigger = None;
+        let summary = format_inspect_summary_with_gate(&slash_only, Some(true));
+        assert!(summary.contains("no text trigger"));
+        assert!(summary.contains("text-trigger:"));
+        assert!(!summary.contains("registration"));
     }
 
     #[test]

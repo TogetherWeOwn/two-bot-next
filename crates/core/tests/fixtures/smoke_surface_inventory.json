@@ -397,7 +397,7 @@
     },
     {
       "name": "command-inspect",
-      "description": "Inspect a saved command or privately preview an unsaved draft",
+      "description": "Inspect saved state and text-trigger eligibility, or preview an unsaved draft",
       "family": "automations",
       "gate": "automations",
       "default_member_permissions": "32",
