@@ -366,7 +366,7 @@ fn copy_contents(contents: &DumpContents) -> DumpContents {
     }
 }
 
-fn write_archive(path: &Path, contents: &DumpContents) {
+fn write_unvalidated_archive(path: &Path, contents: &DumpContents) {
     let mut encoder = new_encoder();
     write_line(
         &mut encoder,
@@ -391,6 +391,10 @@ fn write_archive(path: &Path, contents: &DumpContents) {
         .open(path)
         .unwrap();
     std::io::Write::write_all(&mut file, &finish_gzip(encoder).unwrap()).unwrap();
+}
+
+fn write_archive(path: &Path, contents: &DumpContents) {
+    write_unvalidated_archive(path, contents);
     inspect(path).expect("test archive must pass file validation before reaching restore");
 }
 
@@ -2229,10 +2233,14 @@ async fn v14_archive_restores_starboard_and_clears_newer_reaction_cursors() {
         .retain(|table| table.name != "starboard_reaction_cursors");
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let incomplete_path = directory.path("current-missing-cursors.ndjson.gz");
-    write_archive(&incomplete_path, &old);
+    // This file is intentionally invalid; normal fixtures still self-validate.
+    write_unvalidated_archive(&incomplete_path, &old);
+    let Err(error) = inspect(&incomplete_path) else {
+        panic!("current archives must require the replay cursor table");
+    };
     assert!(
-        inspect(&incomplete_path).is_err(),
-        "current archives must require the replay cursor table"
+        error.to_string().contains("starboard_reaction_cursors"),
+        "{error}"
     );
     old.manifest.version = 14;
     let old_path = directory.path("pre-replay-cursors-v14.ndjson.gz");
