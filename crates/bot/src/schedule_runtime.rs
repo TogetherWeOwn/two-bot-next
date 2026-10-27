@@ -1495,8 +1495,29 @@ pub(crate) fn schedule_edit_options_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command_runtime_tests::slash;
     use twilight_model::application::interaction::application_command::CommandDataOption;
+
+    // Local slash builder: this file is also compiled into integration
+    // targets that path-include it (e.g. `schedule_preview_acceptance`),
+    // where the shared `command_runtime_tests` module does not exist. The
+    // decoders only read `data`, so the fixture carries just the command
+    // name and options.
+    fn slash(name: &str, options: Vec<CommandDataOption>) -> Interaction {
+        let options = serde_json::to_value(&options).expect("options serialize");
+        serde_json::from_value(serde_json::json!({
+            "id": "7",
+            "application_id": "1111",
+            "type": 2,
+            "token": "decoder-fixture",
+            "data": {
+                "id": "1",
+                "name": name,
+                "type": 1,
+                "options": options,
+            },
+        }))
+        .expect("decoder fixture interaction")
+    }
 
     fn text(name: &str, value: &str) -> CommandDataOption {
         CommandDataOption {
@@ -1516,14 +1537,13 @@ mod tests {
     fn inspect_decoder_passes_valid_and_ignores_unknown() {
         let interaction = slash(
             "schedule-inspect",
-            Some(3333),
             vec![text("id", "abc"), text("view", "body"), text("other", "x")],
         );
         assert_eq!(
             schedule_inspect_options_strict(&interaction),
             Ok((Some("abc".to_owned()), Some("body".to_owned())))
         );
-        let bare = slash("schedule-inspect", Some(3333), Vec::new());
+        let bare = slash("schedule-inspect", Vec::new());
         assert_eq!(schedule_inspect_options_strict(&bare), Ok((None, None)));
     }
 
@@ -1531,7 +1551,6 @@ mod tests {
     fn inspect_decoder_refuses_wrong_types_and_duplicates() {
         let wrong_id = slash(
             "schedule-inspect",
-            Some(3333),
             vec![number("id", 1), text("view", "body")],
         );
         assert_eq!(
@@ -1540,25 +1559,19 @@ mod tests {
         );
         let wrong_view = slash(
             "schedule-inspect",
-            Some(3333),
             vec![text("id", "abc"), number("view", 1)],
         );
         assert_eq!(
             schedule_inspect_options_strict(&wrong_view),
             Err(SCHEDULE_INSPECT_INVALID_VIEW)
         );
-        let dupe_id = slash(
-            "schedule-inspect",
-            Some(3333),
-            vec![text("id", "a"), text("id", "b")],
-        );
+        let dupe_id = slash("schedule-inspect", vec![text("id", "a"), text("id", "b")]);
         assert_eq!(
             schedule_inspect_options_strict(&dupe_id),
             Err(SCHEDULE_INSPECT_DUPLICATE_ID)
         );
         let dupe_view = slash(
             "schedule-inspect",
-            Some(3333),
             vec![text("view", "body"), text("view", "metadata")],
         );
         assert_eq!(
@@ -1568,7 +1581,6 @@ mod tests {
         // Name-count wins over type-check, and id wins over view.
         let both = slash(
             "schedule-inspect",
-            Some(3333),
             vec![number("view", 1), text("id", "a"), text("id", "b")],
         );
         assert_eq!(
@@ -1581,7 +1593,6 @@ mod tests {
     fn edit_decoder_passes_valid_and_ignores_unknown() {
         let interaction = slash(
             "schedule-edit",
-            Some(3333),
             vec![
                 text("id", "abc"),
                 text("revision", "rev"),
@@ -1597,7 +1608,7 @@ mod tests {
                 Some("new".to_owned())
             ))
         );
-        let bare = slash("schedule-edit", Some(3333), Vec::new());
+        let bare = slash("schedule-edit", Vec::new());
         assert_eq!(schedule_edit_options_strict(&bare), Ok((None, None, None)));
     }
 
@@ -1620,14 +1631,13 @@ mod tests {
                 SCHEDULE_EDIT_DUPLICATE_BODY,
             ),
         ] {
-            let interaction = slash("schedule-edit", Some(3333), options);
+            let interaction = slash("schedule-edit", options);
             assert_eq!(schedule_edit_options_strict(&interaction), Err(expected));
         }
         // Priority: id duplicates beat revision duplicates beat body
         // duplicates; duplicates beat wrong types.
         let interaction = slash(
             "schedule-edit",
-            Some(3333),
             vec![
                 number("body", 1),
                 text("revision", "a"),
@@ -1642,7 +1652,6 @@ mod tests {
         );
         let interaction = slash(
             "schedule-edit",
-            Some(3333),
             vec![
                 number("body", 1),
                 text("body", "a"),
@@ -1658,7 +1667,7 @@ mod tests {
 
     #[test]
     fn non_command_interactions_decode_to_absent_options() {
-        let mut interaction = slash("schedule-inspect", Some(3333), Vec::new());
+        let mut interaction = slash("schedule-inspect", Vec::new());
         interaction.data = None;
         assert_eq!(
             schedule_inspect_options_strict(&interaction),
