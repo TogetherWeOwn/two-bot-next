@@ -66,7 +66,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Action signing v2](internal-action-signing-v2.md)
 - [Action persistence](internal-action-store.md)
 - [Action ingress](internal-actions-receiver.md)
-- [Announcement executor](internal-action-executor.md)
+- [Announcements](internal-action-executor.md)
 - [Settings actions](internal-action-settings.md)
 - [Channel executor](internal-channel-moderation.md)
 - [Event executors](internal-event-executors.md)
@@ -75,8 +75,8 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## Commands, moderation and community
 
-- [Command publication](command-publish.md)
-- [Command restoration](command-restoration.md)
+- [Publication](command-publish.md)
+- [Restoration](command-restoration.md)
 - [Reply lifecycle](interaction-replies.md)
 - [Prefix gates](prefix-gate-matrix.md)
 - [Actor admission](automation-admission.md)
@@ -94,10 +94,11 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
+- [Warning history (proposal)](warning-history-spec.md)
 - [Self-view](moderation-sanction-selfview-spec.md)
 - [Disable gate](moderation-disable-preflight.md)
-- [Hierarchy order](moderation-hierarchy-order.md)
-- [Moderation MAC tests](moderation-mac-acceptance.md)
+- [Hierarchy](moderation-hierarchy-order.md)
+- [Moderation MAC](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
