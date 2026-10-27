@@ -75,7 +75,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## Commands, moderation and community
 
-- [Command publication](command-publish.md)
+- [Publication](command-publish.md)
 - [Restoration](command-restoration.md)
 - [Reply lifecycle](interaction-replies.md)
 - [Prefix gates](prefix-gate-matrix.md)
@@ -88,15 +88,15 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution corpus](classifier-golden.md)
 - [Attribution PII](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
-- [Channel locking](channel-lockdown-acceptance.md)
-- [Timed lockdown](time-boxed-lockdown-decision.md)
+- [Locking](channel-lockdown-acceptance.md)
+- [Lockdown](time-boxed-lockdown-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
 - [Warning history (proposal)](warning-history-spec.md)
 - [Sanction self-view](moderation-sanction-selfview-spec.md)
 - [Disable gate](moderation-disable-preflight.md)
-- [Hierarchy order](moderation-hierarchy-order.md)
+- [Hierarchy](moderation-hierarchy-order.md)
 - [Moderation MAC](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
