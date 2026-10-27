@@ -114,7 +114,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Onboarding ops](onboarding-operator-guide.md)
 - [Onboarding domain](onboarding-port.md)
 - [Rejoin roles](persistent-game-roles-spec.md)
-- [Welcome timing proposal](onboarding-event-welcome-spec.md)
+- [Welcome timing](onboarding-event-welcome-spec.md)
 - [Leveling domain](leveling-port.md)
 - [Reward](dashboard-leveling-rewards-spec.md)
 - [LFG](lfg-port.md)
