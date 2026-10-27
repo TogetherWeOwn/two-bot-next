@@ -30,6 +30,16 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   the source. Twitch is **not** a Helix API
   integration and does not require a Twitch credential. YouTube also
   accepts a 20–32-character channel ID and expands it into the videos Atom URL.
+- Repeating add for the same guild/channel/kind/normalized-source tuple returns
+  the saved ID and observed enabled/paused state privately, with copyable inspect
+  and pause/resume commands. It creates and updates nothing: creator, timestamps,
+  cadence/high-water and all delivery/nonce evidence remain unchanged. No fetch,
+  auto-resume, replacement or `feed.create` audit occurs for that non-creation.
+  YouTube channel IDs expand as above; no new RSS URL equivalence is introduced.
+  The same source in another channel remains a distinct relay. The guild's
+  25-relay capacity check still precedes duplicate discovery, including paused
+  rows. Unrelated unique violations and outages remain genuine storage failures
+  with the existing bounded rejection auditing, not saved-relay recovery.
 - RSS item/guid and Atom entry/id parsing, alternate-link preference, title,
   published/pubDate/updated fields, 200-item ceiling. No external entity resolver;
   DTD disabled, XML node count bounded. An iterative, allocation-free preflight
