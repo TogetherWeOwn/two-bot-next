@@ -107,6 +107,8 @@ mod music_capture;
 mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
+mod onboarding_preview_review_tests;
+#[cfg(test)]
 mod onboarding_queue_cause_forwarding_tests;
 #[cfg(test)]
 mod onboarding_tests;

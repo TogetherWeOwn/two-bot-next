@@ -95,13 +95,36 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("lfg", "/options/0/max_length", json!(99)),
         ("lfg", "/options/2/max_length", json!(2338)),
         ("lfg-close", "/options/0/max_length", json!(127)),
+        ("lfg-edit", "/options/0/max_length", json!(127)),
+        ("lfg-edit", "/options/0/required", json!(false)),
+        ("lfg-edit", "/options/1/max_length", json!(99)),
+        ("lfg-edit", "/options/2/type", json!(4)),
+        ("lfg-edit", "/default_member_permissions", json!("32")),
+        ("lfg-edit", "/dm_permission", json!(true)),
+        ("lfg-list", "/default_member_permissions", json!("0")),
+        ("lfg-list", "/dm_permission", json!(true)),
+        ("lfg-list", "/description", json!("Changed copy")),
+        ("lfg-list", "/options/0/max_length", json!(513)),
+        ("lfg-list", "/options/0/required", json!(true)),
         ("feed-add", "/options/1/max_length", json!(2047)),
         ("feed-remove", "/options/0/max_length", json!(127)),
+        ("feed-inspect", "/default_member_permissions", json!("0")),
+        ("feed-inspect", "/dm_permission", json!(true)),
+        ("feed-inspect", "/description", json!("Changed copy")),
+        ("feed-inspect", "/options/0/max_length", json!(129)),
+        ("feed-inspect", "/options/0/required", json!(false)),
         ("rsvp-attendance", "/options/0/name", json!("event")),
         ("rsvp-attendance", "/name", json!("attendance")),
         ("leaderboard", "/description", json!("Changed copy")),
         ("leaderboard", "/dm_permission", json!(true)),
         ("leaderboard", "/type", json!(2)),
+        ("game-mix", "/default_member_permissions", json!("8")),
+        ("game-mix", "/dm_permission", json!(true)),
+        (
+            "game-mix",
+            "/options",
+            json!([{"name": "guild", "type": 3}]),
+        ),
         ("giveaway", "/default_member_permissions", json!("0")),
         ("giveaway", "/dm_permission", json!(true)),
         ("giveaway", "/description", json!("Changed copy")),
@@ -164,6 +187,90 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         .expect("rsvp is published");
     rsvp["options"].as_array_mut().unwrap().swap(0, 1);
     assert!(!registry_diff(reordered).is_empty());
+}
+
+#[test]
+fn lfg_preview_option_drift_is_detected() {
+    let lfg = || {
+        expected_registry()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "lfg")
+            .expect("lfg is published")
+            .clone()
+    };
+    let base = lfg();
+    let options = base["options"].as_array().expect("lfg options");
+    assert_eq!(options.len(), 4, "title, starts-at, roles, then preview");
+    assert_eq!(options[3]["name"], json!("preview"));
+    assert_eq!(
+        options[3]["description"],
+        json!("Privately preview without posting")
+    );
+    assert_eq!(options[3]["type"], json!(5));
+    assert!(
+        options[3].get("required").is_none_or(Value::is_null)
+            || options[3]["required"] == json!(false),
+        "preview stays optional"
+    );
+
+    // Deleting preview drops the private-preview surface.
+    let mut deleted = expected_registry();
+    let command = deleted
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|command| command["name"] == "lfg")
+        .unwrap();
+    command
+        .as_object_mut()
+        .unwrap()
+        .get_mut("options")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .retain(|option| option["name"] != "preview");
+    let differences = registry_diff(deleted);
+    assert!(!differences.is_empty(), "missed lfg preview deletion");
+    assert!(
+        differences.join("\n").contains("preview"),
+        "diff must name the deleted option: {differences:?}"
+    );
+
+    // Retyping preview stops Discord from rendering the toggle.
+    let mut retyped = expected_registry();
+    let command = retyped
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|command| command["name"] == "lfg")
+        .unwrap();
+    *command
+        .pointer_mut("/options/3/type")
+        .expect("preview type exists") = json!(3);
+    let differences = registry_diff(retyped);
+    assert!(!differences.is_empty(), "missed lfg preview retype");
+    assert!(
+        differences.join("\n").contains("type"),
+        "diff must identify the changed field: {differences:?}"
+    );
+
+    // Making preview required breaks existing saved invocations.
+    let mut required = expected_registry();
+    let command = required
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|command| command["name"] == "lfg")
+        .unwrap();
+    command["options"][3]["required"] = json!(true);
+    let differences = registry_diff(required);
+    assert!(!differences.is_empty(), "missed lfg preview required flip");
+    assert!(
+        differences.join("\n").contains("required"),
+        "diff must identify the changed field: {differences:?}"
+    );
 }
 
 #[test]

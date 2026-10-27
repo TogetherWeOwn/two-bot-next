@@ -15,7 +15,7 @@ server-wide Manage Events grants. No customer request is claimed.
 their own events and Manage Server holders editing all; it does NOT document
 co-host delegation at that page. Read 2026-10-24. Least-privilege backup hosting
 is OUR product/security hypothesis, not a claimed vendor capability. TWO LFG
-today requires Manage Events at both the builder (`feature_commands.rs:268-296`)
+today requires Manage Events at both the builder (`feature_commands.rs:270-298`)
 and the router/domain layers (`router.rs:666-675`, `lfg.rs:559-564`); any holder
 can manage any LFG post in the guild, and the post creator holds no exception.
 

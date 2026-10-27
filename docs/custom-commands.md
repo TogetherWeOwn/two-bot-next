@@ -137,6 +137,41 @@ remaining gateway/accepted-prefix work:
    miss pointing at `/command-list`; lookup outages reuse the fixed
    availability reply below.
 
+   To check proposed text before saving or replacing a response, use
+   `/command-inspect draft:Hello {username}` instead of a saved `name`.
+   Pass exactly one of `name` or `draft`; missing input, both inputs, duplicate
+   options, unknown options and non-text values refuse before any lookup.
+   Drafts default to preview; explicit `view:preview` is equivalent, while
+   `view:summary` and `view:template` require saved-name mode. The proposed
+   template must be 1–2000 UTF-16 units and uses only `{user}`, `{username}`,
+   `{server}` and `{channel}` with the same single-pass invocation context as
+   saved previews. Optional `arguments` remain ignored — no `{args}` or
+   second interpolation pass. The private response starts **Draft preview —
+   not saved or published**. Markdown escaping and empty allowed mentions keep
+   hostile text inert; framing-only truncation is explicit, but invalid
+   placeholders and expanded output over 2000 units refuse with a correction.
+   Missing context is reported separately. Draft mode works without storage
+   and never reads/writes saved commands, republishes registration, sends to a
+   channel, records audit facts, matches triggers or consumes cooldowns/claims.
+   It cannot overwrite or enable anything. Saving later is a distinct
+   `/command name:<name> template:<text>` invocation with fresh checks; a
+   preview is not permission or a guarantee that the later save will succeed.
+9. `/command-disable name:<name>` pauses one saved definition and
+   `/command-enable name:<name>` resumes it, without deleting anything.
+   Both take exactly one text `name` (a forged type, a duplicate or any
+   extra option refuses before any store read); names lowercase before
+   lookup. Only the enabled flag and update metadata change, and only on a
+   real flip, which commits with one content-free `command.disable` /
+   `command.enable` audit fact inside the guild lifecycle lock. Missing
+   rows, current-state requests and validation refusals are zero-write:
+   no audit fact, no timestamp touch, no republish. Resuming revalidates
+   the stored row against the write rules (a reserved or invalid saved
+   definition refuses without reactivating); pausing needs no content
+   check. The flip commits before the one full-set publication, so a
+   prefix or slash invocation racing a stale picker reads the saved
+   state. A failed publication reports saved-but-not-synchronized with a
+   safe next action; a repeated state never claims the picker repaired.
+
 ## Slash-run audit replay
 
 A definitive pre-mutation defer refusal records a failed `command.run` fact
@@ -182,6 +217,15 @@ interaction records only its own outcome. A successful completion delivers
 the rendered template and records `(ok, None)`; audit rows carry no template
 or rendered content. A render or context failure is definitive and local, so it still
 audits even when the fallback completion is uncertain.
+
+A saved template that no longer passes the definition-time rules (unknown
+placeholder, empty, or over the 2000 UTF-16-unit limit — for example after an
+import) is refused at both execution boundaries: slash completes with the
+fixed context-or-template unavailable text, prefix sends nothing, and the run
+audits `render_failed` without the template text. The definition is never
+disabled, deleted, or repaired automatically. To fix it, run
+`/command-inspect name:<name> view:preview` for the private refusal detail,
+then replace the template with `/command name:<name> template:<text>`.
 
 ## Explicit prefix acceptance and replay safety
 

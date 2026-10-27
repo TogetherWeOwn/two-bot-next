@@ -47,6 +47,9 @@ use two_bot_testsupport::TestDatabase;
 const MANAGEMENT: &str = "command-inspect";
 const TOKEN: &str = "inspect-acceptance-fixture";
 
+#[path = "support/custom_command_draft_acceptance.rs"]
+mod draft_acceptance;
+
 fn gates(enabled: bool) -> RouterGates {
     RouterGates {
         configured_guild: Some(2222),
@@ -287,14 +290,28 @@ fn inspect_is_a_guild_only_management_command_with_three_bounded_views() {
             .dm_permission
     );
     let options = definition["options"].as_array().expect("options");
-    assert_eq!(options.len(), 3, "one workflow, no enable/disable policy");
+    assert_eq!(
+        options.len(),
+        4,
+        "one workflow with exclusive saved/draft input"
+    );
     let name = options
         .iter()
         .find(|value| value["name"] == "name")
         .unwrap();
     assert_eq!(name["type"], 3);
-    assert_eq!(name["required"], true);
+    assert_ne!(
+        name["required"], true,
+        "draft input must not require a saved name"
+    );
     assert_eq!(name["max_length"], 32);
+    let draft = options
+        .iter()
+        .find(|value| value["name"] == "draft")
+        .expect("discover unsaved preview on the existing inspection surface");
+    assert_eq!(draft["type"], 3);
+    assert_ne!(draft["required"], true);
+    assert_eq!(draft["max_length"], 2000);
     let view = options
         .iter()
         .find(|value| value["name"] == "view")
@@ -420,6 +437,76 @@ async fn inspect_lookup_outage_is_not_a_missing_definition_or_a_run() {
     assert!(content.contains("try again"), "{content}");
     assert!(!content.contains("No command") && !content.contains("not found"));
     assert!(!content.contains("PoolClosed") && !content.contains("agent-testdb"));
+}
+
+// Removing the draft-only view guard must not turn a saved-only view into a
+// successful draft preview, even though both view names pass option parsing.
+async fn draft_saved_only_view_refuses_without_sql_or_effects(view: &str) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind SQL-access tripwire");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(100))
+        .connect_lazy_with(
+            PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(listener.local_addr().expect("tripwire address").port())
+                .username("preview_fixture")
+                .database("preview_fixture")
+                .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+        );
+    let mock = discord().await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    let observed = observe(
+        &runtime,
+        &mock,
+        &interaction(
+            490,
+            32,
+            vec![option("draft", "Hello"), option("view", view)],
+        ),
+        Some("TWO"),
+    )
+    .await;
+    let publication = runtime.published_commands();
+    pool.close().await;
+    mock.shutdown().await;
+    let listener = listener.into_std().expect("nonblocking SQL tripwire");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "draft {view} refusal attempted storage access"
+    );
+    assert!(publication.is_none(), "refusal never republishes commands");
+    let content = private_content(&observed);
+    assert_eq!(
+        content,
+        "Invalid draft view: only preview is available for unsaved text. Use /command-inspect draft:Hello view:preview",
+        "draft {view} must reach the saved-only view refusal"
+    );
+    assert!(!content.contains("Draft preview"));
+    for request in &observed.requests {
+        let wire: Value = serde_json::from_slice(&request.body).expect("private response JSON");
+        let data = if request.method == "POST" {
+            &wire["data"]
+        } else {
+            &wire
+        };
+        assert!(
+            data["components"].is_null() || data["components"] == json!([]),
+            "refusal must not expose mutation controls"
+        );
+    }
+}
+
+#[tokio::test]
+async fn draft_summary_view_refuses_without_sql_or_effects() {
+    draft_saved_only_view_refuses_without_sql_or_effects("summary").await;
+}
+
+#[tokio::test]
+async fn draft_template_view_refuses_without_sql_or_effects() {
+    draft_saved_only_view_refuses_without_sql_or_effects("template").await;
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ tested and reviewable.
 
 Browse the [documentation map](docs/README.md) before searching individual guides.
 When adding a doc, add its purpose/link there; run `python3 scripts/check_docs_index.py --json`.
+The index merges with union (`.gitattributes`); after rebasing a docs change, run `python3 scripts/check_docs_index.py --dedupe --json` and repair any rows it still reports instead of hand-merging the index.
 
 ## Pull request contract
 

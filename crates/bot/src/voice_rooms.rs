@@ -54,7 +54,9 @@ use twilight_model::{
 };
 use two_bot_core::voice_presence::MemberPresence;
 use two_bot_core::{
-    evaluate_permissions as evaluate_health, metrics, now_iso,
+    evaluate_permissions as evaluate_health,
+    message_safety::{text_len, CONTENT_LIMIT},
+    metrics, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
@@ -66,8 +68,9 @@ use two_bot_core::{
         VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
-        diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
-        DIFF_HASH_CHARS,
+        diff_configuration, diff_content_hash, render_preview, render_review_preview,
+        serialize_full_review, skip_unknown_channels, ConfigDiff, FullReviewError, DIFF_HASH_CHARS,
+        FULL_REVIEW_BYTE_LIMIT,
     },
     voice_create_admission::{
         CreateAdmissionConfig, RefusalReason, MAX_CREATE_COOLDOWN_SECS, MAX_ROOMS_PER_GUILD,
@@ -11420,8 +11423,40 @@ pub fn setup_member_panel(halted: bool, needs_attention: bool) -> SetupPanel {
     }
 }
 
-#[must_use]
-pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
+/// Budget for an admin `/setup` description: the transport bound minus the
+/// `**Voice rooms**\n` reply prefix the handler adds, so paging budgets
+/// before sending instead of relying on the final safety clip.
+const SETUP_DESCRIPTION_BOUND: usize = CONTENT_LIMIT - "**Voice rooms**\n".len();
+
+/// One admin `/setup` creator row. Rows sort by channel id at pack time;
+/// this only renders.
+fn setup_creator_row(creator: &CreatorChannel) -> String {
+    let position = match creator.position {
+        RoomPosition::Above => "above",
+        RoomPosition::Below => "below",
+    };
+    format!("- <#{}>: new rooms {position}", creator.channel_id)
+}
+
+/// Sorted creator rows for the admin view (channel id ascending, stable).
+/// A failed creator read shows no rows: the error line below says so, and a
+/// partial list must not pose as the complete set.
+fn setup_sorted_rows(summary: &SetupSummary) -> Vec<String> {
+    if summary.store_error.is_some() {
+        return Vec::new();
+    }
+    let mut creators: Vec<&CreatorChannel> = summary.creators.iter().collect();
+    creators.sort_by_key(|creator| creator.channel_id);
+    creators
+        .iter()
+        .map(|creator| setup_creator_row(creator))
+        .collect()
+}
+
+/// Fixed description lines above the creator rows: status, store error, and
+/// the empty-list line or creator header. `row_total` is the full sorted row
+/// count, so the header stays truthful on every page.
+fn setup_prefix_lines(summary: &SetupSummary, row_total: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if summary.halted {
         lines.push(
@@ -11436,22 +11471,18 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
         lines.push(format!(
             "Could not load creator channels ({error}); the worker state below is current."
         ));
-    }
-    if summary.creators.is_empty() {
-        if summary.store_error.is_none() {
-            lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
-        }
+    } else if row_total == 0 {
+        lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
     } else {
-        lines.push(format!("Creator channels ({})", summary.creators.len()));
-        for creator in &summary.creators {
-            let position = match creator.position {
-                RoomPosition::Above => "above",
-                RoomPosition::Below => "below",
-            };
-            lines.push(format!("- <#{}>: new rooms {position}", creator.channel_id));
-        }
+        lines.push(format!("Creator channels ({row_total})"));
     }
-    lines.push(format!("Tracked rooms: {}.", summary.tracked_rooms));
+    lines
+}
+
+/// Fixed description lines below the creator rows: room count and the newest
+/// failures. Rendered on every page so health never hides behind pagination.
+fn setup_suffix_lines(summary: &SetupSummary) -> Vec<String> {
+    let mut lines = vec![format!("Tracked rooms: {}.", summary.tracked_rooms)];
     if summary.failures.is_empty() {
         lines.push("No recent failures.".to_owned());
     } else {
@@ -11460,10 +11491,170 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
             lines.push(format!("- {failure}"));
         }
     }
+    lines
+}
+
+/// Worst-case navigation cost: page numbers fit the creator count's digits.
+fn setup_page_chrome(row_total: usize) -> usize {
+    if row_total <= 1 {
+        return 0;
+    }
+    let wide = "9".repeat(row_total.to_string().len());
+    text_len(&format!("Page {wide} of {wide}"))
+        + 1
+        + text_len(&format!("Next page: /setup page:{wide}"))
+        + 1
+}
+
+/// Keep the fixed status and diagnostic lines within budget too. Prefer the
+/// unchanged single-page view when it fits; otherwise reserve navigation and
+/// one complete creator row before admitting whole diagnostic lines. Health
+/// findings come first from the caller; omitted diagnostics are counted,
+/// never clipped through an ID or mention token.
+fn setup_page_lines(summary: &SetupSummary, rows: &[String]) -> (Vec<String>, Vec<String>) {
+    let prefix = setup_prefix_lines(summary, rows.len());
+    let mut suffix = setup_suffix_lines(summary);
+    let units = |lines: &[String]| lines.iter().map(|line| text_len(line) + 1).sum::<usize>();
+    if units(&prefix) + units(&suffix) + units(rows) <= SETUP_DESCRIPTION_BOUND + 1 {
+        return (prefix, suffix);
+    }
+    let row = rows.iter().map(|row| text_len(row) + 1).max().unwrap_or(0);
+    let budget = SETUP_DESCRIPTION_BOUND
+        .saturating_sub(units(&prefix) + row + setup_page_chrome(rows.len()));
+    if !summary.failures.is_empty() {
+        loop {
+            let omitted = summary.failures.len().saturating_sub(suffix.len() - 2);
+            let notice = format!("Additional failure details not shown: {omitted}.");
+            let notice_units = if omitted > 0 {
+                text_len(&notice) + 1
+            } else {
+                0
+            };
+            if units(&suffix) + notice_units <= budget || suffix.len() == 2 {
+                if omitted > 0 {
+                    suffix.push(notice);
+                }
+                break;
+            }
+            suffix.pop();
+        }
+    }
+    (prefix, suffix)
+}
+
+/// Greedy row ranges that fit [`SETUP_DESCRIPTION_BOUND`] with worst-case
+/// page chrome reserved. Empty when there are no rows; otherwise every page
+/// holds at least one row, so packing always makes progress.
+fn setup_row_pages(summary: &SetupSummary) -> Vec<(usize, usize)> {
+    let rows = setup_sorted_rows(summary);
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let (prefix, suffix) = setup_page_lines(summary, &rows);
+    // Each line plus its joining newline; the one extra newline this counts
+    // keeps every estimate conservative, never over the bound.
+    let fixed: usize = prefix
+        .iter()
+        .chain(suffix.iter())
+        .map(|line| text_len(line) + 1)
+        .sum();
+    let all_rows: usize = rows.iter().map(|row| text_len(row) + 1).sum();
+    if fixed + all_rows <= SETUP_DESCRIPTION_BOUND + 1 {
+        return vec![(0, rows.len())];
+    }
+    let capacity = SETUP_DESCRIPTION_BOUND
+        .saturating_sub(fixed + setup_page_chrome(rows.len()))
+        .max(1);
+    let mut pages = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, row) in rows.iter().enumerate() {
+        let need = text_len(row) + 1;
+        if index > start && used + need > capacity {
+            pages.push((start, index));
+            start = index;
+            used = 0;
+        }
+        used += need;
+    }
+    pages.push((start, rows.len()));
+    pages
+}
+
+/// Page count for the admin `/setup` view: 1 when there are no creator rows
+/// (empty or failed read), otherwise the greedy bounded pack.
+#[must_use]
+pub fn setup_page_total(summary: &SetupSummary) -> usize {
+    setup_row_pages(summary).len().max(1)
+}
+
+/// Render admin `/setup` page `page` (1-based). Out-of-range pages clamp to
+/// the nearest page; callers that must refuse past-end input check
+/// [`setup_page_total`] first. A fitting single-page view keeps its diagnostic
+/// lines unchanged; oversized diagnostics omit whole tail lines with a count.
+/// Page metadata and the next-page hint appear only with multiple pages.
+#[must_use]
+pub fn setup_panel_page(summary: &SetupSummary, page: usize) -> SetupPanel {
+    let rows = setup_sorted_rows(summary);
+    let pages = setup_row_pages(summary);
+    let total = pages.len().max(1);
+    let page = page.clamp(1, total);
+    let (mut lines, suffix) = setup_page_lines(summary, &rows);
+    if let Some((start, end)) = pages.get(page - 1) {
+        lines.extend(rows[*start..*end].iter().cloned());
+    }
+    lines.extend(suffix);
+    if total > 1 {
+        lines.push(format!("Page {page} of {total}"));
+        if page < total {
+            lines.push(format!("Next page: /setup page:{}", page + 1));
+        }
+    }
     SetupPanel {
         title: "Voice rooms".to_owned(),
         description: lines.join("\n"),
     }
+}
+
+#[must_use]
+pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
+    setup_panel_page(summary, 1)
+}
+
+/// Short refusal for a malformed `/setup` page: names the remedy and a valid
+/// start, serves no rows.
+fn setup_page_refusal() -> String {
+    "Unknown page. Use /setup page:1 to see the first page.".to_owned()
+}
+
+/// Short refusal past the last `/setup` page: same shape, plus the real total.
+fn setup_past_end_refusal(total: usize) -> String {
+    let pages = if total == 1 { "page" } else { "pages" };
+    format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
+}
+
+/// Private correction for a malformed setup option: names the option and a
+/// copyable invocation. Static per (command, field): no payload bytes, store
+/// errors or mentions can leak into it.
+fn setup_shape_correction(command: &str, field: &str) -> String {
+    let usage = match command {
+        "create" => "name: lobby",
+        "textchannels" => {
+            "channel: #voice-creator enabled: true name: voice-chat viewer-role: @role"
+        }
+        "position" => "channel: #voice-creator position: below first-number: 5",
+        "group" => "channel: #voice-creator enabled: true",
+        "inheritpermissions" => {
+            "channel: #voice-creator source: channel source-channel: #voice-creator"
+        }
+        "defaultlimit" => "channel: #voice-creator limit: 4",
+        "alwaysprivate" => "channel: #voice-creator enabled: true",
+        _ => "channel: #voice-creator",
+    };
+    format!(
+        "That `/{command}` call has a problem with its `{field}` option: send it exactly once, \
+         with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
+    )
 }
 
 /// Voice definitions for the guild command merge, gated on `TWO_VOICE=1`.
@@ -11516,12 +11707,13 @@ pub enum ImportDecision {
     /// Nothing to confirm (empty diff, cancel, expiry): reply with `text`
     /// alone and store nothing.
     Notice { text: String },
-    /// Show `text` with Confirm/Cancel bound to (`member_id`, `hash`) and
-    /// remember `candidate` for Confirm.
+    /// Show `text` and the complete `review` attachment with Confirm/Cancel
+    /// bound to (`member_id`, `hash`); remember `candidate` for Confirm.
     Preview {
         candidate: VoiceConfiguration,
         hash: String,
         text: String,
+        review: Vec<u8>,
     },
     /// Confirm verified against fresh state: apply `candidate`, then reply
     /// with `message`.
@@ -11582,14 +11774,43 @@ pub fn plan_import_preview(
     // report an empty skipped list and an unknown-channels-only file would
     // read as `No changes`. The pruned `remaining` stays the candidate.
     let diff = diff_configuration(current, &incoming, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    plan_reviewable_import(current, remaining, &diff)
+}
+
+/// One admitted snapshot supplies the summary, full review and pending hash.
+/// Serialize before a Preview can exist, so no failure path can offer Confirm
+/// or insert temporary pending state for an unreviewable diff.
+fn plan_reviewable_import(
+    current: &VoiceConfiguration,
+    candidate: VoiceConfiguration,
+    diff: &ConfigDiff,
+) -> ImportDecision {
     if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
+        return ImportDecision::Notice {
+            text: render_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        };
     }
+    let hash = diff_content_hash(current, &candidate);
+    let review = match serialize_full_review(diff, &candidate.guild_id, &hash) {
+        Ok(bytes) => bytes,
+        Err(FullReviewError::TooLarge) => {
+            return ImportDecision::Refuse {
+                message: format!(
+                    "The complete review diff is too large (limit: {FULL_REVIEW_BYTE_LIMIT} serialized bytes). Reduce the proposed changes in the file and try again. Nothing was changed.",
+                ),
+            };
+        }
+        Err(FullReviewError::Serialization) => {
+            return ImportDecision::Refuse {
+                message: "Could not build the complete review diff. Nothing was changed; try uploading the file again.".to_owned(),
+            };
+        }
+    };
     ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
+        hash,
+        candidate,
+        text: render_review_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        review,
     }
 }
 
@@ -11627,16 +11848,10 @@ pub fn plan_import_confirm(
             ),
         };
     }
-    let diff = diff_configuration(current, &remaining, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
-    if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
-    }
-    ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
-    }
+    // Retain facts about channels newly skipped by this inventory. The
+    // remembered candidate is already pruned by the original preview.
+    let diff = diff_configuration(current, candidate, inventory);
+    plan_reviewable_import(current, remaining, &diff)
 }
 
 /// How many creator channels `candidate` adds over `current`.
@@ -11720,11 +11935,22 @@ fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> Inte
 /// Ephemeral `/import` preview reply with Confirm/Cancel buttons. Mentions
 /// are disabled: the preview quotes uploaded template text, which must never
 /// ping.
-fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
+fn import_preview_response(
+    text: &str,
+    member_id: Snowflake,
+    hash: &str,
+    guild_id: Snowflake,
+    review: Vec<u8>,
+) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             content: Some(text.to_owned()),
+            attachments: Some(vec![Attachment::from_bytes(
+                format!("voice-config-diff-guild-{guild_id}-v1.json"),
+                review,
+                0,
+            )]),
             components: Some(import_preview_components(member_id, hash)),
             flags: Some(MessageFlags::EPHEMERAL),
             allowed_mentions: Some(AllowedMentions {
@@ -11802,7 +12028,9 @@ pub enum VoiceCommand {
     Create {
         name: String,
     },
-    Setup,
+    Setup {
+        page: PageArg,
+    },
     Ping,
     Invite,
     TextChannels {
@@ -11833,6 +12061,16 @@ pub enum VoiceCommand {
     AlwaysPrivate {
         channel_id: Snowflake,
         request: AlwaysPrivateRequest,
+    },
+    /// A setup command (`/create`, `/textchannels`, `/position`, `/group`,
+    /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
+    /// a malformed option shape: a known option sent twice, with the wrong
+    /// wire type, or (for `/textchannels`) the required `channel` missing.
+    /// Answered with a private correction before guild authority, role gates
+    /// and every read or effect.
+    SetupShapeInvalid {
+        command: &'static str,
+        field: &'static str,
     },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
@@ -11885,11 +12123,161 @@ pub enum LoggingAction {
     Invalid,
 }
 
+/// Decoded `page` option for the `/setup` and `/access show` read paths.
+/// `Missing` behaves as page 1; `Invalid` (zero, negative, overflowing,
+/// wrong-typed or duplicated) refuses without touching the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageArg {
+    Missing,
+    Page(usize),
+    Invalid,
+}
+
+impl PageArg {
+    /// 1-based page number, or `None` for [`PageArg::Invalid`].
+    #[must_use]
+    pub fn number(self) -> Option<usize> {
+        match self {
+            Self::Missing => Some(1),
+            Self::Page(number) => Some(number),
+            Self::Invalid => None,
+        }
+    }
+}
+
+/// Strictly decode the optional `page` option: exactly one Integer of at
+/// least 1. Duplicates and every non-integer shape refuse, as do zero,
+/// negatives and values that cannot index a page. Huge but well-typed
+/// integers stay `Page` and refuse past-end at dispatch with the real total.
+/// Unrelated options are ignored.
+fn decode_page(options: &[CommandDataOption]) -> PageArg {
+    let mut seen: Option<PageArg> = None;
+    for option in options {
+        if option.name != "page" {
+            continue;
+        }
+        if seen.is_some() {
+            return PageArg::Invalid;
+        }
+        seen = Some(match &option.value {
+            CommandOptionValue::Integer(number) => match usize::try_from(*number) {
+                Ok(number) if number >= 1 => PageArg::Page(number),
+                _ => PageArg::Invalid,
+            },
+            _ => PageArg::Invalid,
+        });
+    }
+    match seen {
+        Some(page) => page,
+        None => PageArg::Missing,
+    }
+}
+
+/// Expected wire type of one known setup option, for strict shape decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupOptionKind {
+    String,
+    Integer,
+    Boolean,
+    Channel,
+    Role,
+}
+
+impl SetupOptionKind {
+    fn matches(self, value: &CommandOptionValue) -> bool {
+        matches!(
+            (self, value),
+            (Self::String, CommandOptionValue::String(_))
+                | (Self::Integer, CommandOptionValue::Integer(_))
+                | (Self::Boolean, CommandOptionValue::Boolean(_))
+                | (Self::Channel, CommandOptionValue::Channel(_))
+                | (Self::Role, CommandOptionValue::Role(_))
+        )
+    }
+}
+
+/// Known options of one setup command as `(name, expected wire type)`.
+/// Unknown names stay ignored; only these refuse when duplicated, mistyped,
+/// or (for the [`setup_shape_required`] option) missing. `None` for commands
+/// without a strict shape.
+fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
+    match command {
+        "create" => Some(&[("name", SetupOptionKind::String)]),
+        "textchannels" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+            ("name", SetupOptionKind::String),
+            ("viewer-role", SetupOptionKind::Role),
+        ]),
+        "position" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("position", SetupOptionKind::String),
+            ("first-number", SetupOptionKind::Integer),
+        ]),
+        "group" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        "inheritpermissions" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("source", SetupOptionKind::String),
+            ("source-channel", SetupOptionKind::Channel),
+        ]),
+        "defaultlimit" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("limit", SetupOptionKind::Integer),
+        ]),
+        "alwaysprivate" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        _ => None,
+    }
+}
+
+/// The one registration-required option of a strict-shape command:
+/// `/textchannels` requires `channel`; its other options stay optional so
+/// omission keeps the stored value.
+fn setup_shape_required(command: &str) -> Option<&'static str> {
+    match command {
+        "textchannels" => Some("channel"),
+        _ => None,
+    }
+}
+
+/// Strictly decode one setup command's option shape: each known option at
+/// most once and with its registered wire type, and the required option
+/// present. Returns the first malformed known option in payload order, or
+/// the required option when it is the only fault. Unknown names (even
+/// duplicated, even with nested known names beneath them) stay ignored, and
+/// value validation stays in the handlers, so omission semantics are
+/// unchanged.
+fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&'static str> {
+    let fields = setup_shape_fields(command)?;
+    let mut seen: Vec<&'static str> = Vec::new();
+    for option in options {
+        let Some(&(name, kind)) = fields.iter().find(|field| option.name.as_str() == field.0)
+        else {
+            continue;
+        };
+        if seen.contains(&name) || !kind.matches(&option.value) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    match setup_shape_required(command) {
+        Some(required) if !seen.contains(&required) => Some(required),
+        _ => None,
+    }
+}
+
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
 /// is answered, never silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessAction {
-    Show,
+    Show {
+        page: PageArg,
+    },
     Creation(bool),
     RequiredRole(Option<Snowflake>),
     Restrict {
@@ -11940,6 +12328,12 @@ fn parse_voice_command_with_registry(
     let name = identities.slash_name(interaction)?;
     match name.as_str() {
         "create" => {
+            if let Some(field) = setup_shape_refusal("create", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "create",
+                    field,
+                });
+            }
             let name = command
                 .options
                 .iter()
@@ -11951,10 +12345,18 @@ fn parse_voice_command_with_registry(
                 .unwrap_or_default();
             Some(VoiceCommand::Create { name })
         }
-        "setup" => Some(VoiceCommand::Setup),
+        "setup" => Some(VoiceCommand::Setup {
+            page: decode_page(&command.options),
+        }),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
         "textchannels" => {
+            if let Some(field) = setup_shape_refusal("textchannels", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "textchannels",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = TextChannelsRequest {
                 enabled: None,
@@ -11982,6 +12384,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "position" => {
+            if let Some(field) = setup_shape_refusal("position", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "position",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = PositionRequest {
                 position: None,
@@ -12009,6 +12417,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "group" => {
+            if let Some(field) = setup_shape_refusal("group", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "group",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = GroupRequest { enabled: None };
             for option in &command.options {
@@ -12026,6 +12440,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "inheritpermissions" => {
+            if let Some(field) = setup_shape_refusal("inheritpermissions", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "inheritpermissions",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = InheritPermissionsRequest {
                 source: None,
@@ -12049,6 +12469,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "defaultlimit" => {
+            if let Some(field) = setup_shape_refusal("defaultlimit", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "defaultlimit",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = DefaultLimitRequest { limit: None };
             for option in &command.options {
@@ -12066,6 +12492,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "alwaysprivate" => {
+            if let Some(field) = setup_shape_refusal("alwaysprivate", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "alwaysprivate",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = AlwaysPrivateRequest { enabled: None };
             for option in &command.options {
@@ -12370,49 +12802,104 @@ fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
     }
 }
 
+/// Strictly decoded single-occurrence option: `Missing` when absent,
+/// `Invalid` when duplicated or carrying the wrong value type, so callers
+/// refuse before any store touch instead of guessing a value.
+enum StrictArg<T> {
+    Missing,
+    Value(T),
+    Invalid,
+}
+
+/// Strictly decode one named option: `Missing` when absent, `Invalid` when
+/// the name repeats or `decode` rejects its value type. Unrelated names are
+/// ignored, so unknown or inapplicable options never refuse a shape.
+fn decode_strict_arg<T>(
+    args: &[CommandDataOption],
+    name: &str,
+    decode: impl Fn(&CommandOptionValue) -> Option<T>,
+) -> StrictArg<T> {
+    let mut seen: Option<StrictArg<T>> = None;
+    for option in args {
+        if option.name != name {
+            continue;
+        }
+        if seen.is_some() {
+            return StrictArg::Invalid;
+        }
+        seen = Some(match decode(&option.value) {
+            Some(value) => StrictArg::Value(value),
+            None => StrictArg::Invalid,
+        });
+    }
+    seen.unwrap_or(StrictArg::Missing)
+}
+
+/// Strictly decode role slots in listed order. A duplicated slot name or a
+/// non-`Role` value refuses (`None`); well-typed ids keep slot order and
+/// drop duplicate *values* — only duplicate *names* refuse.
+fn decode_access_roles(args: &[CommandDataOption], names: &[&str]) -> Option<Vec<Snowflake>> {
+    let mut roles: Vec<Snowflake> = Vec::new();
+    for name in names {
+        match decode_strict_arg(args, name, |value| match value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        }) {
+            StrictArg::Missing => {}
+            StrictArg::Value(role) => {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+            StrictArg::Invalid => return None,
+        }
+    }
+    Some(roles)
+}
+
+/// Strictly decode one `/access` invocation: exactly one top-level option,
+/// a known `SubCommand`, whose own options decode strictly (a wrong value
+/// type or a duplicated name refuses) while unknown or inapplicable names
+/// are ignored. Refusing here keeps a malformed shape from reaching the
+/// store read in `execute_access`. An omitted `role` is still a genuine
+/// clear, and `page` keeps the strict [`decode_page`] contract.
 fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
-    let Some(sub) = options.first() else {
+    let [sub] = options else {
         return AccessAction::Invalid;
     };
     let CommandOptionValue::SubCommand(args) = &sub.value else {
         return AccessAction::Invalid;
     };
-    let roles: Vec<Snowflake> = ["role", "role2", "role3"]
-        .iter()
-        .filter_map(|name| args.iter().find(|option| option.name == *name))
-        .filter_map(|option| match option.value {
-            CommandOptionValue::Role(role) => Some(role.get()),
-            _ => None,
-        })
-        .fold(Vec::new(), |mut roles, role| {
-            if !roles.contains(&role) {
-                roles.push(role);
-            }
-            roles
-        });
-    let command = args
-        .iter()
-        .find(|option| option.name == "command")
-        .and_then(|option| match &option.value {
-            CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
-            _ => None,
-        });
+    let command = decode_strict_arg(args, "command", |value| match value {
+        CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
+        _ => None,
+    });
     match sub.name.as_str() {
-        "show" => AccessAction::Show,
-        "creation" => args
-            .iter()
-            .find(|option| option.name == "enabled")
-            .and_then(|option| match option.value {
-                CommandOptionValue::Boolean(enabled) => Some(AccessAction::Creation(enabled)),
-                _ => None,
-            })
-            .unwrap_or(AccessAction::Invalid),
-        "role" => AccessAction::RequiredRole(roles.first().copied()),
-        "restrict" => command.map_or(AccessAction::Invalid, |command| AccessAction::Restrict {
+        "show" => AccessAction::Show {
+            page: decode_page(args),
+        },
+        "creation" => match decode_strict_arg(args, "enabled", |value| match value {
+            CommandOptionValue::Boolean(enabled) => Some(*enabled),
+            _ => None,
+        }) {
+            StrictArg::Value(enabled) => AccessAction::Creation(enabled),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
+        "role" => match decode_access_roles(args, &["role"]) {
+            Some(roles) => AccessAction::RequiredRole(roles.first().copied()),
+            None => AccessAction::Invalid,
+        },
+        "restrict" => match (
             command,
-            roles,
-        }),
-        "unrestrict" => command.map_or(AccessAction::Invalid, AccessAction::Unrestrict),
+            decode_access_roles(args, &["role", "role2", "role3"]),
+        ) {
+            (StrictArg::Value(command), Some(roles)) => AccessAction::Restrict { command, roles },
+            _ => AccessAction::Invalid,
+        },
+        "unrestrict" => match command {
+            StrictArg::Value(command) => AccessAction::Unrestrict(command),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
         _ => AccessAction::Invalid,
     }
 }
@@ -12438,7 +12925,7 @@ impl VoiceCommand {
     fn name(&self) -> &'static str {
         match self {
             Self::Create { .. } => "create",
-            Self::Setup => "setup",
+            Self::Setup { .. } => "setup",
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::TextChannels { .. } => "textchannels",
@@ -12447,6 +12934,7 @@ impl VoiceCommand {
             Self::InheritPermissions { .. } => "inheritpermissions",
             Self::DefaultLimit { .. } => "defaultlimit",
             Self::AlwaysPrivate { .. } => "alwaysprivate",
+            Self::SetupShapeInvalid { command, .. } => command,
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Private => "private",
@@ -12877,9 +13365,9 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
-/// Render the controls for `/access show` and as the confirmation after a change.
-fn access_summary(controls: &AccessControls) -> String {
-    let mut lines = vec![
+/// Creation and required-role context, rendered on every `/access show` page.
+fn access_context_lines(controls: &AccessControls) -> Vec<String> {
+    vec![
         format!(
             "Room creation: {}",
             if controls.room_creation_enabled {
@@ -12892,25 +13380,233 @@ fn access_summary(controls: &AccessControls) -> String {
             Some(role) => format!("Required role: <@&{role}>"),
             None => "Required role: none".to_owned(),
         },
-    ];
+    ]
+}
+
+/// One restriction row, roles in stored order. An empty role list fails
+/// closed (`admins only`). The command name is mention-neutralized so a
+/// stored key can never page a mass mention.
+fn access_row(command: &str, roles: &[Snowflake]) -> String {
+    let who = if roles.is_empty() {
+        "admins only".to_owned()
+    } else {
+        roles
+            .iter()
+            .map(|role| format!("<@&{role}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    format!("- /{safe}: {who}")
+}
+
+/// Render units for one restriction: the whole row when it fits `capacity`,
+/// else explicitly labeled deterministic continuation segments
+/// (`- /cmd (part i of k): ...`), roles in stored order, never splitting a
+/// mention token. Empty roles never split: the whole row is short.
+fn access_row_units(command: &str, roles: &[Snowflake], capacity: usize) -> Vec<String> {
+    let whole = access_row(command, roles);
+    if roles.is_empty() || text_len(&whole) <= capacity {
+        return vec![whole];
+    }
+    // Worst-case segment label over every segment (a segment holds at least
+    // one role, so the segment count never exceeds the role count).
+    let wide = "9".repeat(roles.len().to_string().len().max(1));
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    let label = |index: usize, total: usize| format!("- /{safe} (part {index} of {total}): ");
+    let worst_label = text_len(&format!("- /{safe} (part {wide} of {wide}): "));
+    let segment_capacity = capacity.saturating_sub(worst_label).max(1);
+    let mut segments: Vec<Vec<Snowflake>> = vec![Vec::new()];
+    let mut used = 0;
+    for role in roles {
+        let mention = format!("<@&{role}>");
+        let need = text_len(&mention) + 1;
+        let current_is_empty = segments.last().is_some_and(Vec::is_empty);
+        if !current_is_empty && used + need > segment_capacity {
+            segments.push(Vec::new());
+            used = 0;
+        }
+        if let Some(current) = segments.last_mut() {
+            current.push(*role);
+        }
+        used += need;
+    }
+    let total = segments.len().max(1);
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let mentions = segment
+                .iter()
+                .map(|role| format!("<@&{role}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{}{mentions}", label(index + 1, total))
+        })
+        .collect()
+}
+
+/// Row budget for `/access show`: a fitting whole reply needs no navigation.
+/// Otherwise reserve fixed context and worst-case page chrome (the page count
+/// never exceeds the unit count, and every page number fits its digits).
+fn access_page_capacity(controls: &AccessControls) -> usize {
+    let fixed: usize = access_context_lines(controls)
+        .iter()
+        .map(|line| text_len(line) + 1)
+        .sum::<usize>()
+        + text_len("Restricted commands:")
+        + 1;
+    // Check the complete legacy reply before reserving navigation: chrome
+    // that will never be shown must not split a fitting restriction row.
+    let whole_rows: usize = controls
+        .command_roles
+        .iter()
+        .map(|(command, roles)| text_len(&access_row(command, roles)) + 1)
+        .sum();
+    if fixed + whole_rows <= CONTENT_LIMIT + 1 {
+        return CONTENT_LIMIT + 1 - fixed;
+    }
+    let upper = (controls.command_roles.len()
+        + controls.command_roles.values().map(Vec::len).sum::<usize>())
+    .max(1);
+    let wide = "9".repeat(upper.to_string().len());
+    let chrome = text_len(&format!("Page {wide} of {wide}"))
+        + 1
+        + text_len(&format!("Next page: /access show page:{wide}"))
+        + 1;
+    CONTENT_LIMIT.saturating_sub(fixed + chrome).max(1)
+}
+
+/// All restriction render units in command-name ascending order
+/// (`command_roles` is a `BTreeMap`, so iteration already sorts).
+fn access_units(controls: &AccessControls, capacity: usize) -> Vec<String> {
+    let mut units = Vec::new();
+    for (command, roles) in &controls.command_roles {
+        units.extend(access_row_units(command, roles, capacity));
+    }
+    units
+}
+
+/// Greedy unit ranges that fit [`CONTENT_LIMIT`] with worst-case page chrome
+/// reserved. Empty when there are no restrictions; otherwise every page
+/// holds at least one unit, so packing always makes progress.
+fn access_show_pages(controls: &AccessControls) -> Vec<(usize, usize)> {
+    let capacity = access_page_capacity(controls);
+    let units = access_units(controls, capacity);
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let fixed: usize = access_context_lines(controls)
+        .iter()
+        .map(|line| text_len(line) + 1)
+        .sum::<usize>()
+        + text_len("Restricted commands:")
+        + 1;
+    let all_units: usize = units.iter().map(|unit| text_len(unit) + 1).sum();
+    if fixed + all_units <= CONTENT_LIMIT + 1 {
+        return vec![(0, units.len())];
+    }
+    let mut pages = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, unit) in units.iter().enumerate() {
+        let need = text_len(unit) + 1;
+        if index > start && used + need > capacity {
+            pages.push((start, index));
+            start = index;
+            used = 0;
+        }
+        used += need;
+    }
+    pages.push((start, units.len()));
+    pages
+}
+
+/// Page count for `/access show`: 1 when there are no restrictions,
+/// otherwise the greedy bounded pack.
+fn access_show_total(controls: &AccessControls) -> usize {
+    access_show_pages(controls).len().max(1)
+}
+
+/// Render `/access show` page `page` (1-based). Out-of-range pages clamp to
+/// the nearest page; callers that must refuse past-end input check
+/// [`access_show_total`] first. Single-page output is byte-identical to the
+/// legacy summary; page metadata and the next-page hint appear only when
+/// there is more than one page.
+fn access_show_page(controls: &AccessControls, page: usize) -> String {
+    let capacity = access_page_capacity(controls);
+    let units = access_units(controls, capacity);
+    let pages = access_show_pages(controls);
+    let total = pages.len().max(1);
+    let page = page.clamp(1, total);
+    let mut lines = access_context_lines(controls);
     if controls.command_roles.is_empty() {
         lines.push("Restricted commands: none".to_owned());
     } else {
         lines.push("Restricted commands:".to_owned());
-        for (command, roles) in &controls.command_roles {
-            let who = if roles.is_empty() {
-                "admins only".to_owned()
-            } else {
-                roles
-                    .iter()
-                    .map(|role| format!("<@&{role}>"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            lines.push(format!("- /{command}: {who}"));
+        if let Some((start, end)) = pages.get(page - 1) {
+            lines.extend(units[*start..*end].iter().cloned());
+        }
+    }
+    if total > 1 {
+        lines.push(format!("Page {page} of {total}"));
+        if page < total {
+            lines.push(format!("Next page: /access show page:{}", page + 1));
         }
     }
     lines.join("\n")
+}
+
+/// Short refusal for a malformed `/access` shape: names a copyable
+/// invocation, says nothing changed, and echoes none of the bad input.
+fn access_invalid_refusal() -> String {
+    "That /access option is not valid. Nothing was changed. Use /access show page:1 to see the current settings.".to_owned()
+}
+
+/// Short refusal for a malformed `/access show` page: names the remedy and a
+/// valid start, serves no rows and leaks no role mentions.
+fn access_page_refusal() -> String {
+    "Unknown page. Use /access show page:1 to see the first page.".to_owned()
+}
+
+/// Short refusal past the last `/access show` page: same shape, plus the
+/// real total.
+fn access_past_end_refusal(total: usize) -> String {
+    let pages = if total == 1 { "page" } else { "pages" };
+    format!(
+        "Unknown page. /access show has {total} {pages}; use /access show page:1 to start over."
+    )
+}
+
+/// Short truthful post-save confirmations: what changed plus a pointer at
+/// the paged read view. Never the full restriction list.
+fn access_creation_ack(enabled: bool) -> String {
+    let state = if enabled {
+        "on"
+    } else {
+        "off (existing rooms and commands keep working)"
+    };
+    format!("Saved.\nRoom creation: {state}\nSee /access show page:1 for the current settings.")
+}
+
+fn access_required_role_ack(role: Option<Snowflake>) -> String {
+    let line = match role {
+        Some(role) => format!("Required role: <@&{role}>"),
+        None => "Required role: none".to_owned(),
+    };
+    format!("Saved.\n{line}\nSee /access show page:1 for the current settings.")
+}
+
+fn access_restrict_ack(command: &str, roles: &[Snowflake]) -> String {
+    format!(
+        "Saved.\n{}\nSee /access show page:1 for the current settings.",
+        access_row(command, roles)
+    )
+}
+
+fn access_unrestrict_ack(command: &str) -> String {
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    format!("Saved.\n`{safe}` is no longer restricted.\nSee /access show page:1 for the current settings.")
 }
 
 /// Apply one `/access` action: read, change, validate, save, then hand the
@@ -12922,6 +13618,18 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
+    // Malformed shapes refuse before any store touch: no read cost,
+    // no save, no actor/config/audit mutation.
+    if matches!(&action, AccessAction::Invalid) {
+        return access_invalid_refusal();
+    }
+    let show_page_invalid = matches!(
+        &action,
+        AccessAction::Show { page } if page.number().is_none()
+    );
+    if show_page_invalid {
+        return access_page_refusal();
+    }
     let mut controls = match store.access_controls(guild_id).await {
         Ok(controls) => controls,
         Err(error) => {
@@ -12930,34 +13638,49 @@ async fn execute_access<S: RoomPersistence>(
                 .to_owned();
         }
     };
-    match action {
-        AccessAction::Show => return access_summary(&controls),
-        AccessAction::Invalid => {
-            return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
-                .to_owned()
+    let ack = match action {
+        AccessAction::Show { page } => {
+            let Some(number) = page.number() else {
+                return access_page_refusal();
+            };
+            let total = access_show_total(&controls);
+            if number > total {
+                return access_past_end_refusal(total);
+            }
+            return access_show_page(&controls, number);
         }
-        AccessAction::Creation(enabled) => controls.room_creation_enabled = enabled,
-        AccessAction::RequiredRole(role) => controls.required_role = role,
+        // Refused before the store read above; kept for exhaustiveness.
+        AccessAction::Invalid => return access_invalid_refusal(),
+        AccessAction::Creation(enabled) => {
+            controls.room_creation_enabled = enabled;
+            access_creation_ack(enabled)
+        }
+        AccessAction::RequiredRole(role) => {
+            controls.required_role = role;
+            access_required_role_ack(role)
+        }
         AccessAction::Restrict { command, roles } => {
             if !is_voice_command(&command) {
                 return format!("/{command} is not a voice-room command, so nothing was changed.");
             }
+            let ack = access_restrict_ack(&command, &roles);
             controls.command_roles.insert(command, roles);
+            ack
         }
         AccessAction::Unrestrict(command) => {
             if controls.command_roles.remove(&command).is_none() {
                 return format!("/{command} has no role restriction, so nothing was changed.");
             }
+            access_unrestrict_ack(&command)
         }
-    }
+    };
     if validate_access_controls(&controls).is_err() {
         return "Those settings are not valid, so nothing was changed.".to_owned();
     }
     match store.save_access_controls(guild_id, &controls).await {
         Ok(()) => {
-            let summary = access_summary(&controls);
             on_saved(controls);
-            format!("Saved.\n{summary}")
+            ack
         }
         Err(error) => {
             log_admin_store_failure("access_save", guild_id, error);
@@ -13162,6 +13885,12 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Ambiguous setup options refuse before guild authority, role gates and
+    // every read or effect: the parser already proved the shape unusable.
+    if let VoiceCommand::SetupShapeInvalid { command, field } = &command {
+        reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+        return true;
+    }
     // Cold guild-role facts are not a permanent denial: a command that
     // needs that authority gets the retryable warming-up reply and fails
     // closed before any gate read or protected effect. Missing-member
@@ -13310,41 +14039,57 @@ where
             }
             true
         }
-        VoiceCommand::Setup => {
+        VoiceCommand::Setup { page } => {
             let permissions = runtime.guild_permissions(interaction);
             let status = runtime.worker_status(guild_id).await;
-            let panel = if is_voice_admin(permissions) {
-                let (store, _) = runtime.make_pair();
-                let (creators, store_error) = match store.creators(guild_id).await {
-                    Ok(creators) => (creators, None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
-                };
-                setup_panel(&SetupSummary {
-                    guild_id,
-                    creators,
-                    tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                    // Current health findings first: they are live, failures are history.
-                    failures: status.as_ref().map_or_else(Vec::new, |status| {
-                        status
-                            .health
-                            .iter()
-                            .chain(status.failures.iter())
-                            .cloned()
-                            .collect()
-                    }),
-                    halted: status.as_ref().is_some_and(|status| status.halted),
-                    store_error,
-                })
-            } else {
+            if !is_voice_admin(permissions) {
                 // No store read for a member: the generic view needs none, and
                 // an open command should not cost a query per invocation.
-                setup_member_panel(
+                // Forged `page` input never enters the admin/store path.
+                let panel = setup_member_panel(
                     status.as_ref().is_some_and(|status| status.halted),
                     status.as_ref().is_some_and(|status| {
                         !status.health.is_empty() || !status.failures.is_empty()
                     }),
-                )
+                );
+                reply(ephemeral_response(&format!(
+                    "**{}**\n{}",
+                    panel.title, panel.description
+                )))
+                .await;
+                return true;
+            }
+            let Some(page_number) = page.number() else {
+                reply(ephemeral_response(&setup_page_refusal())).await;
+                return true;
             };
+            let (store, _) = runtime.make_pair();
+            let (creators, store_error) = match store.creators(guild_id).await {
+                Ok(creators) => (creators, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
+            let summary = SetupSummary {
+                guild_id,
+                creators,
+                tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
+                // Current health findings first: they are live, failures are history.
+                failures: status.as_ref().map_or_else(Vec::new, |status| {
+                    status
+                        .health
+                        .iter()
+                        .chain(status.failures.iter())
+                        .cloned()
+                        .collect()
+                }),
+                halted: status.as_ref().is_some_and(|status| status.halted),
+                store_error,
+            };
+            let total = setup_page_total(&summary);
+            if page_number > total {
+                reply(ephemeral_response(&setup_past_end_refusal(total))).await;
+                return true;
+            }
+            let panel = setup_panel_page(&summary, page_number);
             reply(ephemeral_response(&format!(
                 "**{}**\n{}",
                 panel.title, panel.description
@@ -13399,6 +14144,14 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.enabled.is_none()
+                        && request.name.is_none()
+                        && request.viewer_role.is_none() =>
+                {
+                    text_channels_summary(&creator)
+                }
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
                     TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -13431,6 +14184,12 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.position.is_none() && request.first_number.is_none() =>
+                {
+                    position_summary(&creator)
+                }
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
                     PositionPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -13463,6 +14222,8 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator)) if request.enabled.is_none() => group_summary(&creator),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
                     GroupPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -13588,6 +14349,13 @@ where
                 },
             };
             reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::SetupShapeInvalid { command, field } => {
+            // Unreachable through the shared handler (answered above before
+            // any read), but a second dispatch path must still refuse here,
+            // never run.
+            reply(ephemeral_response(&setup_shape_correction(command, field))).await;
             true
         }
         VoiceCommand::Reclaim => {
@@ -13877,13 +14645,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { .. } => {
             warn!(
@@ -13995,13 +14767,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { candidate, message } => {
             if let Some(refusal) = import_creator_gate(&current, &candidate, permissions) {
@@ -14032,11 +14808,15 @@ where
                                     candidate,
                                     hash,
                                     text,
+                                    review,
                                 } => {
                                     runtime.remember_pending_import(
                                         guild_id, member_id, &hash, candidate,
                                     );
-                                    reply(import_preview_response(&text, member_id, &hash)).await;
+                                    reply(import_preview_response(
+                                        &text, member_id, &hash, guild_id, review,
+                                    ))
+                                    .await;
                                 }
                                 ImportDecision::Apply {
                                     candidate: retry,

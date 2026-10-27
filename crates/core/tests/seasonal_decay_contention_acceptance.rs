@@ -8,7 +8,7 @@
 mod hotpath_queries;
 
 use hotpath_queries::{assert_fetch_bound, Queries};
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
 use two_bot_core::leveling_store as store;
 use two_bot_testsupport::TestDatabase;
@@ -52,15 +52,43 @@ async fn seed(pool: &PgPool, index: usize, xp: i64, weeks: i32, at: &str) {
 }
 
 async fn worker_pool(db: &TestDatabase, name: &str) -> (PgPool, i32) {
-    let pool = db.independent_pool().await.unwrap();
-    let pid: i32 = sqlx::query_scalar(
-        "SELECT pg_backend_pid() FROM set_config('application_name', $1, false)",
-    )
-    .bind(name)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    // The observed PID and the production worker must use the same session.
+    let options = db
+        .pool()
+        .connect_options()
+        .as_ref()
+        .clone()
+        .application_name(name)
+        .options([("search_path", "public")]);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_lazy_with(options);
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     (pool, pid)
+}
+
+#[tokio::test]
+async fn worker_pool_pins_the_named_backend_for_lock_rendezvous() {
+    let db = database().await;
+    let (pool, expected_pid) = worker_pool(&db, "review-pinned-worker").await;
+    let max_connections = pool.options().get_max_connections();
+    let (observed_pid, application_name): (i32, String) =
+        sqlx::query_as("SELECT pg_backend_pid(), current_setting('application_name')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    db.close().await.unwrap();
+    assert_eq!(
+        max_connections, 1,
+        "lock rendezvous must identify the worker's only PostgreSQL session"
+    );
+    assert_eq!(observed_pid, expected_pid);
+    assert_eq!(application_name, "review-pinned-worker");
 }
 
 async fn blocked_by(pool: &PgPool, blocker: i32, name: &str) -> Option<String> {

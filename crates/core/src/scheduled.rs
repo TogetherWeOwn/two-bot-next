@@ -38,6 +38,8 @@ pub const IN_MINUTES_MAX: i64 = 525_600;
 pub const EVERY_MINUTES_MIN: i64 = 60;
 /// Slash `every-minutes` upper bound: one year.
 pub const EVERY_MINUTES_MAX: i64 = 525_600;
+/// Explicit-offset RFC3339 input ceiling, including fractional seconds.
+pub const MAX_AT_CHARS: usize = 64;
 /// Admin-authored message body ceiling (legacy `MAX_BODY`, Discord's ceiling).
 pub const MAX_BODY_CHARS: usize = 2000;
 /// `/schedule-inspect` view selector ceiling: `metadata` (8 units) is the
@@ -97,6 +99,38 @@ pub enum ScheduleError {
     InMinutesOutOfRange(i64),
     #[error("every-minutes must be between 60 and 525600, got {0}.")]
     EveryMinutesOutOfRange(i64),
+}
+
+/// Absolute-time refusals never echo the supplied timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScheduleAtError {
+    #[error("Invalid at timestamp. Use RFC3339 with Z or a numeric offset, e.g. 2027-01-15T18:30:00+05:30 (at most 64 characters).")]
+    Invalid,
+    #[error("The at timestamp must be in the future. Choose a later RFC3339 time with Z or a numeric offset.")]
+    NotFuture,
+    #[error("The at timestamp exceeds the 525600-minute (365-day) horizon. Choose an earlier future time.")]
+    BeyondHorizon,
+}
+
+/// Normalize an explicit-offset one-off time to the store's millisecond
+/// precision. Check future/horizon against that persisted instant, not the
+/// higher-precision input, so truncation cannot admit a due-now occurrence.
+pub fn validate_schedule_at(at: &str, now_ms: u64) -> Result<u64, ScheduleAtError> {
+    if at.len() > MAX_AT_CHARS || !at.is_ascii() {
+        return Err(ScheduleAtError::Invalid);
+    }
+    let instant = time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| ScheduleAtError::Invalid)?;
+    let due_ms = u64::try_from(instant.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| ScheduleAtError::NotFuture)?;
+    let delay = due_ms
+        .checked_sub(now_ms)
+        .filter(|delay| *delay > 0)
+        .ok_or(ScheduleAtError::NotFuture)?;
+    if delay > IN_MINUTES_MAX as u64 * 60_000 {
+        return Err(ScheduleAtError::BeyondHorizon);
+    }
+    Ok(due_ms)
 }
 
 /// Neutralize mass mentions and invite links in a schedule body so the

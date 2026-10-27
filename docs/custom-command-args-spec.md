@@ -32,7 +32,7 @@ Baseline: `0e904ee2f6cd17d5aa54fa35b2730154791ee1d3`.
   bounds, single-pass render. `{args}` is refused today as an unknown
   placeholder; the preview suite pins that refusal
   (`custom_commands.rs:1839`: `"{args}"` in the invalid-template cases).
-- `crates/core/src/commands.rs:358`: custom commands publish with
+- `crates/core/src/commands.rs:365`: custom commands publish with
   `options(Vec::new())` — slash invocations carry no arguments today.
   Advertise-plus-enforce precedent: `OCCURRENCE_ID_MAX_CHARS`
   (`commands.rs:56-58`): builders advertise `max_length`, runtime refuses.

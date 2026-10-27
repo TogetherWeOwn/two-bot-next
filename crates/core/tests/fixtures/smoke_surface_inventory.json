@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 36,
+  "count": 44,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -160,7 +160,7 @@
     },
     {
       "name": "reopen",
-      "description": "Reopen your games or session picker in a private menu.",
+      "description": "Reopen your games or session picker in a private menu; games includes a no-change preview.",
       "family": "core",
       "gate": "always",
       "default_member_permissions": null,
@@ -191,6 +191,79 @@
       "deferral_reason": "Next-only self-service picker recovery with no legacy counterpart; the defer-first menu open and zero-mutation contract are pinned by the onboarding disposable-database acceptance tests rather than the live smoke five."
     },
     {
+      "name": "welcome-preview",
+      "description": "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private fixture rendering, pinned against a real-join render and zero writes with a disposable database rather than the live smoke five."
+    },
+    {
+      "name": "game-mix",
+      "description": "Show this server's aggregate game activity.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "page",
+          "description": "Page of saved games to show (10 per page). Default: 1.",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": 10000,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "sort",
+          "description": "Order games by play time or in-voice time. Default: play.",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            {
+              "name": "Play time",
+              "value": "play"
+            },
+            {
+              "name": "In-voice time",
+              "value": "voice"
+            }
+          ]
+        },
+        {
+          "name": "format",
+          "description": "Show raw JSON or a readable summary. Default: JSON.",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            {
+              "name": "JSON",
+              "value": "json"
+            },
+            {
+              "name": "Summary",
+              "value": "summary"
+            }
+          ]
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private staff aggregate; seeded game activity and failure cases are pinned by disposable-database gateway acceptance, outside the live smoke five."
+    },
+    {
       "name": "attendance",
       "description": "Check in a verified human attendee for a scheduled event (scorecard)",
       "family": "scorecard",
@@ -200,7 +273,7 @@
       "options": [
         {
           "name": "event-occurrence",
-          "description": "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+          "description": "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
           "type": "string",
           "required": true,
           "min_value": null,
@@ -324,7 +397,7 @@
     },
     {
       "name": "command-inspect",
-      "description": "Inspect or privately preview a saved custom command",
+      "description": "Inspect a saved command or privately preview an unsaved draft",
       "family": "automations",
       "gate": "automations",
       "default_member_permissions": "32",
@@ -332,9 +405,9 @@
       "options": [
         {
           "name": "name",
-          "description": "Saved command name, a-z 0-9 _ -",
+          "description": "Saved command name, a-z 0-9 _ - (choose name or draft)",
           "type": "string",
-          "required": true,
+          "required": false,
           "min_value": null,
           "max_value": null,
           "max_length": 32,
@@ -342,7 +415,7 @@
         },
         {
           "name": "view",
-          "description": "Private view (summary by default)",
+          "description": "Private view (saved: summary by default; draft: preview only)",
           "type": "string",
           "required": false,
           "min_value": null,
@@ -363,11 +436,67 @@
           "max_value": null,
           "max_length": 500,
           "choices": []
+        },
+        {
+          "name": "draft",
+          "description": "Proposed template to preview without saving (choose name or draft)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 2000,
+          "choices": []
         }
       ],
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Read-only but needs a named DB-backed custom row to inspect, which the no-DB offline rule excludes; covered by the disposable-database acceptance instead."
+    },
+    {
+      "name": "command-disable",
+      "description": "Pause a saved custom command without deleting it",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Saved command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke."
+    },
+    {
+      "name": "command-enable",
+      "description": "Resume a saved custom command",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Saved command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke."
     },
     {
       "name": "schedule",
@@ -404,6 +533,26 @@
           "required": false,
           "min_value": 60,
           "max_value": 525600,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "at",
+          "description": "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 64,
+          "choices": []
+        },
+        {
+          "name": "preview",
+          "description": "Preview the proposed post and its first firing without saving it",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
           "max_length": null,
           "choices": []
         }
@@ -561,6 +710,16 @@
           "max_value": 300,
           "max_length": null,
           "choices": []
+        },
+        {
+          "name": "preview",
+          "description": "Privately preview without saving",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
         }
       ],
       "smoke": "deferred",
@@ -581,7 +740,7 @@
     },
     {
       "name": "giveaway",
-      "description": "Create, list or cancel a giveaway",
+      "description": "Create, draw, reroll or cancel a giveaway",
       "family": "automations",
       "gate": "automations",
       "default_member_permissions": "32",
@@ -690,6 +849,158 @@
               "choices": []
             }
           ]
+        },
+        {
+          "name": "end",
+          "description": "Draw now, before the deadline",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "pause",
+          "description": "Pause entry without drawing",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "resume",
+          "description": "Resume a paused giveaway",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "extend",
+          "description": "Add minutes to the deadline",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            },
+            {
+              "name": "duration-minutes",
+              "description": "Minutes to add (1–43200)",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 43200,
+              "max_length": null,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "reroll",
+          "description": "Redraw the winners",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            },
+            {
+              "name": "user",
+              "description": "Replace only this winner",
+              "type": "user",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": null,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "inspect",
+          "description": "Privately inspect saved giveaway details in this channel",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
         }
       ],
       "smoke": "deferred",
@@ -706,12 +1017,12 @@
       "options": [
         {
           "name": "event-id",
-          "description": "Discord scheduled event id (number in the event URL), e.g. 12345",
+          "description": "Scheduled event id or pasted event link, e.g. 12345",
           "type": "string",
           "required": true,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 128,
           "choices": []
         },
         {
@@ -743,12 +1054,12 @@
       "options": [
         {
           "name": "event-id",
-          "description": "Discord scheduled event id (number in the event URL), e.g. 12345",
+          "description": "Scheduled event id or pasted event link, e.g. 12345",
           "type": "string",
           "required": true,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 128,
           "choices": []
         }
       ],
@@ -793,6 +1104,16 @@
           "max_value": null,
           "max_length": 2339,
           "choices": []
+        },
+        {
+          "name": "preview",
+          "description": "Privately preview without posting",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
         }
       ],
       "smoke": "covered",
@@ -821,6 +1142,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs a live LFG post id; sequenced after the lfg create step in the live pass, not standalone."
+    },
+    {
+      "name": "lfg-list",
+      "description": "List open game posts in this channel",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "8589934592",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "cursor",
+          "description": "Continue a current-channel list",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Read-only current-channel list but needs seeded open LFG posts; the announcements create path is covered by lfg."
     },
     {
       "name": "feed-add",
@@ -883,6 +1227,52 @@
       "deferral_reason": "Destructive and needs a live feed id; sequenced after a feed-add, not standalone."
     },
     {
+      "name": "feed-pause",
+      "description": "Pause a feed relay without deleting its history",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Feed id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a live feed id plus seeded delivery state; sequenced after a feed-add, not standalone."
+    },
+    {
+      "name": "feed-resume",
+      "description": "Resume a paused feed relay",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Feed id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a paused relay (DB lifecycle state); sequenced after feed-pause, not standalone."
+    },
+    {
       "name": "feed-list",
       "description": "List this server's feed relays",
       "family": "announcements",
@@ -904,6 +1294,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs seeded feed relays (DB); the no-DB offline rule excludes it."
+    },
+    {
+      "name": "feed-inspect",
+      "description": "Show a saved feed relay's source and last attempt",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Feed id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a live feed id; sequenced after a feed-add, not standalone."
     },
     {
       "name": "ban",

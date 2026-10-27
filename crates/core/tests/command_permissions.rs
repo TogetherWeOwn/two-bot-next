@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use two_bot_core::command_permissions::{
     command_permission, CommandSurface, PolicyHook, COMMAND_PERMISSIONS,
 };
+use two_bot_core::commands::PERM_MANAGE_GUILD;
 use two_bot_core::{
     CustomCommand, HandlerId, InteractionRouter, ModerationAction, RouterGates, SlashContext,
     SlashOutcome,
@@ -28,7 +29,7 @@ fn all_on() -> RouterGates {
 }
 
 #[test]
-fn all_30_rows_equal_parity_section1() {
+fn documented_legacy_rows_equal_parity_section1() {
     let section = include_str!("../../../docs/parity.md")
         .split("## 1.")
         .nth(1)
@@ -95,28 +96,47 @@ fn all_30_rows_equal_parity_section1() {
     // (parity row 31 — legacy has no help command), `/privacy` member
     // self-serve (row 32), management-only `/command-inspect` (row 33),
     // `/reopen` picker recovery (row 34), `/purge-preview` (35),
-    // `/channel-inspect` (36), `/giveaway` timed entry (row 37), and the
-    // private schedule management reads `/schedule-inspect` (row 38) and
-    // `/schedule-edit` (row 39).
-    // No Next-only row appears in the legacy §1 table above; the
-    // registry-equality test below covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 39);
+    // `/channel-inspect` (36), `/giveaway` timed entry (row 37),
+    // `/lfg-list` current-channel list (row 38), `/feed-inspect` relay detail
+    // (row 39), plus `/lfg-edit` sharing row 26, and pause/resume
+    // `/command-disable` and `/command-enable` (rows 40 and 41),
+    // `/welcome-preview` (42), `/game-mix` (43), feed pause/resume (44/45),
+    // and the private schedule management reads `/schedule-inspect`
+    // (row 46) and `/schedule-edit` (row 47).
+    // No Next-only row appears in the legacy §1 table above;
+    // the registry-equality test below covers every published builtin instead.
+    // 48 entries: 47 contiguous parity rows plus the `/lfg-edit` companion
+    // sharing LFG row 26.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 48);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        39
+        48
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=39).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=39"
+        (1..=47).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=47"
     );
+    for (name, parity_row, required_permissions) in
+        [
+            ("command-inspect", 33, 1 << 5),
+            ("lfg-list", 38, 1 << 33),
+            ("schedule-inspect", 46, 1 << 5),
+            ("schedule-edit", 47, 1 << 5),
+        ]
+    {
+        let row = command_permission(name).expect("Next-only command has a permission row");
+        assert_eq!(row.parity_row, parity_row, "{name}");
+        assert_eq!(row.required_permissions, required_permissions, "{name}");
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash, "{name}");
+    }
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
     assert_eq!(help.surface, CommandSurface::BuiltinSlash);
@@ -135,6 +155,71 @@ fn all_30_rows_equal_parity_section1() {
     assert_eq!(giveaway.required_permissions, 32, "ManageGuild bit");
     assert_eq!(giveaway.surface, CommandSurface::BuiltinSlash);
     assert_eq!(giveaway.policy_hook, None);
+    let feed_inspect =
+        command_permission("feed-inspect").expect("feed-inspect has a permission row");
+    assert_eq!(feed_inspect.parity_row, 39);
+    assert_eq!(feed_inspect.required_permissions, 32, "ManageGuild bit");
+    assert_eq!(feed_inspect.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(feed_inspect.policy_hook, None);
+    let game_mix = command_permission("game-mix").expect("game-mix has a permission row");
+    assert_eq!(game_mix.parity_row, 43);
+    assert_eq!(game_mix.required_permissions, 32, "ManageGuild bit");
+    assert_eq!(game_mix.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(game_mix.policy_hook, None);
+    let pause = command_permission("feed-pause").expect("feed-pause has a permission row");
+    assert_eq!(pause.parity_row, 44);
+    assert_eq!(pause.required_permissions, 32, "ManageGuild bit");
+    assert_eq!(pause.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(pause.policy_hook, None);
+    let resume = command_permission("feed-resume").expect("feed-resume has a permission row");
+    assert_eq!(resume.parity_row, 45);
+    assert_eq!(resume.required_permissions, 32, "ManageGuild bit");
+    assert_eq!(resume.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(resume.policy_hook, None);
+    for (name, parity_row) in [("command-disable", 40), ("command-enable", 41)] {
+        let row = command_permission(name).expect("lifecycle command has a permission row");
+        assert_eq!(row.parity_row, parity_row, "{name}");
+        assert_eq!(row.required_permissions, 32, "{name} ManageGuild bit");
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash, "{name}");
+        assert_eq!(row.policy_hook, None, "{name}");
+    }
+    let preview =
+        command_permission("welcome-preview").expect("welcome-preview has a permission row");
+    assert_eq!(preview.parity_row, 42);
+    assert_eq!(preview.required_permissions, PERM_MANAGE_GUILD);
+    assert_eq!(preview.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(preview.policy_hook, None);
+}
+
+#[test]
+fn lfg_edit_is_the_only_companion_of_the_canonical_lfg_parity_row() {
+    let canonical = COMMAND_PERMISSIONS
+        .iter()
+        .find(|row| row.parity_row == 26)
+        .expect("legacy LFG row remains canonical");
+    assert_eq!(canonical.command, "lfg");
+    let edit = command_permission("lfg-edit").expect("Next-only metadata companion");
+    assert_eq!(edit.parity_row, 26);
+    assert_eq!(edit.required_permissions, 1 << 33);
+    assert_eq!(edit.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(edit.policy_hook, None);
+    let mut row26: Vec<_> = COMMAND_PERMISSIONS
+        .iter()
+        .filter(|row| row.parity_row == 26)
+        .map(|row| row.command)
+        .collect();
+    row26.sort_unstable();
+    assert_eq!(row26, ["lfg", "lfg-edit"]);
+    let mut other_rows = HashSet::new();
+    for row in COMMAND_PERMISSIONS
+        .iter()
+        .filter(|row| row.parity_row != 26)
+    {
+        assert!(
+            other_rows.insert(row.parity_row),
+            "duplicate non-LFG parity row"
+        );
+    }
 }
 
 #[test]
@@ -164,7 +249,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 36);
+    assert_eq!(builtins.len(), 45);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -209,9 +294,19 @@ fn every_retained_command_rechecks_resolved_permissions_before_returning_a_handl
             // Even a same-named enabled custom row cannot bypass a builtin.
             custom_row: Some(true),
         };
-        for permissions in [None, Some(0), Some(1 << 3), Some(!row.required_permissions)] {
+        for permissions in [
+            None,
+            Some(0),
+            Some(1 << 3),
+            Some(!row.required_permissions),
+            Some(!(row.required_permissions | (1 << 3))),
+        ] {
             let outcome = router.route_slash(&ctx(permissions));
-            if row.required_permissions == 0 {
+            // Only game-mix accepts Administrator without its advertised bit;
+            // every legacy command retains the same exact-bit runtime check.
+            let game_mix_admin =
+                row.command == "game-mix" && permissions.is_some_and(|bits| bits & (1 << 3) != 0);
+            if row.required_permissions == 0 || game_mix_admin {
                 assert!(
                     matches!(outcome, SlashOutcome::Handled { .. }),
                     "{}: {outcome:?}",
@@ -288,7 +383,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 36, "every retained builtin routes");
+    assert_eq!(routed, 45, "every retained builtin routes");
 }
 
 #[test]
