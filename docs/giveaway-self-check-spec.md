@@ -32,7 +32,7 @@ Source facts, not production verification:
   **all** configured roles, then minimum account age, then minimum guild age in
   whole days; it returns the first failure. Requirements default to empty/zero.
   No standing, denylist, level or prize/legal rule is present.
-- `crates/discord/src/giveaway.rs:578-657`: entry takes its budget, uses
+- `crates/discord/src/giveaway.rs:571-650`: entry takes its budget, uses
   interaction-member evidence, maps missing/future join time to zero days,
   calls mutating `admit_entry`, and updates the public count on success.
   Ineligibility gets generic role-or-age text, not a private non-entry report.
@@ -40,7 +40,7 @@ Source facts, not production verification:
   checks lifecycle/deadline/claim/pending message, adjudicates, checks existing
   entry, durable rate and capacity, then inserts. `get_giveaway` (`:203-219`)
   is read-only but returns internal nonce/claim fields: never serialize its row.
-- `crates/discord/src/giveaway.rs:926-1011`: draw/reroll rechecks fresh membership
+- `crates/discord/src/giveaway.rs:919-1004`: draw/reroll rechecks fresh membership
   and requirements before commit; absent members are excluded and transport
   failure aborts. Do not claim Discord checks are atomic with the transaction.
 - `crates/core/src/router.rs:716-720,838-842`: `/giveaway` is administrative
