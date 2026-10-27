@@ -218,6 +218,15 @@ the rendered template and records `(ok, None)`; audit rows carry no template
 or rendered content. A render or context failure is definitive and local, so it still
 audits even when the fallback completion is uncertain.
 
+A saved template that no longer passes the definition-time rules (unknown
+placeholder, empty, or over the 2000 UTF-16-unit limit — for example after an
+import) is refused at both execution boundaries: slash completes with the
+fixed context-or-template unavailable text, prefix sends nothing, and the run
+audits `render_failed` without the template text. The definition is never
+disabled, deleted, or repaired automatically. To fix it, run
+`/command-inspect name:<name> view:preview` for the private refusal detail,
+then replace the template with `/command name:<name> template:<text>`.
+
 ## Explicit prefix acceptance and replay safety
 
 `AutomationMessageAcceptance` distinguishes deliberately disabled automod,
