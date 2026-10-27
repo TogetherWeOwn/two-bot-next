@@ -154,16 +154,23 @@ permission data than the mutation it previews.
    interaction id as its idempotency identity; inside the lane, `prepare`'s
    own fresh GET must still produce the previewed prior masks and planned write,
    or it refuses before recording a seed or sending a PUT.
-6. **Already locked.** If the live `@everyone` overwrite already denies all
-   five bits (planned write equals current masks), the preview renders,
-   is audited, states that nothing would change, and carries **no** Confirm
+6. **Already locked.** The single arming test is exact equality: the preview is
+   unarmed if and only if `plan_lockdown(current)` equals the current
+   `(allow, deny)` masks, with an absent overwrite treated as `(0, 0)` (so an
+   absent overwrite is never unarmed). In that case the preview renders, is
+   audited, states that nothing would change, and carries **no** Confirm
    button and stores **no** pending entry, so unarmed previews can never
-   exhaust the 64-entry cap. A moderator who deliberately wants the existing
+   exhaust the 64-entry cap. A live overwrite that denies all five bits *and*
+   also allows one of them (allow+deny) is **not** unarmed: the planner clears
+   the allow bit, so the planned write differs, and Confirm is offered (the
+   moderator-facing line shows `allow+deny -> deny`). Deny-all alone is never the
+   test. A moderator who deliberately wants the existing
    repeated-lockdown
    behaviour uses `/lockdown`, whose seed-preservation rules are unchanged
    ([`channel-lockdown-acceptance.md`](channel-lockdown-acceptance.md) item 4).
-7. **Partial locks.** If some but not all five bits are denied (legacy
-   send-only lock or a manual edit), the preview shows the remaining diff and
+7. **Partial locks.** Whenever the planned write differs from the current masks
+   but some lockdown bits are already denied (legacy send-only lock, a manual
+   edit, or an allow+deny overlap), the preview shows the remaining diff and
    Confirm is offered. Saved-recovery presence is rendered separately from the
    live send deny, because the two can disagree in both directions (manual lock
    without a seed; seed whose deny was removed externally). Neither fact alone
@@ -257,11 +264,20 @@ as a metric label.
 
 **Stale-preview refusal.** Confirm re-reads and recomputes; **any** digest
 mismatch refuses with `STALE_PREVIEW`, writes one refused preview audit row
-(section 6), and performs no claim, lane, seed or PUT. That includes changes a
-moderator might call unrelated — an `@everyone` `VIEW_CHANNEL` flip, a role
-base-permission or position change, a member-overwrite allow added, saved
-recovery created by another moderator's lockdown — because the planned write's
-preserved bits and every rendered warning depend on the full snapshot. The
+(section 6), and performs no claim, lane, seed or PUT. The refusal scope is
+exactly what the digest covers, no more: the unmasked `@everyone` prior and
+planned masks (so any `@everyone` bit flip, including `VIEW_CHANNEL`), the
+saved-lockdown state, role ids and positions, and every role permission and
+overwrite allow/deny **masked to `INTEREST`** (the five lockdown bits,
+`VIEW_CHANNEL`, `ADMINISTRATOR`). That includes changes a moderator might call
+unrelated — a role position change, an `INTEREST`-bit change in a role's base
+permissions, a member-overwrite allow of an `INTEREST` bit, saved recovery
+created by another moderator's lockdown — because the planned write and every
+rendered count and warning are functions of exactly those values. A change
+confined to non-`INTEREST` bits of a role or overwrite (for example a role's
+`EMBED_LINKS` base bit) alters no rendered figure and no planned write, leaves
+the digest byte-identical, and does not refuse; the preview makes no claim
+about bits outside `INTEREST`. The
 reply says permissions changed and to preview again; it does not say which
 field changed (the fresh preview is the diff tool, and field-level leak to a
 possibly-no-longer-authorized presser is avoided).
@@ -325,7 +341,7 @@ precedent, next paragraph but one):
 
 | Event | Audit effect (action stays `moderation.lockdown`) |
 | --- | --- |
-| Preview rendered | Exactly one row, outcome `lockdown_preview`, `reason: ""`, `request_id`/`idempotency_key` = preview interaction id, metadata numbers only: `prior_exists`, `roles_evaluated`, `roles_keeping_send`, `member_overwrite_allows`. Row is written **before** the reply; insert failure ⇒ no render, no pending entry |
+| Preview rendered | Exactly one row, outcome `lockdown_preview`, `reason: ""`, `request_id`/`idempotency_key` = preview interaction id, metadata numbers only: `prior_exists`, `roles_evaluated`, `roles_keeping_send`, `member_overwrite_allows`. Row is written **before** the reply through an insert that reports whether a row was created: only `rows_affected == 1` passes the gate. An error **or** zero rows (a redelivered interaction or retry under the same `request_id`) ⇒ no render, no pending entry |
 | Router/validation refusal, read failure, `TOO_COMPLEX`, rate refusal | No row (nothing disclosed), mirroring the reads branch; the rate limiter still charged where section 5 says so |
 | Cancel, expiry, restart loss, duplicate/foreign press | No row |
 | Confirm → stale | One row, outcome `refused`, metadata `{"stale_preview":1}`. If that insert fails the refusal still stands (no mutation is at risk); log the fixed `channel_refusal_audit_failed` token as the missing-context path does |
@@ -400,15 +416,15 @@ live guild). Every row also asserts zero unexpected Discord writes:
 | `LP-03` | A lockdown bit set in both allow and deny → renders `allow+deny -> deny`; planned masks still from `plan_lockdown` |
 | `LP-04` | One role overwrite allows `SEND_MESSAGES`; one member overwrite allows a thread bit → role named as keeper; member counted (1), never identified; counts complete |
 | `LP-05` | Role with base `ADMINISTRATOR`; `@everyone` view denied → admin keeps usable send; non-admin roles show `cannot send already` where view gates them |
-| `LP-06` | All five bits already denied → audited preview, **no Confirm button**, no pending entry (unarmed previews never cause `PREVIEW_BUSY`); partial legacy lock (send-only deny) → remaining four bits diffed, Confirm present |
+| `LP-06` | Planned write equals current masks (all five bits denied, none allowed) → audited preview, **no Confirm button**, no pending entry (unarmed previews never cause `PREVIEW_BUSY`); partial legacy lock (send-only deny) → remaining four bits diffed, Confirm present; all five denied **plus** `SEND_MESSAGES` also allowed → planned write differs, Confirm present, renders `allow+deny -> deny`, and the projection treats send as usable before |
 | `LP-07` | Saved seed present but live send deny removed (and vice versa) → both facts rendered separately; digest covers generation, so a mid-flight seed change is stale |
 | `LP-08` | Between preview and confirm: `@everyone` lock bit change → `STALE_PREVIEW`; zero claim/lane/seed/PUT; exactly one `stale_preview` audit row |
-| `LP-09` | Between preview and confirm: only a role base bit, role position, member-overwrite allow, or unrelated `@everyone` `VIEW_CHANNEL` changes → still `STALE_PREVIEW` (full-snapshot digest) |
+| `LP-09` | Between preview and confirm: only an `INTEREST` bit of a role base permission, a role position, an `INTEREST` member-overwrite allow, or an `@everyone` `VIEW_CHANNEL` flip changes → still `STALE_PREVIEW` (digest scope per section 5); a change confined to non-`INTEREST` bits (e.g. role `EMBED_LINKS`) → digest unchanged, confirm executes |
 | `LP-10` | Actor loses `ManageChannels` or the feature gate closes before confirm → refused before reads; pending consumed; foreign actor / forged digest / double press / cancel-then-confirm / restart → collapsed `PREVIEW_EXPIRED`, no audit row |
 | `LP-11` | Confirm at `now == expires` → refused; at `expires - 1s` with unchanged snapshot → executes |
 | `LP-12` | Malformed masks, missing/duplicate `@everyone` role, duplicate overwrite row, guild/type mismatch (thread, voice, forum, category), saved-record guild mismatch, missing `permission_overwrites`, one failed read → `UNAVAILABLE`/`UNSUPPORTED_CHANNEL`; no partial render, no audit row |
 | `LP-13` | 11 keeper roles → 10 named + `(+1 more …)`; 101 overwrites or 251 roles → `TOO_COMPLEX`, no render; longest render ≤1,900 UTF-16 units with counts intact |
-| `LP-14` | Audit trail: render ⇒ exactly 1 `lockdown_preview` row (numbers-only metadata, empty reason), 0 claims/lanes/seeds/metric samples; audit insert failure ⇒ no render, no pending; executed confirm ⇒ exactly 1 lockdown row added, whose `preview_request_id` equals the confirmed preview's interaction id even when another preview renders before the execution row lands |
+| `LP-14` | Audit trail: render ⇒ exactly 1 `lockdown_preview` row (numbers-only metadata, empty reason), 0 claims/lanes/seeds/metric samples; audit insert error **or** zero rows created (same preview `request_id` redelivered) ⇒ no render, no pending; executed confirm ⇒ exactly 1 lockdown row added, whose `preview_request_id` equals the confirmed preview's interaction id even when another preview renders before the execution row lands |
 | `LP-15` | 11th preview by one actor inside 10 min ⇒ refused with **zero** Discord GETs; new key at 64 live entries ⇒ `PREVIEW_BUSY`, earlier entries intact; same actor+channel replacement at cap succeeds atomically, count stays 64, superseded digest cannot be consumed; concurrent replacements cannot leave two entries for that key |
 | `LP-16` | Lane held by an in-flight channel action at confirm ⇒ existing uncertain reply, pending consumed, no PUT; PUT 403 ⇒ existing no-effect finish; PUT 5xx ⇒ claim/lane retained, no resend |
 | `LP-17` | Blank / 513-unit reason, extra option ⇒ refused before reads; category-parent channel renders parent id + sync-not-evaluated line and reads no second channel |
@@ -443,7 +459,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ...     if everyone_ow: p = (p & ~everyone_ow[1]) | everyone_ow[0]
 ...     if role_ow: p = (p & ~role_ow[1]) | role_ow[0]
 ...     return bool(p & VIEW and p & bit)
+>>> # arming test: unarmed iff planned write == current masks, absent == (0, 0) (LP-06)
+>>> def armed(prior): return plan(prior) != (prior or (0, 0))
+>>> assert armed(None) and armed((0, 0)) and armed((0, SEND))
+>>> assert not armed((0, LOCK))
+>>> assert armed((SEND, LOCK)) and plan((SEND, LOCK)) == (0, LOCK)   # allow+deny overlap
 >>> planned = plan((0, 0))
+>>> # overlap is usable at @everyone before lockdown: (p & ~deny) | allow (LP-06)
+>>> assert usable(VIEW, (SEND, LOCK), None, SEND) and not usable(VIEW, plan((SEND, LOCK)), None, SEND)
 >>> # @everyone-only member loses usable send; a role overwrite allow keeps it (LP-04)
 >>> assert usable(VIEW | SEND, (0, 0), None, SEND) and not usable(VIEW | SEND, planned, None, SEND)
 >>> assert usable(VIEW | SEND, planned, (SEND, 0), SEND)
@@ -461,6 +484,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 ...         "0", str(LOCK), "0", "", [["10", "0", str((VIEW | SEND) & INTEREST)]],
 ...         [["0", "40", str(SEND), "0"]]]
 >>> same = json.loads(json.dumps(snap)); assert digest(snap) == digest(same)
+>>> # exact canonical bytes and SHA-256 vectors a Rust planner must reproduce (section 5)
+>>> assert canonical(snap) == (b'["lockdown-preview.v1","10","20","0","0","30","raid","1","0","0","0",'
+...     b'"377957124160","0","",[["10","0","3072"]],[["0","40","2048","0"]]]')
+>>> assert digest(snap) == "fe0db22860adfe223f7f5b5f38357188b74bb422ae49628c6a01bc07ab8ace05"
 >>> # numeric id order, including within each overwrite type; wire values stay strings
 >>> multi = json.loads(json.dumps(snap))
 >>> multi[14] = [["10", "0", "0"], ["9", "0", "0"]]
@@ -473,12 +500,16 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 >>> stale_role = json.loads(json.dumps(snap)); stale_role[14][0][2] = str(VIEW & INTEREST)
 >>> assert digest(stale_role) != digest(snap)                        # LP-09 sensitivity
 >>> stale_unrelated = json.loads(json.dumps(snap)); stale_unrelated[8] = str(VIEW)
->>> assert digest(stale_unrelated) != digest(snap)                   # LP-09 full masks
+>>> assert digest(stale_unrelated) != digest(snap)                   # LP-09 unmasked @everyone masks
+>>> EMBED = 1<<14   # outside INTEREST: masked out before digesting, so not stale (LP-09)
+>>> assert (VIEW | SEND | EMBED) & INTEREST == (VIEW | SEND) & INTEREST
 >>> # non-ASCII reason: escaped ASCII bytes, UTF-8, deterministic; no normalization
 >>> uni = json.loads(json.dumps(snap)); uni[6] = "raid 🛡️"
 >>> raw = json.dumps(uni, separators=(",", ":")).encode()
 >>> assert raw.decode("ascii") and "🛡️".encode() not in raw
 >>> assert digest(uni) != digest(snap) and digest(uni) == digest(json.loads(json.dumps(uni)))
+>>> assert b'"raid \\ud83d\\udee1\\ufe0f"' in canonical(uni)   # surrogate-pair escapes, ASCII only
+>>> assert digest(uni) == "81a08dd5255d466c7a41230d3b15cdf46b73d978a8953ff91ee852ded68cd8f8"
 >>> nfc, nfd = "café", unicodedata.normalize("NFD", "café")
 >>> ra = json.loads(json.dumps(snap)); ra[6] = nfc
 >>> rb = json.loads(json.dumps(snap)); rb[6] = nfd
@@ -526,6 +557,10 @@ protected-test work exists:
    component path reusing the existing mutation pipeline; the new roles/
    snapshot reads failing closed; numbers-only preview audit rows plus one
    `preview_request_id` on confirmed execution rows in the shared ledger;
+   the new store scope of an audit insert that returns and checks
+   `rows_affected` (today's `record_audit` uses `ON CONFLICT (request_id) DO
+   NOTHING` and discards the count, `crates/core/src/channel_moderation_store.rs:692-711`,
+   so it cannot enforce the gate as written);
    300-second in-memory retention of the pending reason and preview id;
    single-role projection labelling (never member truth); unverified ephemeral
    message retention on Discord's side; direct `/lockdown` remaining
