@@ -1000,16 +1000,20 @@ fn apply_dispatch<I: InviteSource>(
                 failures,
                 deadline,
                 async {
-                    pipeline.drain(requests).await.map(drop).map_err(|error| {
-                        // Runtime Display is sanitized; never
-                        // log its SQL/HTTP source.
-                        tracing::warn!(
-                            error = %error,
-                            committed_awards = error.committed_awards().len(),
-                            "gateway leveling dispatch failed"
-                        );
-                        leveling_dispatch_failure()
-                    })
+                    pipeline
+                        .drain_detached_celebrations(requests)
+                        .await
+                        .map(drop)
+                        .map_err(|error| {
+                            // Runtime Display is sanitized; never
+                            // log its SQL/HTTP source.
+                            tracing::warn!(
+                                error = %error,
+                                committed_awards = error.committed_awards().len(),
+                                "gateway leveling dispatch failed"
+                            );
+                            leveling_dispatch_failure()
+                        })
                 },
             ));
             if drain_outcome.is_err() {

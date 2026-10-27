@@ -621,6 +621,41 @@ impl LevelingRuntime {
         Ok(Some(result))
     }
 
+    /// Award every request in order, stopping at the first failure. Returns
+    /// the outcome plus the celebrations owed for message crossings that
+    /// committed, including one whose role application then failed.
+    async fn award_all(
+        &self,
+        requests: Vec<AwardRequest>,
+    ) -> (
+        Result<Vec<XpAward>, LevelingRuntimeError>,
+        BTreeMap<Snowflake, (Snowflake, u64)>,
+    ) {
+        let mut results = Vec::with_capacity(requests.len());
+        let mut announcements = BTreeMap::new();
+        for request in requests {
+            let outcome = self.award(&request).await;
+            // A role failure still carries this request's committed XP.
+            // Only fresh message crossings can create a celebration;
+            // voice, decay and reconciliation never enter this path.
+            let committed = match &outcome {
+                Ok(award) => award.as_ref(),
+                Err(error) => error.committed_awards().first(),
+            };
+            if let Some(award) = committed
+                .filter(|award| request.duration.is_none() && award.awarded > 0 && award.leveled_up)
+            {
+                announcements.insert(request.member_id, (request.channel_id, award.level));
+            }
+            match outcome {
+                Ok(Some(award)) => results.push(award),
+                Ok(None) => {}
+                Err(error) => return (Err(error.with_prior_awards(results)), announcements),
+            }
+        }
+        (Ok(results), announcements)
+    }
+
     /// Best-effort celebrations never change the committed award or retry an
     /// uncertain send. The shared executor suppresses all mention parsing.
     async fn announce_level_ups(&self, announcements: BTreeMap<Snowflake, (Snowflake, u64)>) {
@@ -907,40 +942,36 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     /// Drain deferred XP awards without holding the async dispatch lock.
     /// The caller owns ordering (the serial checkpoint writer); this only
-    /// preserves the funnel-before-award sequence per dispatch.
+    /// preserves the funnel-before-award sequence per dispatch. Celebrations
+    /// are awaited here, so direct callers see them posted on return.
     pub async fn drain(
         &self,
         requests: Vec<AwardRequest>,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
-        let mut results = Vec::with_capacity(requests.len());
-        if let Some(runtime) = &self.runtime {
-            let mut announcements = BTreeMap::new();
-            for request in requests {
-                let outcome = runtime.award(&request).await;
-                // A role failure still carries this request's committed XP.
-                // Only fresh message crossings can create a celebration;
-                // voice, decay and reconciliation never enter this path.
-                let committed = match &outcome {
-                    Ok(award) => award.as_ref(),
-                    Err(error) => error.committed_awards().first(),
-                };
-                if let Some(award) = committed.filter(|award| {
-                    request.duration.is_none() && award.awarded > 0 && award.leveled_up
-                }) {
-                    announcements.insert(request.member_id, (request.channel_id, award.level));
-                }
-                match outcome {
-                    Ok(Some(award)) => results.push(award),
-                    Ok(None) => {}
-                    Err(error) => {
-                        runtime.announce_level_ups(announcements).await;
-                        return Err(error.with_prior_awards(results));
-                    }
-                }
-            }
-            runtime.announce_level_ups(announcements).await;
+        let Some(runtime) = &self.runtime else {
+            return Ok(Vec::new());
+        };
+        let (outcome, announcements) = runtime.award_all(requests).await;
+        runtime.announce_level_ups(announcements).await;
+        outcome
+    }
+
+    /// Like [`Self::drain`], but celebrations post from a detached task so an
+    /// optional send can never consume the caller's fatal checkpoint budget.
+    /// Delivery stays one bounded attempt per crossing and is lost on restart.
+    pub async fn drain_detached_celebrations(
+        &self,
+        requests: Vec<AwardRequest>,
+    ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
+        let Some(runtime) = &self.runtime else {
+            return Ok(Vec::new());
+        };
+        let (outcome, announcements) = runtime.award_all(requests).await;
+        if !announcements.is_empty() {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.announce_level_ups(announcements).await });
         }
-        Ok(results)
+        outcome
     }
 
     pub async fn handle(&self, event: &Event) -> Result<Vec<XpAward>, LevelingRuntimeError> {

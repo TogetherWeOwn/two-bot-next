@@ -106,7 +106,8 @@ Voice, seasonal decay, revocation and role reconciliation never announce. Sessio
 mode and dry-run suppress celebrations as well as role writes, without suppressing
 XP. The shared sender serializes `allowed_mentions.parse = []`; the member mention
 renders without notifying. Delivery makes one bounded attempt after XP commits;
-failures log only a fixed cause, with no member data, and do not change the award
+the gateway posts from a detached task so a slow send never counts against the
+checkpoint deadline or holds the cursor. Failures log only a fixed cause, with no member data, and do not change the award
 or mask role-application errors. Store cooldowns fence replayed earning events.
 There is no durable announcement outbox, retry or exactly-once remote delivery
 claim across crashes or ambiguous HTTP outcomes. Ordinary runtime
