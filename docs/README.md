@@ -238,9 +238,9 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
 - [Binary lifecycle](alive-acceptance.md)
-- [Presence probe tests](presence-probe-acceptance.md)
-- [REST pacing tests](pacing-backoff-acceptance.md)
-- [Retention acceptance](testing/retention-runtime.md)
+- [Presence probe](presence-probe-acceptance.md)
+- [REST pacing](pacing-backoff-acceptance.md)
+- [Retention runtime](testing/retention-runtime.md)
 
 ## Cutover and watch
 
