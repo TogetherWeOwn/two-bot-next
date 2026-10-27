@@ -382,10 +382,6 @@ library code with no Discord dependency and can start immediately.
   optional role required to use room commands; per-command role restrictions, with
   admins always exempt.
 - Utilities: `/ping` (latency) and `/invite`.
-- `/myroom`: privately lists the rooms you currently own (channel link, private or
-  public). It reads live worker state only and says so when the worker is not
-  live, never that you own no room. A creation refused by the per-user cap still
-  says only that you already have a room; use `/myroom` to find it.
 
 ## V11: Configuration export and import
 
