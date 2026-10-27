@@ -36,6 +36,11 @@ pub async fn execute_settings(
 
 fn action_error(error: SettingsWriteError) -> ActionError {
     match error {
+        SettingsWriteError::SelfRoleRecoveryPending => ActionError::new(
+            ErrorCode::ActionNotAllowed,
+            "Wait for self-role recovery to drain before changing TWO_SELF_ROLE_PANELS",
+            "settings_self_role_recovery_pending",
+        ),
         SettingsWriteError::VersionConflict => ActionError::new(
             ErrorCode::VersionConflict,
             "The setting changed; read it again before saving",
@@ -74,6 +79,27 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_invalid",
                     );
                 }
+                WriteRefusal::InvalidCorrectionCycles(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a non-negative integer correction count for this setting",
+                        "settings_value_invalid",
+                    );
+                }
+                WriteRefusal::InvalidInactivityDays(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a non-negative integer number of days for this setting",
+                        "settings_value_invalid",
+                    );
+                }
+                WriteRefusal::InvalidOnboardingDestination(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        reason.to_string(),
+                        "settings_value_invalid",
+                    );
+                }
             };
             ActionError::new(
                 ErrorCode::ActionNotAllowed,
@@ -94,6 +120,15 @@ fn action_error(error: SettingsWriteError) -> ActionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalogue_drain_refusal_names_the_safe_next_action() {
+        let error = action_error(SettingsWriteError::SelfRoleRecoveryPending);
+        assert_eq!(error.code, ErrorCode::ActionNotAllowed);
+        assert_eq!(error.log_reason, "settings_self_role_recovery_pending");
+        assert!(error.message.contains("TWO_SELF_ROLE_PANELS"));
+        assert!(error.message.contains("drain"));
+    }
 
     #[test]
     fn database_errors_are_sanitized_and_conflicts_are_not_retryable() {
@@ -121,6 +156,8 @@ mod tests {
         for refusal in [
             WriteRefusal::InvalidCooldownValue("TWO_TICKET_COOLDOWN_SECONDS".to_owned()),
             WriteRefusal::InvalidPanelsValue("TWO_SELF_ROLE_PANELS".to_owned()),
+            WriteRefusal::InvalidCorrectionCycles("TWO_COMMUNITY_CORRECTION_CYCLES".to_owned()),
+            WriteRefusal::InvalidInactivityDays("TWO_INACTIVITY_DAYS".to_owned()),
         ] {
             let invalid = action_error(SettingsWriteError::Refused(refusal));
             assert_eq!(invalid.code, ErrorCode::Malformed);

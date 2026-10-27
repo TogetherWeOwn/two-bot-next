@@ -226,6 +226,55 @@ async fn stored_cooldown_rows_move_the_live_ticket_cooldown_without_restart() {
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn ops_cooldown_apply_clear_and_expiry_refresh_without_a_database_revision() {
+    use two_bot_core::settings::{OpsApplyOutcome, OpsRecord, MAX_OPS_STALENESS};
+
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let runtime = runtime(&mock);
+    let (mut writer, live) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    let now = std::time::Instant::now();
+    for (epoch, overrides, expected) in [
+        (
+            1,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "60".to_owned())]),
+            60,
+        ),
+        (2, HashMap::new(), COOLDOWN_SECONDS),
+        (
+            3,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "30".to_owned())]),
+            30,
+        ),
+    ] {
+        assert!(matches!(
+            writer.apply_ops(Some(&OpsRecord { epoch, overrides }), now),
+            OpsApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(live.revision(), 1, "ops does not move the DB revision");
+        runtime.refresh_config_with(Some(&live));
+        assert_eq!(runtime.config_for_test().cooldown_seconds, expected);
+    }
+    assert_eq!(
+        writer.apply_ops(None, now + MAX_OPS_STALENESS + Duration::from_secs(1)),
+        OpsApplyOutcome::Expired
+    );
+    assert_eq!(live.revision(), 1);
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    assert!(
+        mock.requests().is_empty(),
+        "refresh needs no REST or DB I/O"
+    );
+    mock.shutdown().await;
+}
+
 #[test]
 fn ordinary_messages_without_optional_components_do_not_block_panel_ensure() {
     let messages = panels(vec![
@@ -252,6 +301,69 @@ fn malformed_panel_rows_are_counted_without_echoing_content() {
     assert_eq!(isolated.len(), 1);
     assert_eq!(isolated[0].author_id, "400");
     assert!(panel_isolated_count_for_test() > before);
+}
+
+#[test]
+fn open_retry_backoff_doubles_to_the_hourly_cap() {
+    assert_eq!(open_retry_backoff(0), Duration::from_secs(300));
+    assert_eq!(open_retry_backoff(1), Duration::from_secs(600));
+    assert_eq!(open_retry_backoff(2), Duration::from_secs(1200));
+    assert_eq!(open_retry_backoff(3), Duration::from_secs(2400));
+    assert_eq!(open_retry_backoff(4), Duration::from_secs(3600));
+    assert_eq!(open_retry_backoff(u32::MAX), Duration::from_secs(3600));
+    // The first step is exactly one recovery cadence: an immediate
+    // recover/Ready burst at the same clock reading replays nothing, and the
+    // next periodic pass is already eligible.
+    assert_eq!(open_retry_backoff(0), RECOVERY_CADENCE);
+}
+
+#[test]
+fn open_retry_bounds_match_the_acceptance_envelope() {
+    // Pinned against the protected retry acceptance envelope: retention is
+    // finite but never discards every failure, and one pass never spends
+    // more than the per-pass work cap on retries.
+    assert_eq!(OPEN_RETRY_RETAINED_CAP, 128);
+    assert_eq!(OPEN_RETRY_PER_PASS_CAP, 64);
+    // Const context: clippy `assertions_on_constants` rejects this as a
+    // runtime assert, and a cap edited out of order fails the build here.
+    const _: () = {
+        assert!(OPEN_RETRY_PER_PASS_CAP <= OPEN_RETRY_RETAINED_CAP);
+    };
+}
+
+#[test]
+fn open_retry_reasons_are_bounded_machine_tokens() {
+    use two_bot_cutover::tickets::StoreError;
+    let failures = [
+        Failure::Store(StoreError::NotFound),
+        Failure::Store(StoreError::InvalidRow("status")),
+        Failure::Store(StoreError::Domain(
+            two_bot_core::tickets::TicketError::AlreadyClaimed,
+        )),
+        Failure::Rest(DiscordError::Timeout),
+        Failure::Rest(DiscordError::RateLimited),
+        Failure::Rest(DiscordError::Rejected("rejected".into())),
+        Failure::Rest(DiscordError::Unavailable("unavailable".into())),
+        Failure::InvalidEvidence,
+        Failure::Timeout,
+        Failure::LaneBusy,
+        Failure::NoTicket,
+        Failure::TicketClaimedBy("1".into()),
+        Failure::TicketNotOpen,
+    ];
+    for failure in failures {
+        let reason = open_retry_reason(&failure);
+        assert!(
+            !reason.is_empty()
+                && reason.len() <= 64
+                && reason
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "bounded machine token: {reason:?}"
+        );
+    }
+    // Database failures reuse the shared `db_cause` vocabulary, whose own
+    // token shape is pinned in `two_bot_core::error_chain` tests.
 }
 
 #[tokio::test]

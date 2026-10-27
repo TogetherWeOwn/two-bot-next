@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Tests-only proposed-schedule preview handoff. The builder owns the combined implementation PR; deliberately failing acceptance tests must not merge alone.",
+  "baseCommit": "0b8f8c6427859a606c4be710224dc68649fabe00",
+  "branch": "test/schedule-preview-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/tests/schedule_preview_acceptance.rs",
+      "sha256": "2358c732882a1b057c90fb1c39b9faa587298c743339bf916475793068a98345",
+      "tests": 13
+    },
+    {
+      "path": "crates/bot/tests/support/schedule_preview_spies.rs",
+      "sha256": "62fe850b2f4318191fdffaea35696e4fcc867d9bc9002848afa597a31cf43257"
+    },
+    {
+      "path": "crates/bot/src/schedule_preview_dispatch_acceptance.rs",
+      "sha256": "1ce7fd5e0f4f9ff98b847a92147ebc81617373df5f86ad9aaac21e9eebb03cec",
+      "tests": 4
+    }
+  ],
+  "registration": {
+    "path": "crates/bot/src/command_runtime_tests.rs",
+    "module": "schedule_preview_dispatch_acceptance",
+    "protected": false,
+    "productionBehaviorChanged": false
+  },
+  "commands": {
+    "calculationAndEffects": "python3 scripts/cargo_cache.py run -- test -p two-bot --test schedule_preview_acceptance -- --nocapture",
+    "dispatchAndDiscovery": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot schedule_preview_dispatch_acceptance -- --nocapture",
+    "unchangedStrictControls": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot schedule_strict_decode -- --nocapture",
+    "unchangedAbsoluteControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test schedule_at_clock_boundaries --test schedule_absolute_registration -- --nocapture",
+    "unchangedCoreControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core scheduled -- --nocapture",
+    "format": "cargo fmt --all -- --check",
+    "inventory": "python3 scripts/ci/check-test-inventory.py",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref 0b8f8c6427859a606c4be710224dc68649fabe00"
+  },
+  "contract": {
+    "clock": "Fixed 2027-03-28T00:30:00.125Z; the clock advances by one minute per read to catch non-frozen calculations. UTC literals were independently derived. Relative and recurring preview must match ordinary create at the same clock.",
+    "private": "Real CommandRuntime must defer ephemerally and PATCH only that original response. Staff, activation and guild fences remain unchanged.",
+    "rendering": "Preview — not scheduled; invocation channel, canonical UTC plus Discord-local timestamp, one-off or actual recurring interval; disclose later create timing/availability revalidation. Bounded body excerpts must not silently hide the tail or metadata. No fabricated ID, message link or delivery promise.",
+    "effects": "Clock/ID/store boundaries are recording spies; real domain validators, actual path-included handler, actual executor and captured loopback REST. Zero attempted ID/store/read/write/audit/quota/queue admission for valid or invalid preview. The create control activates the same spies. Pool is closed with no connection attempt.",
+    "concurrency": "Two actual handler futures join on one current-thread runtime. A response gate witnesses both completion requests received before release; no sleep-based race or return-order oracle.",
+    "decoding": "Preview is one optional boolean. Wrong wire type and duplicate names, including false/false, refuse privately before ID or persistence. Omitted/false keep create success and rejection-audit behavior.",
+    "discovery": "The actual registry publication payload advertises one optional boolean preview and detailed runtime schedule help advertises it. Builder must regenerate command reference and preserve reference_docs parity controls in the same implementation PR.",
+    "limits": "Store-boundary spies are not a live SQL test. Direct full-dispatch tests use a closed pool; no staging/production database, live Discord or mutable environment is used. No independent cooldown/job-queue API exists in the baseline create handler: its quota/queue boundary is put_scheduled; no claim of testing a separate service is made."
+  },
+  "verification": {
+    "state": "prior_head_behavioral_red_observed_corrected_head_pending",
+    "priorHead": "7118bafcc2405f15903a87568beffc6fede77465",
+    "priorRun": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40204366852",
+    "priorCoverageJob": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40204366852/job/121202072900",
+    "priorBehavioralResults": "Standalone target: 13 executed, 10 behavior-specific assertion failures, 3 controls passed. Preview fell through to actual create: minted IDs and store/audit/quota calls; concurrent witness captured 4 IDs and 2 writes. Dispatch: 3 intended missing-preview failures plus one incorrect new DM control expectation. Existing strict and absolute-time controls passed.",
+    "testCorrections": "Expose the included shared fixture module publicly to avoid 28 dead-code lint errors without a waiver. Preserve the real runtime's existing silent DM guild fence, rather than requiring a new DM response. No implementation changed and no existing controls were edited.",
+    "localCargo": "Five bounded-wrapper attempts across two runs refused admission with exit 75: no idle, below-budget slot; no per-worktree fallback. No local tests executed; refusal is NOT RED. Prior hosted assertions are real behavior evidence, but do not verify the corrected head.",
+    "offline": "Formatting, floor, inventory, secret-debug guard and diff whitespace checks passed. Baseline noncompiling pre-push checklist passed.",
+    "contextPack": "Invoked before push; failed during MCP initialization with RuntimeError: MCP server exited. No production callers changed; only test registration is edited.",
+    "nextAction": "Observe actual assertion failures and passing controls on this candidate before delivering a final immutable handoff. Builder must not start from unverified or compiler-failing evidence."
+  }
+}

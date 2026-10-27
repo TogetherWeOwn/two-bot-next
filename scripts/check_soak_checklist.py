@@ -544,7 +544,14 @@ def render(checklist):
             for item in entry.get("historical", []):
                 lines.append(f"- **Historical:** `{item['path']}` — {item['reason']}")
             lines.append("")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    toc = ["<!-- start-here -->", "**Start here — section map**", ""]
+    for heading in re.findall(r"^## (.+)$", text, re.M):
+        anchor = re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", heading.lower()))
+        toc.append(f"- [{heading}](#{anchor})")
+    toc += ["<!-- /start-here -->", ""]
+    return text.replace("# Parity soak checklist\n\n",
+                        "# Parity soak checklist\n\n" + "\n".join(toc) + "\n", 1)
 
 
 def main():

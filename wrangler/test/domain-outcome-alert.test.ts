@@ -481,6 +481,19 @@ test("a sustained receive gap tickets on the third consecutive sample", () => {
     "further gapped samples must not re-notify");
 });
 
+test("receive gap includes every classify-error variant in the classified sum", () => {
+  for (const kind of rustLabels("EVENTSUB_DELIVERY_KINDS").slice(5, -1)) {
+    let state = EMPTY_STATE;
+    for (let received = 1; received <= EVENTSUB_RECEIVE_GAP_SAMPLES; received++) {
+      state = ev([
+        `${RECEIVED_SERIES} ${received}`,
+        ...classifiedLines({ [kind]: received }),
+      ], state).state;
+      assert.deepEqual(state.firing, [], `${kind} is classified, not a receive gap`);
+    }
+  }
+});
+
 test("receive gap: partial families and negative gaps are no window", () => {
   const full = (received: number, classified: number) =>
     [`${RECEIVED_SERIES} ${received}`, ...classifiedLines({ notification: classified })];

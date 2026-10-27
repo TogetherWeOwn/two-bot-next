@@ -1,0 +1,48 @@
+{
+  "schema": "protected-acceptance/v1",
+  "repository": "TogetherWeOwn/two-bot-next",
+  "baseline_sha": "0b8f8c6427859a606c4be710224dc68649fabe00",
+  "branch": "test/giveaway-inspect-acceptance",
+  "protected_paths": [
+    {
+      "path": "crates/discord/tests/giveaway_inspect_acceptance.rs",
+      "sha256": "b328e0d28aed89ca1cef1788906637e00924a2573de918e3f7a5f19863dec831",
+      "test_count": 18
+    }
+  ],
+  "contract": {
+    "entrypoint": "/giveaway inspect id:<saved-id>",
+    "scope": "Private staff saved-state inspection in the invoking channel; static entry requirements, not per-member eligibility.",
+    "guards": ["existing configured guild", "existing automations feature", "Manage Guild", "saved guild and invoking channel before supplemental reads"],
+    "detail": ["stable ID", "bounded prize", "authorized saved channel/message reference", "saved lifecycle", "localized deadline", "entry and configured winner counts", "static requirements", "drawn is not announcement-confirmed"],
+    "entry_requirements": "One compact Requirements: line, consistent across public entry creation and private detail. Everyone when unrestricted; otherwise inert role IDs and minimum account/server ages.",
+    "no_effects": ["entry admission or budgets", "draw/reroll", "claim/refresh", "applied audit", "public send/edit", "member/channel/profile reads", "scheduled work"],
+    "privacy": ["indistinguishable unknown/foreign/other-channel miss", "no pre-draw nonce or claim capability", "no entry roster or member timestamps", "no raw provider/SQL errors", "mentions suppressed", "at most 2000 UTF-16 units"]
+  },
+  "commands": {
+    "focused_controller": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_inspect_acceptance -- --test-threads=1 --nocapture",
+    "focused_hosted_ci": "cargo test -p two-bot-discord --features db --locked --test giveaway_inspect_acceptance -- --test-threads=1 --nocapture",
+    "offline_new_behavior": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_inspect_acceptance registry_offers_explicit_inspect_without_losing_existing_verbs -- --exact --nocapture",
+    "baseline_controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_inspect_acceptance unchanged_ -- --test-threads=1 --nocapture",
+    "retained_timed_draw_controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_timed_draw_acceptance -- --test-threads=1 --nocapture"
+  },
+  "verification_at_publication": {
+    "valid_behavior_red": {
+      "evidence_head": "975b356b414ae7232ea95da6ab748c6c64a9d786",
+      "run_url": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40213772484",
+      "job_id": 121230431949,
+      "behavior_failures": 13,
+      "unchanged_controls_passed": 4,
+      "fixture_failures": 1,
+      "retained_timed_draw_controls_passed": 17,
+      "retained_controls_job_id": 121230431932
+    },
+    "reason": "This revision corrects one oracle fixture only: the repeated-inspection entry control now releases the seeded draw lease (claim_token/claimed_at) after the no-mutation snapshot and list controls and before the entry button, because entry admission is Closed while a draw lease is held. The lease stays seeded through every inspection and in every other test, and every assertion is preserved, including admitted == 1. Exact-head CI on the combined implementation head showed this test failing only at that admission witness (admitted 0); a production-shaped entry control passed in the same run. Local corrected-head execution was refused by the cargo pool (no idle, below-budget slot); refusal is not RED or GREEN. Do not release the Builder dependency until the corrected test executes green on the combined PR head.",
+    "passed": ["cargo fmt --all -- --check"],
+    "not_executed": ["focused Rust acceptance target (cargo pool refused: no idle, below-budget slot)", "retained Rust runtime controls", "workspace Rust tests", "workspace clippy"]
+  },
+  "expected_baseline_red": ["inspect mode absent from published command", "valid inspect returns invalid options instead of saved detail or unavailable", "entry posts omit static requirements"],
+  "controls": ["configured-guild refusal versus foreign-guild silence", "strict malformed-option rejection", "guild-scoped saved get/count", "existing create/entry/list/end/reroll behavior", "existing command verbs and Manage Guild default permission"],
+  "handoff": "Builder incorporates the immutable published commit and manifest-listed file byte-for-byte. Only the Test Author corrects defective oracles. Do not merge a deliberately red tests-only PR. The combined implementation PR must pass all tests and exact-head independent review.",
+  "limits": ["Shared InteractionRuntime and GiveawayRuntime path, not binary-private gateway execution proof", "DB cases require the guarded disposable bootstrap and fail if absent", "No production/staging reads or activation", "No new migration, grants, host scripts, hooks or timers", "Formatter consistency is observed at response boundaries, not enforced by source-text matching"]
+}

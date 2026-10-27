@@ -42,7 +42,28 @@ unparsable rows):
 - Announcements: the feed poller re-checks the gate on every tick and
   skips while a stored `0` stands (`feed_jobs.rs`).
 - Panels: self-role dispatch and recovery resolve the catalogue on every
-  interaction and sweep (`self_role_handlers.rs`).
+  interaction and sweep (`self_role_handlers.rs`). Catalogue changes and
+  deletes refuse until durable processing, terminal repair and unknown
+  exchanges drain. Admission takes a shared settings-revision lock and
+  rechecks the pinned snapshot revision, so a stale input cannot create work
+  after a catalogue edit commits. Unknown sends may deliberately block edits
+  indefinitely; restoring or bypassing them with SQL is not a safe undo.
+  Boot catalogue changes also require draining before restart. Panels are
+  excluded from the independently expiring ops overlay; use the settings API.
+
+Builder regression controls supplement the protected acceptance suites:
+
+- `settings_consumer_wiring_tests.rs` installs the real global reader in isolated
+  subprocesses and calls actual component, stale-control, reaction, admission,
+  recovery and fenced feed-registration entry points. Feed action counts follow
+  stored `1 → 0 → 1` ticks, then deletion back to boot.
+- `ticket_runtime_tests.rs` pins ops cooldown apply, clear and expiry at the same
+  database revision. Refresh compares effective values, not just that revision.
+- `self_role_catalogue_drain.rs` exercises catalogue edit/delete refusal,
+  processing and terminal/pending work, the admission/writer lock, and stale
+  admission after retirement in a disposable test database.
+- `self_role_ops_boundary.rs` and `ops-self-role-boundary.test.ts` pin exclusion
+  from ops ingest/read and PUT respectively.
 
 Service existence stays boot-gated by design: a boot-off feed poller
 registers no job and a boot-empty catalogue builds no self-role service,
@@ -50,7 +71,8 @@ so enabling from a boot-disabled deployment needs a restart (same reason
 `TWO_AUTOMOD` stays cold). Registration, the live-identity fence and boot
 validation are unchanged; feed and RSVP command dispatch re-check the live
 announcements gate per invocation (refusing with the disabled reply while a
-stored `0` stands) while publication and LFG stay boot-gated.
+stored `0` stands) while publication, LFG and the remaining announcement
+command surface stay boot-gated.
 
 ## Not covered here
 

@@ -26,6 +26,15 @@ Migration replay preserves populated legacy rows and the presence-based halt.
 Existing delivered rows stay delivered; no historical delivery is requeued.
 Legacy `rota_notice` rows are retained but excluded from claims/queue discovery.
 
+Migration `0460_audit_reconcile_cursor.sql` adds nullable TEXT
+`delivery_reconcile_before`, the floor of fully inspected recovery history.
+NULL means start at head; existing rows need no rewrite or requeue. It is
+separate from the immutable pre-POST `delivery_search_before`. Apply through
+the existing cutover runner before a cursor-aware binary. Backout deploys the
+previous binary with this additive column retained: do not drop the column or
+erase its progress. An older binary may rescan from head but remains fenced
+against a second ambiguous POST. No production migration is authorized here.
+
 ## Minimal downstream API
 
 Construct `AuditStore::new(&PgPool)`. Calls return `AuditStoreError`; they do not
@@ -92,18 +101,22 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   retries sort ahead of later arrivals. Uncertain read failures preserve a
   prior `discord_reconcile_scan_bound` classification so they cannot reset
   the bounded reconciliation budget.
-- Internal `bound_reconcile_scan(claim) -> ReconcileBound`: reconciliation
-  scans read at most 16 pages or run for 30 seconds per pass. The first bound
-  hit persists `discord_reconcile_scan_bound`, releases ownership and stamps
-  the fairness yield, leaving the row pending and reconciliation-only. The
-  next owner rescans from the head. If that pass also reaches either bound,
-  the store atomically quarantines with `ScanBoundExceeded`
-  (`discord_reconcile_scan_exhausted`). This two-hit state survives claims,
-  service restarts and intervening read errors, without a schema change or
-  any increment to the POST attempt count. Both transitions check the live
-  token/generation/lease after taking the row lock and retain the boundary,
-  nonce and acceptance evidence. A shallow marker can still reconcile after
-  the first bound hit; a deep row cannot rescan forever.
+- Internal `bound_reconcile_scan(claim, inspected_before) -> ReconcileBound`:
+  reconciliation scans read at most 16 pages or spend 30 seconds reading
+  history per pass. Under the row lock, a fully validated, marker-checked
+  floor at/above the original boundary must be numerically strictly older
+  than the saved cursor. Progress atomically checkpoints the floor, releases
+  ownership, stamps the fairness yield and resets the no-progress budget;
+  the next owner resumes below it, never from head. A bound with no new
+  floor retains the cursor and persists `discord_reconcile_scan_bound`;
+  a second consecutive no-progress bound quarantines `ScanBoundExceeded`
+  (`discord_reconcile_scan_exhausted`). Uncertain reads preserve the cursor
+  and first-strike evidence. All transitions check the live token, generation,
+  lease and absence of an accepted ID after taking the row lock, retaining
+  the original boundary, nonce and POST attempt count. A stale, expired,
+  reused, Send or accepted claim cannot checkpoint. Invalid/forward floors
+  are refused. Finite deep history converges across multiple claims without
+  permitting another POST.
 - `renew(claim) -> bool`: only a still-active owner can renew. An expired worker
   cannot revive a lease or affect a replacement owner.
 - `quarantine(claim, QuarantineReason) -> bool`: terminal hold with bounded

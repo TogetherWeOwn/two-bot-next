@@ -31,6 +31,7 @@ export const JOB_INTERVAL_SECONDS: Record<string, number> = {
   presence_probe: 3600,
   community_scorecard: 60,
   inactivity: 3600,
+  lfg_sweep: 60,
 };
 
 export const STALE_INTERVALS = 2;
@@ -311,7 +312,7 @@ export const HANDLER_SATURATED_SHARE = 0.01;
 /** Consecutive saturated handler windows before the ticket. */
 export const HANDLER_SATURATED_SAMPLES = 3;
 /** Fixed job labels for `two_bot_job_runs_total`, pinned to Rust `JOBS`. */
-export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"];
+export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "other"];
 /** Fixed outcomes for `two_bot_job_runs_total`, pinned to Rust `JOB_OUTCOMES`. */
 export const JOB_RUNS_OUTCOMES: readonly string[] = ["success", "failure"];
 /** Failed runs must exceed this share of a judged window... */
@@ -323,7 +324,7 @@ export const JOB_FAILURE_SHARE_MIN_FAILURES = 2;
 /** Fixed error classes for `two_bot_feed_fetch_errors_total`, pinned to Rust `FEED_FETCH_ERROR_CLASSES`. */
 export const FEED_FETCH_ERROR_CLASSES: readonly string[] = ["invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other"];
 /** Fixed kinds for `two_bot_eventsub_classified_total`, pinned to Rust `EVENTSUB_DELIVERY_KINDS`. */
-export const EVENTSUB_CLASSIFIED_KINDS: readonly string[] = ["challenge", "notification", "revocation", "tampered", "ignored", "other"];
+export const EVENTSUB_CLASSIFIED_KINDS: readonly string[] = ["challenge", "notification", "revocation", "tampered", "ignored", "invalid_secret", "invalid_header", "body_too_large", "bad_signature", "invalid_timestamp", "stale_timestamp", "invalid_body", "duplicate_keys", "wrong_subscription", "invalid_challenge", "invalid_callback", "invalid_broadcaster_id", "too_many_broadcasters", "other"];
 /** Consecutive valid samples with received deliveries ahead of classified ones before the ticket. */
 export const EVENTSUB_RECEIVE_GAP_SAMPLES = 3;
 /** Fixed verbs for `two_bot_moderation_enforcements_total`, pinned to Rust `MODERATION_VERBS`. */
@@ -405,6 +406,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "moderation_enforcement_failures", summary: `moderation enforcement failures increased between samples`, runbook: "runbook.md#alert-moderation-enforcement-failures", severity: "ticket" },
   { id: "voice_rest_stuck", summary: `voice REST attempt in flight past ${VOICE_REST_STUCK_SECONDS} s for ${VOICE_REST_STUCK_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-voice-rest-stuck", severity: "ticket" },
   { id: "voice_global_backoff_capped", summary: `voice global-backoff caps increased between samples`, runbook: "runbook.md#alert-voice-global-backoff-capped", severity: "ticket" },
+  { id: "gateway_drain_skips", summary: `gateway auxiliary drains skipped for schema gaps increased between samples`, runbook: "runbook.md#alert-gateway-drain-skips", severity: "ticket" },
 ];
 
 /**
@@ -567,6 +569,9 @@ export interface MetricsAlertState {
   retentionReplayNeeded?: number;
   /** False until a valid sample stores the retention baseline: the first sample never fires. */
   retentionReplayNeededSeen?: boolean;
+  /** Last valid auxiliary-drain skip count; legacy storage baselines first. */
+  gatewayDrainSkips?: number;
+  gatewayDrainSkipsSeen?: boolean;
   /** `two_bot_voice_dispatch_timeouts_total` at the last valid sample; absent in legacy storage. */
   voiceDispatchTimeouts?: number;
   /** False until a valid sample stores the dispatch-timeout baseline: the first sample never fires. */
@@ -2076,6 +2081,19 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (retentionSeen && retentionNow > prevRetention) firing.push(RETENTION_REPLAY_RULE);
   }
 
+  // Auxiliary XP skipped on a missing table/grant: ticket on growth, like
+  // retention. First sample/reset baselines; missing or invalid is no window.
+  const drainSkipsNow = exactSeries(gauge("two_bot_gateway_drain_skips_total"), {});
+  const prevDrainSkips = prev.gatewayDrainSkips ?? 0;
+  const drainSkipsSeen = prev.gatewayDrainSkipsSeen ?? false;
+  let gatewayDrainSkips = prevDrainSkips;
+  let gatewayDrainSkipsSeen = drainSkipsSeen;
+  if (drainSkipsNow !== undefined) {
+    gatewayDrainSkips = drainSkipsNow;
+    gatewayDrainSkipsSeen = true;
+    if (drainSkipsSeen && drainSkipsNow > prevDrainSkips) firing.push("gateway_drain_skips");
+  }
+
   // Voice dispatch turns past the observe bound (one ticket per slow turn):
   // any increase of `two_bot_voice_dispatch_timeouts_total` between two valid
   // samples means a dispatch turn ran past the 60 s observe bound. The turn
@@ -2700,7 +2718,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (backoffCappedSeen && backoffCappedNow > prevBackoffCapped) firing.push(BACKOFF_CAPPED_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, restRefusalInvalid, restRefusalRejected, restRefusalSeen, restPendingStuckStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, voiceLiveSelfHeal, voiceLiveSelfHealSeen, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, retentionReplayNeeded, retentionReplayNeededSeen, voiceDispatchTimeouts, voiceDispatchTimeoutsSeen, voiceWatchdogStucks, voiceWatchdogStucksSeen, voiceHaltRecoveries, voiceHaltRecoveriesSeen, restBreakerOpens, restBreakerOpensSeen, restGlobalPauses, restGlobalPausesSeen, feedFetchErrors, feedFetchErrorsSeen, eventsubReceiveGapStreak, reconcilePriorFailed, reconcilePriorFailedPassHealthy, reconcilePriorFailedPassPending, reconcilePriorFailedPassFailed, reconcilePriorFailedSeen, automodSanctionRefused, automodSanctionRefusedSeen, moderationEnforcementFailures, moderationEnforcementFailuresSeen, voiceRestStuckStreak, voiceBackoffCapped, voiceBackoffCappedSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak, gatewayLatencyLast, gatewayLatencyDeadStreak, gatewayLatencySeen, gatewayReconnects, gatewayReconnectsSeen, gatewayReconnectStreak, handlerBuckets, handlerStreak, jobShareBase, jobShareSeen }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, restRefusalInvalid, restRefusalRejected, restRefusalSeen, restPendingStuckStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, voiceLiveSelfHeal, voiceLiveSelfHealSeen, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, retentionReplayNeeded, retentionReplayNeededSeen, gatewayDrainSkips, gatewayDrainSkipsSeen, voiceDispatchTimeouts, voiceDispatchTimeoutsSeen, voiceWatchdogStucks, voiceWatchdogStucksSeen, voiceHaltRecoveries, voiceHaltRecoveriesSeen, restBreakerOpens, restBreakerOpensSeen, restGlobalPauses, restGlobalPausesSeen, feedFetchErrors, feedFetchErrorsSeen, eventsubReceiveGapStreak, reconcilePriorFailed, reconcilePriorFailedPassHealthy, reconcilePriorFailedPassPending, reconcilePriorFailedPassFailed, reconcilePriorFailedSeen, automodSanctionRefused, automodSanctionRefusedSeen, moderationEnforcementFailures, moderationEnforcementFailuresSeen, voiceRestStuckStreak, voiceBackoffCapped, voiceBackoffCappedSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak, gatewayLatencyLast, gatewayLatencyDeadStreak, gatewayLatencySeen, gatewayReconnects, gatewayReconnectsSeen, gatewayReconnectStreak, handlerBuckets, handlerStreak, jobShareBase, jobShareSeen }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

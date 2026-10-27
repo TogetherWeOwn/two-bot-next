@@ -14,9 +14,29 @@ Protected files (SHA-256):
 | File | SHA-256 |
 | --- | --- |
 | `crates/bot/src/voice_ownership_receipt_acceptance_tests.rs` | `c1ce2668ed26d520d598f838725d071efdcf70fc4861d8023e664840228fc5bc` |
-| `crates/bot/src/voice_worker_reply_acceptance_tests.rs` | `66282c127eaf2ba1356c49d8684845ebeb63e7a10a5563f1bf27cf069e93d372` |
+| `crates/bot/src/voice_worker_reply_acceptance_tests.rs` | `f64e6f7b6ca4719cb2c6a4775acc2fbcec1afca1ac54d0375e16544cdfeda998` |
 
 Test-author correction: closed-worker delivery calls the handler directly so snapshot publication cannot respawn the deliberately closed inbox.
+
+### Backpressure constructor compatibility correction
+
+Based on implementation head `f9f478f205477ba945569318f84ed71c098c08ad`,
+public branch `test/voice-worker-backpressure-fixture` adds only
+`backpressure: ActorInboxBackpressure::default()` to `stalled_runtime`'s
+`GuildActor` constructor. The existing `live` snapshot, `tx` inbox, all ten
+worker-reply tests and every assertion remain unchanged. The worker-reply hash
+above replaces `66282c127eaf2ba1356c49d8684845ebeb63e7a10a5563f1bf27cf069e93d372`;
+the ownership-receipt fixture is unchanged. Import the corrected fixture and
+this manifest verbatim into the implementation branch; no separate PR is opened.
+
+Before correction, the focused worker-reply library command below exited 101
+with exactly one E0063 error: the constructor lacked `backpressure`. After the
+interface-only correction, the same command passed **10/10**, and the focused
+ownership-receipt library command passed **14/14** (zero ignored). Both used the
+bounded Cargo wrapper, which admitted both runs without a pool refusal.
+Formatting and floor guard passed. These results supersede the historical pool
+refusal below for this combined head, not the original RED baseline. No full
+workspace suite, deployment, live Discord or database test was run.
 
 Do not edit, skip, or weaken these files. Return a mistaken assertion or a
 needed trait-adapter correction to the test author. Preserve the hashes before

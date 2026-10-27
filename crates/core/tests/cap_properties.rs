@@ -115,8 +115,11 @@ proptest! {
         // can send, so the wire round trip must preserve the bounds exactly.
         let wire = serde_json::to_value(&definitions).expect("commands serialize");
         let decoded: Vec<CommandDefinition> =
-            serde_json::from_value(wire).expect("commands deserialize");
-        prop_assert_eq!(&decoded, &definitions);
+            serde_json::from_value(wire.clone()).expect("commands deserialize");
+        prop_assert_eq!(
+            serde_json::to_value(&decoded).expect("commands reserialize"),
+            wire
+        );
         for (option, min, max) in
             [("in-minutes", 1i64, 525_600i64), ("every-minutes", 60i64, 525_600i64)]
         {
