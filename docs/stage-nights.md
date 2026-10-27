@@ -2,8 +2,8 @@
 
 Status: **Proposed, design only**, 2026-10-27. Review **2026-11-02**.
 **Recommend no build.** No authorized community host has described unmanaged
-audio at TWO's scale, and open voice plus existing moderation is the working
-alternative. This page authorizes no command, schema, migration, Stage creation
+audio at TWO's scale, and open voice plus existing moderation is the alternative
+to prove first. This page authorizes no command, schema, migration, Stage creation
 or management, live experiment, activation or new permission. Merge accepts
 documentation, not host intent or a security boundary. A negative finding is the
 expected outcome of this card; it does not condemn the voice feature.
@@ -30,7 +30,7 @@ accepted contract, not Stage count or event attendance.
 
 ## 2. Source trace: zero Stage management, existing alternative
 
-Source inspected at `7046b8eda953a20d129291accd23f6b24a5a0ad0`; not deployment
+Source inspected at `bb19cbda57594dfd22c829d5219a84fdb015f0ab`; not deployment
 verification.
 
 - **No Stage lifecycle code.** `ChannelType::GuildStageVoice` appears only as a
@@ -193,7 +193,7 @@ DB only, never staging or production.
 | `SAVED` | saved / false / none |
 | `REQUESTED`, `OBSERVED` | requested, observed / false / inspect_stage |
 | `PERMISSION_DENIED` | refused / false / operator_fix_permissions |
-| `CHANNEL_BUSY`, `CAP_REACHED`, `NOT_ELIGIBLE`, `NOT_AVAILABLE` | refused / false / none |
+| `CHANNEL_BUSY`, `CAP_REACHED`, `NOT_ELIGIBLE` | refused / false / none |
 | `STALE_REVIEW`, `CONFLICT` | refused / false / new_review, inspect_original_operation respectively |
 | `PENDING` | unknown / false / reconcile_read_only |
 | `UNAVAILABLE` | unknown_read / true / retry_read_only |
