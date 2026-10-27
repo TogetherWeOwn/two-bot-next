@@ -427,14 +427,21 @@ async fn prefix_state(pool: &PgPool) -> (String, String) {
 
 // All options still reach production decoding. Count acquisitions on a pool
 // built from the guarded fixture's options, not a mock store that can prefilter.
+// sqlx runs `after_connect` for a new connection and `before_acquire` for idle
+// reuse, so counting both observes every acquisition.
 async fn counted_pool(db: &TestDatabase) -> (PgPool, Arc<AtomicU64>) {
     let reads = Arc::new(AtomicU64::new(0));
-    let observed = reads.clone();
+    let connected = reads.clone();
+    let reused = reads.clone();
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(5))
-        .after_acquire(move |_, _| {
-            observed.fetch_add(1, Ordering::SeqCst);
+        .after_connect(move |_, _| {
+            connected.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        })
+        .before_acquire(move |_, _| {
+            reused.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(true) })
         })
         .connect_with(db.pool().connect_options().as_ref().clone())
@@ -1026,10 +1033,18 @@ async fn custom_prefix_acceptance_closed_database_is_unavailable_not_no_matching
         .await
         .expect("drop outage fixture through healthy owner pool");
     assert_eq!(before, after);
+    // The unfiltered outage copy is the existing shared management failure;
+    // a filter must classify the same failed read the same way.
+    assert_eq!(
+        reply(&filtered),
+        reply(&unfiltered),
+        "filtered outage matches unfiltered"
+    );
     for requests in [filtered, unfiltered] {
         let content = reply(&requests);
+        let lower = content.to_ascii_lowercase();
         assert!(
-            content.to_ascii_lowercase().contains("unavailable"),
+            lower.contains("unavailable") || lower.contains("try again"),
             "honest failed read: {content}"
         );
         assert!(!content.to_ascii_lowercase().contains("no match"));
