@@ -79,10 +79,11 @@ const EMITTER_SOURCES: [(&str, &str); 11] = [
 
 /// Every scrape job with a supervised emitter, paired with the file that
 /// schedules it. The file must name the job and keep the framework marker.
-const LIVE_JOB_EMITTERS: [(&str, &str); 14] = [
+const LIVE_JOB_EMITTERS: [(&str, &str); 15] = [
     ("counter", "website_jobs.rs"),
     ("rank", "website_jobs.rs"),
     ("scheduled_events", "website_jobs.rs"),
+    ("event_voice", "website_jobs.rs"),
     ("settings", "settings_jobs.rs"),
     ("presence_probe", "community_jobs.rs"),
     ("community_scorecard", "community_jobs.rs"),
@@ -130,10 +131,11 @@ const REGISTER_SINKS: [&str; 8] = [
 /// Entries the shared `NAMES` loop schedules. Pinned inside the array block
 /// so a quiet removal fails here even when the name still appears elsewhere
 /// in the file.
-const NAMES_ENTRIES: [&str; 4] = [
+const NAMES_ENTRIES: [&str; 5] = [
     "\"counter\"",
     "\"rank\"",
     "\"scheduled_events\"",
+    "\"event_voice\"",
     "settings_jobs::NAME",
 ];
 

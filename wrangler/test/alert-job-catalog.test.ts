@@ -211,14 +211,14 @@ test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
     "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages",
-    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "other",
+    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "event_voice", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
   // presence.rs:36, community.rs:61, inactivity.rs:27.
   assert.deepEqual(Object.fromEntries(RUST), {
     counter: 60, rank: 600, scheduled_events: 600,
     presence_probe: 3600, community_scorecard: 60, inactivity: 3600,
-    lfg_sweep: 60,
+    lfg_sweep: 60, event_voice: 60,
   });
 });
 

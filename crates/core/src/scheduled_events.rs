@@ -30,6 +30,10 @@
 /// Poll cadence (legacy `SCHEDULED_EVENTS_INTERVAL_MS`).
 pub const SCHEDULED_EVENTS_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
+/// Event-voice catch-up ticker cadence. The Worker alert catalog parses this
+/// constant, so it lives in core beside the other job cadences.
+pub const EVENT_VOICE_INTERVAL_MS: u64 = 60 * 1000;
+
 /// Snapshot caps (bounded-claim decision §4): at most 100 rows per snapshot,
 /// and per-field `name` ≤ 100 / `description` ≤ 1000 / `channel_id` ≤ 32
 /// chars. Every violation refuses the whole snapshot (`None`, surfaced as

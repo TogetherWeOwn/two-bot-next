@@ -2968,9 +2968,10 @@ mod tests {
         // Together these shift eight entries between those classes. The
         // assistant credential binding and required event-voice category
         // slices add two env-only keys
-        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
+        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The event-voice
+        // opt-out slice adds one hot key (TWO_EVENT_VOICE_OPT_OUT_EVENT_IDS).
         for (class, expected) in [
-            (SettingClass::Hot, 52),
+            (SettingClass::Hot, 53),
             (SettingClass::Cold, 18),
             (SettingClass::EnvOnly, 66),
         ] {

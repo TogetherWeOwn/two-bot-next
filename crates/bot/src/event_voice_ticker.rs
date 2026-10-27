@@ -17,7 +17,7 @@ use two_bot_discord::executor::EventVoiceResponse;
 #[cfg(test)]
 use two_bot_discord::ActionExecutor;
 
-pub const INTERVAL_MS: u64 = 60_000;
+pub const INTERVAL_MS: u64 = two_bot_core::EVENT_VOICE_INTERVAL_MS;
 pub const LIVE_CAP: usize = 10;
 const MINUTE: i64 = 60_000;
 const DAY: i64 = 24 * 60 * MINUTE;

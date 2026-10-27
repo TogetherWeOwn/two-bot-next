@@ -51,7 +51,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
-| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 17 × 7 = 119 series |
+| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 18 × 7 = 126 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence`, `cancelled` or `refused` (create admission refused: cap or rolling burst); retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile changes: newly queued deletes/ownership handoffs and actual access-state transitions; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`. Repeated unchanged passes do not increment these counters |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
@@ -167,9 +167,9 @@ The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
 `community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
-`member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `settings` and `scheduled_messages`
+`member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `event_voice`, `settings` and `scheduled_messages`
 (the two 15 s tickers). The community, audit, recovery, feed, unban-sweep,
-automod-expiry, LFG lifecycle and ticker names may be parked by configuration.
+automod-expiry, LFG lifecycle, event-voice and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -309,7 +309,7 @@ as dynamic labels.
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
   `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `self_role_recovery`,
-  `member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `other`; `outcome` is `success` or `failure`.
+  `member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `event_voice`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `member_unban_sweep` is the 30 s unban sweep. `automod_expiry` is the 60 s
@@ -317,11 +317,13 @@ as dynamic labels.
   `lfg_sweep` is the 60 s bounded LFG lifecycle pass (at most 20 candidates,
   announcements and boot identity gates required); row failures continue the
   batch with a warning. See [LFG lifecycle](lfg-port.md#bounded-lifecycle-maintenance).
+  `event_voice` is the 60 s event voice-channel catch-up ticker (create window,
+  reconcile and per-route 429 pause); it is parked with the other website jobs.
   `settings` is the DB-only 15 s `guild_settings` version poll.
 - `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
   `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
   `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
-  17 jobs has one series per class (119 total); exactly the latest failure's class
+  18 jobs has one series per class (126 total); exactly the latest failure's class
   is `1`, and every class is `0` before a failure or after success. Unknown job
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`

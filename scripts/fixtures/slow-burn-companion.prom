@@ -21,6 +21,7 @@ two_bot_job_last_success_timestamp_seconds{job="self_role_recovery"} 0
 two_bot_job_last_success_timestamp_seconds{job="member_unban_sweep"} 0
 two_bot_job_last_success_timestamp_seconds{job="automod_expiry"} 0
 two_bot_job_last_success_timestamp_seconds{job="lfg_sweep"} 0
+two_bot_job_last_success_timestamp_seconds{job="event_voice"} 0
 two_bot_job_last_success_timestamp_seconds{job="other"} 0
 two_bot_job_consecutive_failures{job="invite_snapshot"} 0
 two_bot_job_consecutive_failures{job="session_checkpoint"} 0
@@ -38,6 +39,7 @@ two_bot_job_consecutive_failures{job="self_role_recovery"} 0
 two_bot_job_consecutive_failures{job="member_unban_sweep"} 0
 two_bot_job_consecutive_failures{job="automod_expiry"} 0
 two_bot_job_consecutive_failures{job="lfg_sweep"} 0
+two_bot_job_consecutive_failures{job="event_voice"} 0
 two_bot_job_consecutive_failures{job="other"} 0
 two_bot_job_last_error_class{job="invite_snapshot",class="database"} 0
 two_bot_job_last_error_class{job="invite_snapshot",class="rest"} 0
@@ -145,12 +147,19 @@ two_bot_job_last_error_class{job="automod_expiry",class="panic"} 0
 two_bot_job_last_error_class{job="automod_expiry",class="feed"} 0
 two_bot_job_last_error_class{job="automod_expiry",class="recovery_required"} 0
 two_bot_job_last_error_class{job="lfg_sweep",class="database"} 0
+two_bot_job_last_error_class{job="event_voice",class="database"} 0
 two_bot_job_last_error_class{job="lfg_sweep",class="rest"} 0
+two_bot_job_last_error_class{job="event_voice",class="rest"} 0
 two_bot_job_last_error_class{job="lfg_sweep",class="configuration"} 0
+two_bot_job_last_error_class{job="event_voice",class="configuration"} 0
 two_bot_job_last_error_class{job="lfg_sweep",class="timeout"} 0
+two_bot_job_last_error_class{job="event_voice",class="timeout"} 0
 two_bot_job_last_error_class{job="lfg_sweep",class="panic"} 0
+two_bot_job_last_error_class{job="event_voice",class="panic"} 0
 two_bot_job_last_error_class{job="lfg_sweep",class="feed"} 0
+two_bot_job_last_error_class{job="event_voice",class="feed"} 0
 two_bot_job_last_error_class{job="lfg_sweep",class="recovery_required"} 0
+two_bot_job_last_error_class{job="event_voice",class="recovery_required"} 0
 two_bot_job_last_error_class{job="other",class="database"} 0
 two_bot_job_last_error_class{job="other",class="rest"} 0
 two_bot_job_last_error_class{job="other",class="configuration"} 0
@@ -599,7 +608,9 @@ two_bot_job_runs_total{job="member_unban_sweep",outcome="failure"} 0
 two_bot_job_runs_total{job="automod_expiry",outcome="success"} 0
 two_bot_job_runs_total{job="automod_expiry",outcome="failure"} 0
 two_bot_job_runs_total{job="lfg_sweep",outcome="success"} 0
+two_bot_job_runs_total{job="event_voice",outcome="success"} 0
 two_bot_job_runs_total{job="lfg_sweep",outcome="failure"} 0
+two_bot_job_runs_total{job="event_voice",outcome="failure"} 0
 two_bot_job_runs_total{job="other",outcome="success"} 0
 two_bot_job_runs_total{job="other",outcome="failure"} 0
 two_bot_feed_fetch_errors_total{error_class="invalid_source"} 0

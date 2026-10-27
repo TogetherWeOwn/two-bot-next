@@ -337,7 +337,7 @@ Each label owns independent `two_bot_job_runs_total{job,outcome}`,
 `JOBS` in `metrics.rs`). Success in one label never clears another label's
 streak. The first four labels below have no `JOB_INTERVAL_SECONDS` cadence
 entry, so staleness tickets via `job_unknown_stale` instead of `job_stale`.
-`lfg_sweep` has a 60-second cadence entry and uses `job_stale`.
+`lfg_sweep` and `event_voice` have 60-second cadence entries and use `job_stale`.
 
 | Job label | Producer (stable anchor) | Meaning |
 | --- | --- | --- |
@@ -346,6 +346,7 @@ entry, so staleness tickets via `job_unknown_stale` instead of `job_stale`.
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
 | `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
 | `lfg_sweep` | `lfg_jobs.rs` (`register`) | Bounded LFG lifecycle sweep every 60 s under announcement/identity gates; at most 20 candidates, row-local failures continue, and success does not prove every row or message refresh settled; 60 s `job_stale` cadence |
+| `event_voice` | `website_jobs.rs` (`Kind::EventVoice`, `event_voice_ticker.rs`) | Event voice-channel catch-up ticker every 60 s; fail-closed category preflight, bounded fresh source read, claim-before-POST creation, guarded reconcile; a success tick need not create or settle every event; 60 s `job_stale` cadence |
 
 ## Alert rules
 

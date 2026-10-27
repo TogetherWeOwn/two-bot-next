@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 788 samples
+## Cardinality budget: 799 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -37,8 +37,8 @@ table and the test are updated together.
 | `two_bot_voice_join_to_move_seconds` | 11 | label-free; 8 buckets + `+Inf` + sum + count |
 | `two_bot_rest_requests_total{route,result}` | 180 | 30 route templates x 6 results |
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
-| job runs, timestamps, failure streaks | 68 | 17 jobs x (2 outcomes + timestamp + streak) |
-| `two_bot_job_last_error_class{job,class}` | 119 | 17 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
+| job runs, timestamps, failure streaks | 72 | 18 jobs x (2 outcomes + timestamp + streak) |
+| `two_bot_job_last_error_class{job,class}` | 126 | 18 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
 | voice ops, reconcile, dead-letters, state | 60 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + live-not-ready age + live self-heals + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries + inbox-turn bound + inbox turns + dispatch turns + inbox-overflow drops + opt-in queue-overflow drops |
 | `two_bot_voice_join_occupancy_total{occupancy}` | 8 | seeding-TEST occupancy buckets `0`-`6` + `7+`; fixed vocabulary, no per-channel/member labels |
 | pool gauges | 4 | configured, size, idle, max |
@@ -132,7 +132,7 @@ So shedding means doing less work per dispatch, in this order:
 5. Voice reconcile detail (plan counts only; outcomes stay counted).
 6. Never shed: session lifecycle lines, checkpoint commits, disconnect and
    missed-events counters, failure classes, or the `other` catchall. `feeds`,
-   `self_role_recovery`, `member_unban_sweep`, `automod_expiry` and `lfg_sweep` completion
+   `self_role_recovery`, `member_unban_sweep`, `automod_expiry`, `lfg_sweep` and `event_voice` completion
    metrics also never shed; park these jobs only through their existing
    feature configuration, not the log guard.
 

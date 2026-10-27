@@ -129,6 +129,7 @@ pub const JOBS: &[&str] = &[
     "member_unban_sweep",
     "automod_expiry",
     "lfg_sweep",
+    "event_voice",
     "other",
 ];
 pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
@@ -160,7 +161,7 @@ impl JobErrorClass {
     }
 }
 
-/// Complete error-class allowlist. With `JOBS`, this yields 119 fixed series.
+/// Complete error-class allowlist. With `JOBS`, this yields 126 fixed series.
 pub const JOB_ERROR_CLASSES: &[JobErrorClass] = &[
     JobErrorClass::Database,
     JobErrorClass::Rest,
@@ -3039,7 +3040,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 17);
+            assert_eq!(JOBS.len(), 18);
             assert!(!text.contains("unknown_job"));
         }
     }
@@ -3086,7 +3087,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 17);
+            assert_eq!(JOBS.len(), 18);
             assert!(!text.contains("unknown_job"));
         }
     }

@@ -15,7 +15,8 @@ use two_bot_core::{
     voice_create_admission::CreateAdmissionConfig,
     write_counter, write_rank_snapshot, Config, JobGate, RankHeal, RankRungProblem,
     RawScheduledEvent, RosterMember, ScheduledEventsSkip, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    EVENT_VOICE_INTERVAL_MS, LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS,
+    SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
@@ -177,7 +178,7 @@ fn cadence(kind: Kind) -> Duration {
         Kind::Counter => LIVE_COUNTER_INTERVAL_MS,
         Kind::Rank => RANK_SNAPSHOT_INTERVAL_MS,
         Kind::Events => SCHEDULED_EVENTS_INTERVAL_MS,
-        Kind::EventVoice => event_voice_ticker::INTERVAL_MS,
+        Kind::EventVoice => EVENT_VOICE_INTERVAL_MS,
     };
     #[cfg(test)]
     let millis = {

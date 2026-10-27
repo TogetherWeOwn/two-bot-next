@@ -440,7 +440,8 @@ pub use scheduled::{
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
-    ScheduledEventMirror, ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+    ScheduledEventMirror, ScheduledEventsSkip, EVENT_VOICE_INTERVAL_MS,
+    SCHEDULED_EVENTS_INTERVAL_MS,
 };
 #[cfg(feature = "db")]
 pub use scheduled_store::{

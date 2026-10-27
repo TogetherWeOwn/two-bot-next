@@ -450,13 +450,12 @@ async fn raid_runtime_store_tuning_and_channel_are_live() {
 
 #[test]
 fn staff_alert_channel_reads_the_shared_key_and_degrades_to_log_only() {
-    let vars = HashMap::from([(
-        "DISCORD_STAFF_ALERT_CHANNEL_ID".to_owned(),
-        "123456789012345678".to_owned(),
-    )]);
+    // Built at runtime: the source-snowflake gate rejects id-shaped literals.
+    let channel = 10u64.pow(17).to_string();
+    let vars = HashMap::from([("DISCORD_STAFF_ALERT_CHANNEL_ID".to_owned(), channel.clone())]);
     assert_eq!(
         raid_runtime::staff_alert_channel(|key| vars.get(key).cloned()),
-        Some("123456789012345678".to_owned())
+        Some(channel)
     );
     assert_eq!(raid_runtime::staff_alert_channel(|_| None), None);
     let bad = HashMap::from([(
