@@ -966,6 +966,25 @@ pub fn feed_pending_evidence_refusal_text(
     )
 }
 
+/// Private duplicate-add receipt. Only a command-safe saved id and the observed
+/// lifecycle state leave the store; no source or delivery capability is echoed.
+/// A malformed restored id is not truncated into a different command target.
+#[must_use]
+pub fn feed_existing_text(id: &str, enabled: bool) -> String {
+    let state = if enabled { "enabled" } else { "paused" };
+    if validate_id(id).is_err() {
+        return format!(
+            "A feed relay is already saved and {state}. No relay was created or changed. \
+             Use /feed-list to inspect saved relays."
+        );
+    }
+    let command = if enabled { "feed-pause" } else { "feed-resume" };
+    format!(
+        "Feed relay already saved: `{id}` is {state}. No relay was created or changed. \
+         Inspect with `/feed-inspect id:{id}` or use `/{command} id:{id}`."
+    )
+}
+
 /// Pause/resume confirmations. The relay id is interpolated by the caller so
 /// the member can copy the stable id back into `/feed-resume`, `/feed-remove`
 /// or `/feed-list page:<n>`. The supplied id renders through `inert` inside
