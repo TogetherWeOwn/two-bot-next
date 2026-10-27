@@ -26,10 +26,10 @@ use two_bot_core::{
         accepted_text_trigger, builtin_command_names, format_command_list_page,
         format_draft_preview, format_inspect_miss, format_inspect_preview, format_inspect_summary,
         format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
-        invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
-        AutomationMessageAcceptance, EditOutcome, EditPatch, InspectView, PutCommandInput,
-        StoredCommand, TemplateContext, ToggleOutcome, TriggerPatch, INVALID_COMMAND_LIST_PAGE,
-        MAX_INSPECT_ARGUMENT_UNITS,
+        invalid_inspect_view_reply, render_template, validate_inspect_name, validate_template,
+        AuditRecord, AutomationMessageAcceptance, EditOutcome, EditPatch, InspectView,
+        PutCommandInput, StoredCommand, TemplateContext, ToggleOutcome, TriggerPatch,
+        INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -37,6 +37,7 @@ use two_bot_core::{
 
 use crate::{
     automation_admission::ActorCooldowns,
+    custom_command_prefix_render::{render_prefix_response, PrefixRenderRefusal},
     interactions::{
         publish_commands, refusal_response, route_interaction, text_response, RoutedInteraction,
     },
@@ -319,9 +320,17 @@ impl CustomCommandRuntime {
                             server: server.to_owned(),
                             channel: format!("<#{}>", channel.id),
                         });
-                let rendered = context
-                    .as_ref()
-                    .and_then(|context| render_template(&row.template, context).ok());
+                // A stored row can predate or bypass definition-time
+                // validation (import, corruption): re-validate before
+                // rendering, so invalid text never renders literally in
+                // front of members. The pure renderer stays literal; this
+                // boundary is what refuses. A refusal takes the existing
+                // content-free unavailable completion and `render_failed`
+                // fact below, and the saved row is left untouched.
+                let rendered = context.as_ref().and_then(|context| {
+                    validate_template(&row.template).ok()?;
+                    render_template(&row.template, context).ok()
+                });
                 let (result, reason) = match rendered {
                     Some(content) => (self.complete(interaction, &content).await, None),
                     None => (
@@ -451,20 +460,24 @@ impl CustomCommandRuntime {
         // The committed attempt is never cleared, including on cancellation,
         // rendering/audit failure, or an ambiguous network response. Nonce
         // enforcement is additional protection, not our durable replay guard.
-        let rendered = guild_name
-            .ok_or(CustomCommandError::Context)
-            .and_then(|server| {
-                render_template(
-                    &row.template,
-                    &TemplateContext {
-                        user: format!("<@{}>", message.author.id),
-                        username: message.author.name.clone(),
-                        server: server.to_owned(),
-                        channel: format!("<#{}>", message.channel_id),
-                    },
-                )
-                .map_err(|_| CustomCommandError::Render)
-            });
+        // Same stored-row re-validation as the slash boundary: an imported
+        // or corrupt template refuses as `Render` before any send, keeping
+        // the durable attempt/result pair and leaving the row untouched.
+        // The context check stays first, preserving `context_unavailable`;
+        // that ordering is pinned by the helper's unit tests.
+        let user_mention = format!("<@{}>", message.author.id);
+        let channel_mention = format!("<#{}>", message.channel_id);
+        let rendered = render_prefix_response(
+            guild_name,
+            &row.template,
+            &user_mention,
+            &message.author.name,
+            &channel_mention,
+        )
+        .map_err(|refusal| match refusal {
+            PrefixRenderRefusal::Context => CustomCommandError::Context,
+            PrefixRenderRefusal::Render => CustomCommandError::Render,
+        });
         let (result, reason) = match rendered {
             Ok(content) => {
                 let result = match self
