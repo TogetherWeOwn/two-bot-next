@@ -164,6 +164,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 ## Voice
 
 - [Room spec](voice-rooms.md)
+- [Presets proposal](voice-presets-spec.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
