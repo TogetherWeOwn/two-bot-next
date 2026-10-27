@@ -58,8 +58,11 @@ verification. Start with the [operator guide](onboarding-operator-guide.md),
 - The runtime image carries only the release binary and CA data (`Dockerfile`
   header), so no system fonts or image tools, and targets the 256 MiB `lite` tier
   ([ADR 0001](adr/0001-discord-framework.md)). No render measurement exists.
-- `welcome()` reads no per-member
-  [opt-out](privacy.md#member-opt-out-per-user-per-guild) state; B adds that check.
+- Opt-out is already enforced: the prompt guard (`begin_prompt`,
+  `crates/core/src/onboarding_store.rs:159-162`) returns no guard for a
+  [suppressed](privacy.md#member-opt-out-per-user-per-guild) pair and `welcome()`
+  sends nothing (`crates/bot/src/onboarding.rs:721-726`). That locked check is the
+  authoritative gate today; B must not weaken or bypass it.
 
 ## 3. Rendering contract (no new spend, no external service)
 
@@ -75,7 +78,7 @@ inside the container without a new service, B is deferred (§1).
 | Budget | Render runs off the async threads (blocking pool), **250 ms CPU**, **500 ms wall**, one permit (non-blocking try-acquire), working memory <=8 MiB, measured on staging before enabling. |
 | Cache | Template decoded once. The member image is never cached or written to disk or the database; it exists only in the send request. |
 | Rate | At most 6 images per guild per rolling minute; excess joins get the text welcome (`RATE_LIMITED`). |
-| Order | Render after the fresh-member read and before the prompt guard, so the guard is never held across a render. |
+| Order | An advisory suppression read first (skip render and name read if suppressed), then render, then the existing prompt guard, so the guard is never held across a render. The guard re-gates the send: an opt-out landing during the render sends no image and no welcome. |
 
 **Fallback is the only failure mode.** Every render or asset problem yields the
 ordinary text welcome in the same single message, with no extra delay beyond the
@@ -126,9 +129,11 @@ send is one message: text, picker and image together; never a follow-up post.
   a member image. Adding it requires its own proposal, CISO disposition and an
   explicit privacy decision; it is never a default or a hidden option of B.
 - Opt-out: fail closed, as [privacy](privacy.md) says opted-out members get no
-  welcome prompts. A stored per-guild opt-out sends nothing (`PRIVACY_OPTED_OUT`).
-  A failed lookup sends nothing and retries the lookup (`UNAVAILABLE`). Option A
-  keeps today's behavior; this check is part of B only.
+  welcome prompts. A stored per-guild opt-out sends nothing (`PRIVACY_OPTED_OUT`),
+  as the existing guard already does (§2). B adds only an advisory pre-render read
+  of that state so the name is never rendered for an opted-out member. A failed
+  advisory read sends nothing and retries the lookup (`UNAVAILABLE`). Option A
+  keeps today's behavior.
 - B stores **nothing new**: no image, name, hash, cache or receipt. The existing
   prompt marker is unchanged. The sent image is Discord-hosted message content,
   like the text mention already is; bot-side erasure does not delete Discord
@@ -176,21 +181,22 @@ where one is sent, the text body is unchanged. Reason and next_action are stable
 | W03 | Other guild | 0 messages from this feature (existing fence); `NOT_CONFIGURED` |
 | W04 | Anchor mode | 1 silent anchor message, unchanged, no image; `NOT_CONFIGURED` |
 | W05 | Dry-run legacy | 0 messages (existing suppression); `NOT_CONFIGURED` |
-| W06 | Name with mentions, Markdown, bidi, controls, zero-width, emoji | 1 text; `NAME_NOT_RENDERABLE`; name in no log or label |
-| W07 | Name of 24 scalars that fits the slot | 1 image message; `IMAGE_SENT` |
-| W08 | Name of 0 or 25 scalars, uncovered script, or width over the slot | 1 text; `NAME_NOT_RENDERABLE`; no truncation |
-| W09 | Template, font or manifest missing, unlisted or hash mismatch | 1 text; `ASSET_UNAVAILABLE` |
-| W10 | Render exceeds 500 ms | 1 text; `RENDER_TIMEOUT`; job succeeds |
-| W11 | Render exceeds 256 KiB or panics | 1 text; `RENDER_FAILED`; job succeeds |
-| W12 | Join burst: permit busy | 1 text; `RENDER_BUSY`; every join welcomed once |
-| W13 | Join burst: 7th image in a minute | 1 text; `RATE_LIMITED` |
-| W14 | Attachment refused with a known no-message result | 1 text after the refusal, same attempt; `ATTACHMENT_REFUSED` |
-| W15 | Timeout or partial result after the image send | At most the 1 message already sent; no retry; `SEND_UNCERTAIN` |
-| W16 | Opted-out member | 0 messages; `PRIVACY_OPTED_OUT`; name not read into any render |
-| W17 | Failed opt-out lookup | 0 messages; `UNAVAILABLE`, retryable lookup |
-| W18 | Rejoin after goodbye; duplicate gateway events | 1 greeting per join; prompt guard unchanged |
-| W19 | Erasure, guild removal, restore | No new rows exist; nothing to purge; disclosed Discord-side persistence |
-| W20 | Setting flipped mid-burst | Next join obeys the new value; no edit of sent messages |
+| W06 | Name with bidi, controls, zero-width, private-use or uncovered emoji | 1 text; `NAME_NOT_RENDERABLE`; name in no log or label |
+| W07 | Name with mention or Markdown syntax only (for example `**Bob**`) that otherwise meets §5 | 1 image message, name drawn inert as literal characters; `IMAGE_SENT` |
+| W08 | Name of 24 scalars that fits the slot | 1 image message; `IMAGE_SENT` |
+| W09 | Name of 0 or 25 scalars, uncovered script, or width over the slot | 1 text; `NAME_NOT_RENDERABLE`; no truncation |
+| W10 | Template, font or manifest missing, unlisted or hash mismatch | 1 text; `ASSET_UNAVAILABLE` |
+| W11 | Render exceeds 500 ms | 1 text; `RENDER_TIMEOUT`; job succeeds |
+| W12 | Render exceeds 256 KiB or panics | 1 text; `RENDER_FAILED`; job succeeds |
+| W13 | Join burst: permit busy | 1 text; `RENDER_BUSY`; every join welcomed once |
+| W14 | Join burst: 7th image in a minute | 1 text; `RATE_LIMITED` |
+| W15 | Attachment refused with a known no-message result | 1 text after the refusal, same attempt; `ATTACHMENT_REFUSED` |
+| W16 | Timeout or partial result after the image send | At most the 1 message already sent; no retry; `SEND_UNCERTAIN` |
+| W17 | Opted-out member; opt-out lands during render | 0 messages; `PRIVACY_OPTED_OUT`; name not rendered if known before render, no image sent if it lands during |
+| W18 | Failed opt-out lookup | 0 messages; `UNAVAILABLE`, retryable lookup |
+| W19 | Rejoin after goodbye; duplicate gateway events | 1 greeting per join; prompt guard unchanged |
+| W20 | Erasure, guild removal, restore | No new rows exist; nothing to purge; disclosed Discord-side persistence |
+| W21 | Setting flipped mid-burst | Next join obeys the new value; no edit of sent messages |
 
 ## 8. Offline documentation check and exact-spec gate
 
@@ -210,7 +216,7 @@ try:
         raise ValueError('DIRTY_SPEC')
     text = blob.decode('utf-8')
     cases = re.findall(r'^\| (W\d{2}) \|', text, re.M)
-    if cases != [f'W{i:02}' for i in range(1, 21)]:
+    if cases != [f'W{i:02}' for i in range(1, 22)]:
         raise ValueError('MATRIX_INCOMPLETE')
     table = text.split('| reason | outcome', 1)[1].split('\n\n', 1)[0]
     reasons = re.findall(r'`([A-Z_]+)`', table.split('\n', 2)[2])
