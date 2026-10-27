@@ -66,6 +66,8 @@ mod giveaway_countdown_edge_acceptance_tests;
 mod giveaway_create_entry_acceptance_tests;
 #[path = "giveaway_list_facts_acceptance_tests.rs"]
 mod giveaway_list_facts_acceptance_tests;
+#[path = "privacy_action_scope_acceptance_tests.rs"]
+mod privacy_action_scope_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
 mod schedule_absolute_acceptance;
 #[path = "schedule_absolute_correction_tests.rs"]
@@ -11362,12 +11364,23 @@ fn privacy_action_decodes_known_analytics_and_deletion_subcommands() {
         privacy_action(&privacy_interaction(88, Some("delete"))),
         PrivacyAction::DeletionRequest
     );
+    // Lookup actions require their complete published request-id shape.
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-status"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-status",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionStatus
     );
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-receipt"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-receipt",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionReceipt
     );
     // Missing options, a non-subcommand value and an unknown name all
