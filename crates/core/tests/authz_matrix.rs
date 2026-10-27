@@ -166,10 +166,7 @@ fn guild_fence_and_unresolved_permissions() {
                 .any(|action| action.command_name() == name)
                 || matches!(
                     name,
-                    "purge-preview"
-                        | "channel-inspect"
-                        | "tempban-list"
-                        | "moderation-recent"
+                    "purge-preview" | "channel-inspect" | "tempban-list" | "moderation-recent"
                 );
             let open = route_row["allow"] == "*";
             let expected_key = if is_moderation {

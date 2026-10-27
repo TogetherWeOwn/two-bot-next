@@ -42,7 +42,6 @@ fn fixture() -> Value {
         fixture["count"], 44,
         "saved inventory retains the feed pair and both staff reads"
     );
-    );
     let rows = fixture["commands"]
         .as_array_mut()
         .expect("saved command rows");
@@ -74,7 +73,7 @@ fn fixture() -> Value {
         "expected_response": null,
         "deferral_reason": "Compiled-only metadata companion; live publication and smoke remain unapproved."
     }));
-    fixture["count"] = serde_json::json!(44);
+    fixture["count"] = serde_json::json!(45);
     fixture
 }
 
@@ -94,7 +93,7 @@ fn option_type_name(kind: u8) -> &'static str {
 fn inventory_matches_registry_output_in_publish_order() {
     let published = all_on_router().publish_set(&[]).expect("publish set");
     let fixture = fixture();
-    assert_eq!(fixture["count"], 44, "44 built-ins");
+    assert_eq!(fixture["count"], 45, "45 built-ins");
     assert_eq!(
         fixture["dm_permission_all_false"], true,
         "fixture claims guild-only"

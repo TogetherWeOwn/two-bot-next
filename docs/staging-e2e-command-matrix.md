@@ -81,13 +81,13 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 Member-moderation policy order (ban, tempban, kick, timeout, warn):
 permission → target present → self-target → owner/Owen/bot/staff protection →
 bot hierarchy → actor hierarchy. Audit `reason` is trimmed, non-empty, ≤512
-UTF-16 units on every mutating moderation row. The three private reads take no
+UTF-16 units on every mutating moderation row. The four private reads take no
 reason and write no audit record. Failed reads stay private with retry guidance;
 unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 44-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 45-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

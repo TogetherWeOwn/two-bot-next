@@ -45,7 +45,7 @@ are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
 per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
 type-4 reply on an isolated gate-safe router).
 
-## Deferred: 38 saved commands with reasons
+## Deferred: 39 saved commands with reasons
 
 Deferred means out of the read-only smoke, not untested: every row below
 is published by the same registry the unit test pins, and most share a
