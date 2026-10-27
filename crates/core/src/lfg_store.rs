@@ -311,8 +311,8 @@ pub async fn save_lfg_message_id(
 
 /// Fetch one post by guild + id (legacy `getLfg`); `None` when missing or
 /// fenced to another guild.
-pub async fn get_lfg(
-    pool: &sqlx::PgPool,
+pub async fn get_lfg<'c>(
+    executor: impl sqlx::Executor<'c, Database = sqlx::Postgres>,
     guild_id: &str,
     id: &str,
 ) -> Result<Option<LfgPost>, sqlx::Error> {
@@ -335,7 +335,7 @@ pub async fn get_lfg(
     )
     .bind(guild_id)
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     row.map(
         |(
@@ -431,13 +431,16 @@ pub async fn delete_lfg(
 }
 
 /// Roles in position order (legacy `listLfgRoles`).
-pub async fn list_lfg_roles(pool: &sqlx::PgPool, id: &str) -> Result<Vec<LfgRole>, sqlx::Error> {
+pub async fn list_lfg_roles<'c>(
+    executor: impl sqlx::Executor<'c, Database = sqlx::Postgres>,
+    id: &str,
+) -> Result<Vec<LfgRole>, sqlx::Error> {
     let rows: Vec<(String, String, String, i32, i32)> = sqlx::query_as(
         "SELECT lfg_id, role_key, label, slots, position
          FROM lfg_roles WHERE lfg_id = $1 ORDER BY position",
     )
     .bind(id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     rows.into_iter()
         .map(|(lfg_id, role_key, label, slots, position)| {
@@ -458,8 +461,8 @@ pub async fn list_lfg_roles(pool: &sqlx::PgPool, id: &str) -> Result<Vec<LfgRole
 }
 
 /// Signups in join order (legacy `listLfgSignups`).
-pub async fn list_lfg_signups(
-    pool: &sqlx::PgPool,
+pub async fn list_lfg_signups<'c>(
+    executor: impl sqlx::Executor<'c, Database = sqlx::Postgres>,
     id: &str,
 ) -> Result<Vec<LfgSignup>, sqlx::Error> {
     let rows: Vec<(String, String, String, time::OffsetDateTime)> = sqlx::query_as(
@@ -467,7 +470,7 @@ pub async fn list_lfg_signups(
          FROM lfg_signups WHERE lfg_id = $1 ORDER BY joined_at, user_id",
     )
     .bind(id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()

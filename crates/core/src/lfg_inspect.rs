@@ -193,11 +193,13 @@ pub fn render_summaries(
     }
     let rows: Vec<String> = ordered
         .iter()
-        .map(|role| {
+        .enumerate()
+        .map(|(index, role)| {
             let filled = filled(role, signups);
             let remaining = usize::from(role.slots).saturating_sub(filled);
             format!(
-                "- {} — {filled}/{} — {remaining} remaining",
+                "- Role {}: {} — {filled}/{} — {remaining} remaining",
+                index + 1,
                 inert_title(&role.label),
                 role.slots
             )
@@ -313,14 +315,54 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "- Label a — 1/3 — 2 remaining",
-                "- Label b — 0/3 — 3 remaining",
-                "- Label c — 0/3 — 3 remaining"
+                "- Role 1: Label a — 1/3 — 2 remaining",
+                "- Role 2: Label b — 0/3 — 3 remaining",
+                "- Role 3: Label c — 0/3 — 3 remaining"
             ]
         );
         assert!(text.contains("<t:4071006245:f>"));
         assert!(!text.contains("111"), "summaries disclose no members");
         assert!(!text.contains("discord.com/channels"));
+    }
+
+    #[test]
+    fn duplicate_labels_keep_global_selectors_across_summary_pages() {
+        let mut roles: Vec<LfgRole> = (0..20)
+            .rev()
+            .map(|position| role(&format!("r{position:02}"), position))
+            .collect();
+        for role in &mut roles {
+            role.label = "😀".repeat(80);
+        }
+        let signups = [signup("111", "r19", "2020-01-01T00:00:00.000Z")];
+        let mut selectors = Vec::new();
+        let mut pages = 0;
+        for page in 1..=MAX_PAGE {
+            let text = render_summaries(&post(), &roles, &signups, page).expect("render");
+            if text == PAGE_OUT_OF_RANGE {
+                break;
+            }
+            pages += 1;
+            assert!(message_safety::text_len(&text) <= message_safety::CONTENT_LIMIT);
+            for row in text.lines().filter(|line| line.starts_with("- ")) {
+                let selector = row
+                    .strip_prefix("- Role ")
+                    .and_then(|row| row.split_once(':'))
+                    .and_then(|(number, _)| number.parse::<usize>().ok())
+                    .expect("each summary exposes its 1-based role selector");
+                selectors.push(selector);
+            }
+        }
+        assert!(
+            pages > 1,
+            "exercise selector numbering across a page boundary"
+        );
+        assert_eq!(selectors, (1..=20).collect::<Vec<_>>());
+        let roster = render_roster(&post(), &roles, &signups, 20, 1).expect("roster");
+        assert!(roster.contains("Role 20:"));
+        assert!(roster.lines().any(|line| line == "- 111"));
+        let empty = render_roster(&post(), &roles, &signups, 1, 1).expect("empty role");
+        assert!(empty.contains("No saved signups"));
     }
 
     #[test]

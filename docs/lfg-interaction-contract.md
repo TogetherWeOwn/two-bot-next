@@ -47,16 +47,21 @@ post truncates its rendered roster at 2,000 UTF-16 units, so later roles can
 disappear there; inspection instead pages whole rows deterministically —
 roles by saved position then key, signups by join time then user ID — until
 every configured role and saved signup has been shown exactly once. Without
-`role`, pages show each role's filled/total and remaining seats and no member
-IDs; with `role`, pages show that one role's saved signups. Saved titles and
-labels render inert (mentions, links and markdown cannot activate), output
-stays within the 2,000 UTF-16-unit limit, and rows are never cut.
+`role`, pages show each role's 1-based selector number, filled/total and
+remaining seats and no member IDs; with `role`, pages show that one role's
+saved signups. Selector numbers follow the full saved position/key order,
+not page-local numbering, so even duplicate labels remain selectable. Saved
+titles and labels render inert (mentions, links and markdown cannot activate),
+output stays within the 2,000 UTF-16-unit limit, and rows are never cut.
 
 Guild and invoking channel are authorized from the saved post before any
 role or signup row is read; unknown, other-guild and other-channel IDs share
-one private miss. Malformed, duplicated or out-of-range options refuse
-before storage, an out-of-range page or role answers honestly with a restart
-cue, and a store outage is reported as unavailable, never as empty. The
+one private miss. Each invocation reads the post, roles and signups in one
+repeatable-read database snapshot, so concurrent changes cannot mix a saved
+header or capacity from one revision with a roster from another. Malformed,
+duplicated or out-of-range options refuse before storage, an out-of-range
+page or role answers honestly with a restart cue, and a store outage is
+reported as unavailable, never as empty. The
 reply shows saved title, start and state only: a stored message ID is not
 rendered as a jump link or delivery proof. Inspection is read-only — no
 signup, cooldown, audit, claim or message effect — and ordinary preview,
