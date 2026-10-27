@@ -237,8 +237,12 @@ integers and no whitespace: version, guild id, channel id, channel type,
 parent id or `0`, actor id, trimmed reason, `prior_exists`, prior allow/deny,
 planned allow/deny, saved-lockdown present flag, saved recovery generation
 (or `""`), roles sorted by id as `[id, position, permissions & INTEREST]`, and
-overwrites sorted by `(type, id)` as `[type, id, allow & INTEREST, deny & INTEREST]`,
-where `INTEREST = LOCKDOWN_BITS | VIEW_CHANNEL (1024) | ADMINISTRATOR (8)`.
+overwrites sorted by `(type, id)` as `[type, id, allow & INTEREST, deny & INTEREST]`.
+Both sorts compare unsigned integer values in ascending order, **not** decimal
+strings: id `"9"` precedes `"10"`; overwrite type `"0"` precedes `"1"`, then
+ids compare numerically within each type. The serialized values remain decimal
+strings. The keeper-role display's id tie-break follows the same numeric order.
+Here `INTEREST = LOCKDOWN_BITS | VIEW_CHANNEL (1024) | ADMINISTRATOR (8)`.
 Canonical bytes are the UTF-8 encoding of that array with compact separators
 and non-ASCII escaped (`\uXXXX`, astral planes as surrogate pairs) — exactly
 Python `json.dumps(snapshot, separators=(",", ":"),
@@ -280,10 +284,16 @@ existing `finish`/retain semantics byte-for-byte; confirm never resends.
 
 - Pending TTL **300 seconds** from preview reply; `now >= expires` refuses.
 - At most **1** outstanding armed preview per `(guild, channel, actor)`; a new
-  armed preview invalidates that actor's previous digest for that channel.
-  Unarmed previews (no Confirm) create no entry and invalidate none. At most
-  **64** pending entries process-wide; at cap, refuse `PREVIEW_BUSY` (never
-  evict a live entry). Expired entries are swept lazily on insert/take.
+  armed preview supersedes that actor's previous digest for that channel.
+  Replacement is atomic with cap evaluation and insertion: sweep expired
+  entries, remove the superseded entry immediately (it no longer counts toward
+  the cap), then evaluate the **64**-entry process-wide cap and insert. Thus a
+  same-key replacement succeeds even with 64 live entries; it does not briefly
+  count as a 65th entry or leave the old digest consumable. A new key at cap
+  refuses `PREVIEW_BUSY`, leaving every live entry intact — never evict another
+  preview to admit it. Unarmed previews (no Confirm) create no entry and
+  invalidate none. Insert/take lazily sweep expired entries; confirm/cancel
+  removal uses the same synchronization as replacement.
 - Rate: at most **10 previews per actor / 10 minutes** and **30 per guild /
   10 minutes**, charged after router+validation and **before** any Discord read,
   so refused-for-rate costs zero GETs. Counters are in-memory in the channel
@@ -399,7 +409,7 @@ live guild). Every row also asserts zero unexpected Discord writes:
 | `LP-12` | Malformed masks, missing/duplicate `@everyone` role, duplicate overwrite row, guild/type mismatch (thread, voice, forum, category), saved-record guild mismatch, missing `permission_overwrites`, one failed read → `UNAVAILABLE`/`UNSUPPORTED_CHANNEL`; no partial render, no audit row |
 | `LP-13` | 11 keeper roles → 10 named + `(+1 more …)`; 101 overwrites or 251 roles → `TOO_COMPLEX`, no render; longest render ≤1,900 UTF-16 units with counts intact |
 | `LP-14` | Audit trail: render ⇒ exactly 1 `lockdown_preview` row (numbers-only metadata, empty reason), 0 claims/lanes/seeds/metric samples; audit insert failure ⇒ no render, no pending; executed confirm ⇒ exactly 1 lockdown row added, whose `preview_request_id` equals the confirmed preview's interaction id even when another preview renders before the execution row lands |
-| `LP-15` | 11th preview by one actor inside 10 min ⇒ refused with **zero** Discord GETs; 65th live pending ⇒ `PREVIEW_BUSY`, earlier entries intact; second preview same actor+channel kills the first digest |
+| `LP-15` | 11th preview by one actor inside 10 min ⇒ refused with **zero** Discord GETs; new key at 64 live entries ⇒ `PREVIEW_BUSY`, earlier entries intact; same actor+channel replacement at cap succeeds atomically, count stays 64, superseded digest cannot be consumed; concurrent replacements cannot leave two entries for that key |
 | `LP-16` | Lane held by an in-flight channel action at confirm ⇒ existing uncertain reply, pending consumed, no PUT; PUT 403 ⇒ existing no-effect finish; PUT 5xx ⇒ claim/lane retained, no resend |
 | `LP-17` | Blank / 513-unit reason, extra option ⇒ refused before reads; category-parent channel renders parent id + sync-not-evaluated line and reads no second channel |
 
@@ -440,12 +450,26 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 >>> # administrator bypasses; missing view already gates send off (LP-05)
 >>> assert usable(ADMIN, planned, None, SEND) and not usable(SEND, (0, 0), None, SEND)
 >>> # digest: canonical JSON array, decimals as strings, interest-masked (section 5)
+>>> def canonical(snap):
+...     ordered = json.loads(json.dumps(snap))
+...     ordered[14].sort(key=lambda role: int(role[0]))
+...     ordered[15].sort(key=lambda ow: (int(ow[0]), int(ow[1])))
+...     return json.dumps(ordered, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 >>> def digest(snap):
-...     return hashlib.sha256(json.dumps(snap, separators=(",", ":")).encode()).hexdigest()
+...     return hashlib.sha256(canonical(snap)).hexdigest()
 >>> snap = ["lockdown-preview.v1", "10", "20", "0", "0", "30", "raid", "1", "0", "0",
 ...         "0", str(LOCK), "0", "", [["10", "0", str((VIEW | SEND) & INTEREST)]],
 ...         [["0", "40", str(SEND), "0"]]]
 >>> same = json.loads(json.dumps(snap)); assert digest(snap) == digest(same)
+>>> # numeric id order, including within each overwrite type; wire values stay strings
+>>> multi = json.loads(json.dumps(snap))
+>>> multi[14] = [["10", "0", "0"], ["9", "0", "0"]]
+>>> multi[15] = [["1", "9", "0", "0"], ["0", "10", "0", "0"], ["0", "9", "0", "0"]]
+>>> ordered = json.loads(canonical(multi))
+>>> assert [r[0] for r in ordered[14]] == ["9", "10"]
+>>> assert [(ow[0], ow[1]) for ow in ordered[15]] == [("0", "9"), ("0", "10"), ("1", "9")]
+>>> shuffled = json.loads(json.dumps(multi)); shuffled[14].reverse(); shuffled[15].reverse()
+>>> assert canonical(multi) == canonical(shuffled)
 >>> stale_role = json.loads(json.dumps(snap)); stale_role[14][0][2] = str(VIEW & INTEREST)
 >>> assert digest(stale_role) != digest(snap)                        # LP-09 sensitivity
 >>> stale_unrelated = json.loads(json.dumps(snap)); stale_unrelated[8] = str(VIEW)
@@ -459,6 +483,22 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_
 >>> ra = json.loads(json.dumps(snap)); ra[6] = nfc
 >>> rb = json.loads(json.dumps(snap)); rb[6] = nfd
 >>> assert nfc != nfd and digest(ra) != digest(rb)
+>>> # atomic pending-map transition model only; not a concurrency/runtime proof (LP-15)
+>>> def arm(pending, key, digest, expires, now):
+...     live = {k: v for k, v in pending.items() if v[1] > now}
+...     live.pop(key, None)  # remove superseded entry before cap evaluation
+...     if len(live) >= 64: return None  # PREVIEW_BUSY; caller keeps live entries
+...     live[key] = (digest, expires)
+...     return live
+>>> full = {(1, 2, actor): (f"old-{actor}", 300) for actor in range(64)}
+>>> replaced = arm(full, (1, 2, 9), "new", 301, 1)
+>>> assert replaced is not None and len(replaced) == 64 and replaced[(1, 2, 9)] == ("new", 301)
+>>> assert ("old-9", 300) not in replaced.values() and all(replaced[k] == v for k, v in full.items() if k != (1, 2, 9))
+>>> before = dict(replaced); assert arm(replaced, (1, 2, 64), "new-64", 301, 1) is None and replaced == before
+>>> # expires == now frees the cap slot, not one second later (LP-11 / LP-15)
+>>> expiring = dict(full); expiring[(1, 2, 0)] = ("old-0", 1)
+>>> swept = arm(expiring, (1, 2, 64), "new-64", 301, 1)
+>>> assert swept is not None and len(swept) == 64 and (1, 2, 0) not in swept
 >>> # expiry equality refuses (LP-11); button id bound (section 3 step 3)
 >>> expires = 1_800_000_300
 >>> assert (expires >= expires) and not (expires - 1 >= expires)
