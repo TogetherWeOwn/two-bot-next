@@ -3,13 +3,14 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from check_docs_index import DOC_LIMIT, INDEX_LIMIT, LARGE_DOCS, ROOT, check
+from check_docs_index import DOC_LIMIT, INDEX_LIMIT, LARGE_DOCS, ROOT, check, dedupe, dedupe_text
 
 
 class DocsIndexTests(unittest.TestCase):
@@ -22,6 +23,14 @@ class DocsIndexTests(unittest.TestCase):
             with self.subTest(doc=name):
                 self.assertTrue(reason.strip())
                 self.assertGreater((ROOT / name).stat().st_size, DOC_LIMIT)
+
+    def test_gitattributes_pins_union_merge_for_the_index(self):
+        lines = (ROOT / ".gitattributes").read_text().splitlines()
+        self.assertIn("docs/README.md merge=union", [line.strip() for line in lines])
+
+    def test_repository_index_is_dedupe_canonical(self):
+        text = (ROOT / "docs/README.md").read_text(encoding="utf-8")
+        self.assertEqual(dedupe_text(text), text)
 
     def test_root_entry_points_link_the_index(self):
         for name in ("README.md", "AGENTS.md"):
@@ -141,6 +150,111 @@ class IndexFixtureTests(unittest.TestCase):
         failed = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(failed.returncode, 1, failed.stderr)
         self.assertEqual(json.loads(failed.stdout), {"missing": [], "stale": ["docs/nested/one.md"], "oversize": []})
+
+
+class DedupeTextTests(unittest.TestCase):
+    def test_exact_duplicates_removed_first_occurrence_wins_order_preserved(self):
+        text = ("# Docs\n\n## Area\n- [One](one.md)\n- [Two](two.md)\n"
+                "## Area\n- [One](one.md)\n- [Three](three.md)\n")
+        self.assertEqual(dedupe_text(text),
+                         "# Docs\n\n## Area\n- [One](one.md)\n- [Two](two.md)\n- [Three](three.md)\n")
+
+    def test_blank_runs_collapse_and_exactly_one_trailing_newline(self):
+        self.assertEqual(dedupe_text("# Docs\n\n\n- [One](one.md)\n\n\n"), "# Docs\n\n- [One](one.md)\n")
+        self.assertEqual(dedupe_text("# Docs"), "# Docs\n")
+        self.assertEqual(dedupe_text(""), "")
+
+    def test_dedupe_is_idempotent(self):
+        text = "# Docs\n\n\n## Area\n- [One](one.md)\n## Area\n- [One](one.md)"
+        self.assertEqual(dedupe_text(dedupe_text(text)), dedupe_text(text))
+
+    def test_same_target_with_different_labels_is_never_guessed(self):
+        text = "# Docs\n\n- [Old label](one.md)\n- [New label](one.md)\n"
+        self.assertEqual(dedupe_text(text), text)
+
+
+class DedupeFixtureTests(unittest.TestCase):
+    def setUp(self):
+        scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("PAPERCLIP_SCRATCH_DIR")
+        self.temp = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "docs").mkdir(parents=True)
+        self.index = self.root / "docs/README.md"
+        (self.root / "docs/one.md").write_text("# One\n")
+        (self.root / "docs/two.md").write_text("# Two\n")
+
+    def cli(self, *extra):
+        command = [sys.executable, str(ROOT / "scripts/check_docs_index.py"),
+                   "--root", str(self.root), *extra]
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def test_union_artifact_is_flagged_then_repaired_end_to_end(self):
+        self.index.write_text("# Docs\n\n## Area\n- [Navigation](README.md)\n- [One](one.md)\n"
+                              "## Area\n- [One](one.md)\n- [Two](two.md)\n")
+        self.assertEqual(check(self.root, large_docs={})["stale"], ["docs/README.md:7"])
+        self.assertTrue(dedupe(self.root))
+        self.assertEqual(check(self.root, large_docs={}), {"missing": [], "stale": [], "oversize": []})
+        self.assertFalse(dedupe(self.root), "second dedupe must be a no-op")
+
+    def test_dedupe_cli_keeps_json_shape_and_exit_zero_after_repair(self):
+        self.index.write_text("# Docs\n\n- [Navigation](README.md)\n- [One](one.md)\n- [One](one.md)\n- [Two](two.md)\n")
+        repaired = self.cli("--dedupe", "--json")
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        self.assertEqual(json.loads(repaired.stdout), {"missing": [], "stale": [], "oversize": []})
+
+    def test_dedupe_cli_still_fails_on_rows_it_must_not_guess(self):
+        self.index.write_text("# Docs\n\n- [Navigation](README.md)\n- [Old](one.md)\n- [New](one.md)\n- [Two](two.md)\n")
+        failed = self.cli("--dedupe", "--json")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertEqual(json.loads(failed.stdout)["stale"], ["docs/README.md:5"])
+        self.assertIn("- [Old](one.md)", self.index.read_text())
+        self.assertIn("- [New](one.md)", self.index.read_text())
+
+    def test_dedupe_cli_leaves_undecodable_index_untouched(self):
+        original = b"# Docs\n- [One](one.md)\n\xff\xfe\n"
+        self.index.write_bytes(original)
+        failed = self.cli("--dedupe", "--json")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertEqual(self.index.read_bytes(), original)
+        self.assertIn("docs/README.md", json.loads(failed.stdout)["stale"])
+
+    def test_dedupe_cli_with_missing_or_directory_index_keeps_json_shape(self):
+        failed = self.cli("--dedupe", "--json")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertNotIn("Traceback", failed.stderr)
+        self.assertIn("docs/README.md", json.loads(failed.stdout)["missing"])
+        self.index.mkdir()
+        failed = self.cli("--dedupe", "--json")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertNotIn("Traceback", failed.stderr)
+        self.assertIn("docs/README.md", json.loads(failed.stdout)["missing"])
+        self.assertTrue(self.index.is_dir())
+
+    def test_check_cli_without_dedupe_flag_never_writes(self):
+        body = "# Docs\n\n- [Navigation](README.md)\n- [One](one.md)\n- [One](one.md)\n- [Two](two.md)\n"
+        self.index.write_text(body)
+        failed = self.cli("--json")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertEqual(self.index.read_text(), body)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for the union merge proof")
+    def test_git_union_merge_of_parallel_row_insertions_has_no_markers(self):
+        scratch = Path(self.temp.name)
+        base = "# Docs\n\n## Area\n- [Navigation](README.md)\n- [One](one.md)\n"
+        ours = base + "- [Two](two.md)\n"
+        (self.root / "docs/three.md").write_text("# Three\n")
+        theirs = base + "- [Three](three.md)\n"
+        for name, text in (("base", base), ("ours", ours), ("theirs", theirs)):
+            (scratch / name).write_text(text)
+        merged = subprocess.run(
+            ["git", "merge-file", "--union", "-p",
+             str(scratch / "ours"), str(scratch / "base"), str(scratch / "theirs")],
+            capture_output=True, text=True)
+        self.assertEqual(merged.returncode, 0, merged.stderr)
+        self.assertNotIn("<<<<<<<", merged.stdout)
+        self.index.write_text(dedupe_text(merged.stdout))
+        self.assertEqual(check(self.root, large_docs={}), {"missing": [], "stale": [], "oversize": []})
 
 
 if __name__ == "__main__":
