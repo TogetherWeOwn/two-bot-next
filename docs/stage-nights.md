@@ -30,7 +30,7 @@ accepted contract, not Stage count or event attendance.
 
 ## 2. Source trace: zero Stage management, existing alternative
 
-Source inspected at `bb19cbda57594dfd22c829d5219a84fdb015f0ab`; not deployment
+Source inspected at `c02672cc4001bb92c4692d7782becd6e96a6c623`; not deployment
 verification.
 
 - **No Stage lifecycle code.** `ChannelType::GuildStageVoice` appears only as a
@@ -50,7 +50,7 @@ verification.
   (`crates/bot/src/event_voice_channels.rs:1-10`); creation is fail-closed on a
   required category and Manage Channels/View Channel preflight
   (`crates/bot/src/event_voice_category.rs:1-12`,
-  `docs/configuration.md:276`). Join/leave presence spans are wired into the
+  `docs/configuration.md:289`). Join/leave presence spans are wired into the
   voice worker (`crates/bot/src/voice_rooms.rs:10016`). I found **no non-test
   caller** of `claim_channel` in `crates/bot/src`: the creating ticker is a
   separate, not-yet-wired slice (`event_voice_category.rs` header). A is therefore
@@ -206,6 +206,7 @@ Discord or database. It checks the committed document's link inventory and finit
 matrix, not behavior, demand, Discord limits or security acceptance.
 
 ```sh
+set -e
 python3 scripts/check_docs_index.py --json
 python3 - <<'PY'
 from pathlib import Path
