@@ -117,9 +117,7 @@ fn remind_me(member: u64, minutes: i64, text: &str) -> Interaction {
             )],
         ),
         member,
-        Permissions::VIEW_CHANNEL
-            | Permissions::USE_APPLICATION_COMMANDS
-            | Permissions::SEND_MESSAGES,
+        Permissions::VIEW_CHANNEL | Permissions::USE_SLASH_COMMANDS | Permissions::SEND_MESSAGES,
     );
     // Fixture-only authorization correction; all original assertions stay frozen.
     interaction.channel = Some(

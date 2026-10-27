@@ -56,9 +56,7 @@ fn command(
         ),
         member,
         if name == "me" {
-            Permissions::VIEW_CHANNEL
-                | Permissions::USE_APPLICATION_COMMANDS
-                | Permissions::SEND_MESSAGES
+            Permissions::VIEW_CHANNEL | Permissions::USE_SLASH_COMMANDS | Permissions::SEND_MESSAGES
         } else {
             Permissions::empty()
         },
@@ -631,7 +629,7 @@ async fn restart_from_armed_before_send_state_holds_without_any_post_beyond_nonc
 const STORE_FAILURE: &str = "Reminder command failed; try again.";
 
 fn readable_command_permissions() -> Permissions {
-    Permissions::VIEW_CHANNEL | Permissions::USE_APPLICATION_COMMANDS
+    Permissions::VIEW_CHANNEL | Permissions::USE_SLASH_COMMANDS
 }
 
 fn resolved_channel(interaction: &mut Interaction, kind: u8) {
