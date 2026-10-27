@@ -2176,6 +2176,25 @@ mod tests {
     }
 
     #[test]
+    fn inspect_invalid_template_refusal_escapes_underscore_names() {
+        let row = StoredCommand {
+            name: "__forged__".to_owned(),
+            template: "{nope}".to_owned(),
+            ..inspect_row()
+        };
+        let view = format_inspect_preview(&row, &inspect_ctx());
+        assert!(
+            view.starts_with("Template for /\\_\\_forged\\_\\_ is invalid: Unknown placeholder"),
+            "{view}"
+        );
+        assert!(
+            view.ends_with(" Replace it with /command name:\\_\\_forged\\_\\_ template:..."),
+            "{view}"
+        );
+        assert!(!view.contains("__forged__"), "{view}");
+    }
+
+    #[test]
     fn inspect_summary_overflow_and_list_escape_underscore_names() {
         let mut row = inspect_row();
         row.name = "__forged__".to_owned();
