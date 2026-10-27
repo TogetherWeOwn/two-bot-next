@@ -27,7 +27,10 @@ Use `/help command:rank` for a command's description, usage and optional member
 argument; `/help command:privacy` explains its subcommands and required inputs.
 The optional `command` selector trims surrounding whitespace, accepts one
 leading slash and compares ASCII case-insensitively. It does not expand aliases
-or name prefixes. Unknown or unpublished names return a correction to `/help`,
+or name prefixes. The optional `subcommand` selector focuses one exact
+space-separated subcommand/group path within the selected command, with its
+own option budget; unknown, malformed or rootless paths return a correction
+to `/help`. Unknown or unpublished names return a correction to `/help`,
 never unpublished definitions. Custom commands appear only after publication
 is confirmed; failed or in-flight changes do not replace the confirmed help.
 Help is ephemeral and does not execute the selected command. The command picker
@@ -356,6 +359,7 @@ Show this server's live commands, grouped by who can use them.
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `command` | string | false | — | — | 32 | — | Command name (case-insensitive; optional leading /) |
+| `subcommand` | string | false | — | — | 96 | — | Subcommand path, space-separated (requires command) |
 
 ## `/import`
 

@@ -313,6 +313,17 @@ pub fn unknown_help_correction() -> String {
         .to_owned()
 }
 
+/// Concise correction for a focused `/help command:… subcommand:…` request
+/// that resolves to nothing: unknown, prefix, over-deep, malformed, duplicate
+/// or rootless input. Never echoes the input or advertises unpublished paths.
+#[must_use]
+pub fn unknown_help_branch_correction() -> String {
+    "Unknown subcommand — no confirmed command path matches that.\n\
+     Use /help to see this server's last confirmed command list, then \
+     /help command:<name> for that command's subcommands."
+        .to_owned()
+}
+
 /// Render untrusted definition text inert: strip markdown/mention-active
 /// punctuation and flatten newlines so a hostile description cannot forge
 /// markup, links or mentions. Reply-level mention suppression stays the
@@ -728,6 +739,115 @@ impl CommandDefinition {
         ));
         detail.push("\n");
         detail.finish()
+    }
+}
+
+/// Resolve exact space-separated subcommand/group segments below the root.
+/// Segments compare ASCII case-insensitively against nested options only;
+/// leaf arguments, prefixes and over-deep paths resolve to nothing.
+fn resolve_branch<'a>(root: &'a [CommandOption], path: &str) -> Option<Vec<&'a CommandOption>> {
+    let segments: Vec<&str> = path.split_whitespace().collect();
+    if segments.is_empty() || segments.len() > NESTING_CAP + 1 {
+        return None;
+    }
+    let mut chain = Vec::with_capacity(segments.len());
+    let mut level = root;
+    for segment in segments {
+        let found = level
+            .iter()
+            .find(|option| is_nested(option) && option.name.eq_ignore_ascii_case(segment))?;
+        chain.push(found);
+        level = &found.options;
+    }
+    Some(chain)
+}
+
+impl CommandDefinition {
+    /// Render one subcommand or group of this confirmed command: the same
+    /// definition-driven vocabulary as [`Self::help_detail_text`], but scoped
+    /// to the branch named by `path` with its own option budget, so later
+    /// siblings neither consume nor leak into the focused reply.
+    ///
+    /// `path` is space-separated exact segments, trimmed and ASCII
+    /// case-insensitive. Returns `None` for an empty, unknown, prefix or
+    /// over-deep path, and for roots without nested branches; the caller
+    /// answers [`unknown_help_branch_correction`].
+    #[must_use]
+    pub fn help_branch_text(&self, path: &str) -> Option<String> {
+        let chain = resolve_branch(&self.options, path)?;
+        let branch = *chain.last()?;
+        let parent = chain[..chain.len() - 1]
+            .iter()
+            .fold(format!("/{}", inert(&self.name)), |acc, option| {
+                format!("{acc} {}", inert(&option.name))
+            });
+        let here = format!("{parent} {}", inert(&branch.name));
+        let mut detail = Detail::default();
+        let description = cap(&inert(&branch.description), DESCRIPTION_CAP);
+        detail.push(&format!("{here} — {description}\n"));
+        let (nested, leaves): (Vec<&CommandOption>, Vec<&CommandOption>) =
+            branch.options.iter().partition(|child| is_nested(child));
+        if nested.is_empty() {
+            detail.push(&format!("Usage: {here}{}\n", usage_suffix(&leaves)));
+        } else {
+            detail.push("Usage:\n");
+            let mut lines = 0usize;
+            let mut omitted = 0usize;
+            for child in &nested {
+                collect_usage(
+                    &mut detail,
+                    &here,
+                    child,
+                    chain.len(),
+                    &mut lines,
+                    &mut omitted,
+                );
+            }
+            if !leaves.is_empty() {
+                detail.push(&format!("- {here}{}\n", usage_suffix(&leaves)));
+            }
+            if omitted > 0 {
+                detail.push(&format!("- …({omitted} more paths omitted.)\n"));
+            }
+        }
+        let mut state = DetailState::default();
+        if !leaves.is_empty() {
+            detail.push("Arguments:\n");
+            push_option_lines(&mut detail, &leaves, &mut state);
+        }
+        if !nested.is_empty() {
+            detail.push("Subcommands:\n");
+            if chain.len() >= NESTING_CAP {
+                state.omitted += nested.len();
+            } else {
+                for child in &nested {
+                    push_nested(&mut detail, &here, child, chain.len(), &mut state);
+                }
+            }
+        }
+        if state.omitted > 0 {
+            detail.push(&format!(
+                "(+{} more options, omitted from this detail.)\n",
+                state.omitted
+            ));
+        }
+        let prefix = format!("{here} ");
+        let examples: Vec<&String> = self
+            .examples
+            .iter()
+            .filter(|example| example.starts_with(&prefix) || **example == here)
+            .collect();
+        if !examples.is_empty() {
+            detail.push("Examples:\n");
+            for example in examples {
+                detail.push(&format!("- {example}\n"));
+            }
+        }
+        detail.push(&permission_sentence(
+            self.default_member_permissions.as_deref(),
+        ));
+        detail.push("\n");
+        Some(detail.finish())
     }
 }
 
