@@ -46,7 +46,7 @@ Previously distinct RSS URLs stay distinct; another channel is a separate relay.
 The 25-relay guild cap still refuses first, including paused relays and repeated
 adds at capacity. Genuine storage failures retain the fixed failure reply.
 
-Built-in commands: 64.
+Built-in commands: 65.
 
 ## `/access`
 
@@ -140,6 +140,21 @@ Pause a saved custom command without deleting it
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+
+## `/command-edit`
+
+Correct one saved custom command, keeping omitted fields
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+| `template` | string | false | — | — | 2000 | — | New response text (omit to keep the saved text) |
+| `description` | string | false | — | — | 100 | — | New command-picker description (omit to keep it) |
+| `text-trigger` | string | false | — | — | 33 | — | New !trigger (omit to keep it) |
+| `clear-trigger` | boolean | false | — | — | — | — | True removes the !trigger (not with text-trigger) |
 
 ## `/command-enable`
 

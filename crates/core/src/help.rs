@@ -87,6 +87,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-inspect",
             "command-disable",
             "command-enable",
+            "command-edit",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -782,12 +783,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 43 non-voice commands (7 core + 25 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
+        // 44 non-voice commands (7 core + 26 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, welcome-preview, pause/resume, edit, giveaway, lfg-edit, lfg-list, feed-inspect,
         // purge-preview and channel-inspect, plus 21 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (64 live)"));
+        assert!(text.contains("**Server commands** (65 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -913,11 +914,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 43 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
+        // 44 non-voice names, including inspection, reopen, welcome-preview, pause/resume, edit,
         // giveaway, lfg-edit, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
         // 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 64);
+        assert_eq!(grouped.len(), 65);
         for name in [
             "rank",
             "leaderboard",
@@ -930,6 +931,7 @@ mod tests {
             "command",
             "command-disable",
             "command-enable",
+            "command-edit",
             "command-inspect",
             "schedule-list",
             "sticky-remove",

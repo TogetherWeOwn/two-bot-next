@@ -171,6 +171,28 @@ remaining gateway/accepted-prefix work:
    prefix or slash invocation racing a stale picker reads the saved
    state. A failed publication reports saved-but-not-synchronized with a
    safe next action; a repeated state never claims the picker repaired.
+10. `/command-edit name:<name>` corrects one saved definition in place, unlike
+   `/command`, which still replaces the whole definition with its defaults
+   (description `Custom command`, no trigger). Optional `template`,
+   `description` and `text-trigger` replace only what is supplied; every
+   omitted field, the creator, the enabled flag and the command identity are
+   kept, so a disabled definition stays disabled. `clear-trigger:true` is the
+   only way to remove the text trigger; `clear-trigger:false` does nothing, an
+   empty `text-trigger` is invalid, and `text-trigger` with `clear-trigger:true`
+   is a contradiction. A forged type, a duplicate or an unknown option refuses
+   before any store read, and the Manage Server and automation checks run
+   before any parsing. The row is re-read under the guild lifecycle lock, so a
+   concurrent change to another field survives, and the complete merged
+   definition must pass the `/command` write rules: an invalid saved template
+   refuses even when the edit did not touch it. A newly supplied trigger may
+   not name a built-in and may not be held by any other command, including a
+   disabled one. The patch commits with one content-free `command.edit` audit
+   fact (no field names or text); a failed write or audit rolls both back.
+   A missing name, a value identical to the saved one and an empty patch are
+   zero-write: no audit fact, no timestamp touch, no republish. A real change
+   republishes the full registry once. A failed publication reports
+   saved-but-not-synchronized with the same safe next action as pause/resume.
+   Confirmations are private and mention-safe and never echo saved text.
 
 ## Slash-run audit replay
 

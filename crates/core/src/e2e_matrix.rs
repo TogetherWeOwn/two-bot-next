@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 43 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 44 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -123,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 43-row contract in publish order (core, scorecard, automation,
+/// The 44-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -298,6 +298,21 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:AutomationsDisabled",
                 "Perm:ManageServerRequired",
                 "Valid:name:required",
+            ],
+        ),
+        row(
+            "command-edit",
+            46,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then ephemeral confirmation after only the supplied template, description or trigger changes plus one audit row; omitted fields, creator and enabled state are kept, and an unchanged edit is an explicit no-op without republish.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+                "Valid:text-trigger|clear-trigger:not-both",
             ],
         ),
         row(

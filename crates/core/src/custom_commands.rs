@@ -441,6 +441,21 @@ impl AuditRecord {
         }
     }
 
+    /// One content-free fact per committed `/command-edit`. The action names
+    /// an in-place patch, distinct from `command.update` (full replacement),
+    /// and never carries the changed values or even which fields changed.
+    #[must_use]
+    pub fn edit(guild_id: &str, actor_id: &str, name: &str) -> Self {
+        Self {
+            guild_id: guild_id.to_owned(),
+            actor_id: Some(actor_id.to_owned()),
+            action: "command.edit".to_owned(),
+            target_key: Some(bounded_audit_name(name)),
+            outcome: "ok".to_owned(),
+            reason: None,
+        }
+    }
+
     #[must_use]
     pub fn run(guild_id: &str, actor_id: &str, name: &str, ok: bool, reason: Option<&str>) -> Self {
         Self {
@@ -563,6 +578,142 @@ pub fn adjudicate_toggle(
             resync_registry: true,
         },
     }
+}
+
+/// What `/command-edit` does with the saved text trigger. `Keep` is the
+/// omitted option; `Clear` is the explicit `clear-trigger:true` operation and
+/// is never inferred from a missing or empty `text-trigger`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerPatch {
+    Keep,
+    Set(String),
+    Clear,
+}
+
+/// A PATCH-like edit of one saved definition: every `None`/`Keep` field is
+/// preserved exactly. Name, creator, enabled state and identity are not
+/// patchable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditPatch {
+    pub template: Option<String>,
+    pub description: Option<String>,
+    pub text_trigger: TriggerPatch,
+}
+
+impl EditPatch {
+    /// The complete definition after the patch. Only patched columns differ.
+    #[must_use]
+    pub fn apply(&self, existing: &StoredCommand) -> StoredCommand {
+        let mut merged = existing.clone();
+        if let Some(template) = &self.template {
+            merged.template.clone_from(template);
+        }
+        if let Some(description) = &self.description {
+            merged.description.clone_from(description);
+        }
+        match &self.text_trigger {
+            TriggerPatch::Keep => {}
+            TriggerPatch::Set(trigger) => merged.text_trigger = Some(trigger.clone()),
+            TriggerPatch::Clear => merged.text_trigger = None,
+        }
+        merged
+    }
+}
+
+/// Outcome of a `/command-edit` request against the stored row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditOutcome {
+    /// At least one field changed; the caller must republish the registry.
+    Changed,
+    /// The patch matches the saved definition (including an empty patch): an
+    /// explicit no-op that writes, audits and publishes nothing.
+    Unchanged,
+    /// No such row in this guild: a zero-write refusal, never an upsert.
+    Missing,
+}
+
+/// Outcome of an edit: the audit row exists only for a committed change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditDecision {
+    pub outcome: EditOutcome,
+    /// Field names that changed, in definition order. Reply text only.
+    pub changed: Vec<&'static str>,
+    pub audit: Option<AuditRecord>,
+    pub resync_registry: bool,
+}
+
+/// Adjudicate a patch against the stored row. Missing rows refuse, identical
+/// definitions are explicit no-ops, and only a real change audits and
+/// republishes.
+#[must_use]
+pub fn adjudicate_edit(
+    guild_id: &str,
+    actor_id: &str,
+    name: &str,
+    existing: Option<&StoredCommand>,
+    patch: &EditPatch,
+) -> EditDecision {
+    let Some(existing) = existing else {
+        return EditDecision {
+            outcome: EditOutcome::Missing,
+            changed: Vec::new(),
+            audit: None,
+            resync_registry: false,
+        };
+    };
+    let merged = patch.apply(existing);
+    let mut changed = Vec::new();
+    if merged.template != existing.template {
+        changed.push("template");
+    }
+    if merged.description != existing.description {
+        changed.push("description");
+    }
+    if merged.text_trigger != existing.text_trigger {
+        changed.push("text-trigger");
+    }
+    if changed.is_empty() {
+        return EditDecision {
+            outcome: EditOutcome::Unchanged,
+            changed,
+            audit: None,
+            resync_registry: false,
+        };
+    }
+    EditDecision {
+        outcome: EditOutcome::Changed,
+        changed,
+        audit: Some(AuditRecord::edit(guild_id, actor_id, name)),
+        resync_registry: true,
+    }
+}
+
+/// Validate the complete definition an edit would save, not just the
+/// supplied fields: an imported row whose omitted template is no longer valid
+/// must not be re-saved. A newly supplied trigger must also not shadow a
+/// builtin name (the dispatch rule); an untouched stored trigger is left
+/// alone so unrelated corrections stay possible.
+pub fn validate_edit(
+    merged: &StoredCommand,
+    patch: &EditPatch,
+    reserved: &HashSet<String>,
+    dispatch: &HashSet<String>,
+) -> Result<(), CommandError> {
+    validate_put_input(
+        &PutCommandInput {
+            name: merged.name.clone(),
+            description: merged.description.clone(),
+            template: merged.template.clone(),
+            text_trigger: merged.text_trigger.clone(),
+        },
+        reserved,
+    )?;
+    if let TriggerPatch::Set(trigger) = &patch.text_trigger {
+        if is_builtin_trigger(trigger, dispatch) {
+            return Err(CommandError::ReservedTextTrigger(trigger.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a stored definition for re-enable: the same write rules as
@@ -1657,6 +1808,141 @@ mod tests {
         let audit = d.audit.expect("changed toggle audits");
         assert_eq!(audit.action, "command.disable");
         assert_eq!(audit.outcome, "ok");
+    }
+
+    fn patch(
+        template: Option<&str>,
+        description: Option<&str>,
+        text_trigger: TriggerPatch,
+    ) -> EditPatch {
+        EditPatch {
+            template: template.map(str::to_owned),
+            description: description.map(str::to_owned),
+            text_trigger,
+        }
+    }
+
+    #[test]
+    fn edit_patch_replaces_only_supplied_fields() {
+        let mut row = stored("faq");
+        row.text_trigger = Some("!faq".to_owned());
+        row.enabled = false;
+        let merged = patch(Some("New {user}"), None, TriggerPatch::Keep).apply(&row);
+        assert_eq!(merged.template, "New {user}");
+        assert_eq!(merged.description, row.description);
+        assert_eq!(merged.text_trigger.as_deref(), Some("!faq"));
+        assert!(!merged.enabled, "a disabled row stays disabled");
+        assert_eq!((&merged.guild_id, &merged.name), (&row.guild_id, &row.name));
+        let set = patch(None, Some("D"), TriggerPatch::Set("!x".to_owned())).apply(&row);
+        assert_eq!(set.description, "D");
+        assert_eq!(set.text_trigger.as_deref(), Some("!x"));
+        let cleared = patch(None, None, TriggerPatch::Clear).apply(&row);
+        assert_eq!(cleared.text_trigger, None);
+        assert_eq!(cleared.template, row.template);
+    }
+
+    #[test]
+    fn edit_adjudication_is_missing_noop_or_audited_change() {
+        let mut row = stored("faq");
+        row.text_trigger = Some("!faq".to_owned());
+        let missing = adjudicate_edit(
+            GUILD,
+            ACTOR,
+            "faq",
+            None,
+            &patch(None, None, TriggerPatch::Keep),
+        );
+        assert_eq!(missing.outcome, EditOutcome::Missing);
+        assert!(missing.audit.is_none() && !missing.resync_registry);
+        for noop in [
+            patch(None, None, TriggerPatch::Keep),
+            patch(Some(&row.template), None, TriggerPatch::Keep),
+            patch(
+                None,
+                Some(&row.description),
+                TriggerPatch::Set("!faq".to_owned()),
+            ),
+        ] {
+            let decision = adjudicate_edit(GUILD, ACTOR, "faq", Some(&row), &noop);
+            assert_eq!(decision.outcome, EditOutcome::Unchanged);
+            assert!(decision.audit.is_none() && !decision.resync_registry);
+            assert!(decision.changed.is_empty());
+        }
+        let changed = adjudicate_edit(
+            GUILD,
+            ACTOR,
+            "faq",
+            Some(&row),
+            &patch(Some("Other"), Some("Desc"), TriggerPatch::Clear),
+        );
+        assert_eq!(changed.outcome, EditOutcome::Changed);
+        assert_eq!(changed.changed, ["template", "description", "text-trigger"]);
+        assert!(changed.resync_registry);
+        assert_eq!(
+            changed.audit.expect("a change audits"),
+            AuditRecord {
+                guild_id: GUILD.to_owned(),
+                actor_id: Some(ACTOR.to_owned()),
+                action: "command.edit".to_owned(),
+                target_key: Some("faq".to_owned()),
+                outcome: "ok".to_owned(),
+                reason: None,
+            }
+        );
+        // Clearing an absent trigger is a no-op, not a change.
+        let slash_only = stored("faq");
+        let decision = adjudicate_edit(
+            GUILD,
+            ACTOR,
+            "faq",
+            Some(&slash_only),
+            &patch(None, None, TriggerPatch::Clear),
+        );
+        assert_eq!(decision.outcome, EditOutcome::Unchanged);
+    }
+
+    #[test]
+    fn edit_validates_the_merged_definition_and_new_triggers() {
+        let reserved = reserved_command_names();
+        let dispatch = builtin_command_names();
+        let mut row = stored("faq");
+        row.template = "Imported {args}".to_owned();
+        let description_only = patch(None, Some("Fine"), TriggerPatch::Keep);
+        assert!(matches!(
+            validate_edit(
+                &description_only.apply(&row),
+                &description_only,
+                &reserved,
+                &dispatch
+            ),
+            Err(CommandError::InvalidTemplate(_))
+        ));
+        let row = stored("faq");
+        let builtin_trigger = patch(None, None, TriggerPatch::Set("!rank".to_owned()));
+        assert_eq!(
+            validate_edit(
+                &builtin_trigger.apply(&row),
+                &builtin_trigger,
+                &reserved,
+                &dispatch
+            ),
+            Err(CommandError::ReservedTextTrigger("!rank".to_owned()))
+        );
+        let empty_trigger = patch(None, None, TriggerPatch::Set(String::new()));
+        assert_eq!(
+            validate_edit(
+                &empty_trigger.apply(&row),
+                &empty_trigger,
+                &reserved,
+                &dispatch
+            ),
+            Err(CommandError::InvalidTextTrigger)
+        );
+        // An untouched stored builtin-named trigger does not block unrelated edits.
+        let mut grandfathered = stored("faq");
+        grandfathered.text_trigger = Some("!rank".to_owned());
+        let keep = patch(Some("Hi"), None, TriggerPatch::Keep);
+        assert!(validate_edit(&keep.apply(&grandfathered), &keep, &reserved, &dispatch).is_ok());
     }
 
     #[test]

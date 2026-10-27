@@ -9,19 +9,19 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 43 compiled built-ins plus the voice set
-  (64 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 44 compiled built-ins plus the voice set
+  (65 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Saved inventory: 7 core + 1 scorecard + 12 automations + 11 announcements +
-9 moderation + 2 private reads = **42 built-ins**. Machine-readable mirror:
+Saved inventory: 7 core + 1 scorecard + 13 automations + 11 announcements +
+9 moderation + 2 private reads = **43 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
-The test extends this saved fixture in memory with `/lfg-edit`: **43 compiled
-built-ins**, five covered and 38 deferred. The saved JSON deliberately excludes
+The test extends this saved fixture in memory with `/lfg-edit`: **44 compiled
+built-ins**, five covered and 39 deferred. The saved JSON deliberately excludes
 edit; this extension is not a live-publication or smoke-acceptance claim.
 
 ## Covered: the smoke five (one per routing family)
@@ -45,7 +45,7 @@ are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
 per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
 type-4 reply on an isolated gate-safe router).
 
-## Deferred: 37 saved commands with reasons
+## Deferred: 38 saved commands with reasons
 
 Deferred means out of the read-only smoke, not untested: every row below
 is published by the same registry the unit test pins, and most share a
@@ -65,6 +65,7 @@ handler family with a covered command.
 | `/command-inspect` | automations | Needs a named DB-backed custom row to inspect, which the no-DB rule excludes; read-only views are pinned by the disposable-database acceptance instead. |
 | `/command-disable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
 | `/command-enable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
+| `/command-edit` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
 | `/schedule` | automations | Effect fires on a wall-clock delay the offline smoke cannot observe; needs a timed live-guild pass. |
 | `/schedule-remove` | automations | Destructive and needs a live scheduled-message id; sequenced after a schedule create, not standalone. |
 | `/schedule-list` | automations | Needs seeded scheduled rows (DB); the no-DB rule excludes it. |
