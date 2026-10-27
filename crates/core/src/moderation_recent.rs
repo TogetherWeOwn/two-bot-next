@@ -110,16 +110,17 @@ pub enum RecentView {
     OutOfRange,
 }
 
-/// Make a stored value inert for display: control characters fold to a
-/// space, backticks become apostrophes (the value is rendered inside a code
-/// span, where Discord renders mentions, markdown and links as plain text),
-/// and the result is cut to `cap` UTF-16 units with an ellipsis.
+/// Make a stored value inert for display: control characters and the Unicode
+/// line/paragraph separators (U+2028/U+2029, which `char::is_control` does not
+/// cover) fold to a space, backticks become apostrophes (the value is rendered
+/// inside a code span, where Discord renders mentions, markdown and links as
+/// plain text), and the result is cut to `cap` UTF-16 units with an ellipsis.
 fn inert(value: &str, cap: usize) -> String {
     let cleaned: String = value
         .chars()
         .map(|ch| match ch {
             '`' => '\'',
-            ch if ch.is_control() => ' ',
+            ch if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => ' ',
             ch => ch,
         })
         .collect();
@@ -313,6 +314,21 @@ mod tests {
         let line = render_row(&hostile);
         assert!(line.ends_with("`'@everyone' <@1> next`"), "{line}");
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn unicode_separators_fold_so_rows_stay_single_line() {
+        let mut tricky = row(1);
+        tricky.reason = "a\u{2028}b\u{2029}c".to_owned();
+        tricky.action = "x\u{2028}y".to_owned();
+        let line = render_row(&tricky);
+        assert!(
+            !line.contains('\u{2028}') && !line.contains('\u{2029}'),
+            "{line}"
+        );
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.contains("x y"), "{line}");
+        assert!(line.ends_with("`a b c`"), "{line}");
     }
 
     #[test]

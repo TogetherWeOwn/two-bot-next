@@ -48,6 +48,23 @@ async fn audit(pool: &PgPool, guild: &str, request: &str, outcome: &str, at: &st
     .expect("seed audit row");
 }
 
+async fn channel_audit(pool: &PgPool, guild: &str, request: &str, at: &str) {
+    sqlx::query(
+        "INSERT INTO moderation_audit
+         (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+          outcome, idempotency_key, metadata_json, created_at)
+         VALUES ($1, $2, '88', 'moderation.lockdown', NULL, '555', 'raid wave',
+                 'locked_down', $3, '{\"claim_token\":\"hidden\"}', $4::text::timestamptz)",
+    )
+    .bind(request)
+    .bind(guild)
+    .bind(format!("idem-{request}"))
+    .bind(at)
+    .execute(pool)
+    .await
+    .expect("seed channel audit row");
+}
+
 async fn warning(pool: &PgPool, guild: &str, request: &str, at: &str) {
     sqlx::query(
         "INSERT INTO moderation_warnings
@@ -134,8 +151,25 @@ async fn warnings_dedupe_against_audit_and_project_alone_when_uncorroborated() {
         ("moderation.warn", "warned", Some("3333"))
     );
     assert_eq!(only.actor_id, "88");
+    assert_eq!(only.reason, "warned reason");
     assert!(only.channel_id.is_none());
     assert_eq!(rows[1].action, "moderation.kick", "the audit row wins");
+}
+
+#[tokio::test]
+async fn channel_audit_rows_project_their_channel_not_a_blank_target() {
+    let db = database().await;
+    let pool = db.pool().clone();
+    channel_audit(&pool, GUILD, "req-channel", "2026-10-12T00:00:00+00:00").await;
+    let rows = read_recent_moderation(&pool, GUILD).await.expect("read");
+    db.close().await.expect("drop owned fixture");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.action, "moderation.lockdown");
+    assert_eq!(row.outcome, "locked_down");
+    assert!(row.target_id.is_none());
+    assert_eq!(row.channel_id.as_deref(), Some("555"));
+    assert_eq!(row.reason, "raid wave");
 }
 
 #[tokio::test]

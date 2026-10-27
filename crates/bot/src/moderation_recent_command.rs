@@ -26,7 +26,7 @@ use two_bot_discord::ActionExecutor;
 
 use crate::{
     command_runtime::actor_id,
-    db_log::db_class,
+    db_log::{db_class, discord_class},
     member_runtime::{actor_authority, fetched_member, guild_facts, sanitize_option_name},
 };
 
@@ -162,7 +162,7 @@ pub(crate) async fn handle_command(
     {
         tracing::warn!(
             interaction_id = %interaction.id.get(),
-            error = %err,
+            reason = discord_class(&err),
             "moderation recent reply edit failed"
         );
     }
