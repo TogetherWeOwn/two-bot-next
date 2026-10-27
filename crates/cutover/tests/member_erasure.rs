@@ -46,6 +46,21 @@ async fn snapshot(pool: &PgPool, table: &str) -> Vec<String> {
     .unwrap()
 }
 
+async fn outside_predicate(
+    pool: &PgPool,
+    entry: &two_bot_cutover::member_erasure::TablePlan,
+) -> Vec<String> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT to_jsonb({})::text FROM {} WHERE NOT COALESCE(({}), false) ORDER BY to_jsonb({})::text",
+        entry.table, entry.table, entry.predicate, entry.table
+    )))
+    .bind(GUILD)
+    .bind(USER)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 async fn audit_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM member_erasure_audit")
         .fetch_one(pool)
@@ -192,11 +207,7 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
     let plan = plan();
     let mut untouched = Vec::new();
     for entry in &plan.tables {
-        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT to_jsonb({})::text FROM {} WHERE NOT COALESCE(({}), false) ORDER BY to_jsonb({})::text",
-            entry.table, entry.table, entry.predicate, entry.table
-        )))
-        .bind(GUILD).bind(USER).fetch_all(db.pool()).await.unwrap();
+        let rows = outside_predicate(db.pool(), entry).await;
         // The other member and both members in the other guild survive.
         // event_store seeds five rows per member: one presence row binding
         // user_id plus three S8 rows (actor-only, target-only, user-only)
@@ -244,12 +255,17 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
     .unwrap();
     assert_eq!(deleted, before);
     for (entry, expected) in plan.tables.iter().zip(untouched) {
-        assert_eq!(
-            snapshot(db.pool(), &entry.table).await,
-            expected,
-            "{} survivors changed",
-            entry.table
-        );
+        let rows = snapshot(db.pool(), &entry.table).await;
+        if entry.redact.is_some() {
+            // A redacting entry keeps the member's row (now outside its
+            // predicate) beside every untouched survivor, byte for byte.
+            assert_eq!(rows.len(), expected.len() + 1, "{} tombstone", entry.table);
+            for survivor in &expected {
+                assert!(rows.contains(survivor), "{} survivor changed", entry.table);
+            }
+            continue;
+        }
+        assert_eq!(rows, expected, "{} survivors changed", entry.table);
     }
     for (table, expected) in exceptions {
         assert_eq!(

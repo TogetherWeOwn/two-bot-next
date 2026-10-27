@@ -45,6 +45,14 @@ are outside this implementation's scope.
   through the scheduled-event mirror. The channel claim row
   (`event_voice_channels`) carries no member identity and is untouched.
   Erasure removes database tracking only, never the Discord channel.
+  Private member reports (`member_reports`, `report_snapshots`,
+  `report_reporters`) keep an accountability tombstone (group ID, guild,
+  message ID, reported member ID, report count, disposition, timestamps and
+  snapshot status). Erasing a reporter clears their first-reporter field and
+  deletes their coalesced reporter rows; erasing a reported author replaces the
+  snapshot content and attachment metadata with an erased marker and redacts
+  their ID from the free-text reason. Closed groups are deleted outright 90
+  days after they close. The tables are never part of a backup archive.
   Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
   IDs) and room logging settings (`voice_logging_settings`: detail level, notice

@@ -33,6 +33,26 @@ pub struct TablePlan {
     /// Constant SQL with $1 = guild, $2 = member. Includes indirect scope for
     /// child tables that have no guild_id of their own.
     pub predicate: String,
+    /// Constant `SET` list (binding the same $1/$2) for a table whose rows
+    /// carry an accountability tombstone that must survive: matching rows are
+    /// redacted in place instead of deleted. The predicate must stop matching
+    /// once a row is redacted so a repeat run counts and changes nothing.
+    #[serde(default)]
+    pub redact: Option<String>,
+}
+
+impl TablePlan {
+    /// The reviewed statement that removes this member's footprint from the
+    /// table: an in-place redaction when the entry declares one, otherwise a
+    /// delete. Table, predicate and `SET` list come from the embedded plan,
+    /// never caller input; binds $1 = guild, $2 = member.
+    #[must_use]
+    pub fn mutation_sql(&self) -> String {
+        match &self.redact {
+            Some(set) => format!("UPDATE {} SET {} WHERE {}", self.table, set, self.predicate),
+            None => format!("DELETE FROM {} WHERE {}", self.table, self.predicate),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +107,8 @@ pub fn is_identity_column(column: &str) -> bool {
                 | "opener_id"
                 | "requester_id"
                 | "holder_id"
+                | "reporter_id"
+                | "claimer_id"
         )
 }
 
@@ -311,7 +333,7 @@ pub async fn erase_member(
             return Err(sqlx::Error::InvalidArgument(REPLAY_GUARD_REFUSAL.into()));
         }
         for (entry, count) in plan.tables.iter().zip(&counts) {
-            let sql = format!("DELETE FROM {} WHERE {}", entry.table, entry.predicate);
+            let sql = entry.mutation_sql();
             let deleted = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(guild)
                 .bind(member)
@@ -353,6 +375,9 @@ mod tests {
             assert!(!entry.columns.is_empty());
             assert!(entry.predicate.contains("$1") && entry.predicate.contains("$2"));
             assert!(!entry.predicate.contains(';'));
+            if let Some(set) = &entry.redact {
+                assert!(!set.contains(';') && set.contains('='), "{}", entry.table);
+            }
             for column in entry.columns {
                 assert!(
                     entry.predicate.contains(&column),
@@ -385,6 +410,8 @@ mod tests {
             "original_creator_id",
             "created_by",
             "actor",
+            "reporter_id",
+            "claimer_id",
         ] {
             assert!(is_identity_column(column));
         }

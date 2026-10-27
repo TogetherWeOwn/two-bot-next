@@ -886,6 +886,16 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
+        } else if entry.table == "report_snapshots" || entry.table == "report_reporters" {
+            // Report children carry no guild column: scope through the group.
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE report_id IN (SELECT id FROM member_reports WHERE guild_id = $1)",
+                entry.table
+            )))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
         } else if entry.table == "retention_deletion_requests" {
             0
         } else {
@@ -977,6 +987,16 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             )
             .bind(format!("ev-{FIX_GONE}:{FIX_USER}"))
             .bind(format!("ev-{FIX_GONE}:{FIX_USER_2}"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "report_snapshots" || entry.table == "report_reporters" {
+            // Report children carry no guild column: scope through the group.
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE report_id IN (SELECT id FROM member_reports WHERE guild_id = $1)",
+                entry.table
+            )))
+            .bind(FIX_GONE)
             .fetch_one(pool)
             .await
             .unwrap()
@@ -1082,6 +1102,15 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             )
             .bind(format!("ev-{FIX_OTHER}:{FIX_USER}"))
             .bind(format!("ev-{FIX_OTHER}:{FIX_USER_2}"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if table == "report_snapshots" || table == "report_reporters" {
+            // Report children carry no guild column: scope through the group.
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE report_id IN (SELECT id FROM member_reports WHERE guild_id = $1)"
+            )))
+            .bind(FIX_OTHER)
             .fetch_one(pool)
             .await
             .unwrap()

@@ -52,8 +52,13 @@ const EXPECTED_DISPOSITIONS: &[(&str, &str)] = &[
     ("lfg_roles", ACCEPT_WITH_REASON),
     // Written with its parent moderation_idempotency claim (claimed_at).
     ("moderation_channel_executions", ACCEPT_WITH_REASON),
+    // Private report evidence is never exported or archived; no legacy
+    // system reads it, so a rollback leaves the tables inert.
+    ("member_reports", ACCEPT_WITH_REASON),
     // Seed reference data.
     ("rank_ladder", ACCEPT_WITH_REASON),
+    ("report_reporters", ACCEPT_WITH_REASON),
+    ("report_snapshots", ACCEPT_WITH_REASON),
     // Written with its exchange lifecycle (self_role_exchanges.created_at).
     ("self_role_exchange_baselines", ACCEPT_WITH_REASON),
     // Voice window: reviewed disposition accepts the reason (read-back pair).

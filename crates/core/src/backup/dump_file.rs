@@ -356,6 +356,15 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "backfill_history_counts",
     "member_catchup_cursors",
     "member_catchup_members",
+    // Private member reports (cutover 0469): bounded single-message evidence
+    // and reporter identities that live at most 90 days after a report closes
+    // and are redacted or erased on request. A backup would outlive that
+    // window and a restore would resurrect expired or erased evidence, so the
+    // tables are never archived; the accountability tombstone survives only
+    // in the live database.
+    "member_reports",
+    "report_snapshots",
+    "report_reporters",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store

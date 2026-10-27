@@ -186,6 +186,14 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // updated_at and reset the decayed_weeks watermark; decay rewrites
     // seasonal_xp/decayed_weeks but leaves an occurred_at-stamped decay row
     // in xp_awards, mirroring the member_levels lifetime path.
+    // Private member reports (0469): evidence and reporter identities that are
+    // erased on request and deleted 90 days after closure. Never exported or
+    // archived, so a rollback artifact cannot outlive those guarantees. No
+    // legacy system reads them, so a rollback leaves them inert.
+    TableSpec {
+        table: "member_reports",
+        measure: TableMeasure::Unmeasurable("private report evidence is never exported or archived (90-day retention and erasure guarantees); no legacy system reads it, so a rollback leaves the tables inert", DISPOSITION_ACCEPT_WITH_REASON),
+    },
     TableSpec { table: "member_season_xp", measure: TableMeasure::Columns(&["updated_at"]) },
     // Pure projection: any milestone/activity write must move the maximum.
     TableSpec {
@@ -220,6 +228,14 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("no timestamp column; rows are rewritten with each rank snapshot (measured via rank_snapshots.snapshot_at in the same transaction, see WebsiteStore::write_rank_snapshot)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "rank_snapshots", measure: TableMeasure::Columns(&["snapshot_at"]) },
+    TableSpec {
+        table: "report_reporters",
+        measure: TableMeasure::Unmeasurable("private report evidence is never exported or archived (90-day retention and erasure guarantees); no legacy system reads it, so a rollback leaves the tables inert", DISPOSITION_ACCEPT_WITH_REASON),
+    },
+    TableSpec {
+        table: "report_snapshots",
+        measure: TableMeasure::Unmeasurable("private report evidence is never exported or archived (90-day retention and erasure guarantees); no legacy system reads it, so a rollback leaves the tables inert", DISPOSITION_ACCEPT_WITH_REASON),
+    },
     TableSpec { table: "rollback_journal", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "rollback_watermarks", measure: TableMeasure::Columns(&["updated_at"]) },
     // Retention deletion ledger (0438): request creation stamps requested_at,

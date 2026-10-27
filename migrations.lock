@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0469_member_reports.sql": {
+      "sha256": "2078078ae2f0db9cbce89e6d2091859be34c3248e06772d3bdd9555636ef3329",
+      "justification": "Add private member-report storage: bounded single-message snapshots, a ten-reporter cap, one active group per message, and cascade children for 90-day retention and reasoned erasure."
+    },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."

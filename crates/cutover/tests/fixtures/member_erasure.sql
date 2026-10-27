@@ -239,6 +239,23 @@ BEGIN
           'INVITE_CREATE:' || g || ':c-' || k || ':' ||
             repeat(md5('invite-' || k), 2) ||
             ':2026-10-01T00:00:00Z');
+      -- One closed report per member: the member is its first reporter, its
+      -- reported author and a persisted reporter row. The 20-digit numeric id
+      -- is unique per (guild, member) pair. Reporter and author erasure
+      -- redact the group and snapshot in place and delete the reporter row.
+      INSERT INTO member_reports
+        (id, guild_id, message_id, reported_member_id, reporter_id, report_count,
+         reason, snapshot_status, status, created_at, closed_at, disposition)
+        VALUES (right(g, 2) || u, g, right(g, 2) || u, u, u, 2, 'Synthetic fixture report',
+          'present', 'closed', now() - interval '2 days', now() - interval '1 day',
+          'informational');
+      INSERT INTO report_snapshots
+        (report_id, author_id, author_bot, message_created_at, content, attachments,
+         attachment_overflow)
+        VALUES (right(g, 2) || u, u, false, now() - interval '3 days', 'Synthetic fixture quote',
+          '[]'::jsonb, false);
+      INSERT INTO report_reporters (report_id, reporter_id, reported_at)
+        VALUES (right(g, 2) || u, u, now() - interval '2 days');
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

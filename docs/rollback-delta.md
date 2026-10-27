@@ -89,6 +89,7 @@ from this map, and the acceptance battery pins the JSON encoding):
 | `level_role_rewards` | `manual-reconcile-required` | Wholesale-replaced configuration with no alternate evidence named |
 | `lfg_roles` | `accept-with-reason` | Child rows are created and updated with the parent `lfg_posts` row |
 | `moderation_channel_executions` | `accept-with-reason` | Written with its parent `moderation_idempotency` claim (measured via `claimed_at`) |
+| `member_reports`, `report_snapshots`, `report_reporters` | `accept-with-reason` | Private report evidence is erased on request and deleted 90 days after closure, so it is never exported or archived; no legacy system reads it |
 | `rank_ladder` | `accept-with-reason` | Rows rewritten with each rank snapshot (measured via `rank_snapshots.snapshot_at` in the same transaction) |
 | `self_role_exchange_baselines` | `accept-with-reason` | Pinned/retired in place by the legacy-journal path; accepted with a per-event baseline dump comparison (freeze vs rollback) as alternate evidence |
 | `voice_channel_templates`, `voice_game_aliases`, `voice_random_lists`, `voice_random_list_choices`, `voice_logging`, `voice_logging_mention_members`, `voice_logging_mention_roles`, `voice_guild_settings`, `voice_command_roles`, `voice_command_role_members` | `accept-with-reason` | Wholesale-replaced configuration, accepted with the freeze/rollback configuration export pair below as alternate evidence |
@@ -147,6 +148,13 @@ but bound or rolled back after it is included in both count and export. A block 
 after the freeze deletes its row, so `voice_room_blocks` measures additions only; a grant
 revoked or refused after the freeze deletes its row, so `voice_join_grants` measures
 approvals only.
+
+The private member-report tables (`member_reports`, `report_snapshots`,
+`report_reporters`) are `unmeasurable` with disposition `accept-with-reason`:
+their evidence and reporter identities are erased on request and deleted 90
+days after a report closes, so they are never exported or archived and a
+rollback artifact cannot outlive those guarantees. No legacy system reads
+them, so restoring an older binary leaves the tables inert.
 
 Read access does **not** authorize execution against real databases for
 tests. Acceptance uses only the disposable test service below. Operational

@@ -47,6 +47,12 @@
 //!   table truncated to make expiry work). Production activation of the
 //!   executing mode remains gated on independent security validation of
 //!   that exception; the supervised job's default stays dry run.
+//! * Closed member reports are time-deleted [`MEMBER_REPORT_RETENTION_DAYS`]
+//!   after `closed_at` (`member_reports`; snapshot and reporter children
+//!   cascade). Open and claimed reports never expire. The user-deletion and
+//!   erasure paths redact a report's snapshot, reason and first-reporter
+//!   fields in place instead of deleting the group (see the plan's `redact`
+//!   entries); only the 90-day expiry and the guild purge delete groups.
 //! * Guild purges cover every guild-keyed erasure-plan table (plus
 //!   `presence_probe`) and leave `retention_deletion_requests` to the receipt
 //!   path, so a pending deletion for a departed guild still completes with a
@@ -92,6 +98,10 @@ pub const PRESENCE_RAW_RETENTION_DAYS: i32 = 30;
 pub const VOICE_RAW_RETENTION_DAYS: i32 = 30;
 /// Audit-log cache rows older than this expire.
 pub const AUDIT_CACHE_RETENTION_DAYS: i32 = 45;
+/// Closed member reports (and their snapshot and reporter children) are
+/// deleted this many days after `closed_at`. Open and claimed reports never
+/// expire.
+pub const MEMBER_REPORT_RETENTION_DAYS: i32 = 90;
 /// User deletion requests complete well inside this many hours.
 pub const DELETION_SLA_HOURS: i64 = 72;
 /// Retention job cadence and raw-expiry maximum-age headroom.
@@ -139,6 +149,11 @@ pub struct RetentionReport {
     /// rows are eligible: never-started and started-but-ambiguous rows stay
     /// fenced however old, so a retry inside the horizon still dedups.
     pub stream_live_delivered_expired: u64,
+    /// Closed member-report groups deleted (closed more than
+    /// [`MEMBER_REPORT_RETENTION_DAYS`] ago). Each group counts once; its
+    /// snapshot and reporter children follow by `ON DELETE CASCADE` and are
+    /// not counted separately. Open and claimed groups are never selected.
+    pub member_reports_expired: u64,
     /// Guild-scoped rows purged for departed guilds.
     pub guild_rows_purged: u64,
     /// Queued guild purges that failed with a real error in this run,
@@ -209,6 +224,7 @@ impl RetentionReport {
             + self.voice_raw_deleted
             + self.audit_cache_deleted
             + self.stream_live_delivered_expired
+            + self.member_reports_expired
             + self.guild_rows_purged
     }
 }
@@ -385,6 +401,7 @@ async fn run_retention_inner(
                 voice_raw_deleted = report.voice_raw_deleted,
                 audit_cache_deleted = report.audit_cache_deleted,
                 stream_live_delivered_expired = report.stream_live_delivered_expired,
+                member_reports_expired = report.member_reports_expired,
                 guild_rows_purged = report.guild_rows_purged,
                 guild_purges_failed = report.guild_purges_failed,
                 guild_purges_deferred = report.guild_purges_deferred,
@@ -497,6 +514,7 @@ async fn run_retention_core(
             let audit = count_audit_cache(&mut tx).await?;
             let live_expired =
                 count_expired_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
+            let reports_expired = count_expired_member_reports(&mut tx).await?;
             let overdue = count_overdue_deletions(&mut tx).await?;
             // A schema-coverage refusal defers every pending request (the
             // live drain rolls back only that request's savepoint), so the
@@ -543,6 +561,7 @@ async fn run_retention_core(
                 voice_raw_deleted: voice,
                 audit_cache_deleted: audit,
                 stream_live_delivered_expired: live_expired,
+                member_reports_expired: reports_expired,
                 guild_rows_purged: guild_rows,
                 // The dry run reports what the live run will delete: guarded
                 // requests stay pending, so they are deferred, not completed;
@@ -614,6 +633,16 @@ async fn run_retention_core(
             // path.
             let live_expired =
                 expire_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
+            // Closed report groups past the horizon; snapshots and reporters
+            // follow by ON DELETE CASCADE. Runs in the time-window stage so
+            // the guild projection can exclude exactly these rows.
+            let reports_expired = sqlx::query(
+                "DELETE FROM member_reports WHERE status = 'closed' AND closed_at < now() - make_interval(days => $1)",
+            )
+            .bind(MEMBER_REPORT_RETENTION_DAYS)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
             let overdue = count_overdue_deletions(&mut tx).await?;
             // Schema gaps are computed once per run, before either drain. A
             // gap means no purge or deletion can certify completeness, so
@@ -759,6 +788,7 @@ async fn run_retention_core(
                 voice_raw_deleted: voice,
                 audit_cache_deleted: audit,
                 stream_live_delivered_expired: live_expired,
+                member_reports_expired: reports_expired,
                 guild_rows_purged: guild_rows,
                 guild_purges_failed: guild_failed,
                 guild_purges_deferred: guild_deferred,
@@ -885,6 +915,7 @@ async fn count_raw_expiry_candidates(
         voice_raw_deleted: voice as u64,
         audit_cache_deleted: audit as u64,
         stream_live_delivered_expired: 0,
+        member_reports_expired: 0,
         guild_rows_purged: 0,
         guild_purges_failed: 0,
         guild_purges_deferred: 0,
@@ -1031,6 +1062,7 @@ pub async fn run_raw_expiry_batch(
         voice_raw_deleted: 0,
         audit_cache_deleted: 0,
         stream_live_delivered_expired: 0,
+        member_reports_expired: 0,
         guild_rows_purged: 0,
         guild_purges_failed: 0,
         guild_purges_deferred: 0,
@@ -1234,7 +1266,7 @@ async fn complete_request(
         }
         // Table names and predicates come from the reviewed embedded plan,
         // never caller input; predicates bind $1 = guild, $2 = member.
-        let sql = format!("DELETE FROM {} WHERE {}", entry.table, entry.predicate);
+        let sql = entry.mutation_sql();
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(guild_id)
             .bind(user_id)
@@ -1272,6 +1304,10 @@ fn guild_purge_predicate(table: &str) -> String {
         }
         "feed_deliveries" => {
             "feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)".to_owned()
+        }
+        // Report children carry no guild column: scope through their group.
+        "report_snapshots" | "report_reporters" => {
+            "report_id IN (SELECT id FROM member_reports WHERE guild_id = $1)".to_owned()
         }
         "self_role_exchanges" => {
             "event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned()
@@ -1325,6 +1361,20 @@ fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Ve
             format!("occurred_at < now() - make_interval(days => ${first_placeholder})"),
             AUDIT_CACHE_RETENTION_DAYS,
         )],
+        // Closed report groups past the horizon, and their cascade children
+        // through the group, are removed by the time-window stage.
+        "member_reports" => vec![(
+            format!(
+                "status = 'closed' AND closed_at < now() - make_interval(days => ${first_placeholder})"
+            ),
+            MEMBER_REPORT_RETENTION_DAYS,
+        )],
+        "report_snapshots" | "report_reporters" => vec![(
+            format!(
+                "report_id IN (SELECT id FROM member_reports WHERE status = 'closed' AND closed_at < now() - make_interval(days => ${first_placeholder}))"
+            ),
+            MEMBER_REPORT_RETENTION_DAYS,
+        )],
         _ => Vec::new(),
     }
 }
@@ -1332,7 +1382,7 @@ fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Ve
 /// `ON DELETE CASCADE` parents of one erasure-plan table, as
 /// `(parent table, join condition)` pairs with fully qualified columns.
 /// Mirrors the CASCADE foreign keys in migrations 0170, 0180, 0210, 0413,
-/// 0416 and 0418: every CASCADE child the guild purge counts. The
+/// 0416, 0418 and 0469: every CASCADE child the guild purge counts. The
 /// remaining CASCADE child, `self_role_exchange_baselines` (0206), is not
 /// a plan table and is never counted by the purge, so it needs no
 /// exclusion. A child row whose parent the user-deletion stage deletes is
@@ -1355,6 +1405,11 @@ fn guild_projection_cascade_parents(table: &str) -> &'static [(&'static str, &'s
         "lfg_roles" => &[("lfg_posts", "lfg_posts.id = lfg_roles.lfg_id")],
         "feed_deliveries" => &[("feed_relays", "feed_relays.id = feed_deliveries.feed_id")],
         "ticket_transcripts" => &[("tickets", "tickets.id = ticket_transcripts.ticket_id")],
+        // Report children cascade from their group. The group redacts in the
+        // user-deletion stage rather than deleting, so the projection skips
+        // this parent until the group itself becomes deletable there.
+        "report_snapshots" => &[("member_reports", "member_reports.id = report_snapshots.report_id")],
+        "report_reporters" => &[("member_reports", "member_reports.id = report_reporters.report_id")],
         "voice_room_blocks" => &[(
             "voice_rooms",
             "voice_rooms.guild_id = voice_room_blocks.guild_id AND voice_rooms.channel_id = voice_room_blocks.room_channel_id",
@@ -1457,6 +1512,20 @@ async fn purge_guild(
         .execute(&mut **tx)
         .await?;
     Ok(purged)
+}
+
+/// Closed member-report groups the Execute time-window stage would delete,
+/// with the same predicate and horizon.
+async fn count_expired_member_reports(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<u64, sqlx::Error> {
+    let expired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM member_reports WHERE status = 'closed' AND closed_at < now() - make_interval(days => $1)",
+    )
+    .bind(MEMBER_REPORT_RETENTION_DAYS)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(expired as u64)
 }
 
 async fn count_presence_raw(
@@ -1572,7 +1641,10 @@ async fn count_queued_guild_rows(
                 binds.push(ProjectionBind::Days(days));
                 next_placeholder += 1;
             }
-            for user_id in &eligible_users {
+            // A redacting entry keeps its rows in the user-deletion stage, so
+            // those rows still reach the guild purge and are never excluded.
+            let user_stage_deletes = entry.redact.is_none();
+            for user_id in eligible_users.iter().filter(|_| user_stage_deletes) {
                 // The plan predicate binds $1 = guild, $2 = member; move the
                 // member bind to this query's next placeholder. The only
                 // other `$` occurrences in plan predicates are regex end
@@ -1589,10 +1661,12 @@ async fn count_queued_guild_rows(
                 // never reaches the guild stage. Shares this user's bind.
                 for (parent_table, join_condition) in guild_projection_cascade_parents(&entry.table)
                 {
+                    // A redacting parent is never deleted by the user stage, so
+                    // it cascades nothing.
                     let Some(parent) = erasure
                         .tables
                         .iter()
-                        .find(|plan| plan.table == *parent_table)
+                        .find(|plan| plan.table == *parent_table && plan.redact.is_none())
                     else {
                         continue;
                     };
@@ -1665,6 +1739,7 @@ mod retention_stage_order_tests {
             voice_raw_deleted: 0,
             audit_cache_deleted: 0,
             stream_live_delivered_expired: 0,
+            member_reports_expired: 0,
             guild_rows_purged: 0,
             guild_purges_failed: 0,
             guild_purges_deferred: 0,
@@ -1798,6 +1873,7 @@ mod ledger_tests {
             voice_raw_deleted: voice,
             audit_cache_deleted: audit,
             stream_live_delivered_expired: live_expired,
+            member_reports_expired: 0,
             guild_rows_purged: guild_rows,
             guild_purges_failed: failed,
             guild_purges_deferred: deferred_guilds,
@@ -2009,6 +2085,17 @@ mod ledger_tests {
         assert!(audit_condition.contains("$2"), "{audit_condition}");
         assert_eq!(audit_days, AUDIT_CACHE_RETENTION_DAYS);
 
+        // Closed member-report groups expire in the same stage, and their
+        // cascade children go with them, so all three share the horizon.
+        for table in ["member_reports", "report_snapshots", "report_reporters"] {
+            let (condition, days) = guild_projection_time_exclusions(table, 2)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("{table} needs a projection exclusion"));
+            assert!(condition.contains("$2"), "{condition}");
+            assert_eq!(days, MEMBER_REPORT_RETENTION_DAYS);
+        }
+
         let mut without_exclusion: Vec<String> = crate::member_erasure::plan()
             .tables
             .iter()
@@ -2016,7 +2103,14 @@ mod ledger_tests {
             .collect();
         without_exclusion.push("presence_probe".to_owned());
         for table in without_exclusion {
-            if table == "events" || table == "operational_audit_log" {
+            if matches!(
+                table.as_str(),
+                "events"
+                    | "operational_audit_log"
+                    | "member_reports"
+                    | "report_snapshots"
+                    | "report_reporters"
+            ) {
                 continue;
             }
             assert!(
@@ -2102,6 +2196,8 @@ mod ledger_tests {
             "voice_room_blocks",
             "voice_join_grants",
             "voice_owner_grants",
+            "report_snapshots",
+            "report_reporters",
         ] {
             for (parent, _) in guild_projection_cascade_parents(child) {
                 assert!(
