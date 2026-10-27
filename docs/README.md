@@ -128,7 +128,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Play-now](lfg-play-now-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
-- [Private sample](feed-preview-spec.md)
+- [Sample](feed-preview-spec.md)
 - [Title filter](feed-title-filter-spec.md)
 - [Relay move](feed-move-spec.md)
 - [EventSub operations](eventsub-runbook.md)
