@@ -126,14 +126,6 @@ library code with no Discord dependency and can start immediately.
     buttons. Approve grants access and moves them in; Block stops further requests
     from that member.
 - `/public`: restores access and deletes the Join channel.
-- `/room-access-inspect [page]`: an ephemeral, read-only list of the caller's
-  current room's blocked, granted and pending-request members, each section
-  shown even when empty. The same owner-or-admin gate as `/private` applies, and
-  only the caller's own current room can be read. Blocks are durable and stay
-  visible after `/public`; grants load from the durable record; pending requests
-  are in memory and are cleared by a restart, so the list reports current state
-  and never rebuilds it from Discord overwrites. Long lists page by member with
-  every section on each page.
 - Per-user bitrate preference: must be above 8 kbps and at most the guild's tier
   maximum; can be reset. A room uses the average of its members' preferences,
   falling back to the creator channel's bitrate.
