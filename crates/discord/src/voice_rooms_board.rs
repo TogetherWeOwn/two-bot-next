@@ -303,12 +303,18 @@ fn render_content(snapshot: &BoardSnapshot<'_>, entries: &[BoardEntry], omitted:
     out
 }
 
-/// Control and bidi-override characters become spaces; ends are trimmed.
+/// Control, line/paragraph separator and bidi characters become spaces; ends
+/// are trimmed. Mirrors the alias policy's refused-control set.
 fn display_text(text: &str) -> String {
     let flat: String = text
         .chars()
         .map(|ch| {
-            if ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+            if ch.is_control()
+                || matches!(
+                    ch,
+                    '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                )
+            {
                 ' '
             } else {
                 ch
@@ -374,6 +380,90 @@ mod tests {
     #[test]
     fn display_text_flattens_controls_and_bidi_overrides() {
         assert_eq!(display_text(" a\nb\u{202e}c\0 "), "a b c");
+        assert_eq!(display_text("a\u{2028}b\u{2029}c"), "a b c");
+    }
+
+    fn fixture_role(id: u64, permissions: Permissions) -> Role {
+        serde_json::from_value(serde_json::json!({
+            "id": id.to_string(), "name": "fixture role", "color": 0,
+            "hoist": false, "managed": false, "mentionable": false, "position": 0,
+            "colors": { "primary_color": 0, "secondary_color": null, "tertiary_color": null },
+            "permissions": permissions.bits().to_string(), "flags": 0
+        }))
+        .expect("synthetic role is valid")
+    }
+
+    fn render_with(roles: &[Role], viewer_roles: &[Id<RoleMarker>], game: &str) -> Board {
+        let presence = MemberPresence {
+            game: Some(game.to_owned()),
+            ..MemberPresence::default()
+        };
+        let aliases = AliasTable::default();
+        let options = GameOptions::default();
+        render_board(&BoardSnapshot {
+            ready: true,
+            generation: 1,
+            as_of_unix: 0,
+            guild_id: 100,
+            guild_owner_id: 101,
+            viewer_id: 102,
+            viewer_roles: Some(viewer_roles),
+            roles,
+            presence_enabled: true,
+            aliases: &aliases,
+            game_options: &options,
+            rooms: vec![BoardRoom {
+                channel_id: 200,
+                tracked: true,
+                owner_id: 103,
+                user_limit: None,
+                overwrites: &[],
+                occupants: vec![BoardOccupant {
+                    member_id: 103,
+                    is_bot: false,
+                    presence: Some(&presence),
+                }],
+            }],
+        })
+    }
+
+    #[test]
+    fn line_separators_in_a_game_title_cannot_forge_a_row() {
+        let roles = [fixture_role(
+            100,
+            Permissions::VIEW_CHANNEL | Permissions::CONNECT,
+        )];
+        for hostile in [
+            "Apex\u{2028}Fake Room \u{b7} 9 in voice \u{b7} Open",
+            "Apex\u{2029}Fake",
+            "A\nB",
+        ] {
+            let board = render_with(&roles, &[], hostile);
+            assert_eq!(board.state, BoardState::Ready);
+            assert_eq!(board.entries.len(), 1);
+            for forbidden in ['\u{2028}', '\u{2029}'] {
+                assert!(!board.content.contains(forbidden), "{hostile:?}");
+            }
+            assert_eq!(
+                board.content.lines().count(),
+                2,
+                "header plus one row: {:?}",
+                board.content
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_roles_are_catching_up_never_an_empty_board() {
+        let everyone = fixture_role(100, Permissions::VIEW_CHANNEL | Permissions::CONNECT);
+        let missing_assigned = render_with(&[everyone], &[Id::new(999)], "Apex");
+        assert_eq!(missing_assigned.state, BoardState::CatchingUp);
+        assert_eq!(missing_assigned.content, CATCHING_UP);
+
+        let other = fixture_role(107, Permissions::VIEW_CHANNEL | Permissions::CONNECT);
+        let missing_everyone = render_with(&[other], &[], "Apex");
+        assert_eq!(missing_everyone.state, BoardState::CatchingUp);
+        assert_eq!(missing_everyone.content, CATCHING_UP);
     }
 
     #[test]
