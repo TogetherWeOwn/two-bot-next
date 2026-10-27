@@ -144,9 +144,12 @@ The next owned request (`/health`, `/readyz`, the ops reads) starts it again;
 deploy verify and the drills poll `/readyz` and wake it the same way. A cold
 probe answers `500` while the container starts (the six-second probe deadline
 trips long before the two-minute auto-start finishes), then `503` until the
-gateway connects. 15 minutes
-outlasts the post-deploy voice synthetic, a 10-minute job that sends no Worker
-traffic. While staging sleeps it has no readiness or metrics alerts, and the
+gateway connects. The two five-minute scheduled monitors (the
+`synthetic-user-flow` staging probe and `slow-burn-tracker`) renew activity on
+every scrape, so staging stays awake while they run and sleeps once they go
+quiet. Giving those monitors a bounded wake-and-wait is follow-up work. 15
+minutes outlasts the post-deploy voice synthetic, a 10-minute job that sends no
+Worker traffic. While staging sleeps it has no readiness or metrics alerts, and the
 bot is offline in the staging guild until something wakes it. An armed
 remediation drill drops both vars from the generated staging config
 (`scripts/staging_rollout.py`), because its fault injector runs on keepalive
