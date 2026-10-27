@@ -234,6 +234,9 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         let names: Vec<String> = present.iter().map(|name| format!("/{name}")).collect();
         out.push_str(&names.join(" · "));
         out.push('\n');
+        if group.commands.contains(&"lfg") && live.contains("lfg") {
+            out.push_str("Members: the **My signup** button privately shows your own role.\n");
+        }
         if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
             out.push_str("Paste the event id or its link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
             out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");

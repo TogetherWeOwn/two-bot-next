@@ -983,7 +983,7 @@ pub fn message_payload(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup])
     let components = if options.is_empty() {
         json!([])
     } else {
-        json!([{
+        let mut rows = vec![json!({
             "type": 1,
             "components": [{
                 "type": 3,
@@ -995,7 +995,22 @@ pub fn message_payload(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup])
                     "label": option.label, "value": option.value
                 })).collect::<Vec<_>>()
             }]
-        }])
+        })];
+        // A select shares its row with nothing, so the private-inspection
+        // button gets its own. Legacy ids past the 100-unit custom_id bound
+        // keep the select and offer no button.
+        if let Some(custom_id) = lfg::lfg_mine_custom_id(&post.id) {
+            rows.push(json!({
+                "type": 1,
+                "components": [{
+                    "type": 2,
+                    "style": 2,
+                    "label": "My signup",
+                    "custom_id": custom_id
+                }]
+            }));
+        }
+        Value::Array(rows)
     };
     json!({
         "content": lfg::lfg_content(post, roles, signups),

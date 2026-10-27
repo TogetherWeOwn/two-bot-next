@@ -18,7 +18,8 @@
 use crate::automation_quota::{lock_quota, AutomationQuota, QuotaWriteError};
 
 use super::lfg::{
-    adjudicate_signup, iso_millis_utc, LfgPost, LfgRole, LfgSignup, LfgStatus, SignupOutcome,
+    adjudicate_signup, iso_millis_utc, LfgPost, LfgRole, LfgSignup, LfgStatus, OwnSignup,
+    OwnSignupView, SignupOutcome,
 };
 
 /// Map an integer column the DDL CHECK-constrains (slots 1–99, position ≥ 0).
@@ -379,6 +380,69 @@ pub async fn get_lfg(
                 created_by,
                 created_at: iso_millis_utc(created_at),
                 closed_at: closed_at.map(iso_millis_utc),
+            })
+        },
+    )
+    .transpose()
+}
+
+/// The invoking member's own view of one post, read for "My signup".
+///
+/// One statement, so one snapshot: status, start and the saved row are
+/// coherent even while a close commits. It is guild-fenced on the stored post,
+/// filters the signup by `user_id` in SQL (no roster is ever fetched), takes no
+/// advisory lock and writes nothing, so it also works on a read-only session.
+/// `Ok(None)` means the post is absent from this guild; a saved row without
+/// its role label is a decode error, never absence.
+pub async fn get_own_signup(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    id: &str,
+    user_id: &str,
+) -> Result<Option<OwnSignupView>, sqlx::Error> {
+    type Row = (
+        String,
+        Option<String>,
+        String,
+        time::OffsetDateTime,
+        Option<String>,
+        Option<String>,
+        Option<time::OffsetDateTime>,
+    );
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT p.channel_id, p.message_id, p.status, p.starts_at,
+                s.role_key, r.label, s.joined_at
+         FROM lfg_posts p
+         LEFT JOIN lfg_signups s ON s.lfg_id = p.id AND s.user_id = $3
+         LEFT JOIN lfg_roles r ON r.lfg_id = s.lfg_id AND r.role_key = s.role_key
+         WHERE p.guild_id = $1 AND p.id = $2",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(
+        |(channel_id, message_id, status, starts_at, role_key, label, joined_at)| {
+            let own = match (role_key, label, joined_at) {
+                (None, None, None) => None,
+                (Some(_), Some(label), Some(joined_at)) => Some(OwnSignup {
+                    label,
+                    joined_at: iso_millis_utc(joined_at),
+                }),
+                _ => {
+                    return Err(sqlx::Error::Decode(
+                        "saved signup is missing its role or join time".into(),
+                    ))
+                }
+            };
+            Ok(OwnSignupView {
+                channel_id,
+                message_id,
+                // Legacy treats any non-'open' status as closed.
+                status: LfgStatus::from_stored(&status).unwrap_or(LfgStatus::Closed),
+                starts_at: iso_millis_utc(starts_at),
+                own,
             })
         },
     )

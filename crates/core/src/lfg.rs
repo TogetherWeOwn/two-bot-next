@@ -46,6 +46,12 @@ const MAX_ROLE_KEY_ERROR_CHARS: usize = 128;
 pub const MAX_ROLE_SLOTS: u8 = 99;
 /// Legacy `LFG_PREFIX` — select `custom_id` is `two:lfg:<post id>`.
 pub const LFG_SELECT_PREFIX: &str = "two:lfg:";
+/// Prefix of the dedicated "My signup" button `custom_id`. It differs from
+/// [`LFG_SELECT_PREFIX`] at the seventh character, so it can never collide with
+/// a select `custom_id` or with any role key the select offers.
+pub const LFG_MINE_PREFIX: &str = "two:lfg-mine:";
+/// Discord's `custom_id` ceiling, in UTF-16 code units.
+pub const MAX_CUSTOM_ID_UNITS: usize = 100;
 /// Legacy leave value in the signup select.
 pub const LFG_LEAVE_VALUE: &str = "__leave__";
 /// Legacy `renderLfg` content cap (`content.slice(0, 2000)`).
@@ -601,6 +607,78 @@ pub fn lfg_select_options(
         value: LFG_LEAVE_VALUE.to_owned(),
     });
     options
+}
+
+/// Button `custom_id` for a post (`two:lfg-mine:<post id>`). `None` when the
+/// identifier would exceed Discord's 100-unit ceiling: such legacy posts keep
+/// their select and simply offer no inspection button.
+#[must_use]
+pub fn lfg_mine_custom_id(post_id: &str) -> Option<String> {
+    let id = format!("{LFG_MINE_PREFIX}{post_id}");
+    (valid_post_id(post_id)
+        && id.encode_utf16().take(MAX_CUSTOM_ID_UNITS + 1).count() <= MAX_CUSTOM_ID_UNITS)
+        .then_some(id)
+}
+
+/// Post id carried by a "My signup" button. `None` for a foreign prefix, an
+/// empty id, or an id past the component bound. The wire identity carries
+/// only the post: the inspected member is always the invoking member.
+#[must_use]
+pub fn parse_lfg_mine(custom_id: &str) -> Option<&str> {
+    let post_id = custom_id.strip_prefix(LFG_MINE_PREFIX)?;
+    lfg_mine_custom_id(post_id).map(|_| post_id)
+}
+
+/// The invoking member's saved signup, as read for the private summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnSignup {
+    /// Stored label of the member's saved role.
+    pub label: String,
+    /// Saved join instant (RFC 3339 UTC).
+    pub joined_at: String,
+}
+
+/// One post as seen by "My signup": identity fields for the authenticity
+/// fence, state, start, and only the invoking member's row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnSignupView {
+    pub channel_id: String,
+    pub message_id: Option<String>,
+    pub status: LfgStatus,
+    pub starts_at: String,
+    pub own: Option<OwnSignup>,
+}
+
+/// Reply for a button that is not a genuine, current LFG control.
+pub const MY_SIGNUP_UNAVAILABLE: &str =
+    "This LFG is no longer available, so there is no saved signup to show.";
+/// Reply when the saved state could not be read. Never absence.
+pub const MY_SIGNUP_FAILED: &str =
+    "Could not check your saved signup right now. Nothing was changed; try again shortly.";
+
+fn discord_instant(iso: &str) -> String {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(iso, &Rfc3339)
+        .map(|dt| format!("<t:{}:F>", dt.unix_timestamp()))
+        .unwrap_or_else(|_| truncate_utf16(iso, 40))
+}
+
+/// Private "My signup" summary: the caller's own role label and join time,
+/// plus the post's state and start. Mention syntax in the stored label is
+/// broken, and the label is bounded, so the reply is inert text.
+#[must_use]
+pub fn my_signup_reply(view: &OwnSignupView) -> String {
+    let state = view.status.display();
+    let starts = discord_instant(&view.starts_at);
+    let text = match &view.own {
+        Some(own) => format!(
+            "You are signed up as **{}**.\nJoined: {}\nStatus: {state}\nStarts: {starts}",
+            truncate_utf16(&own.label, MAX_ROLE_LABEL_CHARS),
+            discord_instant(&own.joined_at),
+        ),
+        None => format!("You are not signed up for this LFG.\nStatus: {state}\nStarts: {starts}"),
+    };
+    crate::message_safety::neutralize_mentions(&break_mention_pills(&text))
 }
 
 /// Resource IDs use the same nonempty, 128-UTF-16-unit bound at every LFG edge.
@@ -1863,5 +1941,74 @@ mod tests {
                 assert!(!text.contains(&hostile), "overlong input echoed: {text:?}");
             }
         }
+    }
+    #[test]
+    fn my_signup_button_id_is_dedicated_bounded_and_post_only() {
+        assert_eq!(
+            lfg_mine_custom_id("lfg-1").as_deref(),
+            Some("two:lfg-mine:lfg-1")
+        );
+        assert_eq!(parse_lfg_mine("two:lfg-mine:lfg-1"), Some("lfg-1"));
+        // Never confusable with the select prefix or any role key.
+        assert!(!"two:lfg-mine:x".starts_with(LFG_SELECT_PREFIX));
+        assert_eq!(parse_lfg_select("two:lfg-mine:x", "tank"), None);
+        assert_eq!(parse_lfg_mine("two:lfg:lfg-1"), None);
+        assert_eq!(parse_lfg_mine("two:lfg-mine:"), None);
+        for id in ["x".repeat(88), "🦀".repeat(44)] {
+            assert_eq!(lfg_mine_custom_id(&id), None, "past 100 units: {id}");
+            assert_eq!(parse_lfg_mine(&format!("{LFG_MINE_PREFIX}{id}")), None);
+        }
+        let longest = "x".repeat(MAX_CUSTOM_ID_UNITS - LFG_MINE_PREFIX.len());
+        assert!(lfg_mine_custom_id(&longest).is_some());
+    }
+
+    fn own_view(status: LfgStatus, own: Option<(&str, &str)>) -> OwnSignupView {
+        OwnSignupView {
+            channel_id: "1".into(),
+            message_id: Some("2".into()),
+            status,
+            starts_at: "2099-09-11T20:00:00.000Z".into(),
+            own: own.map(|(label, joined_at)| OwnSignup {
+                label: label.into(),
+                joined_at: joined_at.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn my_signup_reply_reports_own_row_state_and_start() {
+        let open = my_signup_reply(&own_view(
+            LfgStatus::Open,
+            Some(("Tank", "2026-10-20T10:11:12.000Z")),
+        ));
+        assert!(open.contains("signed up as **Tank**"));
+        assert!(open.contains("<t:1792491072:F>"), "{open}");
+        assert!(open.contains("<t:4092840000:F>"), "{open}");
+        assert!(open.contains("Status: Open") && !open.contains("Closed"));
+        let closed = my_signup_reply(&own_view(LfgStatus::Closed, None));
+        assert!(closed.contains("not signed up") && closed.contains("Status: Closed"));
+        assert!(!closed.contains("Open"));
+    }
+
+    #[test]
+    fn my_signup_reply_neutralizes_hostile_labels_and_stays_bounded() {
+        let hostile = format!("🦀 @everyone @here <@3334> <@&9999> {}", "x".repeat(400));
+        let text = my_signup_reply(&own_view(
+            LfgStatus::Open,
+            Some((&hostile, "2026-10-20T10:11:12.000Z")),
+        ));
+        for mention in ["@everyone", "@here", "<@", "<@&"] {
+            assert!(!text.contains(mention), "{mention} survived: {text}");
+        }
+        assert!(text.contains("🦀"));
+        assert!(crate::message_safety::text_len(&text) <= MAX_MESSAGE_CHARS);
+    }
+
+    #[test]
+    fn my_signup_failure_and_unavailable_copy_are_distinct_from_absence() {
+        for text in [MY_SIGNUP_FAILED, MY_SIGNUP_UNAVAILABLE] {
+            assert!(!text.to_lowercase().contains("not signed up"));
+        }
+        assert_ne!(MY_SIGNUP_FAILED, MY_SIGNUP_UNAVAILABLE);
     }
 }

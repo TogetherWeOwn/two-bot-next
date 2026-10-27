@@ -26,7 +26,7 @@ overlong / zero ids) live in `docs/voice-custom-id-core.md`.
 | --- | --- | --- |
 | Any minted `two:voice:` shape | `Unknown` (in-guild) / `Ignore` (out-of-guild) | Same as components |
 | Malformed / overlong / zero-id `two:voice:` shape | `Unknown`, never a panic | Same as components |
-| `two:lfg:<…>` | `Handled(LfgSignup)` while announcements are on | Same as components |
+| `two:lfg:<…>` / `two:lfg-mine:<…>` | `Handled(LfgSignup)` while announcements are on | Same as components |
 | `two:self-role:<…>` | `Handled(SelfRole)` while self-roles are on | Same as components |
 
 The `two:voice:` prefix never collides with `two:lfg:` or `two:self-role:`

@@ -340,12 +340,13 @@ pub use leveling_store::{
 };
 pub use lfg::{
     adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
-    lfg_custom_id, lfg_nonce, lfg_select_options, normalize_starts_at, parse_lfg_select,
-    parse_role_spec, require_manage_events as lfg_require_manage_events, role_fill, signup_reply,
-    spec_roles, valid_role_key, validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec,
-    LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
-    StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
-    MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
+    lfg_custom_id, lfg_mine_custom_id, lfg_nonce, lfg_select_options, normalize_starts_at,
+    parse_lfg_mine, parse_lfg_select, parse_role_spec,
+    require_manage_events as lfg_require_manage_events, role_fill, signup_reply, spec_roles,
+    valid_role_key, validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec,
+    LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, OwnSignup, OwnSignupView,
+    RoleSpecError, SignupOutcome, StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_MINE_PREFIX,
+    LFG_SELECT_PREFIX, MAX_LFG_ROLES, MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
 };
 pub use mee6::{
     clean_mee6_name, parse_mee6_entry, translate_export, translate_mee6_template, Mee6CommandInput,

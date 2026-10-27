@@ -713,6 +713,77 @@ impl InteractionRuntime {
         self.bot_user_id().await
     }
 
+    /// "My signup" button: a read-only, private view of the invoking
+    /// member's own saved row. Runs after the router's feature, guild and
+    /// application fences; it takes no admission, cooldown, lock or audit and
+    /// never touches a channel. Only a genuine press of the bot's own button
+    /// is answered, and only the invoker's row is ever read.
+    async fn handle_lfg_my_signup(
+        &self,
+        interaction: &Interaction,
+        custom_id: &str,
+    ) -> Result<bool, crate::DiscordError> {
+        use twilight_model::channel::message::component::ComponentType;
+        let (Some(guild), Some(actor)) = (interaction.guild_id, interaction.author_id()) else {
+            return Ok(false);
+        };
+        let Some(InteractionData::MessageComponent(data)) = interaction.data.as_ref() else {
+            return Ok(false);
+        };
+        if data.component_type != ComponentType::Button || !data.values.is_empty() {
+            return Ok(false);
+        }
+        // Acknowledge first: the read must not race Discord's 3 s window.
+        self.executor
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &ephemeral_deferral(),
+            )
+            .await?;
+        // Discord signs the payload, so the message is the bot's own post
+        // button only when its author is this application's bot user.
+        let genuine = interaction.message.as_ref().filter(|message| {
+            message.author.bot && message.author.id.get() == interaction.application_id.get()
+        });
+        let reply = match (two_bot_core::parse_lfg_mine(custom_id), genuine) {
+            (Some(post_id), Some(message)) => {
+                // The stored post is authoritative: it must belong to this
+                // guild and be the exact message carrying the pressed button.
+                // A failed lookup is its own reply, never rendered as absence.
+                match two_bot_core::lfg_store::get_own_signup(
+                    &self.pool,
+                    &guild.to_string(),
+                    post_id,
+                    &actor.to_string(),
+                )
+                .await
+                {
+                    Ok(Some(view))
+                        if view.channel_id == message.channel_id.to_string()
+                            && view.message_id.as_deref() == Some(&message.id.to_string()) =>
+                    {
+                        two_bot_core::lfg::my_signup_reply(&view)
+                    }
+                    Ok(_) => two_bot_core::lfg::MY_SIGNUP_UNAVAILABLE.to_owned(),
+                    Err(_) => {
+                        tracing::warn!("LFG my-signup lookup failed; details withheld");
+                        two_bot_core::lfg::MY_SIGNUP_FAILED.to_owned()
+                    }
+                }
+            }
+            _ => two_bot_core::lfg::MY_SIGNUP_UNAVAILABLE.to_owned(),
+        };
+        self.executor
+            .edit_interaction_response_with_blocked_retry(
+                interaction.application_id.get(),
+                &interaction.token,
+                &reply,
+            )
+            .await?;
+        Ok(true)
+    }
+
     /// A read-only lookup has a one-second budget, leaving time for the
     /// immediate ephemeral callback within Discord's three-second window.
     async fn handle_lfg_list(
@@ -766,7 +837,7 @@ impl InteractionRuntime {
         }
         use crate::lfg_interactions::{LfgError, LfgRequest};
         use twilight_model::application::interaction::application_command::CommandOptionValue;
-        use twilight_model::channel::message::{component::ComponentType, AllowedMentions};
+        use twilight_model::channel::message::component::ComponentType;
         use two_bot_core::{ComponentHandler, HandlerId};
         let request = match routed {
             RoutedInteraction::Slash {
@@ -776,6 +847,16 @@ impl InteractionRuntime {
                     },
                 ..
             } => return self.handle_lfg_list(interaction).await,
+            RoutedInteraction::Component {
+                custom_id,
+                outcome:
+                    ComponentOutcome::Handled {
+                        handler: ComponentHandler::LfgSignup,
+                    },
+                ..
+            } if custom_id.starts_with(two_bot_core::LFG_MINE_PREFIX) => {
+                return self.handle_lfg_my_signup(interaction, &custom_id).await;
+            }
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Refuse { refusal },
                 ..
@@ -900,19 +981,7 @@ impl InteractionRuntime {
                 .await?;
             return Ok(true);
         }
-        let deferred = InteractionResponse {
-            kind: InteractionResponseType::DeferredChannelMessageWithSource,
-            data: Some(InteractionResponseData {
-                flags: Some(MessageFlags::EPHEMERAL),
-                allowed_mentions: Some(AllowedMentions {
-                    parse: vec![],
-                    replied_user: false,
-                    roles: vec![],
-                    users: vec![],
-                }),
-                ..Default::default()
-            }),
-        };
+        let deferred = ephemeral_deferral();
         // Acknowledge before locks, SQL or paced REST can exceed Discord's 3 s window.
         // https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-response
         self.executor
@@ -983,6 +1052,23 @@ impl InteractionRuntime {
             )
             .await?;
         Ok(true)
+    }
+}
+
+/// Ephemeral deferral that suppresses every mention parse.
+fn ephemeral_deferral() -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            flags: Some(MessageFlags::EPHEMERAL),
+            allowed_mentions: Some(twilight_model::channel::message::AllowedMentions {
+                parse: vec![],
+                replied_user: false,
+                roles: vec![],
+                users: vec![],
+            }),
+            ..Default::default()
+        }),
     }
 }
 

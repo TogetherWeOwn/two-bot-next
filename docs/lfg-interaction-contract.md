@@ -38,6 +38,35 @@ same `lfg::valid_post_id` predicate as Close: nonempty and at most 128 UTF-16
 units. Whitespace is not trimmed; multibyte UTF-8 byte length is not the
 bound. Invalid Select IDs produce no store, audit or channel operation.
 
+## Check my saved signup
+
+Every new or normally refreshed **open** game post carries a second component
+row with one **My signup** button (`two:lfg-mine:<post id>`). It is separate
+from the role select, so no role key (including `__mine__`, `__status__` and
+`my-signup`) can collide with it. Closed posts render no components. A post id
+that would push the id past Discord's 100-unit `custom_id` limit gets no button;
+its select still works.
+
+Pressing it answers a private (ephemeral) summary of the invoking member's own
+row: stored role label, saved join time, the post's open/closed state and its
+start time. The wire id carries only the post, never a member, and the lookup is
+filtered by the invoker in SQL, so no other member's row is read. The reply is
+bounded, with mention syntax in the stored label made inert. It is independent of
+the public roster, which truncates at 2,000 units.
+
+Outcomes are distinct: a saved signup, "not signed up", "no longer available"
+(deleted post, other guild, or a message that is not the stored post message),
+and "could not check right now" for a store failure, which is never shown as
+absence. A retained button on a closed post still reads the closed history and
+never reopens it.
+
+The path is read-only: no signup or timestamp change, mutation audit, signup
+cooldown, advisory lock, channel REST or extra notification. It sits behind the
+same announcements gate, configured-guild and application fences as the select,
+and requires a button press on a message authored by the bot itself.
+`crates/discord/tests/lfg_my_signup_acceptance.rs` exercises the real component
+path against disposable fixtures and loopback Discord only.
+
 ## Edit an existing game post
 
 `/lfg-edit id:<id> title:<optional title> starts-at:<optional RFC3339 timestamp>`

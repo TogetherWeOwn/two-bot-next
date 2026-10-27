@@ -825,7 +825,9 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::Tickets
-        } else if let Some(_suffix) = custom_id.strip_prefix(LFG_PREFIX) {
+        } else if custom_id.starts_with(LFG_PREFIX)
+            || custom_id.starts_with(crate::lfg::LFG_MINE_PREFIX)
+        {
             if !self.gates.announcements || !self.guild_ok(guild_id) {
                 return ComponentOutcome::Ignore;
             }
@@ -1575,6 +1577,16 @@ mod tests {
             }
         );
         assert_eq!(
+            r.route_component("two:lfg-mine:abc123", Some(GUILD)),
+            ComponentOutcome::Handled {
+                handler: ComponentHandler::LfgSignup
+            }
+        );
+        assert_eq!(
+            r.route_component("two:lfg-mine:abc123", Some(9999)),
+            ComponentOutcome::Ignore
+        );
+        assert_eq!(
             r.route_component("two:self-role:games:valorant", Some(GUILD)),
             ComponentOutcome::Handled {
                 handler: ComponentHandler::SelfRole
@@ -1623,6 +1635,7 @@ mod tests {
             SESSION_SELECT_ID,
             TICKET_OPEN_ID,
             "two:lfg:x",
+            "two:lfg-mine:x",
             "two:self-role:p",
         ] {
             assert_eq!(
