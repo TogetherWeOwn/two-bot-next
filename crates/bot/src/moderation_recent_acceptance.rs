@@ -493,7 +493,7 @@ async fn moderation_recent_covers_every_action_outcome_pair_exactly_once() {
     // corroborated warning. Reverse insertion order catches accidental
     // insertion-order reads; identical outcome words across verbs catch
     // verb-blind rendering.
-    let rows: Vec<(&str, &str, &str, Option<&str>, &str, &str, &str)> = vec![
+    let rows: Vec<(&str, &str, &str, Option<&str>, &str, &str)> = vec![
         (
             "req-unlock-001",
             "moderation.unlock",
