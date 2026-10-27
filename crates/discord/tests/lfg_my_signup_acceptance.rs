@@ -1100,6 +1100,6 @@ fn member_help_discovers_private_inspection_without_adding_a_target_member_comma
             .iter()
             .map(|option| option.name.as_str())
             .collect::<Vec<_>>(),
-        ["title", "starts-at", "roles"]
+        ["title", "starts-at", "roles", "preview"]
     );
 }
