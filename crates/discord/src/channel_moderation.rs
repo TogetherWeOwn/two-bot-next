@@ -23,12 +23,15 @@ use crate::{
     RoutedInteraction,
 };
 
+#[path = "channel_moderation_reads.rs"]
+mod reads;
+
 #[derive(Debug)]
-struct ChannelHandler(ModerationAction);
+struct ChannelHandler(HandlerId);
 
 impl InteractionHandler for ChannelHandler {
     fn id(&self) -> HandlerId {
-        HandlerId::Moderation(self.0)
+        self.0
     }
 }
 
@@ -38,7 +41,10 @@ pub fn register_channel_handlers(router: &mut InteractionRouter) {
         .into_iter()
         .filter(|a| !a.targets_member())
     {
-        router.register(Box::new(ChannelHandler(action)));
+        router.register(Box::new(ChannelHandler(HandlerId::Moderation(action))));
+    }
+    for handler in [HandlerId::PurgePreview, HandlerId::ChannelInspect] {
+        router.register(Box::new(ChannelHandler(handler)));
     }
 }
 
@@ -138,7 +144,8 @@ impl ChannelModerationRuntime {
         matches!(
             (interaction.kind, interaction.data.as_ref()),
             (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data)))
-                if ModerationAction::ALL.into_iter().any(|a| !a.targets_member() && a.command_name() == data.name)
+                if reads::handler(&data.name).is_some()
+                    || ModerationAction::ALL.into_iter().any(|a| !a.targets_member() && a.command_name() == data.name)
         )
     }
 
@@ -178,14 +185,25 @@ impl ChannelModerationRuntime {
             Ok(Some(reply)) => reply.text.as_str(),
             _ => "The channel action requires reconciliation; do not repeat it.",
         };
-        let edit = self
-            .executor
-            .edit_interaction_response_with_blocked_retry(
-                interaction.application_id.get(),
-                &interaction.token,
-                text,
-            )
-            .await;
+        let edit = if matches!(&result, Ok(Some(reply)) if reply.outcome == "channel_inspect") {
+            // Staff must see their bounded saved reason verbatim. The shared
+            // private-view edit still disables all allowed_mentions explicitly.
+            self.executor
+                .edit_interaction_response_without_mention_neutralization_with_blocked_retry(
+                    interaction.application_id.get(),
+                    &interaction.token,
+                    text,
+                )
+                .await
+        } else {
+            self.executor
+                .edit_interaction_response_with_blocked_retry(
+                    interaction.application_id.get(),
+                    &interaction.token,
+                    text,
+                )
+                .await
+        };
         if result.is_err() {
             return Err(ChannelResponseError::Persistence);
         }
@@ -230,6 +248,12 @@ impl ChannelModerationRuntime {
         else {
             return Ok(None);
         };
+        // Reads never enter request/audit/claim/lease admission, even on refusal.
+        if let Some(handler) = reads::handler(&name) {
+            return Ok(Some(
+                reads::execute(self, router, interaction, handler, outcome).await,
+            ));
+        }
         let Some(action) = ModerationAction::ALL
             .into_iter()
             .find(|a| !a.targets_member() && a.command_name() == name)
@@ -668,7 +692,7 @@ fn channel_enforcement_outcome(
 }
 
 #[allow(deprecated)]
-fn invoking_channel_id(interaction: &Interaction) -> Option<String> {
+pub(crate) fn invoking_channel_id(interaction: &Interaction) -> Option<String> {
     interaction
         .channel
         .as_ref()

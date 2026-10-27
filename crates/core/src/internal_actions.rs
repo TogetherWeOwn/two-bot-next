@@ -2074,7 +2074,7 @@ impl InternalFlags {
     /// Whether a token holding `scopes` may run `action`.
     ///
     /// Higher scope implies lower for reads only: any held scope allows a
-    /// read verb, while a write needs its listed scope or admin. Scope
+    /// read verb, while a write needs its exact listed scope. Scope
     /// names are exact lowercase literals; unknown or empty scope sets
     /// allow nothing, and unmapped actions refuse even for admin.
     #[must_use]
@@ -2086,10 +2086,10 @@ impl InternalFlags {
                     || *scope == ADMIN_SCOPE_MODERATE
                     || *scope == ADMIN_SCOPE_ADMIN
             }),
-            // Writes: the listed scope or admin.
-            Some(required @ (ADMIN_SCOPE_MODERATE | ADMIN_SCOPE_ADMIN)) => scopes
-                .iter()
-                .any(|scope| *scope == ADMIN_SCOPE_ADMIN || *scope == required),
+            // Writes: only an explicit grant of the listed scope.
+            Some(required @ (ADMIN_SCOPE_MODERATE | ADMIN_SCOPE_ADMIN)) => {
+                scopes.contains(&required)
+            }
             // Unmapped actions — and any future scope the map has not named
             // yet — fail closed.
             Some(_) | None => false,
@@ -2959,13 +2959,20 @@ mod tests {
         // TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID, TWO_EVENTSUB_INVITE_URL).
         // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
         // shifting one entry between those classes. The stored invite-code
-        // slice adds one hot key (TWO_GUILD_INVITE_CODE). The required
-        // event-voice category slice adds one env-only key
-        // (TWO_EVENT_VOICE_CATEGORY_ID).
+        // slice adds one hot key (TWO_GUILD_INVITE_CODE). The ticket/feed/
+        // self-role live-keys slice moves TWO_TICKET_COOLDOWN_SECONDS,
+        // TWO_ANNOUNCEMENTS and TWO_SELF_ROLE_PANELS from cold to hot.
+        // The community slice moves TWO_COMMUNITY_SCORECARD,
+        // TWO_COMMUNITY_RECOMMENDATIONS, TWO_COMMUNITY_CORRECTION_CYCLES,
+        // TWO_PRESENCE_PROBE and TWO_INACTIVITY_DAYS from cold to hot.
+        // Together these shift eight entries between those classes. The
+        // assistant credential binding and required event-voice category
+        // slices add two env-only keys
+        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
         for (class, expected) in [
-            (SettingClass::Hot, 44),
-            (SettingClass::Cold, 26),
-            (SettingClass::EnvOnly, 65),
+            (SettingClass::Hot, 52),
+            (SettingClass::Cold, 18),
+            (SettingClass::EnvOnly, 66),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

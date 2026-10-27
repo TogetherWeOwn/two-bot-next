@@ -181,6 +181,12 @@ pub struct RetentionReport {
     /// deferred or not. A nonzero value is the signal that the under-72-hour
     /// wording does not hold for every request.
     pub deletions_overdue: u64,
+    /// More pending requests remain beyond this run's probed prefix. Pending
+    /// rows are read in TOP-25 keyset pages and at most 25 eligible requests
+    /// complete per run. Deferred rows do not starve later eligible work.
+    /// Per-request counts cover the probed prefix; COUNT-based overdue counts
+    /// remain exact. This fixed field is the truncation marker.
+    pub pending_truncated: bool,
     /// Wall-clock run time.
     pub duration_ms: u64,
 }
@@ -387,6 +393,7 @@ async fn run_retention_inner(
                 deletions_deferred = report.deletions_deferred,
                 schema_gap_deferrals = report.schema_gap_deferrals,
                 deletions_overdue = report.deletions_overdue,
+                pending_truncated = report.pending_truncated,
                 duration_ms = started.elapsed().as_millis() as u64,
                 "core retention completed; raw expiry failed and will retry on the next cadence",
             );
@@ -410,6 +417,68 @@ where
     Ok((core, raw_expiry))
 }
 
+struct PendingSelection {
+    eligible: Vec<(String, String, String)>,
+    deferred: u64,
+    truncated: bool,
+}
+
+/// Select at most 25 eligible requests without an unbounded queue Vec. The
+/// keyset advances past guarded rows; otherwise 25 permanently guarded head
+/// rows would prevent every later deletion from ever reaching the drain.
+/// Dry-run, execute and raw-expiry projection share this exact selection.
+async fn select_pending(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_gap: bool,
+) -> Result<PendingSelection, sqlx::Error> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retention_deletion_requests WHERE status = 'pending'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut selection = PendingSelection {
+        eligible: Vec::new(),
+        deferred: 0,
+        truncated: false,
+    };
+    if schema_gap {
+        selection.deferred = total as u64;
+        return Ok(selection);
+    }
+    let mut after = None::<String>;
+    let mut probed = 0u64;
+    while selection.eligible.len() < 25 {
+        // TOP-25 plus one lookahead. No whole-queue materialization, including
+        // on an all-guarded queue. request_id is a unique, stable keyset.
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT request_id, guild_id, user_id FROM retention_deletion_requests
+             WHERE status = 'pending' AND ($1::text IS NULL OR request_id > $1)
+             ORDER BY request_id LIMIT 26",
+        )
+        .bind(after.as_deref())
+        .fetch_all(&mut **tx)
+        .await?;
+        let more = rows.len() > 25;
+        for (request_id, guild_id, user_id) in rows.into_iter().take(25) {
+            after = Some(request_id.clone());
+            probed += 1;
+            if crate::member_erasure::has_unresolved_guards(tx, &guild_id, &user_id).await? {
+                selection.deferred += 1;
+            } else {
+                selection.eligible.push((request_id, guild_id, user_id));
+                if selection.eligible.len() == 25 {
+                    break;
+                }
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    selection.truncated = probed < total as u64;
+    Ok(selection)
+}
+
 async fn run_retention_core(
     pool: &PgPool,
     mode: RetentionMode,
@@ -428,17 +497,7 @@ async fn run_retention_core(
             let audit = count_audit_cache(&mut tx).await?;
             let live_expired =
                 count_expired_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
-            let pending: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM retention_deletion_requests WHERE status = 'pending'",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
             let overdue = count_overdue_deletions(&mut tx).await?;
-            let pendings: Vec<(String, String)> = sqlx::query_as(
-            "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
             // A schema-coverage refusal defers every pending request (the
             // live drain rolls back only that request's savepoint), so the
             // dry run mirrors it: with gaps, all pendings are deferred.
@@ -451,18 +510,13 @@ async fn run_retention_core(
             // unresolved guard in the guild defers its purge too.
             let gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
             let schema_gap = !gaps.is_empty();
-            let mut deferred = 0u64;
-            let mut eligible: Vec<(String, String)> = Vec::new();
-            for (guild_id, user_id) in &pendings {
-                if schema_gap
-                    || crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id)
-                        .await?
-                {
-                    deferred += 1;
-                } else {
-                    eligible.push((guild_id.clone(), user_id.clone()));
-                }
-            }
+            let selected = select_pending(&mut tx, schema_gap).await?;
+            let deferred = selected.deferred;
+            let eligible: Vec<(String, String)> = selected
+                .eligible
+                .iter()
+                .map(|(_, guild_id, user_id)| (guild_id.clone(), user_id.clone()))
+                .collect();
             // With schema gaps a purge built from an incomplete plan would
             // dequeue work it did not fully delete, so every queued guild
             // stays queued (failed, not purged) and guard probing is
@@ -497,10 +551,11 @@ async fn run_retention_core(
                 guild_purges_failed: guild_failed,
                 guild_purges_deferred: guild_deferred,
                 guild_purges_deferred_oldest_secs: guild_deferred_oldest,
-                deletions_completed: (pending as u64).saturating_sub(deferred),
+                deletions_completed: selected.eligible.len() as u64,
                 deletions_deferred: deferred,
-                schema_gap_deferrals: if schema_gap { pending as u64 } else { 0 },
+                schema_gap_deferrals: if schema_gap { deferred } else { 0 },
                 deletions_overdue: overdue,
+                pending_truncated: selected.truncated,
                 duration_ms: started.elapsed().as_millis() as u64,
             }
         }
@@ -572,31 +627,16 @@ async fn run_retention_core(
             // Each request runs in its own savepoint: a guard or
             // schema-coverage refusal rolls back only that request, leaving
             // it pending, while other failures abort the run.
-            let pendings: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
+            let selected = select_pending(&mut tx, schema_gapped).await?;
+            let pendings = selected.eligible;
             let mut completed = 0u64;
-            let mut deferred = 0u64;
-            let mut gap_deferred = 0u64;
+            let mut deferred = selected.deferred;
+            let mut gap_deferred = if schema_gapped { selected.deferred } else { 0 };
             let mut deferred_ids: Vec<String> = Vec::new();
             for (request_id, guild_id, user_id) in &pendings {
                 sqlx::query("SAVEPOINT retention_pending")
                     .execute(&mut *tx)
                     .await?;
-                if schema_gapped {
-                    sqlx::query("ROLLBACK TO SAVEPOINT retention_pending")
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query("RELEASE SAVEPOINT retention_pending")
-                        .execute(&mut *tx)
-                        .await?;
-                    deferred += 1;
-                    gap_deferred += 1;
-                    deferred_ids.push(request_id.clone());
-                    continue;
-                }
                 match complete_request(&mut tx, request_id, guild_id, user_id).await {
                     Ok(_) => {
                         sqlx::query("RELEASE SAVEPOINT retention_pending")
@@ -620,7 +660,7 @@ async fn run_retention_core(
                     Err(err) => return Err(err),
                 }
             }
-            if !deferred_ids.is_empty() {
+            if deferred > 0 {
                 let failure =
                     deletion_intake_failure("replay guard or schema gap deferred the request");
                 tracing::warn!(
@@ -727,6 +767,7 @@ async fn run_retention_core(
                 deletions_deferred: deferred,
                 schema_gap_deferrals: gap_deferred,
                 deletions_overdue: overdue,
+                pending_truncated: selected.truncated,
                 duration_ms: started.elapsed().as_millis() as u64,
             }
         }
@@ -774,16 +815,12 @@ async fn count_raw_expiry_candidates(
     let mut eligible_pairs: Vec<(String, String)> = Vec::new();
     let mut queued_unguarded: Vec<String> = Vec::new();
     if !schema_gapped {
-        let pendings: Vec<(String, String)> = sqlx::query_as(
-            "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        for (guild_id, user_id) in &pendings {
-            if !crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id).await? {
-                eligible_pairs.push((guild_id.clone(), user_id.clone()));
-            }
-        }
+        eligible_pairs = select_pending(&mut tx, false)
+            .await?
+            .eligible
+            .into_iter()
+            .map(|(_, guild_id, user_id)| (guild_id, user_id))
+            .collect();
         let queued: Vec<String> =
             sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
                 .fetch_all(&mut *tx)
@@ -856,6 +893,7 @@ async fn count_raw_expiry_candidates(
         deletions_deferred: 0,
         schema_gap_deferrals: 0,
         deletions_overdue: 0,
+        pending_truncated: false,
         duration_ms: started.elapsed().as_millis() as u64,
     })
 }
@@ -1001,6 +1039,7 @@ pub async fn run_raw_expiry_batch(
         deletions_deferred: 0,
         schema_gap_deferrals: 0,
         deletions_overdue: 0,
+        pending_truncated: false,
         duration_ms: started.elapsed().as_millis() as u64,
     };
     for event_type in &selected {
@@ -1634,6 +1673,7 @@ mod retention_stage_order_tests {
             deletions_deferred: 0,
             schema_gap_deferrals: 0,
             deletions_overdue: 0,
+            pending_truncated: false,
             duration_ms: 0,
         }
     }
@@ -1766,6 +1806,7 @@ mod ledger_tests {
             deletions_deferred: deferred,
             schema_gap_deferrals: gap,
             deletions_overdue: overdue,
+            pending_truncated: false,
             duration_ms: 0,
         }
     }

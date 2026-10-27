@@ -1,5 +1,23 @@
 # Parity soak checklist
 
+<!-- start-here -->
+**Start here — section map**
+
+- [Safety and execution contract](#safety-and-execution-contract)
+- [Maintaining coverage](#maintaining-coverage)
+- [Existing fixture entry points](#existing-fixture-entry-points)
+- [1. Slash / prefix commands](#1-slash--prefix-commands)
+- [2. Non-command interactions](#2-non-command-interactions)
+- [3. Gateway event handlers](#3-gateway-event-handlers)
+- [4. Scheduled jobs & timers](#4-scheduled-jobs--timers)
+- [5. DB tables & queries](#5-db-tables--queries)
+- [6. External integrations](#6-external-integrations)
+- [7. Config / env](#7-config--env)
+- [8. Observable behaviours](#8-observable-behaviours)
+- [12. Baseline additions and corrections](#12-baseline-additions-and-corrections)
+- [13. Post-freeze ledger obligations (non-dropped rows)](#13-post-freeze-ledger-obligations-non-dropped-rows)
+<!-- /start-here -->
+
 <!-- Generated from soak-checklist.json by scripts/check_soak_checklist.py --render. -->
 
 This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699), authored under [TOG-10885](/TOG/issues/TOG-10885). Running the soak is out of scope. `manual`/`automated`/`waived` describe the verification method, not PASS. No row has been executed by writing this checklist.
@@ -140,8 +158,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-16: 17 — `/schedule`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule body:soak-once in-minutes:1; also create body:soak-repeat every-minutes:60; try neither option and below-minimum intervals.
-- **Expected:** Valid messages are queued for invoking channel, one-shot fires once; invalid cadence rejected; recurring schedule removed after evidence.
+- **Action:** On staging only, invoke /schedule body:soak-once in-minutes:1 and body:soak-repeat every-minutes:60. Create future at times in Z and a numeric offset naming the same instant; list/remove their IDs. Try malformed/no-offset/past/out-of-horizon at, at plus in-minutes/every-minutes, neither timing and below-minimum intervals. Through the approved restart contract, verify a not-yet-due and an already delivered one-off.
+- **Expected:** Offset-equivalent inputs persist the same canonical UTC millisecond instant; set/list show that instant, localized time, stable ID and uncertain delivery timing. Every invalid time/conflict has zero schedule/audit/channel effects. Relative and recurring semantics, body safety and quota remain intact; restart retains the due instant without a second occurrence. No exact-second SLO. Remove fixture schedules after evidence.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-17: 18 — `/schedule-remove`
@@ -821,7 +839,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s7-01: Config / env catalogue
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_TICKET_COOLDOWN_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
+- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_AUTOMATIONS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
 - **Expected:** Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
@@ -1237,7 +1255,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `automated` (not an execution verdict).
 - **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
-- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 29 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 43 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
 - **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata

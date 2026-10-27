@@ -210,6 +210,56 @@ from this sandbox on 2026-10-12 was blocked after the redirect chain
 about the policy's current text. Before citing Discord policy in a member
 answer, open the live page and quote what it says that day.
 
+### Staging verification read (fixture pairs, CI route)
+
+The manual `staging-privacy-verify-read` workflow reads all-time per-pair
+counts for one fixture member in one staging guild, without handing any
+agent a database credential. The dispatcher chooses only the guild alias
+(`g` for TWO Staging, `h` for the second guild); the script maps the alias
+to its pinned guild and refuses anything else. The `h` pin travels the
+normal config path: until `STAGING_PRIVACY_VERIFY_H_GUILD_ID` is set,
+recorded and verified not-live, every `h` read refuses. The fixture member
+comes only from the `STAGING_FIXTURE_MEMBER_ID` environment secret, never
+from an input, so a dispatch cannot aim the read at another member.
+
+The read-only login `TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL` must name
+role `two_bot_privacy_verify_ro` on database `two_bot` at the host pinned
+in `STAGING_PRIVACY_VERIFY_EXPECTED_HOST`. The role holds column-limited
+`SELECT` on exactly six tables, covering every column the queries read:
+`events` (`guild_id`, `member_id`, `metadata`, `idempotency_key`),
+`members` (`guild_id`, `member_id`), `invite_snapshots` (`guild_id`,
+`inviter_id`), `community_facts` (`guild_id`, `actor_id`, `metadata`,
+`source_event_id`, `idempotency_key`), `privacy_opt_outs` (`guild_id`,
+`member_id`), and `privacy_opt_out_audit` (`guild_id`, `member_id`,
+`actor`, `opted_out_at`, `id`; `actor` and `opted_out_at` are projected,
+`id` orders the receipts), and nothing else. Every statement runs in a
+`READ ONLY` transaction with a 10 s
+statement timeout after a `current_user`/`current_database()` identity
+probe.
+
+The six equality-count queries project `COUNT(*)` only. Two sweep queries
+apply the reviewed `member_erasure` manifest predicates for `events` and
+`community_facts` (the only purge tables matching beyond direct ownership)
+restricted to non-owned rows, and likewise project only counts: a zero
+sweep proves the purge touches only directly owned rows. One capped receipt
+query returns actor labels plus `opted_out_at` (at most 10 rows plus an
+overflow witness; the receipt count stays exact). Every count above
+1,000,000 fails closed: a single fixture pair cannot legitimately reach it,
+so a larger count means the predicates matched beyond the pair. The
+15-minute window of the events-smoke read does not apply here; purge
+verification needs all-time counts.
+
+The run uploads `staging-privacy-verify-read-<run_id>.json` (14 days):
+guild alias, collection timestamp, the six counts, the two sweep counts,
+and the capped receipt rows. Only the exact identity-free actor labels
+`member:self-serve` and `operator:fixture-check` may be published. Any other
+actor fails the whole read without an artifact or summary, even if it has
+a valid service shape or occurs only in the overflow witness. Labels are
+not normalized or replaced. The independent artifact validator enforces
+the same closed allowlist without needing member or guild bindings. Member,
+guild pins, sources and metadata never reach the artifact, the log or the
+step summary.
+
 ## Retention and explicit exceptions
 
 The retention module (`two-bot-cutover::retention`, migration `0438`)
@@ -333,6 +383,7 @@ The manifest explicitly retains these control-plane records:
 | `guild_settings_audit.actor`, `old_value`, `new_value` | Immutable configuration history; the database refuses DELETE, UPDATE and TRUNCATE, even a zero-row DELETE. No trigger disabling or audit bypass is permitted. IDs in prior/current policy remain here. |
 | `audit_kill_switch.engaged_by` | Global incident-control attribution, with no guild scope. Member erasure never disengages or rewrites the halt. |
 | `member_erasure_audit.actor` | Minimal operator accountability, retained independently of member activity. It is not the erased subject field. |
+| `admin_api_tokens.holder_id`, `issued_by` | Named human/AI credential principal (which may identify a member) and issuing-operator attribution. Guild-local activity erasure must not rewrite holders or silently change cross-guild grants. Separate authorized credential revocation/retention disposition is required; see the [registry contract](admin-registry.md). |
 | `privacy_opt_outs` (guild, member, time) | Guild-scoped opt-out suppression tombstone. Deleting it would silently resume per-user persistence the member refused. Retained until the member opts back in; member erasure never removes suppression. |
 | `privacy_opt_out_audit` (scope, actor, time) | One receipt row per opt-out/purge, same accountability class as `member_erasure_audit`. The subject appears only in the scope columns, never in the actor label. |
 | `guild_analytics_settings` | Per-guild ingestion switches (presence/activity/voice). Guild configuration, not member activity; no member IDs stored. |

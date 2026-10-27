@@ -477,7 +477,9 @@ async fn timeout_and_panics_report_failure_with_bounded_labels() {
     settle().await;
     let text = metrics.render(None);
     assert_eq!(text.lines().count(), before);
-    assert!(!text.contains("secret"));
+    // `invalid_secret` is a legitimate bounded kind: match the hostile
+    // `secret=value` injection marker, not the bare substring.
+    assert!(!text.contains("secret="));
     assert!(!text.contains("job=\"panic\""));
     assert!(!text.contains("job=\"factory\""));
     assert!(text.contains("two_bot_job_runs_total{job=\"other\",outcome=\"failure\"} 3\n"));

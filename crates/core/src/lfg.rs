@@ -432,9 +432,109 @@ fn truncate_utf16(value: &str, limit: usize) -> String {
 
 /// Post body (legacy `renderLfg` content): title, state, Discord timestamp,
 /// and one `**label** n/slots[ — mentions]` line per role, capped at 2000
-/// UTF-16 code units.
+/// UTF-16 code units. Real posts use [`lfg_content`], which appends the
+/// persisted-post identity footer; private previews use this body without
+/// that footer, so a preview can never look like a persisted post.
+#[must_use]
+pub fn lfg_content_body(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> String {
+    truncate_utf16(
+        &lfg_body_text(post, roles, signups),
+        crate::message_safety::CONTENT_LIMIT,
+    )
+}
+
+/// Full post content: [`lfg_content_body`] plus the persisted-post identity
+/// footer (`LFG id: ... — close with /lfg-close`).
 #[must_use]
 pub fn lfg_content(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> String {
+    // Reserve the footer before truncating a full roster: the close identifier
+    // must remain discoverable even when the member list fills the message.
+    let footer = crate::message_safety::content(&format!(
+        "\nLFG id: `{}` — close with `/lfg-close`",
+        truncate_utf16(&post.id, crate::commands::MAX_RESOURCE_ID_CHARS)
+    ));
+    let content = lfg_body_text(post, roles, signups);
+    let budget = crate::message_safety::CONTENT_LIMIT
+        .saturating_sub(crate::message_safety::text_len(&footer));
+    format!("{}{footer}", truncate_utf16(&content, budget))
+}
+
+/// Disclosure header starting every private `/lfg preview:true` reply.
+pub const LFG_PREVIEW_HEADER: &str = "Preview — nothing posted";
+
+/// Render a private `/lfg preview:true` reply: the same title, future-time
+/// and role-spec validation and the same creation body as a real post, with
+/// the [`LFG_PREVIEW_HEADER`] disclosure instead of the identity footer.
+///
+/// Pure and framework-free: no store, quota, identity, audit or channel
+/// effect. Validation failures return the same fixed refusal text as real
+/// creation. The body additionally breaks mention-pill syntax (real posts
+/// need member `<@user>` signup lines, so the shared renderer preserves
+/// pills; a preview has no signups, so no pill is legitimate). Discord
+/// timestamps (`<t:...>`) are untouched, and the whole reply stays within
+/// the 2000 UTF-16 content bound.
+pub fn preview_lfg_content(
+    title: &str,
+    starts_at: &str,
+    roles: &str,
+    now_unix_ms: i64,
+) -> Result<String, String> {
+    let title = validate_title(title).map_err(|error| error.to_string())?;
+    let starts_at =
+        normalize_starts_at(starts_at, now_unix_ms).map_err(|error| error.to_string())?;
+    let specs = parse_role_spec(roles).map_err(|error| error.to_string())?;
+    // In-memory only: the body renderer never reads identity, guild, channel
+    // or audit fields, and no footer is rendered, so no synthetic persisted
+    // identity can leak into the reply.
+    let post = LfgPost {
+        id: String::new(),
+        guild_id: String::new(),
+        channel_id: String::new(),
+        message_id: None,
+        title,
+        starts_at,
+        status: LfgStatus::Open,
+        created_by: String::new(),
+        created_at: String::new(),
+        closed_at: None,
+    };
+    let body = break_mention_pills(&lfg_content_body(&post, &spec_roles("", &specs), &[]));
+    let header = format!("{LFG_PREVIEW_HEADER}\n");
+    let budget = crate::message_safety::CONTENT_LIMIT
+        .saturating_sub(crate::message_safety::text_len(&header));
+    Ok(format!("{header}{}", truncate_utf16(&body, budget)))
+}
+
+/// Break mention-pill syntax (`<@user>`, `<@&role>`, `<#channel>`,
+/// `<:emoji>`, `<a:animated:>`, `</command:>`) so hostile titles/labels
+/// render as literal text in an ephemeral preview. Inserts a zero-width
+/// space after `<` — the same invisible technique
+/// `message_safety::neutralize_mentions` uses for mass mentions, and neutral
+/// for every legitimate preview character. Discord timestamps (`<t:...>`)
+/// are untouched.
+fn break_mention_pills(text: &str) -> String {
+    let mut broken = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find('<') {
+        let (before, from) = rest.split_at(index);
+        broken.push_str(before);
+        broken.push('<');
+        // `<` is one byte, so this split is always on a boundary.
+        let after = &from[1..];
+        // `a` needs its colon: a bare `<a` is ordinary text, while `<a:`
+        // starts an animated emoji. Every other prefix is pill-only.
+        if after.starts_with(['@', '#', ':', '/']) || after.starts_with("a:") {
+            broken.push('\u{200b}');
+        }
+        rest = after;
+    }
+    broken.push_str(rest);
+    broken
+}
+
+/// Neutralized body lines before truncation and footer budgeting: the single
+/// source shared by [`lfg_content`] and [`lfg_content_body`].
+fn lfg_body_text(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> String {
     use time::format_description::well_known::Rfc3339;
     let unix_secs = time::OffsetDateTime::parse(&post.starts_at, &Rfc3339)
         .map(|dt| dt.unix_timestamp())
@@ -455,8 +555,7 @@ pub fn lfg_content(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> 
         }
         lines.push(line);
     }
-    let content = lines.join("\n");
-    crate::message_safety::content(&content)
+    crate::message_safety::neutralize_mentions(&lines.join("\n"))
 }
 
 /// One signup-select option (plain data; the adapter maps this to the
@@ -1163,6 +1262,101 @@ mod tests {
         assert!(content.contains("**DPS** 1/1 — <@555555555555555555>"));
         let closed = lfg_content(&sample_post(LfgStatus::Closed), &sample_roles(), &signups);
         assert!(closed.contains("— Closed\n"));
+    }
+
+    #[test]
+    fn content_body_is_content_without_the_identity_footer() {
+        let post = sample_post(LfgStatus::Open);
+        let roles = sample_roles();
+        let body = lfg_content_body(&post, &roles, &[]);
+        assert!(!body.contains("LFG id:"));
+        // Short bodies truncate identically with and without the footer
+        // budget, so content is exactly body plus the pinned footer.
+        assert_eq!(
+            lfg_content(&post, &roles, &[]),
+            format!("{body}\nLFG id: `lfg-proof` — close with `/lfg-close`")
+        );
+    }
+
+    #[test]
+    fn preview_reuses_creation_body_with_disclosure_and_no_footer() {
+        let preview = preview_lfg_content(
+            "  Friday raid  ",
+            "2099-09-11T22:00:00+02:00",
+            " TANK : Tank : 2 , healer : Healer : 1 ",
+            0,
+        )
+        .expect("valid preview");
+        assert_eq!(
+            preview,
+            "Preview — nothing posted\n\
+             **Friday raid** — Open\n\
+             Starts <t:4092840000:F>\n\
+             **Tank** 0/2\n\
+             **Healer** 0/1"
+        );
+        assert!(!preview.contains("LFG id:"));
+    }
+
+    #[test]
+    fn preview_breaks_pills_preserves_timestamps_and_stays_bounded() {
+        let preview = preview_lfg_content(
+            "Raid @everyone <@3333>",
+            "2099-09-11T20:00:00Z",
+            "tank:坦克 @everyone:2,heal:治療 <@&5555>:1",
+            0,
+        )
+        .expect("hostile preview renders");
+        assert!(preview.contains("坦克") && preview.contains("治療"));
+        assert!(preview.contains("<t:4092840000:F>"));
+        assert!(!preview.contains("@everyone"));
+        assert!(!preview.contains("<@3333>"));
+        assert!(!preview.contains("<@&5555>"));
+        // Animated emoji and command mentions break too, while timestamps
+        // and bare `<a` text pass through visibly unchanged.
+        assert_eq!(
+            break_mention_pills("<a:dance:123> </lfg:456> <t:789:F> 1<a <#12> <:e:34>"),
+            "<\u{200b}a:dance:123> <\u{200b}/lfg:456> <t:789:F> 1<a <\u{200b}#12> <\u{200b}:e:34>"
+        );
+        assert!(preview.encode_utf16().count() <= MAX_MESSAGE_CHARS);
+        // Maximum valid inputs stay bounded with the title retained.
+        let title = "😀".repeat(50);
+        let roles = (0..20)
+            .map(|n| format!("{n:032}:{}:99", "😀".repeat(40)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let preview = preview_lfg_content(&title, "2099-09-11T20:00:00Z", &roles, 0)
+            .expect("maximum preview renders");
+        assert!(preview.contains(&title));
+        assert!(preview.encode_utf16().count() <= MAX_MESSAGE_CHARS);
+    }
+
+    #[test]
+    fn preview_refusals_match_creation_validation() {
+        for (title, starts_at, roles, field) in [
+            ("   ", "2099-09-11T20:00:00Z", "tank:Tank:1", "title"),
+            ("Raid", "not-a-time", "tank:Tank:1", "starts-at"),
+            ("Raid", "2000-01-01T00:00:00Z", "tank:Tank:1", "starts-at"),
+            (
+                "Raid",
+                "2099-09-11T20:00:00Z",
+                "TANK:Tank:1,tank:Other:1",
+                "role",
+            ),
+            ("Raid", "2099-09-11T20:00:00Z", "__leave__:Leave:1", "role"),
+        ] {
+            // Validation runs title, then starts-at, then roles: `now` must sit
+            // after the past-time case but before the valid 2099 starts-at, so
+            // the role cases reach role validation instead of refusing on time.
+            let now_ms = 1_789_034_400_000; // 2026-09-10T10:00:00Z
+            let refusal = preview_lfg_content(title, starts_at, roles, now_ms)
+                .expect_err("invalid preview refuses");
+            assert!(
+                refusal.to_lowercase().contains(field),
+                "{refusal:?} must name {field}"
+            );
+            assert!(!refusal.contains("Preview — nothing posted"));
+        }
     }
 
     #[test]

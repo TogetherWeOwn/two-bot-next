@@ -131,9 +131,20 @@ The toolchain comes from `rust-toolchain.toml` (rustup and CI honour it):
 
 ```sh
 cargo fmt --all -- --check
+python3 scripts/generate_command_reference.py
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
+
+Generate `docs/generated/commands.md` before compiling workspace tests or
+all-targets Clippy: one test embeds the generated Markdown at compile time.
+On the persistent controller use `python3 scripts/generate_command_reference.py --controller`,
+which builds only the generator through bounded Cargo admission. The output is
+ignored; never commit generated registry rows. The authored
+[command-reference landing page](docs/commands.md) links to same-head CI artifacts.
+Normal reference-doc tests compare bytes without writing. Missing or stale output
+fails until explicit generation; tracked configuration drift still fails and is
+never automatically repaired.
 
 The ops-override DB acceptance test mutates process environment. With the test
 DB configured, run it separately from parallel workspace tests (CI does this in
@@ -239,8 +250,29 @@ internal actions, and leveling are migrated; older suites retain their existing
 explicit opt-ins until migrated separately.
 
 The `wrangler/` Worker/DO wrapper has its own `npm ci`, `npm run typecheck`
-and `npm test`. Never commit secrets, `.env` files or `target/`. See
-[README.md](README.md) for the full service reference.
+and `npm test`. The `worker check` lane in `.github/workflows/check.yml` also
+runs `npm audit --audit-level=high --include=dev --json` from `wrangler/` before
+installation whenever worker inputs are selected (including full main and
+scheduled runs). It audits the committed lockfile, including dev tooling, and
+prints npm's machine-readable JSON report directly in the CI step log. High or
+critical advisories and registry errors fail the lane and therefore `ci-ok`;
+low/moderate advisories remain visible but do not fail it. There are no audit
+suppressions. Fix new high/critical findings before merging; any proposed
+exception needs an explicit tracking note and expiry, not a silent ignore.
+
+Rerun the audit and its offline pass/failure fixtures from the repository root
+with the existing npm and Python CI tools (no new local prerequisites):
+
+```sh
+npm --prefix wrangler audit --audit-level=high --include=dev --json
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_worker_npm_audit.py' -v
+```
+
+The offline fixtures stub npm and check the actual workflow command's exit-status
+and JSON-log propagation; the native audit above queries the registry's current
+advisories. Audits detect known advisories, not every supply-chain compromise.
+Never commit secrets, `.env` files or `target/`. See [README.md](README.md) for
+the full service reference.
 
 ### Secret-scan allowlists
 

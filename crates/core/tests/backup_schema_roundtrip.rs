@@ -806,6 +806,27 @@ async fn dirty_target(pool: &PgPool) {
     ).execute(pool).await.unwrap();
 }
 
+fn store_inventory_command() -> Command {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/store_table_inventory.py");
+    let mut command = Command::new("python3");
+    command.env("PYTHONDONTWRITEBYTECODE", "1").arg(script);
+    command
+}
+
+#[test]
+fn store_inventory_parser_negative_controls_run_without_database() {
+    let output = store_inventory_command()
+        .arg("--self-test")
+        .output()
+        .expect("run actual store inventory controls");
+    assert!(
+        output.status.success(),
+        "store inventory controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_first() {
     let Some(db) = database().await else {
@@ -844,48 +865,36 @@ async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_fi
             "migrated table {table} is neither DUMP_TABLES nor EXCLUDED_TABLES"
         );
     }
-    // The store chain (crates/store/migrations) shares the database (the
-    // operator applies both chains) but this guard migrates only the cutover
-    // chain. A pure text scan is enough, with no second database migration:
-    // every store-chain CREATE TABLE must be classified, so a new store
-    // table without a DUMP/EXCLUDED decision fails CI instead of silently
-    // leaving the backup.
+    // Both chains share the backup. Inventory every persistent store CREATE,
+    // plus the explicit quoted, same-file CREATE/DROP authority reference.
+    // The helper is not a persistent exclusion. Its runtime success/refusal
+    // cleanup is independently covered by admin_registry_repair_acceptance.
     let store_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../store/migrations");
-    let mut store_entries: Vec<_> = std::fs::read_dir(&store_dir)
-        .expect("store migrations directory")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+    let output = store_inventory_command()
+        .arg(store_dir)
+        .args(DUMP_TABLES.iter().chain(EXCLUDED_TABLES.iter()).copied())
+        .output()
+        .expect("run store inventory");
+    assert!(
+        output.status.success(),
+        "store inventory failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&output.stdout).expect("store inventory JSON");
+    assert_eq!(
+        inventory["transaction_local"],
+        json!([{
+            "migration": "0463_admin_api_token_authority.sql",
+            "table": "admin_api_token_authority_contract"
+        }]),
+        "explicit reference accounting must not disappear or expand"
+    );
+    let store_tables: BTreeSet<String> = inventory["tables"]
+        .as_array()
+        .expect("persistent store tables")
+        .iter()
+        .map(|table| table.as_str().expect("table name").to_owned())
         .collect();
-    store_entries.sort();
-    assert!(!store_entries.is_empty(), "no store migrations found");
-    let mut store_tables = BTreeSet::new();
-    for path in &store_entries {
-        let sql = std::fs::read_to_string(path).expect("migration file readable");
-        for line in sql.lines() {
-            // Real DDL only: no store migration carries CREATE TABLE in a
-            // comment, and every statement names its bare table on the same
-            // line (verified: no qualified or quoted names in this directory).
-            let trimmed = line.trim_start();
-            let rest = match trimmed
-                .strip_prefix("CREATE TABLE IF NOT EXISTS")
-                .or_else(|| trimmed.strip_prefix("CREATE TABLE"))
-            {
-                Some(rest) => rest,
-                None => continue,
-            };
-            let name: String = rest
-                .trim_start()
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            assert!(
-                !name.is_empty(),
-                "unparsable CREATE TABLE in {}",
-                path.display()
-            );
-            store_tables.insert(name);
-        }
-    }
     assert!(
         store_tables.contains("rollback_journal") && store_tables.contains("rollback_watermarks"),
         "store-chain scan must see the journal tables: {store_tables:?}"
@@ -1585,6 +1594,9 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let rows = old.buffers.remove(name).unwrap();
@@ -1610,6 +1622,9 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
             "starboard_config",
             "starboard_starrers",
             "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
             "starboard_reaction_cursors"
         ]
     );
@@ -1628,6 +1643,9 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -1668,6 +1686,9 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let rows = old.buffers.remove(name).unwrap();
@@ -1691,6 +1712,9 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "starboard_config",
             "starboard_starrers",
             "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
             "starboard_reaction_cursors"
         ]
     );
@@ -1707,6 +1731,9 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -1749,6 +1776,9 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let rows = old.buffers.remove(name).unwrap();
@@ -1771,6 +1801,9 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "starboard_config",
             "starboard_starrers",
             "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
             "starboard_reaction_cursors"
         ]
     );
@@ -1786,6 +1819,9 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -1834,6 +1870,9 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let rows = old.buffers.remove(name).unwrap();
@@ -1855,6 +1894,9 @@ async fn v11_archive_restores_and_clears_newer_registry() {
             "starboard_config",
             "starboard_starrers",
             "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
             "starboard_reaction_cursors"
         ]
     );
@@ -1869,6 +1911,9 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -1914,6 +1959,9 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let rows = old.buffers.remove(table).unwrap();
@@ -1934,6 +1982,9 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
             "starboard_config",
             "starboard_starrers",
             "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
             "starboard_reaction_cursors"
         ]
     );
@@ -1947,6 +1998,9 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -1994,6 +2048,9 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let rows = old.buffers.remove(name).unwrap();
@@ -2020,6 +2077,9 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
             "starboard_config",
             "starboard_starrers",
             "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
             "starboard_reaction_cursors"
         ]
     );
@@ -2053,6 +2113,9 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -2108,6 +2171,9 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         assert!(
@@ -2140,6 +2206,9 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
             "starboard_config",
             "starboard_starrers",
             "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
             "starboard_reaction_cursors",
         ]
     );
@@ -2186,6 +2255,9 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
         "starboard_reaction_cursors",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -2197,6 +2269,130 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         .unwrap();
         assert_eq!(count, 0, "v13 restore clears newer {name} destination rows");
     }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v14_archive_restores_and_clears_newer_giveaways() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let preserved = vec![
+        "starboard_config".to_owned(),
+        "starboard_starrers".to_owned(),
+        "starboard_posts".to_owned(),
+        "event_voice_channels".to_owned(),
+        "event_voice_presence".to_owned(),
+        "admin_api_tokens".to_owned(),
+    ];
+    let archived = snapshot(pool, &preserved).await;
+    for name in &preserved {
+        assert!(
+            !archived[name].rows.is_empty(),
+            "v14 fixture must populate {name}"
+        );
+    }
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    assert_eq!(old.manifest.tables.len(), 104, "released v14 inventory");
+    assert_eq!(&DUMP_TABLES[..101], FROZEN_V13_TABLES.as_slice());
+    assert_eq!(
+        &DUMP_TABLES[101..104],
+        ["starboard_config", "starboard_starrers", "starboard_posts"]
+    );
+    old.manifest.version = 14;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-giveaways-v14.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v14 archive remains readable");
+    assert_eq!(inspected.manifest.version, 14);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["giveaways", "giveaway_entries", "giveaway_draws"]
+    );
+    sqlx::query("DELETE FROM starboard_starrers")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM starboard_posts")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM starboard_config")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_voice_presence")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_voice_channels")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE admin_api_tokens SET label = 'destination-only registry label'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let dirty = snapshot(pool, &preserved).await;
+    for name in &preserved {
+        assert_ne!(
+            dirty[name], archived[name],
+            "dirty destination must differ for {name}"
+        );
+    }
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &preserved).await,
+        archived,
+        "v14 restores starboard, voice and registry data"
+    );
+    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v14 restore clears newer {name} target rows");
+    }
+    for name in ["event_voice_channels", "event_voice_presence"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(count > 0, "the v14 {name} rows are restored, not discarded");
+    }
+    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tokens > 0,
+        "the v12 token registry is restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
     db.close().await.unwrap();
 }
 

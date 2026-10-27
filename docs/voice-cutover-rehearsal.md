@@ -248,7 +248,7 @@ Re-check at `86a6668a7`: the 2026-10-04 registry observation above is history,
 not current state. The code wiring it waited on has since landed — the voice
 set is defined in `voice_commands()` (`crates/core/src/voice_rooms.rs:1292-1660`),
 merged when the voice gate is on (`crates/core/src/router.rs:717-719`), and
-synced on ready (`crates/bot/src/command_runtime.rs:1013-1024`). Re-read the
+synced on ready (`crates/bot/src/command_runtime.rs:1043-1065`). Re-read the
 staging guild registry before the next rehearsal instead of reusing the
 17-command snapshot.
 

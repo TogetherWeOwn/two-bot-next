@@ -46,7 +46,7 @@ async fn behind_cursor_in_flight_rows_are_reattempted_while_open_rows_skip() {
             .collect(),
         |ticket| async {
             first.lock().unwrap().push(ticket.id);
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -71,7 +71,7 @@ async fn behind_cursor_in_flight_rows_are_reattempted_while_open_rows_skip() {
         ],
         |ticket| async {
             second.lock().unwrap().push(ticket.id);
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -115,7 +115,7 @@ async fn budget_dropped_count_covers_only_the_post_skip_remainder() {
         |ticket| async {
             attempted.lock().unwrap().push(ticket.id);
             tokio::time::sleep(Duration::from_secs(50)).await;
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
