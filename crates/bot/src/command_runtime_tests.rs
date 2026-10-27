@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "feed_read_strict_decode_acceptance_tests.rs"]
+mod feed_read_strict_decode_acceptance_tests;
 #[path = "feed_sticky_strict_decode_acceptance_tests.rs"]
 mod feed_sticky_strict_decode_acceptance_tests;
 #[path = "reopen_dispatch_review_acceptance_tests.rs"]
@@ -46,6 +48,8 @@ mod help_detail_acceptance;
 
 #[path = "game_mix_acceptance_tests.rs"]
 mod game_mix_acceptance_tests;
+#[path = "game_mix_browse_acceptance_tests.rs"]
+mod game_mix_browse_acceptance_tests;
 #[path = "game_mix_content_acceptance_tests.rs"]
 mod game_mix_content_acceptance_tests;
 // Builder-owned: pins the classified store-failure warn the protected
@@ -58,6 +62,8 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
+#[path = "giveaway_list_facts_acceptance_tests.rs"]
+mod giveaway_list_facts_acceptance_tests;
 #[path = "privacy_action_scope_acceptance_tests.rs"]
 mod privacy_action_scope_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
