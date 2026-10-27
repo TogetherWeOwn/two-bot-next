@@ -62,6 +62,8 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
+#[path = "giveaway_list_facts_acceptance_tests.rs"]
+mod giveaway_list_facts_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
 mod schedule_absolute_acceptance;
 #[path = "schedule_absolute_correction_tests.rs"]
