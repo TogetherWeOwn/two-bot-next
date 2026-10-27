@@ -345,6 +345,7 @@ impl CommandRuntime {
         // Registration documents the ownership the router outcome names; the
         // shared router routes member verbs by name table regardless.
         if member.is_some() {
+            router.register(Box::new(SliceHandler(HandlerId::TempbanList)));
             for action in [
                 ModerationAction::Ban,
                 ModerationAction::TempBan,
@@ -1576,6 +1577,7 @@ impl CommandRuntime {
             "feed-inspect" => Some(HandlerId::FeedInspect),
             // Member verbs are owned only while the consumer exists; without
             // it they keep the immediate, non-deferred unavailable reply.
+            "tempban-list" if self.member.is_some() => Some(HandlerId::TempbanList),
             "ban" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Ban)),
             "tempban" if self.member.is_some() => {
                 Some(HandlerId::Moderation(ModerationAction::TempBan))
@@ -1700,6 +1702,12 @@ impl CommandRuntime {
                     interaction,
                 )
                 .await;
+            }
+            "tempban-list" => {
+                if let Some(member) = &self.member {
+                    let reply = member.inventory_reply(&self.executor, interaction).await;
+                    self.finish(interaction, reply).await;
+                }
             }
             "ban" => {
                 self.member_command(interaction, ModerationAction::Ban)
