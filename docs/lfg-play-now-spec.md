@@ -41,7 +41,7 @@ Source baseline: `c838e5125` (repository inspection, not a live-system claim).
 | Existing behavior | Evidence | Proposed difference |
 | --- | --- | --- |
 | Staff commands require Manage Events | `crates/core/src/feature_commands.rs:455-532` | Member creation is new, separately gated authority; no permission drop. |
-| Game picker asks “What do you play?” | `crates/discord/src/onboarding_messages.rs:89-107`; role mapping in `crates/core/src/onboarding.rs:197-230` | Interest/access roles are eligibility only, never inferred ping consent. |
+| Game picker’s “Apply game roles” menu | `crates/discord/src/onboarding_messages.rs:89-107`; role mapping in `crates/core/src/onboarding.rs:197-230` | Interest/access roles are eligibility only, never inferred ping consent. |
 | Join/Leave uses one string select with seat buckets | `crates/core/src/lfg.rs:569-603`; `crates/discord/src/lfg_interactions.rs:584-595` | One Player bucket; retain self-only, guild/message-bound validation. Seat buckets are not Discord roles. |
 | Signups stop at start; sweep closes after 15 minutes | [Current lifecycle](lfg-port.md#bounded-lifecycle-maintenance), backed by `crates/core/src/lfg_store.rs` | Member kind accepts `now` and joins until explicit expiry; do not reuse the staff cutoff unchanged. |
 | Current creates/edits suppress mentions; nonce/history recovery is bounded | [Current delivery](lfg-port.md) | An explicitly gated member notification effect, not a global change to mention policy. |
