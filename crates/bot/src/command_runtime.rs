@@ -2392,8 +2392,9 @@ impl CommandRuntime {
     /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
     /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
     /// only) and writes no audit row. An omitted `page` means page 1; a
-    /// present-but-unusable option refuses without a store read, and
-    /// out-of-range refuses after the same bounded read every list uses.
+    /// duplicated, wrong-typed, unknown or nested option refuses without a
+    /// store read, and out-of-range refuses after the same bounded read
+    /// every list uses.
     async fn feed_list(&self, interaction: &Interaction) {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
@@ -2402,6 +2403,8 @@ impl CommandRuntime {
             Ok(FeedCommandPlan::List { guild_id }) => {
                 let reply = match feed_list_page_request(interaction) {
                     FeedListPage::Invalid => feed_list_page_invalid_text().to_owned(),
+                    FeedListPage::Duplicate => FEED_LIST_DUPLICATE_PAGE.to_owned(),
+                    FeedListPage::Unknown => FEED_LIST_UNKNOWN_OPTION.to_owned(),
                     FeedListPage::Default => self.list_feed_page(&guild_id, 1).await,
                     FeedListPage::Page(page) if page < 1 => {
                         feed_list_page_underflow_text().to_owned()
@@ -2422,12 +2425,18 @@ impl CommandRuntime {
     /// mutation, audit write, claim renewal or delivery reset on any path,
     /// including store failure (legacy list parity). Absent, invalid-id and
     /// store-failure replies stay distinct; the raw source never reaches logs.
+    /// Malformed `id` options refuse before any store read via
+    /// [`feed_inspect_options_strict`].
     async fn feed_inspect(&self, interaction: &Interaction) {
         // Inspect does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
+        if let Err(refusal) = feed_inspect_options_strict(interaction) {
+            self.finish(interaction, refusal).await;
+            return;
+        }
         let command = FeedCommand::Inspect {
             id: feed_id_option(interaction).unwrap_or_default(),
         };
@@ -2760,7 +2769,7 @@ pub(crate) fn new_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-/// Refusal literals for malformed `/feed-add` and `/feed-remove` options.
+/// Refusal literals for malformed feed command options.
 /// Each names the offending option and carries a copyable corrected
 /// invocation, echoes no user input (mention-safe), and stays far under
 /// Discord's 2,000-unit cap (bounded). Handlers reply with these before any
@@ -2781,6 +2790,12 @@ const FEED_PAUSE_MISSING_ID: &str = "Missing id. Use /feed-pause id:<relay-id>."
 const FEED_RESUME_INVALID_ID: &str = "Invalid id. Use /feed-resume id:<relay-id>.";
 const FEED_RESUME_DUPLICATE_ID: &str = "Duplicate id. Use /feed-resume id:<relay-id>.";
 const FEED_RESUME_MISSING_ID: &str = "Missing id. Use /feed-resume id:<relay-id>.";
+const FEED_INSPECT_INVALID_ID: &str = "Invalid id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_DUPLICATE_ID: &str = "Duplicate id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_MISSING_ID: &str = "Missing id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-inspect id:<relay-id>.";
+const FEED_LIST_DUPLICATE_PAGE: &str = "Duplicate page. Use /feed-list page:<number>.";
+const FEED_LIST_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-list page:<number>.";
 
 /// Strictly decode `/feed-add`'s options: `kind` and `source` must each
 /// appear exactly once with a string value. Duplicates win over wrong types
@@ -2877,9 +2892,38 @@ fn feed_id_option_strict(
     }
 }
 
-/// `/feed-inspect`'s `id` option; `None` plans against an empty id, which
-/// `validate_id` rejects with `InvalidId` and inspect's distinct recovery
-/// copy (`/feed-remove` decodes strictly via [`feed_remove_option_strict`]).
+/// Guard the complete `/feed-inspect` option namespace before extracting
+/// `id` with [`feed_id_option`]: exactly one string `id` and no other
+/// options. An unknown name (including a nested group) wins over a
+/// duplicated `id`, which wins over a wrong wire type, which wins over a
+/// missing `id` — the same namespace-first layering as
+/// [`sticky_preview_option`], with the `id` checks themselves delegated to
+/// [`feed_id_option_strict`]. Unlike the writer decoders, unknown names
+/// refuse here, so a malformed read never silently inspects an arbitrarily
+/// chosen relay. A non-command interaction refuses as a missing `id`.
+fn feed_inspect_options_strict(interaction: &Interaction) -> Result<(), &'static str> {
+    if let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(
+        data,
+    )) = &interaction.data
+    {
+        if data.options.iter().any(|option| option.name != "id") {
+            return Err(FEED_INSPECT_UNKNOWN_OPTION);
+        }
+    }
+    feed_id_option_strict(
+        interaction,
+        FEED_INSPECT_INVALID_ID,
+        FEED_INSPECT_DUPLICATE_ID,
+        FEED_INSPECT_MISSING_ID,
+    )
+    .map(|_| ())
+}
+
+/// `/feed-inspect`'s `id` option. The handler runs
+/// [`feed_inspect_options_strict`] first, so a missing, duplicated or
+/// wrong-typed `id` never reaches this extractor; a present-but-empty id
+/// still extracts as `Some("")`, which `validate_id` rejects with
+/// `InvalidId` and inspect's distinct recovery copy.
 pub(crate) fn feed_id_option(interaction: &Interaction) -> Option<String> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
@@ -2914,14 +2958,19 @@ pub(crate) fn help_command_selector(interaction: &Interaction) -> Option<String>
     }
 }
 
-/// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
-/// omitted option means page 1, while a present option with a non-integer
-/// wire value is unusable and must refuse rather than silently list page 1.
+/// `/feed-list`'s optional 1-based `page` option, decoded over the complete
+/// option shape: an omitted option means page 1, while a duplicated,
+/// wrong-typed, unknown or nested option must refuse rather than silently
+/// list an arbitrarily chosen page. An unknown name wins over a duplicated
+/// `page`, which wins over a wrong wire type; range stays the reply
+/// composer's refusal, not the decoder's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeedListPage {
     Default,
     Page(i64),
     Invalid,
+    Duplicate,
+    Unknown,
 }
 
 pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage {
@@ -2930,12 +2979,24 @@ pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage 
     else {
         return FeedListPage::Default;
     };
-    let Some(page) = data.options.iter().find(|option| option.name == "page") else {
-        return FeedListPage::Default;
-    };
-    match &page.value {
-        CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
-        _ => FeedListPage::Invalid,
+    let mut pages: Vec<&CommandOptionValue> = Vec::new();
+    let mut unknown = false;
+    for option in &data.options {
+        match option.name.as_str() {
+            "page" => pages.push(&option.value),
+            _ => unknown = true,
+        }
+    }
+    if unknown {
+        return FeedListPage::Unknown;
+    }
+    if pages.len() > 1 {
+        return FeedListPage::Duplicate;
+    }
+    match pages.first() {
+        None => FeedListPage::Default,
+        Some(CommandOptionValue::Integer(value)) => FeedListPage::Page(*value),
+        Some(_) => FeedListPage::Invalid,
     }
 }
 
