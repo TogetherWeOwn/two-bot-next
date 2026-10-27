@@ -5656,7 +5656,28 @@ class WorkflowTests(unittest.TestCase):
                     ])
                 else:
                     self.assertEqual(supplemental, [])
-        self.assertEqual(len(planner.FULL_LEGS), 16)
+        self.assertEqual(len(planner.FULL_LEGS), 17)
+        # The serial invite-saturation replay is its own store leg; its
+        # guarded block must run exactly the command the planner describes.
+        invite = planner.FULL_LEGS[16]
+        self.assertEqual(invite["id"], "store-invite_uses_saturation_acceptance")
+        self.assertEqual(invite["crates"], ["two-bot-store"])
+        self.assertEqual(
+            invite["command"],
+            "cargo llvm-cov --no-report -p two-bot-store --features two-bot-core/db "
+            "--locked --test invite_uses_saturation_acceptance -- --test-threads=1 "
+            "--skip regenerate_reference_docs",
+        )
+        self.assertEqual(invite.get("supplemental_commands", []), [])
+        [invite_block] = re.findall(
+            rf"if selected {re.escape(invite['id'])}; then\n(.*?)\nfi",
+            step["run"], re.DOTALL,
+        )
+        self.assertEqual(
+            [["cargo" if token == "$COV" else token for token in shlex.split(line)[1:]]
+             for line in shell_logical_lines(invite_block) if line.startswith("cov_run ")],
+            [shlex.split(invite["command"])],
+        )
 
     def test_coverage_shard_caches_the_instrumented_build(self):
         # Each shard restores its own rust-cache entry and reports sccache
