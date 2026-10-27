@@ -3231,6 +3231,64 @@ mod tests {
         }
     }
 
+    fn live_entry() -> (LiveInteraction, tokio::sync::oneshot::Sender<bool>) {
+        let interaction: twilight_model::application::interaction::Interaction =
+            serde_json::from_value(serde_json::json!({
+                "id": "9", "application_id": "1111", "type": 2,
+                "token": "synthetic-interaction-token", "version": 1,
+                "guild_id": "22",
+                "channel": {"id": "4444", "type": 0, "name": "commands"},
+                "authorizing_integration_owners": {"0": "22"}, "entitlements": [],
+                "member": {
+                    "permissions": "0", "roles": [], "joined_at": null,
+                    "deaf": false, "mute": false, "flags": 0,
+                    "user": {"id": "3333", "username": "tester",
+                             "discriminator": "0000", "avatar": null}
+                },
+                "data": {"id": "5555", "name": "fixture", "type": 1, "options": []}
+            }))
+            .expect("synthetic interaction");
+        let (sender, ticket) = tokio::sync::oneshot::channel();
+        (
+            LiveInteraction {
+                interaction: Box::new(interaction),
+                ticket,
+                generation: 1,
+            },
+            sender,
+        )
+    }
+
+    #[test]
+    fn live_cache_evicts_oldest_arrival_once_past_the_cap() {
+        let mut cache = LiveCache::default();
+        let mut tickets = Vec::new();
+        for id in 0..=LIVE_INTERACTION_CAP as i64 {
+            let (live, sender) = live_entry();
+            cache.insert(id, live);
+            tickets.push(sender);
+        }
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert!(!cache.contains_key(&0), "oldest arrival must be evicted");
+        assert!(cache.contains_key(&1) && cache.contains_key(&(LIVE_INTERACTION_CAP as i64)));
+        assert!(
+            tickets.remove(0).send(true).is_err(),
+            "evicted ticket freed"
+        );
+        // A claim frees its slot, so the next insert evicts nothing.
+        assert!(cache.remove(&1).is_some());
+        let (live, _sender) = live_entry();
+        cache.insert(-1, live);
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert!(cache.contains_key(&2));
+        // Re-inserting an id replaces it instead of consuming a second slot.
+        let (live, _sender) = live_entry();
+        assert!(cache.insert(2, live).is_some());
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert_eq!(cache.arrival.len(), LIVE_INTERACTION_CAP);
+        assert!(!cache.is_empty());
+    }
+
     #[tokio::test]
     async fn voice_runtime_off_without_gate() {
         let config = voice_config(Some("token"), Some("postgres://localhost/unused"));
