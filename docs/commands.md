@@ -1,6 +1,6 @@
 # Command reference
 
-The full [generated command reference](generated/commands.md) lists the compiled
+After generation, `docs/generated/commands.md` contains the compiled
 built-in commands, options, bounds and default Discord permissions with all
 publication gates enabled. Its rows are build outputs, not tracked snapshots.
 A fresh checkout intentionally has no generated reference.
