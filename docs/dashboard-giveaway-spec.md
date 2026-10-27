@@ -14,7 +14,7 @@ draw, and run its lifecycle without rewriting history. A browser draft is
 **not** a giveaway, and a stored giveaway row is **not** a drawn result.
 
 **Recommend wiring-first, not a dashboard editor over today's surface.**
-Inventory at source commit `fb11f134ac002a8a6fa6e9982c7b1de03734fbb1` finds
+Inventory at source commit `f515b6a7e82e01764affede3484db490572fe9ad` finds
 nine shipped slash subcommands (eight in this contract plus read-only
 `inspect`, owned by the inspect slice), but no guild template/config store, no
 signed giveaway read or lifecycle verb, and no revision column.
@@ -35,7 +35,7 @@ ships but stays with the inspect slice — the oracle pins its presence without
 contracting it. Entry buttons stay open to members. There is no guild
 template, default, or configuration row: create carries prize, duration,
 winners, one required role and two age gates as invocation options
-(`crates/discord/src/giveaway.rs:343-373`). The word "giveaway" appears nowhere
+(`crates/discord/src/giveaway.rs:336-366`). The word "giveaway" appears nowhere
 in `crates/core/src/internal_actions.rs`, so no signed internal verb reads or
 mutates giveaways today; the web cannot reuse a transport the way the ticket
 page reuses `settings.get`/`settings.set`.
@@ -52,26 +52,26 @@ re-validate every entrant.
 
 The 15 s draw ticker claims due rows under a 600 s lease
 (`crates/bot/src/giveaway_runtime.rs:16`;
-`crates/discord/src/giveaway.rs:44`), re-validates every entrant against fresh
-membership reads (`:926-964`), commits the draw row plus the drawn flip
-atomically (`:894`), audits before announcing (`:912-921`), and retries
+`crates/discord/src/giveaway.rs:50`), re-validates every entrant against fresh
+membership reads (`:919-957`), commits the draw row plus the drawn flip
+atomically (`:887`), audits before announcing (`:905-914`), and retries
 announce from the stored row. A transport failure aborts the draw; it never
-silently shrinks the eligible set (`:975-981`). A crash between the draw-row
+silently shrinks the eligible set (`:968-974`). A crash between the draw-row
 insert and the drawn flip replays the stored row and never re-draws
-(`:813-840`).
+(`:806-833`).
 
 ### Present vs proposed
 
 | Shipped slash behavior | Proposed dashboard control | Page state |
 | --- | --- | --- |
-| GW-C1 `create`: validates prize/winners/duration (`giveaway.rs:201`), admits under quota+idempotency (`giveaway_store.rs:711-744`), posts the entry message, neutralizes orphans on attach failure (`giveaway.rs:400-427`) | Draft composer; drafts stay browser-local until a submit verb exists | `draft_only` until GW-W1 |
-| GW-C2 `list`: open+paused only, ends-first, max 10, 32-char prize preview (`giveaway.rs:170-186`) | Read-only active list + active-row detail (status, `updated_at`, `latest_draw_no`, `announced_at`, deadline, counts) | `candidate_readonly` after GW-W1 |
+| GW-C1 `create`: validates prize/winners/duration (`giveaway.rs:201`), admits under quota+idempotency (`giveaway_store.rs:711-744`), posts the entry message, neutralizes orphans on attach failure (`giveaway.rs:393-420`) | Draft composer; drafts stay browser-local until a submit verb exists | `draft_only` until GW-W1 |
+| GW-C2 `list`: open+paused only, ends-first, max 10, 32-char prize preview (`giveaway.rs:176-179`; preview `giveaway_list.rs:7-13`) | Read-only active list + active-row detail (status, `updated_at`, `latest_draw_no`, `announced_at`, deadline, counts) | `candidate_readonly` after GW-W1 |
 | GW-C3 `cancel`: open/paused-to-cancelled, clears claims, audited (`giveaway_store.rs:873-887`); can win a race against a draw in flight | Explicit confirm; re-read after commit because cancel-vs-draw races | `disabled_lifecycle` until GW-W1+GW-W2 |
-| GW-C4 `end`: claims open/paused (`:436-448`), draws under claim, commits from prior status (`:894-900`), audits (`:912-921`), announces (`:1077`) | Explicit confirm; refused while claimed; re-read names the actual state | `disabled_lifecycle` until GW-W1+GW-W2 |
+| GW-C4 `end`: claims open/paused (`:429-441`), draws under claim, commits from prior status (`:887-893`), audits (`:905-914`), announces (`:1070`) | Explicit confirm; refused while claimed; re-read names the actual state | `disabled_lifecycle` until GW-W1+GW-W2 |
 | GW-C5 `pause`: open-to-paused only when unclaimed (`giveaway_store.rs:910-933`); leaves the due scan; audited (`giveaway.pause`, actor, same transaction) | Explicit confirm; refused mid-draw | `disabled_lifecycle` until GW-W1+GW-W2 |
 | GW-C6 `resume`: paused-to-open with deadline shifted by the paused span (`:951-990`); audited (`giveaway.resume`, actor, same transaction) | Explicit confirm; shows the recomputed deadline before commit | `disabled_lifecycle` until GW-W1+GW-W2 |
 | GW-C7 `extend`: open/paused deadline += 1 s–30 d (`giveaway.rs:325-330`; `:1009-1049`); paused stays paused; audited (`giveaway.extend`, actor, same transaction) | Explicit confirm; shows the new deadline before commit | `disabled_lifecycle` until GW-W1+GW-W2 |
-| GW-C8 `reroll`: requires a stored draw; re-validates members; appends `draw_no+1` (`giveaway.rs:482-576`); full or `single:<id>`; audited (`:1114-1132`) | Explicit confirm; refused before first draw; appends, never rewrites | `disabled_lifecycle` until GW-W1+GW-W2 |
+| GW-C8 `reroll`: requires a stored draw; re-validates members; appends `draw_no+1` (`giveaway.rs:475-569`); full or `single:<id>`; audited (`:1114-1132`) | Explicit confirm; refused before first draw; appends, never rewrites | `disabled_lifecycle` until GW-W1+GW-W2 |
 
 ### Control map
 
@@ -87,7 +87,7 @@ insert and the drawn flip replays the stored row and never re-draws
 | GW-C8 reroll | prior draw exists; target (if any) is a current winner | Manage Server | `insert_reroll_draw` | `giveaway.reroll` | announce sweep; replay per round seed |
 
 Commands and the supervised ticker serialize on one effects mutex
-(`giveaway.rs:113-139`), and every mutating store path takes row locks or
+(`giveaway.rs:119-145`), and every mutating store path takes row locks or
 claim-conditional updates, so the dashboard's future verbs must join the same
 exclusion rather than invent a parallel writer.
 
@@ -98,7 +98,8 @@ Before any page build they must prove: private, non-cacheable admin responses;
 CSRF protection; current guild membership and Manage Server authority checked
 server-side on reads and writes; no signing key in browser code; and session
 revocation/failure denial. No nonce, claim token or entry identity anywhere
-in the page; no prize prose or role mentions in logs, alerts, errors,
+in the page except announced `winner_ids` (rule below); no prize prose or
+role mentions in logs, alerts, errors,
 dry-run results or any server/read preview. The single prize-text exception
 is the browser-local composer preview of the admin's own unsent draft, shown
 only to that admin and never sent or logged. Everywhere prize text renders,
@@ -140,7 +141,7 @@ claimed row refuses with `RACE_LOST`; on a lost race the page re-reads and
 names cancelled vs drawn. Pause during a draw refuses (claim guard); end during
 a pause draws from paused. Every lifecycle reply pattern follows the shipped
 `end` shape: commit, then re-read, then name the actual state
-(`giveaway.rs:448-465`).
+(`giveaway.rs:441-458`).
 
 ### CAS, idempotency and dry-run
 
@@ -148,7 +149,7 @@ No `giveaways` revision column ships. The proposed expected-state guard is
 `(status, updated_at, latest_draw_no, announced_at)` supplied with every
 lifecycle intent and re-checked server-side under the row lock before the
 mutation; any mismatch refuses with `STALE_STATE` and keeps the draft.
-`updated_at` stamps on every mutation (`:456-475` release path included), and
+`updated_at` stamps on every mutation (`:449-468` release path included), and
 inserts carry monotonic `draw_no`, so the tuple detects lifecycle races,
 reroll races and announce transitions without a schema change. The existing
 `set_giveaway_status` CAS primitive has no production callers; the proposal
@@ -185,13 +186,13 @@ what the admin could already set. One narrow exception: `winner_ids` for a
 round only when that round's `announced_at IS NOT NULL`, enforced server-side
 in the read verb — the field is omitted, not client-hidden, while
 unannounced. Announced winners are already published as mentions in the
-giveaway channel (`giveaway.rs:1077`), so this reads back facts the guild
+giveaway channel (`giveaway.rs:1070`), so this reads back facts the guild
 already saw; drawn-but-unannounced winners are never returned. Writes split
 by effect: create vs
 lifecycle-transition vs reroll-append, each refusing outside its transition
 set. Attribution derives `created_by`/actor from the authenticated admin's
 Discord identity on the server, never editable browser input, matching the
-shipped `actor_id` derivation (`giveaway.rs:1181`). Lifecycle audit rows ship
+shipped `actor_id` derivation (`giveaway.rs:1174`). Lifecycle audit rows ship
 for every transition (create/cancel/draw/reroll/pause/resume/extend); future
 dashboard verbs must reuse them with server-side attribution, and the page
 shows no guessed history.
@@ -245,10 +246,10 @@ forces re-inventory instead of passing on a stale snapshot.
 ```json
 {
   "schema": "dashboard.giveaway.v1",
-  "source_sha": "fb11f134ac002a8a6fa6e9982c7b1de03734fbb1",
+  "source_sha": "f515b6a7e82e01764affede3484db490572fe9ad",
   "controls": [
     {"id":"GW-C1","slash":"create","state":"draft_only","gate":["GW-W1"],"evidence":["E-CMD","E-PERM","E-VALIDATE","E-CREATE","E-QUOTA","E-AUDIT-CREATE"]},
-    {"id":"GW-C2","slash":"list","state":"candidate_readonly","gate":["GW-W1"],"evidence":["E-LIST","E-PERM"]},
+    {"id":"GW-C2","slash":"list","state":"candidate_readonly","gate":["GW-W1"],"evidence":["E-LIST","E-PRIZE32","E-PERM"]},
     {"id":"GW-C3","slash":"cancel","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-CANCEL","E-PERM","E-AUDIT-CANCEL"]},
     {"id":"GW-C4","slash":"end","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-END","E-COMMIT","E-AUDIT","E-PERM"]},
     {"id":"GW-C5","slash":"pause","state":"disabled_lifecycle","gate":["GW-W1","GW-W2"],"evidence":["E-PAUSE","E-PERM","E-AUDIT-PAUSE"]},
@@ -274,21 +275,22 @@ forces re-inventory instead of passing on a stale snapshot.
     "E-VALIDATE-EXTEND":{"path":"crates/core/src/giveaway.rs","line":325,"contains":"pub fn extend_deadline_ms"},
     "E-STATUS":{"path":"crates/core/src/giveaway.rs","line":63,"contains":"ALL: [Self; 5]"},
     "E-TRANSITION":{"path":"crates/core/src/giveaway.rs","line":299,"contains":"pub fn transition"},
-    "E-CREATE":{"path":"crates/discord/src/giveaway.rs","line":400,"contains":"create_admitted"},
-    "E-LIST":{"path":"crates/discord/src/giveaway.rs","line":171,"contains":"list_active"},
-    "E-CANCEL":{"path":"crates/discord/src/giveaway.rs","line":192,"contains":"cancel_audited"},
-    "E-END":{"path":"crates/discord/src/giveaway.rs","line":436,"contains":"claim_specific"},
-    "E-END-DATA":{"path":"crates/discord/src/giveaway.rs","line":470,"contains":"Err(DrawError::Data)"},
-    "E-WINNERS-POST":{"path":"crates/discord/src/giveaway.rs","line":1077,"contains":"winners_posts("},
+    "E-CREATE":{"path":"crates/discord/src/giveaway.rs","line":393,"contains":"create_admitted"},
+    "E-LIST":{"path":"crates/discord/src/giveaway.rs","line":177,"contains":"list_active"},
+    "E-CANCEL":{"path":"crates/discord/src/giveaway.rs","line":185,"contains":"cancel_audited"},
+    "E-END":{"path":"crates/discord/src/giveaway.rs","line":429,"contains":"claim_specific"},
+    "E-END-DATA":{"path":"crates/discord/src/giveaway.rs","line":463,"contains":"Err(DrawError::Data)"},
+    "E-WINNERS-POST":{"path":"crates/discord/src/giveaway.rs","line":1070,"contains":"winners_posts("},
     "E-DUE":{"path":"crates/core/src/giveaway.rs","line":334,"contains":"pub fn is_due"},
     "E-ENTRY-CLOSED":{"path":"crates/core/src/giveaway_store.rs","line":800,"contains":"row.ends_at <= now"},
-    "E-PAUSE":{"path":"crates/discord/src/giveaway.rs","line":211,"contains":"pause_audited"},
-    "E-RESUME":{"path":"crates/discord/src/giveaway.rs","line":233,"contains":"resume_audited"},
-    "E-EXTEND":{"path":"crates/discord/src/giveaway.rs","line":265,"contains":"extend_audited"},
-    "E-REROLL":{"path":"crates/discord/src/giveaway.rs","line":554,"contains":"insert_reroll_draw"},
-    "E-COMMIT":{"path":"crates/discord/src/giveaway.rs","line":894,"contains":"commit_draw_from"},
-    "E-ELIG":{"path":"crates/discord/src/giveaway.rs","line":957,"contains":"adjudicate_eligibility"},
-    "E-CLAIM":{"path":"crates/discord/src/giveaway.rs","line":44,"contains":"CLAIM_LEASE_SECS"},
+    "E-PAUSE":{"path":"crates/discord/src/giveaway.rs","line":204,"contains":"pause_audited"},
+    "E-RESUME":{"path":"crates/discord/src/giveaway.rs","line":226,"contains":"resume_audited"},
+    "E-EXTEND":{"path":"crates/discord/src/giveaway.rs","line":258,"contains":"extend_audited"},
+    "E-REROLL":{"path":"crates/discord/src/giveaway.rs","line":547,"contains":"insert_reroll_draw"},
+    "E-COMMIT":{"path":"crates/discord/src/giveaway.rs","line":887,"contains":"commit_draw_from"},
+    "E-ELIG":{"path":"crates/discord/src/giveaway.rs","line":950,"contains":"adjudicate_eligibility"},
+    "E-CLAIM":{"path":"crates/discord/src/giveaway.rs","line":50,"contains":"CLAIM_LEASE_SECS"},
+    "E-PRIZE32":{"path":"crates/discord/src/giveaway_list.rs","line":7,"contains":"PRIZE_CHARS: usize = 32"},
     "E-AUDIT":{"path":"crates/core/src/giveaway_store.rs","line":1091,"contains":"audit_draw"},
     "E-AUDIT-REROLL":{"path":"crates/core/src/giveaway_store.rs","line":1114,"contains":"audit_reroll"},
     "E-AUDIT-CREATE":{"path":"crates/core/src/giveaway_store.rs","line":734,"contains":"surface_audit"},
