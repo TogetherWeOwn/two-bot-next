@@ -115,6 +115,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'starboard_config', 'table'),
     ('public', 'starboard_starrers', 'table'),
     ('public', 'starboard_posts', 'table'),
+    ('public', 'starboard_reaction_cursors', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', '_two_bot_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),

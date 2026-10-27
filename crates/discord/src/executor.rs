@@ -4556,11 +4556,20 @@ mod tests {
             "/users/@me?",
             "/users/@me?limit=100",
             "/users/@me/",
-            "/users/5555",
+            "/users/0",
+            "/users/5555?limit=1",
             "https://discord.com/api/v10/users/@me",
         ] {
             assert!(raw_get_route(path).is_err());
         }
+    }
+
+    #[test]
+    fn user_read_accepts_only_a_bare_nonzero_id() {
+        assert!(matches!(
+            raw_get_route("/users/5555").unwrap(),
+            Route::GetUser { user_id: 5555 }
+        ));
     }
 
     #[tokio::test]
