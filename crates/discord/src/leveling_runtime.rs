@@ -1047,6 +1047,12 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.cache()
     }
 
+    /// Share the same live cache the ordered shard runner updates.
+    #[must_use]
+    pub fn cache_shared(&self) -> Arc<twilight_cache_inmemory::InMemoryCache> {
+        self.pipeline.cache_shared()
+    }
+
     /// Register the post-funnel join observer (raid watch). First wins.
     pub fn set_join_observer(&self, observer: std::sync::Arc<dyn crate::pipeline::JoinObserver>) {
         self.pipeline.set_join_observer(observer);
@@ -1155,6 +1161,14 @@ mod tests {
     use axum::{body::Body, http::Method, http::Response, http::Uri, Router};
     use serde_json::{json, Value};
     use std::collections::VecDeque;
+
+    #[test]
+    fn shared_cache_is_the_same_allocation_as_the_ordered_pipeline_cache() {
+        let pipeline = OrderedLevelingPipeline::new(two_bot_core::MemStore::new(), None);
+        let shared = pipeline.cache_shared();
+        assert!(std::ptr::eq(pipeline.cache(), shared.as_ref()));
+        assert!(Arc::ptr_eq(&shared, &pipeline.cache_shared()));
+    }
 
     struct RoleRest {
         executor: Arc<ActionExecutor>,
