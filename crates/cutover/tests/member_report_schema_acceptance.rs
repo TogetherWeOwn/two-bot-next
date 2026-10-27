@@ -57,10 +57,12 @@ async fn require_report_schema(pool: &PgPool) {
 async fn snapshot_tables(pool: &PgPool) -> Vec<Vec<String>> {
     let mut result = Vec::new();
     for table in TABLES {
+        // Audited: `table` comes only from the fixed `TABLES` const, never from
+        // test input, so interpolating it cannot inject SQL.
         result.push(
-            sqlx::query_scalar(&format!(
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text"
-            ))
+            )))
             .fetch_all(pool)
             .await
             .expect("snapshot synthetic report rows"),
