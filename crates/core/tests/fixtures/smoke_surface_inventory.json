@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 30,
+  "count": 31,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -280,6 +280,53 @@
       "deferral_reason": "Read-only but needs DB-backed custom rows, which the no-DB offline rule excludes; the list is empty in the smoke guild."
     },
     {
+      "name": "command-inspect",
+      "description": "Inspect or privately preview a saved custom command",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Saved command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        },
+        {
+          "name": "view",
+          "description": "Private view (summary by default)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            { "name": "Summary", "value": "summary" },
+            { "name": "Saved template", "value": "template" },
+            { "name": "Preview", "value": "preview" }
+          ]
+        },
+        {
+          "name": "arguments",
+          "description": "Sample invocation arguments (ignored by current templates)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 500,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Read-only but needs a named DB-backed custom row to inspect, which the no-DB offline rule excludes; covered by the disposable-database acceptance instead."
+    },
+    {
       "name": "schedule",
       "description": "Schedule a message, once or recurring",
       "family": "automations",
@@ -476,7 +523,7 @@
     },
     {
       "name": "rsvp-attendance",
-      "description": "Show RSVP totals for a scheduled event",
+      "description": "Show RSVP totals and your saved response for an event",
       "family": "announcements",
       "gate": "announcements",
       "default_member_permissions": null,

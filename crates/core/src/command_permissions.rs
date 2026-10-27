@@ -73,13 +73,13 @@ use PolicyHook::{
     AutomationsEnabled, ConfiguredPrimaryActor, MemberModeration, TextCommandsEnabled,
 };
 
-/// All 31 parity rows, including the three non-static-slash dispositions,
+/// All 30 legacy parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
-/// no help command), the Next-only `/privacy` member self-serve
-/// (parity row 32) and the Next-only `/sticky-status` private inspection
-/// (parity row 33).
+/// no help command), `/privacy` member self-serve (parity row 32),
+/// management-only `/command-inspect` (parity row 33) and `/sticky-status`
+/// private inspection (parity row 34).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 34] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -134,12 +134,13 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
     row(14, "command", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(15, "command-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(16, "command-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(20, "sticky", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(21, "sticky-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(33, "sticky-status", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(34, "sticky-status", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(22, "<custom>", DynamicSlash, 0, Some(AutomationsEnabled)),
     row(23, "<trigger>", Prefix, 0, Some(TextCommandsEnabled)),
     row(24, "rsvp", BuiltinSlash, 0, None),

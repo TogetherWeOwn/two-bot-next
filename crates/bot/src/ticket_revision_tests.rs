@@ -271,6 +271,53 @@ async fn equal_timestamp_history_uses_snowflake_order_across_page_boundary() {
 }
 
 #[tokio::test]
+async fn malformed_panel_history_refuses_absence_but_keeps_a_found_panel() {
+    let doc = json!({"id":"700","guild_id":"100","type":0,
+        "permission_overwrites":[{"id":"400","type":1,"allow":"68624","deny":"0"}]});
+    let malformed = json!({"id":"902","author":{"id":"400"},"components":"rows"});
+    let panel = json!({"id":"901","author":{"id":"400"},"components":[
+        {"type":1,"components":[{"type":2,"custom_id":TICKET_OPEN_ID}]}
+    ]});
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, doc.clone()),
+            ScriptedResponse::json(200, json!([malformed.clone()])),
+            ScriptedResponse::json(200, doc.clone()),
+            ScriptedResponse::json(200, json!([malformed, panel])),
+            ScriptedResponse::json(200, doc),
+            ScriptedResponse::json(200, json!([])),
+            ScriptedResponse::json(200, json!({"id":"903"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&mock);
+    let uncertain = runtime.ensure_panel().await;
+    let uncertain_calls = mock.requests();
+    let found = runtime.ensure_panel().await;
+    let found_calls = mock.requests();
+    let absent = runtime.ensure_panel().await;
+    let all_calls = mock.requests();
+    mock.shutdown().await;
+    assert!(matches!(uncertain, Err(Failure::InvalidEvidence)));
+    assert_eq!(uncertain_calls.len(), 2);
+    assert!(uncertain_calls.iter().all(|r| r.method == "GET"));
+    assert!(
+        found.is_ok(),
+        "a proven panel survives unrelated malformed rows"
+    );
+    assert_eq!(found_calls.len(), 4);
+    assert!(found_calls.iter().all(|r| r.method == "GET"));
+    assert!(
+        absent.is_ok(),
+        "readable empty history still repairs the panel"
+    );
+    assert_eq!(all_calls.len(), 7);
+    assert_eq!(all_calls.iter().filter(|r| r.method == "POST").count(), 1);
+    assert_eq!(all_calls[6].path, "/api/v10/channels/700/messages");
+}
+
+#[tokio::test]
 async fn unreadable_history_never_reposts_panels_or_controls() {
     let mut script = Vec::new();
     for channel in ["700", "700", "600", "600"] {

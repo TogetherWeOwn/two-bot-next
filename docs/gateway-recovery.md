@@ -65,6 +65,22 @@ Dispatch-worker failures use the same path: a failed leveling drain, a dropped i
 
 These changes prevent scheduler-induced loss at backlog/deadline and recoverable checkpoint-error boundaries, not process-crash exactly-once delivery. RSVP store effects and Discord acknowledgements are not atomic with the gateway checkpoint, and no durable interaction inbox is introduced. A failed final edit never retries the already-executed command.
 
+### Voice action queue: no enforced production pending cap
+
+`ActionQueue::try_enqueue` is an opt-in API for future sheddable producers. It
+refuses new work once a guild has 1,024 pending urgent + deferred actions, while
+allowing a newer rename or respace to overwrite its same-kind pending entry
+without allocating another slot or counting a refusal.
+
+**That limit is not a production queue-memory bound.** All current production
+producers still use the always-admit `enqueue` path to preserve accepted user
+commands and room lifecycle writes. The actor inbox gate limits inbound bursts,
+not cumulative production under a stalled drain. Wiring producers that can
+safely handle refusal is future work; do not assume queue depth stops at 1,024
+or that a zero overflow counter proves the drain is healthy. Inspect
+`two_bot_voice_queue_pending` and `two_bot_voice_queue_oldest_age_seconds`
+with the actor/REST stall signals when investigating accumulation.
+
 ## Force-fresh IDENTIFY (first production boot)
 
 The age policy alone RESUMEs any checkpoint up to 15 minutes old. The first production boot must IDENTIFY with RESUME disabled, so an operator arms a one-shot directive instead of relying on checkpoint age. The Worker forwards no feature flags, so an environment toggle cannot do this.

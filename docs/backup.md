@@ -172,11 +172,17 @@ aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
 monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
 scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
 its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
-admin API token registry (`admin_api_tokens`: 0456/0457), the event
-voice pair (`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
+admin API token registry (`admin_api_tokens`: 0456/0457, named-holder and
+90-day lifetime repair 0464/0463), the event voice pair
+(`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
 configuration, distinct starrers and post state (`starboard_config`,
 `starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
 entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461).
+The [registry contract](admin-registry.md) adds no table or archive version:
+new v15 dumps discover `holder_id` / `holder_kind` dynamically. Populated
+pre-holder archives refuse transactionally on the required authority columns
+instead of inventing holders; older readable archives that omit the table
+retain their versioned clearing behavior.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 107 table entries. A missing current table refuses a dump/restore: migrate

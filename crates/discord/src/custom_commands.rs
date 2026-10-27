@@ -23,9 +23,12 @@ use twilight_model::{
 use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        accepted_text_trigger, builtin_command_names, format_command_list_page, render_template,
-        AuditRecord, AutomationMessageAcceptance, PutCommandInput, StoredCommand, TemplateContext,
-        INVALID_COMMAND_LIST_PAGE,
+        accepted_text_trigger, builtin_command_names, format_command_list_page,
+        format_inspect_miss, format_inspect_preview, format_inspect_summary,
+        format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
+        invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
+        AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand, TemplateContext,
+        INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -199,7 +202,7 @@ impl CustomCommandRuntime {
         };
         let management = matches!(
             data.name.as_str(),
-            "command" | "command-remove" | "command-list"
+            "command" | "command-remove" | "command-list" | "command-inspect"
         );
         let builtin = builtin_command_names().contains(&data.name);
         if builtin && !management {
@@ -257,14 +260,20 @@ impl CustomCommandRuntime {
                 handler: HandlerId::AutomationAdmin,
             } if management => {
                 self.defer(interaction, true, received).await?;
-                let reply = self.manage(interaction, data, &guild).await;
-                self.complete(
-                    interaction,
-                    reply
-                        .as_deref()
-                        .unwrap_or("Custom-command operation failed. Please try again."),
-                )
-                .await?;
+                let reply = self.manage(interaction, data, &guild, guild_name).await;
+                let body = reply
+                    .as_deref()
+                    .unwrap_or("Custom-command operation failed. Please try again.");
+                // Inspect views show saved text exactly as stored: mention
+                // safety comes from the reply's explicit empty
+                // allowed_mentions, never from rewriting `@everyone`/`@here`.
+                // Every other completion keeps the neutralizing path.
+                if data.name == "command-inspect" {
+                    self.complete_without_mention_neutralization(interaction, body)
+                        .await?;
+                } else {
+                    self.complete(interaction, body).await?;
+                }
                 reply?;
                 Ok(true)
             }
@@ -561,6 +570,25 @@ impl CustomCommandRuntime {
         .map_err(delivery_error)
     }
 
+    /// Inspect-view completion: same retry/error contract as [`Self::complete`],
+    /// without mention neutralization — the ephemeral reply's explicit empty
+    /// `allowed_mentions` is the mention safety, and the admin must see the
+    /// saved text exactly as stored.
+    async fn complete_without_mention_neutralization(
+        &self,
+        interaction: &Interaction,
+        content: &str,
+    ) -> Result<(), CustomCommandError> {
+        self.executor
+            .edit_interaction_response_without_mention_neutralization_with_blocked_retry(
+                self.application_id,
+                &interaction.token,
+                content,
+            )
+            .await
+            .map_err(delivery_error)
+    }
+
     async fn complete(
         &self,
         interaction: &Interaction,
@@ -609,12 +637,101 @@ impl CustomCommandRuntime {
             .map_err(|_| CustomCommandError::Storage)
     }
 
+    /// Private saved-response inspection: one ephemeral content-only view,
+    /// never a public send, registration, cooldown/claim touch, definition
+    /// mutation or `command.run` fact. The only store access is a live
+    /// `get_command` read after every validation passes — no cache, so a
+    /// deleted definition immediately misses.
+    async fn inspect(
+        &self,
+        interaction: &Interaction,
+        data: &CommandData,
+        guild: &str,
+        guild_name: Option<&str>,
+    ) -> String {
+        let name = match single_string_option(data, "name") {
+            SingleOption::Missing | SingleOption::Malformed => {
+                return invalid_inspect_option_reply(
+                    "command name",
+                    "a saved command name is required.",
+                );
+            }
+            SingleOption::Value(name) => name,
+        };
+        let name = match validate_inspect_name(name, &builtin_command_names()) {
+            Ok(name) => name,
+            Err(reason) => {
+                return invalid_inspect_option_reply("command name", &reason.to_string());
+            }
+        };
+        let view = match single_string_option(data, "view") {
+            SingleOption::Missing => InspectView::Summary,
+            SingleOption::Malformed => return invalid_inspect_view_reply(None),
+            SingleOption::Value(raw) => match InspectView::parse(raw) {
+                Some(view) => view,
+                None => return invalid_inspect_view_reply(Some(raw)),
+            },
+        };
+        match single_string_option(data, "arguments") {
+            SingleOption::Missing => {}
+            SingleOption::Malformed => {
+                return invalid_inspect_option_reply(
+                    "arguments",
+                    "expected a single text sample of invocation arguments.",
+                );
+            }
+            SingleOption::Value(sample) => {
+                if sample.encode_utf16().count() > MAX_INSPECT_ARGUMENT_UNITS {
+                    return invalid_inspect_option_reply(
+                        "arguments",
+                        "sample arguments must be at most 500 characters.",
+                    );
+                }
+            }
+        }
+        let row = match store::get_command(&self.pool, guild, &name).await {
+            Ok(row) => row,
+            Err(_) => return LOOKUP_OUTAGE_REPLY.to_owned(),
+        };
+        let Some(row) = row else {
+            return format_inspect_miss(&name);
+        };
+        match view {
+            InspectView::Summary => format_inspect_summary(&row),
+            InspectView::Template => format_inspect_template(&row),
+            InspectView::Preview => {
+                // Same invoking member/channel/guild context as real
+                // execution; the sample arguments are never interpolated.
+                let actor = interaction.author();
+                let context = actor.zip(interaction.channel.as_ref()).zip(guild_name).map(
+                    |((actor, channel), server)| TemplateContext {
+                        user: format!("<@{}>", actor.id),
+                        username: actor.name.clone(),
+                        server: server.to_owned(),
+                        channel: format!("<#{}>", channel.id),
+                    },
+                );
+                match context {
+                    Some(context) => format_inspect_preview(&row, &context),
+                    None => inspect_preview_context_unavailable(&row.name),
+                }
+            }
+        }
+    }
+
     async fn manage(
         &self,
         interaction: &Interaction,
         data: &CommandData,
         guild: &str,
+        guild_name: Option<&str>,
     ) -> Result<String, CustomCommandError> {
+        if data.name == "command-inspect" {
+            // Routing already enforced guild/application, ManageGuild and the
+            // feature gate. Reject forged types/duplicates before a store
+            // read; validate name/view/arguments before any lookup.
+            return Ok(self.inspect(interaction, data, guild, guild_name).await);
+        }
         let actor = interaction
             .author_id()
             .ok_or(CustomCommandError::Context)?
@@ -728,4 +845,251 @@ fn string_option<'a>(data: &'a CommandData, name: &str) -> Option<&'a str> {
         CommandOptionValue::String(value) if option.name == name => Some(value.as_str()),
         _ => None,
     })
+}
+
+/// One named option read strictly: a forged type or a duplicate refuses
+/// instead of silently taking the first value.
+enum SingleOption<'a> {
+    Missing,
+    Malformed,
+    Value(&'a str),
+}
+
+fn single_string_option<'a>(data: &'a CommandData, name: &str) -> SingleOption<'a> {
+    let mut matches = data.options.iter().filter(|option| option.name == name);
+    let Some(first) = matches.next() else {
+        return SingleOption::Missing;
+    };
+    if matches.next().is_some() {
+        return SingleOption::Malformed;
+    }
+    match &first.value {
+        CommandOptionValue::String(value) => SingleOption::Value(value.as_str()),
+        _ => SingleOption::Malformed,
+    }
+}
+
+#[cfg(test)]
+mod inspect_regressions {
+    use super::*;
+    use crate::test_wire::{MockRest, ScriptedResponse};
+    use serde_json::{json, Value};
+    use two_bot_core::RouterGates;
+    use two_bot_testsupport::TestDatabase;
+
+    const TOKEN: &str = "inspect-regression-fixture";
+
+    struct Fixture {
+        db: TestDatabase,
+        http: MockRest,
+        runtime: CustomCommandRuntime,
+    }
+
+    impl Fixture {
+        async fn new(name: &str, template: &str) -> Self {
+            let url =
+                std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+            let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+                .await
+                .expect("isolated migrated fixture");
+            store::put_command(
+                db.pool(),
+                &StoredCommand {
+                    guild_id: "2222".to_owned(),
+                    name: name.to_owned(),
+                    description: "Saved response".to_owned(),
+                    template: template.to_owned(),
+                    text_trigger: Some(format!("!{name}")),
+                    enabled: true,
+                },
+                "3333",
+                "3333",
+                "2026-10-01T00:00:00Z",
+                "2026-10-02T00:00:00Z",
+            )
+            .await
+            .expect("seed existing row without write-time validation");
+            let http = MockRest::with_responder(|request| match request.method.as_str() {
+                "POST" if request.path.ends_with("/callback") => ScriptedResponse::status(204),
+                "PATCH" if request.path.ends_with("/messages/@original") => {
+                    ScriptedResponse::json(200, json!({"id": "9000"}))
+                }
+                _ => ScriptedResponse::status(403),
+            })
+            .await;
+            let mut router = InteractionRouter::new(RouterGates {
+                configured_guild: Some(2222),
+                automations: true,
+                moderation: false,
+                voice: false,
+                voice_assistant: false,
+                scorecard: false,
+                announcements: false,
+                tickets: false,
+                self_roles: false,
+                onboarding_picker: false,
+                session_picker: false,
+            });
+            CustomCommandRuntime::register(&mut router);
+            let runtime = CustomCommandRuntime::new(
+                db.pool().clone(),
+                Arc::new(router),
+                ActionExecutor::with_proxy(TOKEN.to_owned(), Some(http.origin()))
+                    .expect("loopback executor"),
+                1111,
+            );
+            Self { db, http, runtime }
+        }
+
+        async fn definitions(&self) -> Vec<Value> {
+            sqlx::query_scalar(
+                "SELECT to_jsonb(c) FROM automation_commands c ORDER BY guild_id, name",
+            )
+            .fetch_all(self.db.pool())
+            .await
+            .expect("full definition snapshot")
+        }
+
+        async fn assert_read_only(&self, before: Vec<Value>) {
+            assert_eq!(self.definitions().await, before);
+            let facts: i64 = sqlx::query_scalar("SELECT count(*) FROM automation_audit_log")
+                .fetch_one(self.db.pool())
+                .await
+                .expect("execution and management facts");
+            assert_eq!(facts, 0);
+            assert!(self.runtime.published_commands().is_none());
+        }
+
+        async fn reply(&self, input: &Interaction, guild_name: Option<&str>) -> String {
+            let start = self.http.requests().len();
+            assert!(matches!(
+                self.runtime.handle_interaction(input, guild_name).await,
+                Ok(true)
+            ));
+            let requests = self.http.requests();
+            let requests = &requests[start..];
+            assert_eq!(
+                requests.len(),
+                2,
+                "one private defer and completion, no execution/registration"
+            );
+            assert_eq!(requests[0].method, "POST");
+            assert!(requests[0]
+                .path
+                .ends_with(&format!("/interactions/{}/{TOKEN}/callback", input.id)));
+            let defer: Value = serde_json::from_slice(&requests[0].body).expect("defer JSON");
+            assert_eq!(defer["type"], 5);
+            assert_eq!(defer["data"]["flags"].as_u64().expect("flags") & 64, 64);
+            assert_eq!(requests[1].method, "PATCH");
+            assert!(requests[1]
+                .path
+                .ends_with(&format!("/webhooks/1111/{TOKEN}/messages/@original")));
+            let edit: Value = serde_json::from_slice(&requests[1].body).expect("edit JSON");
+            for body in [&defer["data"], &edit] {
+                assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+                for key in ["users", "roles"] {
+                    assert!(
+                        body["allowed_mentions"][key].is_null()
+                            || body["allowed_mentions"][key] == json!([])
+                    );
+                }
+                assert_ne!(body["allowed_mentions"]["replied_user"], true);
+                assert!(body["embeds"].is_null() || body["embeds"] == json!([]));
+            }
+            let content = edit["content"].as_str().expect("private content");
+            assert!(!content.is_empty());
+            assert!(content.encode_utf16().count() <= 2000);
+            content.to_owned()
+        }
+
+        async fn close(self) {
+            self.http.shutdown().await;
+            self.db.close().await.expect("drop isolated fixture");
+        }
+    }
+
+    fn inspect(id: u64, name: &str, view: &str) -> Interaction {
+        serde_json::from_value(json!({
+            "id": id.to_string(), "application_id": "1111", "type": 2,
+            "token": TOKEN, "version": 1,
+            "guild_id": "2222", "channel": {"id": "4444", "type": 0},
+            "authorizing_integration_owners": {"0": "2222"}, "entitlements": [],
+            "member": {
+                "permissions": "32", "roles": [], "joined_at": null,
+                "deaf": false, "mute": false, "flags": 0,
+                "user": {"id": "3333", "username": "tester", "discriminator": "0000", "avatar": null}
+            },
+            "data": {"id": "5555", "name": "command-inspect", "type": 1, "options": [
+                {"name": "name", "type": 3, "value": name},
+                {"name": "view", "type": 3, "value": view}
+            ]}
+        })).expect("Twilight interaction fixture")
+    }
+
+    #[tokio::test]
+    async fn grandfathered_voice_name_remains_privately_inspectable_with_voice_off() {
+        let fixture = Fixture::new("setup", "Legacy {username}").await;
+        let before = fixture.definitions().await;
+        let summary = fixture
+            .reply(&inspect(6001, "SETUP", "summary"), Some("TWO"))
+            .await;
+        assert_eq!(summary, "Summary /setup\nDescription: Saved response\nStatus: Enabled\nText trigger: !setup\nSaved template: /command-inspect name:setup view:template\nPrivate preview: /command-inspect name:setup view:preview\nReplace the definition: /command name:setup template:...");
+        assert_eq!(
+            fixture
+                .reply(&inspect(6002, "setup", "template"), Some("TWO"))
+                .await,
+            "Saved template /setup\nLegacy {username}"
+        );
+        assert_eq!(
+            fixture
+                .reply(&inspect(6003, "setup", "preview"), Some("TWO"))
+                .await,
+            "Preview /setup\nLegacy tester"
+        );
+        fixture.assert_read_only(before).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_preview_context_refuses_privately_without_execution_effects() {
+        let fixture = Fixture::new("faq", "Hi {username}").await;
+        let before = fixture.definitions().await;
+        for missing in 0..3 {
+            let mut input = inspect(6100 + missing, "faq", "preview");
+            let mut guild_name = Some("TWO");
+            match missing {
+                0 => guild_name = None,
+                1 => input.channel = None,
+                _ => {
+                    input
+                        .member
+                        .as_mut()
+                        .expect("member permissions retained")
+                        .user = None;
+                    input.user = None;
+                }
+            }
+            assert_eq!(
+                fixture.reply(&input, guild_name).await,
+                "Preview for /faq is unavailable: command context is missing. Please try again."
+            );
+        }
+        fixture.assert_read_only(before).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn long_invalid_template_keeps_correction_on_the_private_wire() {
+        let fixture = Fixture::new("faq", &format!("{{{}}}", "a".repeat(1998))).await;
+        let before = fixture.definitions().await;
+        let reply = fixture
+            .reply(&inspect(6200, "faq", "preview"), Some("TWO"))
+            .await;
+        assert_eq!(reply.encode_utf16().count(), 2000);
+        assert!(reply.starts_with("Template for /faq is invalid: Unknown placeholder"));
+        assert!(reply.contains("…[truncated]"));
+        assert!(reply.ends_with(" Replace it with /command name:faq template:..."));
+        fixture.assert_read_only(before).await;
+        fixture.close().await;
+    }
 }

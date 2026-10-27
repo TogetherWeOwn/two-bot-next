@@ -2,7 +2,7 @@
 //! No transcript body is logged, audited, or returned in an interaction reply.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -39,6 +39,60 @@ const RECOVERY_ITEM_TIMEOUT: Duration = Duration::from_secs(20);
 const RECOVERY_ROWS_BUDGET: Duration = Duration::from_secs(180);
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(6);
 const PANEL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Base delay before a failed Open row becomes eligible for retry: one
+/// recovery cadence. Immediate recover/Ready bursts at the same clock reading
+/// must not replay a just-failed row.
+const OPEN_RETRY_BASE_BACKOFF: Duration = Duration::from_secs(RECOVERY_INTERVAL_SECONDS);
+/// Upper bound for the doubling backoff: a persistently failing row is
+/// re-attempted at least hourly, never more often than the base delay.
+const OPEN_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(3600);
+/// Retained failed Open rows per runtime. Beyond this bound a new failure is
+/// attempted once without gaining eligibility; the bound keeps the set finite
+/// instead of growing with the ticket table.
+const OPEN_RETRY_RETAINED_CAP: usize = 128;
+/// Eligible Open retries attempted per recovery pass, after the forward scan
+/// and inside the same row budget, so new rows and the panel slot keep their
+/// existing priority.
+const OPEN_RETRY_PER_PASS_CAP: usize = 64;
+
+/// Doubling backoff for the nth consecutive Open failure (0-based): 300 s,
+/// 600 s, 1200 s, 2400 s, then the hourly cap. Every failure stays eligible
+/// within twelve five-minute passes.
+fn open_retry_backoff(attempts: u32) -> Duration {
+    let shift = attempts.min(4);
+    Duration::from_secs(
+        (OPEN_RETRY_BASE_BACKOFF.as_secs() << shift).min(OPEN_RETRY_MAX_BACKOFF.as_secs()),
+    )
+}
+
+/// In-memory retry eligibility for one failed Open row. The durable row,
+/// re-read on every attempt, remains truth: status, channel and receipt are
+/// revalidated before any Discord mutation, and terminal or removed rows shed
+/// their entry without I/O. `eligible_at` rides the Tokio clock so paused
+/// test time advances eligibility exactly like production time.
+struct OpenRetryEntry {
+    eligible_at: Instant,
+    attempts: u32,
+}
+
+/// Fixed-vocabulary cause for the `ticket open retry` diagnostics. Store
+/// failures reuse the shared `db_cause` class, Discord failures reuse the
+/// executor's `cause()`, and selection/interruption use local tokens; no arm
+/// carries remote text, topics, message content or member names.
+fn open_retry_reason(error: &Failure) -> &'static str {
+    match error {
+        Failure::Store(StoreError::Database(error)) => two_bot_core::error_chain::db_cause(error),
+        Failure::Store(_) => "store_error",
+        Failure::Rest(error) => error.cause(),
+        Failure::InvalidEvidence => "invalid_evidence",
+        Failure::Timeout => "timeout",
+        Failure::LaneBusy => "lane_busy",
+        Failure::NoTicket => "no_ticket",
+        Failure::TicketClaimedBy(_) => "already_claimed",
+        Failure::TicketNotOpen => "not_open",
+    }
+}
 
 /// Concurrently admitted ticket component executions per runtime. Admission
 /// is non-waiting and happens before spawning: beyond this bound (or the
@@ -395,6 +449,14 @@ pub(crate) struct TicketRuntime {
     lane: Mutex<()>,
     purge_lane: Mutex<()>,
     recovery_cursor: TaskMutex<Option<(i64, String)>>,
+    /// Failed Open rows awaiting a later eligible pass. Forward progress
+    /// never rewinds for these: the cursor keeps advancing past them, and a
+    /// bounded retry phase re-attempts the due ones after each forward scan.
+    /// Inserted before the row's work is awaited so scope cancellation and
+    /// per-item timeouts retain eligibility; removed on success and on
+    /// terminal or removed rows. Like the cursor, this set is in-memory: a
+    /// restart re-attempts every row through the normal forward scan.
+    open_retries: TaskMutex<BTreeMap<String, OpenRetryEntry>>,
     ready: watch::Sender<u64>,
     started: AtomicBool,
     stopping: AtomicBool,
@@ -524,6 +586,121 @@ fn prune_finished(tasks: &mut JoinSet<()>) {
     }
 }
 
+/// Back one retry entry off after a failed attempt: eligibility moves out by
+/// the current step, then the step advances. Saturates instead of wrapping.
+fn backoff_entry(entry: &mut OpenRetryEntry) {
+    entry.eligible_at = Instant::now() + open_retry_backoff(entry.attempts);
+    entry.attempts = entry.attempts.saturating_add(1);
+}
+
+/// Cancellation-safe retry bookkeeping for one Open row attempt. The entry is
+/// inserted on creation (before any await), so a scope cancellation or a
+/// per-item timeout that drops the future keeps the row eligible; `settle`
+/// records the explicit outcome, and `Drop` retains only when the attempt
+/// never settled. Non-Open rows never enter: their behind-cursor workflows
+/// already re-attempt through the forward scan.
+struct OpenRetryGuard<'a> {
+    runtime: &'a TicketRuntime,
+    ticket_id: String,
+    preexisting: bool,
+    settled: bool,
+}
+
+impl<'a> OpenRetryGuard<'a> {
+    fn enter(runtime: &'a TicketRuntime, ticket: &Ticket) -> Option<Self> {
+        if ticket.status != TicketStatus::Open {
+            return None;
+        }
+        let mut retries = runtime.open_retries.lock().expect("ticket open retry set");
+        let preexisting = retries.contains_key(&ticket.id);
+        if !preexisting {
+            if retries.len() >= OPEN_RETRY_RETAINED_CAP {
+                // At capacity: the attempt proceeds once without eligibility.
+                return None;
+            }
+            retries.insert(
+                ticket.id.clone(),
+                OpenRetryEntry {
+                    eligible_at: Instant::now() + open_retry_backoff(0),
+                    attempts: 0,
+                },
+            );
+        }
+        Some(Self {
+            runtime,
+            ticket_id: ticket.id.clone(),
+            preexisting,
+            settled: false,
+        })
+    }
+
+    /// Record the attempt's explicit outcome: success removes the entry (a
+    /// repaired retained row reports once; a first-pass success stays
+    /// silent), failure backs the entry off with its reason code.
+    fn settle(mut self, result: &Result<()>) {
+        self.settled = true;
+        let mut retries = self
+            .runtime
+            .open_retries
+            .lock()
+            .expect("ticket open retry set");
+        match result {
+            Ok(()) => {
+                retries.remove(&self.ticket_id);
+                if self.preexisting {
+                    tracing::info!(
+                        ticket_id = %self.ticket_id,
+                        retryable = false,
+                        reason = %"retry_succeeded",
+                        outcome = %"repaired",
+                        next_action = %"none",
+                        "ticket open retry repaired"
+                    );
+                }
+            }
+            Err(error) => {
+                let reason = open_retry_reason(error);
+                if let Some(entry) = retries.get_mut(&self.ticket_id) {
+                    backoff_entry(entry);
+                }
+                tracing::warn!(
+                    ticket_id = %self.ticket_id,
+                    retryable = true,
+                    reason = %reason,
+                    outcome = %"deferred",
+                    next_action = %"await_retry",
+                    "ticket open retry deferred"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for OpenRetryGuard<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // The attempt was cancelled or timed out mid-flight: retain
+        // eligibility with the same backoff step an explicit failure would
+        // take. Never panic here: a poisoned set keeps the speculative entry
+        // that `enter` inserted, which is itself a valid deferral.
+        if let Ok(mut retries) = self.runtime.open_retries.lock() {
+            if let Some(entry) = retries.get_mut(&self.ticket_id) {
+                backoff_entry(entry);
+            }
+        }
+        tracing::warn!(
+            ticket_id = %self.ticket_id,
+            retryable = true,
+            reason = %"interrupted",
+            outcome = %"deferred",
+            next_action = %"await_retry",
+            "ticket open retry deferred"
+        );
+    }
+}
+
 impl TicketRuntime {
     pub fn new(
         pool: PgPool,
@@ -541,6 +718,7 @@ impl TicketRuntime {
             lane: Mutex::new(()),
             purge_lane: Mutex::new(()),
             recovery_cursor: TaskMutex::new(None),
+            open_retries: TaskMutex::new(BTreeMap::new()),
             ready: watch::channel(0).0,
             started: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -1255,6 +1433,11 @@ impl TicketRuntime {
             self.store.recoverable().await.map_err(Failure::from)
         })
         .await;
+        // The retry phase shares this row envelope: captured here so it matches
+        // the deadline the forward batch computes internally. `recovery_batch`
+        // keeps its signature because cursor/budget seam tests call it
+        // directly; retries never extend row work past the existing budget.
+        let rows_deadline = Instant::now() + RECOVERY_ROWS_BUDGET;
         let mut failed = match tickets {
             Ok(tickets) => {
                 recovery_batch(&self.recovery_cursor, tickets, |ticket| async move {
@@ -1264,12 +1447,150 @@ impl TicketRuntime {
             }
             Err(error) => Some(error.class()),
         };
+        // Due Open retries run after the forward scan, so new rows keep their
+        // priority; the retry phase re-reads every row and sheds terminal or
+        // removed entries without Discord I/O.
+        if let Some(class) = self.retry_open_rows(rows_deadline).await {
+            failed = Some(class);
+        }
         // Rows consume at most 180s, leaving a separate bounded panel slot
         // inside the 240s supervisor budget, even with a permanent slow prefix.
         if let Err(error) = bounded(PANEL_TIMEOUT, self.ensure_panel()).await {
             failed = Some(error.class());
         }
         failed.map_or(Ok(()), Err)
+    }
+
+    /// Re-attempt due Open retries after the forward scan, inside the same row
+    /// budget. Eligible entries are tried oldest-due first up to
+    /// [`OPEN_RETRY_PER_PASS_CAP`]; each attempt re-reads its row, so
+    /// terminal or removed rows shed their entry without Discord I/O, and the
+    /// forward cursor is never touched: retries neither advance nor rewind
+    /// progress. Successful unchanged Open rows are never retained, so they
+    /// stay zero-work here exactly as in the forward scan.
+    async fn retry_open_rows(&self, rows_deadline: Instant) -> Option<ErrorClass> {
+        let due: Vec<String> = {
+            let retries = self.open_retries.lock().expect("ticket open retry set");
+            let now = Instant::now();
+            let mut due: Vec<(&String, &OpenRetryEntry)> = retries
+                .iter()
+                .filter(|(_, entry)| entry.eligible_at <= now)
+                .collect();
+            due.sort_by(|a, b| (a.1.eligible_at, a.0).cmp(&(b.1.eligible_at, b.0)));
+            due.into_iter()
+                .take(OPEN_RETRY_PER_PASS_CAP)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut failed = None;
+        let total = due.len();
+        for (index, ticket_id) in due.into_iter().enumerate() {
+            let remaining = rows_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let dropped = total - index;
+                tracing::warn!(dropped, "ticket open retry budget exhausted");
+                break;
+            }
+            // The re-read is bounded by the row's item timeout: an unbounded
+            // pool wait here could otherwise push row work past the shared
+            // envelope and starve the panel slot.
+            let fresh = tokio::time::timeout(
+                remaining.min(RECOVERY_ITEM_TIMEOUT),
+                self.store.get(&ticket_id),
+            )
+            .await;
+            let ticket = match fresh {
+                Ok(Ok(Some(ticket))) if ticket.status == TicketStatus::Open => ticket,
+                Ok(Ok(Some(_))) => {
+                    self.shed_open_retry(&ticket_id, "status_changed");
+                    continue;
+                }
+                Ok(Ok(None)) => {
+                    self.shed_open_retry(&ticket_id, "missing_row");
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    // A sick store defers without attempting: no Discord I/O.
+                    let failure = Failure::from(error);
+                    self.defer_open_retry_read(&ticket_id, &failure);
+                    failed = Some(failure.class());
+                    continue;
+                }
+                Err(_) => {
+                    // A stalled re-read defers like a sick store.
+                    let failure = Failure::Timeout;
+                    self.defer_open_retry_read(&ticket_id, &failure);
+                    failed = Some(failure.class());
+                    continue;
+                }
+            };
+            // Size the attempt from a fresh reading: the re-read above already
+            // spent part of this row's share of the envelope.
+            let remaining = rows_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let dropped = total - index;
+                tracing::warn!(dropped, "ticket open retry budget exhausted");
+                break;
+            }
+            // The timeout arm drops the attempt future, so the guard retains
+            // the entry and reports `interrupted`; only the pass outcome is
+            // recorded here. The guard reports explicit outcomes from inside
+            // the attempt.
+            match tokio::time::timeout(
+                remaining.min(RECOVERY_ITEM_TIMEOUT),
+                self.recover_ticket_traced(&ticket),
+            )
+            .await
+            {
+                Ok((result, _)) => {
+                    if let Err(error) = result {
+                        failed = Some(error.class());
+                    }
+                }
+                Err(_) => {
+                    failed = Some(ErrorClass::Timeout);
+                }
+            }
+        }
+        failed
+    }
+
+    /// Defer one retry entry after its re-read failed or stalled: back the
+    /// entry off and report one deferred line. The row is not attempted, so
+    /// no Discord I/O happens on a sick or slow store.
+    fn defer_open_retry_read(&self, ticket_id: &str, failure: &Failure) {
+        let reason = open_retry_reason(failure);
+        if let Ok(mut retries) = self.open_retries.lock() {
+            if let Some(entry) = retries.get_mut(ticket_id) {
+                backoff_entry(entry);
+            }
+        }
+        tracing::warn!(
+            ticket_id = %ticket_id,
+            retryable = true,
+            reason = %reason,
+            outcome = %"deferred",
+            next_action = %"await_retry",
+            "ticket open retry deferred"
+        );
+    }
+
+    /// Drop one retry entry whose row can no longer be repaired: it left Open
+    /// (`status_changed`) or it is gone (`missing_row`). Exactly one line per
+    /// shed entry; the row's forward handling (if any) is unaffected.
+    fn shed_open_retry(&self, ticket_id: &str, reason: &'static str) {
+        self.open_retries
+            .lock()
+            .expect("ticket open retry set")
+            .remove(ticket_id);
+        tracing::info!(
+            ticket_id = %ticket_id,
+            retryable = false,
+            reason = %reason,
+            outcome = %"cancelled",
+            next_action = %"none",
+            "ticket open retry cancelled"
+        );
     }
 
     // Test-only shim over the traced recovery: the ticket acceptance suites
@@ -1285,13 +1606,26 @@ impl TicketRuntime {
     /// that failed. The token is `None` when selection itself failed (the
     /// transcript probe) or selected no action.
     async fn recover_ticket_traced(&self, ticket: &Ticket) -> (Result<()>, Option<&'static str>) {
+        // Entered before the probe: a probe failure, a later Discord
+        // failure, and a mid-flight cancellation or timeout all retain Open
+        // retry eligibility for a later eligible pass.
+        let retry = OpenRetryGuard::enter(self, ticket);
         let saved = match self.store.transcript_exists(&ticket.id).await {
             Ok(saved) => saved,
-            Err(error) => return (Err(error.into()), None),
+            Err(error) => {
+                let result: Result<()> = Err(error.into());
+                if let Some(retry) = retry {
+                    retry.settle(&result);
+                }
+                return (result, None);
+            }
         };
         let action = recovery_action(ticket, now_millis_for_test(), saved);
         let attempted = recovery_action_token(&action);
         let result = self.run_recovery_action(ticket, action).await;
+        if let Some(retry) = retry {
+            retry.settle(&result);
+        }
         (result, attempted)
     }
 
@@ -1425,22 +1759,30 @@ impl TicketRuntime {
             .executor
             .fetch_channel_messages(channel, None, 50)
             .await?;
-        let panels = panels(messages)?;
+        let (panels, isolated) = panels_with_isolation(messages)?;
         let bot = self.bot_id()?;
-        if !panels.iter().any(|message| {
+        let attached = panels.iter().any(|message| {
             message.author_id == bot
                 && message.custom_ids.iter().any(|id| id == TICKET_CLAIM_ID)
                 && message.custom_ids.iter().any(|id| id == TICKET_CLOSE_ID)
-        }) {
-            self.executor
-                .post_ticket_message(
-                    channel,
-                    TicketMessage::Controls {
-                        opener_id: &ticket.opener_id,
-                    },
-                )
-                .await?;
+        });
+        if attached {
+            return Ok(());
         }
+        if isolated > 0 {
+            // Uncertain evidence cannot prove absence: a malformed message
+            // may hide the controls, so refuse instead of posting a possible
+            // duplicate. A later eligible pass re-reads the full history.
+            return Err(Failure::InvalidEvidence);
+        }
+        self.executor
+            .post_ticket_message(
+                channel,
+                TicketMessage::Controls {
+                    opener_id: &ticket.opener_id,
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -1458,7 +1800,13 @@ impl TicketRuntime {
             .executor
             .fetch_channel_messages(&config.panel_channel_id, None, 50)
             .await?;
-        if panel_needed(&self.bot_id()?, &panels(messages)?) {
+        let (panels, isolated) = panels_with_isolation(messages)?;
+        if panel_needed(&self.bot_id()?, &panels) {
+            // A malformed row may hide an existing panel. Preserve found-first
+            // handling, but never treat uncertain history as proof of absence.
+            if isolated > 0 {
+                return Err(Failure::InvalidEvidence);
+            }
             self.executor
                 .post_ticket_message(&config.panel_channel_id, TicketMessage::Panel)
                 .await?;
@@ -1574,7 +1922,16 @@ fn parse_panel_message(message: &Value) -> Option<(PanelMessage, bool)> {
     ))
 }
 
+#[cfg(test)]
 fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
+    panels_with_isolation(messages).map(|(panels, _)| panels)
+}
+
+/// Parse one history batch into panel rows, reporting how many messages were
+/// isolated (skipped as malformed or truncated over the id bound). Callers
+/// that would POST on absence must treat `isolated > 0` without a found
+/// panel as uncertain evidence, never as proof of absence.
+fn panels_with_isolation(messages: Vec<Value>) -> Result<(Vec<PanelMessage>, u64)> {
     let mut out = Vec::with_capacity(messages.len());
     let mut skipped = 0_u64;
     for message in &messages {
@@ -1594,7 +1951,7 @@ fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
         PANEL_ISOLATED_ROWS.fetch_add(skipped, Ordering::Relaxed);
         tracing::debug!(skipped, "ticket panel messages isolated");
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 #[cfg(test)]

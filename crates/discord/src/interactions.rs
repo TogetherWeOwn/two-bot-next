@@ -276,6 +276,36 @@ impl InteractionRuntime {
         .await
     }
 
+    /// True when this interaction can reach RSVP admission: the same
+    /// application-identity, resolvability and RSVP-name checks [`Self::prepare`]
+    /// applies before any callback or store work. The gateway calls this
+    /// before acquiring an RSVP permit, so non-RSVP interactions never
+    /// consume RSVP permits or pollute the refusal counter. Keep the
+    /// early-outs identical to `prepare`: a `false` here must imply
+    /// `prepare` would return `ignored()`.
+    #[must_use]
+    pub fn is_rsvp_candidate(&self, interaction: &Interaction) -> bool {
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return false;
+        }
+        let Some(resolved) = self
+            .executor
+            .command_identities()
+            .resolve_interaction(interaction)
+        else {
+            return false;
+        };
+        let RoutedInteraction::Slash { name, .. } =
+            route_interaction(&self.router, resolved.as_ref(), None)
+        else {
+            return false;
+        };
+        crate::rsvp::is_rsvp_command(name.as_str())
+    }
+
     pub async fn prepare(
         &self,
         interaction: Interaction,

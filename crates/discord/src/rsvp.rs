@@ -301,10 +301,40 @@ async fn execute(
             // Legacy totals read persisted responses even after cancellation or
             // deletion; only an RSVP mutation requires live-event validation.
             if handler == HandlerId::RsvpAttendance {
+                let actor_id = interaction
+                    .author_id()
+                    .ok_or("Missing command member.")?
+                    .to_string();
                 let rows = list_rsvps(pool, &guild_id, &event_id)
                     .await
                     .map_err(|_| "Unable to read RSVP totals.")?;
-                return Ok(attendance_totals_text(&partition_rsvps(&rows)));
+                // Reuse the same guild/event snapshot as the totals: no extra
+                // query, live lookup, write or write-budget admission.
+                let personal = match rows.iter().find(|row| {
+                    row.guild_id == guild_id && row.event_id == event_id && row.user_id == actor_id
+                }) {
+                    Some(row) => {
+                        let saved_at = time::OffsetDateTime::parse(
+                            &row.responded_at,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .map_err(|_| "Unable to read RSVP totals.")?;
+                        let status = match row.status {
+                            RsvpStatus::Going => "Going",
+                            RsvpStatus::Interested => "Interested",
+                            RsvpStatus::Declined => "Declined",
+                        };
+                        format!(
+                            "Your saved response: {status}\nSaved: <t:{}:f>",
+                            saved_at.unix_timestamp()
+                        )
+                    }
+                    None => "You have no saved response for this event.".to_owned(),
+                };
+                return Ok(format!(
+                    "Stored RSVPs for event `{event_id}`\n{}\n{personal}\nHistorical saved responses; live event availability is not checked.",
+                    attendance_totals_text(&partition_rsvps(&rows))
+                ));
             }
             let status = RsvpStatus::parse(string_option("status")?).map_err(|e| e.to_string())?;
             let actor_id = interaction

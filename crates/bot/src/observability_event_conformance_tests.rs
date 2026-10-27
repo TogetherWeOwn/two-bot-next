@@ -526,8 +526,9 @@ fn voice_event_values_are_bounded_by_the_catalog() {
 /// disk at test time instead of via `include_str!`: a missing file must fail
 /// this one test, not break compilation of the whole suite. Once the file
 /// is permanent, fold it into `SCOPED_SOURCES` and drop the disk read.
-const EVENTSUB_RS_EVENTS: [&str; 5] = [
+const EVENTSUB_RS_EVENTS: [&str; 6] = [
     "eventsub delivery refused",
+    "eventsub delivery classification failed",
     "challenge answered",
     "notification acknowledged",
     "revocation acknowledged",

@@ -366,6 +366,11 @@
       "table": "admin_api_tokens",
       "column": "issued_by",
       "reason": "Operator attribution for admin API token issuance: names the issuing operator, never a guild member. Retained like member_erasure_audit.actor; guild-local member erasure must never rewrite credential issuance accountability."
+    },
+    {
+      "table": "admin_api_tokens",
+      "column": "holder_id",
+      "reason": "Named human or AI credential principal, potentially identifying a member, retained as credential authority independently of guild activity. Guild-local member erasure must not rewrite holders or silently alter cross-guild grants; revocation and credential retention require a separate authorized operator action. No holder is inferred from an erased subject."
     }
   ]
 }

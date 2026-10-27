@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 51.
+Built-in commands: 52.
 
 ## `/access`
 
@@ -93,6 +93,19 @@ Define or replace a custom command
 | `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
 | `description` | string | false | — | — | 100 | — | Shown in the command picker |
 | `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
+
+## `/command-inspect`
+
+Inspect or privately preview a saved custom command
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+| `view` | string | false | — | — | — | Summary = `"summary"`; Saved template = `"template"`; Preview = `"preview"` | Private view (summary by default) |
+| `arguments` | string | false | — | — | 500 | — | Sample invocation arguments (ignored by current templates) |
 
 ## `/command-list`
 
@@ -433,7 +446,7 @@ RSVP to a Discord scheduled event
 
 ## `/rsvp-attendance`
 
-Show RSVP totals for a scheduled event
+Show RSVP totals and your saved response for an event
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false

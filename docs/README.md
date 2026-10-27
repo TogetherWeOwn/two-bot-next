@@ -23,6 +23,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
 - [Read-only MCP tools](mcp.md)
+- [Admin token registry contract](admin-registry.md)
 
 ## Operations and observability
 

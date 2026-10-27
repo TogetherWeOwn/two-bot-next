@@ -2058,15 +2058,10 @@ mod tests {
         }
     }
 
-    /// Serialises the fixture write-and-spawn window of the bounded
-    /// upload-helper tests. `write_upload_fixture` leaves the script open
-    /// for writing while a sibling test on another thread forks; the forked
-    /// child inherits the write fd until its own exec, so exec of the fresh
-    /// script fails with ETXTBSY and the helper reports a spurious
-    /// `SpawnFailed`. Holding this guard from the fixture write through
-    /// `run_upload_command` keeps those windows disjoint. The mutex is
-    /// async-aware (`tokio::sync`) so holding the guard across `.await` is
-    /// allowed and does not block the executor.
+    /// Serialises the bounded upload-helper fixtures. Other suites can
+    /// still fork while a script is open for writing, so these tests run
+    /// scripts through `/bin/sh` rather than exec the freshly written file:
+    /// an inherited write fd must not cause a spurious ETXTBSY spawn failure.
     #[cfg(unix)]
     static UPLOAD_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -2094,6 +2089,13 @@ mod tests {
             UPLOAD_SECRET_MARKER.to_owned(),
             file.to_owned(),
         ]
+    }
+
+    #[cfg(unix)]
+    fn upload_fixture_argv(helper: &std::path::Path, file: &str) -> Vec<String> {
+        let mut args = vec![helper.to_string_lossy().into_owned()];
+        args.extend(secret_argv(file));
+        args
     }
 
     #[test]
@@ -2151,8 +2153,8 @@ mod tests {
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 0\n",
         );
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -2180,9 +2182,14 @@ mod tests {
             "upload-fail.sh",
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 3\n",
         );
+        // Model a writable fd inherited by an unrelated concurrent child.
+        let _writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&helper)
+            .unwrap();
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -2273,8 +2280,8 @@ mod tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             super::run_upload_command(
-                &helper.to_string_lossy(),
-                &secret_argv("archive.ndjson.gz"),
+                "/bin/sh",
+                &upload_fixture_argv(&helper, "archive.ndjson.gz"),
                 std::time::Duration::from_millis(300),
             ),
         )

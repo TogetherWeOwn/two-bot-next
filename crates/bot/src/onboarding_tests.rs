@@ -261,6 +261,55 @@ fn runtime(pool: &PgPool, mock: &MockRest, vars: &HashMap<String, String>) -> On
     OnboardingRuntime::new(pool.clone(), executor, vars, 22, 999).unwrap()
 }
 
+use crate::hotpath_settings_test_support as hotpath_scope;
+
+#[tokio::test]
+async fn onboarding_runtime_hotpath_config_materializes_only_its_guild() {
+    use hotpath_scope::queries::Queries;
+    let db = hotpath_scope::database("TWO_ONBOARDING_DRY_RUN").await;
+    let store = SettingsStore::new(db.pool());
+    // Stored dry-run uses the runtime's canonical string values, not bools.
+    store
+        .set("22", "TWO_ONBOARDING_DRY_RUN", Some(json!("0")), "fixture")
+        .await
+        .unwrap();
+    for index in 0..30 {
+        store
+            .set(
+                &format!("{}", 300 + index),
+                "TWO_ONBOARDING_DRY_RUN",
+                Some(json!("1")),
+                "fixture",
+            )
+            .await
+            .unwrap();
+    }
+    let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+    let runtime = runtime(db.pool(), &mock, &vars("legacy", false));
+    let (first, reads) = Queries::capture(runtime.handle(welcome(44), NOW)).await;
+    first.unwrap();
+    hotpath_scope::assert_reads(&reads, Some(2), false);
+    assert_eq!(
+        posts(&mock).len(),
+        1,
+        "foreign dry-run overrides cannot suppress this guild's welcome"
+    );
+    assert_eq!(posts(&mock)[0].path, "/api/v10/channels/12/messages");
+    store
+        .set("22", "TWO_ONBOARDING_DRY_RUN", Some(json!("1")), "fixture")
+        .await
+        .unwrap();
+    let (next, reads) = Queries::capture(runtime.handle(welcome(45), NOW + 1)).await;
+    next.unwrap();
+    hotpath_scope::assert_reads(&reads, Some(2), false);
+    assert_eq!(
+        posts(&mock).len(),
+        1,
+        "actual config reload applies the target guild's update"
+    );
+    db.close().await.unwrap();
+}
+
 fn welcome(member_id: u64) -> OnboardingJob {
     OnboardingJob::Welcome {
         guild_id: 22,

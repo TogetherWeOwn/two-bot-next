@@ -276,7 +276,7 @@ impl OnboardingRuntime {
     async fn config(&self) -> Result<OnboardingConfig, RuntimeError> {
         let snapshot = tokio::time::timeout(
             Duration::from_millis(1500),
-            SettingsStore::new(&self.pool).load_snapshot(),
+            SettingsStore::new(&self.pool).load_guild_snapshot(&self.guild_id.to_string()),
         )
         .await
         .map_err(|_| RuntimeError::Settings)?

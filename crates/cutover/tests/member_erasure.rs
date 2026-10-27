@@ -82,6 +82,110 @@ async fn migrated_schema_requires_every_member_column_and_detects_a_new_migratio
 }
 
 #[tokio::test]
+async fn holder_id_only_fixture_refuses_both_modes_without_data_or_audit_changes() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO admin_api_tokens
+         (token_id, secret_hash, scopes, guild_ids, issued_at, expires_at, holder_id, holder_kind)
+         VALUES ('adm_0000000000000001', repeat('0', 64), '{read}', ARRAY[1545644954272137297]::bigint[],
+                 '2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z', $1, 'human')",
+    )
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert!(schema_gaps(&mut conn).await.unwrap().is_empty());
+    drop(conn);
+    let counts = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    assert!(counts.iter().any(|count| count.rows > 0));
+    assert_eq!(audit_count(db.pool()).await, 0);
+    sqlx::query(
+        "INSERT INTO member_erasure_audit (actor, erased_at)
+         VALUES ('fixture-prior-receipt', '2026-10-01T00:00:00Z')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // No other identity alias or unsettled replay guard can mask holder_id.
+    sqlx::query(
+        "CREATE TABLE privacy_holder_tripwire (guild_id TEXT, holder_id TEXT, payload TEXT)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO privacy_holder_tripwire VALUES ($1, $2, 'must survive refusal')")
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert_eq!(
+        schema_gaps(&mut conn).await.unwrap(),
+        vec!["uncovered identity: privacy_holder_tripwire.holder_id".to_owned()]
+    );
+    drop(conn);
+    let mut before = Vec::new();
+    for table in plan()
+        .tables
+        .iter()
+        .map(|entry| entry.table.as_str())
+        .chain([
+            "privacy_holder_tripwire",
+            "admin_api_tokens",
+            "member_erasure_audit",
+        ])
+    {
+        before.push((table.to_owned(), snapshot(db.pool(), table).await));
+    }
+    for mode in [ErasureMode::DryRun, ErasureMode::Execute { actor: ACTOR }] {
+        let error = erase_member(db.pool(), GUILD, USER, mode)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, sqlx::Error::InvalidArgument(ref message)
+                if message == "erasure schema coverage incomplete"),
+            "the holder-only schema gap must be the refusal reason: {error}"
+        );
+        for (table, rows) in &before {
+            assert_eq!(snapshot(db.pool(), table).await, *rows, "{table} changed");
+        }
+        assert_eq!(audit_count(db.pool()).await, 1);
+    }
+    sqlx::query("DROP TABLE privacy_holder_tripwire")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert!(schema_gaps(&mut conn).await.unwrap().is_empty());
+    drop(conn);
+    assert_eq!(
+        erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+            .await
+            .unwrap(),
+        counts
+    );
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR }
+        )
+        .await
+        .unwrap(),
+        counts
+    );
+    assert_eq!(snapshot(db.pool(), "admin_api_tokens").await.len(), 1);
+    assert_eq!(audit_count(db.pool()).await, 2);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
     let Some(db) = database().await else { return };
     seed(db.pool()).await;

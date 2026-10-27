@@ -355,13 +355,14 @@ VALUES (79, '100000000000000001', 'TWO_STICKY_ENABLED', NULL,
 -- acceptance suite, not the backup roundtrip.
 INSERT INTO admin_api_tokens
     (token_id, secret_hash, scopes, guild_ids, label, issued_by,
-     issued_at, expires_at, revoked_at, last_used_at)
+     holder_id, holder_kind, issued_at, expires_at, revoked_at, last_used_at)
 VALUES ('adm_1000000000000001', repeat(md5('backup:admin-api-tokens:1'), 2),
         '{read}', '{100000000000000001}', 'backup reader', 'backup operator',
+        'fixture-human-reader', 'human',
         '2026-08-01T10:00:00Z', '2026-10-30T10:00:00Z', NULL, NULL),
        ('adm_1000000000000002', repeat(md5('backup:admin-api-tokens:2'), 2),
         '{read,moderate}', '{100000000000000001,100000000000000002}',
-        'backup moderator', 'backup operator',
+        'backup moderator', 'backup operator', 'fixture-ai-moderator', 'ai_agent',
         '2026-08-01T10:00:00Z', '2026-10-30T10:00:00Z',
         '2026-08-15T10:00:00Z', '2026-08-02T10:00:00Z');
 INSERT INTO audit_kill_switch (id, engaged_at, engaged_by)

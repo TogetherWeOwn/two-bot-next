@@ -15,7 +15,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -7610,6 +7610,162 @@ pub trait VoiceEventSink: Send + Sync {
 struct GuildActor {
     live: LiveGuild,
     tx: mpsc::UnboundedSender<ActorCommand>,
+    backpressure: ActorInboxBackpressure,
+}
+
+/// Cap on outstanding fire-and-forget inbox entries per guild actor. Past
+/// the cap [`GuildActor::try_send_command`] refuses (never blocks or
+/// evicts) and counts the drop; the actor loop releases one permit per
+/// received bufferable command, so a draining actor never wedges.
+/// Reply-bearing commands bypass the gate: dropping a reply would hang its
+/// caller, while fire-and-forget state reconverges on the next frame, with
+/// exceptions: a refused ticketed `Join` drops its ticket, and only a
+/// fresh channel transition re-tickets, so the member rejoins to get a room;
+/// and control-plane updates bypass losslessly — saved creation-policy and
+/// naming-settings switches, plus the startup display-name seed batch — so
+/// a saved switch never leaves the worker on the previous state past the cap.
+const VOICE_ACTOR_INBOX_CAP: usize = 256;
+
+/// Backpressure ledger for one guild actor's inbox
+/// ([`VOICE_ACTOR_INBOX_CAP`]). Cloned into the actor task: every gated
+/// send consumes one permit and every receive of a bufferable command
+/// releases one, so the in-flight count is the live inbox depth.
+/// Reply-bearing traffic never touches the ledger (see
+/// [`ActorCommand::is_bufferable`]), which keeps the acquire/release
+/// pairing exact: every gated bufferable send goes through
+/// [`GuildActor::try_send_command`], and the rare lossless control-plane
+/// sends claim an uncounted slot up front (see
+/// [`GuildActor::send_command_lossless`]), so every bufferable receive
+/// releases exactly one held slot.
+#[derive(Debug, Clone, Default)]
+struct ActorInboxBackpressure {
+    in_flight: Arc<AtomicUsize>,
+    overflow_dropped: Arc<AtomicU64>,
+}
+
+impl ActorInboxBackpressure {
+    /// Admit one fire-and-forget command, or refuse at capacity. A refusal
+    /// rolls its optimistic increment back immediately and counts the drop;
+    /// the caller must not touch the channel afterwards.
+    fn try_acquire(&self) -> bool {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= VOICE_ACTOR_INBOX_CAP {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.overflow_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics::global().voice_inbox_overflow_dropped();
+            return false;
+        }
+        true
+    }
+
+    /// Claim a slot that can never refuse, for bufferable lossless sends:
+    /// the send cannot fail closed, so the slot is held without consulting
+    /// the cap and without counting. Reception still releases it, which
+    /// keeps the acquire/release pairing exact (a lossless send that never
+    /// acquired would let its receive spend a gated send's slot and admit
+    /// past the cap over the actor's lifetime).
+    fn acquire_unchecked(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Release the permit a received command consumed. Only bufferable
+    /// commands consume permits, so only they release: reply-bearing
+    /// receives must not inflate capacity. Saturating: a receive must
+    /// never drive the count negative (which would wedge the gate shut);
+    /// every production send acquires first, so saturation only engages
+    /// for test-only direct sends.
+    fn release_for(&self, command: &ActorCommand) {
+        if command.is_bufferable() {
+            let _ = self
+                .in_flight
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |in_flight| {
+                    in_flight.checked_sub(1)
+                });
+        }
+    }
+
+    /// Roll back an acquisition whose channel send failed (actor gone):
+    /// not an overflow, so the counter stays untouched.
+    fn rollback(&self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Outstanding gated entries: the live inbox depth.
+    fn depth(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Lifetime refused sends. Monotonic per actor.
+    fn dropped(&self) -> u64 {
+        self.overflow_dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl GuildActor {
+    /// Send a command unless the inbox already holds
+    /// [`VOICE_ACTOR_INBOX_CAP`] outstanding fire-and-forget entries, in
+    /// which case the command is refused (`false`) and counted by
+    /// [`Self::inbox_overflow_dropped`]. A refusal touches no channel.
+    /// Reply-bearing commands bypass the gate and are never refused: a
+    /// dropped reply would hang its caller.
+    fn try_send_command(&self, command: ActorCommand) -> bool {
+        if !command.is_bufferable() {
+            return self.tx.send(command).is_ok();
+        }
+        if !self.backpressure.try_acquire() {
+            return false;
+        }
+        if self.tx.send(command).is_ok() {
+            true
+        } else {
+            self.backpressure.rollback();
+            false
+        }
+    }
+
+    /// Deliver a control-plane command past the inbox gate. The channel is
+    /// unbounded, so this only fails when the actor is gone; it never blocks
+    /// and never counts a refusal. Saved creation-policy and naming-settings
+    /// updates use this: a refused `AccessChanged` would leave the worker
+    /// enforcing the previous policy after the administrator already saw
+    /// "Saved", and a refused `NameSettingsChanged` would likewise keep the
+    /// previous settings and skip the prompt reload. Persisted creator
+    /// updates (including default privacy) and the startup display-name seed
+    /// use the same lossless path.
+    /// Bufferable commands still claim an uncounted ledger slot up front,
+    /// released on reception like any other: without it the receive would
+    /// spend a gated send's slot and the gate would admit past the cap.
+    /// The depth gauge briefly includes concurrent lossless entries;
+    /// administrator saves are rare enough that the bound stays effective.
+    fn send_command_lossless(&self, command: ActorCommand) -> bool {
+        let acquired = command.is_bufferable();
+        if acquired {
+            self.backpressure.acquire_unchecked();
+        }
+        if self.tx.send(command).is_ok() {
+            return true;
+        }
+        if acquired {
+            self.backpressure.rollback();
+        }
+        false
+    }
+
+    /// Fire-and-forget sends refused past the inbox cap. Monotonic per actor.
+    /// Test-observable seam: production reads this through `WorkerStatus`
+    /// (the `Status` branch reports the same ledger), so the accessor is
+    /// compiled for tests only instead of warning as unused.
+    #[cfg(test)]
+    fn inbox_overflow_dropped(&self) -> u64 {
+        self.backpressure.dropped()
+    }
+
+    /// Outstanding gated inbox entries: the live inbox depth. Test-only,
+    /// like [`Self::inbox_overflow_dropped`]; production reads the depth
+    /// through `WorkerStatus::inbox_pending`.
+    #[cfg(test)]
+    fn inbox_depth(&self) -> usize {
+        self.backpressure.depth()
+    }
 }
 
 enum ActorCommand {
@@ -7620,6 +7776,11 @@ enum ActorCommand {
         member_id: Snowflake,
         display: String,
     },
+    /// Startup display-name seed: one batch for every cached member, so a
+    /// guild with more members than inbox slots still seeds every name
+    /// (room owners included) instead of refusing the tail. Sent losslessly
+    /// like other control-plane updates; each entry applies as a `Display`.
+    DisplaySeed(Vec<(Snowflake, String)>),
     /// The guild's voice configuration was written (`/import`): automatic
     /// names use the same settings `/name` Restore reads from now on.
     NameSettingsChanged(NameSettings),
@@ -7731,11 +7892,32 @@ enum ActorCommand {
     },
 }
 
+#[derive(PartialEq, Eq)]
+enum ActorInitStateKey {
+    DisplaySeed,
+    NameSettings,
+    Access,
+    Creator(Snowflake),
+}
+
 impl ActorCommand {
+    /// Startup snapshots and acknowledged saves must survive ordinary init
+    /// churn. Only the latest value for each key is needed before loading.
+    fn init_state_key(&self) -> Option<ActorInitStateKey> {
+        match self {
+            Self::DisplaySeed(_) => Some(ActorInitStateKey::DisplaySeed),
+            Self::NameSettingsChanged(_) => Some(ActorInitStateKey::NameSettings),
+            Self::AccessChanged(_) => Some(ActorInitStateKey::Access),
+            Self::CreatorAdded(creator) => Some(ActorInitStateKey::Creator(creator.channel_id)),
+            _ => None,
+        }
+    }
+
     /// True for fire-and-forget state that can wait for the worker:
-    /// snapshots, voice frames and config swaps apply in arrival order
-    /// once it loads. Anything else carries a one-shot reply no worker
-    /// exists to answer yet (status, room commands, vote-kick, test
+    /// snapshots, voice frames, config swaps and public ballot message
+    /// references apply in arrival order once it loads. Anything else carries
+    /// a one-shot reply no worker exists to answer yet (status, room commands,
+    /// vote-kick start/ballot/room queries, test
     /// probes), so [`load_actor_worker`] drops it while initialization is
     /// pending: the caller sees `None` and takes the existing "syncing,
     /// try again shortly" path instead of hanging until recovery.
@@ -7746,6 +7928,7 @@ impl ActorCommand {
             self,
             ActorCommand::Reconcile
                 | ActorCommand::Display { .. }
+                | ActorCommand::DisplaySeed(_)
                 | ActorCommand::NameSettingsChanged(_)
                 | ActorCommand::RoomFactsChanged(_)
                 | ActorCommand::Join { .. }
@@ -7753,23 +7936,42 @@ impl ActorCommand {
                 | ActorCommand::CreatorAdded(_)
                 | ActorCommand::RefreshCreators
                 | ActorCommand::AccessChanged(_)
+                | ActorCommand::KickMessage { .. }
         )
     }
 }
 
-/// Cap on commands buffered while actor initialization is pending: voice
-/// state converges on the latest frame and `Reconcile` is idempotent, so
-/// a long outage sheds the oldest instead of growing without bound.
+/// Cap on ordinary commands buffered while actor initialization is pending:
+/// voice state converges and `Reconcile` is idempotent, so an outage sheds
+/// the oldest ordinary entry. Saved control state has a separate budget:
+/// one latest value per init-state key, never evicted by ordinary churn.
 const VOICE_ACTOR_INIT_BUFFER_CAP: usize = 512;
 
-/// Buffer one command that arrived during a load attempt. Everything waits
-/// (capped, oldest shed): when the attempt succeeds the worker answers the
-/// reply-bearing commands in arrival order, so a status or vote-kick sent
-/// right after the snapshot still resolves. Shedding the oldest at the cap
-/// drops its one-shot sender, so an overflowed caller fails fast with `None`.
+/// Buffer one command that arrived during a load attempt. Replies wait in
+/// the ordinary FIFO; shedding one drops its sender so its caller fails
+/// fast with `None`. Keep saved state and the startup seed outside that
+/// eviction budget. Replacing a control key appends the latest value at its
+/// arrival position, preserving the order of all surviving commands.
 fn buffer_attempt_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
-    if buffered.len() >= VOICE_ACTOR_INIT_BUFFER_CAP {
-        let _ = buffered.pop_front();
+    if let Some(key) = command.init_state_key() {
+        if let Some(index) = buffered
+            .iter()
+            .position(|previous| previous.init_state_key().as_ref() == Some(&key))
+        {
+            let _ = buffered.remove(index);
+        }
+    } else if buffered
+        .iter()
+        .filter(|entry| entry.init_state_key().is_none())
+        .count()
+        >= VOICE_ACTOR_INIT_BUFFER_CAP
+    {
+        if let Some(index) = buffered
+            .iter()
+            .position(|entry| entry.init_state_key().is_none())
+        {
+            let _ = buffered.remove(index);
+        }
     }
     buffered.push_back(command);
 }
@@ -7853,6 +8055,101 @@ mod voice_actor_init_buffer_tests {
             buffer_init_command(&mut buffered, ActorCommand::Reconcile);
         }
         assert_eq!(buffered.len(), VOICE_ACTOR_INIT_BUFFER_CAP);
+    }
+}
+
+#[cfg(test)]
+mod voice_actor_inbox_backpressure_tests {
+    use super::{
+        ActorCommand, ActorInboxBackpressure, GuildActor, LiveGuild, VOICE_ACTOR_INBOX_CAP,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    fn actor() -> (GuildActor, mpsc::UnboundedReceiver<ActorCommand>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            GuildActor {
+                live: LiveGuild::new(7),
+                tx,
+                backpressure: ActorInboxBackpressure::default(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn gate_admits_to_cap_then_refuses_and_counts() {
+        let (actor, rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        for _ in 0..10 {
+            assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert_eq!(actor.inbox_overflow_dropped(), 10);
+        assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP);
+    }
+
+    #[test]
+    fn release_on_receive_restores_capacity() {
+        let (actor, mut rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        let command = rx.try_recv().expect("queued command");
+        actor.backpressure.release_for(&command);
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP - 1);
+        assert!(actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_overflow_dropped(), 1);
+    }
+
+    #[test]
+    fn lossless_sends_hold_a_slot_until_received() {
+        // Ledger pairing for the control-plane bypass: a lossless send
+        // claims an uncounted slot and its receive releases exactly that
+        // slot, so repeated lossless deliveries never spend a gated
+        // send's slot and the gate keeps refusing at the cap.
+        let (actor, mut rx) = actor();
+        assert!(actor.send_command_lossless(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 1);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+        let command = rx.try_recv().expect("queued command");
+        actor.backpressure.release_for(&command);
+        assert_eq!(actor.inbox_depth(), 0);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+    }
+
+    #[test]
+    fn lossless_closed_channel_rolls_back_without_counting() {
+        let (actor, rx) = actor();
+        drop(rx);
+        assert!(!actor.send_command_lossless(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 0);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+    }
+
+    #[test]
+    fn closed_channel_rolls_back_without_counting() {
+        let (actor, rx) = actor();
+        drop(rx);
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 0);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+    }
+
+    #[test]
+    fn reply_bearing_sends_bypass_the_gate() {
+        let (actor, rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        let (reply, _inbox) = oneshot::channel();
+        assert!(actor.try_send_command(ActorCommand::Status(reply)));
+        assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP + 1);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
     }
 }
 
@@ -8209,6 +8506,7 @@ where
         let actor = GuildActor {
             live: LiveGuild::new(guild),
             tx,
+            backpressure: ActorInboxBackpressure::default(),
         };
         actor
             .live
@@ -8241,9 +8539,11 @@ where
         let name_policy = Arc::clone(&self.name_policy);
         let live_source = Arc::clone(&self.live_source);
         let admission_config = self.admission_config;
+        let backpressure = actor.backpressure.clone();
         tokio::spawn(async move {
             let mut rx = rx;
-            let Some((worker, buffered)) = load_actor_worker(make.as_ref(), live, &mut rx).await
+            let Some((worker, buffered)) =
+                load_actor_worker(make.as_ref(), live, &mut rx, &backpressure).await
             else {
                 return;
             };
@@ -8262,7 +8562,7 @@ where
             if let Some(config) = admission_config {
                 worker.set_admission_config(config);
             }
-            run_actor_with_initial(&mut worker, rx, tick, buffered).await;
+            run_actor_with_initial(&mut worker, rx, tick, buffered, &backpressure).await;
         });
         actors.insert(guild, actor.clone());
         Some(actor)
@@ -8283,7 +8583,7 @@ where
         let Some(actor) = self.ensure_actor(guild) else {
             return false;
         };
-        actor.live.publish(snapshot) && actor.tx.send(ActorCommand::Reconcile).is_ok()
+        actor.live.publish(snapshot) && actor.try_send_command(ActorCommand::Reconcile)
     }
 
     /// READY or RESUMED was handled: the gateway is connected again. Any
@@ -8401,7 +8701,7 @@ where
             }
             None => {
                 if channel.is_some() {
-                    let _ = actor.tx.send(ActorCommand::Display {
+                    let _ = actor.try_send_command(ActorCommand::Display {
                         member_id: member,
                         display,
                     });
@@ -8413,13 +8713,13 @@ where
         // room handling: same-channel frames (mute, video, role-only) send
         // nothing, so this costs one command per join/leave/move only.
         if previous != channel {
-            let _ = actor.tx.send(ActorCommand::EventVoicePresence {
+            let _ = actor.try_send_command(ActorCommand::EventVoicePresence {
                 member_id: member,
                 previous,
                 current: channel,
             });
         }
-        actor.tx.send(command).is_ok()
+        actor.try_send_command(command)
     }
 
     /// Fresh store/http pair from the actor factory (used by the S4 command
@@ -8563,10 +8863,7 @@ where
 
     fn kick_message(&self, guild: Snowflake, vote_id: Snowflake, message: MessageRef) -> bool {
         let queued = self.live_actor(guild).is_some_and(|actor| {
-            actor
-                .tx
-                .send(ActorCommand::KickMessage { vote_id, message })
-                .is_ok()
+            actor.try_send_command(ActorCommand::KickMessage { vote_id, message })
         });
         if !queued {
             warn!(
@@ -8620,7 +8917,7 @@ where
     fn presence_frame(&self, guild: Snowflake, member: Snowflake, facts: MemberPresence) {
         if let Some(actor) = self.live_actor(guild) {
             if let Some(room) = actor.live.set_presence(member, facts) {
-                let _ = actor.tx.send(ActorCommand::RoomFactsChanged(room));
+                let _ = actor.try_send_command(ActorCommand::RoomFactsChanged(room));
             }
         }
     }
@@ -8629,7 +8926,7 @@ where
     fn stream_frame(&self, guild: Snowflake, member: Snowflake, streaming: bool) {
         if let Some(actor) = self.live_actor(guild) {
             if let Some(room) = actor.live.set_self_stream(member, streaming) {
-                let _ = actor.tx.send(ActorCommand::RoomFactsChanged(room));
+                let _ = actor.try_send_command(ActorCommand::RoomFactsChanged(room));
             }
         }
         // Game-activity wiring: fold the flag into the member's voice span.
@@ -8647,7 +8944,7 @@ where
     fn update_live(&self, guild: Snowflake, update: impl FnOnce(&LiveGuild)) {
         if let Some(actor) = self.live_actor(guild) {
             update(&actor.live);
-            let _ = actor.tx.send(ActorCommand::Reconcile);
+            let _ = actor.try_send_command(ActorCommand::Reconcile);
         }
     }
 
@@ -8656,15 +8953,17 @@ where
     /// before the first GuildCreate have no worker to flag.
     fn refresh_creators(&self, guild: Snowflake) {
         if let Some(actor) = self.live_actor(guild) {
-            let _ = actor.tx.send(ActorCommand::RefreshCreators);
+            let _ = actor.try_send_command(ActorCommand::RefreshCreators);
         }
     }
 
     /// Push freshly saved access controls to the live actor, so a creation
-    /// switch takes effect without a restart.
+    /// switch takes effect without a restart. Lossless: the store write
+    /// already succeeded and the administrator is told "Saved", so the
+    /// update must reach the worker even past the inbox cap.
     fn access_changed(&self, guild: Snowflake, controls: AccessControls) {
         if let Some(actor) = self.live_actor(guild) {
-            let _ = actor.tx.send(ActorCommand::AccessChanged(controls));
+            let _ = actor.send_command_lossless(ActorCommand::AccessChanged(controls));
         }
     }
 
@@ -8690,7 +8989,7 @@ where
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
             actor.live.protect_creators([creator.channel_id]);
-            let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
+            let _ = actor.try_send_command(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
 
@@ -8760,8 +9059,15 @@ where
         let Some(actor) = self.live_actor(guild_id) else {
             return;
         };
-        for (member_id, display) in cached_display_names(cache, guild_id) {
-            let _ = actor.tx.send(ActorCommand::Display { member_id, display });
+        // One lossless batch, not one gated send per member: a guild with
+        // more cached members than inbox slots would otherwise refuse the
+        // tail (room-owner names included), and the periodic settings reload
+        // never repopulates the directory. The batch holds one uncounted
+        // ledger slot until the worker receives it (see
+        // `send_command_lossless`).
+        let seed = cached_display_names(cache, guild_id);
+        if !seed.is_empty() {
+            let _ = actor.send_command_lossless(ActorCommand::DisplaySeed(seed));
         }
     }
 
@@ -8783,10 +9089,13 @@ where
         inbox.await.ok()
     }
 
-    /// Hand freshly written voice settings to the guild worker.
+    /// Hand freshly written voice settings to the guild worker. Lossless:
+    /// the store write already succeeded and the administrator saw "Saved",
+    /// so a full inbox must not leave the worker on the previous settings
+    /// (or skip the `name_settings_read_ms` reset that prompts a reload).
     fn name_settings_updated(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
         if let Some(actor) = self.live_actor(guild_id) {
-            let _ = actor.tx.send(ActorCommand::NameSettingsChanged(
+            let _ = actor.send_command_lossless(ActorCommand::NameSettingsChanged(
                 NameSettings::from_config(config),
             ));
         }
@@ -8795,7 +9104,7 @@ where
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.protect_creators([creator.channel_id]);
-            let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
+            let _ = actor.send_command_lossless(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
 
@@ -9088,7 +9397,7 @@ where
                     .unwrap_or_else(|| updated.user.name.clone());
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
-                    let _ = actor.tx.send(ActorCommand::Display { member_id, display });
+                    let _ = actor.try_send_command(ActorCommand::Display { member_id, display });
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -9145,9 +9454,11 @@ where
 /// [`voice_actor_load_backoff_jittered`] between attempts, and the same single
 /// spawned task owns every attempt — retries never spawn a second actor.
 ///
-/// While a load attempt is in flight, every inbox command waits in order
-/// (capped, oldest shed) and is handed to `run_actor_with_initial` on
-/// success, so a status sent right after the snapshot still resolves once
+/// While a load attempt is in flight, ordinary inbox commands wait in a
+/// capped FIFO (oldest ordinary entry shed). The startup seed and saved
+/// naming/access/per-creator state retain one latest value per key outside
+/// that eviction budget. Surviving commands reach `run_actor_with_initial`
+/// in order on success, so a status sent after the snapshot still resolves once
 /// the worker exists. When the attempt fails or times out, buffered
 /// reply-bearing commands are purged (see [`ActorCommand::is_bufferable`])
 /// so their callers get the existing "syncing" fallback instead of hanging
@@ -9162,6 +9473,7 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
     make: &(dyn Fn() -> (S, H) + Send + Sync),
     live: LiveGuild,
     inbox: &mut mpsc::UnboundedReceiver<ActorCommand>,
+    backpressure: &ActorInboxBackpressure,
 ) -> Option<(GuildRoomWorker<S, H>, VecDeque<ActorCommand>)> {
     let guild_id = live.guild_id;
     let mut buffered = VecDeque::new();
@@ -9185,7 +9497,10 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                     break;
                 }
                 command = inbox.recv() => match command {
-                    Some(command) => buffer_attempt_command(&mut buffered, command),
+                    Some(command) => {
+                        backpressure.release_for(&command);
+                        buffer_attempt_command(&mut buffered, command);
+                    }
                     None => return None,
                 },
             }
@@ -9199,7 +9514,10 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                 // (guild removed) is discarded, never published.
                 loop {
                     match inbox.try_recv() {
-                        Ok(command) => buffer_attempt_command(&mut buffered, command),
+                        Ok(command) => {
+                            backpressure.release_for(&command);
+                            buffer_attempt_command(&mut buffered, command);
+                        }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return None,
                     }
@@ -9229,7 +9547,10 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
             tokio::select! {
                 () = &mut wait => break,
                 command = inbox.recv() => match command {
-                    Some(command) => buffer_init_command(&mut buffered, command),
+                    Some(command) => {
+                        backpressure.release_for(&command);
+                        buffer_init_command(&mut buffered, command);
+                    }
                     None => return None,
                 },
             }
@@ -9255,7 +9576,8 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
 ) {
-    run_actor_with_limits(worker, inbox, tick, ActorLimits::default()).await;
+    let backpressure = ActorInboxBackpressure::default();
+    run_actor_with_limits(worker, inbox, tick, ActorLimits::default(), &backpressure).await;
 }
 
 /// Run the actor loop after [`load_actor_worker`], applying the commands
@@ -9266,8 +9588,17 @@ async fn run_actor_with_initial<S: RoomPersistence, H: RoomWrites + 'static>(
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
     initial: VecDeque<ActorCommand>,
+    backpressure: &ActorInboxBackpressure,
 ) {
-    run_actor_inner(worker, inbox, tick, ActorLimits::default(), initial).await;
+    run_actor_inner(
+        worker,
+        inbox,
+        tick,
+        ActorLimits::default(),
+        initial,
+        backpressure,
+    )
+    .await;
 }
 
 /// Bounds for the per-guild actor loop (TOG stall follow-up). All bounds are
@@ -9585,8 +9916,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
     limits: ActorLimits,
+    backpressure: &ActorInboxBackpressure,
 ) {
-    run_actor_inner(worker, inbox, tick, limits, VecDeque::new()).await;
+    run_actor_inner(worker, inbox, tick, limits, VecDeque::new(), backpressure).await;
 }
 
 async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
@@ -9595,6 +9927,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     tick: Duration,
     limits: ActorLimits,
     initial: VecDeque<ActorCommand>,
+    backpressure: &ActorInboxBackpressure,
 ) {
     let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
@@ -9686,7 +10019,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             )
             .await;
         }
-        let accepted = apply_command(worker, command, now_ms);
+        let accepted = apply_command(worker, command, now_ms, backpressure);
         // An Ownership command stages its reply on the durable commit;
         // drive it before the next command so replies stay ordered.
         worker.drive_staged_ownership(now_ms).await;
@@ -9728,6 +10061,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             // progressing dispatch keeps the park (see below).
             command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
                 let Some(command) = command else { break };
+                backpressure.release_for(&command);
                 let now_ms = start
                     .elapsed()
                     .as_millis()
@@ -9755,7 +10089,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     )
                     .await;
                 }
-                let accepted = apply_command(worker, command, now_ms);
+                let accepted = apply_command(worker, command, now_ms, backpressure);
                 // An Ownership command stages its reply on the durable commit;
                 // drive it before the next command so replies stay ordered.
                 worker.drive_staged_ownership(now_ms).await;
@@ -9942,12 +10276,18 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     worker: &mut GuildRoomWorker<S, H>,
     command: ActorCommand,
     now_ms: u64,
+    backpressure: &ActorInboxBackpressure,
 ) -> bool {
     let mut accepted_join = false;
     match command {
         ActorCommand::Reconcile => worker.reconcile(),
         ActorCommand::Display { member_id, display } => {
             worker.name_directory.insert(member_id, display);
+        }
+        ActorCommand::DisplaySeed(entries) => {
+            for (member_id, display) in entries {
+                worker.name_directory.insert(member_id, display);
+            }
         }
         ActorCommand::NameSettingsChanged(settings) => {
             worker.update_name_settings(settings);
@@ -10016,6 +10356,8 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
                 tracked_rooms: worker.tracked().len(),
                 failures: worker.failures().iter().map(failure_line).collect(),
                 halted: worker.halted(),
+                inbox_pending: backpressure.depth(),
+                inbox_overflow_dropped: backpressure.dropped(),
             });
         }
         ActorCommand::Ownership {
@@ -12393,6 +12735,11 @@ pub struct WorkerStatus {
     pub health: Vec<String>,
     pub failures: Vec<String>,
     pub halted: bool,
+    /// Outstanding gated inbox entries when the status was read: the live
+    /// inbox depth (see `VOICE_ACTOR_INBOX_CAP`).
+    pub inbox_pending: usize,
+    /// Fire-and-forget sends refused past the inbox cap. Monotonic per actor.
+    pub inbox_overflow_dropped: u64,
 }
 
 /// Notice body for one failure. `brief` includes actionable permission/name

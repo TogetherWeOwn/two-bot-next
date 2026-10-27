@@ -67,6 +67,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command",
             "command-remove",
             "command-list",
+            "command-inspect",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -196,6 +197,9 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         let names: Vec<String> = present.iter().map(|name| format!("/{name}")).collect();
         out.push_str(&names.join(" · "));
         out.push('\n');
+        if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
+            out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
+        }
     }
     // DB custom rows publish alongside the builtins; anything else ungrouped
     // (a future builtin this table predates) still renders rather than
@@ -270,12 +274,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 28 legacy builtins plus the Next-only help, privacy and sticky-status
-        // commands, plus the 21 gated voice commands (voice `kick` loses
-        // first-wins to moderation `/kick`; `/templateassistant` stays
-        // unpublished until its slice lands): matches the regenerated
-        // `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (51 live)"));
+        // 27 retained legacy builtins plus Next-only help, privacy,
+        // command-inspect and sticky-status, plus the 21 gated voice commands
+        // (voice `kick` loses first-wins to moderation `/kick`;
+        // `/templateassistant` stays unpublished until its slice lands):
+        // matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (52 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -395,10 +399,10 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help, privacy and sticky-status
-        // commands, then the 21 voice names (voice `kick` shares the Kick
+        // 27 legacy builtins plus Next-only help, privacy, command-inspect and
+        // sticky-status, then the 21 voice names (voice `kick` shares the Kick
         // group). `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 51);
+        assert_eq!(grouped.len(), 52);
         for name in [
             "rank",
             "leaderboard",

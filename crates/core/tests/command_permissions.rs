@@ -91,20 +91,31 @@ fn all_30_rows_equal_parity_section1() {
         assert_eq!(row.policy_hook, policy_hook, "parity row {number}");
     }
     assert_eq!(seen, (1..=30).collect::<HashSet<_>>());
-    // The 30 legacy parity rows plus the Next-only `/help` discovery command
-    // (parity row 31 — legacy has no help command) and the Next-only
-    // `/privacy` member self-serve (parity row 32), plus private sticky status
-    // (parity row 33). These Next-only rows do not appear in the legacy §1
-    // table above; the registry-equality test below
-    // covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 33);
+    // Keep the original 30-row legacy control above. Next-only help (31),
+    // privacy (32), command-inspect (33) and sticky-status (34) are additive;
+    // registry equality below covers every published builtin.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 34);
+    assert_eq!(
+        COMMAND_PERMISSIONS
+            .iter()
+            .map(|row| row.parity_row)
+            .collect::<HashSet<_>>(),
+        (1..=34).collect::<HashSet<_>>(),
+        "every parity id is unique and the legacy range is preserved"
+    );
+    for (name, parity_row) in [("command-inspect", 33), ("sticky-status", 34)] {
+        let row = command_permission(name).expect("private inspection has a permission row");
+        assert_eq!(row.parity_row, parity_row, "{name}");
+        assert_eq!(row.required_permissions, 1 << 5, "{name}");
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash, "{name}");
+    }
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        33
+        34
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
@@ -124,7 +135,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 30);
+    assert_eq!(builtins.len(), 31);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -248,7 +259,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 30, "every retained builtin routes");
+    assert_eq!(routed, 31, "every retained builtin routes");
 }
 
 #[test]

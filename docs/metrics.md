@@ -23,6 +23,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
 | `two_bot_gateway_disconnects_total` | Observed transport losses funnelled through the shard supervisor (reconnect failures, close frames, invalid sessions, cold-resume IDENTIFY). Every disconnect must pair with a later RESUME or fresh READY in the same window; an unpaired disconnect means the gateway never came back |
 | `two_bot_gateway_missed_events_total` | Dispatches Discord assigned but this process never received (sequence gaps inside one session). Any nonzero increase over the watch window fails the zero-missed-events acceptance |
+| `two_bot_gateway_rsvp_refused_total` | RSVP interactions refused at reception because the in-flight RSVP bound (32) was exhausted: no prepare task spawned and nothing entered the serial drain. The dispatch advances with no RSVP completion instead of wedging the funnel, checkpoint or dispatch worker |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Fixed three series from process start; no user, activity, application or free-text labels. Deliberately unwatched: no production callsite records this family yet (the event-store S3 producer is still cut over), so the rule lands with the producer; see the catalog |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels. The `automod_sanction_refused` rule tickets on any `sanction_refused` increase (first sample is baseline-only, restarts re-baseline, missing family is no window); the other seven outcomes are policy working as designed and stay quiet |
@@ -59,6 +60,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_voice_joins_received_total` | Creator joins received by the guild actor; compare with create/move/refused outcomes — received persistently above handled means the actor is not processing joins |
 | `two_bot_voice_join_refused_total{reason}` | Actor-received creator joins refused before queueing; `reason` is `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked` or `other` |
+| `two_bot_voice_inbox_overflow_dropped_total` | Fire-and-forget commands refused at the 256-entry actor inbox gate, including public ballot message references. One label-free increment per capacity refusal; accepted/lossless sends and closed-channel rollbacks do not count. Process-lifetime total survives actor retirement, resets on restart. Consumed by no alert rule; compare growth with queue age and dispatch progress when diagnosing overload |
+| `two_bot_voice_queue_overflow_dropped_total` | New actions refused by opt-in `ActionQueue::try_enqueue` at 1,024 pending actions per guild. One label-free increment per refusal; at/past-cap coalescing does not count. Process-lifetime total survives queue retirement, resets on restart. All current production producers use uncapped must-admit `enqueue`, so this counter remains zero there: zero is not a healthy-drain signal or evidence of a production queue bound. Consumed by no alert rule |
 | `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while any guild actor is halted by a store CredentialRefused or Discord 401 (only store halts auto-recover; 401s need a token fix + restart); aggregated over all current guild actors, so a healthy guild cannot hide another guild's halt; the `voice_worker_halted` rule pages while 1 (a valid 0 clears, missing holds) |
 | `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions, summed across all current guild actors per lane; `lane` is `urgent` or `deferred`; deliberately unwatched — depth without age is not a failure signal (bursts queue legitimately, no code-grounded bound exists), so it stays a manual complement to the `voice_queue_stall` ticket |
 | `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds, the maximum across all current guild actors; 0 when every queue is empty; the `voice_queue_stall` rule tickets past 120 s (at or below clears, missing holds; a hung dispatch still climbs past the bound — the sibling recomputes the age from the snapshot stamp) |
@@ -91,7 +94,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). The `audit_delivery_halt` rule tickets after 3 consecutive valid engaged samples (~2 minutes from first to third at the default cadence); `0` recovers once. A failed `audit_retry` attempt vetoes both transitions because the gauge may be retained from an earlier readable sweep. Missing/invalid samples break the streak, not an active ticket. Production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
 | `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Alert rule `event_store_consumer_lag` tickets on sustained lag above 60 s (see below). No message, channel, user, dedup-key, content or body label ever reaches exposition |
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter. The `eventsub_receive_gap` rule tickets when received exceeds the summed classified kinds for 3 consecutive samples; a closed gap resolves, missing/invalid samples break the consecutive-evidence streak but preserve an active firing ticket |
-| `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. `eventsub_tampered` pages when the `tampered` series with exactly that label rises in 3 consecutive samples. No IDs, tokens, headers, body text or secrets become labels |
+| `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored`, one snake_case label per `EventSubError` variant (`invalid_secret`, `invalid_header`, `body_too_large`, `bad_signature`, `invalid_timestamp`, `stale_timestamp`, `invalid_body`, `duplicate_keys`, `wrong_subscription`, `invalid_challenge`, `invalid_callback`, `invalid_broadcaster_id`, `too_many_broadcasters`), or trailing `other`. Classify errors record their variant label (`wrong_subscription`, `invalid_body`, `duplicate_keys` and `invalid_challenge` for the deterministic arms; future variants record theirs); `ignored` covers unknown message types and non-signature verification failures; `other` absorbs unknown label strings. Only `BadSignature` is `tampered`. `eventsub_tampered` pages when the `tampered` series with exactly that label rises in 3 consecutive samples. No IDs, tokens, headers, body text or secrets become labels |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. Counted by the receiver only for deliveries that reach the sender through the durable ledger flow; boot injects no delivery dependencies yet, so these remain zero until channel/invite provisioning lands; no IDs, content or errors become labels |
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per concluded pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only, as are passes interrupted by shutdown (which still record the mutations they already made in actions). Alert `eventsub_reconcile_failed` tickets when `failed` rises between keepalive samples (first sample is baseline-only; see the alert table below) |
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful EventSub reconcile mutations by fixed `action`: `create` (2xx creates) or `delete` (2xx deletes, including already-gone deletes). 409 already-exists confirmations fold into the pass outcome, not into actions; per-subscription labels never reach exposition. Deliberately unwatched: successful mutations are the healthy signal, failures ticket through the failed-pass rule; see the catalog |
@@ -99,6 +102,31 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome: `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP). One sample per fetch; per-outcome, never per-feed, so no source URL, host or feed id reaches a label. Deliberately unwatched: every non-success attempt pairs 1:1 with an errors increment, so the errors sum carries the same signal with finer reason codes; see the catalog |
 | `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class: `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`. One sample per failed fetch alongside `two_bot_feed_fetches_total`; successes record nothing here. No URL, host, header or body bytes reach a label. The `feed_fetch_failures` rule tickets on any summed increase (first sample is baseline-only, restarts re-baseline, missing family is no window) |
 | `two_bot_ticket_lifecycle_total{event,outcome}` | Terminal ticket lifecycle events by bounded `event` and `outcome` (see label allowlists below). Retire, abandon, successful claim and successful close count once each alongside their `ticket_lifecycle` log line; the purge pass counts one per deleted transcript body (not one per pass) and reports a `db_cause` outcome instead of `deleted` when its storage write fails. No member text, channel name, ticket id or error string ever becomes a label. No alert rule consumes this family yet; read it alongside the lifecycle log lines in [ticket-lifecycle-observability.md](ticket-lifecycle-observability.md) |
+
+## Voice overload bounds
+
+The actor inbox refuses ordinary fire-and-forget sends at 256 outstanding
+entries. Reply-bearing requests, acknowledged naming/access saves, edits to
+existing creator rows and the startup display-name seed bypass this admission
+gate; the limit is not a hard memory bound for all actor traffic. New-creator
+notifications still use gated admission and can converge by periodic refresh
+or first-join read-through. Saved edits to an existing creator's privacy must
+reach an already-loaded worker before it plans the next room.
+
+During initialization, up to 512 ordinary commands wait in arrival order;
+overflow sheds the oldest ordinary command. Saved naming/access settings, each
+creator channel's latest saved row and the latest startup display-name seed
+are retained outside that eviction budget, coalesced by state key. They survive
+failed attempts and backoff, while failed-attempt reply waiters close promptly.
+This retains at most three guild-wide state entries plus one per distinct
+creator channel, in addition to the ordinary FIFO; seed contents scale with the
+guild snapshot. It is not a fixed total-memory bound. Init-buffer shedding is
+not an inbox admission refusal and does not increment the inbox overflow counter.
+
+The action-queue cap is opt-in: all current production producers still use
+must-admit `enqueue`, not bounded `try_enqueue`. A stalled production action
+drain can therefore grow cumulatively; zero overflow refusals do not prove
+healthy drainage. Compare queue depth, oldest age and dispatch progress.
 
 ## REST admission guard
 
@@ -201,7 +229,11 @@ REST clients are not silently claimed as covered.
 - Body: Prometheus text exposition 0.0.4. Every family is preceded by its
   `# HELP` / `# TYPE` lines, one sample per line, body ends with a trailing
   newline. All families render from process start at zero/`NaN`, before any
-  gateway event or job completion.
+  gateway event or job completion. Keep HELP descriptions concise: the full
+  exposition must fit the consumers' 64 KiB body cap, not only the series-count
+  budget. A regression saturates EventSub, pool and REST-guard samples and
+  reserves 1 KiB for other value growth; it does not bound every possible
+  combination of process counters at their maxima.
 
 ## Label allowlists (stable)
 
@@ -210,7 +242,12 @@ are added to these compile-time lists in `crates/core/src/metrics.rs`, never
 as dynamic labels.
 
 - `two_bot_eventsub_classified_total{kind}` — `kind` is one of
-  `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`.
+  `challenge`, `notification`, `revocation`, `tampered`, `ignored`, the thirteen
+  `EventSubError` snake_case labels (`invalid_secret`, `invalid_header`,
+  `body_too_large`, `bad_signature`, `invalid_timestamp`, `stale_timestamp`,
+  `invalid_body`, `duplicate_keys`, `wrong_subscription`, `invalid_challenge`,
+  `invalid_callback`, `invalid_broadcaster_id`, `too_many_broadcasters`), or
+  trailing `other`.
 - `two_bot_eventsub_posts_total{outcome}` — `outcome` is one of `attempted`,
   `succeeded`, `failed` or `other`.
 - `two_bot_eventsub_reconcile_passes_total{outcome}` — `outcome` is one of

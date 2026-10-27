@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("sticky-status", "docs/parity.md §1 sticky-status"),
 ];
 
@@ -256,6 +257,32 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only saved-response inspection. This independent literal pins the
+    // whole publication contract; never manufacture it from production shapes.
+    let inspect = json!({
+        "name": "command-inspect",
+        "description": "Inspect or privately preview a saved custom command",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
+             "required": true, "max_length": 32},
+            {"name": "view", "description": "Private view (summary by default)", "type": 3,
+             "choices": [
+                 {"name": "Summary", "value": "summary"},
+                 {"name": "Saved template", "value": "template"},
+                 {"name": "Preview", "value": "preview"}
+             ]},
+            {"name": "arguments", "description": "Sample invocation arguments (ignored by current templates)",
+             "type": 3, "max_length": 500}
+        ]
+    });
+    let after_list = commands
+        .iter()
+        .position(|command| command["name"] == "command-list")
+        .expect("legacy command-list remains published")
+        + 1;
+    commands.insert(after_list, inspect);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.
@@ -278,7 +305,7 @@ pub fn expected_registry() -> Value {
         (
             "rsvp-attendance",
             "/description",
-            "Show RSVP totals for a scheduled event",
+            "Show RSVP totals and your saved response for an event",
         ),
         (
             "rsvp-attendance",

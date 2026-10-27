@@ -73,6 +73,7 @@
 //! natural home). Add it in the implementation PR alongside this file.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -216,6 +217,53 @@ const BASE_MIGRATIONS: [&str; 8] = [
     include_str!("../migrations/0449_self_role_ticket_acknowledgement.sql"),
 ];
 
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(pid: u32, timestamp: std::time::Duration) -> String {
+    // Low 64 bits of the nanosecond clock: real timestamps fit entirely, and
+    // Duration::MAX stays bounded. The atomic sequence distinguishes identical
+    // PID/clock samples across concurrent fixtures in this process.
+    let nonce = timestamp.as_nanos() as u64;
+    let sequence = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
+    // At most 59 bytes: prefix 17 + PID 8 + separators 2 + nanos 16 + sequence 16.
+    format!("self_role_settle_{pid:x}_{nonce:x}_{sequence:016x}")
+}
+
+#[test]
+fn settlement_schema_names_are_distinct_and_bounded_when_the_clock_repeats() {
+    let barrier = std::sync::Barrier::new(8);
+    let names = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    (0..32)
+                        .map(|_| schema_name_at(u32::MAX, std::time::Duration::MAX))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("schema allocation worker"))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(names.len(), 256);
+    assert_eq!(
+        names.iter().collect::<std::collections::HashSet<_>>().len(),
+        names.len(),
+        "concurrent fixtures must not share a schema when PID and timestamp repeat"
+    );
+    for name in names {
+        assert!(name.len() <= 63, "Postgres must not truncate {name}");
+        assert!(name.starts_with("self_role_settle_"));
+        assert!(name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'));
+    }
+}
+
 /// One generated schema per scenario, dropped even when the scenario panics.
 async fn isolated<F, Fut>(scenario: F) -> TestResult
 where
@@ -232,11 +280,8 @@ where
         .max_connections(1)
         .connect_with(options.clone())
         .await?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    // Fixed prefix plus numeric PID/timestamp; no caller-supplied identifiers.
-    let schema = format!("self_role_settle_{}_{}", std::process::id(), nonce);
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let schema = schema_name_at(std::process::id(), timestamp);
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&admin)
         .await?;

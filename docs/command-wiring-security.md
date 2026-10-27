@@ -57,6 +57,14 @@ or existence checks. Apply the mutation gates before
 [`rsvp_store::put_rsvp`, `write_audit` or `record_checkin`](../crates/core/src/rsvp_store.rs).
 The read-only `/rsvp-attendance` path uses `list_rsvps`: preserve its historical
 totals after event cancellation or deletion, without requiring a live-event lookup.
+Its ephemeral reply also shows only the invoking member's saved response and
+Discord-localized saved time, or explicit absence, from those same guild/event
+rows. The event ID identifies stored history, not verified live availability;
+no event link or attendee roster is emitted. Reads neither write nor consume
+RSVP-write quota. Analytics opt-out retains transactional RSVP history; member
+erasure removes it. Store failures refuse rather than claiming absence.
+The protected `saved_response_acceptance` module in `rsvp_runtime` exercises
+these boundaries through the shared router, executor and disposable store.
 
 | ID | Required control | Minimum regression evidence |
 | --- | --- | --- |
