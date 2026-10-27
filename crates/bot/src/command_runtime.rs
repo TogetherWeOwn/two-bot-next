@@ -1547,7 +1547,7 @@ impl CommandRuntime {
             let response = match self.published_commands() {
                 Some(defs) => match (
                     help_command_selector(interaction),
-                    help_subcommand_selector(interaction),
+                    help_focus_selector(interaction),
                 ) {
                     (None, HelpSubcommand::Absent) => help_response(&defs),
                     // A focused path without a root is malformed, not an index.
@@ -3035,6 +3035,23 @@ pub(crate) enum HelpSubcommand {
     Absent,
     Path(String),
     Malformed,
+}
+
+/// The focused path as the runtime consumes it: a duplicated `command`
+/// selector makes a focused request malformed instead of letting the first
+/// duplicate pick the root. An unfocused request keeps its existing decode.
+pub(crate) fn help_focus_selector(interaction: &Interaction) -> HelpSubcommand {
+    let focus = help_subcommand_selector(interaction);
+    let duplicated = matches!(
+        &interaction.data,
+        Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data))
+            if data.options.iter().filter(|option| option.name == "command").count() > 1
+    );
+    if duplicated && focus != HelpSubcommand::Absent {
+        HelpSubcommand::Malformed
+    } else {
+        focus
+    }
 }
 
 pub(crate) fn help_subcommand_selector(interaction: &Interaction) -> HelpSubcommand {

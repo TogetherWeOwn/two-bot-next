@@ -114,8 +114,9 @@ use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options_strict, feed_id_option, feed_list_page_request,
-    feed_remove_option_strict, help_command_selector, new_id, router_with_commands,
-    sticky_options_strict, CommandRuntime, FeedListPage, RegistrySyncError,
+    feed_remove_option_strict, help_command_selector, help_focus_selector, new_id,
+    router_with_commands, sticky_options_strict, CommandRuntime, FeedListPage, HelpSubcommand,
+    RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
@@ -3553,6 +3554,34 @@ fn help_command_selector_keeps_omitted_absent_and_malformed_present() {
         let interaction = slash("help", Some(CHANNEL), vec![option("command", value)]);
         assert_eq!(help_command_selector(&interaction), Some(String::new()));
     }
+}
+
+#[test]
+fn help_focus_selector_rejects_duplicate_command_with_a_path() {
+    let command = |name: &str| option("command", CommandOptionValue::String(name.to_owned()));
+    let path = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    let focused = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank"), path.clone()],
+    );
+    assert_eq!(help_focus_selector(&focused), HelpSubcommand::Malformed);
+    // One root keeps the focused path.
+    let single = slash("help", Some(CHANNEL), vec![command("privacy"), path]);
+    assert_eq!(
+        help_focus_selector(&single),
+        HelpSubcommand::Path("deletion-status".to_owned())
+    );
+    // Without a path the existing root decode is untouched.
+    let root_only = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank")],
+    );
+    assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
 }
 
 #[test]

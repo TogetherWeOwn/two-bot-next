@@ -793,15 +793,20 @@ impl CommandDefinition {
             detail.push("Usage:\n");
             let mut lines = 0usize;
             let mut omitted = 0usize;
-            for child in &nested {
-                collect_usage(
-                    &mut detail,
-                    &here,
-                    child,
-                    chain.len(),
-                    &mut lines,
-                    &mut omitted,
-                );
+            if chain.len() > NESTING_CAP {
+                // The whole-command render never lists below this depth.
+                omitted += nested.len();
+            } else {
+                for child in &nested {
+                    collect_usage(
+                        &mut detail,
+                        &here,
+                        child,
+                        chain.len(),
+                        &mut lines,
+                        &mut omitted,
+                    );
+                }
             }
             if !leaves.is_empty() {
                 detail.push(&format!("- {here}{}\n", usage_suffix(&leaves)));
@@ -817,7 +822,7 @@ impl CommandDefinition {
         }
         if !nested.is_empty() {
             detail.push("Subcommands:\n");
-            if chain.len() >= NESTING_CAP {
+            if chain.len() > NESTING_CAP {
                 state.omitted += nested.len();
             } else {
                 for child in &nested {
@@ -1240,5 +1245,76 @@ mod tests {
         let rendered = mixed.help_detail_text();
         assert!(rendered.contains("/mixed group leaf"));
         assert!(rendered.contains("[top]"));
+    }
+
+    /// l1 > l2 > ... > l6, each level holding the next as a sub-command and
+    /// l6 holding a leaf argument.
+    fn deep_chain() -> CommandDefinition {
+        use crate::commands::{CommandOption, CommandOptionType};
+        let mut option =
+            CommandOption::new("l6", "Level six", CommandOptionType::SubCommand).sub_options(vec![
+                CommandOption::new("arg", "Deep argument", CommandOptionType::String),
+            ]);
+        for level in (1..=5).rev() {
+            option = CommandOption::new(
+                &format!("l{level}"),
+                &format!("Level {level}"),
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![option]);
+        }
+        CommandDefinition::new("deep", "Deep nesting").options(vec![option])
+    }
+
+    #[test]
+    fn focused_depth_matches_the_whole_command_nesting_cap() {
+        let def = deep_chain();
+        let whole = def.help_detail_text();
+        // The whole render lists l5 and omits l6 entirely.
+        assert!(whole.contains("/deep l1 l2 l3 l4 l5 — Level 5"));
+        assert!(!whole.contains("l6"));
+        // Focusing the parent of l5 must list l5 as the whole render does.
+        let l4 = def.help_branch_text("l1 l2 l3 l4").expect("l4 resolves");
+        assert!(l4.contains("/deep l1 l2 l3 l4 l5 — Level 5"), "{l4}");
+        assert!(!l4.contains("l6"), "{l4}");
+        // Focusing l5 omits l6 in usage and subcommands alike, with a count.
+        let l5 = def.help_branch_text("l1 l2 l3 l4 l5").expect("l5 resolves");
+        assert!(!l5.contains("l6"), "{l5}");
+        assert!(l5.contains("omitted"), "{l5}");
+        // A sixth segment stays unresolved.
+        assert!(def.help_branch_text("l1 l2 l3 l4 l5 l6").is_none());
+    }
+
+    #[test]
+    fn focused_examples_keep_only_the_matching_branch() {
+        use crate::commands::{CommandOption, CommandOptionType};
+        let def = CommandDefinition::new("proj", "Project tools")
+            .options(vec![
+                CommandOption::new("alpha", "Alpha", CommandOptionType::SubCommand),
+                CommandOption::new("beta", "Beta", CommandOptionType::SubCommand),
+            ])
+            .examples(vec![
+                "/proj alpha".to_owned(),
+                "/proj beta".to_owned(),
+                "/proj alphabet".to_owned(),
+            ]);
+        let alpha = def.help_branch_text("alpha").expect("alpha resolves");
+        assert!(alpha.contains("Examples:\n- /proj alpha\n"), "{alpha}");
+        assert!(!alpha.contains("/proj beta"), "{alpha}");
+        // A shared name prefix is not a match: the example must be exact or
+        // continue after a space.
+        assert!(!alpha.contains("/proj alphabet"), "{alpha}");
+        // A branch with no matching example prints no Examples section.
+        let none = CommandDefinition::new("proj", "Project tools")
+            .options(vec![CommandOption::new(
+                "gamma",
+                "Gamma",
+                CommandOptionType::SubCommand,
+            )])
+            .examples(vec!["/proj other".to_owned()]);
+        assert!(!none
+            .help_branch_text("gamma")
+            .expect("gamma")
+            .contains("Examples:"));
     }
 }
