@@ -145,6 +145,7 @@ async fn diff_and_publish_default_to_get_only_without_opening_a_database() {
             "+ 1/help",
             "+ 1/reopen",
             "+ 1/welcome-preview",
+            "+ 1/goodbye-preview",
             "Dry run: no commands written.",
         ] {
             assert!(

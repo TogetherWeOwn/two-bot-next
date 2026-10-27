@@ -594,7 +594,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
             .collect();
         // The harness boots with a synthetic token no clearance recognizes,
         // so activation narrows every clearable surface while scorecard
-        // stays: the single boot PUT carries exactly the seven core commands
+        // stays: the single boot PUT carries exactly the eight core commands
         // plus scorecard, each once. Uncleared
         // surfaces stay unpublished (and refused at dispatch) rather than
         // advertised.
@@ -608,6 +608,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "reopen",
                 "welcome-preview",
                 "game-mix",
+                "goodbye-preview",
                 "attendance"
             ],
             "publish the narrowed shared registry exactly once, nothing withheld or extra"

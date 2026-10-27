@@ -46,6 +46,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-inspect", "docs/parity.md §1 feed-inspect"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("game-mix", "docs/parity.md §1 game-mix"),
+    ("goodbye-preview", "docs/parity.md §1 goodbye preview"),
     ("lfg-edit", "docs/parity.md §1 #26 Next-only companion"),
     ("command-disable", "docs/parity.md §1 command-disable"),
     ("command-enable", "docs/parity.md §1 command-enable"),
@@ -329,6 +330,18 @@ pub fn expected_registry() -> Value {
             ]
         }),
     );
+    // Next-only goodbye preview, immediately after game-mix: same staff gate and
+    // optionless shape as welcome-preview, pinned as an independent literal.
+    commands.insert(
+        7,
+        json!({
+            "name": "goodbye-preview",
+            "description": "Privately preview the current goodbye post for a synthetic member. No delivery.",
+            "dm_permission": false,
+            "default_member_permissions": "32",
+            "options": []
+        }),
+    );
     // Next-only saved-response inspection or unsaved draft preview. This
     // independent literal pins the whole publication contract; never
     // manufacture it from production shapes.
@@ -427,8 +440,8 @@ pub fn expected_registry() -> Value {
         + 1;
     commands.insert(after_edit, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 19, immediately after sticky-remove, with
-    // game-mix, welcome-preview, pause/resume and inspection inserts above)
+    // publish position (index 20, immediately after sticky-remove, with
+    // game-mix, goodbye-preview, welcome-preview, pause/resume and inspection inserts above)
     // as the exact published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
         CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
@@ -567,7 +580,7 @@ pub fn expected_registry() -> Value {
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(19, giveaway);
+    commands.insert(20, giveaway);
     // Next-only feed lifecycle pair. These independent literals pin the whole
     // publication contract; never manufacture them from production shapes.
     // The feed-remove lookup stays dynamic so the giveaway insert above does

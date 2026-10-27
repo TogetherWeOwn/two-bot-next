@@ -7,7 +7,7 @@ use two_bot_core::message_safety::{text_len, CONTENT_LIMIT};
 use two_bot_core::RouterRefusal;
 
 // A synthetic, roleless identity, never resolved via Discord or the member store.
-const FIXTURE_MEMBER_ID: u64 = 765_432_109_876_543_210;
+pub(super) const FIXTURE_MEMBER_ID: u64 = 765_432_109_876_543_210;
 const BANNER_PREFIX: &str = "Preview — not a delivery";
 
 /// The onboarding receive-relative ACK owns this slash, including refusals.
@@ -29,7 +29,7 @@ pub(crate) fn is_preview_control(interaction: &Interaction) -> bool {
 }
 
 impl OnboardingRuntime {
-    fn preview_banner(&self) -> String {
+    pub(super) fn preview_banner(&self) -> String {
         // Mode is boot-only. Use a fixed label even on configuration failure;
         // no raw deployment/stored values may reach the guidance response.
         let mode = match self

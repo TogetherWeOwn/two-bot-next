@@ -570,7 +570,7 @@ mod tests {
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
         let default = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(default.len(), 7);
+        assert_eq!(default.len(), 8);
         assert!(
             default.iter().any(|def| def.name == "reopen"),
             "reopen is core-always in the default registry"
@@ -583,6 +583,10 @@ mod tests {
             default.iter().any(|def| def.name == "game-mix"),
             "game-mix is core-always in the default registry"
         );
+        assert!(
+            default.iter().any(|def| def.name == "goodbye-preview"),
+            "goodbye-preview is core-always in the default registry"
+        );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
         env.insert("TWO_COMMUNITY_SCORECARD".into(), "1".into());
@@ -591,9 +595,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 43 all-gate builtins: 7 core + 1 scorecard + 12 automation
+            // 44 all-gate builtins: 8 core + 1 scorecard + 12 automation
             // + 12 announcements + 9 moderation mutations + 2 private reads.
-            43
+            44
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -602,6 +606,10 @@ mod tests {
         assert!(
             all_on.iter().any(|def| def.name == "game-mix"),
             "game-mix survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "goodbye-preview"),
+            "goodbye-preview survives the all-on registry"
         );
         assert!(
             all_on.iter().any(|def| def.name == "giveaway"),
@@ -633,7 +641,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 64);
+        assert_eq!(with_voice.len(), 65);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -641,6 +649,10 @@ mod tests {
         assert!(
             with_voice.iter().any(|def| def.name == "game-mix"),
             "game-mix survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "goodbye-preview"),
+            "goodbye-preview survives the voice registry"
         );
         assert!(
             with_voice.iter().any(|def| def.name == "giveaway"),

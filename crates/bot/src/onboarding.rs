@@ -25,6 +25,14 @@ use crate::gateway::GatewayPipeline;
 #[path = "welcome_preview.rs"]
 mod welcome_preview;
 pub(crate) use welcome_preview::{is_preview_control, owns_welcome_preview};
+#[path = "goodbye_preview.rs"]
+mod goodbye_preview;
+pub(crate) use goodbye_preview::owns_goodbye_preview;
+
+/// Either admin preview slash: onboarding owns its ACK and private refusal.
+pub(crate) fn owns_preview_command(interaction: &Interaction) -> bool {
+    owns_welcome_preview(interaction) || owns_goodbye_preview(interaction)
+}
 
 const CONFIG_KEYS: &[&str] = &[
     "DISCORD_GUILD_ID",
@@ -415,7 +423,7 @@ impl OnboardingRuntime {
             .as_ref()
             .and_then(|member| member.user.as_ref())
             .is_some_and(|user| !user.bot)
-            && (if owns_welcome_preview(&interaction) {
+            && (if owns_preview_command(&interaction) {
                 // Refusals belong here too: defer before private authorization
                 // guidance, but never read settings for a non-admin.
                 !matches!(
@@ -469,7 +477,7 @@ impl OnboardingRuntime {
         &self,
         interaction: &Interaction,
     ) -> Result<(), RuntimeError> {
-        if owns_welcome_preview(interaction) {
+        if owns_preview_command(interaction) {
             return self
                 .preview_guidance(
                     interaction,
@@ -508,6 +516,9 @@ impl OnboardingRuntime {
         let interaction = interaction.as_ref();
         if owns_welcome_preview(interaction) {
             return self.welcome_preview(interaction, now_ms).await;
+        }
+        if owns_goodbye_preview(interaction) {
+            return self.goodbye_preview(interaction).await;
         }
         if welcome_preview::is_preview_control(interaction) {
             return self.reply(interaction, "This menu is a preview, not a delivery. No selection was applied. Use the newcomer menu for real selections.").await;

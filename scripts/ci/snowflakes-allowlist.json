@@ -2,8 +2,8 @@
   {
     "path": "crates/bot/src/welcome_preview.rs",
     "value": "765432109876543210",
-    "source": "const FIXTURE_MEMBER_ID: u64 = 765_432_109_876_543_210;",
-    "reason": "Fixed documented synthetic welcome-preview identity required by the private read-only rendering contract; no Discord/member lookup or delivery uses it. Protected acceptance tests pin this exact fixture and zero effects. This is not a deployment/member configuration ID."
+    "source": "pub(super) const FIXTURE_MEMBER_ID: u64 = 765_432_109_876_543_210;",
+    "reason": "Fixed documented synthetic welcome-preview and goodbye-preview identity required by the private read-only rendering contract; no Discord/member lookup or delivery uses it. Protected acceptance tests pin this exact fixture and zero effects. This is not a deployment/member configuration ID."
   },
   {
     "path": "crates/bot/src/audit_runtime_tests.rs",

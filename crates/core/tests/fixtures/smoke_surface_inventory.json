@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 42,
+  "count": 43,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -262,6 +262,18 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only private staff aggregate; seeded game activity and failure cases are pinned by disposable-database gateway acceptance, outside the live smoke five."
+    },
+    {
+      "name": "goodbye-preview",
+      "description": "Privately preview the current goodbye post for a synthetic member. No delivery.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private fixture rendering, pinned against the live goodbye adjudication and zero writes with a disposable database rather than the live smoke five."
     },
     {
       "name": "attendance",

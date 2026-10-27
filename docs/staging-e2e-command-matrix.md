@@ -9,7 +9,7 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 43 built-in slash commands (core + scorecard + automation +
+Scope: 44 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
 the voice set; with the voice gates on it renders 64). No guild was
 touched, no staging secrets used, no credentials created.
@@ -39,6 +39,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 34 | `/reopen` | always | Everyone | Deferred ephemeral reply; a fresh private games or session menu built from current roles and current configured picks, with zero role, channel or funnel writes; games includes a no-change preview select | `kind` required (`games`/`session`); unavailable kinds and failed lookups get private no-effect guidance, guild-only |
 | 42 | `/welcome-preview` | always | ManageGuild | Deferred private configuration preview through the live renderer for roleless synthetic newcomer `765432109876543210`; no delivery or member lookup | `ManageServerRequired`; disabled or invalid configuration gets private no-effect/retry guidance |
 | 43 | `/game-mix` | always | ManageGuild or Administrator | Ephemeral defer then one guild aggregate page: up to ten games per `page`, `play`/`voice` ordering, JSON by default or a readable `summary`; play/in-voice milliseconds and session counts; empty hint or explicit label truncation note; at most 2000 UTF-16 units | `ManageServerRequired`; live guild explicitly refused before read; store failure gives private retry guidance, no fabricated totals; foreign guild/DM ignored |
+| 46 | `/goodbye-preview` | always | ManageGuild | Deferred private preview of the current goodbye post and its first configured destination for a synthetic member whose hostile display name proves the live sanitizer; no delivery, prompt-guard release or member lookup | `ManageServerRequired`; non-session mode, dry run, missing destination or unavailable configuration gets private no-effect guidance |
 | 12 | `/attendance` | `TWO_COMMUNITY_SCORECARD` | ManageEvents | Ephemeral confirmation/refusal; records verified attendee | `ScorecardDisabled`, `ManageEventsRequired`, `event-occurrence` required ≤128, `member` required |
 | 14 | `/command` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name`/`template` required |
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
@@ -85,7 +86,7 @@ unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 43-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 44-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

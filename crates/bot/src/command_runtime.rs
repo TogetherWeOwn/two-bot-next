@@ -1043,7 +1043,7 @@ impl CommandRuntime {
                 // onboarding owns their defer and guidance, so a saturated
                 // shared lane must not race it with a competing busy callback.
                 if self.voice_owns_interaction(&interaction)
-                    || crate::onboarding::owns_welcome_preview(&interaction)
+                    || crate::onboarding::owns_preview_command(&interaction)
                     || crate::onboarding::is_preview_control(&interaction)
                     || matches!(
                         route_interaction(&self.interactions.router, &interaction, None),
@@ -1406,7 +1406,7 @@ impl CommandRuntime {
         let interaction = interaction.as_ref();
         // The onboarding ingress already owns the preview's receive-relative
         // ACK and private refusal. Never double-answer it here.
-        if crate::onboarding::owns_welcome_preview(interaction) {
+        if crate::onboarding::owns_preview_command(interaction) {
             return;
         }
         if ChannelModerationRuntime::accepts(interaction) {
@@ -3195,6 +3195,8 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // Onboarding ingress owns the preview, including its private refusal.
     router.register(Box::new(SliceHandler(HandlerId::WelcomePreview)));
     router.register(Box::new(SliceHandler(HandlerId::GameMix)));
+    // Onboarding ingress also owns this preview's ACK and private refusal.
+    router.register(Box::new(SliceHandler(HandlerId::GoodbyePreview)));
     router
 }
 

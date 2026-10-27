@@ -306,3 +306,30 @@ Results on this head: fmt clean; core onboarding 43 passed; discord
 current); both `--help` outputs print the preflight usage quoted above
 (`two-bot preflight [--json] [--level-role-ids CSV]`, exit 0, no
 credentials needed).
+
+## Private goodbye preview
+
+Run `/goodbye-preview` in the configured server with **Manage Server**. It is
+always discoverable, even when goodbye posts are off, and takes no options. The
+response is private and starts with **Preview — not a delivery**, the mode and
+the fixture identity. It then names the first configured goodbye channel and
+shows the exact text the live departure path would post, built by the same
+adjudication and name sanitizer.
+
+The member is synthetic: a fixed identity with a deliberately hostile display
+name and a seven-day stay, so every preview also shows that markdown and
+mentions in a real name are neutralised. No real member (including the
+invoker) is fetched. There is no goodbye post, no prompt-guard release, no
+funnel or audit write, and the response disables all mentions.
+
+Goodbye posts only run in session mode with dry run off and a configured
+channel. When any of those is missing, or settings cannot be loaded, the
+preview says so and names the next action instead of showing a render: switch
+to session mode, turn off dry run, set a goodbye channel, or try again. An
+unconfirmed initial acknowledgement is never retried.
+
+This is a **configuration preview**, not a permission probe: the live path also
+skips channels the bot cannot post in, and the preview does not check channel
+existence or posting permissions. Use [preflight](preflight.md) for those
+checks. The configured channel shown is the first one; the live path picks the
+first it can post in.

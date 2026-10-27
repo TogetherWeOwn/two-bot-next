@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 43 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 44 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -35,7 +35,7 @@ use crate::commands::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
     /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`,
-    /// `welcome-preview`, `game-mix`).
+    /// `welcome-preview`, `game-mix`, `goodbye-preview`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -123,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 43-row contract in publish order (core, scorecard, automation,
+/// The 44-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -200,6 +200,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "ManageGuild",
             "GameMix",
             "Deferred private guild aggregate page: up to ten games per page, play or voice ordering, JSON or readable summary; play milliseconds, in-voice milliseconds and session counts; empty hint or truthful truncation note. Invalid selectors corrected before a read; live guild refused without a read.",
+            &["Perm:ManageServerRequired"],
+        ),
+        row(
+            "goodbye-preview",
+            46,
+            E2eGate::Always,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "GoodbyePreview",
+            "Deferred private preview of the current goodbye post and destination for a fixed synthetic member; no delivery, member lookup or state mutation. Disabled or unavailable configuration returns private guidance.",
             &["Perm:ManageServerRequired"],
         ),
         row(
