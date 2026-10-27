@@ -151,8 +151,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-15: 16 — `/command-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Create enough enabled/disabled fixture commands with text triggers to span pages; as manager, invoke /command-list with no page, traverse all valid pages, and try invalid/unavailable pages. Check the empty list after cleanup and invoke as a normal member.
-- **Expected:** Manager sees every whole name/trigger/on-off row exactly once in name order without secrets; each nonempty page fits 2,000 UTF-16 units with page/total and a next-page hint when applicable. Missing page equals page:1; empty page 1 keeps its existing reply; invalid/unavailable pages are refused without mutation; normal member is denied.
+- **Action:** Create enough enabled/disabled fixture commands with text triggers to span pages; as manager, invoke /command-list with no page, traverse all valid pages, filter by a name prefix (mixed case, disabled match, no-match, invalid filter), and try invalid/unavailable pages. Check the empty list after cleanup and invoke as a normal member.
+- **Expected:** Manager sees every whole name/trigger/on-off row exactly once in name order without secrets; each nonempty page fits 2,000 UTF-16 units with page/total and a next-page hint when applicable. Filtered pages show the normalized prefix, filtered total and a retained-filter next hint. Missing page equals page:1; empty page 1 keeps its existing reply; empty guild, zero matches and page misses stay distinguishable; invalid filters/pages are refused without mutation; normal member is denied.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-16: 17 — `/schedule`
