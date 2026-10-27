@@ -5,6 +5,7 @@
 //! The two earlier acceptance modules are intentionally unchanged.
 
 mod failures;
+mod final_leave;
 mod names;
 mod storage;
 mod support;
