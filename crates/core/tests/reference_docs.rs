@@ -51,7 +51,8 @@ const COMMAND_NOTES: &str =
     "Bounds below are registry bounds; a dash means no bound is declared there,\n\
 not that handler validation is unlimited. Permissions are Discord default\n\
 member-permission bitfields, not a replacement for runtime authorization.\n\n\
-Offline check: `python3 scripts/cargo_cache.py run -- test -p two-bot-core --test\n\
+Offline check: `python3 scripts/generate_command_reference.py --controller`,\n\
+then `python3 scripts/cargo_cache.py run -- test -p two-bot-core --test\n\
 reference_docs`, plus `python3 scripts/check_docs_index.py --json`.\n\n\
 ## Private command help\n\n\
 Use `/help` for the grouped index of this server's last confirmed publication.\n\
@@ -1117,6 +1118,12 @@ fn reference_prose_cites_existing_tests_docs_and_tooling() {
     assert!(
         wrapper.contains("add_parser('run')"),
         "cited offline-check subcommand is missing"
+    );
+    let generator = std::fs::read_to_string(root.join("scripts/generate_command_reference.py"))
+        .expect("cited generator entry point must be readable");
+    assert!(
+        generator.contains("\"--controller\""),
+        "cited offline-check controller flag is missing"
     );
 }
 
