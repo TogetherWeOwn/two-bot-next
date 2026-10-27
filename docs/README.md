@@ -1,8 +1,7 @@
 # Documentation map
 
-Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
-Empty `{missing,stale,oversize}` = 0; else 1.
-Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
+Rows: `- [Purpose](path.md)`. Check: `python3 scripts/check_docs_index.py --json`
+(empty = pass). Index <12,000; docs <=65,536 unless LARGE_DOCS.
 
 ## References
 
