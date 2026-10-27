@@ -128,8 +128,12 @@ async fn duplicate_collection_drain_and_restart_never_celebrate_the_same_crossin
     let first = pipeline(db.pool().clone(), &mock);
     let event = message(MEMBER, CHANNEL, 0);
     let stamp = at(0);
-    let original = first.collect_at(&event, &stamp, MessageEligibility::default());
-    let already_collected = first.collect_at(&event, &stamp, MessageEligibility::default());
+    let original = first
+        .collect_at(&event, &stamp, MessageEligibility::default())
+        .expect("collect");
+    let already_collected = first
+        .collect_at(&event, &stamp, MessageEligibility::default())
+        .expect("collect");
     assert_eq!(original.len(), 1);
     let awards = first.drain(original).await.unwrap();
     assert_eq!(awards.len(), 1);
@@ -158,7 +162,9 @@ async fn duplicate_collection_drain_and_restart_never_celebrate_the_same_crossin
         1,
         "a second pre-collected batch cannot re-post"
     );
-    let repeated = first.collect_at(&event, &stamp, MessageEligibility::default());
+    let repeated = first
+        .collect_at(&event, &stamp, MessageEligibility::default())
+        .expect("collect");
     let awards = first.drain(repeated).await.unwrap();
     assert!(awards.iter().all(|a| a.awarded == 0 && !a.leveled_up));
     assert!(first.drain(vec![]).await.unwrap().is_empty());
@@ -236,15 +242,19 @@ async fn one_drain_collapses_multiple_crossings_per_member_not_globally() {
         for offset in [0_u64, 1] {
             // Disjoint channel sets pair each exact crossing channel with
             // its own member, independent of post order or incidental prose.
-            batch.extend(pipeline.collect_at(
-                &message(
-                    MEMBER + offset,
-                    CHANNEL + offset * 100 + index as u64,
-                    *seconds,
-                ),
-                &at(*seconds),
-                MessageEligibility::default(),
-            ));
+            batch.extend(
+                pipeline
+                    .collect_at(
+                        &message(
+                            MEMBER + offset,
+                            CHANNEL + offset * 100 + index as u64,
+                            *seconds,
+                        ),
+                        &at(*seconds),
+                        MessageEligibility::default(),
+                    )
+                    .expect("collect"),
+            );
         }
     }
     assert_eq!(batch.len(), 32);

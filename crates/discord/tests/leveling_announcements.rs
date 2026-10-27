@@ -304,11 +304,15 @@ async fn multi_level_burst_in_one_drain_collapses_to_single_highest_level_messag
     stamps.push((68_600, CHANNEL + 15));
     let mut batch = Vec::new();
     for (seconds, channel) in &stamps {
-        batch.extend(pipeline.collect_at(
-            &message_in(*seconds, *channel),
-            &at(*seconds),
-            MessageEligibility::default(),
-        ));
+        batch.extend(
+            pipeline
+                .collect_at(
+                    &message_in(*seconds, *channel),
+                    &at(*seconds),
+                    MessageEligibility::default(),
+                )
+                .expect("collect"),
+        );
     }
     assert_eq!(batch.len(), 16, "every message queues one award request");
     let awards = pipeline.drain(batch).await.unwrap();
