@@ -170,7 +170,7 @@ impl ReadFixture {
         let data = response.data.as_ref().expect("reply data");
         assert!(
             data.flags
-                .unwrap_or_default()
+                .unwrap_or(MessageFlags::empty())
                 .contains(MessageFlags::EPHEMERAL),
             "room access must not be public"
         );

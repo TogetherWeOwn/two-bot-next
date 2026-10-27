@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/voice_room_access_inspect_acceptance_tests.rs",
-      "sha256": "aeaec8a2209c178ff83a487d92b0d2f905bfee4dc0fb2e211785c950952b0aee",
+      "sha256": "617528b9abcfc2ebf3033e13379305f632905d4bfd85055a7d6ed32be53a4137",
       "tests": 11
     },
     {
