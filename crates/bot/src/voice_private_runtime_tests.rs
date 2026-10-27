@@ -1118,3 +1118,124 @@ async fn private_copy_public_again_exact() {
         "Making this room public again: anyone can join, and its ⇩ Join channel is going away."
     );
 }
+
+#[test]
+fn parse_myroom() {
+    let interaction = voice_interaction(Some(command_data("myroom", Vec::new())), None, true);
+    // The role-restriction gate keys on `name()`, so a wrong literal would
+    // let a `/access` restriction on `/myroom` go unenforced.
+    assert_eq!(VoiceCommand::MyRoom.name(), "myroom");
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::MyRoom)
+    );
+    assert!(two_bot_core::voice_access::VOICE_COMMANDS.contains(&"myroom"));
+    let guildless = voice_interaction(Some(command_data("myroom", Vec::new())), None, false);
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[tokio::test]
+async fn myroom_honours_a_role_restriction_before_any_actor_read() {
+    let controls = AccessControls {
+        command_roles: [("myroom".to_owned(), vec![7])].into(),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let request = || voice_interaction(Some(command_data("myroom", Vec::new())), None, true);
+
+    let (_, response) = handle_capture(&runtime, &request()).await;
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::CommandRestricted)
+    );
+    let (_, response) = handle_capture(&runtime, &with_roles(request(), &[7])).await;
+    assert_eq!(
+        response_text(&response.expect("allowed read")),
+        myroom_render(&[])
+    );
+}
+
+/// Run `/myroom` through the real handler against a runtime with `actor`
+/// installed (or none), returning every reply text.
+async fn myroom_replies(
+    runtime: &VoiceRuntime<Store, Http>,
+    actor: Option<GuildActor>,
+) -> Vec<String> {
+    if let Some(actor) = actor {
+        runtime.actors.lock().unwrap().insert(GUILD, actor);
+    }
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    let capture = replies.clone();
+    let request = voice_interaction_as(
+        Some(command_data("myroom", Vec::new())),
+        Some(Permissions::empty()),
+        OWNER,
+    );
+    assert!(
+        handle_voice_interaction(runtime, &request, move |response| {
+            capture.lock().unwrap().push(response_text(&response));
+            async {}
+        })
+        .await
+    );
+    let replies = replies.lock().unwrap().clone();
+    replies
+}
+
+#[tokio::test]
+async fn myroom_without_a_worker_says_warming_up_never_that_no_room_is_owned() {
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let replies = myroom_replies(&runtime, None).await;
+    assert_eq!(
+        replies,
+        ["The voice worker isn't warmed up yet — try again in a moment."]
+    );
+    assert_ne!(replies[0], myroom_render(&[]));
+}
+
+#[tokio::test]
+async fn myroom_with_a_closed_inbox_says_the_worker_stopped_never_that_no_room_is_owned() {
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    let actor = GuildActor {
+        live: LiveGuild::new(GUILD),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    let replies = myroom_replies(&runtime, Some(actor)).await;
+    assert_eq!(replies, [WORKER_LOST_REPLY]);
+}
+
+#[tokio::test]
+async fn myroom_with_a_worker_that_drops_the_reply_says_the_worker_stopped() {
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let actor = GuildActor {
+        live: LiveGuild::new(GUILD),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    let replies = myroom_replies(&runtime, Some(actor)).await;
+    assert_eq!(replies, [WORKER_LOST_REPLY]);
+    assert_ne!(replies[0], myroom_render(&[]));
+}
+
+#[tokio::test]
+async fn myroom_read_fails_closed_without_authoritative_live_evidence() {
+    let (live, store, http, _) = parts();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let owned = worker.owned_rooms(OWNER);
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].0, ROOM);
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(owned.clone()));
+    // A halted worker cannot vouch for what is live.
+    worker.halted = true;
+    assert_eq!(worker.live_owned_rooms(OWNER), None);
+    worker.halted = false;
+    // A disconnected gateway leaves the tracked rows behind; they are stale.
+    worker.live.disconnect();
+    assert_eq!(worker.live_owned_rooms(OWNER), None);
+    assert_eq!(worker.owned_rooms(OWNER), owned);
+}

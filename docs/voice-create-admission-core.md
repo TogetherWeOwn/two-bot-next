@@ -122,7 +122,9 @@ keeps today's effective default (1 room per member, 40 per guild, no
 cooldown); an unparsable or out-of-range value warns with reason
 `invalid_value` and fails closed to that knob's default only.
 A refusal reaches the operator as a `/setup` failure line and a notice; there
-is no per-member reply on a gateway voice join. No retention job prunes
+is no per-member reply on a gateway voice join, so the recorded refusal stays
+context-free (no member room ids); a refused member finds their rooms with
+`/myroom`, which reads live worker state only. No retention job prunes
 `voice_create_reservations`. Unknown-outcome and crash-orphan holds are
 conservative capacity debt across restarts, not automatically expired leases.
 They require evidence-led reconciliation before release; this slice adds no

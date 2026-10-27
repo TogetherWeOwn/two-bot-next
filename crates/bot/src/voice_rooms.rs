@@ -3937,6 +3937,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         rooms
     }
 
+    /// `owned_rooms` for the `/myroom` read: `None` unless live evidence is
+    /// authoritative (gateway connected, snapshot ready, worker not halted),
+    /// matching `kick_room_of`. A disconnected or just-loaded worker may track
+    /// rooms Discord no longer has, so it must not call them live.
+    pub fn live_owned_rooms(&self, member: Snowflake) -> Option<Vec<(Snowflake, bool)>> {
+        if !self.live.read_state().ready || self.halted {
+            return None;
+        }
+        Some(self.owned_rooms(member))
+    }
+
     /// The member's currently owned live rooms as `(room channel, runtime
     /// private)` pairs in channel order. Ownership is the current
     /// `owner_id`, never the original creator. Privacy is the effective
@@ -5937,23 +5948,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             }
                             Ok(CreateClaim::Refused(reason)) => {
                                 observe_voice_operation("create", "refused");
-                                // A per-user-cap refusal names the refused
-                                // member's own live rooms so they can find
-                                // them; every other refusal (and an unknown
-                                // room set) keeps the context-free message
-                                // byte-identical.
-                                let mut message = reason.user_message(&self.admission);
-                                if reason == RefusalReason::UserCap {
-                                    let owned = self.owned_rooms(creation.ticket.member_id);
-                                    if !owned.is_empty() {
-                                        let mentions = owned
-                                            .iter()
-                                            .map(|(channel, _)| format!("<#{channel}>"))
-                                            .collect::<Vec<_>>()
-                                            .join(", ");
-                                        message.push_str(&format!(" Your live rooms: {mentions}."));
-                                    }
-                                }
+                                // The recorded refusal stays context-free: it is an
+                                // operator diagnostic (`/setup`, logging notices) with
+                                // no per-member reply, so member room ids do not
+                                // belong in it or in its dedup key. Members find their
+                                // rooms with `/myroom`.
+                                let message = reason.user_message(&self.admission);
                                 self.record(LifecycleFailure::CreateRefused {
                                     creator_id: creator_channel_id,
                                     reason,
@@ -7937,7 +7937,7 @@ enum ActorCommand {
     /// from live worker state only; never touches the store.
     MyRooms {
         member: Snowflake,
-        reply: oneshot::Sender<Vec<(Snowflake, bool)>>,
+        reply: oneshot::Sender<Option<Vec<(Snowflake, bool)>>>,
     },
 }
 
@@ -8948,8 +8948,9 @@ where
 
     /// Read one member's currently owned live rooms (`/myroom`) from the
     /// live worker as `(room channel, runtime private)` pairs. `None` when
-    /// the guild has no live actor, when its inbox already drained, or when
-    /// no answer arrived within `WORKER_ACK_WAIT`.
+    /// the guild has no live actor, when its inbox already drained, when no
+    /// answer arrived within `WORKER_ACK_WAIT`, or when the worker's live
+    /// evidence is not ready.
     pub async fn run_myrooms(
         &self,
         guild: Snowflake,
@@ -8964,7 +8965,7 @@ where
         tokio::time::timeout(WORKER_ACK_WAIT, inbox)
             .await
             .ok()?
-            .ok()
+            .ok()?
     }
 
     /// Invalidate first: even an in-flight task cannot write after GuildDelete.
@@ -10504,7 +10505,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             let _ = reply.send(worker.apply_join_decision(decision));
         }
         ActorCommand::MyRooms { member, reply } => {
-            let _ = reply.send(worker.owned_rooms(member));
+            let _ = reply.send(worker.live_owned_rooms(member));
         }
     }
     accepted_join
