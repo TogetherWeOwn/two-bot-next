@@ -90,6 +90,8 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
 - [Lockdown: no build](time-boxed-lockdown-decision.md)
+- [Lockdown](time-boxed-lockdown-decision.md)
+- [Slowmode](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
@@ -245,6 +247,9 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Presence probe tests](presence-probe-acceptance.md)
 - [REST pacing tests](pacing-backoff-acceptance.md)
 - [Retention acceptance](testing/retention-runtime.md)
+- [Presence probe](presence-probe-acceptance.md)
+- [REST pacing](pacing-backoff-acceptance.md)
+- [Retention runtime](testing/retention-runtime.md)
 
 ## Cutover and watch
 

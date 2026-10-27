@@ -944,7 +944,7 @@ impl OnboardingRuntime {
         let components = picker_components(Some(kind), &role_refs, session_picks);
         let caption = match kind {
             PickerKind::Games => {
-                "Here's your games picker — only you can see this menu. Pick what you play, then submit."
+                "Here's your games picker — only you can see this menu. Choosing in the Apply game roles menu updates your roles right away: unselected catalog game roles are removed, and selecting nothing clears the catalog game roles you hold. The preview menu is preview only, with no role changes."
             }
             PickerKind::Session => {
                 "Here's your session picker — only you can see this menu. Choose what to do, then submit."
