@@ -88,7 +88,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution PII](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
-- [Timed lockdown: no build](time-boxed-lockdown-decision.md)
 - [Lockdown preview](lockdown-preview-spec.md)
 - [Timed lockdown](time-boxed-lockdown-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
