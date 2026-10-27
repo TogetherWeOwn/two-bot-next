@@ -34,6 +34,18 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
+## Saved feed relays
+
+Repeating `/feed-add` for the same channel, kind and normalized source privately
+returns the original relay ID and its observed enabled/paused state. It creates
+and changes nothing, fetches nothing, and never resumes a paused relay. Use the
+copyable `/feed-inspect id:<id>` and `/feed-pause id:<id>` (enabled) or
+`/feed-resume id:<id>` (paused) guidance in the reply; do not delete/re-add.
+A YouTube channel ID and its canonical videos feed URL identify the same source.
+Previously distinct RSS URLs stay distinct; another channel is a separate relay.
+The 25-relay guild cap still refuses first, including paused relays and repeated
+adds at capacity. Genuine storage failures retain the fixed failure reply.
+
 Built-in commands: 64.
 
 ## `/access`
@@ -282,7 +294,11 @@ Show this server's aggregate game activity.
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | 10000 | — | — | Page of saved games to show (10 per page). Default: 1. |
+| `sort` | string | false | — | — | — | Play time = `"play"`; In-voice time = `"voice"` | Order games by play time or in-voice time. Default: play. |
+| `format` | string | false | — | — | — | JSON = `"json"`; Summary = `"summary"` | Show raw JSON or a readable summary. Default: JSON. |
 
 ## `/giveaway`
 
@@ -315,18 +331,20 @@ Create, draw, reroll or cancel a giveaway
 | `reroll` | subcommand | false | — | — | — | — | Redraw the winners |
 | `reroll id` | string | true | — | — | 64 | — | Giveaway id |
 | `reroll user` | user | false | — | — | — | — | Replace only this winner |
+| `inspect` | subcommand | false | — | — | — | — | Privately inspect saved giveaway details in this channel |
+| `inspect id` | string | true | — | — | 64 | — | Giveaway id |
 
 ## `/group`
 
-Toggle shared numbering per category for one creator channel
+Toggle shared numbering per category for one creator channel; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (required: choose on or off) |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
+| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (leave empty to show current settings) |
 
 ## `/help`
 
@@ -503,14 +521,14 @@ No options.
 
 ## `/position`
 
-Set where new rooms appear and the first room number
+Set where new rooms appear and the first room number; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
 | `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
 | `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
 
@@ -724,14 +742,14 @@ Temporarily ban a member
 
 ## `/textchannels`
 
-Toggle companion text channels for one creator channel
+Toggle companion text channels for one creator channel; channel alone shows current settings
 
 - Default permissions: ManageChannels (`16`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure (alone: show current settings) |
 | `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (leave empty to keep the stored value) |
 | `name` | string | false | — | — | 100 | — | Companion channel name (default voice-chat) |
 | `viewer-role` | role | false | — | — | — | — | Extra role that may view companions (@everyone for all) |

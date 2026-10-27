@@ -63,16 +63,14 @@ fn refusal_message(worker: &GuildRoomWorker<Store, Http>, reason: RefusalReason)
 }
 
 #[tokio::test]
-async fn user_cap_refusal_links_every_known_currently_owned_room_only() {
-    // Break caught: rendering the count alone, using original_creator_id, or
-    // listing every guild room instead of the refused member's owned rooms.
+async fn control_user_cap_refusal_record_stays_context_free_even_with_owned_rooms() {
+    // The recorded refusal is an operator diagnostic: a gateway voice join has
+    // no per-member reply, and member-specific text would split the failure
+    // dedup key and notice ledger. Break caught: embedding any owned room id.
     let worker = refusal(RefusalReason::UserCap, true).await;
-    let text = refusal_message(&worker, RefusalReason::UserCap);
-    assert!(text.contains("<#500>"), "missing owned room: {text}");
-    assert!(text.contains("<#501>"), "missing second owned room: {text}");
-    assert!(
-        !text.contains("<#502>"),
-        "another owner's room leaked: {text}"
+    assert_eq!(
+        refusal_message(&worker, RefusalReason::UserCap),
+        "You already have a temporary voice channel."
     );
 }
 
