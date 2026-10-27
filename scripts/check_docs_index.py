@@ -22,6 +22,9 @@ import re
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
+# The authored commands.md landing stays indexed. This optional build output
+# has separate read-only drift tests and still obeys the byte budget if present.
+GENERATED_DOCS = frozenset({"docs/generated/commands.md"})
 DOC_LIMIT = 64 * 1024
 INDEX_LIMIT = 12_000  # Strictly below 12 KB, including UTF-8 and Markdown syntax.
 LARGE_DOCS = {
@@ -67,9 +70,9 @@ def check(root=ROOT, large_docs=LARGE_DOCS):
                 stale.add(f"docs/README.md:{number}")
                 continue
             indexed.add(name)
-            if name not in files:
+            if name not in files and name not in GENERATED_DOCS:
                 stale.add(name)
-    missing = set(files) - indexed
+    missing = set(files) - indexed - GENERATED_DOCS
     if not index.is_file():
         missing.add("docs/README.md")
     oversize = {
