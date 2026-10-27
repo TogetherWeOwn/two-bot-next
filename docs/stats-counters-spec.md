@@ -53,15 +53,18 @@ Design budget (checked by the offline check in §7):
   digits with `,` grouping. Names are always under 100 characters.
 - **Staleness label.** If the reading is older than 1800 s (source read failed,
   roster truncated as in [website_jobs](../crates/bot/src/website_jobs.rs#L1147), rename blocked), the
-  next permitted rename appends ` (stale)`, and it has priority over a value
-  update. The label clears on the next fresh applied value. The bot never writes
-  a value it did not read this cycle.
+  next permitted rename appends a space and `(stale)` to `last_value`, and it
+  has priority over a value update. A stale rename reuses `last_value` only to
+  mark it stale, never as a fresh number. The label clears on the next fresh
+  applied value. For fresh value updates the bot never writes a value it did not
+  read this cycle.
 - **Residual, disclosed.** The label itself needs a rename. If a 429, permission
   loss or deletion blocks that too, the channel keeps an old number unlabeled.
-  State `stale_unlabeled` then raises a staff alert (log and metric by counter ID,
+  State `stale_unlabeled` (a counter state, not an outcome) then raises a staff alert (log and metric by counter ID,
   never by guild-visible text). Repeated `stale_unlabeled` is evidence for the
   defer rule, not something to hide.
-- 429: obey `Retry-After`, extend the spacing, no burst retry. Three consecutive
+- 429: obey `Retry-After` (persisted as `retry_after_until`, §4), extend the
+  spacing, no burst retry. Three consecutive
   failures move the counter to `blocked` and alert staff; recovery is a manual
   `resume` command.
 - Counters use the bot-excluded human count (raid-window accounts excluded, as the
@@ -93,7 +96,9 @@ subcommands (not registered): `setup`, `status`, `resume`, `teardown`.
 - **Manual rename** (read-back or channel-update shows a name other than the last
   one the bot applied): state `drifted`. The bot does **not** rename back, since
   that would spend the budget and fight an admin. It pauses until `resume` or
-  `teardown`.
+  `teardown`. **Precedence:** when an admin rename both uses a budget slot and
+  shows up as drift, `drifted` wins over `DEFERRED_BUDGET`/`RATE_LIMITED`; the
+  slot is still counted, so after `resume` the bot waits the full spacing.
 - **Manual delete**: state `orphaned`. No auto-recreate; an admin runs `setup`
   again, which creates a new generation.
 - **Teardown** stops writes, deletes the state row, and leaves the channel and its
@@ -104,14 +109,18 @@ subcommands (not registered): `setup`, `status`, `resume`, `teardown`.
 
 One new row per counter (no schema is added here): `guild_id`, `counter_id`,
 `channel_id`, `channel_generation`, `state`, `state_version`, `last_value`,
-`last_applied_name`, `last_attempt_at`, `last_success_at`. **No member ID, name,
+`last_applied_name`, `last_attempt_at`, `last_success_at`, `retry_after_until`.
+**No member ID, name,
 role or raw voice list is stored**; the voice count is an in-memory integer.
 
 - **Restart/replay.** The desired name is recomputed from the source, never queued.
   `last_attempt_at` is written before the PATCH, so a crash mid-refresh counts the
   rename as spent: state `uncertain`, wait the full spacing, then read the channel
-  back. A matching name settles to `applied`; no automatic second PATCH within
-  spacing. A restart cannot create an extra rename.
+  back. A matching name settles to `active` and reports `APPLIED` (an outcome,
+  not a state); no automatic second PATCH within spacing. A 429 stores its
+  `Retry-After` deadline in `retry_after_until`, and the refresh flow sends no
+  PATCH before it, even after a restart; `last_attempt_at` still enforces the
+  fixed spacing. A restart cannot create an extra rename.
 - **Retention/erasure.** Row deleted at teardown and by the existing guild-purge
   queue on true guild removal ([privacy](privacy.md#retention-and-explicit-exceptions));
   a rejoin cancels the purge. Member erasure has nothing to erase beyond what the
@@ -127,7 +136,7 @@ One repo source: this document. No live flags. Future agents may read `status`;
 they cannot run `setup` or `teardown` for an admin.
 
 ```json
-{"version":1,"counter_id":"stats.human_members.v1","channel_id":"789","channel_generation":"2","outcome":"refused","reason":"STALE_UNLABELED","retryable":false,"next_action":"staff_resume_or_teardown","effects":{"renames":0,"db_writes":0}}
+{"version":1,"counter_id":"stats.human_members.v1","channel_id":"789","channel_generation":"2","outcome":"stale","reason":"STALE_UNLABELED","retryable":false,"next_action":"staff_resume_or_teardown","effects":{"renames":0,"db_writes":0}}
 ```
 
 Envelopes are at most 8 KiB, depth 4; reject duplicate or unknown fields. Unknown
@@ -147,7 +156,8 @@ effects are `null`, not zero.
 
 ## 6. Finite state/test matrix
 
-States: `off`, `active`, `drifted`, `orphaned`, `blocked`, `uncertain`, `fenced_off`.
+States: `off`, `active`, `stale_unlabeled`, `drifted`, `orphaned`, `blocked`,
+`uncertain`, `fenced_off`. Outcomes such as `APPLIED` are not states.
 Design oracles only, **not executed tests**. Future tests use synthetic IDs, fixed
 clocks and recording Discord doubles, never production or staging.
 
@@ -157,10 +167,10 @@ clocks and recording Discord doubles, never production or staging.
 | S02 | Non-admin or foreign guild runs setup | `NOT_ADMIN`/`FENCED_OFF`; zero effects |
 | S03 | Setup on a managed room, bound channel or without Manage Channels | `INVALID_INPUT`; no row, no rename |
 | S04 | Count changes every minute for an hour | At most one rename per 660 s, so at most one in any 10-minute window |
-| S05 | Rename budget exhausted (429 or admin rename uses the second slot) | `RATE_LIMITED`/`DEFERRED_BUDGET`; honor Retry-After; no burst |
-| S06 | Source read fails or roster truncated past 1800 s | ` (stale)` label at next slot, never a guessed number |
+| S05 | Rename budget exhausted by a 429 or the bot's own spacing | `RATE_LIMITED`/`DEFERRED_BUDGET`; honor `retry_after_until`, also after restart; no burst |
+| S06 | Source read fails or roster truncated past 1800 s | `(stale)` suffix at next slot on `last_value`, never a guessed number |
 | S07 | Rename blocked while stale | `STALE_UNLABELED`; staff alert; no hidden retry loop |
-| S08 | Admin renames the channel | `drifted`; no rename-back until `resume` |
+| S08 | Admin renames the channel (also consumes a slot) | `drifted` wins over budget deferral; no rename-back until `resume`; full spacing after `resume` |
 | S09 | Admin deletes the channel | `orphaned`; no auto-recreate; new generation on re-setup |
 | S10 | Guild unfenced, then re-fenced | `fenced_off`; zero PATCHes; resume only by `resume` |
 | S11 | Crash between row write and PATCH, or after PATCH | `uncertain`; full spacing; read back; no double rename |
