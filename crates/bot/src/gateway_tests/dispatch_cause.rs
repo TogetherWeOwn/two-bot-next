@@ -216,13 +216,13 @@ async fn start_runner(pool: &PgPool, peer: &Peer, leveling_pool: &PgPool) -> Run
     // leveling award, or these tests would exercise the commit path instead
     // of the drain-failure site.
     assert!(
-        !build_pipeline(vec![], None)
+        build_pipeline(vec![], None)
             .collect_at(
                 &message_event(),
                 &two_bot_core::now_iso(),
                 two_bot_discord::MessageEligibility::default(),
             )
-            .is_empty(),
+            .is_ok_and(|requests| !requests.is_empty()),
         "fixture message must queue a leveling award"
     );
     let pipeline = Arc::new(build_pipeline(

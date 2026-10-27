@@ -60,6 +60,7 @@
 - [audit delivery halt](#alert-audit-delivery-halt)
 - [eventsub reconcile failed](#alert-eventsub-reconcile-failed)
 - [EventSub tampered](#alert-eventsub-tampered)
+- [gateway drain skips](#alert-gateway-drain-skips)
 - [retention replay needed](#alert-retention-replay-needed)
 - [voice dispatch timeouts](#alert-voice-dispatch-timeouts)
 - [voice watchdog stucks](#alert-voice-watchdog-stucks)
