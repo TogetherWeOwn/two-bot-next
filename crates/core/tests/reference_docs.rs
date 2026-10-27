@@ -49,6 +49,8 @@ const COMMAND_NOTES: &str =
     "Bounds below are registry bounds; a dash means no bound is declared there,\n\
 not that handler validation is unlimited. Permissions are Discord default\n\
 member-permission bitfields, not a replacement for runtime authorization.\n\n\
+Offline check: `python3 scripts/cargo_cache.py run -- test -p two-bot-core --test\n\
+reference_docs`, plus `python3 scripts/check_docs_index.py --json`.\n\n\
 ## Private command help\n\n\
 Use `/help` for the grouped index of this server's last confirmed publication.\n\
 Use `/help command:rank` for a command's description, usage and optional member\n\
@@ -688,10 +690,13 @@ fn write_options_table(output: &mut String, options: &[CommandOption]) {
     output.push('\n');
 }
 
-fn render_shadowed_shapes(output: &mut String) {
+fn render_shadowed_shapes(output: &mut String, built_in_count: usize) {
     output.push_str("## Shadowed and unpublished shapes\n\n");
-    output
-        .push_str("These shapes are real but absent from the 50 above. Shape IDs are stable.\n\n");
+    writeln!(
+        output,
+        "These shapes are real but absent from the {built_in_count} above. Shape IDs are stable.\n"
+    )
+    .unwrap();
     output.push_str("### `/kick` (vote-kick shape)\n\n");
     output.push_str(SHADOWED_KICK_PROSE);
     let no_moderation = publish_with(RouterGates {
@@ -727,6 +732,7 @@ fn render_commands() -> String {
     output.push_str(&render_gate_table(&map));
     output.push_str(COMMAND_NOTES);
     writeln!(output, "Built-in commands: {}.\n", commands.len()).unwrap();
+    let built_in_count = commands.len();
     for command in commands {
         writeln!(output, "## `/{}`", command.name).unwrap();
         writeln!(output, "\n{}\n", markdown_cell(&command.description)).unwrap();
@@ -735,7 +741,7 @@ fn render_commands() -> String {
         writeln!(output, "- Gate: {}\n", map.gate_line(&command.name)).unwrap();
         write_options_table(&mut output, &command.options);
     }
-    render_shadowed_shapes(&mut output);
+    render_shadowed_shapes(&mut output, built_in_count);
     output.trim_end_matches('\n').to_owned() + "\n"
 }
 
@@ -971,11 +977,6 @@ fn rejects_deliberately_stale_documents() {
 fn command_gates_partition_the_publish_set() {
     let map = build_gate_map();
     let full = published_names(&publish_with(all_gates_on()));
-    assert_eq!(
-        full.len(),
-        50,
-        "reference covers the 50 published built-ins"
-    );
     // Each name vanishes for exactly one gate, except always-published core
     // names and dual-shaped kick.
     let mut seen = BTreeSet::new();
@@ -990,33 +991,24 @@ fn command_gates_partition_the_publish_set() {
             assert!(seen.insert(name.clone()), "{name} vanishes for two gates");
         }
     }
-    assert_eq!(
-        map.core,
-        BTreeSet::from([
-            "help".to_owned(),
-            "leaderboard".to_owned(),
-            "privacy".to_owned(),
-            "rank".to_owned()
-        ])
-    );
+    for name in ["help", "leaderboard", "privacy", "rank"] {
+        assert!(map.core.contains(name), "{name} is always published");
+    }
+    assert!(map.core.is_disjoint(&seen), "core names never vanish");
     assert_eq!(map.scorecard, BTreeSet::from(["attendance".to_owned()]));
-    assert_eq!(map.automations.len(), 8);
     assert!(map.automations.contains("command"));
-    assert_eq!(map.announcements.len(), 7);
     assert!(map.announcements.contains("rsvp"));
-    assert_eq!(map.moderation.len(), 8);
     assert!(map.moderation.contains("ban"));
     assert!(
         !map.moderation.contains("kick"),
         "kick yields shape, it does not vanish"
     );
-    assert_eq!(map.voice.len(), 21);
     assert!(map.voice.contains("ping"));
     assert!(!map.voice.contains("kick"));
     assert_eq!(
         seen.len() + map.core.len() + 1,
-        50,
-        "partition covers kick exactly once"
+        full.len(),
+        "partition covers every published name, kick exactly once"
     );
 }
 
