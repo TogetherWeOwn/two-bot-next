@@ -142,7 +142,9 @@ an earlier version drains on its next tick without probing. Only inbound
 requests renew activity, so the container stops 15 minutes after the last one.
 The next owned request (`/health`, `/readyz`, the ops reads) starts it again;
 deploy verify and the drills poll `/readyz` and wake it the same way. A cold
-start answers `503` until the gateway connects (about two minutes). 15 minutes
+probe answers `500` while the container starts (the six-second probe deadline
+trips long before the two-minute auto-start finishes), then `503` until the
+gateway connects. 15 minutes
 outlasts the post-deploy voice synthetic, a 10-minute job that sends no Worker
 traffic. While staging sleeps it has no readiness or metrics alerts, and the
 bot is offline in the staging guild until something wakes it. An armed
