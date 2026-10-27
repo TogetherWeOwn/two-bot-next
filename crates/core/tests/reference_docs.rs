@@ -98,9 +98,10 @@ admin-only, but unpublished in every gate state until its slice lands with a\n\
 handler: no published command may lack one. Dispatch answers `Unknown` in the\n\
 configured guild (`Ignore` elsewhere); the name is reserved, so no custom row\n\
 can take it; the endpoint config currently publishes nothing. The `/help`\n\
-listing and the `two-bot commands` CLI both state the unpublished status.\n\
-Handler spec: the in-repo assistant gate docs (`docs/voice-assistant-core.md`\n\
-config gate); the slice spec itself is tracked on the board.\n\n";
+listing and the `two-bot commands` desired-registry output both omit it, so\n\
+neither implies it is usable (`/help command:templateassistant` answers as an\n\
+unknown name). Gate documentation: `docs/voice-assistant-core.md`; the handler\n\
+slice itself has not landed.\n\n";
 
 const SHADOWED_ASSISTANT_PINS: &str = "Pinned by\n\
 `router::templateassistant_stays_unpublished_until_its_slice_lands`,\n\
