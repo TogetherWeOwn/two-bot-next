@@ -427,11 +427,15 @@ class ReaderCoverageTests(unittest.TestCase):
     # content read and must select the rust job. docs/backup.md left this
     # set: the voice owner-grant journal regression reads its content, so a
     # content edit must select rust (the preconditions is_file check still
-    # holds alongside the content read).
+    # holds alongside the content read). docs/voice-assistant-core.md is the
+    # same shape from a test: reference_docs cites it in prose and asserts
+    # is_file, and no Rust code reads its content, so content edits skip rust
+    # while a deletion still forces all jobs.
     EXISTENCE_ONLY_DOCS = frozenset({
         "docs/staging-soak.md",
         "docs/preflight.md",
         "docs/runbook.md",
+        "docs/voice-assistant-core.md",
     })
 
     def test_rust_content_readers_are_classified_rust(self):
