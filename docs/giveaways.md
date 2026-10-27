@@ -29,6 +29,32 @@ links and deadlines are never cut and rows are never silently dropped. Empty
 inventory says `No open giveaways.`; a failed read says unavailable, not empty.
 The list makes no entry, lifecycle, audit, budget, claim or scheduling changes.
 
+## Strict management options
+
+Every `/giveaway` subcommand is checked as a whole before the bot reads or
+changes anything. A payload that is ambiguous is refused with one private,
+mention-safe reply that names the option to repair; it never picks a winner
+among duplicates and never fills a default after bad input.
+
+- Exactly one subcommand per invocation: `create`, `list`, `inspect`, `cancel`,
+  `end`, `pause`, `resume`, `extend` or `reroll`.
+- Each option may appear once, with its registered type. Unknown options are
+  refused, including on `list`, which takes none.
+- `id` is required for every subcommand except `create` and `list`: 1–64
+  letters, digits, `_` or `-`.
+- `create` needs `prize` (1–200 characters), a duration and `winners`
+  (1–100). `required-role`, `min-account-age-days` and `min-server-age-days`
+  (0–3650) are optional. A `channel` value is still accepted for older
+  callers but never moves the post: giveaways open in the invoking channel.
+- The duration (1–43200 minutes) is `duration` on `create` and
+  `duration-minutes` on `extend`. Each command also accepts the other name for
+  compatibility, but only one of the two, once. Supplying both is refused.
+- `reroll` takes an optional `user`, at most once.
+
+The refusal never repeats what was submitted. A refusal does not take an entry
+budget, an audit row or any lifecycle step, and member entry buttons are
+unaffected.
+
 ## Private saved-state inspection
 
 Inspection shows the stable ID, bounded prize, saved lifecycle, localized
@@ -69,7 +95,10 @@ refresh runs; inspection itself never edits them.
 
 ## Verification
 
-The protected `giveaway_inspect_acceptance` integration target covers saved
+The protected `giveaway_options_acceptance` integration target covers every
+malformed management shape above against the real routed runtime with a
+connection-acquisition spy. The protected `giveaway_inspect_acceptance`
+integration target covers saved
 states, counts, same-channel privacy, malformed options, unavailable reads,
 shared static summaries, hostile Unicode and no-effect controls. Run against
 an authorized disposable database as described in [Contributing](../CONTRIBUTING.md#database-tests):
