@@ -5,6 +5,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_access_strict_shapes_acceptance_tests.rs"]
+mod access_strict_shapes_acceptance;
 #[path = "voice_actor_inbox_backpressure_acceptance_tests.rs"]
 mod actor_inbox_backpressure_acceptance;
 #[path = "voice_admission_config_acceptance_tests.rs"]
@@ -19,6 +21,8 @@ mod cold_authority;
 mod control_plane_overflow_acceptance;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
+#[path = "voice_creator_settings_read_acceptance_tests.rs"]
+mod creator_settings_read_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_disconnect_loud_acceptance_tests.rs"]
@@ -35,6 +39,8 @@ mod event_voice_channels_acceptance;
 mod event_voice_channels_regression;
 #[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
 mod fair_scheduling_acceptance;
+#[path = "voice_config_full_diff_acceptance_tests.rs"]
+mod full_diff_acceptance;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
 #[path = "voice_invite_responder_wiring_tests.rs"]
@@ -63,6 +69,10 @@ mod ownership_receipt_acceptance;
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
 mod responder_admission_acceptance;
+#[path = "voice_import_review_regressions_tests.rs"]
+mod review_regressions;
+#[path = "voice_setup_access_paging_acceptance_tests.rs"]
+mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 #[path = "voice_snapshot_fence_acceptance_tests.rs"]
@@ -5529,7 +5539,9 @@ async fn registered_voice_identity_drives_parsing_and_refused_ids_have_no_effect
     data.guild_id = Some(Id::new(GUILD));
     assert_eq!(
         runtime.parse_voice_command(&voice_interaction(Some(data), None, true)),
-        Some(VoiceCommand::Setup)
+        Some(VoiceCommand::Setup {
+            page: PageArg::Missing,
+        })
     );
     for id in [9001, 9999] {
         let mut data = command_data("create", vec![command_option("name", "lobby")]);
@@ -5564,7 +5576,12 @@ async fn registered_voice_identity_drives_parsing_and_refused_ids_have_no_effect
 #[test]
 fn parse_setup_command() {
     let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
-    assert_eq!(parse_voice_command(&interaction), Some(VoiceCommand::Setup));
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Setup {
+            page: PageArg::Missing,
+        })
+    );
 }
 
 #[test]
@@ -5757,8 +5774,16 @@ async fn channel_manage_channels_never_bypasses_voice_restrictions_or_configurat
         "defaultlimit",
         "alwaysprivate",
     ] {
+        // `/textchannels` strictly decodes its options before the
+        // permission check, so it needs its required `channel` option to
+        // reach the authority refusal under test.
+        let options = if name == "textchannels" {
+            vec![channel_option("channel", CREATOR)]
+        } else {
+            vec![]
+        };
         let mut interaction = voice_interaction(
-            Some(command_data(name, vec![])),
+            Some(command_data(name, options)),
             Some(Permissions::MANAGE_CHANNELS),
             true,
         );
@@ -6592,7 +6617,9 @@ fn access_action(sub: CommandDataOption) -> AccessAction {
 fn parse_access_subcommands() {
     assert_eq!(
         access_action(sub_option("show", vec![])),
-        AccessAction::Show
+        AccessAction::Show {
+            page: PageArg::Missing,
+        }
     );
     assert_eq!(
         access_action(sub_option(
@@ -7783,6 +7810,78 @@ fn parse_textchannels_leaves_unset_options_unset() {
     );
 }
 
+#[test]
+fn parse_textchannels_strict_shape_names_the_offending_field() {
+    let valid_options = || {
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(true)),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ]
+    };
+    let mut cases: Vec<(&'static str, Vec<CommandDataOption>)> = Vec::new();
+    for (field, wrong) in [
+        ("channel", CommandOptionValue::String("bad".to_owned())),
+        ("enabled", CommandOptionValue::String("bad".to_owned())),
+        ("name", CommandOptionValue::Boolean(true)),
+        ("viewer-role", CommandOptionValue::String("bad".to_owned())),
+    ] {
+        let mut options = valid_options();
+        options
+            .iter_mut()
+            .find(|option| option.name == field)
+            .expect("known field")
+            .value = wrong;
+        cases.push((field, options));
+    }
+    for (field, good) in [
+        ("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+        ("enabled", CommandOptionValue::Boolean(true)),
+        ("name", CommandOptionValue::String("lounge".to_owned())),
+        ("viewer-role", CommandOptionValue::Role(Id::new(42))),
+    ] {
+        let mut options = valid_options();
+        options.push(typed_option(field, good));
+        cases.push((field, options));
+    }
+    cases.push((
+        "channel",
+        valid_options()
+            .into_iter()
+            .filter(|option| option.name != "channel")
+            .collect(),
+    ));
+
+    for (expected, options) in cases {
+        let interaction = textchannels_interaction(options, Some(Permissions::MANAGE_CHANNELS));
+        assert_eq!(
+            parse_voice_command(&interaction),
+            Some(VoiceCommand::SetupShapeInvalid {
+                command: "textchannels",
+                field: expected,
+            }),
+            "malformed {expected} must be reported as {expected}"
+        );
+    }
+}
+
+#[test]
+fn textchannels_shape_correction_names_the_field_before_the_usage_example() {
+    for field in ["channel", "enabled", "name", "viewer-role"] {
+        let text = setup_shape_correction("textchannels", field);
+        // The usage example names every option, so only the diagnostic
+        // before it can prove which field the correction blames.
+        let (diagnostic, usage) = text.split_once("Try:").expect("copyable invocation");
+        assert!(diagnostic.contains(&format!("`{field}`")), "{text}");
+        if field != "channel" {
+            assert!(!diagnostic.contains("`channel`"), "{text}");
+        }
+        assert!(usage.contains("/textchannels channel:"), "{text}");
+        assert!(!text.contains("ambiguous"), "{text}");
+    }
+}
+
 fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
     TextChannelsRequest {
         enabled,
@@ -7883,7 +7982,9 @@ fn command_names_key_the_role_restrictions() {
         VoiceCommand::Create {
             name: String::new(),
         },
-        VoiceCommand::Setup,
+        VoiceCommand::Setup {
+            page: PageArg::Missing,
+        },
         VoiceCommand::Ping,
         VoiceCommand::Invite,
         VoiceCommand::TextChannels {
@@ -8872,6 +8973,722 @@ fn setup_member_panel_is_generic() {
         assert!(!panel.description.contains("<#"));
         assert!(!panel.description.chars().any(|c| c.is_ascii_digit()));
     }
+}
+
+// --- `/setup` + `/access show` paging (builder) --------------------------------
+
+fn paging_page_option(value: CommandOptionValue) -> CommandDataOption {
+    CommandDataOption {
+        name: "page".to_owned(),
+        value,
+    }
+}
+
+fn paging_setup_page(options: Vec<CommandDataOption>) -> PageArg {
+    match parse_voice_command(&voice_interaction(
+        Some(command_data("setup", options)),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    )) {
+        Some(VoiceCommand::Setup { page }) => page,
+        other => panic!("not a /setup command: {other:?}"),
+    }
+}
+
+#[test]
+fn setup_page_decoding_is_strict_about_shape() {
+    assert_eq!(paging_setup_page(Vec::new()), PageArg::Missing);
+    assert_eq!(
+        paging_setup_page(vec![paging_page_option(CommandOptionValue::Integer(1))]),
+        PageArg::Page(1)
+    );
+    assert_eq!(
+        paging_setup_page(vec![paging_page_option(CommandOptionValue::Integer(50))]),
+        PageArg::Page(50)
+    );
+    // Huge but well-typed integers stay pages and refuse past-end at dispatch
+    // with the real total.
+    assert!(matches!(
+        paging_setup_page(vec![paging_page_option(CommandOptionValue::Integer(
+            i64::MAX
+        ))]),
+        PageArg::Page(_)
+    ));
+    for options in [
+        vec![paging_page_option(CommandOptionValue::Integer(0))],
+        vec![paging_page_option(CommandOptionValue::Integer(-1))],
+        vec![paging_page_option(CommandOptionValue::Integer(i64::MIN))],
+        vec![paging_page_option(CommandOptionValue::String(
+            "2".to_owned(),
+        ))],
+        vec![paging_page_option(CommandOptionValue::Boolean(true))],
+        vec![paging_page_option(CommandOptionValue::Number(1.0))],
+        vec![paging_page_option(CommandOptionValue::SubCommand(
+            Vec::new(),
+        ))],
+        vec![
+            paging_page_option(CommandOptionValue::Integer(1)),
+            paging_page_option(CommandOptionValue::Integer(1)),
+        ],
+        vec![
+            paging_page_option(CommandOptionValue::Integer(1)),
+            paging_page_option(CommandOptionValue::Integer(2)),
+        ],
+    ] {
+        assert_eq!(paging_setup_page(options), PageArg::Invalid);
+    }
+    // Unrelated options stay ignored, as before paging existed.
+    assert_eq!(
+        paging_setup_page(vec![command_option("other", "x")]),
+        PageArg::Missing
+    );
+}
+
+#[test]
+fn access_show_page_decoding_is_strict_about_shape() {
+    assert_eq!(
+        access_action(sub_option("show", Vec::new())),
+        AccessAction::Show {
+            page: PageArg::Missing,
+        }
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "show",
+            vec![paging_page_option(CommandOptionValue::Integer(2))]
+        )),
+        AccessAction::Show {
+            page: PageArg::Page(2),
+        }
+    );
+    for args in [
+        vec![paging_page_option(CommandOptionValue::Integer(0))],
+        vec![paging_page_option(CommandOptionValue::Integer(-3))],
+        vec![paging_page_option(CommandOptionValue::String(
+            "1".to_owned(),
+        ))],
+        vec![paging_page_option(CommandOptionValue::Boolean(false))],
+        vec![
+            paging_page_option(CommandOptionValue::Integer(1)),
+            paging_page_option(CommandOptionValue::Integer(2)),
+        ],
+    ] {
+        assert_eq!(
+            access_action(sub_option("show", args)),
+            AccessAction::Show {
+                page: PageArg::Invalid,
+            }
+        );
+    }
+    // Other subcommands ignore a stray page: no new surface there.
+    assert_eq!(
+        access_action(sub_option(
+            "role",
+            vec![paging_page_option(CommandOptionValue::Integer(2))]
+        )),
+        AccessAction::RequiredRole(None)
+    );
+}
+
+#[test]
+fn setup_reply_prefix_budget_matches_the_handler_format() {
+    // The handler prefixes every panel with `**{title}**\n` and both panels
+    // title "Voice rooms"; the paging budget subtracts exactly that prefix.
+    assert_eq!(
+        two_bot_core::message_safety::text_len("**Voice rooms**\n"),
+        16
+    );
+    assert_eq!(
+        setup_panel(&SetupSummary {
+            guild_id: GUILD,
+            creators: Vec::new(),
+            tracked_rooms: 0,
+            failures: Vec::new(),
+            halted: false,
+            store_error: None,
+        })
+        .title,
+        "Voice rooms"
+    );
+}
+
+#[test]
+fn setup_single_page_sorts_rows_and_keeps_legacy_lines() {
+    let mut below = CreatorChannel::new(GUILD, 201);
+    below.position = RoomPosition::Below;
+    let summary = SetupSummary {
+        guild_id: GUILD,
+        creators: vec![
+            CreatorChannel::new(GUILD, 203),
+            below,
+            CreatorChannel::new(GUILD, 202),
+        ],
+        tracked_rooms: 2,
+        failures: vec!["create <#200>: rate limited".to_owned()],
+        halted: false,
+        store_error: None,
+    };
+    assert_eq!(setup_page_total(&summary), 1);
+    let panel = setup_panel(&summary);
+    assert_eq!(
+        panel.description,
+        "Voice rooms are running.\n\
+         Creator channels (3)\n\
+         - <#201>: new rooms below\n\
+         - <#202>: new rooms above\n\
+         - <#203>: new rooms above\n\
+         Tracked rooms: 2.\n\
+         Recent failures (1)\n\
+         - create <#200>: rate limited"
+    );
+    assert!(!panel.description.contains("Page "));
+    // One page renders identically through every entry point; out-of-range
+    // render requests clamp (the handler refuses past-end instead).
+    assert_eq!(setup_panel_page(&summary, 1).description, panel.description);
+    assert_eq!(setup_panel_page(&summary, 0).description, panel.description);
+    assert_eq!(
+        setup_panel_page(&summary, 99).description,
+        panel.description
+    );
+}
+
+#[test]
+fn setup_many_pages_stay_bounded_and_cover_every_row_once() {
+    // Descending insertion, an astral failure line (emoji counts 2 UTF-16
+    // units) and halted status: every page budgets before sending.
+    let creators: Vec<CreatorChannel> = (0..120u64)
+        .rev()
+        .map(|index| CreatorChannel::new(GUILD, 10_000 + index))
+        .collect();
+    let summary = SetupSummary {
+        guild_id: GUILD,
+        creators,
+        tracked_rooms: 7,
+        failures: vec!["create <#200>: rate limited 🐢".to_owned()],
+        halted: true,
+        store_error: None,
+    };
+    let total = setup_page_total(&summary);
+    assert!(total > 1, "120 rows cannot fit one bounded reply");
+    let mut covered = Vec::new();
+    for number in 1..=total {
+        let panel = setup_panel_page(&summary, number);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        assert!(
+            two_bot_core::message_safety::text_len(&reply) <= 2000,
+            "page {number} over budget"
+        );
+        assert!(
+            panel
+                .description
+                .contains(&format!("Page {number} of {total}")),
+            "page {number} metadata"
+        );
+        assert!(panel.description.contains("paused"));
+        assert!(panel.description.contains("Tracked rooms: 7."));
+        assert!(panel.description.contains("rate limited"));
+        if number < total {
+            assert!(
+                panel
+                    .description
+                    .contains(&format!("/setup page:{}", number + 1)),
+                "copyable next page on {number}"
+            );
+        }
+        for line in panel.description.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("- <#") {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                covered.push(digits.parse::<u64>().unwrap());
+                assert!(rest[digits.len()..].starts_with('>'), "clipped token");
+            }
+        }
+        assert_eq!(
+            setup_panel_page(&summary, number).description,
+            panel.description,
+            "page {number} is deterministic"
+        );
+    }
+    let expected: Vec<u64> = (0..120u64).map(|index| 10_000 + index).collect();
+    assert_eq!(covered, expected);
+}
+
+fn setup_move_permission_failure(channel_id: Snowflake) -> String {
+    failure_line(&LifecycleFailure::MissingPermission {
+        write: RefusedWrite::Move,
+        channel_id,
+        findings: [
+            VoicePermission::ManageChannels,
+            VoicePermission::MoveMembers,
+            VoicePermission::ViewChannel,
+            VoicePermission::Connect,
+        ]
+        .into_iter()
+        .map(|permission| PermissionFinding {
+            permission,
+            scope: VoicePermissionScope::Channel,
+            category_id: None,
+            channel_id: Some(channel_id),
+        })
+        .collect(),
+    })
+}
+
+#[test]
+fn setup_fitting_diagnostics_keep_the_exact_reply_at_the_transport_boundary() {
+    let channel_id = 100_000_000;
+    let failures: Vec<_> = (0..5)
+        .map(|index| setup_move_permission_failure(channel_id + index))
+        .collect();
+    let diagnostic_lines = failures
+        .iter()
+        .map(|failure| format!("- {failure}"))
+        .collect::<Vec<_>>();
+    // Adding a tracked-room digit crosses 1998/1999/2000/2001 UTF-16 units
+    // without changing the production-shaped diagnostics or creator rows.
+    for (tracked_rooms, expected_units) in [(7, 1998), (77, 1999), (777, 2000), (7777, 2001)] {
+        let summary = SetupSummary {
+            guild_id: GUILD,
+            creators: vec![
+                CreatorChannel::new(GUILD, channel_id),
+                CreatorChannel::new(GUILD, channel_id + 1),
+            ],
+            tracked_rooms,
+            failures: failures.clone(),
+            halted: false,
+            store_error: None,
+        };
+        let prefix = format!(
+            "**Voice rooms**\n\
+             Voice rooms are running.\n\
+             Creator channels (2)\n\
+             - <#100000000>: new rooms above\n\
+             - <#100000001>: new rooms above\n\
+             Tracked rooms: {tracked_rooms}.\n\
+             Recent failures (5)\n"
+        );
+        let full_reply = format!("{prefix}{}", diagnostic_lines.join("\n"));
+        assert_eq!(text_len(&full_reply), expected_units, "boundary fixture");
+        assert_eq!(setup_page_total(&summary), 1);
+        let panel = setup_panel_page(&summary, 1);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        if expected_units <= CONTENT_LIMIT {
+            assert_eq!(reply, full_reply, "keep every fitting diagnostic unchanged");
+            assert!(!reply.contains("Additional failure details not shown"));
+        } else {
+            assert_eq!(
+                reply,
+                format!(
+                    "{prefix}{}\nAdditional failure details not shown: 1.",
+                    diagnostic_lines[..4].join("\n")
+                ),
+                "omit only the complete trailing diagnostic at 2001 units"
+            );
+            assert!(!reply.contains(&failures[4]));
+        }
+        assert!(text_len(&reply) <= CONTENT_LIMIT);
+        assert!(!reply.contains("Page "));
+        assert!(!reply.contains("Next page:"));
+        assert_eq!(setup_panel(&summary), panel);
+        assert_eq!(setup_panel_page(&summary, 1), panel);
+    }
+}
+
+#[test]
+fn setup_overflow_keeps_live_health_then_leading_history_on_every_page() {
+    let channel_id = 1_844_674_407_370_955_615;
+    // Match dispatch order: live health precedes distinct historical failures.
+    let mut failures = vec![health_line(&PermissionFinding {
+        permission: VoicePermission::ManageChannels,
+        scope: VoicePermissionScope::Channel,
+        category_id: None,
+        channel_id: Some(channel_id),
+    })];
+    failures.extend((1..5).map(|index| setup_move_permission_failure(channel_id + index)));
+    let expected_diagnostics = format!(
+        "{}\nAdditional failure details not shown: 1.",
+        failures[..4]
+            .iter()
+            .map(|failure| format!("- {failure}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let summary = SetupSummary {
+        guild_id: GUILD,
+        creators: (0..120)
+            .map(|index| CreatorChannel::new(GUILD, channel_id + index))
+            .collect(),
+        tracked_rooms: 7,
+        failures,
+        halted: true,
+        store_error: None,
+    };
+    let total = setup_page_total(&summary);
+    assert!(total > 1, "exercise diagnostic selection on multiple pages");
+    for number in 1..=total {
+        let panel = setup_panel_page(&summary, number);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        assert!(text_len(&reply) <= CONTENT_LIMIT, "page {number} bound");
+        assert!(reply.contains("paused"));
+        assert!(reply.contains("Tracked rooms: 7."));
+        let (_, diagnostics_and_navigation) = panel
+            .description
+            .split_once("Recent failures (5)\n")
+            .expect("truthful full diagnostic count");
+        let (diagnostics, _) = diagnostics_and_navigation
+            .split_once("\nPage ")
+            .expect("page metadata follows diagnostics");
+        assert_eq!(
+            diagnostics, expected_diagnostics,
+            "page {number} retains the exact ordered prefix, not any subset"
+        );
+        assert!(!reply.contains(&summary.failures[4]), "omit the tail only");
+        assert!(reply.contains(&format!("Page {number} of {total}")));
+        if number < total {
+            assert!(reply.ends_with(&format!("Next page: /setup page:{}", number + 1)));
+        } else {
+            assert!(reply.ends_with(&format!("Page {number} of {total}")));
+        }
+        assert_eq!(setup_panel_page(&summary, number), panel);
+    }
+}
+
+#[test]
+fn setup_worst_case_diagnostics_leave_room_for_rows_and_navigation() {
+    let channel_id = 1_844_674_407_370_955_615;
+    let failure = setup_move_permission_failure(channel_id);
+    assert!(
+        text_len(&failure) > 400,
+        "production-shaped permission failure"
+    );
+    for creators in [
+        Vec::new(),
+        (0..120)
+            .map(|index| CreatorChannel::new(GUILD, channel_id + index))
+            .collect(),
+    ] {
+        for store_error in [None, Some(StoreError::Unavailable.to_string())] {
+            let summary = SetupSummary {
+                guild_id: GUILD,
+                creators: creators.clone(),
+                tracked_rooms: 7,
+                failures: vec![failure.clone(); 5],
+                halted: true,
+                store_error,
+            };
+            let total = setup_page_total(&summary);
+            let mut covered = Vec::new();
+            for number in 1..=total {
+                let panel = setup_panel_page(&summary, number);
+                let reply = format!("**{}**\n{}", panel.title, panel.description);
+                assert!(
+                    text_len(&reply) <= CONTENT_LIMIT,
+                    "page {number}: {} units",
+                    text_len(&reply)
+                );
+                assert!(reply.contains("paused"));
+                assert!(reply.contains("Tracked rooms: 7."));
+                assert!(reply.contains("Recent failures (5)"));
+                assert!(
+                    reply.contains(&failure),
+                    "retain complete actionable diagnostics"
+                );
+                let shown = reply.matches(&format!("- {failure}")).count();
+                assert!(shown < summary.failures.len(), "exercise diagnostic budget");
+                assert!(
+                    reply.contains(&format!(
+                        "Additional failure details not shown: {}.",
+                        summary.failures.len() - shown
+                    )),
+                    "disclose the exact omitted count"
+                );
+                if summary.store_error.is_some() {
+                    assert!(reply.contains("Could not load creator channels"));
+                    assert!(!reply.contains("No creator channels yet"));
+                }
+                if total > 1 {
+                    assert!(reply.contains(&format!("Page {number} of {total}")));
+                    if number < total {
+                        assert!(reply.ends_with(&format!("Next page: /setup page:{}", number + 1)));
+                    }
+                }
+                for line in panel.description.lines() {
+                    if let Some(rest) = line.strip_prefix("- <#") {
+                        let (id, _) = rest.split_once('>').expect("complete creator mention");
+                        covered.push(id.parse::<u64>().unwrap());
+                    }
+                }
+                assert_eq!(
+                    setup_panel_page(&summary, number).description,
+                    panel.description
+                );
+            }
+            let expected: Vec<_> = if summary.store_error.is_some() {
+                Vec::new()
+            } else {
+                creators.iter().map(|creator| creator.channel_id).collect()
+            };
+            assert_eq!(covered, expected);
+        }
+    }
+}
+
+#[test]
+fn setup_oversized_astral_failure_is_omitted_as_a_whole_line() {
+    let summary = SetupSummary {
+        failures: vec![format!("health: <#200> {}", "🐢".repeat(2000))],
+        ..empty_like_summary()
+    };
+    let panel = setup_panel(&summary);
+    let reply = format!("**{}**\n{}", panel.title, panel.description);
+    assert!(text_len(&reply) <= CONTENT_LIMIT);
+    assert!(reply.contains("Recent failures (1)"));
+    assert!(reply.contains("Additional failure details not shown: 1."));
+    assert!(!reply.contains("<#"), "never truncate a diagnostic mention");
+    assert!(!reply.contains('🐢'));
+}
+
+#[test]
+fn setup_empty_and_error_views_stay_single_page() {
+    let empty = SetupSummary {
+        guild_id: GUILD,
+        creators: Vec::new(),
+        tracked_rooms: 0,
+        failures: Vec::new(),
+        halted: false,
+        store_error: None,
+    };
+    assert_eq!(setup_page_total(&empty), 1);
+    assert!(!setup_panel(&empty).description.contains("Page "));
+    let error = SetupSummary {
+        store_error: Some("the store is unavailable".to_owned()),
+        ..empty_like_summary()
+    };
+    assert_eq!(setup_page_total(&error), 1);
+    assert!(!setup_panel(&error).description.contains("Page "));
+}
+
+fn empty_like_summary() -> SetupSummary {
+    SetupSummary {
+        guild_id: GUILD,
+        creators: Vec::new(),
+        tracked_rooms: 0,
+        failures: Vec::new(),
+        halted: false,
+        store_error: None,
+    }
+}
+
+#[test]
+fn setup_page_refusals_stay_short_and_actionable() {
+    for refusal in [
+        setup_page_refusal(),
+        setup_past_end_refusal(1),
+        setup_past_end_refusal(12),
+    ] {
+        assert!(
+            two_bot_core::message_safety::text_len(&refusal) <= 500,
+            "{refusal}"
+        );
+        assert!(refusal.to_ascii_lowercase().contains("page"), "{refusal}");
+        assert!(refusal.contains("/setup"), "{refusal}");
+        assert!(refusal.contains('1'), "{refusal}");
+        assert!(!refusal.contains("<#"), "{refusal}");
+        assert!(!refusal.contains("Creator channels ("), "{refusal}");
+        assert!(!refusal.contains("No creator channels yet."), "{refusal}");
+    }
+    assert!(setup_past_end_refusal(12).contains("12"));
+    assert!(setup_past_end_refusal(1).contains("1 page;"));
+}
+
+#[test]
+fn access_show_single_page_matches_the_legacy_summary() {
+    let mut controls = AccessControls::default();
+    controls.command_roles.insert("kick".to_owned(), vec![7, 8]);
+    controls
+        .command_roles
+        .insert("template".to_owned(), Vec::new());
+    assert_eq!(access_show_total(&controls), 1);
+    let text = access_show_page(&controls, 1);
+    assert_eq!(
+        text,
+        "Room creation: on\n\
+         Required role: none\n\
+         Restricted commands:\n\
+         - /kick: <@&7> <@&8>\n\
+         - /template: admins only"
+    );
+    assert!(!text.contains("Page "));
+    // Out-of-range render requests clamp (the handler refuses past-end).
+    assert_eq!(access_show_page(&controls, 0), text);
+    assert_eq!(access_show_page(&controls, 99), text);
+
+    let empty = AccessControls::default();
+    assert_eq!(access_show_total(&empty), 1);
+    assert_eq!(
+        access_show_page(&empty, 1),
+        "Room creation: on\nRequired role: none\nRestricted commands: none"
+    );
+}
+
+#[test]
+fn access_row_units_keep_exact_capacity_rows_whole() {
+    let roles = vec![7; 314];
+    let whole = format!("- /kick: {}", vec!["<@&7>"; 314].join(" "));
+    let length = text_len(&whole);
+    for capacity in [length, length + 1] {
+        assert_eq!(
+            access_row_units("kick", &roles, capacity),
+            std::slice::from_ref(&whole)
+        );
+    }
+    let segments = access_row_units("kick", &roles, length - 1);
+    assert!(segments.len() > 1, "capacity+1 must split");
+    assert!(segments.iter().all(|segment| text_len(segment) < length));
+    assert_eq!(
+        segments
+            .iter()
+            .map(|segment| segment.matches("<@&7>").count())
+            .sum::<usize>(),
+        roles.len()
+    );
+}
+
+#[test]
+fn access_show_checks_the_whole_reply_before_reserving_page_chrome() {
+    let mut exact = vec![7; 322];
+    *exact.last_mut().unwrap() = 10;
+    let cases = [
+        vec![1_844_674_407_370_955_615; 79],
+        vec![1_844_674_407_370_955_615; 80],
+        vec![7; 314],
+        exact,
+    ];
+    let mut largest = 0;
+    for roles in cases {
+        let expected = format!(
+            "Room creation: on\nRequired role: none\nRestricted commands:\n- /kick: {}",
+            roles
+                .iter()
+                .map(|role| format!("<@&{role}>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(text_len(&expected) <= CONTENT_LIMIT, "single-page fixture");
+        largest = largest.max(text_len(&expected));
+        let mut controls = AccessControls::default();
+        controls.command_roles.insert("kick".to_owned(), roles);
+        assert_eq!(access_show_total(&controls), 1);
+        assert_eq!(
+            access_show_page(&controls, 1),
+            expected,
+            "no continuation labels or extra pages for a fitting reply"
+        );
+    }
+    assert_eq!(largest, CONTENT_LIMIT, "cover the exact transport boundary");
+    let mut controls = AccessControls::default();
+    let mut roles = vec![7; 322];
+    *roles.last_mut().unwrap() = 100;
+    controls.command_roles.insert("kick".to_owned(), roles);
+    let total = access_show_total(&controls);
+    assert!(total > 1, "a 2001-unit reply really does need paging");
+    for number in 1..=total {
+        assert!(text_len(&access_show_page(&controls, number)) <= CONTENT_LIMIT);
+    }
+}
+
+#[test]
+fn access_show_splits_rows_without_clipping_tokens() {
+    let mut controls = AccessControls::default();
+    let roles: Vec<u64> = (0..100).map(|index| u64::MAX - index).collect();
+    controls
+        .command_roles
+        .insert("kick".to_owned(), roles.clone());
+    let total = access_show_total(&controls);
+    assert!(total > 1, "one 100-role row cannot fit one reply");
+    let mut covered = Vec::new();
+    for number in 1..=total {
+        let text = access_show_page(&controls, number);
+        assert!(
+            two_bot_core::message_safety::text_len(&text) <= 2000,
+            "page {number} over budget"
+        );
+        assert!(text.contains("/kick"), "command recurs: {text:.200}");
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("part") || lower.contains("continu"),
+            "continuation label: {text:.200}"
+        );
+        assert!(text.contains("Room creation:"));
+        assert!(text.contains("Required role:"));
+        let mut rest = text.as_str();
+        let marker = "<@&";
+        while let Some(start) = rest.find(marker) {
+            rest = &rest[start + marker.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            covered.push(digits.parse::<u64>().unwrap());
+            assert!(rest[digits.len()..].starts_with('>'), "clipped token");
+        }
+    }
+    assert_eq!(covered, roles);
+}
+
+#[test]
+fn access_post_save_acks_stay_short_and_point_at_show() {
+    let acks = [
+        access_creation_ack(true),
+        access_creation_ack(false),
+        access_required_role_ack(Some(9)),
+        access_required_role_ack(None),
+        access_restrict_ack("kick", &[7]),
+        access_restrict_ack("template", &[]),
+        access_unrestrict_ack("kick"),
+    ];
+    for ack in &acks {
+        assert!(ack.starts_with("Saved."), "{ack}");
+        assert!(two_bot_core::message_safety::text_len(ack) <= 600, "{ack}");
+        assert!(ack.contains("/access show"), "{ack}");
+        assert!(
+            !ack.contains("@everyone") && !ack.contains("@here"),
+            "{ack}"
+        );
+    }
+    assert!(acks[2].contains("Required role: <@&9>"));
+    assert!(acks[3].contains("Required role: none"));
+    assert!(acks[4].contains("- /kick: <@&7>"));
+    assert!(acks[5].contains("- /template: admins only"));
+    assert!(!acks[6].contains("/kick"));
+    // Stored and forged command names can never page a mass mention.
+    assert!(!access_row("@everyone", &[1]).contains("@everyone"));
+    assert!(
+        !access_unrestrict_ack("@everyone").contains("@everyone"),
+        "forged names stay neutralized"
+    );
+}
+
+#[test]
+fn access_page_refusals_stay_short_and_actionable() {
+    for refusal in [
+        access_page_refusal(),
+        access_past_end_refusal(1),
+        access_past_end_refusal(4),
+    ] {
+        assert!(
+            two_bot_core::message_safety::text_len(&refusal) <= 500,
+            "{refusal}"
+        );
+        assert!(refusal.to_ascii_lowercase().contains("page"), "{refusal}");
+        assert!(refusal.contains("/access"), "{refusal}");
+        assert!(refusal.contains('1'), "{refusal}");
+        assert!(
+            !refusal
+                .lines()
+                .any(|line| line.trim_start().starts_with("- /")),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("Restricted commands:"), "{refusal}");
+        assert!(!refusal.contains("<@&"), "{refusal}");
+    }
+    assert!(access_past_end_refusal(4).contains("4 pages"));
 }
 
 #[test]

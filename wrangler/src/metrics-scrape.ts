@@ -1,9 +1,9 @@
-import { processIncarnation, type Sample } from "./alert-rules.ts";
+import { JOB_RUNS_JOBS, processIncarnation, type Sample } from "./alert-rules.ts";
 
 /** Required inputs consumed by alert rules; pinned to metrics.rs in tests. */
 export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
-  two_bot_job_last_success_timestamp_seconds: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
-  two_bot_job_consecutive_failures: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
+  two_bot_job_last_success_timestamp_seconds: { job: JOB_RUNS_JOBS },
+  two_bot_job_consecutive_failures: { job: JOB_RUNS_JOBS },
   two_bot_rest_requests_total: {
     route: ["GET /channels/:channel", "GET /channels/:channel/messages", "GET /guilds/:guild", "GET /guilds/:guild/members", "GET /guilds/:guild/scheduled-events", "DELETE /guilds/:guild/bans/:member", "DELETE /channels/:channel/permissions/:overwrite", "PUT /applications/:application/commands", "PUT /applications/:application/guilds/:guild/commands", "POST /interactions/:interaction/:token/callback", "POST /channels/:channel/messages", "DELETE /channels/:channel/messages/:message", "DELETE /guilds/:guild/members/:member", "PUT /guilds/:guild/bans/:member", "PATCH /guilds/:guild/members/:member", "PATCH /channels/:channel", "PUT /channels/:channel/voice-status", "PUT /channels/:channel/permissions/:overwrite", "POST /channels/:channel/messages/bulk-delete", "PUT /guilds/:guild/members/:member/roles/:role", "DELETE /guilds/:guild/members/:member/roles/:role", "POST /guilds/:guild/scheduled-events", "PATCH /guilds/:guild/scheduled-events/:event", "DELETE /guilds/:guild/scheduled-events/:event", "POST /guilds/:guild/channels", "DELETE /channels/:channel", "GET /guilds/:guild/members/:member", "GET /users/@me", "PATCH /webhooks/:application/:token/messages/@original", "other"],
     result: ["2xx", "3xx", "4xx", "429", "5xx", "transport"],
@@ -40,7 +40,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_gateway_latency_seconds: {},
   two_bot_gateway_reconnects_total: {},
   two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
-  two_bot_job_runs_total: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], outcome: ["success", "failure"] },
+  two_bot_job_runs_total: { job: JOB_RUNS_JOBS, outcome: ["success", "failure"] },
 };
 
 /**
@@ -78,7 +78,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
-  two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
+  two_bot_job_last_error_class: { job: JOB_RUNS_JOBS, class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
   two_bot_rest_guard_breaker_open: {},

@@ -434,7 +434,7 @@ jobs:
       # Lint lane: its own entry (compile-only artifacts), saved on pushes to main only.
       - name: Restore cargo cache
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           shared-key: lint
@@ -762,7 +762,7 @@ jobs:
       # graph). `patch-coverage` owns a separate `coverage` entry: its llvm-cov graph
       # never builds here, so sharing would cold-build every run after a rotation.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           shared-key: check
@@ -878,7 +878,29 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
+        # The invite saturation tests build throwaway schema names from a
+        # wall-clock nanos nonce plus pid, so two tests starting on sibling
+        # threads can observe the same tick and collide on CREATE SCHEMA;
+        # they run serially in their own step below, so skip them here.
+        run: >-
+          cargo test --workspace --test '*' --features two-bot-core/db --locked --
+          --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump
+          --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
+          --skip uses_one_above_i32_max_saturates_and_write_proceeds
+          --skip uses_u64_max_saturates_at_i32_max
+          --skip saturated_write_warns_with_identifiers_and_no_raw_counter
+          --skip normal_uses_round_trip_byte_identical
+          --skip exact_i32_max_writes_without_saturation_warn
+
+      # Invite saturation acceptance is DB-backed and racy under parallelism
+      # (nanos+pid schema nonce; one head collided on CREATE SCHEMA with a
+      # duplicate pg_namespace key), so it runs alone, serially, in a fresh
+      # process (skipped in the parallel sweep above). Sequential tests drop
+      # their schema at finish, so back-to-back nonces cannot collide.
+      - name: cargo test (isolated invite saturation acceptance)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-store --test invite_uses_saturation_acceptance --features two-bot-core/db --locked -- --test-threads=1
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -1128,7 +1150,7 @@ jobs:
       # Own entry: the instrumented llvm-cov graph never builds in `rust-tests`,
       # so this lane saves its own dependency cache on push events.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           shared-key: coverage
@@ -1248,10 +1270,18 @@ jobs:
           # publication regression and game report run in dedicated steps;
           # reengagement runs below against agent_test. Keep them out of the
           # bootstrap sweep so their database guards are exercised correctly.
+          # The invite saturation tests build throwaway schema names from a
+          # wall-clock nanos nonce plus pid and collide under parallelism;
+          # they run serially in the dedicated re-run below, never here.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
             --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only \
+            --skip uses_one_above_i32_max_saturates_and_write_proceeds \
+            --skip uses_u64_max_saturates_at_i32_max \
+            --skip saturated_write_warns_with_identifiers_and_no_raw_counter \
+            --skip normal_uses_round_trip_byte_identical \
+            --skip exact_i32_max_writes_without_saturation_warn \
             --skip settings_jobs::tests::ops_overrides_acceptance_tests::
           # Run the env-mutating ops acceptance alone, before switching away
           # from its disposable bootstrap URL. Failure remains fail-closed.
@@ -1358,6 +1388,11 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_verify_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test staging_migrate_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Invite saturation is racy under parallelism (nanos+pid schema
+          # nonce; skipped in the main sweep above), so its binary runs
+          # alone and serially here. Sequential tests drop their schema at
+          # finish, so back-to-back nonces cannot collide.
+          cov_run "$COV" llvm-cov --no-report -p two-bot-store --features two-bot-core/db --locked --test invite_uses_saturation_acceptance -- --test-threads=1 --skip regenerate_reference_docs
           # Suites pinned to the agent_test database under the empty-password
           # URL form. (MEMBER_TESTDB is exported before the ignored sweep
           # above so the member-moderation suite runs green there too.)
@@ -1634,7 +1669,7 @@ jobs:
 
       # Restore-only: the entry is written by the `rust-tests` lane.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           shared-key: check
@@ -2109,7 +2144,7 @@ jobs:
 
       # Restore-only: the entry is written by the `rust-tests` lane.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           shared-key: check
@@ -2401,7 +2436,7 @@ jobs:
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
@@ -2498,7 +2533,7 @@ jobs:
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
@@ -2778,7 +2813,7 @@ jobs:
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
@@ -2865,7 +2900,7 @@ jobs:
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
@@ -2934,7 +2969,7 @@ jobs:
       # TOG-11810: dependency build cache, as in the `check` job. The key
       # includes the job id, so this job keeps its own entry (it builds a
       # different dependency set); saved only on pushes to main.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
@@ -2997,7 +3032,7 @@ jobs:
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
@@ -3128,6 +3163,16 @@ jobs:
       - name: Verify production deploy guards
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-deploy-production.py
+      - name: Verify immutable bot promotion intake (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_immutable_bot_promotion.py -v
+      - name: Verify immutable promotion subprocess bounds (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_bot_promotion_command_adapter.py -v
+      - name: Verify immutable promotion image copy (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_bot_promotion_copy_adapter.py -v
+      - name: Verify immutable promotion runtime identity (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_production_promotion_runtime_adapters.py -v
+      - name: Verify immutable promotion saved bundles (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_promotion_integration_acceptance.py -v
       # Always runs, even on docs/asset-only fast-pass: the offline suite
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)

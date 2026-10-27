@@ -15,6 +15,7 @@
 - [Secret inventory: names only](#secret-inventory-names-only)
 - [Legacy review and deliberately unported operations](#legacy-review-and-deliberately-unported-operations)
 - [Keep the runbook honest](#keep-the-runbook-honest)
+- [Giveaways](#giveaways)
 
 **Alert anchors**
 
@@ -95,7 +96,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.151.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.152.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -194,7 +195,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.151.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.152.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 Container stdout is also in the Workers Observability `containers` dataset, which a
@@ -2779,7 +2780,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.151 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.152 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
@@ -3624,3 +3625,104 @@ command existence, **not authorization, successful deployment, backup custody,
 Discord effects, or a live rollback**. Required exact-head merge gates remain
 `ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB test
 lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.
+
+## Giveaways
+
+`/giveaway create|list|cancel|end|pause|resume|extend|reroll` requires Manage
+Server; entry buttons are open to human members with per-interaction role and
+age checks. Limits: prize 1–200 characters, duration 1–43200 minutes,
+winners 1–100, 10 active giveaways per guild, 1000 entrants each (one paced
+membership re-check per entrant must fit the 300 s draw run). Entry
+attempts have a bounded process-local 10/minute member budget, and successful
+entries share a durable 10/minute guild/member budget across giveaways and
+restarts. Duplicates collapse to one row. `gw:<id>` carries only the opaque
+id; the server resolves guild, message, deadline, status, requirements and
+capacity.
+
+The giveaway row is recorded before its message posts. If sending or the
+message-id attachment fails, never blindly re-post: inspect the channel for
+a delivered message and cancel the recorded id if needed. An unconfirmed
+definition holds an active slot and takes no entries.
+
+`giveaway_countdown` ticks every 15 seconds; durable claims permit at most
+one cosmetic refresh at each 1h, 10min, 1min and ending-soon threshold
+through the shared REST pacing guard. Count edits are best-effort; the
+entry row stays authoritative when a display edit fails.
+
+`giveaway_draw` ticks every 15 seconds: it claims due giveaways under a
+10-minute lease, re-validates eligibility from fresh membership reads, runs
+the pure draw, commits one draw row and flips to drawn, then announces (edit
+the giveaway message, post the winners with seed and revealed nonce, mark
+announced). Drawn-but-unannounced rows re-announce from the stored row and
+never re-draw; a stale claim with a stored draw skips to announce. Pause
+excludes a giveaway from the due scan; resume extends the deadline by the
+paused span. Rerolls append a new draw round and leave history intact. No
+winner DMs: deferred until a DM send path exists. Staging smoke: create,
+enter from two test members, verify two rows plus ephemeral replies, end,
+verify the draw row plus winners post, reroll, verify a second round, then
+cancel a fresh giveaway and verify a later entry is refused.
+
+### Lifecycle audit and saved-versus-delivered state
+
+Successful pause, resume and extension commands commit one minimal fact in
+`automation_audit_log` in the **same transaction** as the lifecycle/deadline
+change. `actor_id` is the authenticated staff member, not the giveaway creator;
+store-only system calls use NULL. Actions are `giveaway.pause`,
+`giveaway.resume` and `giveaway.extend`, with `guild_id`, the giveaway id as
+`target_key`, `outcome = 'ok'`, a stable fact `id` and `created_at`; `reason`
+stays NULL. No prize/body, entrant roster, seed/nonce, claim capability or raw
+database error belongs in these facts or command logs.
+
+Pause still requires an unclaimed open row. Resume locks the paused row and
+adds the nonnegative paused span before reopening entries. Extend locks an
+open or paused row, adds the validated duration and preserves its status.
+Unknown/foreign targets, wrong states and invalid deadlines create neither a
+transition nor a success fact. Audit insertion failure rolls back the change
+and returns `Giveaway unavailable; try again later.` without a message refresh.
+A resume with a backwards clock still changes paused to open and records a fact,
+even when its deadline does not move.
+
+A fact's random per-write suffix distinguishes repeated valid extensions and
+pause/resume cycles, including equal-timestamp writes. It is **not** a durable
+interaction replay key: submitting a fresh extension can extend again. Existing
+create/cancel identities and round-numbered draw/reroll audit identities do not
+change. Do not infer ordering from the random suffix.
+
+With existing authorized database read access, inspect one guild and giveaway
+using this bounded read (replace both placeholders; no new endpoint or grant):
+
+```sql
+SELECT id, guild_id, actor_id, action, target_key, outcome, created_at
+FROM automation_audit_log
+WHERE guild_id = '<guild-id>' AND target_key = '<giveaway-id>'
+  AND action IN ('giveaway.pause', 'giveaway.resume', 'giveaway.extend')
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+```
+
+The result is a capped snapshot, not a full-history export. An empty successful
+read means no matching retained facts; a failed read means unknown, not empty.
+There is no automatic age-based expiry or actor pseudonymization for this table;
+the 45-day `operational_audit_log` cache policy applies to a different table.
+Existing [member erasure](privacy.md) deletes entire rows matching guild and
+`actor_id`, subject to safety checks, not every fact about that member's
+giveaways. NULL/system and other-actor facts can remain. A true guild removal
+queues guild-wide deletion, including these facts, but only a successful
+executing retention run deletes them: dry-run deletes nothing, rejoin cancels
+the queue entry and guards/failures can defer completion. No new retention
+window, purge trigger or grant is introduced. Existing MCP/ops audit readers
+are not giveaway-audit listing APIs.
+
+The transaction confirms **saved state**, not Discord delivery. The subsequent
+message edit is separate and best-effort: `Giveaway paused/resumed/extended; its
+message could not be refreshed.` means the state and audit are already saved.
+Inspect the saved giveaway and channel before retrying; in particular, do not
+repeat an extension just to repair its display. Even a saved success fact does
+not prove that the final interaction reply reached Discord. For a repeatable
+disposable-DB check, run the protected runtime corpus:
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
+  --test giveaway_actor_audit_acceptance -- --test-threads=1
+```

@@ -89,14 +89,64 @@ pub fn is_snowflake(s: &str) -> bool {
     (17..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// True when `s` is a snowflake Discord could have issued: the legacy shape
+/// plus a nonzero `u64` value. All-zero strings and values past `u64::MAX`
+/// are representable shapes, but no live guild, event or member can carry
+/// them, so event references refuse them before any lookup or write.
+#[must_use]
+fn is_strict_snowflake(s: &str) -> bool {
+    is_snowflake(s) && s.parse::<u64>().is_ok_and(|id| id != 0)
+}
+
 /// Validate an `/rsvp` or `/rsvp-attendance` event id (legacy
-/// `assertSnowflake(eventId, 'event id')`).
+/// `assertSnowflake(eventId, 'event id')`, tightened to ids Discord could
+/// have issued: all-zero and `u64`-overflowing shapes refuse).
 pub fn validate_event_id(value: &str) -> Result<String, RsvpError> {
-    if is_snowflake(value) {
+    if is_strict_snowflake(value) {
         Ok(value.to_owned())
     } else {
         Err(RsvpError::InvalidEventId)
     }
+}
+
+/// Canonical pasted event-link prefix, matched literally: links are parsed
+/// locally only, never fetched, decoded or allow-listed.
+const EVENT_LINK_PREFIX: &str = "https://discord.com/events/";
+
+/// Normalize a pasted Discord event link to its event id (`Some`), or `None`
+/// when the input is not a link. Callers fall through to the existing numeric
+/// / `ID:label` parsing on `None`, so malformed input keeps the legacy
+/// refusals (bounded, never echoing the input).
+///
+/// Accepted shape: exactly
+/// `https://discord.com/events/<guild>/<event>`, optionally wrapped in one
+/// `<...>` pair (Discord's embed-suppressing paste). Both ids are strict
+/// snowflakes (17–20 ASCII digits, nonzero, fitting `u64`); the link guild
+/// must equal the invoking guild. Anything else — other schemes, hosts,
+/// userinfo, ports, trailing dots, queries, fragments, trailing slashes,
+/// extra segments, backslashes, percent-escapes, unbalanced or doubled
+/// brackets, markdown, surrounding text — is not a link.
+#[must_use]
+pub fn normalize_event_link(value: &str, invoking_guild_id: &str) -> Option<String> {
+    let inner = if let Some(unwrapped) = value.strip_prefix('<') {
+        unwrapped.strip_suffix('>')?
+    } else if value.ends_with('>') {
+        return None;
+    } else {
+        value
+    };
+    let rest = inner.strip_prefix(EVENT_LINK_PREFIX)?;
+    let (guild, event) = rest.split_once('/')?;
+    if event.contains('/') {
+        return None;
+    }
+    if !is_strict_snowflake(guild) || guild != invoking_guild_id {
+        return None;
+    }
+    if !is_strict_snowflake(event) {
+        return None;
+    }
+    Some(event.to_owned())
 }
 
 /// One RSVP row (legacy `EventRsvpRow`): the durable per-member response.
@@ -193,6 +243,15 @@ pub fn rsvp_saved_text(status: RsvpStatus) -> String {
     format!("RSVP saved: {}.", status.as_str())
 }
 
+/// `/rsvp` reply when the member pasted an event link: the legacy status
+/// sentence plus the stable numeric identity the link normalized to. The URL
+/// itself is never echoed. Raw numeric input keeps [`rsvp_saved_text`]
+/// byte-identical.
+#[must_use]
+pub fn rsvp_saved_text_with_event(status: RsvpStatus, event_id: &str) -> String {
+    format!("{} Event `{event_id}`.", rsvp_saved_text(status))
+}
+
 /// `/rsvp-attendance` totals reply (legacy `` `Going: ${g}\nInterested:
 /// ${i}\nDeclined: ${d}` ``, ephemeral).
 #[must_use]
@@ -273,11 +332,12 @@ pub struct AttendanceOccurrence {
 /// must anchor to one as `{event_id}:{label}` so the handler can prove the
 /// event exists in this guild before recording; the free-text format stays
 /// accepted (parity §1 #12) while bare slugs with no anchor refuse, because no
-/// live authority could vouch for them. Input must already be trimmed
-/// ([`validate_occurrence_id`]); the anchor and label trim again so the
-/// canonical id has one stable shape.
+/// live authority could vouch for them. Anchors are strict snowflakes: an
+/// all-zero or `u64`-overflowing anchor refuses even behind a label. Input
+/// must already be trimmed ([`validate_occurrence_id`]); the anchor and label
+/// trim again so the canonical id has one stable shape.
 pub fn parse_attendance_occurrence(value: &str) -> Result<AttendanceOccurrence, CheckinError> {
-    if is_snowflake(value) {
+    if is_strict_snowflake(value) {
         return Ok(AttendanceOccurrence {
             anchor_event_id: value.to_owned(),
             canonical_id: value.to_owned(),
@@ -288,7 +348,7 @@ pub fn parse_attendance_occurrence(value: &str) -> Result<AttendanceOccurrence, 
         .ok_or(CheckinError::UnanchoredOccurrence)?;
     let anchor = anchor_raw.trim();
     let label = label_raw.trim();
-    if !is_snowflake(anchor) || label.is_empty() {
+    if !is_strict_snowflake(anchor) || label.is_empty() {
         return Err(CheckinError::UnanchoredOccurrence);
     }
     Ok(AttendanceOccurrence {
@@ -551,7 +611,9 @@ mod tests {
             text in proptest::collection::vec(any::<char>(), 0..128)
                 .prop_map(|chars| chars.into_iter().collect::<String>()),
         ) {
-            let expected_id = (17..=20).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
+            let expected_id = (17..=20).contains(&text.len())
+                && text.bytes().all(|b| b.is_ascii_digit())
+                && text.parse::<u64>().is_ok_and(|id| id != 0);
             prop_assert_eq!(validate_event_id(&text).is_ok(), expected_id);
             if let Ok(id) = validate_event_id(&text) {
                 prop_assert_eq!(validate_event_id(&id), Ok(id));
@@ -565,8 +627,10 @@ mod tests {
             digits in "[0-9]{0,23}",
             status in prop::sample::select(RsvpStatus::ALL.to_vec()),
         ) {
-            prop_assert_eq!(validate_event_id(&digits).is_ok(), (17..=20).contains(&digits.len()));
-            if (17..=20).contains(&digits.len()) {
+            let expected = (17..=20).contains(&digits.len())
+                && digits.parse::<u64>().is_ok_and(|id| id != 0);
+            prop_assert_eq!(validate_event_id(&digits).is_ok(), expected);
+            if expected {
                 prop_assert_eq!(validate_event_id(&digits), Ok(digits));
             }
             prop_assert_eq!(RsvpStatus::parse(&status.to_string()), Ok(status));
@@ -620,10 +684,95 @@ mod tests {
             validate_event_id(&"9".repeat(21)),
             Err(RsvpError::InvalidEventId)
         );
-        // 17-digit lower bound and 20-digit upper bound both pass.
+        // 17-digit lower bound passes; the 20-digit shape passes only when it
+        // fits a nonzero u64 (all-zero and overflowing shapes refuse).
         assert!(validate_event_id(&"1".repeat(17)).is_ok());
-        assert!(validate_event_id(&"9".repeat(20)).is_ok());
+        assert_eq!(
+            validate_event_id(&"9".repeat(20)),
+            Err(RsvpError::InvalidEventId)
+        );
+        assert_eq!(
+            validate_event_id("18446744073709551615"),
+            Ok("18446744073709551615".to_owned())
+        );
+        assert_eq!(
+            validate_event_id("18446744073709551616"),
+            Err(RsvpError::InvalidEventId)
+        );
+        assert_eq!(
+            validate_event_id("00000000000000000"),
+            Err(RsvpError::InvalidEventId)
+        );
         assert!(!is_snowflake("1234567890123456x"));
+    }
+
+    #[test]
+    fn event_links_normalize_to_the_invoking_guild_event() {
+        let link = format!("https://discord.com/events/{GUILD}/{EVENT}");
+        assert_eq!(normalize_event_link(&link, GUILD), Some(EVENT.to_owned()));
+        assert_eq!(
+            normalize_event_link(&format!("<{link}>"), GUILD),
+            Some(EVENT.to_owned())
+        );
+        // Non-links fall through to the numeric / ID:label parsers.
+        assert_eq!(normalize_event_link(EVENT, GUILD), None);
+        assert_eq!(
+            normalize_event_link(&format!("{EVENT}:weekly"), GUILD),
+            None
+        );
+        assert_eq!(normalize_event_link("", GUILD), None);
+    }
+
+    #[test]
+    fn event_link_refusals_stay_literal_and_guild_bound() {
+        let link = format!("https://discord.com/events/{GUILD}/{EVENT}");
+        let foreign = "1545644954272137001";
+        let overflow = "18446744073709551616";
+        for not_a_link in [
+            format!("https://discord.com/events/{foreign}/{EVENT}"),
+            link.replacen("https:", "http:", 1),
+            link.replacen("discord.com", "discordapp.com", 1),
+            link.replacen("discord.com", "www.discord.com", 1),
+            link.replacen("discord.com", "discord.com.evil.example", 1),
+            link.replacen("discord.com", "user@discord.com", 1),
+            link.replacen("discord.com", "discord.com:443", 1),
+            link.replacen("discord.com", "discord.com.", 1),
+            format!("{link}?x=1"),
+            format!("{link}#frag"),
+            format!("{link}/"),
+            format!("{link}/extra"),
+            format!("https://discord.com/events//{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/../{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/%31{EVENT}"),
+            format!("https://discord.com/events/{GUILD}\\{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/{overflow}"),
+            format!("https://discord.com/events/{overflow}/{EVENT}"),
+            format!("https://discord.com/events/{GUILD}/00000000000000000"),
+            format!("https://discord.com/events/{GUILD}/1234567890123456"),
+            format!("<{link}"),
+            format!("{link}>"),
+            format!("<<{link}>>"),
+            format!("[event]({link})"),
+            format!("{link}\n{link}"),
+            "HTTPS://discord.com/events/".to_owned() + GUILD + "/" + EVENT,
+            format!(" {link} "),
+        ] {
+            assert_eq!(
+                normalize_event_link(&not_a_link, GUILD),
+                None,
+                "{not_a_link:?} is not a link"
+            );
+        }
+    }
+
+    #[test]
+    fn link_confirmation_keeps_the_status_sentence_and_names_the_event() {
+        assert_eq!(
+            rsvp_saved_text_with_event(RsvpStatus::Going, EVENT),
+            format!("RSVP saved: going. Event `{EVENT}`.")
+        );
+        // Raw numeric confirmations stay byte-identical.
+        assert_eq!(rsvp_saved_text(RsvpStatus::Going), "RSVP saved: going.");
     }
 
     #[test]
@@ -974,10 +1123,18 @@ mod tests {
         // `rsvp-attendance`. First-wins merge must publish each exactly once.
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices merge cleanly");
-        // 4 core + 17 feature + 9 moderation: nothing deduped away.
-        assert_eq!(merged.len(), 30);
+        // 7 core + 25 feature commands, including pause/resume, lfg-edit and feed-inspect,
+        // + 9 mutations + 2 reads: nothing deduped away.
+        assert_eq!(merged.len(), 43);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
-        for name in ["attendance", "rsvp", "rsvp-attendance"] {
+        for name in [
+            "attendance",
+            "rsvp",
+            "rsvp-attendance",
+            "lfg-edit",
+            "lfg-list",
+            "feed-inspect",
+        ] {
             assert_eq!(
                 names.iter().filter(|n| **n == name).count(),
                 1,
