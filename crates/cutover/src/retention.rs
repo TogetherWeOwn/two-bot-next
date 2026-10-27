@@ -2091,7 +2091,7 @@ mod ledger_tests {
             let (condition, days) = guild_projection_time_exclusions(table, 2)
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| panic!("{table} needs a projection exclusion"));
+                .expect("member-report tables need a projection exclusion");
             assert!(condition.contains("$2"), "{condition}");
             assert_eq!(days, MEMBER_REPORT_RETENTION_DAYS);
         }
