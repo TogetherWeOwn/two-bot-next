@@ -52,8 +52,8 @@ verification. Start with the [operator guide](onboarding-operator-guide.md),
 - Anchor mode is a deliberately silent one-message welcome with no extras
   (operator guide). B excludes anchor mode. Dry run suppresses legacy/anchor
   welcomes, so B never renders there; session mode posts in dry run and B follows it.
-- `Cargo.lock` contains `flate2` and `crc32fast` only: no PNG encoder, image,
-  font or rasterizer crate. Any in-Rust render adds crates that must pass
+- `Cargo.lock` has no PNG encoder, image, font or rasterizer crate (checked
+  by name, not a full audit). Any in-Rust render adds crates that must pass
   `deny.toml`'s license allow-list and supply-chain review, plus a bundled font.
 - The runtime image carries only the release binary and CA data (`Dockerfile`
   header), so no system fonts or image tools, and targets the 256 MiB `lite` tier
@@ -83,8 +83,9 @@ ordinary text welcome in the same single message, with no extra delay beyond the
 name, missing asset: all send exactly today's message. An attachment the transport
 or Discord **refuses with a known no-message result** may be followed by the text
 send once in the same attempt. An **uncertain** outcome (timeout, partial) must
-not trigger a second message; retries of that job send text only. A build carries
-that bit in the job attempt, not a new table, or revises this spec. A successful
+not trigger a second message and is never retried blindly: the job ends as
+`SEND_UNCERTAIN` for manual inspection of the channel, unless a build defines
+durable proof that no message exists (which this spec does not). A successful
 send is one message: text, picker and image together; never a follow-up post.
 
 ## 4. Configuration, fencing and provenance
@@ -114,7 +115,9 @@ send is one message: text, picker and image together; never a follow-up post.
   global display name, else username. It is a **member-supplied, untrusted**
   string. Draw only if it is 1..24 Unicode scalars, trimmed, NFC, free of
   controls, bidi overrides, zero-width or private-use scalars, and every scalar
-  is covered by `welcome-font-v1`. Anything else is `NAME_NOT_RENDERABLE`: send
+  is covered by `welcome-font-v1`, and the measured line width fits the fixed
+  name slot (a build records the slot width). Anything else, overflow included,
+  is `NAME_NOT_RENDERABLE`: send
   the text welcome (the mention already names the member). Never truncate,
   transliterate or draw replacement glyphs. Mentions and Markdown are inert in a
   bitmap; the name is never placed in alt text, filename, logs or metrics.
@@ -122,8 +125,10 @@ send is one message: text, picker and image together; never a follow-up post.
   attacker-controlled image, a new network and parser surface, and re-publishing
   a member image. Adding it requires its own proposal, CISO disposition and an
   explicit privacy decision; it is never a default or a hidden option of B.
-- Opt-out: a member with a stored per-guild opt-out gets the text welcome
-  (`PRIVACY_OPTED_OUT`). A failed lookup is `UNAVAILABLE`, which also sends text.
+- Opt-out: fail closed, as [privacy](privacy.md) says opted-out members get no
+  welcome prompts. A stored per-guild opt-out sends nothing (`PRIVACY_OPTED_OUT`).
+  A failed lookup sends nothing and retries the lookup (`UNAVAILABLE`). Option A
+  keeps today's behavior; this check is part of B only.
 - B stores **nothing new**: no image, name, hash, cache or receipt. The existing
   prompt marker is unchanged. The sent image is Discord-hosted message content,
   like the text mention already is; bot-side erasure does not delete Discord
@@ -149,36 +154,43 @@ next action. Unknown reasons are a contract failure, never a new success.
 | reason | outcome / retryable / next_action |
 | --- | --- |
 | `IMAGE_SENT` | image_sent / false / none |
-| `NOT_CONFIGURED`, `PRIVACY_OPTED_OUT` | text_only / false / none |
+| `NOT_CONFIGURED` | unchanged / false / none |
+| `PRIVACY_OPTED_OUT` | no_welcome / false / none |
 | `NAME_NOT_RENDERABLE`, `RENDER_BUSY`, `RATE_LIMITED` | text_fallback / false / none |
 | `RENDER_FAILED`, `RENDER_TIMEOUT`, `ASSET_UNAVAILABLE` | text_fallback / false / host_review_assets |
 | `ATTACHMENT_REFUSED` | text_fallback / false / host_review_permissions |
-| `UNAVAILABLE` | text_fallback / true / none |
-| `SEND_UNCERTAIN` | uncertain / false / inspect_welcome_channel |
+| `UNAVAILABLE` | no_send / true / retry_lookup |
+| `SEND_UNCERTAIN` | uncertain / false / inspect_welcome_channel (never auto-retried) |
 
 ## 7. Finite future acceptance matrix
 
 Design oracles only, **not executed behavior tests**. Future independent tests
 use synthetic identities, fixed clocks, recording Discord doubles and disposable
-databases, never staging or production. Every row asserts: exactly one message,
-text body unchanged, and stable reason and next_action.
+databases, never staging or production. Each row states its own message count;
+where one is sent, the text body is unchanged. Reason and next_action are stable.
 
 | ID | Scenario | Required oracle |
 | --- | --- | --- |
-| W01 | Setting `off`, absent or unknown value | Today's text message; no render, no permit taken |
-| W02 | `static_name`, legacy and session, normal name | One message: text, picker and `welcome.png`; `IMAGE_SENT` |
-| W03 | Other guild, anchor mode, dry-run legacy | `NOT_CONFIGURED`; behavior unchanged |
-| W04 | Name with mentions, Markdown, bidi, controls, zero-width, emoji | `NAME_NOT_RENDERABLE`; text welcome; name not in any log or label |
-| W05 | Name of 0, 24 and 25 scalars; uncovered script | 24 renders; 0, 25 and uncovered fall back; no truncation |
-| W06 | Template, font or manifest missing, unlisted or hash mismatch | `ASSET_UNAVAILABLE`; text welcome |
-| W07 | Render exceeds 500 ms or 256 KiB, or panics | Text welcome; job succeeds; no second message |
-| W08 | Join burst: permit busy, 7th image in a minute | `RENDER_BUSY` or `RATE_LIMITED`; every join still welcomed once |
-| W09 | Attachment refused with a known no-message result | One text send in the same attempt; `ATTACHMENT_REFUSED` |
-| W10 | Timeout or partial result after the image send | `SEND_UNCERTAIN`; no second message; retry sends text only |
-| W11 | Opted-out member, failed opt-out lookup | Text welcome; no name read into any render |
-| W12 | Rejoin after goodbye; duplicate gateway events | One greeting per join; prompt guard unchanged |
-| W13 | Erasure, guild removal, restore | No new rows exist; nothing to purge; disclosed Discord-side persistence |
-| W14 | Setting flipped mid-burst | Next join obeys the new value; no edit of sent messages |
+| W01 | Setting `off`, absent or unknown value | 1 message, today's text; `NOT_CONFIGURED`; no render, no permit |
+| W02 | `static_name`, legacy and session, normal name | 1 message: text, picker and `welcome.png`; `IMAGE_SENT` |
+| W03 | Other guild | 0 messages from this feature (existing fence); `NOT_CONFIGURED` |
+| W04 | Anchor mode | 1 silent anchor message, unchanged, no image; `NOT_CONFIGURED` |
+| W05 | Dry-run legacy | 0 messages (existing suppression); `NOT_CONFIGURED` |
+| W06 | Name with mentions, Markdown, bidi, controls, zero-width, emoji | 1 text; `NAME_NOT_RENDERABLE`; name in no log or label |
+| W07 | Name of 24 scalars that fits the slot | 1 image message; `IMAGE_SENT` |
+| W08 | Name of 0 or 25 scalars, uncovered script, or width over the slot | 1 text; `NAME_NOT_RENDERABLE`; no truncation |
+| W09 | Template, font or manifest missing, unlisted or hash mismatch | 1 text; `ASSET_UNAVAILABLE` |
+| W10 | Render exceeds 500 ms | 1 text; `RENDER_TIMEOUT`; job succeeds |
+| W11 | Render exceeds 256 KiB or panics | 1 text; `RENDER_FAILED`; job succeeds |
+| W12 | Join burst: permit busy | 1 text; `RENDER_BUSY`; every join welcomed once |
+| W13 | Join burst: 7th image in a minute | 1 text; `RATE_LIMITED` |
+| W14 | Attachment refused with a known no-message result | 1 text after the refusal, same attempt; `ATTACHMENT_REFUSED` |
+| W15 | Timeout or partial result after the image send | At most the 1 message already sent; no retry; `SEND_UNCERTAIN` |
+| W16 | Opted-out member | 0 messages; `PRIVACY_OPTED_OUT`; name not read into any render |
+| W17 | Failed opt-out lookup | 0 messages; `UNAVAILABLE`, retryable lookup |
+| W18 | Rejoin after goodbye; duplicate gateway events | 1 greeting per join; prompt guard unchanged |
+| W19 | Erasure, guild removal, restore | No new rows exist; nothing to purge; disclosed Discord-side persistence |
+| W20 | Setting flipped mid-burst | Next join obeys the new value; no edit of sent messages |
 
 ## 8. Offline documentation check and exact-spec gate
 
@@ -187,8 +199,7 @@ Discord or database. It checks the committed document's link inventory, finite
 matrix and reason table, not behavior, demand, rendering or security acceptance.
 
 ```sh
-python3 scripts/check_docs_index.py --json
-python3 - <<'PY'
+python3 scripts/check_docs_index.py --json && python3 - <<'PY'
 from pathlib import Path
 import hashlib, json, re, subprocess, sys
 p = Path('docs/welcome-image-spec.md')
@@ -199,7 +210,7 @@ try:
         raise ValueError('DIRTY_SPEC')
     text = blob.decode('utf-8')
     cases = re.findall(r'^\| (W\d{2}) \|', text, re.M)
-    if cases != [f'W{i:02}' for i in range(1, 15)]:
+    if cases != [f'W{i:02}' for i in range(1, 21)]:
         raise ValueError('MATRIX_INCOMPLETE')
     table = text.split('| reason | outcome', 1)[1].split('\n\n', 1)[0]
     reasons = re.findall(r'`([A-Z_]+)`', table.split('\n', 2)[2])
