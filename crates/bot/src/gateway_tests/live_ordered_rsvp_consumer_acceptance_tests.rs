@@ -54,6 +54,25 @@ async fn ordered_gateway_rsvp_observes_off_on_delete_and_foreign_snapshots() {
         if request.method == "GET" && request.path.contains("scheduled-events") {
             return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
         }
+        if request.method == "PUT" && request.path.ends_with("/commands") {
+            let mut commands: Value = serde_json::from_slice(&request.body).expect("registry JSON");
+            for (index, command) in commands
+                .as_array_mut()
+                .expect("full registry array")
+                .iter_mut()
+                .enumerate()
+            {
+                let id = if command["name"] == "rsvp" {
+                    4444
+                } else {
+                    10000 + index
+                };
+                command["id"] = json!(id.to_string());
+                command["application_id"] = json!("1111");
+                command["guild_id"] = json!(GUILD);
+            }
+            return ScriptedResponse::json(200, commands);
+        }
         ScriptedResponse::json(200, json!({"id":"1111"}))
     })
     .await;
@@ -157,7 +176,9 @@ async fn ordered_gateway_rsvp_observes_off_on_delete_and_foreign_snapshots() {
                 .into_iter()
                 .collect(),
         });
-        ws.send(Message::text(interaction(sequence, status).to_string()))
+        let mut packet = interaction(sequence, status);
+        packet["d"]["data"]["guild_id"] = json!(GUILD);
+        ws.send(Message::text(packet.to_string()))
             .await
             .expect("RSVP packet");
         let token = format!("mock-rsvp-{sequence}");
