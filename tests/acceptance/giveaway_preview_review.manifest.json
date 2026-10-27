@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Independent tests-only review regressions for private giveaway previews; not a separately mergeable change.",
+  "baseSha": "526ae934b67ab642da5a5f5a67a024db0bbf45c1",
+  "branch": "test/giveaway-preview-review-witnesses",
+  "protectedFiles": [
+    {
+      "path": "crates/discord/tests/giveaway_preview_review_acceptance.rs",
+      "sha256": "45855cfdd213d7ca6f0f83d6d85749119c62c699d68dda87a12e42cb1172732b",
+      "tests": 4
+    }
+  ],
+  "unchangedProtectedFiles": [
+    {
+      "path": "crates/discord/tests/giveaway_preview_acceptance.rs",
+      "sha256": "fc3309bfb6c23ea4aac17d8dc8a1a456864699cb0fbea1826a4aa1ee35967233"
+    },
+    {
+      "path": "tests/acceptance/giveaway_preview.manifest.json",
+      "sha256": "2ac066c41c12cf487d54092fe0f9804d23e1648e0047593fa11057e420de6ee9"
+    }
+  ],
+  "commands": {
+    "focused": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_preview_review_acceptance -- --nocapture --test-threads=1",
+    "combined": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_preview_acceptance --test giveaway_preview_review_acceptance -- --nocapture --test-threads=1",
+    "format": "cargo fmt --all -- --check",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref 526ae934b67ab642da5a5f5a67a024db0bbf45c1",
+    "inventory": "python3 scripts/ci/check-test-inventory.py"
+  },
+  "contract": {
+    "entrypoint": "Real GiveawayRuntime::command post-authorization seam with authorized synthetic wire inputs and existing clock/nonce injection. The normal dispatcher privately defers before this seam; tests allow exactly one PATCH of the original private completion.",
+    "liveEffectHeld": "A real non-preview create reaches an independent bound SQL socket, proving it passed the process-wide effect lock. Retain the socket without speaking PostgreSQL. A separate runtime/pool/executor must complete a valid preview before the effect is released; assert no preview SQL, nonce or public/component effects.",
+    "previewResponseHeld": "Existing MockRest response gate observes the actual preview completion and withholds its HTTP response. A separate live create must reach its SQL socket before the response is released. Check the preview stayed held; release the response and abort/join held effect tasks before assertions.",
+    "durationAliases": "Both duration/duration-minutes orders, unequal individually valid values, preview true/false/absent: six private validation refusals, zero SQL/nonce/publication.",
+    "deadlineOverflow": "Construct a valid final-minute instant with time::Date::MAX.with_hms(...).assume_utc(); independently prove adding the valid one-minute duration overflows. Preview true/false/absent: three private refusals, zero SQL/nonce/publication and no panic.",
+    "synchronization": "Socket acceptance and the existing response gate, never sleeps. Three-second bounded observations; live SQL acquisition budget is sixty seconds. Check the held task remains unfinished before and after the observation.",
+    "cleanup": "Abort and join spawned tasks, drop held SQL sockets/listeners, close pools and shut down mock REST before expected RED assertions. JoinSet, sockets and MockRest also provide panic-path cancellation/drop.",
+    "registration": "New non-ignored Cargo integration target is automatically discovered with --features db. No source hooks, workflow changes or live database are required. Existing CI workspace integration execution includes the target."
+  },
+  "expectedBaseline": {
+    "red": [
+      {
+        "test": "preview_completes_before_a_held_live_effect_is_released",
+        "reason": "Preview waits for the live-effect lock despite requiring no effects. Fixture-startup failures have separate diagnostics and are not behavioral RED."
+      },
+      {
+        "test": "held_preview_completion_does_not_retain_the_live_effect_lock",
+        "reason": "A stalled private preview completion retains the live-effect lock and prevents a separate live create from reaching SQL."
+      }
+    ],
+    "green": [
+      "duration_alias_collision_refuses_in_both_orders_and_create_modes",
+      "checked_deadline_overflow_refuses_in_preview_and_real_create"
+    ],
+    "observed": "Not executed: bounded Cargo pool refused admission with exit 75 (no idle, below-budget slot; no per-worktree fallback). This is neither behavioral RED nor GREEN, and compilation remains unverified."
+  },
+  "handoff": {
+    "nextAction": "Consume the immutable commit unchanged. First execute the focused target on this exact baseline plus tests to obtain behavioral RED/GREEN evidence, then implement the lock fix and run the combined target and normal CI/review gates.",
+    "ownership": "Implementation owner consumes these tests unchanged and owns combined GREEN, CI, independent review and auto-merge. Return oracle defects to the test author; never weaken protected assertions.",
+    "undo": "Discard this tests-only commit before consuming it. No production state or code is changed."
+  }
+}
