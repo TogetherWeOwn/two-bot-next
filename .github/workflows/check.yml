@@ -3018,6 +3018,7 @@ jobs:
       - name: Starboard runtime and mock Discord acceptance
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_GATEWAY_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot --locked --bin two-bot starboard_ -- --include-ignored --test-threads=1
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
