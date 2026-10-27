@@ -1535,6 +1535,50 @@ mod tests {
         assert_eq!(state.config.version, "community-v7");
     }
 
+    #[tokio::test]
+    async fn rank_rejects_duplicate_member_option_before_ack_or_store() {
+        // Each option is rejected on its own merit: a repeated `member` must
+        // fail as invalid input instead of silently taking the first, with no
+        // acknowledgement sent and no store read (the pool is unreachable).
+        let rest = RoleRest::start(vec![]).await;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let runtime = LevelingRuntime::new(
+            pool,
+            Arc::clone(&rest.executor),
+            100,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
+        let interaction: Interaction = serde_json::from_value(json!({
+            "id":"7", "application_id":"8", "type":2, "token":"dup-member",
+            "version":1, "guild_id":"100", "locale":"en-US",
+            "member":{"user":{"id":"1", "username":"Player", "discriminator":"0",
+                "global_name":"Player", "avatar":null, "bot":false}, "roles":[], "flags":0,
+                "joined_at":null, "deaf":false, "mute":false, "permissions":"0"},
+            "data":{"id":"1", "name":"rank", "type":1, "options":[
+                {"name":"member", "type":6, "value":"2"},
+                {"name":"member", "type":6, "value":"3"}
+            ]},
+            "entitlements":[], "authorizing_integration_owners":{"0":"100"}
+        }))
+        .expect("valid synthetic interaction");
+        let result = runtime
+            .handle_interaction_at(&interaction, HandlerId::Rank, "2026-11-20T12:00:00.000Z")
+            .await;
+        assert!(matches!(
+            result,
+            Err(LevelingRuntimeError::InvalidInteraction)
+        ));
+        assert!(
+            rest.requests.lock().unwrap().is_empty(),
+            "a duplicate member option is rejected before any acknowledgement"
+        );
+    }
+
     #[test]
     fn rules_take_returns_arrival_order_and_empties() {
         let buffer = DeferredCommunityFacts::new();

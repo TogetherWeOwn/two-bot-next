@@ -1088,15 +1088,18 @@ mod tests {
             reply.content.starts_with(&default.content),
             "details extend the default card, never replace it"
         );
-        for (label, number) in [
-            ("message", "137"),
-            ("voice", "59"),
-            ("imported", "1,038"),
-            ("stored total", "1,200"),
+        // Each label is bound to its own value: a swapped pair (message vs
+        // voice) would still mention every number, so assert the adjacent
+        // `label **value**` rendering.
+        for pair in [
+            "Message XP **137**",
+            "Voice XP **59**",
+            "Imported XP **1,038**",
+            "Stored total XP **1,200**",
         ] {
             assert!(
-                reply.content.to_lowercase().contains(label) && reply.content.contains(number),
-                "details must label {label} XP ({number}): {}",
+                reply.content.contains(pair),
+                "details must bind `{pair}`: {}",
                 reply.content
             );
         }
