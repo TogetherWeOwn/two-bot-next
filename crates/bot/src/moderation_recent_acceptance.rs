@@ -484,8 +484,9 @@ async fn dispatch_recent(
         true,
         member,
     );
+    let seen = rest.requests().len();
     runtime.on_interaction(&interaction).await;
-    rest.requests()
+    rest.requests().split_off(seen)
 }
 
 #[tokio::test]
