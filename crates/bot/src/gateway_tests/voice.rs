@@ -589,9 +589,13 @@ async fn voice_startup_uses_dml_role_without_migration_ledger_access() {
         listen_addr: "127.0.0.1:0".to_owned(),
         guild_id: Some(100),
     };
-    let sink = crate::gateway::build_voice_runtime(&config, true).await;
+    let (shutdown, latched) = tokio::sync::watch::channel(false);
+    let sink = crate::gateway::build_voice_runtime(&config, true, latched).await;
     let enabled = sink.is_some();
-    drop(sink);
+    if let Some((_, flush)) = sink {
+        shutdown.send(true).expect("flush loop holds the receiver");
+        flush.await.expect("flush loop joins after shutdown");
+    }
     restricted.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP OWNED BY {role}; DROP ROLE {role}"

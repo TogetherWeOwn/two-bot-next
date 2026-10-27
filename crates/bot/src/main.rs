@@ -516,9 +516,17 @@ async fn run(cli_args: &[String]) {
     // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
     // Inert unless TWO_VOICE=1 with token + database present; any failure
     // degrades to voice-off with a warn, never a boot failure.
-    let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
-
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
+    let (voice, flush_task) = match build_voice_runtime(
+        &config,
+        VoiceGates::from_env().enabled,
+        shutdown.subscribe(),
+    )
+    .await
+    {
+        Some((sink, flush)) => (Some(sink), Some(flush)),
+        None => (None, None),
+    };
 
     // M3.3 reconcile: once at startup plus a bounded interval while
     // `TWO_EVENTSUB` is exactly `1`. The loop shares the bound receiver's
@@ -546,8 +554,10 @@ async fn run(cli_args: &[String]) {
     // containment), filled by the gateway task below and joined after the
     // supervisor drains: retaining them here is what holds the process open
     // for the worker drains instead of aborting them with the runtime.
+    // The game-activity flush loop joins here too: its trailing flush on the
+    // shutdown latch must finish before the process exits.
     let worker_supervisors: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+        Arc::new(std::sync::Mutex::new(flush_task.into_iter().collect()));
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
