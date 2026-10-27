@@ -106,7 +106,6 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Self-role panels](dashboard-self-roles-spec.md)
 - [Onboarding](dashboard-onboarding-self-roles-spec.md)
 - [Settings tests](internal-settings-acceptance.md)
-- [Settings parser](internal-settings-acceptance.md)
 - [Settings refresh](settings-catalog-acceptance.md)
 - [Live keys](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
