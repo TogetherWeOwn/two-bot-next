@@ -64,6 +64,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   two_bot_eventsub_classified_total: { kind: "EVENTSUB_DELIVERY_KINDS" },
   two_bot_event_store_consumer_lag_seconds: {},
   two_bot_retention_replay_needed_total: {},
+  two_bot_gateway_drain_skips_total: {},
   two_bot_voice_dispatch_timeouts_total: {},
   two_bot_voice_watchdog_stucks_total: {},
   two_bot_voice_halt_recoveries_total: {},

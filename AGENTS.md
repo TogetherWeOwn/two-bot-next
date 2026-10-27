@@ -49,9 +49,16 @@ order, is in [`CONTRIBUTING.md`](CONTRIBUTING.md#pre-push-checklist).
 
 ```sh
 cargo fmt --all -- --check
+python3 scripts/generate_command_reference.py
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
+
+The generated reference is ignored at `docs/generated/commands.md`; the tracked
+`docs/commands.md` is its landing page. Generate explicitly before test-target
+compilation. On the controller use `python3 scripts/generate_command_reference.py --controller`;
+this builds only the generator through the bounded cache wrapper. The generator
+never rewrites tracked configuration or independent publication fixtures.
 
 On the persistent Paperclip controller, run the compiling commands through the
 cache wrapper described under [Controller builds](#controller-builds).
