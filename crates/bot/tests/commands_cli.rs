@@ -30,6 +30,10 @@ fn bot(mock: &MockRest) -> Command {
         .stderr(Stdio::piped())
         // Drop kills a timed-out child; wait_with_output reaps normal exits.
         .kill_on_drop(true);
+    // Keep coverage instrumentation, not inherited application configuration.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     command
 }
 
@@ -65,21 +69,32 @@ fn matching_registry() -> Value {
     let mut wire = compiled_registry();
     let commands = wire.as_array_mut().unwrap();
     for (index, command) in commands.iter_mut().enumerate() {
+        // The server echoes the writable permission gate; only everyone-commands
+        // come back null. Forcing null on a gated command would fake drift.
+        let gated = command
+            .get("default_member_permissions")
+            .is_some_and(|value| !value.is_null());
         let object = command.as_object_mut().unwrap();
         object.insert("id".into(), json!((8000 + index).to_string()));
         object.insert("application_id".into(), json!(APP_ID.to_string()));
         object.insert("guild_id".into(), json!(GUILD_ID.to_string()));
         object.insert("version".into(), json!("9876"));
         object.insert("nsfw".into(), json!(false));
-        object.insert("default_member_permissions".into(), Value::Null);
+        if !gated {
+            object.insert("default_member_permissions".into(), Value::Null);
+        }
         object.insert("name_localizations".into(), json!({}));
         object.insert("description_localizations".into(), json!({}));
         object.entry("options").or_insert(json!([]));
         for option in command["options"].as_array_mut().unwrap() {
             let object = option.as_object_mut().unwrap();
-            object.insert("required".into(), json!(false));
+            // The server echoes back required flags and fixed choices: only
+            // fill in Discord's defaults where the compiled option omits
+            // them, so a required choice option (like `/reopen kind`)
+            // still matches its own echo.
+            object.entry("required").or_insert(json!(false));
             object.insert("autocomplete".into(), json!(false));
-            object.insert("choices".into(), json!([]));
+            object.entry("choices").or_insert(json!([]));
             object.insert("name_localizations".into(), json!({}));
             object.insert("description_localizations".into(), json!({}));
         }
@@ -128,6 +143,8 @@ async fn diff_and_publish_default_to_get_only_without_opening_a_database() {
             "+ 1/rank",
             "+ 1/leaderboard",
             "+ 1/help",
+            "+ 1/reopen",
+            "+ 1/welcome-preview",
             "Dry run: no commands written.",
         ] {
             assert!(
@@ -156,7 +173,9 @@ async fn publish_apply_is_a_full_put_and_a_new_process_skips_normalized_match() 
             ScriptedResponse::json(
                 200,
                 json!([{
-                    "type": 1, "name": "obsolete", "description": "Out-of-band command.",
+                    // Intentional feature-disable removal, not an unknown custom command.
+                    "type": 1, "name": two_bot_core::feature_commands::automation_commands()[0].name,
+                    "description": "Disabled builtin.",
                     "default_member_permissions": null, "version": "1",
                 }]),
             ),
@@ -379,6 +398,182 @@ async fn opt_in_boot_with_voice_on_keeps_the_voice_set_in_the_put() {
     }
     assert!(!names.iter().any(|name| name == "templateassistant"));
     mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn json_and_human_unknown_removals_are_inspectable_but_never_applied() {
+    for json in [false, true] {
+        for apply in [false, true] {
+            let mock = MockRest::start(
+                vec![ScriptedResponse::json(
+                    200,
+                    json!([{
+                        "id": "9001", "type": 1, "name": "zz-custom",
+                        "description": "Fixture.", "version": "1"
+                    }]),
+                )],
+                ScriptedResponse::status(403),
+            )
+            .await;
+            let mut command = bot(&mock);
+            credentials(&mut command);
+            command.args(["commands", "publish"]);
+            if json {
+                command.arg("--json");
+            }
+            if apply {
+                command.arg("--apply");
+            }
+            let output = run(command).await;
+            assert_eq!(output.status.code(), Some(i32::from(apply)));
+            if json {
+                let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+                assert_eq!(report["ok"], !apply);
+                assert_eq!(report["removals"][0]["id"], "9001");
+                assert_eq!(report["removals"][0]["removal_class"], "unrecognized");
+                if apply {
+                    assert_eq!(report["error"]["code"], "unrecognized_command_removal");
+                }
+            } else {
+                assert!(stdout(&output).contains("unrecognized"));
+                assert!(stdout(&output).contains("1/zz-custom"));
+            }
+            assert_eq!(mock.requests().len(), 1);
+            assert_get(&mock.requests()[0]);
+            mock.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn json_success_reports_dry_run_apply_and_no_drift_without_extra_reads() {
+    for (operation, current, expected_methods, applied) in [
+        (vec!["diff", "--json"], json!([]), vec!["GET"], false),
+        (
+            vec!["publish", "--apply", "--json"],
+            json!([]),
+            vec!["GET", "PUT"],
+            true,
+        ),
+        (
+            vec!["publish", "--apply", "--json"],
+            matching_registry(),
+            vec!["GET"],
+            false,
+        ),
+    ] {
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::json(200, current),
+                ScriptedResponse::json(200, matching_registry()),
+            ],
+            ScriptedResponse::status(403),
+        )
+        .await;
+        let mut command = bot(&mock);
+        credentials(&mut command);
+        command.arg("commands").args(operation);
+        let output = run(command).await;
+        assert!(output.status.success(), "{}", stderr(&output));
+        let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], applied);
+        assert_eq!(report["error"], Value::Null);
+        assert_eq!(report["has_unrecognized_removals"], false);
+        assert!(stderr(&output).is_empty());
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .map(|r| r.method.as_str())
+                .collect::<Vec<_>>(),
+            expected_methods
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn strict_json_flags_and_configuration_errors_never_reach_rest() {
+    for args in [
+        vec!["diff", "--apply", "--json"],
+        vec!["publish", "--json", "--json"],
+        vec!["publish", "--apply", "--apply", "--json"],
+        vec!["publish", "--json", "true"],
+        vec!["publish", "--json", "--json=true"],
+        vec!["publish", "--json", "--guild-id"],
+        vec!["publish", "--json", "--help"],
+        vec!["publish", "--json", "synthetic-argument-secret"],
+    ] {
+        let mock = MockRest::start(vec![], ScriptedResponse::status(403)).await;
+        let mut command = bot(&mock);
+        credentials(&mut command);
+        command.arg("commands").args(&args);
+        let output = run(command).await;
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["current_hash"], Value::Null);
+        assert_eq!(report["removed_count"], Value::Null);
+        assert_eq!(report["error"]["code"], "configuration_error");
+        assert!(!report["error"]["next_action"].as_str().unwrap().is_empty());
+        assert!(!stdout(&output).contains("synthetic-argument-secret"));
+        assert!(stderr(&output).is_empty());
+        assert!(mock.requests().is_empty());
+        mock.shutdown().await;
+    }
+    // The live fence still takes precedence over missing token/application.
+    let mock = MockRest::start(vec![], ScriptedResponse::status(403)).await;
+    let mut command = bot(&mock);
+    command
+        .env("GUILD_ID", two_bot_cutover::LIVE_GUILD_ID)
+        .args(["commands", "publish", "--apply", "--json"]);
+    let output = run(command).await;
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["error"]["code"], "configuration_error");
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn ambiguous_registry_identities_fail_before_put_and_failed_put_is_not_success() {
+    let mut empty_name = matching_registry();
+    empty_name[0]["name"] = json!("");
+    let mut duplicate = matching_registry();
+    // Writable drift forces PUT if canonicalization stops rejecting duplicates;
+    // a matching snapshot would fail later cache validation and mask that bug.
+    duplicate[0]["description"] = json!("Out-of-band duplicate description.");
+    let repeated = duplicate[0].clone();
+    duplicate.as_array_mut().unwrap().push(repeated);
+    for (current, expected_methods) in [
+        (empty_name, vec!["GET"]),
+        (duplicate, vec!["GET"]),
+        (json!([]), vec!["GET", "PUT"]),
+    ] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, current)],
+            ScriptedResponse::status(403),
+        )
+        .await;
+        let mut command = bot(&mock);
+        credentials(&mut command);
+        command.args(["commands", "publish", "--apply", "--json"]);
+        let output = run(command).await;
+        assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+        let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["applied"], false);
+        assert_eq!(report["error"]["code"], "registry_request_failed");
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .map(|r| r.method.as_str())
+                .collect::<Vec<_>>(),
+            expected_methods
+        );
+        mock.shutdown().await;
+    }
 }
 
 #[tokio::test]

@@ -281,9 +281,10 @@ claim them as shipped acceptance:
   the `production` job against live production `/ops/metrics` (evidence
   `production-error-rate-gate.json`), failing the stage into the same
   auto-rollback; live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
-  secret, else a recorded skip. Production has no rehearsal path: its guard
-  refuses `inject_error_rate_spike` (failure injection runs on staging only,
-  after the 10-20 20:54Z forced production drill).
+  secret, else a recorded skip. Production has no drill input, guard binding
+  or rehearsal flag. The [daily staging proof](production-deploy.md#daily-staging-proof)
+  exercises automatic rollback on staging only; its independent freshness
+  watcher alerts when the scheduled proof fails or goes missing.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested

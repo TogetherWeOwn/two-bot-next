@@ -3060,16 +3060,19 @@ mod tests {
         // TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID, TWO_EVENTSUB_INVITE_URL).
         // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
         // shifting one entry between those classes. The stored invite-code
-        // slice adds one hot key (TWO_GUILD_INVITE_CODE). This change moves
-        // TWO_COMMUNITY_SCORECARD, TWO_COMMUNITY_RECOMMENDATIONS,
-        // TWO_COMMUNITY_CORRECTION_CYCLES, TWO_PRESENCE_PROBE and
-        // TWO_INACTIVITY_DAYS from cold to hot, shifting five entries
-        // between those classes. The assistant credential binding and required
-        // event-voice category slices add two env-only keys
+        // slice adds one hot key (TWO_GUILD_INVITE_CODE). The ticket/feed/
+        // self-role live-keys slice moves TWO_TICKET_COOLDOWN_SECONDS,
+        // TWO_ANNOUNCEMENTS and TWO_SELF_ROLE_PANELS from cold to hot.
+        // The community slice moves TWO_COMMUNITY_SCORECARD,
+        // TWO_COMMUNITY_RECOMMENDATIONS, TWO_COMMUNITY_CORRECTION_CYCLES,
+        // TWO_PRESENCE_PROBE and TWO_INACTIVITY_DAYS from cold to hot.
+        // Together these shift eight entries between those classes. The
+        // assistant credential binding and required event-voice category
+        // slices add two env-only keys
         // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
         for (class, expected) in [
-            (SettingClass::Hot, 49),
-            (SettingClass::Cold, 21),
+            (SettingClass::Hot, 52),
+            (SettingClass::Cold, 18),
             (SettingClass::EnvOnly, 66),
         ] {
             assert_eq!(
