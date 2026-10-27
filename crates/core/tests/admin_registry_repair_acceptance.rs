@@ -475,33 +475,23 @@ mod database {
     async fn pre_repair_migrators(chain: &str, shipped: i64) -> (Migrator, Migrator) {
         // Apply unrelated predecessors too: a refusal must roll back the repair,
         // not accidentally compare history across a successful earlier migration.
-        let registry_files = super::forward_registry_files(chain, shipped);
-        let first_repair = registry_files
-            .first()
-            .expect("forward registry repair exists")
-            .file_name()
-            .expect("repair filename")
-            .to_str()
-            .expect("UTF-8 repair filename")
-            .split('_')
-            .next()
-            .expect("repair version")
-            .parse::<i64>()
-            .expect("numeric repair version");
-        let registry_versions: Vec<i64> = registry_files
+        let repair_versions: Vec<i64> = super::forward_registry_files(chain, shipped)
             .iter()
             .map(|path| {
                 path.file_name()
-                    .expect("registry filename")
+                    .expect("repair filename")
                     .to_str()
-                    .expect("UTF-8 registry filename")
+                    .expect("UTF-8 repair filename")
                     .split('_')
                     .next()
-                    .expect("registry version")
+                    .expect("repair version")
                     .parse::<i64>()
-                    .expect("numeric registry version")
+                    .expect("numeric repair version")
             })
             .collect();
+        let first_repair = *repair_versions
+            .first()
+            .expect("forward registry repair exists");
         let full = migrator(chain).await;
         let prefix = Migrator::with_migrations(
             full.iter()
@@ -509,11 +499,15 @@ mod database {
                 .cloned()
                 .collect(),
         );
-        // Only registry repairs after the prefix: unrelated forward schema
-        // evolution must not masquerade as helper residue or catalog drift.
+        // Scope the upgrade to the actual forward registry repairs. Later
+        // non-repair migrations (for example cutover 0465 voice settings) must
+        // not trip repair-contract assertions: they legitimately add
+        // tables/functions, and they may reference chain-only tables absent on
+        // the mirrored chain. Migration numbers are globally unique across
+        // chains, so a later feature can never be renumbered below a repair.
         let latest = Migrator::with_migrations(
             full.iter()
-                .filter(|m| m.version < first_repair || registry_versions.contains(&m.version))
+                .filter(|m| m.version < first_repair || repair_versions.contains(&m.version))
                 .cloned()
                 .collect(),
         );

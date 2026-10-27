@@ -240,11 +240,13 @@ An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-Three runtime application tables, plus the member-report tables below, are excluded, each with its reason inline in
+Four runtime application tables, plus the member-report tables below, are excluded, each with its reason inline in
 `EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
 target cooldowns), `discord_send_admission` (per-credential lane state that a
-recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
-queue bound to a gateway session). The private member-report tables
+recovered process re-learns), `gateway_onboarding_jobs` (a restart-recovery
+queue bound to a gateway session) and `automation_command_registry_resync`
+(the pending registry-publication marker; a recovered process republishes
+the complete custom-command set on boot regardless). The private member-report tables
 (`member_reports`, `report_snapshots`, `report_reporters`: 0469) are excluded
 on purpose: their evidence and reporter identities live at most 90 days after a
 report closes and are erased on request, so an archive would outlive that
