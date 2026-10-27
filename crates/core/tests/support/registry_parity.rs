@@ -59,6 +59,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
+    ("tempban-list", "docs/parity.md §1 tempban-list"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -997,6 +998,29 @@ pub fn expected_registry() -> Value {
                 "type": 3,
                 "required": true,
                 "max_length": 128
+            }]
+        }),
+    );
+    let after_tempban = commands
+        .iter()
+        .position(|command| command["name"] == "tempban")
+        .expect("tempban anchors saved-expiry inspection")
+        + 1;
+    commands.insert(
+        after_tempban,
+        json!({
+            "name": "tempban-list",
+            "description": "Inspect saved temporary-ban expiry work",
+            "type": 1,
+            "default_member_permissions": "4",
+            "dm_permission": false,
+            "options": [{
+                "name": "page",
+                "description": "Saved expiry page (10 rows, default 1; due time then work ID order)",
+                "type": 4,
+                "required": false,
+                "min_value": 1,
+                "max_value": 10000
             }]
         }),
     );

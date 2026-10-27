@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 43 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 44 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -123,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 43-row contract in publish order (core, scorecard, automation,
+/// The 44-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -274,7 +274,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "command-clone",
-            46,
+            47,
             E2eGate::Automations,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -595,6 +595,21 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Valid:target:required,user",
                 "Valid:duration_seconds:>=60,runtime-max-365d",
                 "Valid:reason:required,1..=512",
+            ],
+        ),
+        row(
+            "tempban-list",
+            46,
+            E2eGate::Moderation,
+            PERM_BAN_MEMBERS,
+            "BanMembers",
+            "TempbanList",
+            "Ephemeral saved-expiry inventory: ten complete rows per page, localized saved due time, exact state and dispatch uncertainty. Saved/due is not a confirmed Discord unban; running is not completion. Fresh actor authority, suppressed mentions, at most 2000 UTF-16 units; no claims, audit writes or moderation effects.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:TempbanListPermission",
+                "Valid:page:optional,integer,1..=10000",
             ],
         ),
         row(

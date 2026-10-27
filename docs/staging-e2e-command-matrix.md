@@ -44,7 +44,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
 | 16 | `/command-list` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral custom-command list | `AutomationsDisabled`, `ManageServerRequired` |
 | 33 | `/command-inspect` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then one private content-only view (summary, saved template, or rendered preview); no send, registration, cooldown, mutation or run audit | `AutomationsDisabled`, `ManageServerRequired`, `name` required, `view` summary/template/preview, `arguments` ≤500 |
-| 46 | `/command-clone` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral saved-state confirmation, atomic create-only clone plus content-free audit, full-registry publication; committed save reported separately from picker failure | `AutomationsDisabled`, `ManageServerRequired`, required `source`/`destination` ≤32, valid nonreserved names, absent destination, valid saved template/description, capacity including disabled rows |
+| 47 | `/command-clone` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral saved-state confirmation, atomic create-only clone plus content-free audit, full-registry publication; committed save reported separately from picker failure | `AutomationsDisabled`, `ManageServerRequired`, required `source`/`destination` ≤32, valid nonreserved names, absent destination, valid saved template/description, capacity including disabled rows |
 | 40 | `/command-disable` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation after the saved definition is paused + audit row; a repeated pause is an explicit no-op without republish | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
 | 41 | `/command-enable` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation after the saved definition is resumed + audit row; a repeated resume is an explicit no-op without republish | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
 | 17 | `/schedule` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then completion; one timing option required | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `in-minutes` 1–525600, `every-minutes` 60–525600 |
@@ -67,6 +67,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 39 | `/feed-inspect` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay detail with safe source and last attempt | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
 | 3 | `/ban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + REST ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Ban)`, member-moderation policy, `target`/`reason` required |
 | 4 | `/tempban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + timed ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(TempBan)`, member-moderation policy, `duration_seconds` ≥60 (runtime max 365d) |
+| 46 | `/tempban-list` | `TWO_MODERATION` | BanMembers (4) | Ephemeral saved-expiry inventory: ten complete rows per page, localized saved due time, exact state and dispatch uncertainty. Saved/due is not a confirmed Discord unban; running is not completion. Fresh actor authority, suppressed mentions, at most 2000 UTF-16 units; no claims, audit writes or moderation effects. | `GuildRestricted`, `ModerationDisabled`, `TempbanListPermission`, optional integer `page` 1–10000 (default 1); no target or reason |
 | 5 | `/kick` | `TWO_MODERATION` | KickMembers | Ephemeral outcome + REST kick + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Kick)`, member-moderation policy, `target`/`reason` required |
 | 6 | `/timeout` | `TWO_MODERATION` | ModerateMembers | Ephemeral outcome + REST timeout + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Timeout)`, member-moderation policy, `duration_seconds` ≥60 (runtime max 28d) |
 | 7 | `/warn` | `TWO_MODERATION` | ModerateMembers | Ephemeral outcome + recorded warning | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Warn)`, member-moderation policy, `target`/`reason` required |
@@ -80,7 +81,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 Member-moderation policy order (ban, tempban, kick, timeout, warn):
 permission → target present → self-target → owner/Owen/bot/staff protection →
 bot hierarchy → actor hierarchy. Audit `reason` is trimmed, non-empty, ≤512
-UTF-16 units on every mutating moderation row. The two private reads take no
+UTF-16 units on every mutating moderation row. The three private reads take no
 reason and write no audit record. Failed reads stay private with retry guidance;
 unknown metadata never becomes a claim that no restriction exists.
 

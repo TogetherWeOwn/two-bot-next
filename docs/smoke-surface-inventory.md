@@ -9,19 +9,19 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 44 compiled built-ins plus the voice set
-  (65 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 45 compiled built-ins plus the voice set
+  (66 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
 Saved inventory: 7 core + 1 scorecard + 13 automations + 11 announcements +
-9 moderation + 2 private reads = **43 built-ins**. Machine-readable mirror:
+9 moderation + 3 private reads = **44 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
-The test extends this saved fixture in memory with `/lfg-edit`: **43 compiled
-built-ins**, five covered and 38 deferred. The saved JSON deliberately excludes
+The test extends this saved fixture in memory with `/lfg-edit`: **45 compiled
+built-ins**, five covered and 40 deferred. The saved JSON deliberately excludes
 edit; this extension is not a live-publication or smoke-acceptance claim.
 
 ## Covered: the smoke five (one per routing family)
@@ -82,6 +82,7 @@ handler family with a covered command.
 | `/feed-list` | announcements | Needs seeded feed relays (DB); the no-DB rule excludes it. |
 | `/feed-inspect` | announcements | Needs a live feed id; sequenced after a feed-add, not standalone. |
 | `/tempban` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
+| `/tempban-list` | moderation | Read-only saved-expiry inventory needs seeded saved work; offline acceptance only, outside the unchanged live smoke five. |
 | `/kick` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/timeout` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/warn` | moderation | Same handler family as `/ban` (covered); writes a live audit record, excluded from the read-only smoke. |
