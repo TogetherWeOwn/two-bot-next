@@ -93,10 +93,13 @@ the app pool. The presence spans carry a member column (`user_id`, erased
 via the scheduled-event mirror); the channel row carries no member identity.
 
 The private member-report tables (`member_reports`, `report_snapshots`,
-`report_reporters`) are ordinary `table` kind; their reporter cap trigger
-function `report_reporters_cap()` is a matrix `function` row like the guild
-settings trigger functions, executable by the migrator only (a trigger fires
-without EXECUTE on its function).
+`report_reporters`) are ordinary `table` kind. Their reporter-cap trigger
+function `report_reporters_cap()` is intentionally **not** a matrix `function`
+row: matrix functions are strict in the bootstrap phase, which replays the
+29-version staging ledger and cannot know a function created after it. The
+migration revokes `EXECUTE` from `PUBLIC` instead, so only its owner (the
+migrator) holds it, and the verifier's privilege check stays clean. A trigger
+fires without `EXECUTE` on its function.
 
 The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
 for the same reason: the container authorizer reads the token row through

@@ -96,7 +96,13 @@ CREATE INDEX IF NOT EXISTS report_reporters_reporter
 -- At most ten persisted identities per group. The parent row lock serializes
 -- concurrent coalescing inserts, so two racing reporters cannot both take the
 -- tenth-plus slot.
-CREATE OR REPLACE FUNCTION report_reporters_cap() RETURNS trigger AS $$
+--
+-- Deliberately not a database_role_matrix.sql function row: matrix functions
+-- are strict in the bootstrap role phase, which replays the 29-version staging
+-- ledger and so cannot know a function created after it. Its privileges are
+-- instead closed here: no role but the owner (the migrator) can execute it, and
+-- a trigger fires without EXECUTE on its function.
+CREATE FUNCTION report_reporters_cap() RETURNS trigger AS $$
 BEGIN
     PERFORM 1 FROM member_reports WHERE id = NEW.report_id FOR UPDATE;
     IF (SELECT count(*) FROM report_reporters WHERE report_id = NEW.report_id) >= 10 THEN
@@ -107,7 +113,8 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS report_reporters_cap ON report_reporters;
+REVOKE ALL ON FUNCTION report_reporters_cap() FROM PUBLIC;
+
 CREATE TRIGGER report_reporters_cap
     BEFORE INSERT ON report_reporters
     FOR EACH ROW EXECUTE FUNCTION report_reporters_cap();
