@@ -331,5 +331,8 @@ unconfirmed initial acknowledgement is never retried.
 This is a **configuration preview**, not a permission probe: the live path also
 skips channels the bot cannot post in, and the preview does not check channel
 existence or posting permissions. Use [preflight](preflight.md) for those
-checks. The configured channel shown is the first one; the live path picks the
+checks. When a stored `DISCORD_GOODBYE_CHANNEL_IDS` override exists, set the
+preflight environment value to the same comma-separated, nonzero channel IDs,
+without empty entries. Preflight checks supplied environment values, not stored
+overrides. The configured channel shown is the first one; the live path picks the
 first it can post in.
