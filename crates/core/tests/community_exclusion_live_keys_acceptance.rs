@@ -1092,26 +1092,141 @@ fn fence_marker(line: &str) -> Option<(char, usize, &str)> {
     (run >= 3).then(|| (marker, run, &rest[run..]))
 }
 
-// Lines a Markdown renderer shows as text. Fenced code blocks (``` or ~~~)
-// and HTML comment blocks are not index rows, so a link inside one is not
-// discoverable. A fence closes only on the same marker at least as long as
-// its opener with nothing but whitespace after it; a backtick opener may not
-// carry a backtick in its info string.
+// Whether a line leaves an HTML comment open, given whether it started inside
+// one. A comment closed and reopened on one line stays open.
+fn comment_open_after(line: &str, mut in_comment: bool) -> bool {
+    let mut rest = line;
+    loop {
+        let marker = if in_comment { "-->" } else { "<!--" };
+        let Some(at) = rest.find(marker) else {
+            return in_comment;
+        };
+        rest = &rest[at + marker.len()..];
+        in_comment = !in_comment;
+    }
+}
+
+// CommonMark HTML block starts that hide their content from the renderer.
+// Type 1 (script, pre, style, textarea) ends at its closing tag; type 6
+// (block-level tags) ends at the next blank line.
+const RAW_HTML_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+const RAW_HTML_VERBATIM_TAGS: &[&str] = &["script", "pre", "style", "textarea"];
+
+// The tag name opening a line (`<name` or `</name`), lowercased, when it is
+// followed by whitespace, `>`, `/>` or the end of the line.
+fn html_block_tag(line: &str) -> Option<(String, bool)> {
+    let body = line.trim_start_matches(' ');
+    if line.len() - body.len() > 3 {
+        return None;
+    }
+    let after = body.strip_prefix('<')?;
+    let (closing, after) = match after.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, after),
+    };
+    let name_len = after
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(after.len());
+    let (name, tail) = after.split_at(name_len);
+    let boundary = tail.is_empty() || tail.starts_with([' ', '\t', '>']) || tail.starts_with("/>");
+    (!name.is_empty() && boundary).then(|| (name.to_ascii_lowercase(), closing))
+}
+
+// Lines a Markdown renderer shows as text. Fenced code blocks (``` or ~~~),
+// HTML comments and raw HTML blocks are not index rows, so a link inside one
+// is not discoverable. A fence closes only on the same marker at least as long
+// as its opener with nothing but spaces or tabs after it; a backtick opener
+// may not carry a backtick in its info string.
 fn rendered_lines(text: &str) -> Vec<&str> {
     let mut fence: Option<(char, usize)> = None;
     let mut in_comment = false;
+    let mut verbatim: Option<String> = None;
+    let mut in_block = false;
     let mut rendered = Vec::new();
     for line in text.lines() {
         if let Some((open, len)) = fence {
-            if fence_marker(line)
-                .is_some_and(|(c, run, rest)| c == open && run >= len && rest.trim().is_empty())
-            {
+            if fence_marker(line).is_some_and(|(c, run, rest)| {
+                c == open && run >= len && rest.trim_matches([' ', '\t']).is_empty()
+            }) {
                 fence = None;
             }
             continue;
         }
         if in_comment {
-            in_comment = !line.contains("-->");
+            in_comment = comment_open_after(line, true);
+            continue;
+        }
+        if let Some(tag) = &verbatim {
+            if line.to_ascii_lowercase().contains(&format!("</{tag}>")) {
+                verbatim = None;
+            }
+            continue;
+        }
+        if in_block {
+            in_block = !line.trim().is_empty();
             continue;
         }
         if let Some((c, run, rest)) = fence_marker(line) {
@@ -1122,8 +1237,20 @@ fn rendered_lines(text: &str) -> Vec<&str> {
         }
         let body = line.trim_start_matches(' ');
         if line.len() - body.len() <= 3 && body.starts_with("<!--") {
-            in_comment = !body[4..].contains("-->");
+            in_comment = comment_open_after(body, false);
             continue;
+        }
+        if let Some((tag, closing)) = html_block_tag(line) {
+            if !closing && RAW_HTML_VERBATIM_TAGS.contains(&tag.as_str()) {
+                if !line.to_ascii_lowercase().contains(&format!("</{tag}>")) {
+                    verbatim = Some(tag);
+                }
+                continue;
+            }
+            if RAW_HTML_BLOCK_TAGS.contains(&tag.as_str()) {
+                in_block = true;
+                continue;
+            }
         }
         rendered.push(line);
     }
@@ -1372,6 +1499,48 @@ fn control_docs_index_rejects_rows_inside_html_comments() {
         ("docs/index-community.v2.md", &fragment),
         ("docs/community-jobs.md", "# Community jobs\n"),
     ]));
+}
+
+#[test]
+fn control_docs_index_rejects_rows_hidden_by_raw_html_and_odd_markup() {
+    let guide = "- [Community jobs](community-jobs.md)";
+    let hidden = |readme: String| {
+        assert!(
+            !community_jobs_fixture_is_indexed(&[
+                ("docs/README.md", &readme),
+                ("docs/community-jobs.md", "# Community jobs\n"),
+            ]),
+            "row must not count as discoverable: {readme:?}"
+        );
+    };
+    let shown = |readme: String| {
+        assert!(
+            community_jobs_fixture_is_indexed(&[
+                ("docs/README.md", &readme),
+                ("docs/community-jobs.md", "# Community jobs\n"),
+            ]),
+            "row must count as discoverable: {readme:?}"
+        );
+    };
+    // Raw HTML blocks: type 6 runs to a blank line, type 1 to its closing tag.
+    hidden(format!("<div>\n{guide}\n</div>\n"));
+    hidden(format!("<DIV class=\"x\">\n{guide}\n"));
+    hidden(format!("<pre>\n{guide}\n</pre>\n"));
+    hidden(format!("<script>\n\n{guide}\n</script>\n"));
+    // A fence closed with a non-breaking space is still open.
+    hidden(format!("```\n```\u{a0}\n{guide}\n```\n"));
+    // A comment closed and reopened on one line stays open.
+    hidden(format!("<!-- a\n--> <!-- b\n{guide}\n-->\n"));
+    hidden(format!("<!-- a --> <!-- b\n{guide}\n-->\n"));
+    // Content after the block ends renders again; a tab after a fence closes it.
+    shown(format!("<div>\ntext\n\n{guide}\n"));
+    shown(format!("<pre>x</pre>\n{guide}\n"));
+    shown(format!("<script>\nx\n</script>\n{guide}\n"));
+    shown(format!("```\nx\n```\t\n{guide}\n"));
+    shown(format!("<!-- a --> <!-- b -->\n{guide}\n"));
+    // Inline or unknown tags and tag-prefixed words are not block starts.
+    shown(format!("<span>x</span>\n{guide}\n"));
+    shown(format!("<divider>\n{guide}\n"));
 }
 
 #[test]
