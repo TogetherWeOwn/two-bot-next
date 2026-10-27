@@ -11,12 +11,19 @@
 
 #[path = "frozen_baseline.rs"]
 mod frozen_baseline;
+#[path = "frozen_e2e.rs"]
+mod frozen_e2e;
 
 use frozen_baseline::{gate_env_flag, FROZEN};
-use two_bot_core::command_descriptor::DescriptorRegistry;
+use frozen_e2e::FROZEN_E2E;
+use two_bot_core::command_descriptor::{CommandDescriptor, DescriptorRegistry, HelpPlacement};
 use two_bot_core::command_permissions::{CommandSurface, COMMAND_PERMISSIONS};
-use two_bot_core::e2e_matrix::e2e_command_matrix;
-use two_bot_core::{help_text, InteractionRouter, RouterGates, SlashContext};
+use two_bot_core::commands::PERM_MANAGE_GUILD;
+use two_bot_core::e2e_matrix::{e2e_command_matrix, E2eGate};
+use two_bot_core::{
+    help_text, help_text_with_registry, CommandDefinition, HandlerId, InteractionRouter,
+    RouterGates, RouterRefusal, SlashContext,
+};
 
 const GUILD: u64 = 2222;
 
@@ -109,12 +116,29 @@ fn the_shipping_registry_projects_exactly_the_frozen_rows() {
         .filter(|r| frozen.contains(r.command))
         .collect();
     assert_eq!(rows.len(), FROZEN.len());
-    for (row, f) in rows.iter().zip(FROZEN.iter()) {
+    assert_eq!(FROZEN_E2E.len(), FROZEN.len(), "complete metadata oracle");
+    for ((row, f), e2e) in rows.iter().zip(FROZEN.iter()).zip(FROZEN_E2E) {
+        assert_eq!(e2e.name, f.name, "metadata oracle order");
         assert_eq!(row.command, f.name);
         assert_eq!(row.parity_row, f.parity_row, "/{}", f.name);
         assert_eq!(row.gate.env_flag(), gate_env_flag(f.gate), "/{}", f.name);
         assert_eq!(row.required_permissions, f.mask, "/{}", f.name);
         assert_eq!(row.handler, f.handler, "/{}", f.name);
+        assert_eq!(
+            row.success_shape, e2e.success_shape,
+            "/{} success shape",
+            f.name
+        );
+        assert_eq!(
+            row.permission_name, e2e.permission_name,
+            "/{} permission label",
+            f.name
+        );
+        assert_eq!(
+            row.denials, e2e.denials,
+            "/{} complete ordered denials",
+            f.name
+        );
     }
     assert_eq!(reg.e2e_matrix(), e2e_command_matrix());
 }
@@ -212,7 +236,73 @@ fn help_is_rendered_from_the_registry_with_the_legacy_text() {
     let reg = DescriptorRegistry::builtin();
     for gates in gate_sets() {
         let defs = InteractionRouter::new(gates).publish_set(&[]).unwrap();
-        assert_eq!(reg.help_text(&defs), help_text(&defs), "{gates:?}");
+        // Registry-only help deliberately ignores non-descriptor names. The
+        // public consumer additionally preserves voice groups and Custom rows.
+        if !gates.voice {
+            assert_eq!(reg.help_text(&defs), help_text(&defs), "{gates:?}");
+        }
+        assert_eq!(
+            help_text_with_registry(&defs, &reg),
+            help_text(&defs),
+            "the default consumer uses the built-in registry with {gates:?}"
+        );
+    }
+}
+
+#[test]
+fn the_help_consumer_uses_supplied_metadata_instead_of_a_custom_name_fallback() {
+    let descriptor = CommandDescriptor::builder("probe-alpha")
+        .definition(
+            CommandDefinition::new("probe-alpha", "Synthetic probe command")
+                .permissions(PERM_MANAGE_GUILD),
+        )
+        .handler(HandlerId::Descriptor("probe-alpha"))
+        .gate(E2eGate::Always)
+        .requires(PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)
+        .help(HelpPlacement {
+            group: "Synthetic probes",
+            group_order: 900,
+            needs: Some("Manage Server"),
+            position: 1,
+        })
+        .help_note("Synthetic probe guidance.")
+        .e2e_case("Ephemeral probe reply.", &["Perm:ManageServerRequired"])
+        .parity_row(90)
+        .publish_order(9_001)
+        .build()
+        .unwrap();
+    let reg = DescriptorRegistry::builtin().with(descriptor).unwrap();
+    for gates in gate_sets() {
+        let mut defs = InteractionRouter::with_registry(gates, &reg)
+            .publish_set(&[])
+            .unwrap();
+        defs.push(CommandDefinition::new(
+            "probe-custom",
+            "Synthetic custom command",
+        ));
+        let help = help_text_with_registry(&defs, &reg);
+        assert!(
+            help.contains("**Synthetic probes** — needs Manage Server\n/probe-alpha\nSynthetic probe guidance.\n"),
+            "the consumer lost descriptor-owned help metadata with {gates:?}:\n{help}"
+        );
+        assert_eq!(help.matches("\n**Custom**\n").count(), 1);
+        assert_eq!(
+            help.split_once("\n**Custom**\n").unwrap().1.lines().next(),
+            Some("/probe-custom"),
+            "registered probes must not be relegated to Custom"
+        );
+        assert!(help.starts_with(&format!("**Server commands** ({} live)\n", defs.len())));
+        assert!(help.ends_with("\nThis is the last confirmed command list. Your picker hides gated commands you cannot use."));
+        assert!(!reg.help_text(&defs).contains("probe-custom"));
+        assert_ne!(
+            help,
+            help_text(&defs),
+            "positive control: the default consumer has no probe descriptor"
+        );
+        let removed = help_text_with_registry(&defs, &reg.without("probe-alpha"));
+        assert!(!removed.contains("Synthetic probes"));
+        assert!(!removed.contains("Synthetic probe guidance."));
+        assert!(removed.contains("\n**Custom**\n/probe-alpha · /probe-custom\n"));
     }
 }
 

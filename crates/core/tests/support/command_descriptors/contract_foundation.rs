@@ -51,6 +51,7 @@ fn gates(announcements: bool) -> RouterGates {
 
 const SUCCESS: &str = "Ephemeral probe reply.";
 const DENIALS: &[&str] = &["Gate:AnnouncementsDisabled", "Perm:ManageServerRequired"];
+const HELP_NOTE: &str = "Synthetic probe guidance.";
 
 /// A fully specified synthetic command: announcement-gated, Manage Server,
 /// one option, its own help group, one E2E case, its own parity row.
@@ -86,6 +87,7 @@ fn probe_builder_in(
         .gate(E2eGate::Announcements)
         .requires(PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)
         .help(help)
+        .help_note(HELP_NOTE)
         .e2e_case(SUCCESS, DENIALS)
         .parity_row(parity_row)
         .publish_order(order)
@@ -278,11 +280,19 @@ fn one_complete_descriptor_reaches_every_projection() {
         help.contains("**Synthetic probes** — needs Manage Server\n/probe-alpha\n"),
         "help text:\n{help}"
     );
+    assert!(
+        help.contains("/probe-alpha\nSynthetic probe guidance.\n"),
+        "the descriptor owns guidance as well as its group: {help}"
+    );
+    assert!(!reg
+        .help_text(&off.publish_set(&[]).unwrap())
+        .contains(HELP_NOTE));
     let baseline_help = DescriptorRegistry::builtin().help_text(&published);
     assert!(
         !baseline_help.contains("probe-alpha"),
         "builtin help must not know the probe"
     );
+    assert!(!baseline_help.contains(HELP_NOTE));
 }
 
 // ---------------------------------------------------------------------------

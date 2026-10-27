@@ -10,15 +10,21 @@
 //!
 //! Pure checks: no database, no network, no Discord. The same source is meant
 //! to run unchanged with and without `--features db`; nothing here may depend
-//! on that feature. Every comparison covers only the 43 frozen commands, so an
-//! unrelated command added by another change does not break this file.
+//! on that feature. Command comparisons cover the 43 frozen commands; full
+//! help comparisons also preserve the existing voice groups and custom rows.
+//! Unrelated new commands are excluded from those controlled help inputs.
 
 #[path = "support/command_descriptors/frozen_baseline.rs"]
 mod frozen_baseline;
+#[path = "support/command_descriptors/frozen_e2e.rs"]
+mod frozen_e2e;
+#[path = "support/command_descriptors/frozen_help.rs"]
+mod frozen_help;
 
 use frozen_baseline::{
     gate_env_flag, gate_refusal, Frozen, Gate, ADMINISTRATOR, FROZEN, HELP_LAYOUT, NON_SLASH_PARITY,
 };
+use frozen_e2e::FROZEN_E2E;
 use std::collections::BTreeSet;
 use two_bot_core::command_permissions::{command_permission, CommandSurface, COMMAND_PERMISSIONS};
 use two_bot_core::e2e_matrix::e2e_command_matrix;
@@ -420,6 +426,57 @@ fn help_groups_titles_and_order_are_frozen_in_every_gate_set() {
 }
 
 #[test]
+fn full_help_reply_preserves_voice_custom_guidance_and_framing_in_every_gate_set() {
+    let scope: BTreeSet<_> = frozen_names()
+        .into_iter()
+        .chain(frozen_help::voice_names())
+        .collect();
+    for on in every_gate_set() {
+        let mut defs = published(on);
+        defs.retain(|d| scope.contains(d.name.as_str()));
+        let mut expected_names = expected_published_frozen(on);
+        if on.voice {
+            expected_names.extend(frozen_help::voice_names());
+        }
+        // Deliberately not alphabetical: Custom keeps confirmed-publication order.
+        for name in ["zz-probe-custom", "aa-probe-custom"] {
+            defs.push(CommandDefinition::new(name, "Synthetic custom command"));
+            expected_names.push(name);
+        }
+        assert_eq!(
+            help_text(&defs),
+            frozen_help::expected_help_text(&expected_names),
+            "complete help reply with {on:?}"
+        );
+    }
+}
+
+#[test]
+fn voice_names_need_the_anchor_and_custom_header_counts_unique_names() {
+    for names in [
+        vec!["ping", "export", "create", "ping"],
+        vec![
+            "ping",
+            "textchannels",
+            "export",
+            "create",
+            "zz-probe-custom",
+        ],
+        vec![],
+    ] {
+        let defs: Vec<_> = names
+            .iter()
+            .map(|name| CommandDefinition::new(name, "Synthetic confirmed definition"))
+            .collect();
+        assert_eq!(
+            help_text(&defs),
+            frozen_help::expected_help_text(&names),
+            "voice anchor, Custom order and unique header count for {names:?}"
+        );
+    }
+}
+
+#[test]
 fn help_order_differs_from_publish_order_where_users_see_it() {
     // game-mix publishes in the always-on core block but renders last;
     // welcome-preview renders before the check-in group. Sorting help by
@@ -451,7 +508,9 @@ fn e2e_matrix_rows_match_the_frozen_contract() {
         FROZEN.len(),
         "one matrix row per frozen command"
     );
-    for (row, f) in rows.iter().zip(FROZEN.iter()) {
+    assert_eq!(FROZEN_E2E.len(), FROZEN.len(), "complete metadata oracle");
+    for ((row, f), e2e) in rows.iter().zip(FROZEN.iter()).zip(FROZEN_E2E) {
+        assert_eq!(e2e.name, f.name, "metadata oracle order");
         assert_eq!(row.command, f.name, "matrix order");
         assert_eq!(row.parity_row, f.parity_row, "/{} parity row", f.name);
         assert_eq!(
@@ -462,31 +521,19 @@ fn e2e_matrix_rows_match_the_frozen_contract() {
         );
         assert_eq!(row.required_permissions, f.mask, "/{} mask", f.name);
         assert_eq!(row.handler, f.handler, "/{} handler", f.name);
-        assert!(!row.success_shape.is_empty(), "/{} success shape", f.name);
         assert_eq!(
-            row.permission_name == "Everyone",
-            f.mask == 0,
+            row.success_shape, e2e.success_shape,
+            "/{} success shape",
+            f.name
+        );
+        assert_eq!(
+            row.permission_name, e2e.permission_name,
             "/{} permission label",
             f.name
         );
-        // The denial vocabulary is the router's own refusal spelling, in the
-        // same two families the live suite probes, gate case first.
-        let mut expected: Vec<String> = Vec::new();
-        if let Some(refusal) = gate_refusal(f.gate) {
-            expected.push(format!("Gate:{refusal}"));
-        }
-        if let Some(refusal) = f.denial {
-            expected.push(format!("Perm:{refusal}"));
-        }
-        let actual: Vec<&str> = row
-            .denials
-            .iter()
-            .copied()
-            .filter(|d| d.starts_with("Gate:") || d.starts_with("Perm:"))
-            .collect();
         assert_eq!(
-            actual, expected,
-            "/{} gate and permission denial cases",
+            row.denials, e2e.denials,
+            "/{} complete ordered denial cases",
             f.name
         );
     }

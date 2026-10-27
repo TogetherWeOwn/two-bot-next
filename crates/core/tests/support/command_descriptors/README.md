@@ -23,6 +23,8 @@ reachable.
 |---|---|---|---|
 | `../../command_registry_baseline_acceptance.rs` | yes, discovered | baseline | Public-behavior characterization of the current router, publish set, `/help`, E2E matrix and permission table against the frozen oracle, in all 32 gate sets. Passes on `main`; must pass unchanged after the migration. |
 | `frozen_baseline.rs` | via the baseline | oracle | Hand-written literal table of the 43 non-voice built-ins (handler, gate, permission bits, denial, policy hook, parity row, help layout, non-slash parity rows). Never derived from a registry. |
+| `frozen_e2e.rs` | via the baseline | oracle | Exact success shape, permission label and full ordered denial list for every frozen command, shared with the phase-2 consumer contract. |
+| `frozen_help.rs` | via the baseline | oracle | Full help-reply oracle: frozen groups plus legacy voice anchor/groups, RSVP guidance, Custom order, unique-name count and footer. No production renderer calls. |
 | `contract_foundation.rs` | **no** (future API) | 1 | Synthetic-command contract for the descriptor, registry and router seam. |
 | `contract_consumers.rs` | **no** (future API) | 2 | Shipping commands reproduce the frozen rows through the registry; central files hold no per-command list. |
 
@@ -58,6 +60,7 @@ DescriptorBuilder            by-value chain, every method returns Self
   also_allowed_by(bits: u64)              extra bits that satisfy it (the /game-mix Administrator rule)
   policy_hook(PolicyHook)                 optional
   help(HelpPlacement)
+  help_note(line: &'static str)           optional, repeatable, descriptor-owned guidance
   e2e_case(success_shape: &'static str, denials: &'static [&'static str])   repeatable
   parity_row(u8)
   publish_order(u32)
@@ -81,6 +84,10 @@ DescriptorRegistry           Clone + Debug, immutable value
 InteractionRouter::with_registry(gates: RouterGates, registry: &DescriptorRegistry) -> InteractionRouter
   InteractionRouter::new(gates) == with_registry(gates, &DescriptorRegistry::builtin())
 HandlerId::Descriptor(&'static str)         one additive variant: the identity of a leaf-owned handler
+
+Phase 2 consumer seam (exported from two_bot_core, like help_text):
+  help_text_with_registry(published: &[CommandDefinition], registry: &DescriptorRegistry) -> String
+  help_text(published) == help_text_with_registry(published, &DescriptorRegistry::builtin())
 ```
 
 Semantics the tests pin beyond the signatures:
@@ -93,6 +100,41 @@ Semantics the tests pin beyond the signatures:
 - `E2eMatrixRow.permission_name` is the Discord permission constant name for a single known bit (`ManageGuild`), `Everyone` for 0; `handler` is the `Debug` spelling of the `HandlerId`.
 - Gate off keeps the name routed and refused (`Refuse`), never `Unknown`; guild fence first, gate second, permission third.
 - Registered metadata is not an executing handler: `unregistered_handlers` reports it.
+
+## Help scope and unchanged member-visible output
+
+`DescriptorRegistry::help_text` renders **only descriptors in that registry whose
+names are in `published`**. It ignores all other names, including another
+registry's synthetic probe, voice-only names and custom rows. Its header counts
+those unique descriptor names; it uses the legacy framing/footer. It has no
+Custom fallback. A descriptor's `help_note` lines render after its group's name
+line, in member-position order and then builder-call order, only while that
+descriptor is published. The `rsvp-attendance` descriptor owns the two existing
+guidance lines verbatim; no migrated-command literal is needed in `help.rs`.
+
+The phase-2 **public consumer** `help_text_with_registry` uses the supplied
+registry's group/needs/position/note metadata, then preserves the legacy voice
+and Custom surfaces. `help_text` delegates with `builtin()`; it must not discard
+voice or custom definitions to make the two renderers equal:
+
+- All three voice groups, their order and permission labels stay unchanged.
+  They require the published `textchannels` anchor; without it, voice-looking
+  names remain under Custom. The shared `kick` keeps its frozen Kick group.
+- Any published name not grouped by the supplied registry or anchored voice
+  groups appears under Custom in input order. A removed descriptor's still-
+  published definition therefore falls back to Custom here, but is ignored by
+  registry-only help. Removing metadata never fabricates a new route.
+- The public header counts **all unique published names**, including voice and
+  Custom, and the introductory sentence/footer stay byte-identical. Repeated
+  Custom definitions preserve the legacy repeated-name output, not the count.
+- Registry-only help equals public help for built-in, voice-off publish sets.
+  With voice or Custom present, equality applies to `help_text_with_registry`
+  and `help_text`, not to registry-only help. The baseline freezes complete
+  output bytes in all 32 gate sets plus anchor/duplicate/empty-input controls.
+
+The optional note builder method and phase-2 consumer seam preserve existing
+output and expose the supplied-registry control; they do not move voice into
+the 43-command E2E/parity registry or require a new registration dependency.
 
 ## Open interface questions for the builder
 
