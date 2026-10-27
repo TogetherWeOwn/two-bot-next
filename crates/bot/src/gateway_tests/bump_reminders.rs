@@ -119,6 +119,8 @@
 //! under a parallel local runner; CI runs it serially via the existing
 //! `gateway_tests` filter step with no workflow change.
 
+mod review_regressions;
+
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -316,9 +318,10 @@ fn responder() -> impl Fn(&RestRequest) -> ScriptedResponse + Send + Sync + 'sta
             let id = ids.fetch_add(1, Ordering::Relaxed);
             return ScriptedResponse::json(200, json!({"id": id.to_string()}));
         }
-        if request.method == "PATCH" {
-            let id = ids.fetch_add(1, Ordering::Relaxed);
-            return ScriptedResponse::json(200, json!({"id": id.to_string()}));
+        if request.method == "PATCH" && path.replace("%40", "@").ends_with("/messages/@original") {
+            // Editing a deferred original is a successful message operation,
+            // not another callback. The executor needs only a success status.
+            return ScriptedResponse::status(204);
         }
         ScriptedResponse::json(200, json!({"id": "9000"}))
     }
@@ -472,7 +475,12 @@ async fn await_reply_text(mock: &MockRest, token: &str, budget: Duration) -> Opt
                     parts.push(content.to_owned());
                 }
             }
-            if request.method == "PATCH" {
+            if request.method == "PATCH"
+                && request
+                    .path
+                    .replace("%40", "@")
+                    .ends_with("/messages/@original")
+            {
                 if let Some(content) = body["content"].as_str() {
                     parts.push(content.to_owned());
                 }
