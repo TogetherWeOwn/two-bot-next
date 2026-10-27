@@ -16,8 +16,9 @@ use crate::message_safety::{text_len, truncate, CONTENT_LIMIT};
 /// Newest saved rows read per invocation. The read is `LIMIT`-bounded to
 /// this window and paginated in memory.
 pub const RECENT_WINDOW: usize = 100;
-/// Highest selectable page. [`ROW_UNIT_CAP`] guarantees at least six rows per
-/// page, so a full window never needs more than 17 pages.
+/// Highest selectable page. Every row field is capped, so a page always holds
+/// at least six rows and a full window never needs more than 17 pages (pinned
+/// by `worst_case_rows_still_fit_the_page_cap`).
 pub const RECENT_MAX_PAGE: i64 = 20;
 /// Reply for an empty ledger.
 pub const RECENT_EMPTY_REPLY: &str = "No recent moderation actions in this server.";
