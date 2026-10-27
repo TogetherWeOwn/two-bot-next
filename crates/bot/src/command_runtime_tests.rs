@@ -4326,6 +4326,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedInspect,
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
+            HandlerId::TempbanList,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids
@@ -4347,6 +4348,7 @@ fn production_router_matches_composed_production_wiring() {
             ] {
                 router.register(Box::new(Marker(HandlerId::Moderation(action))));
             }
+            router.register(Box::new(Marker(HandlerId::TempbanList)));
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
@@ -4412,13 +4414,13 @@ fn production_router_matches_composed_production_wiring() {
                                  moderation={moderation} member={member_present})"
                             );
                         }
-                        // The exception list is the same five verbs the owner
-                        // map guards on the consumer, and nothing else.
+                        // The exception list is the five verbs plus the private
+                        // expiry read the owner map guards on the consumer.
                         let exceptions =
                             InteractionRouter::intentional_registration_exceptions(member_present);
                         assert_eq!(
                             exceptions.len(),
-                            if member_present { 0 } else { 5 },
+                            if member_present { 0 } else { 6 },
                             "member={member_present}"
                         );
                     }
