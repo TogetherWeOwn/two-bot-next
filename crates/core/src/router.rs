@@ -2106,13 +2106,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 43
+        // Both gates on is the full voice set without the assistant: 44
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 64);
+        assert_eq!(both.len(), 65);
     }
 
     #[test]
