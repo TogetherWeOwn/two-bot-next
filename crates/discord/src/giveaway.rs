@@ -35,6 +35,12 @@ use two_bot_core::{
 
 use crate::{ActionExecutor, DiscordError};
 
+#[path = "giveaway_list.rs"]
+mod list;
+#[cfg(test)]
+#[path = "giveaway_list_tests.rs"]
+mod list_tests;
+
 const FAILURE: &str = "Giveaway unavailable; try again later.";
 const INVALID: &str = "Invalid giveaway options. Use a prize up to 200 characters, 1–43200 minutes and 1–100 winners.";
 const WRITE_BUDGET: u32 = 10;
@@ -169,20 +175,7 @@ impl GiveawayRuntime {
             }
             "list" => {
                 let rows = store::list_active(&self.pool, &guild).await?;
-                if rows.is_empty() {
-                    return Ok("No open giveaways.".into());
-                }
-                let mut text = String::from("Open giveaways:\n");
-                // A bounded preview keeps 10 maximum-length prizes below Discord's ceiling.
-                for row in rows {
-                    let prize: String = row.prize.chars().take(32).collect();
-                    let line = format!("`{}` — {} ({})\n", row.id, prize, row.status);
-                    if text.len() + line.len() > 1800 {
-                        break;
-                    }
-                    text.push_str(&line);
-                }
-                Ok(text)
+                Ok(list::render_active_list(&rows))
             }
             "cancel" => {
                 let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
