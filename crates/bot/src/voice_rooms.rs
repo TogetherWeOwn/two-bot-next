@@ -14144,6 +14144,14 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.enabled.is_none()
+                        && request.name.is_none()
+                        && request.viewer_role.is_none() =>
+                {
+                    text_channels_summary(&creator)
+                }
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
                     TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14176,6 +14184,12 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.position.is_none() && request.first_number.is_none() =>
+                {
+                    position_summary(&creator)
+                }
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
                     PositionPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14208,6 +14222,8 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator)) if request.enabled.is_none() => group_summary(&creator),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
                     GroupPlan::Update(creator) => match store.add_creator(&creator).await {
