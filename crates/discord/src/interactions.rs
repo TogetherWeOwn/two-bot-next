@@ -369,6 +369,10 @@ pub struct InteractionRuntime {
     giveaway: crate::giveaway::GiveawayRuntime,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
+    /// Test-only live-settings override: per-instance reader for ordered
+    /// consumer acceptance. Production stays `None`; gateway reception then
+    /// reads the poller snapshot through the bot crate.
+    live_override: std::sync::Mutex<Option<two_bot_core::settings::LiveSettings>>,
 }
 
 #[cfg(feature = "db")]
@@ -644,6 +648,7 @@ impl InteractionRuntime {
             giveaway: crate::giveaway::GiveawayRuntime::new(pool.clone(), executor.clone()),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
+            live_override: std::sync::Mutex::new(None),
         }
     }
 
@@ -687,6 +692,26 @@ impl InteractionRuntime {
     pub fn set_application_id(&self, id: u64) {
         self.application_id
             .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only per-instance live reader: gateway reception resolves the
+    /// ordered announcements bit from this instead of the poller snapshot.
+    /// No process-global installation; production runtimes never set it.
+    pub fn set_live_settings(&self, live: two_bot_core::settings::LiveSettings) {
+        *self
+            .live_override
+            .lock()
+            .expect("interaction live override") = Some(live);
+    }
+
+    /// Installed per-instance live source, if any. Gateway reception reads
+    /// the poller snapshot when this is `None`, so production behavior is
+    /// unchanged.
+    pub fn live_settings_override(&self) -> Option<two_bot_core::settings::LiveSettings> {
+        self.live_override
+            .lock()
+            .expect("interaction live override")
+            .clone()
     }
 
     /// Current application pin (0 = unpinned). READY callers check this before

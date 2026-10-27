@@ -307,6 +307,9 @@ pub struct CommandRuntime {
     /// answerer of `/kick`: moderation first, then this delegate for room
     /// occupants the moderation path refused.
     voice_kick_vote: Mutex<Option<VoiceKickVote>>,
+    /// Test-only live-settings override: per-instance reader for consumer
+    /// acceptance. Production stays `None` and reads the poller snapshot.
+    live_override: Mutex<Option<LiveSettings>>,
 }
 
 // Each in-flight LFG execution holds up to two connections of the shared pool;
@@ -391,6 +394,7 @@ impl CommandRuntime {
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
             voice_kick_vote: Mutex::new(None),
+            live_override: Mutex::new(None),
         })
     }
 
@@ -398,6 +402,23 @@ impl CommandRuntime {
     #[cfg(test)]
     pub(crate) fn test_interactions(&self) -> &two_bot_discord::interactions::InteractionRuntime {
         &self.interactions
+    }
+
+    /// Test-only per-instance live reader: the real [`Self::on_interaction`]
+    /// entry resolves announcements from this instead of the poller snapshot.
+    /// No process-global installation; production instances never set it.
+    #[cfg(test)]
+    pub(crate) fn set_live_settings(&self, live: LiveSettings) {
+        *self.live_override.lock().expect("command live override") = Some(live);
+    }
+
+    /// Effective live source: the test override when set, else the poller.
+    fn live_source(&self) -> Option<LiveSettings> {
+        self.live_override
+            .lock()
+            .expect("command live override")
+            .clone()
+            .or_else(crate::settings_jobs::live)
     }
 
     pub(crate) fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
@@ -1393,7 +1414,8 @@ impl CommandRuntime {
     /// commands own their defer/audit lifecycle. Unwired builtins
     /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
-        self.on_interaction_with_live(interaction, crate::settings_jobs::live().as_ref())
+        let live = self.live_source();
+        self.on_interaction_with_live(interaction, live.as_ref())
             .await;
     }
 

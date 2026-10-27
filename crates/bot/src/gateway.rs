@@ -1737,9 +1737,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                         // ordered RSVP path (self-role per-dispatch
                                         // pattern): a stored `0` refuses RSVP commands
                                         // with the disabled reply before any defer.
+                                        // The runtime's installed test source wins;
+                                        // production reads the poller snapshot.
                                         let guild = interaction.guild_id.map(|id| id.get().to_string()).unwrap_or_default();
                                         let boot = runtime.router.gates().announcements;
-                                        let announcements_live = crate::feed_jobs::live_announcements_on(&guild, boot);
+                                        let live = runtime
+                                            .live_settings_override()
+                                            .or_else(crate::settings_jobs::live);
+                                        let announcements_live =
+                                            crate::feed_jobs::live_announcements_with(
+                                                &guild, boot, live.as_ref(),
+                                            );
                                         let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction, announcements_live).await });
                                         // Track owned acknowledgement work so the bounded
                                         // completion policy can cancel it on timeout or
