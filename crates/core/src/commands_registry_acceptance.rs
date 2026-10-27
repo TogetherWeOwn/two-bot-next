@@ -15,13 +15,45 @@ fn core_commands_match_legacy_names() {
     // Guild-only, DM off (legacy `setDMPermission(false)`).
     assert!(core.iter().all(|c| !c.dm_permission));
     // `rank` and `help` have optional selectors, `reopen` a required one;
-    // `leaderboard` and the Next-only `welcome-preview` take none, while
-    // `game-mix` takes the three optional browse selectors pinned below.
+    // `leaderboard` takes the optional scope selector pinned below and the
+    // Next-only `welcome-preview` takes none, while `game-mix` takes the
+    // three optional browse selectors pinned below.
     // Help stays open to everyone and names are not frozen to builtin choices.
-    assert_eq!(core[0].options.len(), 1);
-    assert_eq!(core[0].options[0].kind, 6);
-    assert!(core[0].options[0].required.is_none());
-    assert!(core[1].options.is_empty());
+    assert_eq!(core[0].options.len(), 2);
+    let mut rank_options: Vec<&str> =
+        core[0].options.iter().map(|o| o.name.as_str()).collect();
+    rank_options.sort_unstable();
+    assert_eq!(rank_options, ["details", "member"]);
+    for option in &core[0].options {
+        assert!(option.required.is_none());
+        assert!(option.options.is_empty());
+    }
+    let member = core[0]
+        .options
+        .iter()
+        .find(|o| o.name == "member")
+        .expect("member selector");
+    assert_eq!(member.kind, 6);
+    let details = core[0]
+        .options
+        .iter()
+        .find(|o| o.name == "details")
+        .expect("details selector");
+    assert_eq!(details.kind, CommandOptionType::Boolean.as_u8());
+    assert!(details.choices.is_empty());
+    assert_eq!(core[1].options.len(), 1);
+    let scope = &core[1].options[0];
+    assert_eq!(scope.name, "scope");
+    assert_eq!(scope.kind, CommandOptionType::String.as_u8());
+    assert!(scope.required.is_none());
+    assert!(scope.options.is_empty());
+    let mut scope_values: Vec<&str> = scope
+        .choices
+        .iter()
+        .map(|choice| choice.value.as_str())
+        .collect();
+    scope_values.sort_unstable();
+    assert_eq!(scope_values, ["lifetime", "seasonal"]);
     assert_eq!(core[2].options.len(), 1);
     assert_eq!(core[2].options[0].name, "command");
     assert_eq!(core[2].options[0].kind, 3);

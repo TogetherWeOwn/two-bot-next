@@ -499,6 +499,36 @@ pub fn rank_reply(profile: &LevelProfile, display_name: &str) -> RankReply {
     }
 }
 
+/// Build the `/rank details:true` reply: the default card plus one labeled
+/// line per XP source and the authoritative stored total. The sources are
+/// labeled independently and never re-summed here — adjustments can leave
+/// them differing from the stored total, and the reply says so instead of
+/// assuming they add up.
+#[must_use]
+pub fn rank_reply_detailed(profile: &LevelProfile, display_name: &str) -> RankReply {
+    let mut content = rank_text(
+        display_name,
+        profile.level,
+        profile.rank,
+        profile.member_count,
+        profile.xp,
+    );
+    content.push_str(
+        format!(
+            "\nMessage XP **{}** · Voice XP **{}** · Imported XP **{}**\nStored total XP **{}** (sources can differ from the stored total after adjustments)",
+            grouped_number(profile.message_xp),
+            grouped_number(profile.voice_xp),
+            grouped_number(profile.imported_xp),
+            grouped_number(profile.xp),
+        )
+        .as_str(),
+    );
+    RankReply {
+        content,
+        ephemeral: true,
+    }
+}
+
 /// A `/leaderboard` reply: legacy posts it publicly with mentions suppressed
 /// (`allowedMentions: { parse: [] }`), never ephemerally.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -536,10 +566,10 @@ pub const PARTIAL_SEASON_NOTE: &str = " — partial: early-season XP not counted
 
 /// Build the seasonal `/leaderboard` reply (AC3): same 1–25 clamp and top-10
 /// public shape as [`leaderboard_reply`], scoped to one season. Lifetime
-/// stays behind an explicit flag owned by a later slice. The first partial
-/// quarter renders the partial marker inside its header; an empty first
-/// quarter keeps the marker on its header plus the honest empty body, never
-/// lifetime totals.
+/// standings render through [`leaderboard_reply_lifetime`] instead. The
+/// first partial quarter renders the partial marker inside its header; an
+/// empty first quarter keeps the marker on its header plus the honest empty
+/// body, never lifetime totals.
 #[must_use]
 pub fn leaderboard_reply_for_season(
     entries: &[LeaderboardEntry],
@@ -561,6 +591,28 @@ pub fn leaderboard_reply_for_season(
     };
     LeaderboardReply {
         content: format!("{header}\n{body}"),
+        suppress_mentions: true,
+    }
+}
+
+/// Build the explicit-lifetime `/leaderboard` reply: same 1–25 clamp and
+/// top-10 public shape as [`leaderboard_reply_for_season`], reading lifetime
+/// totals instead of one season. The header always labels the lifetime
+/// scope and never a season id or the partial marker; an empty guild keeps
+/// the honest empty body.
+#[must_use]
+pub fn leaderboard_reply_lifetime(entries: &[LeaderboardEntry]) -> LeaderboardReply {
+    let rows: Vec<String> = entries
+        .iter()
+        .map(|e| leaderboard_line(e.rank, &e.member_id, e.level, e.xp))
+        .collect();
+    let body = if rows.is_empty() {
+        "No XP has been earned yet.".to_owned()
+    } else {
+        rows.join("\n")
+    };
+    LeaderboardReply {
+        content: format!("**TWO XP Leaderboard (Lifetime)**\n{body}"),
         suppress_mentions: true,
     }
 }
@@ -1009,6 +1061,83 @@ mod tests {
         assert_eq!(
             rank_text("Zero XP", 0, Some(2), 3, 0),
             "**Zero XP**\nLevel **0** · Rank **#2** of **3**\nXP **0** · 0/100 this level · **100** to level 1"
+        );
+    }
+
+    #[test]
+    fn rank_reply_detailed_labels_sources_without_resumming_divergent_total() {
+        // Sources can diverge from the stored total after adjustments; the
+        // renderer labels each independently and keeps the stored total
+        // authoritative instead of re-summing (137 + 59 + 1038 = 1234 ≠ 1200).
+        let profile = LevelProfile {
+            guild_id: "g".to_owned(),
+            member_id: "100000000000000001".to_owned(),
+            xp: 1200,
+            level: level_for_xp(1200),
+            message_xp: 137,
+            voice_xp: 59,
+            imported_xp: 1038,
+            rank: Some(2),
+            member_count: 3,
+            next_level_xp: total_xp_for_level(level_for_xp(1200) + 1),
+        };
+        let reply = rank_reply_detailed(&profile, "Diverged");
+        assert!(reply.ephemeral, "details keep /rank private");
+        let default = rank_reply(&profile, "Diverged");
+        assert!(
+            reply.content.starts_with(&default.content),
+            "details extend the default card, never replace it"
+        );
+        for (label, number) in [
+            ("message", "137"),
+            ("voice", "59"),
+            ("imported", "1,038"),
+            ("stored total", "1,200"),
+        ] {
+            assert!(
+                reply.content.to_lowercase().contains(label) && reply.content.contains(number),
+                "details must label {label} XP ({number}): {}",
+                reply.content
+            );
+        }
+        assert!(
+            !reply.content.contains("1,234"),
+            "sources are never re-summed: {}",
+            reply.content
+        );
+        assert!(
+            reply.content.contains("differ") || reply.content.contains("adjust"),
+            "details explain the gap: {}",
+            reply.content
+        );
+    }
+
+    #[test]
+    fn leaderboard_reply_lifetime_labels_scope_without_season_or_partial() {
+        let entries = vec![LeaderboardEntry {
+            member_id: "100000000000000001".to_owned(),
+            xp: 1200,
+            level: 5,
+            rank: 1,
+        }];
+        let reply = leaderboard_reply_lifetime(&entries);
+        assert!(reply.suppress_mentions, "lifetime parses no mentions");
+        assert!(
+            reply
+                .content
+                .starts_with("**TWO XP Leaderboard (Lifetime)**\n**1.** <@100000000000000001>"),
+            "lifetime header plus rows: {}",
+            reply.content
+        );
+        assert!(!reply.content.contains("2026-Q"), "no season id leaks in");
+        assert!(
+            !reply.content.to_lowercase().contains("partial"),
+            "lifetime is never partial"
+        );
+        let empty = leaderboard_reply_lifetime(&[]);
+        assert_eq!(
+            empty.content,
+            "**TWO XP Leaderboard (Lifetime)**\nNo XP has been earned yet."
         );
     }
 

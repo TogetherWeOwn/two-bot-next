@@ -32,8 +32,8 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 
 | # | Command | Gate (staging env) | Permission | Success shape | Denial paths |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `/rank` | always | Everyone | Ephemeral text with XP, level, server rank | — |
-| 2 | `/leaderboard` | always | Everyone | Public mention-suppressed top ten | — |
+| 1 | `/rank` | always | Everyone | Ephemeral text with XP, level, server rank; optional member target, optional details with labeled XP sources | — |
+| 2 | `/leaderboard` | always | Everyone | Public mention-suppressed top ten; optional scope selects seasonal (default) or lifetime | — |
 | 31 | `/help` | always | Everyone | Immediate ephemeral list of the live published commands, grouped by audience with permission hints (no defer, no store read) | — |
 | 32 | `/privacy` | always | Everyone | Deferred ephemeral reply; analytics `opt-out` purges the invoker's guild rows plus suppression plus one audit receipt, `opt-in` clears suppression, `status` reports suppression plus guild switches; `delete` queues the invoker's erasure request (fresh requests acknowledge as pending; same-interaction retries reuse the request and direct the member to status), and deletion status/receipt reads bind to the same invoker and guild | subcommand required (`opt-out`/`opt-in`/`status`/`delete`/`deletion-status`/`deletion-receipt`); request id required for `deletion-status` and `deletion-receipt`; guild-only |
 | 34 | `/reopen` | always | Everyone | Deferred ephemeral reply; a fresh private games or session menu built from current roles and current configured picks, with zero role, channel or funnel writes; games includes a no-change preview select | `kind` required (`games`/`session`); unavailable kinds and failed lookups get private no-effect guidance, guild-only |

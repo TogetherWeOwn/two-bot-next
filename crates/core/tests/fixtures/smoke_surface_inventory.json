@@ -20,6 +20,16 @@
           "max_value": null,
           "max_length": null,
           "choices": []
+        },
+        {
+          "name": "details",
+          "description": "Show message, voice and imported XP next to the stored total.",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
         }
       ],
       "smoke": "covered",
@@ -33,7 +43,27 @@
       "gate": "always",
       "default_member_permissions": null,
       "dm_permission": false,
-      "options": [],
+      "options": [
+        {
+          "name": "scope",
+          "description": "Which standings to show. Default: seasonal.",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            {
+              "name": "Seasonal",
+              "value": "seasonal"
+            },
+            {
+              "name": "Lifetime",
+              "value": "lifetime"
+            }
+          ]
+        }
+      ],
       "smoke": "covered",
       "expected_response": "docs/smoke-expected-responses.md Expected-response table, `/leaderboard` happy-path shape; docs/smoke-run-record.md row 2",
       "deferral_reason": null

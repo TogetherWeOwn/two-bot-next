@@ -409,7 +409,9 @@ Show the server XP leaderboard.
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `scope` | string | false | — | — | — | Seasonal = `"seasonal"`; Lifetime = `"lifetime"` | Which standings to show. Default: seasonal. |
 
 ## `/lfg`
 
@@ -601,6 +603,7 @@ Show your XP, level and server rank.
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `member` | user | false | — | — | — | — | Show another member. |
+| `details` | boolean | false | — | — | — | — | Show message, voice and imported XP next to the stored total. |
 
 ## `/reclaim`
 

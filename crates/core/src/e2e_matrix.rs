@@ -136,7 +136,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Rank",
-            "Ephemeral text reply with XP, level and server rank; optional member option echoes that member.",
+            "Ephemeral text reply with XP, level and server rank; optional member option echoes that member, optional details adds labeled XP sources next to the stored total.",
             &[],
         ),
         row(
@@ -146,7 +146,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Leaderboard",
-            "Public mention-suppressed top-ten reply.",
+            "Public mention-suppressed top-ten reply; optional scope selects seasonal (default) or explicitly labeled lifetime standings.",
             &[],
         ),
         row(

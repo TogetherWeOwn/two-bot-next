@@ -21,8 +21,8 @@ use two_bot_core::{
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
-        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms,
-        RewardPlanError, XpAward, LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_reply_for_season, leaderboard_reply_lifetime, plan_reward_roles, rank_reply,
+        rank_reply_detailed, season_id_for_ms, RewardPlanError, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
     ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
@@ -673,9 +673,11 @@ enum PendingRead {
     Rank {
         member_id: String,
         display_name: String,
+        details: bool,
     },
     Leaderboard {
         season: String,
+        lifetime: bool,
     },
 }
 
@@ -794,9 +796,12 @@ impl LevelingRuntime {
     /// [`Self::handle_interaction`] at an explicit event-time instant (AC3):
     /// the routed `/leaderboard` serves `season_id_for_ms` of `at`, scoped to
     /// `member_season_xp`, with an explicit season label and no lifetime
-    /// fallback. `/rank` stays lifetime-based at every instant. Shaped like
-    /// the pipeline's existing `handle_at` ISO-millis convention; the season
-    /// convention itself is unchanged.
+    /// fallback — unless the strict optional `scope` reads `lifetime`, which
+    /// serves the bounded lifetime standings with a lifetime label instead.
+    /// `/rank` stays lifetime-based at every instant; its strict optional
+    /// `details` flag appends labeled XP sources to the same private card.
+    /// Shaped like the pipeline's existing `handle_at` ISO-millis convention;
+    /// the season convention itself is unchanged.
     ///
     /// Defer-then-edit lifecycle: the initial acknowledgement (ephemeral for
     /// rank, public for leaderboard) precedes either store read, so a slow
@@ -833,6 +838,31 @@ impl LevelingRuntime {
                 else {
                     return Err(LevelingRuntimeError::InvalidInteraction);
                 };
+                // Strict pre-ack option check: only `member` (user) and
+                // `details` (boolean) exist, each at most once. Unknown,
+                // duplicate or wrong-typed options fail before any store
+                // read or acknowledgement.
+                let mut seen_member = false;
+                let mut seen_details = false;
+                for option in &data.options {
+                    match option.name.as_str() {
+                        "member" => {
+                            if seen_member || !matches!(option.value, CommandOptionValue::User(_)) {
+                                return Err(LevelingRuntimeError::InvalidInteraction);
+                            }
+                            seen_member = true;
+                        }
+                        "details" => {
+                            if seen_details
+                                || !matches!(option.value, CommandOptionValue::Boolean(_))
+                            {
+                                return Err(LevelingRuntimeError::InvalidInteraction);
+                            }
+                            seen_details = true;
+                        }
+                        _ => return Err(LevelingRuntimeError::InvalidInteraction),
+                    }
+                }
                 let user = if let Some(option) = data.options.iter().find(|o| o.name == "member") {
                     let CommandOptionValue::User(id) = option.value else {
                         return Err(LevelingRuntimeError::InvalidInteraction);
@@ -846,17 +876,49 @@ impl LevelingRuntime {
                         .or(interaction.user.as_ref())
                 }
                 .ok_or(LevelingRuntimeError::InvalidInteraction)?;
+                let details = data
+                    .options
+                    .iter()
+                    .find(|o| o.name == "details")
+                    .is_some_and(|o| matches!(o.value, CommandOptionValue::Boolean(true)));
                 PendingRead::Rank {
                     member_id: user.id.get().to_string(),
                     display_name: user.global_name.as_deref().unwrap_or(&user.name).to_owned(),
+                    details,
                 }
             }
             HandlerId::Leaderboard => {
-                let at_ms = two_bot_core::parse_iso_millis(at)
-                    .ok_or(LevelingRuntimeError::InvalidInteraction)?;
-                PendingRead::Leaderboard {
-                    season: season_id_for_ms(at_ms),
+                let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref()
+                else {
+                    return Err(LevelingRuntimeError::InvalidInteraction);
+                };
+                // Strict pre-ack scope check: one optional `scope` string,
+                // exactly `seasonal` (the default) or `lifetime`. Any other
+                // name, type, repetition or value fails before any store
+                // read or acknowledgement — never a silent seasonal read.
+                let mut seen_scope = false;
+                let mut lifetime = false;
+                for option in &data.options {
+                    if option.name != "scope" || seen_scope {
+                        return Err(LevelingRuntimeError::InvalidInteraction);
+                    }
+                    seen_scope = true;
+                    match &option.value {
+                        CommandOptionValue::String(value) if value == "lifetime" => {
+                            lifetime = true;
+                        }
+                        CommandOptionValue::String(value) if value == "seasonal" => {}
+                        _ => return Err(LevelingRuntimeError::InvalidInteraction),
+                    }
                 }
+                let season = if lifetime {
+                    String::new()
+                } else {
+                    let at_ms = two_bot_core::parse_iso_millis(at)
+                        .ok_or(LevelingRuntimeError::InvalidInteraction)?;
+                    season_id_for_ms(at_ms)
+                };
+                PendingRead::Leaderboard { season, lifetime }
             }
             _ => unreachable!(),
         };
@@ -871,17 +933,32 @@ impl LevelingRuntime {
             PendingRead::Rank {
                 member_id,
                 display_name,
+                details,
             } => leveling_store::profile(&self.pool, &guild, &member_id)
                 .await
-                .map(|profile| rank_reply(&profile, &display_name).content),
-            PendingRead::Leaderboard { season } => leveling_store::seasonal_leaderboard(
-                &self.pool,
-                &guild,
-                &season,
-                LEADERBOARD_DEFAULT_LIMIT,
-            )
-            .await
-            .map(|entries| leaderboard_reply_for_season(&entries, &season).content),
+                .map(|profile| {
+                    if details {
+                        rank_reply_detailed(&profile, &display_name).content
+                    } else {
+                        rank_reply(&profile, &display_name).content
+                    }
+                }),
+            PendingRead::Leaderboard { season, lifetime } => {
+                if lifetime {
+                    leveling_store::leaderboard(&self.pool, &guild, LEADERBOARD_DEFAULT_LIMIT)
+                        .await
+                        .map(|entries| leaderboard_reply_lifetime(&entries).content)
+                } else {
+                    leveling_store::seasonal_leaderboard(
+                        &self.pool,
+                        &guild,
+                        &season,
+                        LEADERBOARD_DEFAULT_LIMIT,
+                    )
+                    .await
+                    .map(|entries| leaderboard_reply_for_season(&entries, &season).content)
+                }
+            }
         };
         let application_id = interaction.application_id.get();
         match content {

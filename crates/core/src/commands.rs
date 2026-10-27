@@ -298,8 +298,29 @@ pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
         CommandDefinition::new("rank", "Show your XP, level and server rank.").options(vec![
             CommandOption::new("member", "Show another member.", CommandOptionType::User),
+            CommandOption::new(
+                "details",
+                "Show message, voice and imported XP next to the stored total.",
+                CommandOptionType::Boolean,
+            ),
         ]),
-        CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
+        CommandDefinition::new("leaderboard", "Show the server XP leaderboard.").options(vec![
+            CommandOption::new(
+                "scope",
+                "Which standings to show. Default: seasonal.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "Seasonal".to_owned(),
+                    value: "seasonal".to_owned(),
+                },
+                CommandChoice {
+                    name: "Lifetime".to_owned(),
+                    value: "lifetime".to_owned(),
+                },
+            ]),
+        ]),
         CommandDefinition::new("help", HELP_DESCRIPTION)
             .options(vec![
                 CommandOption::new(
