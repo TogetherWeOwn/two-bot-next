@@ -210,7 +210,9 @@ async fn scheduled_events_get_preserves_user_count_flag() {
 }
 
 // Finding 2: unsupported paths are refused without I/O — never silently
-// rewritten to another resource.
+// rewritten to another resource. A bare nonzero /users/{id} is a supported
+// author-profile read (starboard bot/human lookup), so the refused user
+// paths below are the malformed shapes only.
 #[tokio::test]
 async fn unsupported_get_path_is_refused_without_io() {
     let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
@@ -218,7 +220,9 @@ async fn unsupported_get_path_is_refused_without_io() {
     for path in [
         "/guilds/2222/bogus",
         "/channels/4444/bogus",
-        "/users/3333",
+        "/users/0",
+        "/users/not-a-snowflake",
+        "/users/3333?limit=1",
         "/channels/not-a-snowflake",
         "/guilds/2222/scheduled-events/0",
         "/guilds/2222/scheduled-events/not-a-snowflake",
