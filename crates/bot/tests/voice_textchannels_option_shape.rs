@@ -716,7 +716,7 @@ async fn textchannels_omitted_options_preserve_stored_settings() {
     let observed = fixture.state.lock().expect("observation lock");
     assert_eq!(
         observed.saved,
-        vec![seeded_creator()],
-        "omission preserves stored enabled, name and viewer role"
+        Vec::<CreatorChannel>::new(),
+        "channel alone is a read: stored enabled, name and viewer role stay unsaved"
     );
 }

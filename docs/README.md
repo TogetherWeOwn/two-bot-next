@@ -20,7 +20,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## Operations
 
-- [Operations](runbook.md)
+- [Runbook](runbook.md)
 - [Observability triage](runbook-observability.md)
 - [Metrics](metrics.md)
 - [Readiness](container-readiness.md)
@@ -45,7 +45,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Oct 1 tabletop](incident-tabletop-2026-10-01.md)
 - [Oct 6 tabletop](incident-tabletop-2026-10-06.md)
 - [Incident](production-incident-2026-10-15-postmortem.md)
-- [Ops audit reads](ops-control.md)
+- [Audit reads](ops-control.md)
 
 ## Storage and internal actions
 
@@ -124,6 +124,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Threads](lfg-thread-spec.md)
 - [LFG voice](lfg-voice-room-spec.md)
 - [LFG page (design only)](dashboard-lfg-config-spec.md)
+- [Signup reminder](lfg-reminder-spec.md)
 - [Play-now](lfg-play-now-spec.md)
 - [Feed ops](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
@@ -164,6 +165,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 ## Voice
 
 - [Room spec](voice-rooms.md)
+- [Presets proposal](voice-presets-spec.md)
 - [Router prefix seam](router-voice-prefix.md)
 - [Room creation plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
@@ -174,6 +176,8 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Access corpus](voice-access-golden.md)
 - [Vote-kick decisions](voice-vote-kick-core.md)
 - [Cooldown tests](voice-vote-cooldown-acceptance.md)
+- [Vote-kick](voice-vote-kick-core.md)
+- [Vote cooldown tests](voice-vote-cooldown-acceptance.md)
 - [Vote cooldown](voice-vote-kick-cooldown-checklist.md)
 - [Template composition](voice-template-core.md)
 - [Template styling](voice-style-core.md)
@@ -201,7 +205,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Rename pipeline](voice-rename-pipeline.md)
 - [Ping/invite](voice-utilities-core.md)
 - [Presence facts](voice-presence.md)
-- [Occupancy experiment](voice-occupancy-curve.md)
+- [Occupancy](voice-occupancy-curve.md)
 - [Delete guards](voice-delete-guards.md)
 - [Health contract](voice-health-contract.md)
 - [Config codec](voice-config-codec.md)
@@ -282,7 +286,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Pipeline benchmark](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)
 - [Image supply chain](supply-chain.md)
-- [Distroless eval](distroless-evaluation.md)
+- [Distroless](distroless-evaluation.md)
 - [Threat model](threat-model.md)
 - [Command wiring gates](command-wiring-security.md)
 - [Rejection telemetry](rejection-telemetry.md)
