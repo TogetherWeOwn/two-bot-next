@@ -37,7 +37,9 @@ carries a permission row (`handled_published_contract_acceptance`:\n\
 the voice sink answers each exactly once\n\
 (`router::voice_names_yield_to_the_voice_sink_only_while_gated`). A stale\n\
 entry, published and then left in Discord after its gate turned off, refuses\n\
-with its gate's disabled reply instead of executing\n\
+with its gate's disabled reply instead of executing, except for two shapes:\n\
+stale voice names answer `Unknown`, and `/kick` may delegate to the voice\n\
+vote as the gate table states\n\
 (`router::disabled_features_refuse_not_silence`,\n\
 `router::publish_reserves_disabled_builtin_names`). `/kick` has a second,\n\
 shadowed shape, and `/templateassistant` is defined but unpublished: see\n\
@@ -80,13 +82,16 @@ merge, the moderation `/kick` above wins first-wins. The published shape is\n\
 the real voice definition (`voice_rooms::voice_commands`).\n\n";
 
 const SHADOWED_KICK_INVOCATION: &str =
-    "Invocation: invoke moderation `/kick` (`target` + `reason`). The guild\n\
-fence, the moderation gate and the Kick Members check run first; a refusal\n\
-for moderation-off or a missing permission hands the interaction to the voice\n\
-vote, while guild-fence refusals never delegate and a passing moderator is\n\
-never turned into a voter. The vote needs the initiator and the target in one\n\
-tracked room; ballots arrive as `votekick:*` button interactions, not slash\n\
-commands. `/help` lists `/kick` once, under Kick, with the vote hint.\n\n\
+    "Invocation is gate-shaped. With moderation on, Discord presents moderation\n\
+`/kick` (`target` + required `reason`): the guild fence, the moderation gate\n\
+and the Kick Members check run first, and a refusal for a missing permission\n\
+may hand the interaction to the voice vote. With moderation off and\n\
+`TWO_VOICE=1`, Discord presents the voice shape below (`member` + optional\n\
+`reason`), whose moderation-off refusal likewise may delegate. Guild-fence\n\
+refusals never delegate and a passing moderator is never turned into a\n\
+voter. The vote needs the initiator and the target in one tracked room;\n\
+ballots arrive as `votekick:*` button interactions, not slash commands.\n\
+`/help` lists `/kick` once, under Kick, with the vote hint.\n\n\
 Pinned by `router::voice_kick_loses_first_wins_to_moderation_kick`,\n\
 `staging_publish_manifest::voice_kick_is_shadowed_by_moderation_kick`,\n\
 `command_runtime_tests::refused_kick_hands_the_interaction_to_the_voice_delegate`\n\
@@ -1071,6 +1076,62 @@ fn templateassistant_is_defined_but_unpublished() {
         .options
         .iter()
         .any(|o| o.name == "request" && o.required == Some(true)));
+}
+
+#[test]
+fn reference_prose_cites_existing_tests_docs_and_tooling() {
+    // Every test, doc and wrapper subcommand the reference prose pins must
+    // exist, or the generated reference cites a ghost. Cite a new pin in the
+    // prose above and add its name here in the same change.
+    let cited_tests = [
+        "every_published_non_voice_command_routes_to_a_handler",
+        "every_published_non_voice_command_has_a_permission_row",
+        "help_lists_only_handled_commands",
+        "voice_names_yield_to_the_voice_sink_only_while_gated",
+        "disabled_features_refuse_not_silence",
+        "publish_reserves_disabled_builtin_names",
+        "voice_kick_loses_first_wins_to_moderation_kick",
+        "voice_kick_is_shadowed_by_moderation_kick",
+        "refused_kick_hands_the_interaction_to_the_voice_delegate",
+        "kick_moderation_outcomes_never_consult_the_voice_delegate",
+        "templateassistant_stays_unpublished_until_its_slice_lands",
+        "write_reservations_cover_the_maximal_publish_set_and_capacity",
+        "desired_registry_reads_voice_and_assistant_gates_without_io",
+    ];
+    let sources = rust_sources_under(&repository_root().join("crates"));
+    assert!(!sources.is_empty(), "crate sources must be readable");
+    for name in cited_tests {
+        let definition = format!("fn {name}(");
+        assert!(
+            sources.iter().any(|src| src.contains(&definition)),
+            "{name} is cited but defines no fn"
+        );
+    }
+    let root = repository_root();
+    assert!(
+        root.join("docs/voice-assistant-core.md").is_file(),
+        "cited gate doc is missing"
+    );
+    let wrapper = std::fs::read_to_string(root.join("scripts/cargo_cache.py"))
+        .expect("wrapper source must be readable");
+    assert!(
+        wrapper.contains("add_parser('run')"),
+        "cited offline-check subcommand is missing"
+    );
+}
+
+fn rust_sources_under(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(dir).expect("read source dir");
+    for entry in entries {
+        let path = entry.expect("read dir entry").path();
+        if path.is_dir() {
+            out.extend(rust_sources_under(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(std::fs::read_to_string(&path).expect("read rust source"));
+        }
+    }
+    out
 }
 
 #[test]

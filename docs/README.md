@@ -8,7 +8,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 - [Find a doc](README.md)
 - [Framework](adr/0001-discord-framework.md)
-- [Commands + check](commands.md)
+- [Commands](commands.md)
 - [Settings](configuration.md)
 - [Parity ledger](parity.md)
 - [Containment](containment.md)
