@@ -1,4 +1,4 @@
-# Giveaway saved details and entry rules
+# Giveaway lists, saved details and entry rules
 
 Use `/giveaway list` to find active IDs, then `/giveaway inspect id:<saved-id>`
 in the giveaway's channel. `/help command:giveaway` lists the published
@@ -6,6 +6,28 @@ subcommands and their arguments. Administration requires Manage Server, the
 configured guild and the existing automations feature. Inspection does not add
 cross-channel visibility: an unknown ID, another guild's ID and a giveaway in
 another channel produce the same private miss.
+
+## Private active list
+
+`/giveaway list` shows the existing same-guild staff inventory, in saved deadline
+and ID order. Each complete row carries its stable ID, an inert prize preview,
+saved destination, and `open` with a localized saved deadline or `paused (no
+countdown)`. Paused rows do not show a ticking timestamp. This does not grant
+cross-channel inspection rights or perform Discord visibility or message reads.
+
+Only recorded, valid guild/channel/message IDs become message links. A saved
+channel without a recorded message says `message unconfirmed`; an unavailable
+destination says so and has no link. Links are historical saved references, not
+proof the post still exists or that delivery succeeded. Check the destination
+before recreating an unconfirmed giveaway.
+
+All ten active IDs fit one private reply of at most 2,000 UTF-16 units. Prize
+previews use at most 32 display characters, shortened further when needed;
+`…` explicitly marks shortening and `?` means the saved prize has no displayable
+text. Escaping and mention neutralization count toward the final budget. IDs,
+links and deadlines are never cut and rows are never silently dropped. Empty
+inventory says `No open giveaways.`; a failed read says unavailable, not empty.
+The list makes no entry, lifecycle, audit, budget, claim or scheduling changes.
 
 ## Private saved-state inspection
 

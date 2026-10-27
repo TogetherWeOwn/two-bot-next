@@ -78,6 +78,8 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
+  // Rollback containers predate this counter; validate it only when present.
+  two_bot_gateway_drain_skips_total: {},
   two_bot_job_last_error_class: { job: JOB_RUNS_JOBS, class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
