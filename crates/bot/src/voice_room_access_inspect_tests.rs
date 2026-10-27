@@ -1,8 +1,10 @@
 //! Builder-owned pins for `/room-access-inspect` handler behavior outside the
 //! protected acceptance module: unusable `page` shapes refuse through real
 //! slash parsing and dispatch (never silently serving page 1), past-end pages
-//! name the real total, and a missing or dead guild actor reports warming-up
-//! or worker-lost instead of an empty room. No protected file is touched here.
+//! name the real total, and a missing, dead or stalled guild actor reports
+//! warming-up or worker-lost instead of an empty room. An open-but-stalled
+//! inbox must time out within the acknowledgement bound, never hang.
+//! No protected file is touched here.
 #![cfg(test)]
 
 use super::*;
@@ -190,4 +192,43 @@ async fn inspect_with_dead_actor_reports_worker_lost() {
         "The voice worker stopped answering — try again in a moment."
     );
     assert_no_access_sections(&text);
+}
+
+#[tokio::test(start_paused = true)]
+async fn inspect_with_stalled_actor_reports_worker_lost_within_ack_wait() {
+    let (runtime, mut rx) = stalled_worker_runtime();
+    let interaction = voice_interaction_as(
+        Some(command_data("room-access-inspect", vec![])),
+        None,
+        MEMBER,
+    );
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let captured = responses.clone();
+    let call = handle_voice_interaction(&runtime, &interaction, move |response| {
+        captured.lock().unwrap().push(response);
+        async {}
+    });
+    tokio::pin!(call);
+    let command = tokio::select! {
+        command = rx.recv() => command.expect("accepted inspect command"),
+        _ = &mut call => panic!("inspect handler did not reach its worker boundary"),
+    };
+    assert!(
+        matches!(command, ActorCommand::RoomAccess { .. }),
+        "the stalled inbox must hold the inspect read"
+    );
+    // Hold the accepted command without answering: the inbox stays open but
+    // stalled, so the read must time out instead of hanging.
+    let held = Some(command);
+    let owned = bounded_sibling_wait(&mut call).await;
+    assert!(owned, "inspect must be handled, not silently dropped");
+    let responses = responses.lock().unwrap();
+    assert_eq!(responses.len(), 1, "exactly one reply");
+    let text = response_text(&responses[0]);
+    assert_eq!(
+        text,
+        "The voice worker stopped answering — try again in a moment."
+    );
+    assert_no_access_sections(&text);
+    drop(held);
 }

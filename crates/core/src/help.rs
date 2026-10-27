@@ -793,10 +793,10 @@ mod tests {
         }
         // 44 non-voice commands (7 core + 25 feature + 9 moderation + 3 reads),
         // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
-        // purge-preview and channel-inspect, plus 21 additional voice commands (voice
+        // purge-preview and channel-inspect, plus 22 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (65 live)"));
+        assert!(text.contains("**Server commands** (66 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -925,9 +925,9 @@ mod tests {
             .collect();
         // 44 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview and channel-inspect, plus
-        // 21 additional voice names (voice `kick` shares the Kick group).
+        // 22 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 65);
+        assert_eq!(grouped.len(), 66);
         for name in [
             "rank",
             "leaderboard",
