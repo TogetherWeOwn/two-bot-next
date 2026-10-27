@@ -388,7 +388,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Rsvp",
-            "Ephemeral `RSVP saved: <status>.` confirmation (pasted links append the event id).",
+            "Ephemeral `RSVP saved: <status>.` confirmation; a changed or repeated choice adds `(changed from <previous>)` or `(saved again; time updated)` (pasted links append the event id).",
             &[
                 "Gate:AnnouncementsDisabled",
                 "Valid:event-id:required,max128",
