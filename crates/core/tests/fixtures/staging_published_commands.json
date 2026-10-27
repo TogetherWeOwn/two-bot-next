@@ -49,7 +49,8 @@
     "lockdown",
     "unlock",
     "purge-preview",
-    "channel-inspect"
+    "channel-inspect",
+    "moderation-recent"
   ],
   "example_dynamic": [
     { "name": "faq", "description": "Example automation-gated custom command", "enabled": true }
@@ -98,6 +99,7 @@
     "unlock",
     "purge-preview",
     "channel-inspect",
+    "moderation-recent",
     "faq"
   ],
   "voice": {

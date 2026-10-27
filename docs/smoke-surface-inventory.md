@@ -9,19 +9,19 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 44 compiled built-ins plus the voice set
-  (65 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 45 compiled built-ins plus the voice set
+  (66 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
 Saved inventory: 7 core + 1 scorecard + 12 automations + 11 announcements +
-9 moderation + 3 private reads = **43 built-ins**. Machine-readable mirror:
+9 moderation + 4 private reads = **44 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
-The test extends this saved fixture in memory with `/lfg-edit`: **44 compiled
-built-ins**, five covered and 39 deferred. The saved JSON deliberately excludes
+The test extends this saved fixture in memory with `/lfg-edit`: **45 compiled
+built-ins**, five covered and 40 deferred. The saved JSON deliberately excludes
 edit; this extension is not a live-publication or smoke-acceptance claim.
 
 ## Covered: the smoke five (one per routing family)
@@ -91,6 +91,7 @@ handler family with a covered command.
 | `/unlock` | moderation | Channel-state mutation; excluded from the read-only smoke. |
 | `/purge-preview` | moderation | Next-only private read with no legacy counterpart; the sampled preview is pinned by the offline preview/inspect acceptance tests rather than the live smoke five. |
 | `/channel-inspect` | moderation | Next-only private read with no legacy counterpart; the restriction snapshot is pinned by the offline preview/inspect acceptance tests rather than the live smoke five. |
+| `/moderation-recent` | moderation | Next-only private staff read of saved ledger rows with no legacy counterpart; pinned by the offline recent-actions acceptance tests rather than the live smoke five. |
 
 ## How the live-guild pass uses this inventory
 

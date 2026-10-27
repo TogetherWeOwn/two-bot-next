@@ -600,7 +600,10 @@ mod tests {
                 // still requires one.
                 if !matches!(
                     definition.name.as_str(),
-                    "purge-preview" | "channel-inspect" | "tempban-list"
+                    "purge-preview"
+                        | "channel-inspect"
+                        | "tempban-list"
+                        | "moderation-recent"
                 ) {
                     let reason = definition
                         .options
