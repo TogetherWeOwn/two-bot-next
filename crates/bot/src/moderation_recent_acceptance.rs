@@ -266,6 +266,9 @@ async fn snapshot(pool: &PgPool) -> Vec<i64> {
     out
 }
 
+/// `(request_id, action, outcome, target_id, reason, created_at)`.
+type AuditRow<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, &'a str, &'a str);
+
 struct AuditSeed<'a> {
     request_id: &'a str,
     guild_id: &'a str,
@@ -298,28 +301,29 @@ async fn seed_audit(pool: &PgPool, seed: AuditSeed<'_>) {
     .expect("seed audit ledger");
 }
 
-async fn seed_warning(
-    pool: &PgPool,
-    id: &str,
-    guild_id: &str,
-    user_id: &str,
-    actor_id: &str,
-    reason: &str,
-    request_id: &str,
-    created_at: &str,
-) {
+struct WarningSeed<'a> {
+    id: &'a str,
+    guild_id: &'a str,
+    user_id: &'a str,
+    actor_id: &'a str,
+    reason: &'a str,
+    request_id: &'a str,
+    created_at: &'a str,
+}
+
+async fn seed_warning(pool: &PgPool, seed: WarningSeed<'_>) {
     sqlx::query(
         "INSERT INTO moderation_warnings
          (id, guild_id, user_id, actor_id, reason, request_id, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7::text::timestamptz)",
     )
-    .bind(id)
-    .bind(guild_id)
-    .bind(user_id)
-    .bind(actor_id)
-    .bind(reason)
-    .bind(request_id)
-    .bind(created_at)
+    .bind(seed.id)
+    .bind(seed.guild_id)
+    .bind(seed.user_id)
+    .bind(seed.actor_id)
+    .bind(seed.reason)
+    .bind(seed.request_id)
+    .bind(seed.created_at)
     .execute(pool)
     .await
     .expect("seed warnings ledger");
@@ -493,7 +497,7 @@ async fn moderation_recent_covers_every_action_outcome_pair_exactly_once() {
     // corroborated warning. Reverse insertion order catches accidental
     // insertion-order reads; identical outcome words across verbs catch
     // verb-blind rendering.
-    let rows: Vec<(&str, &str, &str, Option<&str>, &str, &str)> = vec![
+    let rows: Vec<AuditRow<'_>> = vec![
         (
             "req-unlock-001",
             "moderation.unlock",
@@ -625,13 +629,15 @@ async fn moderation_recent_covers_every_action_outcome_pair_exactly_once() {
     }
     seed_warning(
         &pool,
-        "warn-row-1",
-        GUILD_S,
-        "3333",
-        "88",
-        "first warning",
-        "req-warn-001",
-        "2026-10-10T00:00:06+00:00",
+        WarningSeed {
+            id: "warn-row-1",
+            guild_id: GUILD_S,
+            user_id: "3333",
+            actor_id: "88",
+            reason: "first warning",
+            request_id: "req-warn-001",
+            created_at: "2026-10-10T00:00:06+00:00",
+        },
     )
     .await;
     seed_audit(
@@ -892,25 +898,31 @@ async fn moderation_recent_refuses_nonstaff_missing_and_cold_actors() {
     let honest_requests = dispatch_recent(pool.clone(), &rest, honest).await;
     // Stale staff interaction, live facts say otherwise: empty roles (cold),
     // missing member (404), and unprivileged roles (non-staff).
-    let mut cold = RecentFacts::default();
-    cold.actor = member_body(ACTOR, &[], false);
+    let cold = RecentFacts {
+        actor: member_body(ACTOR, &[], false),
+        ..RecentFacts::default()
+    };
     let cold_rest = RecentRest::start(cold).await;
     let cold_requests =
         dispatch_recent(pool.clone(), &cold_rest, staff_interaction(Vec::new())).await;
-    let mut missing = RecentFacts::default();
-    missing.missing_actor = true;
+    let missing = RecentFacts {
+        missing_actor: true,
+        ..RecentFacts::default()
+    };
     let missing_rest = RecentRest::start(missing).await;
     let missing_requests =
         dispatch_recent(pool.clone(), &missing_rest, staff_interaction(Vec::new())).await;
-    let mut junior = RecentFacts::default();
-    junior.guild = json!({
-        "id": GUILD_S, "owner_id": "5555",
-        "roles": [
-            {"id": GUILD_S, "position": 0, "permissions": "0"},
-            {"id": MOD_ROLE, "position": 50, "permissions": "0"},
-            {"id": BOT_ROLE, "position": 100, "permissions": Permissions::all().bits().to_string()},
-        ],
-    });
+    let junior = RecentFacts {
+        guild: json!({
+            "id": GUILD_S, "owner_id": "5555",
+            "roles": [
+                {"id": GUILD_S, "position": 0, "permissions": "0"},
+                {"id": MOD_ROLE, "position": 50, "permissions": "0"},
+                {"id": BOT_ROLE, "position": 100, "permissions": Permissions::all().bits().to_string()},
+            ],
+        }),
+        ..RecentFacts::default()
+    };
     let junior_rest = RecentRest::start(junior).await;
     let junior_requests =
         dispatch_recent(pool.clone(), &junior_rest, staff_interaction(Vec::new())).await;
