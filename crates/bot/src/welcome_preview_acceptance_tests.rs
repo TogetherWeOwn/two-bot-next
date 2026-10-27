@@ -994,15 +994,17 @@ async fn preview_broken_stored_config_fails_privately_with_retry_guidance() {
     // Non-snowflake session pick in session mode.
     let db = TestSchema::new().await;
     let result = std::panic::AssertUnwindSafe(async {
-        SettingsStore::new(&db.pool)
-            .set(
-                "22",
-                "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID",
-                Some(json!(["bogus"])),
-                "test",
-            )
-            .await
-            .unwrap();
+        // Seed a corrupt legacy row without the validated settings writer.
+        sqlx::query(
+            "INSERT INTO guild_settings (guild_id, key, value, updated_by) VALUES ($1, $2, $3, $4)",
+        )
+        .bind("22")
+        .bind("DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID")
+        .bind(json!(["bogus"]))
+        .bind("test")
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let mock = preview_discord(Arc::new(Mutex::new(PreviewDiscordState::default()))).await;
         let runtime = runtime(&db.pool, &mock, &vars("session", false));
         runtime.handle(job(preview()), NOW).await.unwrap();
