@@ -344,32 +344,35 @@ pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Op
             return None;
         }
     };
-    let poller = Arc::new(FeedPoller::default());
-    let guild = context.guild.clone();
-    let action: JobAction = Arc::new(move || {
-        let context = context.clone();
-        let poller = poller.clone();
-        Box::pin(async move {
-            poller
-                .run_once(
-                    context.pool().await?,
-                    &context.rest,
-                    &context.guild,
-                    &PublicFeedFetch,
-                )
-                .await
-        })
-    });
-    register_fenced(gates, activation, action, guild)
+    Arc::new(FeedPoller::default()).registered_job(
+        context,
+        gates,
+        activation,
+        None,
+        Arc::new(PublicFeedFetch),
+    )
 }
 
 /// Identity can only narrow the env gate: the poller posts under the token's
 /// identity, exactly like the announcement verbs the router refuses there.
+/// Production [`register`] goes through [`FeedPoller::registered_job`];
+/// this stays as the test-only fenced-registration convenience.
+#[cfg(test)]
 pub(crate) fn register_fenced(
     gates: FeatureGates,
     activation: &BootActivation,
     action: JobAction,
     guild: String,
+) -> Option<Job> {
+    register_fenced_with_live(gates, activation, action, guild, None)
+}
+
+fn register_fenced_with_live(
+    gates: FeatureGates,
+    activation: &BootActivation,
+    action: JobAction,
+    guild: String,
+    live: Option<two_bot_core::settings::LiveSettings>,
 ) -> Option<Job> {
     let fenced = activation.constrain_features(gates);
     if gates.announcements && !fenced.announcements {
@@ -379,10 +382,24 @@ pub(crate) fn register_fenced(
             "feed poller parked: live activation refused"
         );
     }
-    register_gated(fenced, action, guild)
+    register_gated_with_live(fenced, action, guild, live)
 }
 
+/// Test-only ungated-registration convenience over [`register_gated_with_live`].
+#[cfg(test)]
 fn register_gated(gates: FeatureGates, action: JobAction, guild: String) -> Option<Job> {
+    register_gated_with_live(gates, action, guild, None)
+}
+
+/// Shared per-tick announcements gate: `None` reads the poller-published
+/// snapshot, `Some` reads the injected per-instance source through the SAME
+/// resolver. Production and consumer acceptance never fork the policy.
+fn register_gated_with_live(
+    gates: FeatureGates,
+    action: JobAction,
+    guild: String,
+    live: Option<two_bot_core::settings::LiveSettings>,
+) -> Option<Job> {
     if !gates.announcements {
         return None;
     }
@@ -391,11 +408,14 @@ fn register_gated(gates: FeatureGates, action: JobAction, guild: String) -> Opti
         gates.feed_poll_seconds,
         action,
         guild,
-        Arc::new(move || live_announcements_on(&gate_guild, true)),
+        Arc::new(move || match &live {
+            Some(live) => live_announcements_with(&gate_guild, true, Some(live)),
+            None => live_announcements_on(&gate_guild, true),
+        }),
     )
 }
 
-/// [`register_gated`] over an injectable per-tick gate, for tests. The
+/// [`register_gated_with_live`] over an injectable per-tick gate. The
 /// production gate reads the live announcements snapshot store-first over the
 /// boot value; a closed gate skips the tick without error (like the schedule
 /// gate below it), silently so a parked poller does not log every interval.
@@ -416,6 +436,41 @@ fn register_gated_with(
         })
     });
     scheduled_job_live(feed_poll_seconds, gated, guild).ok()
+}
+
+impl FeedPoller {
+    /// Shared registration factory: the actual registration gate, schedule,
+    /// per-tick announcements gate and real poller action in one composition.
+    /// Production [`register`] delegates with `None` (the poller-published
+    /// snapshot); consumer acceptance injects `Some` per-instance source plus
+    /// an explicit fetch boundary. Never fork this composition: a second
+    /// registration path would let the gate and the job disagree.
+    pub(crate) fn registered_job(
+        self: Arc<Self>,
+        context: Arc<Context>,
+        gates: FeatureGates,
+        activation: &BootActivation,
+        live: Option<two_bot_core::settings::LiveSettings>,
+        fetch: Arc<dyn FeedFetch>,
+    ) -> Option<Job> {
+        let guild = context.guild.clone();
+        let action: JobAction = Arc::new(move || {
+            let context = context.clone();
+            let poller = self.clone();
+            let fetch = fetch.clone();
+            Box::pin(async move {
+                poller
+                    .run_once(
+                        context.pool().await?,
+                        &context.rest,
+                        &context.guild,
+                        fetch.as_ref(),
+                    )
+                    .await
+            })
+        });
+        register_fenced_with_live(gates, activation, action, guild, live)
+    }
 }
 
 #[derive(Default)]
