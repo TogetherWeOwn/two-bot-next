@@ -751,12 +751,17 @@ async fn a_saved_reserved_source_is_not_a_backdoor_around_clone_name_validation(
 
 #[tokio::test]
 async fn invalid_saved_template_or_description_cannot_be_cloned() {
+    // No empty-template or empty-description case: the table CHECKs
+    // (length BETWEEN 1 AND 100 / 2000, migration 0130) make an empty legacy
+    // row impossible to store, and the validator's lower bound is the same
+    // 1 UTF-16 unit, so no storable-but-rejected lower-bound value exists
+    // (whitespace-only passes validation). The emoji cases stay storable:
+    // 51 / 1001 chars fit the CHECKs while 102 / 2002 UTF-16 units exceed
+    // the validator's 100 / 2000 bounds.
     for (template, description) in [
         ("{usre}".to_owned(), DESCRIPTION.to_owned()),
         (TEMPLATE.to_owned(), "😀".repeat(51)),
-        (String::new(), DESCRIPTION.to_owned()),
         ("😀".repeat(1001), DESCRIPTION.to_owned()),
-        (TEMPLATE.to_owned(), String::new()),
     ] {
         let f = Fixture::new(true).await;
         sqlx::query("UPDATE automation_commands SET template = $1, description = $2 WHERE guild_id = $3 AND name = 'source'")
