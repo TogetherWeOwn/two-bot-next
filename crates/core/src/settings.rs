@@ -1049,6 +1049,10 @@ pub enum WriteRefusal {
          store a plain count or delete the row to fall back to the boot value"
     )]
     InvalidInactivityDays(String),
+    #[error(
+        "refused: {0} accepts only a JSON array of at most 100 canonical nonzero event id strings"
+    )]
+    InvalidEventVoiceOptOuts(String),
 }
 
 /// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
@@ -1137,6 +1141,15 @@ pub fn validate_write(
             .is_some_and(|rendered| crate::parse_self_role_panels(&rendered).is_err())
     {
         return Err(WriteRefusal::InvalidPanelsValue(key.to_owned()));
+    }
+    // Refuse malformed opt-outs before storing them; the strict read-side
+    // parser remains the fail-closed backstop for legacy/direct-SQL rows.
+    if key == EVENT_VOICE_OPT_OUT_KEY
+        && value
+            .as_ref()
+            .is_some_and(|value| parse_event_voice_opt_outs(value).is_none())
+    {
+        return Err(WriteRefusal::InvalidEventVoiceOptOuts(key.to_owned()));
     }
     // Correction cycles and inactivity days validate through their real
     // readers: a stored value the tick cannot parse is refused before any

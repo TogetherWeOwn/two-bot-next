@@ -191,9 +191,86 @@ fn event_voice_failure(response: &RawResponse) -> EventVoiceResponse {
         EventVoiceResponse::RateLimited {
             retry_after_ms: (delay * 1000.0).ceil() as u64,
         }
-    } else if (400..500).contains(&response.status) && response.status != 408 {
+    } else if super::is_definitive_rejection(response.status) {
         EventVoiceResponse::Refused(response.status)
     } else {
         EventVoiceResponse::Uncertain
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn failure_for(status: u16) -> EventVoiceResponse {
+        event_voice_failure(&RawResponse {
+            status,
+            retry_after_header: None,
+            body: Vec::new(),
+            completion: None,
+        })
+    }
+
+    #[test]
+    fn ambiguous_conflicts_stay_uncertain_so_fences_hold() {
+        // 409/425 prove nothing about a POST: the transport holds the permit
+        // as uncertain, so the adapter must not report a definite no-effect
+        // that would let Creator::release_no_effect clear the lease/capacity.
+        for status in [408, 409, 425] {
+            assert_eq!(
+                failure_for(status),
+                EventVoiceResponse::Uncertain,
+                "status {status} must stay uncertain"
+            );
+            assert!(
+                !super::is_definitive_rejection(status),
+                "transport must also hold status {status} as uncertain"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_set_matches_transport_definitive_rejections() {
+        // The adapter may claim Refused only for statuses whose permit the
+        // transport already released at receipt (complete_on_receipt). Sweep
+        // every client-error status against the live transport predicate so a
+        // future 4xx cannot slip back into Refused while fenced.
+        for status in 400..500u16 {
+            let verdict = failure_for(status);
+            if status == 429 {
+                assert!(
+                    matches!(
+                        verdict,
+                        EventVoiceResponse::RateLimited {
+                            retry_after_ms: 1000
+                        }
+                    ),
+                    "429 keeps its own rate-limit verdict, got {verdict:?}"
+                );
+            } else if super::is_definitive_rejection(status) {
+                assert_eq!(
+                    verdict,
+                    EventVoiceResponse::Refused(status),
+                    "definitive rejection {status} releases the lane"
+                );
+            } else {
+                assert_eq!(
+                    verdict,
+                    EventVoiceResponse::Uncertain,
+                    "fenced status {status} must stay uncertain"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn server_errors_and_redirects_stay_uncertain() {
+        for status in [301, 302, 500, 502, 503, 200, 201, 204] {
+            assert_eq!(
+                failure_for(status),
+                EventVoiceResponse::Uncertain,
+                "status {status} must stay uncertain"
+            );
+        }
     }
 }

@@ -80,7 +80,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate`, `name_blocked` or `other` |
 | `two_bot_voice_join_occupancy_total{occupancy}` | Organic VOICE_STATE_UPDATE joins by humans already present in the target channel when the join arrived, excluding the joiner; `occupancy` is `0`, `1`, `2`, `3`, `4`, `5`, `6` or `7+` (`7+` caps the tail). Leaves, same-channel updates, pre-READY frames and mechanical transitions (creator/generator target or previous channel: creator join, generator join, bot move echo) are not samples; joins into the session lobby or permanent protected channels still sample; no member, channel or time labels, so hourly curves use `increase(...[1h])` and there is no per-event log line. Deliberately unwatched: distribution telemetry for capacity curves, no bucket is a fault; see the catalog |
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
-| `two_bot_event_voice_tick_total{outcome}` | Event-voice T-15 ticks that stayed TBD, by website reason; `outcome` is `opens_soon`, `rate_limited`, `perm_denied`, `no_category`, `unavailable` or `other`. Every TBD tick counts once, including backoff-skipped ticks; `Ready` ticks record nothing here — the ticker card extends this same series with its ready/create family |
+| `two_bot_event_voice_tick_total{outcome}` | Event-voice waiting preflights and counted per-event decisions after a ready preflight; `outcome` is `created`, `deleted`, `opens_soon`, `rate_limited`, `perm_denied`, `no_category`, `unavailable` or `other`. Waiting preflights count once, including backoff-skipped ticks; ready ticks count each create/recreate as `created`, each confirmed far-future delete as `deleted`, and each rate-limited/permission-denied/missing-category event under its reason. Unchanged and skipped events record nothing |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
 | `two_bot_raid_dropped_joins_total{reason}` | Joins not enqueued for raid observation; `reason` is exactly `queue_full` or `queue_closed`. Counts once per dropped join, not per alert. Both series start at zero and reset on process restart. No guild/member/error-text labels |
 | `two_bot_join_risk_dropped_joins_total{reason}` | Joins not enqueued for risk scoring; the same two reasons and reset semantics as the raid counter. These observer drops do not undo gateway persistence. No automatic retry or new alert rule; see [queue triage](runbook-observability.md#raid-and-join-risk-queue-drops) |
@@ -362,13 +362,15 @@ as dynamic labels.
   terminal `KickMember` enforcement (`EnforcementOutcome::as_str`); vote
   results are audit-only. Refusal codes never become free-form text; unknown
   outcomes collapse to `other`.
-- `two_bot_event_voice_tick_total{outcome}` — `outcome` is `opens_soon`,
-  `rate_limited`, `perm_denied`, `no_category`, `unavailable` or `other`
-  (`crates/core/src/metrics.rs` `EVENT_VOICE_TICK_OUTCOMES`). Recorded once
-  per event-voice preflight that returns `Waiting`, including backoff-skipped
-  ticks, with the website reason (`EventVoiceTbdReason::as_str`); `Ready`
-  ticks record nothing here. The ticker card extends this same series with
-  its ready/create family. Unknown outcomes collapse to `other`.
+- `two_bot_event_voice_tick_total{outcome}` — `outcome` is `created`, `deleted`,
+  `opens_soon`, `rate_limited`, `perm_denied`, `no_category`, `unavailable` or
+  `other` (`crates/core/src/metrics.rs` `EVENT_VOICE_TICK_OUTCOMES`). A waiting
+  preflight counts once with its website reason, including backoff skips.
+  After a ready preflight, each counted event decision increments its outcome:
+  creates and recreates use `created`, confirmed far-future deletes use
+  `deleted`; rate-limited (including give-up), permission-denied and
+  missing-category events use their corresponding reason. Skipped/unchanged
+  events record nothing. Unknown outcomes collapse to `other`.
 - `two_bot_voice_join_occupancy_total{occupancy}` — `occupancy` is `0`, `1`,
   `2`, `3`, `4`, `5`, `6` or `7+` (`crates/core/src/metrics.rs`
   `VOICE_JOIN_OCCUPANCY_BUCKETS`). Recorded once per organic ticketed join by
@@ -753,7 +755,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 
 | Rule | Fires when | Runbook |
 | --- | --- | --- |
-| `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
+| `job_stale:<job>` | last success older than 2 x the job cadence, with a 180 s floor for `event_voice` (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
 | `rest_5xx_rate` | 5xx responses > 10% of REST requests between samples, >= 10 requests | [REST 5xx](runbook.md#alert-rest-5xx) |
@@ -839,7 +841,11 @@ process-incarnation family: a restart whose new count already exceeds the old
 count cannot be distinguished from growth by this rule.
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
-Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
+Rust `*_INTERVAL_MS / 1000`. The threshold is two intervals, with an explicit
+180 s floor for `event_voice` (60 s cadence plus a 120 s attempt timeout).
+Rollback containers may omit all EventVoice job samples; when any are present,
+the scraper still requires the complete current required set. Other jobs'
+required samples remain mandatory. The 15 s tickers (`scheduled_messages`,
 `settings`) use `ticker_stale` with the explicit `TICKER_STALE_SECONDS` (600)
 window instead: at two intervals a 15 s cadence would flap on a single slow
 scrape, and skipped busy deadlines are neither success nor failure, so

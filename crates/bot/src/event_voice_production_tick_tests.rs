@@ -175,3 +175,94 @@ async fn production_tick_reconciles_then_creates_and_binds_through_the_guarded_p
     mock.shutdown().await;
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn production_defaults_admit_the_earliest_ten_events_for_the_same_bot_actor() {
+    let Some(db) = database().await else { return };
+    let prototype = source_document();
+    let events: Vec<Value> = (0..20)
+        .rev()
+        .map(|index| {
+            let mut event = prototype.clone();
+            event["id"] = json!((5000 + index).to_string());
+            event["name"] = json!(format!("Event {index}"));
+            event
+        })
+        .collect();
+    let mut responses = vec![
+        ScriptedResponse::json(
+            200,
+            json!({"id":"200","guild_id":"100","type":4,
+            "name":"events","permission_overwrites":[]}),
+        ),
+        ScriptedResponse::json(200, json!(events)),
+        ScriptedResponse::json(200, json!({"id":"999","bot":true})),
+    ];
+    responses.extend((0..10).map(|index| {
+        ScriptedResponse::json(
+            201,
+            json!({"id":(7000 + index).to_string(),"guild_id":"100","parent_id":"200","type":2}),
+        )
+    }));
+    let mock = MockRest::start(responses, ScriptedResponse::status(500)).await;
+    crate::gateway::ensure_crypto_provider();
+    let context = Context {
+        url: "invalid fixture database; must never connect".into(),
+        pool: OnceCell::new(),
+        rest: ActionExecutor::with_proxy(
+            "synthetic-production-defaults".into(),
+            Some(mock.origin()),
+        )
+        .unwrap(),
+        guild: "100".into(),
+        observation: Mutex::new(()),
+        events_gate: JobGate::default(),
+        event_voice: event_voice_preflight::Tick::default(),
+        event_voice_source: event_voice_source::Reader::default(),
+        event_voice_reconcile: event_voice_reconcile::Reconciler::default(),
+        voice: Some(Arc::new(Sink(super::event_voice_preflight_tests::live()))),
+    };
+    context.pool.set(db.pool().clone()).unwrap();
+    let (_stop, shutdown) = watch::channel(false);
+    context
+        .run_event_voice_tick_guarded(
+            event_voice_preflight::Settings {
+                category: Some(200),
+                staff_channel: None,
+            },
+            two_bot::voice_rooms::configured_admission(|_| None),
+            &shutdown,
+        )
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    let creates: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(
+        creates.len(),
+        10,
+        "member defaults must not cap the shared bot actor at one (or three)"
+    );
+    let bound: Vec<String> = sqlx::query_scalar(
+        "SELECT event_id FROM event_voice_channels WHERE voice_channel_id IS NOT NULL ORDER BY event_id"
+    ).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(
+        bound,
+        (5000..5010).map(|id| id.to_string()).collect::<Vec<_>>()
+    );
+    let reservations: Vec<String> = sqlx::query_scalar(
+        "SELECT user_id FROM voice_create_reservations WHERE settled_at IS NULL",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        reservations,
+        vec!["999"; 10],
+        "keep the real bot identity for capacity and audit"
+    );
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}

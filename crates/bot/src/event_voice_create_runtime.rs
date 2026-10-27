@@ -27,8 +27,8 @@ pub(super) struct Creator<'a> {
 }
 
 /// Production [`TickIo`](event_voice_ticker::TickIo): durable claims before
-/// POST against the fresh source observation, and worker-guarded deletes that
-/// retire the binding and its capacity witness on a confirmed delete.
+/// POST against the fresh source observation. Deletion fails closed until
+/// the room worker's send-time live-empty guard is available to this adapter.
 pub(super) struct DurableTickIo<'a> {
     pub pool: &'a PgPool,
     pub rest: &'a ActionExecutor,
@@ -52,54 +52,16 @@ impl TickIo for DurableTickIo<'_> {
     }
 
     async fn delete(&self, event: &Value, channel: &str) -> Result<EventVoiceResponse, ErrorClass> {
-        let event_id = event_voice_ticker::text(event, "event_id");
-        let instance = timestamp(event_voice_ticker::instance(event))?;
-        let occupants =
-            two_bot_cutover::event_voice::open_event_voice_occupants(self.pool, event_id, instance)
-                .await
-                .map_err(|_| ErrorClass::Database)?;
-        if !occupants.is_empty() {
-            tracing::info!(
-                event_id,
-                channel_id = channel,
-                occupants = occupants.len(),
-                "event voice far-future delete refused: channel occupied; kept"
-            );
-            return Ok(EventVoiceResponse::Uncertain);
-        }
-        match self.rest.delete_event_voice_channel(channel).await {
-            Ok(EventVoiceResponse::Deleted) => {
-                let guild: u64 = self.guild.parse().map_err(|_| ErrorClass::Configuration)?;
-                // Best-effort bookkeeping after a confirmed Discord delete: a
-                // failed retire still converges on the next tick (the
-                // reconciler 404s the dead channel), so it must not fail the
-                // tick that already did its job.
-                match two_bot_cutover::event_voice::retire_deleted_event_voice_channel(
-                    self.pool, guild, event_id, instance, channel,
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => tracing::warn!(
-                        event_id,
-                        channel_id = channel,
-                        "event voice binding moved under a confirmed delete; reconciler converges"
-                    ),
-                    Err(error) => tracing::warn!(
-                        event_id,
-                        channel_id = channel,
-                        error = %error,
-                        "event voice delete retire failed; the reconciler 404 pass converges"
-                    ),
-                }
-                Ok(EventVoiceResponse::Deleted)
-            }
-            // Unknown wire outcome: the channel may or may not be gone. Report
-            // unconfirmed and let the reconciler's fresh GET decide; failing
-            // the tick here would only hide the convergence it already owns.
-            Ok(other) => Ok(other),
-            Err(_) => Ok(EventVoiceResponse::Uncertain),
-        }
+        // Persisted spans can lag gateway joins. Neither an empty SQL result
+        // nor the source overlay is the worker's live guard, and the generic
+        // executor can await admission before sending. Until the guarded
+        // worker write is wired here, never issue DELETE or release capacity.
+        tracing::info!(
+            event_id = event_voice_ticker::text(event, "event_id"),
+            channel_id = channel,
+            "event voice far-future delete deferred: live worker guard unavailable"
+        );
+        Ok(EventVoiceResponse::Uncertain)
     }
 }
 
@@ -204,7 +166,7 @@ impl Creator<'_> {
         };
         let store = PgRoomStore::new(self.pool.clone());
         let reservation = match store
-            .claim_create(
+            .claim_event_create(
                 guild,
                 self.actor,
                 &self.admission,

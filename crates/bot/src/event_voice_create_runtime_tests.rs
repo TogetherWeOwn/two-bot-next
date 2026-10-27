@@ -693,7 +693,7 @@ async fn guarded_delete_keeps_occupied_channel_and_issues_no_delete() {
 }
 
 #[tokio::test]
-async fn guarded_delete_removes_empty_channel_and_retires_binding_and_capacity() {
+async fn production_delete_without_live_worker_guard_retains_binding_and_capacity() {
     let Some(db) = database().await else { return };
     let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
     let rest = rest(&mock);
@@ -704,20 +704,30 @@ async fn guarded_delete_removes_empty_channel_and_retires_binding_and_capacity()
         .await
         .unwrap();
     assert!(
-        matches!(outcome, EventVoiceResponse::Deleted),
-        "an empty far-future channel must be deleted"
+        matches!(outcome, EventVoiceResponse::Uncertain),
+        "empty persisted spans are not the worker's send-time live guard"
     );
     let requests = mock.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].method, "DELETE");
-    assert!(requests[0].path.ends_with("/channels/700"));
+    assert_eq!(requests.len(), 0);
+    assert!(!requests.iter().any(|request| request.method == "DELETE"));
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/channels/700")));
     let row: (String, Option<String>) = sqlx::query_as(
         "SELECT status, owner_tick_lease FROM event_voice_channels WHERE event_id='500'",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("orphaned".to_owned(), None));
+    assert_eq!(row.0, "creating");
+    assert!(row.1.is_some(), "the binding lease must remain held");
+    let channel: Option<String> = sqlx::query_scalar(
+        "SELECT voice_channel_id FROM event_voice_channels WHERE event_id='500'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(channel.as_deref(), Some("700"));
     let settled: bool = sqlx::query_scalar(
         "SELECT settled_at IS NOT NULL FROM voice_create_reservations WHERE channel_id='700'",
     )
@@ -725,8 +735,8 @@ async fn guarded_delete_removes_empty_channel_and_retires_binding_and_capacity()
     .await
     .unwrap();
     assert!(
-        settled,
-        "the purposeful delete must release its capacity witness"
+        !settled,
+        "without a guarded delete the original capacity must remain held"
     );
     mock.shutdown().await;
     db.close().await.unwrap();

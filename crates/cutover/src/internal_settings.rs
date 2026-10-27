@@ -72,6 +72,13 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_invalid",
                     );
                 }
+                WriteRefusal::InvalidEventVoiceOptOuts(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be an array of at most 100 canonical nonzero event id strings",
+                        "settings_value_invalid",
+                    );
+                }
                 WriteRefusal::InvalidPanelsValue(_) => {
                     return ActionError::new(
                         ErrorCode::Malformed,
@@ -151,6 +158,7 @@ mod tests {
             WriteRefusal::InvalidPanelsValue("TWO_SELF_ROLE_PANELS".to_owned()),
             WriteRefusal::InvalidCorrectionCycles("TWO_COMMUNITY_CORRECTION_CYCLES".to_owned()),
             WriteRefusal::InvalidInactivityDays("TWO_INACTIVITY_DAYS".to_owned()),
+            WriteRefusal::InvalidEventVoiceOptOuts("TWO_EVENT_VOICE_OPT_OUT_EVENT_IDS".to_owned()),
         ] {
             let invalid = action_error(SettingsWriteError::Refused(refusal));
             assert_eq!(invalid.code, ErrorCode::Malformed);

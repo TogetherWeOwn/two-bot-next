@@ -36,6 +36,8 @@ export const JOB_INTERVAL_SECONDS: Record<string, number> = {
 };
 
 export const STALE_INTERVALS = 2;
+/** EventVoice may spend 120 s in one attempt after its 60 s cadence gap. */
+export const JOB_STALE_FLOOR_SECONDS: Record<string, number> = { event_voice: 180 };
 /**
  * Staleness window in seconds for the 15 s tickers (`scheduled_messages`,
  * `settings`). Ten minutes is 40 missed ticks: far above the keepalive scrape
@@ -1141,7 +1143,9 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     const job = s.labels["job"] ?? "";
     const interval = JOB_INTERVAL_SECONDS[job];
     // Zero means never succeeded since start (parked/just started): not stale.
-    if (interval !== undefined && s.value > 0 && nowSeconds - s.value > STALE_INTERVALS * interval) {
+    const staleAfter = interval === undefined ? undefined
+      : Math.max(STALE_INTERVALS * interval, JOB_STALE_FLOOR_SECONDS[job] ?? 0);
+    if (staleAfter !== undefined && s.value > 0 && nowSeconds - s.value > staleAfter) {
       firing.push(`job_stale:${job}`);
     }
   }

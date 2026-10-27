@@ -312,13 +312,15 @@ pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
     "gave_up",
     "other",
 ];
-/// Event-voice tick outcomes for `two_bot_event_voice_tick_total{outcome}`:
-/// one observation per T-15 ticker tick that stays TBD, with the website
-/// reason (`EventVoiceTbdReason::as_str`), including backoff-skipped ticks.
-/// The ticker card extends this same series with its ready/create family.
-/// Unknown outcomes collapse to the trailing `other`, never to a dynamic
-/// label. No IDs, tokens or bodies are retained.
+/// Event-voice outcomes for `two_bot_event_voice_tick_total{outcome}`:
+/// one observation per waiting preflight (including backoff skips), or per
+/// counted event decision after a ready preflight. Recreates count as created;
+/// confirmed far-future deletes count as deleted. Unknown outcomes collapse
+/// to the trailing `other`, never to a dynamic label. No IDs, tokens or bodies
+/// are retained.
 pub const EVENT_VOICE_TICK_OUTCOMES: &[&str] = &[
+    "created",
+    "deleted",
     "opens_soon",
     "rate_limited",
     "perm_denied",
@@ -1206,12 +1208,10 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
-    /// One event-voice tick that stayed TBD (host decision D4). Call once
-    /// per preflight that returns `Waiting`, including backoff-skipped
-    /// ticks, with the website reason (`EventVoiceTbdReason::as_str`).
-    /// `Ready` ticks record nothing here; the ticker card extends this same
-    /// series with its ready/create family. Unknown outcomes collapse to
-    /// `other`.
+    /// One waiting preflight (including backoff-skipped ticks), or one
+    /// counted per-event decision after a ready preflight. Creates and
+    /// recreates use `created`; confirmed far-future deletes use `deleted`.
+    /// Unknown outcomes collapse to `other`.
     pub fn event_voice_tick(&self, outcome: &str) {
         let mut values = self
             .0
@@ -2006,7 +2006,7 @@ impl Metrics {
         values.voice_join_to_move.render(
             &mut out,
             "two_bot_voice_join_to_move_seconds",
-            "Creator-join receipt to move, seconds.",
+            "Creator-join to move seconds.",
         );
         header(
             &mut out,
@@ -2361,7 +2361,7 @@ impl Metrics {
             &mut out,
             "two_bot_event_voice_tick_total",
             "counter",
-            "T-15 TBD ticks.",
+            "Event outcomes.",
         );
         for (outcome, count) in EVENT_VOICE_TICK_OUTCOMES
             .iter()

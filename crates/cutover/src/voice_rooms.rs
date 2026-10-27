@@ -837,6 +837,25 @@ impl PgRoomStore {
             .await
     }
 
+    /// Event ticker admission uses the real bot actor for attribution, not a
+    /// synthetic member per event. The bot may hold ten live/uncertain event
+    /// slots; member cooldown and three-per-member burst do not apply to it.
+    /// The configured guild cap, durable ten-per-guild burst and guild lock
+    /// remain shared with ordinary room creates. Settlement never erases
+    /// history, and unknown POST outcomes continue to hold capacity.
+    pub async fn claim_event_create(
+        &self,
+        guild_id: Snowflake,
+        bot_id: Snowflake,
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> Result<CreateClaim, sqlx::Error> {
+        let event_config =
+            CreateAdmissionConfig::new(10, config.max_per_guild(), 0).map_err(invalid_argument)?;
+        self.claim_create_policy(guild_id, bot_id, &[], &event_config, now_secs, false)
+            .await
+    }
+
     /// [`Self::claim_create`] with `leaving`: rooms the worker sees empty and
     /// about to be deleted (the member just left them for the creator). They
     /// do not count toward either cap, so hopping from your own room back into
@@ -849,6 +868,19 @@ impl PgRoomStore {
         leaving: &[Snowflake],
         config: &CreateAdmissionConfig,
         now_secs: i64,
+    ) -> Result<CreateClaim, sqlx::Error> {
+        self.claim_create_policy(guild_id, user_id, leaving, config, now_secs, true)
+            .await
+    }
+
+    async fn claim_create_policy(
+        &self,
+        guild_id: Snowflake,
+        user_id: Snowflake,
+        leaving: &[Snowflake],
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+        member_burst: bool,
     ) -> Result<CreateClaim, sqlx::Error> {
         if guild_id == 0 {
             return Err(invalid_argument("guild id must be nonzero"));
@@ -904,7 +936,11 @@ impl PgRoomStore {
             config,
             &request,
             now_secs,
-            count("user_burst")?,
+            if member_burst {
+                count("user_burst")?
+            } else {
+                0
+            },
             count("guild_burst")?,
         )
         .map_err(invalid_argument)?

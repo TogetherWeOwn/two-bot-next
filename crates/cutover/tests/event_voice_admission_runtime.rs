@@ -21,6 +21,108 @@ async fn database() -> Option<TestDatabase> {
     )
 }
 
+#[tokio::test]
+async fn event_admission_holds_ten_bot_slots_and_keeps_guild_burst_history() {
+    let Some(db) = database().await else { return };
+    let config = CreateAdmissionConfig::new(1, 40, 3600).unwrap();
+    let store = PgRoomStore::new(db.pool().clone());
+    let mut reservations = Vec::new();
+    for _ in 0..10 {
+        let CreateClaim::Admitted { reservation_id } = store
+            .claim_event_create(100, 999, &config, 1_800_000_000)
+            .await
+            .unwrap()
+        else {
+            panic!("event creates share a bot, not member limits")
+        };
+        reservations.push(reservation_id);
+    }
+    let peer = db.independent_pool().await.unwrap();
+    let restarted = PgRoomStore::new(peer.clone());
+    assert_eq!(
+        restarted
+            .claim_event_create(100, 999, &config, 1_800_000_061)
+            .await
+            .unwrap(),
+        CreateClaim::Refused(RefusalReason::UserCap),
+        "uncertain creates keep all ten slots after restart"
+    );
+    for reservation in reservations {
+        assert!(store.settle_create(&reservation).await.unwrap());
+    }
+    assert_eq!(
+        restarted
+            .claim_event_create(100, 999, &config, 1_800_000_001)
+            .await
+            .unwrap(),
+        CreateClaim::Refused(RefusalReason::GuildBurst),
+        "settlement cannot erase accepted burst history"
+    );
+    assert!(matches!(
+        restarted
+            .claim_event_create(100, 999, &config, 1_800_000_061)
+            .await
+            .unwrap(),
+        CreateClaim::Admitted { .. }
+    ));
+    peer.close().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_admission_keeps_configured_guild_cap_and_member_policy_unchanged() {
+    let Some(db) = database().await else { return };
+    let store = PgRoomStore::new(db.pool().clone());
+    let config = CreateAdmissionConfig::new(1, 1, 0).unwrap();
+    assert!(matches!(
+        store
+            .claim_event_create(100, 999, &config, 1_800_000_000)
+            .await
+            .unwrap(),
+        CreateClaim::Admitted { .. }
+    ));
+    assert_eq!(
+        store
+            .claim_event_create(100, 999, &config, 1_800_000_061)
+            .await
+            .unwrap(),
+        CreateClaim::Refused(RefusalReason::GuildCap)
+    );
+    let member_config = CreateAdmissionConfig::new(1, 40, 0).unwrap();
+    assert!(matches!(
+        store
+            .claim_create(200, 300, &member_config, 1_800_000_000)
+            .await
+            .unwrap(),
+        CreateClaim::Admitted { .. }
+    ));
+    assert_eq!(
+        store
+            .claim_create(200, 300, &member_config, 1_800_000_061)
+            .await
+            .unwrap(),
+        CreateClaim::Refused(RefusalReason::UserCap)
+    );
+    let burst_config = CreateAdmissionConfig::new(10, 40, 0).unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            store
+                .claim_create(300, 400, &burst_config, 1_800_000_000)
+                .await
+                .unwrap(),
+            CreateClaim::Admitted { .. }
+        ));
+    }
+    assert_eq!(
+        store
+            .claim_create(300, 400, &burst_config, 1_800_000_001)
+            .await
+            .unwrap(),
+        CreateClaim::Refused(RefusalReason::UserBurst)
+    );
+    db.close().await.unwrap();
+}
+
 async fn reserve(store: &PgRoomStore, guild: u64, user: u64) -> String {
     let config = CreateAdmissionConfig::new(10, 10, 0).unwrap();
     match store

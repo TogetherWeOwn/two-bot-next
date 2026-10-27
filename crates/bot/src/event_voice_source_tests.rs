@@ -23,6 +23,35 @@ async fn database() -> Option<TestDatabase> {
     )
 }
 
+/// The audited writer must refuse this value. Inject a legacy/direct-SQL row
+/// only in the disposable fixture so the strict read-side backstop stays tested.
+async fn legacy_opt_out(pool: &PgPool, value: Value) {
+    let refusal = SettingsStore::new(pool)
+        .set(
+            "100",
+            EVENT_VOICE_OPT_OUT_KEY,
+            Some(value.clone()),
+            "moderator",
+        )
+        .await;
+    assert!(matches!(
+        refusal,
+        Err(two_bot_cutover::settings::SettingsWriteError::Refused(
+            two_bot_core::settings::WriteRefusal::InvalidEventVoiceOptOuts(_)
+        ))
+    ));
+    sqlx::query(
+        "INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
+         VALUES ('100', $1, $2, nextval('guild_settings_version_seq'), 'legacy-fixture')
+         ON CONFLICT (guild_id, key) DO UPDATE SET value = EXCLUDED.value, version = EXCLUDED.version",
+    )
+    .bind(EVENT_VOICE_OPT_OUT_KEY)
+    .bind(value)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     ActionExecutor::with_proxy("synthetic-event-source-token".into(), Some(mock.origin())).unwrap()
@@ -257,15 +286,7 @@ async fn malformed_stored_opt_out_fails_closed_before_refreshing_bindings() {
     claim_event_voice_channel(db.pool(), "500", original, original, None, "held")
         .await
         .unwrap();
-    SettingsStore::new(db.pool())
-        .set(
-            "100",
-            EVENT_VOICE_OPT_OUT_KEY,
-            Some(json!(["0500"])),
-            "moderator",
-        )
-        .await
-        .unwrap();
+    legacy_opt_out(db.pool(), json!(["0500"])).await;
     let mut event = document("500", 2);
     event["scheduled_start_time"] = json!("2026-10-26T22:10:00.123Z");
     assert_eq!(
@@ -325,15 +346,7 @@ async fn durable_opt_out_overrides_a_queued_create_snapshot_before_claiming() {
         creator.create(&event, "200").await.unwrap(),
         event_voice_ticker::CreateResult::Ineligible
     ));
-    store
-        .set(
-            "100",
-            EVENT_VOICE_OPT_OUT_KEY,
-            Some(json!(false)),
-            "moderator",
-        )
-        .await
-        .unwrap();
+    legacy_opt_out(db.pool(), json!(false)).await;
     assert!(matches!(
         creator.create(&event, "200").await,
         Err(ErrorClass::Configuration)
@@ -387,15 +400,19 @@ async fn opt_out_during_admission_releases_only_known_no_post_fences() {
                 .await
                 .unwrap()
                 .unwrap();
-            SettingsStore::new(db.pool())
-                .set(
-                    "100",
-                    EVENT_VOICE_OPT_OUT_KEY,
-                    Some(setting.clone()),
-                    "moderator",
-                )
-                .await
-                .unwrap();
+            if setting.is_array() {
+                SettingsStore::new(db.pool())
+                    .set(
+                        "100",
+                        EVENT_VOICE_OPT_OUT_KEY,
+                        Some(setting.clone()),
+                        "moderator",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                legacy_opt_out(db.pool(), setting.clone()).await;
+            }
             capacity.commit().await.unwrap();
         };
         let (result, ()) = tokio::join!(creator.create(&event, "200"), change);

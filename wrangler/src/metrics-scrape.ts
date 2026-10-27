@@ -143,6 +143,10 @@ function combinations(axes: Record<string, readonly string[]>): Record<string, s
 
 const REQUIRED_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
   combinations(axes).map((labels) => identity(name, labels))));
+// EventVoice was added after the Worker scrape contract. A rollback may omit
+// this job entirely, but a present job must still supply the complete set.
+const EVENT_VOICE_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
+  combinations(axes).filter((labels) => labels.job === "event_voice").map((labels) => identity(name, labels))));
 
 // Prometheus numbers, not JavaScript's empty/hexadecimal/Infinity coercions.
 const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf)";
@@ -198,5 +202,8 @@ export function parseAlertScrape(text: string): Sample[] | null {
   }
   const incarnation = samples.filter((sample) => sample.name === "two_bot_process_incarnation");
   if (incarnation.length > 0 && processIncarnation(incarnation) === undefined) return null;
-  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) ? samples : null;
+  const hasEventVoice = samples.some((sample) => Object.hasOwn(VALIDATED_INPUT_LABELS, sample.name)
+    && sample.labels.job === "event_voice");
+  return [...REQUIRED_INPUTS].every((key) => seen.has(key)
+    || (!hasEventVoice && EVENT_VOICE_INPUTS.has(key))) ? samples : null;
 }
