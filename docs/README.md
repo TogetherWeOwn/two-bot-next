@@ -143,6 +143,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [RSVP](dashboard-event-rsvp-spec.md)
 - [Notice](event-change-notices-spec.md)
 - [Reminder prefs](event-reminder-preferences-spec.md)
+- [Host nudge](host-nudge-spec.md)
 - [Seat](rsvp-capacity-spec.md)
 - [Withdrawal](rsvp-withdrawal-spec.md)
 - [RSVP cutoff](rsvp-registration-cutoff-spec.md)
