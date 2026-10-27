@@ -90,6 +90,8 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Channel locking](channel-lockdown-acceptance.md)
 - [Lockdown preview](lockdown-preview-spec.md)
 - [Timed lockdown](time-boxed-lockdown-decision.md)
+- [Lockdown](time-boxed-lockdown-decision.md)
+- [Slowmode](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
@@ -240,10 +242,10 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Smoke inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
-- [Binary lifecycle tests](alive-acceptance.md)
-- [Presence tests](presence-probe-acceptance.md)
-- [REST pacing tests](pacing-backoff-acceptance.md)
-- [Retention acceptance](testing/retention-runtime.md)
+- [Binary lifecycle](alive-acceptance.md)
+- [Presence probe](presence-probe-acceptance.md)
+- [REST pacing](pacing-backoff-acceptance.md)
+- [Retention runtime](testing/retention-runtime.md)
 
 ## Cutover and watch
 
