@@ -21,7 +21,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 ## Operations
 
 - [Runbook](runbook.md)
-- [Observability](runbook-observability.md)
+- [Observability triage](runbook-observability.md)
 - [Metrics](metrics.md)
 - [Readiness](container-readiness.md)
 - [Startup](startup-diagnostics.md)
@@ -31,9 +31,9 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Backups and restores](backup.md)
 - [Backfill](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
-- [Prod deploy](production-deploy.md)
+- [Production deploy](production-deploy.md)
 - [Releases](releases.md)
-- [Gradual](gradual-promote-caller.md)
+- [Gradual promote](gradual-promote-caller.md)
 - [Logging](logging.md)
 - [Log volume guard](log-volume-guard.md)
 - [Event catalog](observability-event-catalog.md)
@@ -75,8 +75,8 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## Commands, moderation and community
 
-- [Cmd publish](command-publish.md)
-- [Cmd restore](command-restoration.md)
+- [Command publication](command-publish.md)
+- [Command restoration](command-restoration.md)
 - [Reply lifecycle](interaction-replies.md)
 - [Prefix gates](prefix-gate-matrix.md)
 - [Actor admission](automation-admission.md)
@@ -89,14 +89,15 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution PII](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
-- [Timed lockdown](time-boxed-lockdown-decision.md)
+- [Lockdown](time-boxed-lockdown-decision.md)
+- [Slowmode](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
 - [Self-view](moderation-sanction-selfview-spec.md)
 - [Disable gate](moderation-disable-preflight.md)
 - [Hierarchy order](moderation-hierarchy-order.md)
-- [MAC tests](moderation-mac-acceptance.md)
+- [Moderation MAC tests](moderation-mac-acceptance.md)
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
@@ -241,10 +242,10 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Smoke inventory](smoke-surface-inventory.md)
 - [T0 smoke contract](t0-acceptance-smoke-contract.md)
 - [User-flow synthetic](synthetic-user-flow.md)
-- [Binary tests](alive-acceptance.md)
-- [Presence tests](presence-probe-acceptance.md)
-- [REST pacing tests](pacing-backoff-acceptance.md)
-- [Retention](testing/retention-runtime.md)
+- [Binary lifecycle](alive-acceptance.md)
+- [Presence probe](presence-probe-acceptance.md)
+- [REST pacing](pacing-backoff-acceptance.md)
+- [Retention runtime](testing/retention-runtime.md)
 
 ## Cutover and watch
 
@@ -278,7 +279,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [CI security](ci-security.md)
 - [CI speed rollout](ci-speed-rollout.md)
 - [Delivery metrics](dora-metrics.md)
-- [Docs queue](ci-docs-only-queue-note.md)
+- [Docs queue timing](ci-docs-only-queue-note.md)
 - [Subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
 - [Flake ledger](flake-ledger.md)

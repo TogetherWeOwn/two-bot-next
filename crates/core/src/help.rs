@@ -318,7 +318,7 @@ pub fn unknown_help_correction() -> String {
 /// markup, links or mentions. Reply-level mention suppression stays the
 /// mention backstop. Generated framing (usage brackets, section headers)
 /// never passes through here.
-fn inert(text: &str) -> String {
+pub(crate) fn inert(text: &str) -> String {
     text.chars()
         .filter_map(|ch| match ch {
             '*' | '`' | '<' | '>' | '[' | ']' | '(' | ')' | '\\' => None,
