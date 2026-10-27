@@ -17,7 +17,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Process history](process-history-contract.md)
 - [MCP tools](mcp.md)
 - [Token registry](admin-registry.md)
-- [Admin gateway](admin-api.md)
+- [Admin API](admin-api.md)
 
 ## Operations
 
@@ -89,7 +89,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution PII tests](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
-- [Timed lockdown: no build](time-boxed-lockdown-decision.md)
+- [Timed lockdown](time-boxed-lockdown-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
