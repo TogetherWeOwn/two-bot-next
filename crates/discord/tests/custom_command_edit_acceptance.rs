@@ -335,6 +335,46 @@ fn owned_reply(observed: &Observed) -> String {
     private_reply(&observed.requests, observed.id)
 }
 
+/// A saved response is run by `/<name>` as a public deferred reply, unlike the
+/// private management confirmations that `owned_reply` pins.
+fn run_reply(observed: &Observed) -> String {
+    assert!(
+        matches!(observed.result, Ok(true)),
+        "saved response must own its slash run: {:?}",
+        observed.result
+    );
+    assert_eq!(observed.requests.len(), 2, "one defer and one completion");
+    let callback = format!("/interactions/{0}/edit-fixture-{0}/callback", observed.id);
+    let completion = format!(
+        "/webhooks/1111/edit-fixture-{}/messages/@original",
+        observed.id
+    );
+    assert!(
+        observed.requests[0].method == "POST" && observed.requests[0].path.ends_with(&callback)
+    );
+    assert!(
+        observed.requests[1].method == "PATCH" && observed.requests[1].path.ends_with(&completion)
+    );
+    let defer: Value = serde_json::from_slice(&observed.requests[0].body).expect("callback JSON");
+    assert_eq!(defer["type"], 5);
+    assert_eq!(
+        defer["data"]["flags"].as_u64().unwrap_or(0) & 64,
+        0,
+        "a saved response runs publicly"
+    );
+    no_mentions(&defer["data"]);
+    let body: Value = serde_json::from_slice(&observed.requests[1].body).expect("completion JSON");
+    no_mentions(&body);
+    assert!(body["embeds"].is_null() || body["embeds"] == json!([]));
+    assert!(body["attachments"].is_null() || body["attachments"] == json!([]));
+    let content = body["content"]
+        .as_str()
+        .expect("rendered response")
+        .to_owned();
+    assert!(!content.is_empty() && content.encode_utf16().count() <= 2000);
+    content
+}
+
 fn row(rows: &[Value], guild: &str, name: &str) -> Value {
     rows.iter()
         .find(|row| row["guild_id"] == guild && row["name"] == name)
@@ -519,7 +559,7 @@ async fn template_only_edit_preserves_metadata_and_updates_slash_and_prefix_exec
             assert_eq!(edit_facts[0]["outcome"], "ok");
             assert_safe_facts(&edit_facts);
             let slash = h.observe(&interaction(101, "faq", 0, vec![])).await;
-            assert_eq!(owned_reply(&slash), "EDITED_CONTENT_SENTINEL tester");
+            assert_eq!(run_reply(&slash), "EDITED_CONTENT_SENTINEL tester");
             assert!(publications(&slash.requests).is_empty());
             let start = h.mock.requests().len();
             assert_eq!(
@@ -665,7 +705,7 @@ async fn explicit_clear_removes_only_trigger_and_keeps_slash_response() {
             );
             assert_eq!(h.mock.requests().len(), start);
             let slash = h.observe(&interaction(132, "faq", 0, vec![])).await;
-            assert_eq!(owned_reply(&slash), "ORIGINAL_CONTENT_SENTINEL tester");
+            assert_eq!(run_reply(&slash), "ORIGINAL_CONTENT_SENTINEL tester");
             let cleared = definitions(h.db.pool()).await;
             let repeated = h.observe(&edit(133, vec![clear(true)])).await;
             let reply = owned_reply(&repeated).to_lowercase();
