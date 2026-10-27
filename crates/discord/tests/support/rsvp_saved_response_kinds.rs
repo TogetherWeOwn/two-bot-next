@@ -6,6 +6,7 @@
 //! - first response: legacy `RSVP saved: {status}.` byte-identical;
 //! - changed response: `RSVP saved: {current} (changed from {previous}).`;
 //! - repeated choice: `RSVP saved: {status} (saved again; time updated).`
+//!
 //! No pre-read, follow-up query, extra write/audit or new Discord request may
 //! choose the copy: each success is one ack, two membership/event GET pairs and
 //! one private edit, with exactly one RSVP row and one audit row. The repeat
