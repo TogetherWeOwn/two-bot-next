@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "feed_read_strict_decode_acceptance_tests.rs"]
+mod feed_read_strict_decode_acceptance_tests;
 #[path = "feed_sticky_strict_decode_acceptance_tests.rs"]
 mod feed_sticky_strict_decode_acceptance_tests;
 #[path = "reopen_dispatch_review_acceptance_tests.rs"]
