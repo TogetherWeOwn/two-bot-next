@@ -39,10 +39,9 @@ use two_bot_core::{
     message_safety::{text_len, truncate},
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
-        parse_inspect_view, schedule_cancelled_text, schedule_confirm_text,
-        schedule_delivery_state_word, schedule_edit_fenced_text,
-        schedule_edit_revision_required_text, schedule_edit_saved_text, schedule_edit_stale_text,
-        schedule_edit_unchanged_text, schedule_inspect_cadence_text,
+        parse_inspect_view, schedule_confirm_text, schedule_delivery_state_word,
+        schedule_edit_fenced_text, schedule_edit_revision_required_text, schedule_edit_saved_text,
+        schedule_edit_stale_text, schedule_edit_unchanged_text, schedule_inspect_cadence_text,
         schedule_inspect_last_run_text, schedule_inspect_metadata_text, schedule_list_first_pages,
         schedule_list_line, schedule_list_overflow_for_count, schedule_list_overflow_line,
         schedule_list_page, schedule_list_page_out_of_range_text,
@@ -731,7 +730,7 @@ pub(crate) async fn schedule_inspect(
     };
     match view {
         InspectView::Body => {
-            finish(executor, interaction, &row.body).await;
+            finish_verbatim(executor, interaction, &row.body).await;
         }
         InspectView::Metadata => {
             let state = schedule_delivery_state_word(
@@ -1137,6 +1136,28 @@ async fn audit(
 async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: impl AsRef<str>) {
     if let Err(err) = executor
         .edit_interaction_response_with_blocked_retry(
+            interaction.application_id.get(),
+            &interaction.token,
+            content.as_ref(),
+        )
+        .await
+    {
+        tracing::warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "schedule reply edit failed");
+    }
+}
+
+/// Inspect body-view completion: same retry/error contract as [`finish`],
+/// without mention neutralization — the ephemeral reply's explicit empty
+/// `allowed_mentions` is the mention safety, and the admin must see the
+/// saved body exactly as stored (legacy rows predate creation-time
+/// neutralization). Every other schedule reply keeps the neutralizing path.
+async fn finish_verbatim(
+    executor: &ActionExecutor,
+    interaction: &Interaction,
+    content: impl AsRef<str>,
+) {
+    if let Err(err) = executor
+        .edit_interaction_response_without_mention_neutralization_with_blocked_retry(
             interaction.application_id.get(),
             &interaction.token,
             content.as_ref(),

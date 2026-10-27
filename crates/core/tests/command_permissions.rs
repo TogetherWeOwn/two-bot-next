@@ -124,14 +124,12 @@ fn documented_legacy_rows_equal_parity_section1() {
         (1..=47).collect::<HashSet<_>>(),
         "parity rows are contiguous 1..=47"
     );
-    for (name, parity_row, required_permissions) in
-        [
-            ("command-inspect", 33, 1 << 5),
-            ("lfg-list", 38, 1 << 33),
-            ("schedule-inspect", 46, 1 << 5),
-            ("schedule-edit", 47, 1 << 5),
-        ]
-    {
+    for (name, parity_row, required_permissions) in [
+        ("command-inspect", 33, 1 << 5),
+        ("lfg-list", 38, 1 << 33),
+        ("schedule-inspect", 46, 1 << 5),
+        ("schedule-edit", 47, 1 << 5),
+    ] {
         let row = command_permission(name).expect("Next-only command has a permission row");
         assert_eq!(row.parity_row, parity_row, "{name}");
         assert_eq!(row.required_permissions, required_permissions, "{name}");
