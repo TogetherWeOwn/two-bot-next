@@ -37,6 +37,9 @@ mod event_link_id_controls;
 #[path = "support/rsvp_saved_response_kinds.rs"]
 mod saved_response_kinds;
 
+#[path = "support/rsvp_link_receipts.rs"]
+mod link_receipts;
+
 fn router() -> InteractionRouter {
     InteractionRouter::new(RouterGates {
         configured_guild: Some(GUILD.parse().unwrap()),
