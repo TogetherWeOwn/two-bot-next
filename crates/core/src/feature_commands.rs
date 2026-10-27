@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
-        assert_eq!(automation_commands().len(), 12);
+        assert_eq!(automation_commands().len(), 14);
         assert_eq!(
             names(&feature_commands()),
             [

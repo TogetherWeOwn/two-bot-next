@@ -55,11 +55,12 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
-    ("schedule-inspect", "docs/parity.md §1 #19 inspect"),
-    ("schedule-edit", "docs/parity.md §1 #19 body correction"),
+    ("schedule-inspect", "docs/parity.md §1 #47 inspect"),
+    ("schedule-edit", "docs/parity.md §1 #48 body correction"),
     ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
+    ("tempban-list", "docs/parity.md §1 tempban-list"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -1031,6 +1032,29 @@ pub fn expected_registry() -> Value {
                 "type": 3,
                 "required": true,
                 "max_length": 128
+            }]
+        }),
+    );
+    let after_tempban = commands
+        .iter()
+        .position(|command| command["name"] == "tempban")
+        .expect("tempban anchors saved-expiry inspection")
+        + 1;
+    commands.insert(
+        after_tempban,
+        json!({
+            "name": "tempban-list",
+            "description": "Inspect saved temporary-ban expiry work",
+            "type": 1,
+            "default_member_permissions": "4",
+            "dm_permission": false,
+            "options": [{
+                "name": "page",
+                "description": "Saved expiry page (10 rows, default 1; due time then work ID order)",
+                "type": 4,
+                "required": false,
+                "min_value": 1,
+                "max_value": 10000
             }]
         }),
     );

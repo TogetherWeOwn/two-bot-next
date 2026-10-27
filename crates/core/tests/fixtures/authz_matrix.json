@@ -25,6 +25,7 @@
     {"name": "rsvp-attendance", "allow": "*"},
     {"name": "ban", "allow": ["ban_members", "all_bits"], "deny": "ModerationPermission(Ban)"},
     {"name": "tempban", "allow": ["ban_members", "all_bits"], "deny": "ModerationPermission(TempBan)"},
+    {"name": "tempban-list", "allow": ["ban_members", "all_bits"], "deny": "TempbanListPermission"},
     {"name": "kick", "allow": ["kick_members", "all_bits"], "deny": "ModerationPermission(Kick)"},
     {"name": "timeout", "allow": ["moderate_members", "all_bits"], "deny": "ModerationPermission(Timeout)"},
     {"name": "warn", "allow": ["moderate_members", "all_bits"], "deny": "ModerationPermission(Warn)"},

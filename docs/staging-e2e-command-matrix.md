@@ -9,9 +9,9 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 45 built-in slash commands (core + scorecard + automation +
+Scope: 46 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 66). No guild was
+the voice set; with the voice gates on it renders 67). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -49,8 +49,8 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 17 | `/schedule` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then completion; one timing option required | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `in-minutes` 1–525600, `every-minutes` 60–525600 |
 | 18 | `/schedule-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `id` required |
 | 19 | `/schedule-list` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral schedule list | `AutomationsDisabled`, `ManageServerRequired` |
-| 46 | `/schedule-inspect` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then one private content-only view (saved metadata plus edit revision, or the whole saved body); no mutation or audit | `AutomationsDisabled`, `ManageServerRequired`, `id` required, `view` metadata/body |
-| 47 | `/schedule-edit` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then save confirmation + one content-free audit row; only body/updater/timestamp change, only on a matching idle revision | `AutomationsDisabled`, `ManageServerRequired`, `id` required, `revision` required, `body` required |
+| 47 | `/schedule-inspect` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then one private content-only view (saved metadata plus edit revision, or the whole saved body); no mutation or audit | `AutomationsDisabled`, `ManageServerRequired`, `id` required, `view` metadata/body |
+| 48 | `/schedule-edit` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then save confirmation + one content-free audit row; only body/updater/timestamp change, only on a matching idle revision | `AutomationsDisabled`, `ManageServerRequired`, `id` required, `revision` required, `body` required |
 | 20 | `/sticky` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `debounce` 1–300 |
 | 21 | `/sticky-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired` |
 | 37 | `/giveaway` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row; one-click member entry; timed draw + announce with reroll | `AutomationsDisabled`, `ManageServerRequired`, `prize` 1–200 chars, `duration` 1–43200 min, `winners` 1–100 |
@@ -68,6 +68,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 39 | `/feed-inspect` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay detail with safe source and last attempt | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
 | 3 | `/ban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + REST ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Ban)`, member-moderation policy, `target`/`reason` required |
 | 4 | `/tempban` | `TWO_MODERATION` | BanMembers | Ephemeral outcome + timed ban + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(TempBan)`, member-moderation policy, `duration_seconds` ≥60 (runtime max 365d) |
+| 46 | `/tempban-list` | `TWO_MODERATION` | BanMembers (4) | Ephemeral saved-expiry inventory: ten complete rows per page, localized saved due time, exact state and dispatch uncertainty. Saved/due is not a confirmed Discord unban; running is not completion. Fresh actor authority, suppressed mentions, at most 2000 UTF-16 units; no claims, audit writes or moderation effects. | `GuildRestricted`, `ModerationDisabled`, `TempbanListPermission`, optional integer `page` 1–10000 (default 1); no target or reason |
 | 5 | `/kick` | `TWO_MODERATION` | KickMembers | Ephemeral outcome + REST kick + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Kick)`, member-moderation policy, `target`/`reason` required |
 | 6 | `/timeout` | `TWO_MODERATION` | ModerateMembers | Ephemeral outcome + REST timeout + audit reason | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Timeout)`, member-moderation policy, `duration_seconds` ≥60 (runtime max 28d) |
 | 7 | `/warn` | `TWO_MODERATION` | ModerateMembers | Ephemeral outcome + recorded warning | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Warn)`, member-moderation policy, `target`/`reason` required |
@@ -81,13 +82,13 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 Member-moderation policy order (ban, tempban, kick, timeout, warn):
 permission → target present → self-target → owner/Owen/bot/staff protection →
 bot hierarchy → actor hierarchy. Audit `reason` is trimmed, non-empty, ≤512
-UTF-16 units on every mutating moderation row. The two private reads take no
+UTF-16 units on every mutating moderation row. The three private reads take no
 reason and write no audit record. Failed reads stay private with retry guidance;
 unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 45-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 46-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

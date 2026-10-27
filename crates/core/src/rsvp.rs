@@ -1125,8 +1125,8 @@ mod tests {
             .expect("slices merge cleanly");
         // 7 core + 27 feature commands, including pause/resume, lfg-edit,
         // feed-inspect, schedule-inspect and schedule-edit, + 9 mutations
-        // + 2 reads: nothing deduped away.
-        assert_eq!(merged.len(), 45);
+        // + 3 reads: nothing deduped away.
+        assert_eq!(merged.len(), 46);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         for name in [
             "attendance",

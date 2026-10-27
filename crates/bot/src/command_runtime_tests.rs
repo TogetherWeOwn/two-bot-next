@@ -38,6 +38,8 @@ mod member_strict_decode_acceptance;
 mod sticky_uncertain_acceptance_tests;
 #[path = "sticky_unsaved_preview_acceptance_tests.rs"]
 mod sticky_unsaved_preview_acceptance_tests;
+#[path = "tempban_inventory_acceptance_tests.rs"]
+mod tempban_inventory_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
@@ -67,6 +69,8 @@ mod giveaway_countdown_edge_acceptance_tests;
 mod giveaway_create_entry_acceptance_tests;
 #[path = "giveaway_list_facts_acceptance_tests.rs"]
 mod giveaway_list_facts_acceptance_tests;
+#[path = "privacy_action_scope_acceptance_tests.rs"]
+mod privacy_action_scope_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
 mod schedule_absolute_acceptance;
 #[path = "schedule_absolute_correction_tests.rs"]
@@ -4347,6 +4351,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedInspect,
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
+            HandlerId::TempbanList,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids
@@ -4368,6 +4373,7 @@ fn production_router_matches_composed_production_wiring() {
             ] {
                 router.register(Box::new(Marker(HandlerId::Moderation(action))));
             }
+            router.register(Box::new(Marker(HandlerId::TempbanList)));
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
@@ -4433,13 +4439,13 @@ fn production_router_matches_composed_production_wiring() {
                                  moderation={moderation} member={member_present})"
                             );
                         }
-                        // The exception list is the same five verbs the owner
-                        // map guards on the consumer, and nothing else.
+                        // The exception list is the five verbs plus the private
+                        // expiry read the owner map guards on the consumer.
                         let exceptions =
                             InteractionRouter::intentional_registration_exceptions(member_present);
                         assert_eq!(
                             exceptions.len(),
-                            if member_present { 0 } else { 5 },
+                            if member_present { 0 } else { 6 },
                             "member={member_present}"
                         );
                     }
@@ -11377,12 +11383,23 @@ fn privacy_action_decodes_known_analytics_and_deletion_subcommands() {
         privacy_action(&privacy_interaction(88, Some("delete"))),
         PrivacyAction::DeletionRequest
     );
+    // Lookup actions require their complete published request-id shape.
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-status"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-status",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionStatus
     );
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-receipt"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-receipt",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionReceipt
     );
     // Missing options, a non-subcommand value and an unknown name all

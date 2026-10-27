@@ -89,10 +89,10 @@ use PolicyHook::{
 /// `/command-disable` and `/command-enable` (parity rows 40 and 41),
 /// `/welcome-preview` admin preview (parity row 42), staff aggregate
 /// `/game-mix` (43), feed lifecycle `/feed-pause` (44) and `/feed-resume`
-/// (45), and the private schedule management reads `/schedule-inspect`
-/// (row 46) and `/schedule-edit` (row 47). Only `/game-mix` admits
-/// Administrator alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
+/// (45), private `/tempban-list` (46), and schedule management
+/// `/schedule-inspect` (47) and `/schedule-edit` (48). Only `/game-mix`
+/// admits Administrator alone; legacy masks are unchanged.
+pub const COMMAND_PERMISSIONS: [CommandPermission; 49] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -115,6 +115,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
         PERM_BAN_MEMBERS,
         Some(MemberModeration),
     ),
+    row(46, "tempban-list", BuiltinSlash, PERM_BAN_MEMBERS, None),
     row(
         5,
         "kick",
@@ -172,13 +173,13 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
-        46,
+        47,
         "schedule-inspect",
         BuiltinSlash,
         PERM_MANAGE_GUILD,
         None,
     ),
-    row(47, "schedule-edit", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(48, "schedule-edit", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(20, "sticky", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(21, "sticky-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(22, "<custom>", DynamicSlash, 0, Some(AutomationsEnabled)),

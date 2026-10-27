@@ -26,7 +26,7 @@
 //! where `production_router` carries the full production registration set
 //! (including the three RSVP ids) and `intentional_registration_exceptions`
 //! is the single place blessing any id that intentionally stays unregistered
-//! (today: the five member verbs while no member consumer exists). The
+//! (today: five member verbs and one private read while no member consumer exists). The
 //! `baseline_mirror_keeps_the_adapter_trait_live` control keeps this trait
 //! used in both states via explicit qualified calls.
 //!
@@ -69,7 +69,7 @@ impl InteractionHandler for Stub {
 ///   privacy/game-mix always. The channel and custom registrations below call the
 ///   real public functions; the rest are marker ids, as in production.
 /// - `CommandRuntime::build` member verbs (`command_runtime.rs`): the five
-///   member moderation ids while a member consumer exists.
+///   member moderation ids and saved-expiry read while a member consumer exists.
 /// - `InteractionRuntime::with_router` (`interactions.rs`, public, ungated):
 ///   the `Lfg`/`LfgClose`/`LfgEdit` handlers.
 /// - Missing on the baseline: `Rsvp`, `RsvpAttendance`,
@@ -109,6 +109,7 @@ impl ProductionRegistrations for InteractionRouter {
             router.register(Box::new(Stub(id)));
         }
         if member_present {
+            router.register(Box::new(Stub(HandlerId::TempbanList)));
             for action in [
                 ModerationAction::Ban,
                 ModerationAction::TempBan,
@@ -140,13 +141,14 @@ impl ProductionRegistrations for InteractionRouter {
     }
 
     fn intentional_registration_exceptions(member_present: bool) -> Vec<HandlerId> {
-        // Member verbs register only while the member consumer exists; without
+        // Member verbs and the private read register only with a consumer; without
         // it the gap is intentional and the owner map drops them to the
         // unavailable reply in the same shape.
         if member_present {
             Vec::new()
         } else {
             vec![
+                HandlerId::TempbanList,
                 HandlerId::Moderation(ModerationAction::Ban),
                 HandlerId::Moderation(ModerationAction::TempBan),
                 HandlerId::Moderation(ModerationAction::Kick),
@@ -197,6 +199,7 @@ fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
         "feed-inspect" => Some(HandlerId::FeedInspect),
         "ban" if member_present => Some(HandlerId::Moderation(ModerationAction::Ban)),
         "tempban" if member_present => Some(HandlerId::Moderation(ModerationAction::TempBan)),
+        "tempban-list" if member_present => Some(HandlerId::TempbanList),
         "kick" if member_present => Some(HandlerId::Moderation(ModerationAction::Kick)),
         "timeout" if member_present => Some(HandlerId::Moderation(ModerationAction::Timeout)),
         "warn" if member_present => Some(HandlerId::Moderation(ModerationAction::Warn)),
@@ -399,8 +402,8 @@ fn baseline_mirror_keeps_the_adapter_trait_live() {
         <InteractionRouter as ProductionRegistrations>::intentional_registration_exceptions(false);
     assert_eq!(
         exceptions.len(),
-        5,
-        "five member-verb exceptions without a consumer"
+        6,
+        "five member verbs and one private read without a consumer"
     );
     let none =
         <InteractionRouter as ProductionRegistrations>::intentional_registration_exceptions(true);

@@ -143,6 +143,7 @@ pub enum HandlerId {
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
+    TempbanList,
 }
 
 /// Which feature slice owns a routed component / modal submit (parity §2).
@@ -282,6 +283,7 @@ pub enum RouterRefusal {
     ModerationPermission(ModerationAction),
     PurgePreviewPermission,
     ChannelInspectPermission,
+    TempbanListPermission,
 }
 
 impl RouterRefusal {
@@ -299,6 +301,7 @@ impl RouterRefusal {
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
             // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
@@ -444,6 +447,7 @@ impl InteractionRouter {
             register(id);
         }
         if member_present {
+            register(HandlerId::TempbanList);
             // Member verbs (`CommandRuntime::build`, while the consumer exists).
             for action in [
                 ModerationAction::Ban,
@@ -473,6 +477,7 @@ impl InteractionRouter {
             Vec::new()
         } else {
             vec![
+                HandlerId::TempbanList,
                 HandlerId::Moderation(ModerationAction::Ban),
                 HandlerId::Moderation(ModerationAction::TempBan),
                 HandlerId::Moderation(ModerationAction::Kick),
@@ -577,6 +582,7 @@ impl InteractionRouter {
     ) -> Option<SlashOutcome> {
         // Moderation carries its own guild fence (refusal, not silence).
         let moderation = match name {
+            "tempban-list" => Some((HandlerId::TempbanList, RouterRefusal::TempbanListPermission)),
             "purge-preview" => Some((
                 HandlerId::PurgePreview,
                 RouterRefusal::PurgePreviewPermission,
@@ -1007,6 +1013,7 @@ mod tests {
             ("game-mix", HandlerId::GameMix),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
+            ("tempban-list", HandlerId::TempbanList),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
             ("timeout", HandlerId::Moderation(ModerationAction::Timeout)),
             ("warn", HandlerId::Moderation(ModerationAction::Warn)),
@@ -1050,7 +1057,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 45, "all 45 handler-owned builtins covered");
+        assert_eq!(cases.len(), 46, "all 46 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1145,6 +1152,7 @@ mod tests {
             ("lfg-edit", RouterRefusal::AnnouncementsDisabled),
             ("feed-list", RouterRefusal::AnnouncementsDisabled),
             ("ban", RouterRefusal::ModerationDisabled),
+            ("tempban-list", RouterRefusal::ModerationDisabled),
             ("purge", RouterRefusal::ModerationDisabled),
             ("purge-preview", RouterRefusal::ModerationDisabled),
             ("channel-inspect", RouterRefusal::ModerationDisabled),
@@ -1227,6 +1235,8 @@ mod tests {
     fn private_read_permissions_name_the_invoked_command_and_never_fall_through() {
         let r = router();
         for (name, required, handler, refusal, expected) in [
+            ("tempban-list", 4, HandlerId::TempbanList, RouterRefusal::TempbanListPermission,
+             "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it."),
             ("purge-preview", 8192, HandlerId::PurgePreview, RouterRefusal::PurgePreviewPermission,
              "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
             ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
@@ -1663,8 +1673,8 @@ mod tests {
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
         // 7 core + 1 scorecard + 14 automation + 12 announcements + 9 moderation
-        // + 2 reads + 1 custom = 46, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 46);
+        // + 3 reads + 1 custom = 47, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 47);
         assert_eq!(
             &names[..8],
             [
@@ -1696,14 +1706,22 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[34..43],
+            &names[34..44],
             [
-                "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
+                "ban",
+                "tempban",
+                "tempban-list",
+                "kick",
+                "timeout",
+                "warn",
+                "purge",
+                "slowmode",
+                "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[43..45], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[45], "faq");
+        assert_eq!(&names[44..46], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[46], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1721,6 +1739,8 @@ mod tests {
             "schedule",
             "schedule-remove",
             "schedule-list",
+            "schedule-inspect",
+            "schedule-edit",
             "sticky",
             "sticky-remove",
             "giveaway",
@@ -1742,6 +1762,7 @@ mod tests {
         let moderation = [
             "ban",
             "tempban",
+            "tempban-list",
             "kick",
             "timeout",
             "warn",
@@ -2019,7 +2040,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 45);
+        assert_eq!(off.len(), 46);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -2029,16 +2050,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 45 builtins keep their order; the 21 voice names that survive
+        // 46 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 66);
-        assert_eq!(on_names[..45], off_names[..]);
+        assert_eq!(on.len(), 67);
+        assert_eq!(on_names[..46], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[45..], expected[..]);
+        assert_eq!(on_names[46..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -2099,13 +2120,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 45
+        // Both gates on is the full voice set without the assistant: 46
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 66);
+        assert_eq!(both.len(), 67);
     }
 
     #[test]
