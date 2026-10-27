@@ -50,6 +50,12 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 - `/feed-remove`, `/feed-pause` and `/feed-resume` require exactly one string
   `id` option. Duplicate, wrong-type or missing options refuse with the correct
   command invocation before any store read or audit write.
+- `/feed-inspect` likewise requires exactly one string `id` and no other
+  options, and `/feed-list` allows at most one integer `page` (omitted means
+  page 1) and no other options. Duplicate, wrong-type, unknown or nested
+  options refuse with the corrected invocation before any saved relay is
+  read, so a malformed read never inspects an arbitrarily chosen relay or
+  lists an arbitrarily chosen page.
 
 Gates (both must hold or the poller parks):
 
@@ -366,4 +372,5 @@ binary was not built in this docs run, so no binary `--help` transcript
 is claimed. Slash-command options are pasted from `docs/commands.md`
 (rendered from the compiled registry) and the option decoders in
 `crates/bot/src/command_runtime.rs`: `feed_add_options_strict`,
-`feed_id_option_strict` and `feed_list_page_request`.
+`feed_id_option_strict`, `feed_inspect_options_strict` and
+`feed_list_page_request`.

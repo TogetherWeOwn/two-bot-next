@@ -31,6 +31,7 @@ mod backpressure_acceptance;
 mod commands;
 mod custom_composition;
 mod deadline;
+mod dispatch_cause;
 mod duplicate_refusal;
 mod force_identify;
 mod member_journey;
