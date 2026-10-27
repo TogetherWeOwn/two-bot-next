@@ -158,8 +158,8 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Rating](ticket-satisfaction-spec.md)
 - [Resolution](ticket-resolution-request-spec.md)
 - [Giveaway leave](giveaway-withdrawal-spec.md)
-- [Ticket lifecycle](ticket-lifecycle-observability.md)
-- [Suggestions triage](suggestions-triage-box.md)
+- [Lifecycle](ticket-lifecycle-observability.md)
+- [Triage](suggestions-triage-box.md)
 
 ## Voice
 
