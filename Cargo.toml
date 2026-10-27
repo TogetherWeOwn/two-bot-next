@@ -130,7 +130,9 @@ tokio-websockets = { version = "0.13", default-features = false, features = [
     "server",
     "sha1_smol",
 ] }
-twilight-cache-inmemory = { version = "0.17", default-features = false }
+twilight-cache-inmemory = { version = "0.17", default-features = false, features = [
+    "permission-calculator",
+] }
 twilight-gateway = { version = "0.17", default-features = false, features = [
     "rustls-platform-verifier",
     "zlib",
