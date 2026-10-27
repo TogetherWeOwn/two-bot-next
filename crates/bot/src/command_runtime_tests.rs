@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "feed_read_strict_decode_acceptance_tests.rs"]
+mod feed_read_strict_decode_acceptance_tests;
 #[path = "feed_sticky_strict_decode_acceptance_tests.rs"]
 mod feed_sticky_strict_decode_acceptance_tests;
 #[path = "reopen_dispatch_review_acceptance_tests.rs"]
@@ -46,6 +48,8 @@ mod help_detail_acceptance;
 
 #[path = "game_mix_acceptance_tests.rs"]
 mod game_mix_acceptance_tests;
+#[path = "game_mix_browse_acceptance_tests.rs"]
+mod game_mix_browse_acceptance_tests;
 #[path = "game_mix_content_acceptance_tests.rs"]
 mod game_mix_content_acceptance_tests;
 // Builder-owned: pins the classified store-failure warn the protected
@@ -58,10 +62,14 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
+#[path = "giveaway_list_facts_acceptance_tests.rs"]
+mod giveaway_list_facts_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
 mod schedule_absolute_acceptance;
 #[path = "schedule_absolute_correction_tests.rs"]
 mod schedule_absolute_correction_tests;
+#[path = "schedule_delivery_truth_acceptance_tests.rs"]
+mod schedule_delivery_truth_acceptance_tests;
 #[path = "schedule_preview_dispatch_acceptance.rs"]
 mod schedule_preview_dispatch_acceptance;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
@@ -9176,7 +9184,10 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
         .collect();
     assert_eq!(edits.len(), 3, "one completion per remove");
     let removed: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
-    assert_eq!(removed["content"], "Cancelled. Schedule `xyz999`.");
+    schedule_delivery_truth_acceptance_tests::assert_removed_receipt(
+        removed["content"].as_str().expect("removal receipt"),
+        "xyz999",
+    );
     let ambiguous: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
     assert_eq!(
         ambiguous["content"],
@@ -9482,7 +9493,10 @@ async fn schedule_remove_invalid_ids_leave_store_untouched() {
         .collect();
     assert_eq!(edits.len(), 10, "one completion per interaction");
     let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
-    assert_eq!(valid["content"], "Cancelled. Schedule `xyz999`.");
+    schedule_delivery_truth_acceptance_tests::assert_removed_receipt(
+        valid["content"].as_str().expect("removal receipt"),
+        "xyz999",
+    );
     mock.shutdown().await;
     db.close().await;
 }

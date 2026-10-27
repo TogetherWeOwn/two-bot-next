@@ -23,7 +23,7 @@ _EXCLUDED_PARTS = {".git", ".paperclip", "target", "node_modules"}
 
 
 def _markdown_corpus():
-    """Tracked markdown files; rglob fallback when git is unavailable.
+    """Tracked markdown plus the generated command reference when present.
 
     ``git ls-files`` works offline and limits the corpus to files the PR can
     change, so untracked scratch notes or build output never fail the suite
@@ -36,7 +36,11 @@ def _markdown_corpus():
             capture_output=True,
             check=True,
         ).stdout.decode("utf-8")
-        return sorted(ROOT / p for p in out.split("\0") if p)
+        paths = {ROOT / p for p in out.split("\0") if p}
+        generated = ROOT / "docs/generated/commands.md"
+        if generated.is_file():
+            paths.add(generated)
+        return sorted(paths)
     except (OSError, subprocess.CalledProcessError):
         return sorted(
             p

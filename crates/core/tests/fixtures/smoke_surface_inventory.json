@@ -209,7 +209,56 @@
       "gate": "always",
       "default_member_permissions": "32",
       "dm_permission": false,
-      "options": [],
+      "options": [
+        {
+          "name": "page",
+          "description": "Page of saved games to show (10 per page). Default: 1.",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": 10000,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "sort",
+          "description": "Order games by play time or in-voice time. Default: play.",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            {
+              "name": "Play time",
+              "value": "play"
+            },
+            {
+              "name": "In-voice time",
+              "value": "voice"
+            }
+          ]
+        },
+        {
+          "name": "format",
+          "description": "Show raw JSON or a readable summary. Default: JSON.",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            {
+              "name": "JSON",
+              "value": "json"
+            },
+            {
+              "name": "Summary",
+              "value": "summary"
+            }
+          ]
+        }
+      ],
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only private staff aggregate; seeded game activity and failure cases are pinned by disposable-database gateway acceptance, outside the live smoke five."
@@ -851,6 +900,28 @@
               "min_value": null,
               "max_value": null,
               "max_length": null,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "inspect",
+          "description": "Privately inspect saved giveaway details in this channel",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
               "choices": []
             }
           ]

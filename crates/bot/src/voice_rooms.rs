@@ -68,8 +68,9 @@ use two_bot_core::{
         VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
-        diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
-        DIFF_HASH_CHARS,
+        diff_configuration, diff_content_hash, render_preview, render_review_preview,
+        serialize_full_review, skip_unknown_channels, ConfigDiff, FullReviewError, DIFF_HASH_CHARS,
+        FULL_REVIEW_BYTE_LIMIT,
     },
     voice_create_admission::{
         CreateAdmissionConfig, RefusalReason, MAX_CREATE_COOLDOWN_SECS, MAX_ROOMS_PER_GUILD,
@@ -11632,7 +11633,7 @@ fn setup_past_end_refusal(total: usize) -> String {
     format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
 }
 
-/// Private correction for an ambiguous setup option: names the option and a
+/// Private correction for a malformed setup option: names the option and a
 /// copyable invocation. Static per (command, field): no payload bytes, store
 /// errors or mentions can leak into it.
 fn setup_shape_correction(command: &str, field: &str) -> String {
@@ -11651,7 +11652,7 @@ fn setup_shape_correction(command: &str, field: &str) -> String {
         _ => "channel: #voice-creator",
     };
     format!(
-        "That `/{command}` call has an ambiguous `{field}` option: send each option once, \
+        "That `/{command}` call has a problem with its `{field}` option: send it exactly once, \
          with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
     )
 }
@@ -11706,12 +11707,13 @@ pub enum ImportDecision {
     /// Nothing to confirm (empty diff, cancel, expiry): reply with `text`
     /// alone and store nothing.
     Notice { text: String },
-    /// Show `text` with Confirm/Cancel bound to (`member_id`, `hash`) and
-    /// remember `candidate` for Confirm.
+    /// Show `text` and the complete `review` attachment with Confirm/Cancel
+    /// bound to (`member_id`, `hash`); remember `candidate` for Confirm.
     Preview {
         candidate: VoiceConfiguration,
         hash: String,
         text: String,
+        review: Vec<u8>,
     },
     /// Confirm verified against fresh state: apply `candidate`, then reply
     /// with `message`.
@@ -11772,14 +11774,43 @@ pub fn plan_import_preview(
     // report an empty skipped list and an unknown-channels-only file would
     // read as `No changes`. The pruned `remaining` stays the candidate.
     let diff = diff_configuration(current, &incoming, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    plan_reviewable_import(current, remaining, &diff)
+}
+
+/// One admitted snapshot supplies the summary, full review and pending hash.
+/// Serialize before a Preview can exist, so no failure path can offer Confirm
+/// or insert temporary pending state for an unreviewable diff.
+fn plan_reviewable_import(
+    current: &VoiceConfiguration,
+    candidate: VoiceConfiguration,
+    diff: &ConfigDiff,
+) -> ImportDecision {
     if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
+        return ImportDecision::Notice {
+            text: render_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        };
     }
+    let hash = diff_content_hash(current, &candidate);
+    let review = match serialize_full_review(diff, &candidate.guild_id, &hash) {
+        Ok(bytes) => bytes,
+        Err(FullReviewError::TooLarge) => {
+            return ImportDecision::Refuse {
+                message: format!(
+                    "The complete review diff is too large (limit: {FULL_REVIEW_BYTE_LIMIT} serialized bytes). Reduce the proposed changes in the file and try again. Nothing was changed.",
+                ),
+            };
+        }
+        Err(FullReviewError::Serialization) => {
+            return ImportDecision::Refuse {
+                message: "Could not build the complete review diff. Nothing was changed; try uploading the file again.".to_owned(),
+            };
+        }
+    };
     ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
+        hash,
+        candidate,
+        text: render_review_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        review,
     }
 }
 
@@ -11817,16 +11848,10 @@ pub fn plan_import_confirm(
             ),
         };
     }
-    let diff = diff_configuration(current, &remaining, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
-    if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
-    }
-    ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
-    }
+    // Retain facts about channels newly skipped by this inventory. The
+    // remembered candidate is already pruned by the original preview.
+    let diff = diff_configuration(current, candidate, inventory);
+    plan_reviewable_import(current, remaining, &diff)
 }
 
 /// How many creator channels `candidate` adds over `current`.
@@ -11910,11 +11935,22 @@ fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> Inte
 /// Ephemeral `/import` preview reply with Confirm/Cancel buttons. Mentions
 /// are disabled: the preview quotes uploaded template text, which must never
 /// ping.
-fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
+fn import_preview_response(
+    text: &str,
+    member_id: Snowflake,
+    hash: &str,
+    guild_id: Snowflake,
+    review: Vec<u8>,
+) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             content: Some(text.to_owned()),
+            attachments: Some(vec![Attachment::from_bytes(
+                format!("voice-config-diff-guild-{guild_id}-v1.json"),
+                review,
+                0,
+            )]),
             components: Some(import_preview_components(member_id, hash)),
             flags: Some(MessageFlags::EPHEMERAL),
             allowed_mentions: Some(AllowedMentions {
@@ -12028,12 +12064,25 @@ pub enum VoiceCommand {
     },
     /// A setup command (`/create`, `/textchannels`, `/position`, `/group`,
     /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
-    /// an ambiguous option shape: a known option sent twice or with the wrong
-    /// wire type. Answered with a private correction before guild authority,
-    /// role gates and every read or effect.
+    /// a malformed option shape: a known option sent twice, with the wrong
+    /// wire type, or (for `/textchannels`) the required `channel` missing.
+    /// Answered with a private correction before guild authority, role gates
+    /// and every read or effect.
     SetupShapeInvalid {
         command: &'static str,
         field: &'static str,
+    },
+    /// `/logging` arrived with an ambiguous shape: a known option sent twice,
+    /// with the wrong wire type, or more than one action. Answered with a
+    /// private correction before the role gate and every read or effect.
+    LoggingShapeInvalid {
+        field: &'static str,
+    },
+    /// `/kick` arrived with a repeated or wrong-typed `reason`. Answered with
+    /// a private correction before any read, ballot or ledger claim; the
+    /// vote never starts with a silently dropped reason.
+    KickReasonInvalid {
+        target: Snowflake,
     },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
@@ -12160,8 +12209,9 @@ impl SetupOptionKind {
 }
 
 /// Known options of one setup command as `(name, expected wire type)`.
-/// Unknown names stay ignored; only these refuse when duplicated or
-/// mistyped. `None` for commands without a strict shape.
+/// Unknown names stay ignored; only these refuse when duplicated, mistyped,
+/// or (for the [`setup_shape_required`] option) missing. `None` for commands
+/// without a strict shape.
 fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
     match command {
         "create" => Some(&[("name", SetupOptionKind::String)]),
@@ -12197,11 +12247,23 @@ fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOpt
     }
 }
 
+/// The one registration-required option of a strict-shape command:
+/// `/textchannels` requires `channel`; its other options stay optional so
+/// omission keeps the stored value.
+fn setup_shape_required(command: &str) -> Option<&'static str> {
+    match command {
+        "textchannels" => Some("channel"),
+        _ => None,
+    }
+}
+
 /// Strictly decode one setup command's option shape: each known option at
-/// most once and with its registered wire type. Returns the first ambiguous
-/// known option in payload order. Unknown names (even duplicated, even with
-/// nested known names beneath them) stay ignored, and value validation stays
-/// in the handlers, so omission semantics are unchanged.
+/// most once and with its registered wire type, and the required option
+/// present. Returns the first malformed known option in payload order, or
+/// the required option when it is the only fault. Unknown names (even
+/// duplicated, even with nested known names beneath them) stay ignored, and
+/// value validation stays in the handlers, so omission semantics are
+/// unchanged.
 fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&'static str> {
     let fields = setup_shape_fields(command)?;
     let mut seen: Vec<&'static str> = Vec::new();
@@ -12215,7 +12277,10 @@ fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&
         }
         seen.push(name);
     }
-    None
+    match setup_shape_required(command) {
+        Some(required) if !seen.contains(&required) => Some(required),
+        _ => None,
+    }
 }
 
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -12480,9 +12545,10 @@ fn parse_voice_command_with_registry(
             Some(VoiceCommand::Transfer { target_id })
         }
         "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
-        "logging" => Some(VoiceCommand::Logging(parse_logging_action(
-            &command.options,
-        ))),
+        "logging" => Some(match logging_shape_refusal(&command.options) {
+            Some(field) => VoiceCommand::LoggingShapeInvalid { field },
+            None => VoiceCommand::Logging(parse_logging_action(&command.options)),
+        }),
         "export" => Some(VoiceCommand::Export),
         "import" => Some(VoiceCommand::Import {
             file_id: command.options.iter().find_map(|option| {
@@ -12501,9 +12567,15 @@ fn parse_voice_command_with_registry(
         // the published shape, decides vote-kick versus moderation kick, so
         // accept both. An unparsable shape stays silent here so the shared
         // router keeps the interaction.
-        "kick" => parse_kick_target(&command.options).map(|target| VoiceCommand::Kick {
-            target,
-            reason: parse_kick_reason(&command.options),
+        "kick" => parse_kick_target(&command.options).map(|target| {
+            if kick_reason_malformed(&command.options) {
+                VoiceCommand::KickReasonInvalid { target }
+            } else {
+                VoiceCommand::Kick {
+                    target,
+                    reason: parse_kick_reason(&command.options),
+                }
+            }
         }),
         "limit" => Some(VoiceCommand::Limit(limit::parse_limit_arg(
             &command.options,
@@ -12701,6 +12773,67 @@ fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
         })
 }
 
+/// Whether `reason` is sent twice or with a non-text wire type. An omitted
+/// reason is well formed (the vote starts without a reason line); a malformed
+/// one must refuse, never post a ballot that drops the stated reason.
+fn kick_reason_malformed(options: &[CommandDataOption]) -> bool {
+    matches!(
+        decode_strict_arg(options, "reason", |value| {
+            matches!(value, CommandOptionValue::String(_)).then_some(())
+        }),
+        StrictArg::Invalid
+    )
+}
+
+/// Private correction for a malformed `/kick` reason. Echoes no input.
+fn kick_reason_correction() -> String {
+    "That `/kick` call has a problem with its `reason` option: send it at most once, as text. \
+     Nothing was changed and no vote was started. Try:\n`/kick member: @member reason: too loud`"
+        .to_owned()
+}
+
+/// Strictly decode `/logging`'s shape: exactly one action, and the selected
+/// action's known option sent at most once. Returns the offending field
+/// (`subcommand` for more than one action). Unknown names inside the action
+/// stay ignored. A single missing or wrong-typed option keeps today's
+/// [`LoggingAction::Invalid`] refusal (or clear, for an omitted optional
+/// `channel`/`role`), so only the ambiguous duplicates change.
+fn logging_shape_refusal(options: &[CommandDataOption]) -> Option<&'static str> {
+    if options.len() > 1 {
+        return Some("subcommand");
+    }
+    let sub = options.first()?;
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return None;
+    };
+    let field = match sub.name.as_str() {
+        "level" => "level",
+        "channel" => "channel",
+        "mention" => "role",
+        _ => return None,
+    };
+    (args.iter().filter(|option| option.name == field).count() > 1).then_some(field)
+}
+
+/// Private correction for a malformed `/logging` call. Names the field and a
+/// copyable invocation; echoes no input.
+fn logging_shape_correction(field: &str) -> String {
+    if field == "subcommand" {
+        return "That `/logging` call has more than one action: send exactly one of show, level, \
+                channel or mention. Nothing was changed. Try:\n`/logging show`"
+            .to_owned();
+    }
+    let usage = match field {
+        "level" => "level level: full",
+        "channel" => "channel channel: #logs",
+        _ => "mention role: @role",
+    };
+    format!(
+        "That `/logging` call has a problem with its `{field}` option: send it exactly once, \
+         with the right type. Nothing was changed. Try:\n`/logging {usage}`"
+    )
+}
+
 /// The invoker's server display name: nickname, then global name, then user
 /// name. Empty when the interaction carries no user.
 fn interaction_display_name(interaction: &Interaction) -> String {
@@ -12749,51 +12882,104 @@ fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
     }
 }
 
+/// Strictly decoded single-occurrence option: `Missing` when absent,
+/// `Invalid` when duplicated or carrying the wrong value type, so callers
+/// refuse before any store touch instead of guessing a value.
+enum StrictArg<T> {
+    Missing,
+    Value(T),
+    Invalid,
+}
+
+/// Strictly decode one named option: `Missing` when absent, `Invalid` when
+/// the name repeats or `decode` rejects its value type. Unrelated names are
+/// ignored, so unknown or inapplicable options never refuse a shape.
+fn decode_strict_arg<T>(
+    args: &[CommandDataOption],
+    name: &str,
+    decode: impl Fn(&CommandOptionValue) -> Option<T>,
+) -> StrictArg<T> {
+    let mut seen: Option<StrictArg<T>> = None;
+    for option in args {
+        if option.name != name {
+            continue;
+        }
+        if seen.is_some() {
+            return StrictArg::Invalid;
+        }
+        seen = Some(match decode(&option.value) {
+            Some(value) => StrictArg::Value(value),
+            None => StrictArg::Invalid,
+        });
+    }
+    seen.unwrap_or(StrictArg::Missing)
+}
+
+/// Strictly decode role slots in listed order. A duplicated slot name or a
+/// non-`Role` value refuses (`None`); well-typed ids keep slot order and
+/// drop duplicate *values* — only duplicate *names* refuse.
+fn decode_access_roles(args: &[CommandDataOption], names: &[&str]) -> Option<Vec<Snowflake>> {
+    let mut roles: Vec<Snowflake> = Vec::new();
+    for name in names {
+        match decode_strict_arg(args, name, |value| match value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        }) {
+            StrictArg::Missing => {}
+            StrictArg::Value(role) => {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+            StrictArg::Invalid => return None,
+        }
+    }
+    Some(roles)
+}
+
+/// Strictly decode one `/access` invocation: exactly one top-level option,
+/// a known `SubCommand`, whose own options decode strictly (a wrong value
+/// type or a duplicated name refuses) while unknown or inapplicable names
+/// are ignored. Refusing here keeps a malformed shape from reaching the
+/// store read in `execute_access`. An omitted `role` is still a genuine
+/// clear, and `page` keeps the strict [`decode_page`] contract.
 fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
-    let Some(sub) = options.first() else {
+    let [sub] = options else {
         return AccessAction::Invalid;
     };
     let CommandOptionValue::SubCommand(args) = &sub.value else {
         return AccessAction::Invalid;
     };
-    let roles: Vec<Snowflake> = ["role", "role2", "role3"]
-        .iter()
-        .filter_map(|name| args.iter().find(|option| option.name == *name))
-        .filter_map(|option| match option.value {
-            CommandOptionValue::Role(role) => Some(role.get()),
-            _ => None,
-        })
-        .fold(Vec::new(), |mut roles, role| {
-            if !roles.contains(&role) {
-                roles.push(role);
-            }
-            roles
-        });
-    let command = args
-        .iter()
-        .find(|option| option.name == "command")
-        .and_then(|option| match &option.value {
-            CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
-            _ => None,
-        });
+    let command = decode_strict_arg(args, "command", |value| match value {
+        CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
+        _ => None,
+    });
     match sub.name.as_str() {
         "show" => AccessAction::Show {
             page: decode_page(args),
         },
-        "creation" => args
-            .iter()
-            .find(|option| option.name == "enabled")
-            .and_then(|option| match option.value {
-                CommandOptionValue::Boolean(enabled) => Some(AccessAction::Creation(enabled)),
-                _ => None,
-            })
-            .unwrap_or(AccessAction::Invalid),
-        "role" => AccessAction::RequiredRole(roles.first().copied()),
-        "restrict" => command.map_or(AccessAction::Invalid, |command| AccessAction::Restrict {
+        "creation" => match decode_strict_arg(args, "enabled", |value| match value {
+            CommandOptionValue::Boolean(enabled) => Some(*enabled),
+            _ => None,
+        }) {
+            StrictArg::Value(enabled) => AccessAction::Creation(enabled),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
+        "role" => match decode_access_roles(args, &["role"]) {
+            Some(roles) => AccessAction::RequiredRole(roles.first().copied()),
+            None => AccessAction::Invalid,
+        },
+        "restrict" => match (
             command,
-            roles,
-        }),
-        "unrestrict" => command.map_or(AccessAction::Invalid, AccessAction::Unrestrict),
+            decode_access_roles(args, &["role", "role2", "role3"]),
+        ) {
+            (StrictArg::Value(command), Some(roles)) => AccessAction::Restrict { command, roles },
+            _ => AccessAction::Invalid,
+        },
+        "unrestrict" => match command {
+            StrictArg::Value(command) => AccessAction::Unrestrict(command),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
         _ => AccessAction::Invalid,
     }
 }
@@ -12834,12 +13020,12 @@ impl VoiceCommand {
             Self::Private => "private",
             Self::Public => "public",
             Self::Transfer { .. } => "transfer",
-            Self::Logging(_) => "logging",
+            Self::Logging(_) | Self::LoggingShapeInvalid { .. } => "logging",
             Self::Export => "export",
             Self::Import { .. } => "import",
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
-            Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Kick { .. } | Self::KickReasonInvalid { .. } | Self::Ballot { .. } => "kick",
             Self::Limit(_) => "limit",
             Self::Unlimit => "unlimit",
             Self::Name => "name",
@@ -13451,6 +13637,12 @@ fn access_show_page(controls: &AccessControls, page: usize) -> String {
     lines.join("\n")
 }
 
+/// Short refusal for a malformed `/access` shape: names a copyable
+/// invocation, says nothing changed, and echoes none of the bad input.
+fn access_invalid_refusal() -> String {
+    "That /access option is not valid. Nothing was changed. Use /access show page:1 to see the current settings.".to_owned()
+}
+
 /// Short refusal for a malformed `/access show` page: names the remedy and a
 /// valid start, serves no rows and leaks no role mentions.
 fn access_page_refusal() -> String {
@@ -13506,8 +13698,11 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
-    // A malformed read page refuses before any store touch: no read cost,
+    // Malformed shapes refuse before any store touch: no read cost,
     // no save, no actor/config/audit mutation.
+    if matches!(&action, AccessAction::Invalid) {
+        return access_invalid_refusal();
+    }
     let show_page_invalid = matches!(
         &action,
         AccessAction::Show { page } if page.number().is_none()
@@ -13534,10 +13729,8 @@ async fn execute_access<S: RoomPersistence>(
             }
             return access_show_page(&controls, number);
         }
-        AccessAction::Invalid => {
-            return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
-                .to_owned()
-        }
+        // Refused before the store read above; kept for exhaustiveness.
+        AccessAction::Invalid => return access_invalid_refusal(),
         AccessAction::Creation(enabled) => {
             controls.room_creation_enabled = enabled;
             access_creation_ack(enabled)
@@ -13776,6 +13969,17 @@ where
     // every read or effect: the parser already proved the shape unusable.
     if let VoiceCommand::SetupShapeInvalid { command, field } = &command {
         reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+        return true;
+    }
+    // Ambiguous `/logging` and `/kick` options refuse the same way, so a
+    // duplicate or wrong-typed option never saves a setting or posts a
+    // ballot that silently dropped the stated reason.
+    if let VoiceCommand::LoggingShapeInvalid { field } = &command {
+        reply(ephemeral_response(&logging_shape_correction(field))).await;
+        return true;
+    }
+    if matches!(command, VoiceCommand::KickReasonInvalid { .. }) {
+        reply(ephemeral_response(&kick_reason_correction())).await;
         return true;
     }
     // Cold guild-role facts are not a permanent denial: a command that
@@ -14031,6 +14235,14 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.enabled.is_none()
+                        && request.name.is_none()
+                        && request.viewer_role.is_none() =>
+                {
+                    text_channels_summary(&creator)
+                }
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
                     TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14063,6 +14275,12 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.position.is_none() && request.first_number.is_none() =>
+                {
+                    position_summary(&creator)
+                }
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
                     PositionPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14095,6 +14313,8 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator)) if request.enabled.is_none() => group_summary(&creator),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
                     GroupPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14227,6 +14447,14 @@ where
             // any read), but a second dispatch path must still refuse here,
             // never run.
             reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+            true
+        }
+        VoiceCommand::LoggingShapeInvalid { field } => {
+            reply(ephemeral_response(&logging_shape_correction(field))).await;
+            true
+        }
+        VoiceCommand::KickReasonInvalid { .. } => {
+            reply(ephemeral_response(&kick_reason_correction())).await;
             true
         }
         VoiceCommand::Reclaim => {
@@ -14516,13 +14744,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { .. } => {
             warn!(
@@ -14634,13 +14866,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { candidate, message } => {
             if let Some(refusal) = import_creator_gate(&current, &candidate, permissions) {
@@ -14671,11 +14907,15 @@ where
                                     candidate,
                                     hash,
                                     text,
+                                    review,
                                 } => {
                                     runtime.remember_pending_import(
                                         guild_id, member_id, &hash, candidate,
                                     );
-                                    reply(import_preview_response(&text, member_id, &hash)).await;
+                                    reply(import_preview_response(
+                                        &text, member_id, &hash, guild_id, review,
+                                    ))
+                                    .await;
                                 }
                                 ImportDecision::Apply {
                                     candidate: retry,
@@ -14973,7 +15213,7 @@ where
         // would race it and could answer twice.
         if matches!(
             runtime.parse_voice_command(interaction),
-            Some(VoiceCommand::Kick { .. })
+            Some(VoiceCommand::Kick { .. } | VoiceCommand::KickReasonInvalid { .. })
         ) {
             return;
         }
@@ -15080,7 +15320,8 @@ where
         if !runtime.enabled {
             return false;
         }
-        let Some(VoiceCommand::Kick { target, .. }) = runtime.parse_voice_command(interaction)
+        let Some(VoiceCommand::Kick { target, .. } | VoiceCommand::KickReasonInvalid { target }) =
+            runtime.parse_voice_command(interaction)
         else {
             return false;
         };
@@ -15182,7 +15423,10 @@ where
         if let Event::InteractionCreate(created) = event {
             let command = self.runtime.parse_voice_command(&created.0);
             // The shared router answers `/kick`; see `kick_vote`.
-            if matches!(command, Some(VoiceCommand::Kick { .. })) {
+            if matches!(
+                command,
+                Some(VoiceCommand::Kick { .. } | VoiceCommand::KickReasonInvalid { .. })
+            ) {
                 return;
             }
             if command.is_none()
