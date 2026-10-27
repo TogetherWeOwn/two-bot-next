@@ -114,7 +114,7 @@ fn control_compatibility_adapter_ignores_the_path_until_the_builder_lands() {
     let def = capped_fixture();
     assert_eq!(
         LegacyHelpFocus::help_branch_text(&def, "zeta"),
-        def.help_detail_text(),
+        Some(def.help_detail_text()),
         "fallback is the old whole-command detail"
     );
 }

@@ -409,7 +409,7 @@ async fn control_unconfirmed_snapshot_answers_refresh_for_focused_request() {
 
 #[tokio::test]
 async fn control_failed_refresh_keeps_focused_answers_stable() {
-    let (mock, origin) = MockRest::start(vec![200, 403, 200]).await;
+    let (mock, origin) = MockRest::start(vec![200, 200, 403]).await;
     let runtime = closed_runtime(gates(false, false), origin, vec![]).await;
     runtime
         .publish_registry_checked(Some(1111))
