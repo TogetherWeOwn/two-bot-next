@@ -101,6 +101,7 @@ struct ReadFixture {
     grants: BTreeMap<u64, BTreeSet<u64>>,
     rooms: HashMap<u64, VoiceRoom>,
     trace: Trace,
+    startup_presence: Vec<String>,
 }
 
 impl ReadFixture {
@@ -113,6 +114,20 @@ impl ReadFixture {
         let stored_privacy = worker.store.privacy.lock().unwrap().clone();
         let grants = worker.store.join_grants.lock().unwrap().clone();
         let rooms = worker.store.rooms.lock().unwrap().clone();
+        // run_actor's start flushes join-only presence spans for snapshot
+        // occupants before it reads the inbox; that is actor startup, not
+        // the read, so exactly these entries are excused below.
+        let startup_presence = worker
+            .live
+            .read_state()
+            .members
+            .iter()
+            .filter_map(|(member, state)| {
+                state
+                    .channel_id
+                    .map(|channel| format!("evjoin:{channel}:{member}"))
+            })
+            .collect();
         let runtime = test_runtime(trace.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         runtime.actors.lock().unwrap().insert(
@@ -135,6 +150,7 @@ impl ReadFixture {
             grants,
             rooms,
             trace,
+            startup_presence,
         }
     }
 
@@ -214,7 +230,12 @@ impl ReadFixture {
             self.rooms,
             "read changed ownership/rooms"
         );
-        let effects = self.trace.lock().unwrap().clone();
+        let mut effects = self.trace.lock().unwrap().clone();
+        for startup in &self.startup_presence {
+            if let Some(at) = effects.iter().position(|entry| entry == startup) {
+                effects.remove(at);
+            }
+        }
         assert!(
             effects.is_empty(),
             "read caused store/Discord effects: {effects:?}"
