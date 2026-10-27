@@ -980,6 +980,10 @@ fn text_blockers(row: &StoredCommand, gate: Option<bool>) -> Vec<TextBlocker> {
 fn text_eligibility_lines(row: &StoredCommand, gate: Option<bool>) -> String {
     let blockers = text_blockers(row, gate);
     let name = &row.name;
+    // Resume revalidates against the wider write reservation, so a paused
+    // grandfathered voice/assistant-named row can never be resumed: offering
+    // /command-enable would promise an action that deterministically refuses.
+    let name_reserved = reserved_command_names().contains(name);
     if blockers.is_empty() {
         return if gate.is_some() {
             "\nText-trigger eligibility: Eligible, subject to normal per-message permission checks and automod. This is not a delivery guarantee and says nothing about slash-command registration.".to_owned()
@@ -1010,7 +1014,13 @@ fn text_eligibility_lines(row: &StoredCommand, gate: Option<bool>) -> String {
                 "\nNext: choose a non-builtin trigger with /command name:{name} template:... text-trigger:!word (replaces the definition)."
             )),
             TextBlocker::Paused => {
-                out.push_str(&format!("\nNext: resume it with /command-enable name:{name}."));
+                if name_reserved {
+                    out.push_str(&format!(
+                        "\nNext: the name \"{name}\" is reserved, so this definition cannot be resumed. Recreate it under a different name with /command, or delete it with /command-remove name:{name}."
+                    ));
+                } else {
+                    out.push_str(&format!("\nNext: resume it with /command-enable name:{name}."));
+                }
             }
             TextBlocker::GateOff => out.push_str(
                 "\nNext: text commands follow the TWO_TEXT_COMMANDS configuration; ask the bot operator to review it. Inspecting changes nothing.",
@@ -2095,6 +2105,31 @@ mod tests {
         assert!(summary.contains("no text trigger"));
         assert!(summary.contains("text-trigger:"));
         assert!(!summary.contains("registration"));
+    }
+
+    #[test]
+    fn inspect_summary_paused_reserved_name_points_at_replace_or_delete_not_resume() {
+        assert!(
+            reserved_command_names().contains("setup"),
+            "test premise: setup is a voice-room name in the write reservation"
+        );
+        let mut row = inspect_row();
+        row.name = "setup".to_owned();
+        row.text_trigger = Some("!setup".to_owned());
+        row.enabled = false;
+        let summary = format_inspect_summary_with_gate(&row, Some(true));
+        assert!(summary.contains("paused definition"));
+        assert!(!summary.contains("builtin-reserved trigger"));
+        assert!(!summary.contains("/command-enable"));
+        assert!(summary.contains("is reserved"));
+        assert!(summary.contains("cannot be resumed"));
+        assert!(summary.contains("/command-remove name:setup"));
+        assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        // Control: an ordinary paused row still offers resume.
+        let mut plain = inspect_row();
+        plain.enabled = false;
+        let control = format_inspect_summary_with_gate(&plain, Some(true));
+        assert!(control.contains("/command-enable name:faq"));
     }
 
     #[test]
