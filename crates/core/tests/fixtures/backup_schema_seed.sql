@@ -687,7 +687,7 @@ VALUES ('GUILD_SCHEDULED_EVENT_CREATE', '100000000000000001',
         '100000000000000033', '100000000000000065', 1, 2,
         '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
         'GUILD_SCHEDULED_EVENT_CREATE:100000000000000001:100000000000000065:2026-08-03T10:00:00Z');
--- Starboard foundation (v11): one configured guild plus one default/off guild;
+-- Starboard foundation (v14): one configured guild plus one default/off guild;
 -- two starrers on one message and one on another; one posted board row plus
 -- one pending (NULL board message) below-threshold row. BIGINT snowflakes, so
 -- the roundtrip asserts archive coverage with numeric ids, not an empty seed.
@@ -708,7 +708,7 @@ VALUES (100000000000000001, 100000000000000003, 100000000000000006,
         100000000000000010, 100000000000000020, 2, 'posted'),
        (100000000000000001, 100000000000000003, 100000000000000007,
         100000000000000010, NULL, 1, 'below_threshold');
--- Starboard replay cursors (v15) survive backups even after a reaction removal.
+-- Starboard replay cursors (v16) survive backups even after a reaction removal.
 INSERT INTO starboard_reaction_cursors
     (guild_id, source_message_id, user_id, session_key, event_order, updated_at)
 VALUES (100000000000000001, 100000000000000007, 100000000000000004,

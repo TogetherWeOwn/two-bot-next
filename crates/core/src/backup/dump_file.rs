@@ -3379,18 +3379,16 @@ mod tests {
             DUMP_VERSION, 16,
             "giveaways follow the released v14 starboard format"
         );
-        // Literal names, not V15_ADDED_TABLES: this reproduces the pre-change
-        // inventory even if the version waiver is accidentally removed.
-        let without_giveaways = |tables: Vec<Value>| {
-            tables
-                .into_iter()
-                .filter(|table| {
-                    !["giveaways", "giveaway_entries", "giveaway_draws"]
-                        .contains(&table["name"].as_str().unwrap_or_default())
-                })
-                .collect::<Vec<_>>()
-        };
-        let tables = without_giveaways(complete_tables(&BTreeMap::new()));
+        // Released v14 is the frozen v13 inventory plus the three starboard
+        // tables, independent of today's inventory or version-waiver constants.
+        let tables = FROZEN_V13_TABLES
+            .iter()
+            .copied()
+            .chain(["starboard_config", "starboard_starrers", "starboard_posts"])
+            .map(|name| {
+                serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
+            })
+            .collect();
         let mut old = manifest(tables);
         for version in 4..=14 {
             old["version"] = serde_json::json!(version);
@@ -3401,8 +3399,18 @@ mod tests {
             .expect("old archives without the v15 giveaway tables stay readable");
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
+                contents.manifest.tables.len(),
+                104,
+                "released v14 inventory"
+            );
+            assert_eq!(
                 contents.manifest.missing_tables(),
-                ["giveaways", "giveaway_entries", "giveaway_draws"]
+                [
+                    "giveaways",
+                    "giveaway_entries",
+                    "giveaway_draws",
+                    "starboard_reaction_cursors",
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -3462,22 +3470,40 @@ mod tests {
     }
 
     #[test]
-    fn starboard_replay_ledger_requires_current_archive_but_not_released_v14() {
+    fn starboard_replay_ledger_requires_current_archive_but_not_released_v15() {
         let mut archive = manifest(complete_tables(&BTreeMap::new()));
+        assert_eq!(archive["version"], serde_json::json!(16));
+        assert_eq!(archive["tables"].as_array().unwrap().len(), 108);
         archive["tables"]
             .as_array_mut()
             .unwrap()
             .retain(|table| table["name"] != "starboard_reaction_cursors");
-        archive["version"] = serde_json::json!(14);
+        archive["version"] = serde_json::json!(15);
         let old = inspect_bytes(&gzip_lines(&[
             archive.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("released v14 remains readable");
+        .expect("released v15 remains readable");
+        assert_eq!(old.manifest.version, 15);
+        assert_eq!(old.manifest.tables.len(), 107, "released v15 inventory");
         assert_eq!(
             old.manifest.missing_tables(),
             ["starboard_reaction_cursors"]
         );
+        for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+            let mut gap = archive.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "v15 must require {name}: {error}");
+        }
         archive["version"] = serde_json::json!(DUMP_VERSION);
         let error = inspect_bytes(&gzip_lines(&[
             archive,
@@ -3601,7 +3627,7 @@ mod tests {
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
             message.contains(&format!(
-                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 and {DUMP_VERSION}"
+                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 and {DUMP_VERSION}"
             )),
             "unknown versions are refused with the readable list: {message}"
         );

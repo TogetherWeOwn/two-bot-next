@@ -289,6 +289,8 @@ async fn snapshot(pool: &PgPool, tables: &[String]) -> Snapshot {
 }
 
 fn assert_archive_matches(contents: &DumpContents, expected: &Snapshot) {
+    assert_eq!(expected.len(), 108, "complete v16 snapshot inventory");
+    assert_eq!(contents.manifest.tables.len(), 108, "current v16 inventory");
     let names: BTreeSet<_> = contents
         .manifest
         .tables
@@ -2295,11 +2297,17 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.tables.len(), 108, "current v16 inventory");
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "starboard_reaction_cursors",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -2317,8 +2325,18 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
     let inspected = inspect(&old_path).expect("pre-change v14 archive remains readable");
     assert_eq!(inspected.manifest.version, 14);
     assert_eq!(
+        inspected.manifest.tables.len(),
+        104,
+        "released v14 inventory"
+    );
+    assert_eq!(
         inspected.manifest.missing_tables(),
-        ["giveaways", "giveaway_entries", "giveaway_draws"]
+        [
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "starboard_reaction_cursors",
+        ]
     );
     sqlx::query("DELETE FROM starboard_starrers")
         .execute(pool)
@@ -2351,6 +2369,24 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
             "dirty destination must differ for {name}"
         );
     }
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "starboard_reaction_cursors",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            count > 0,
+            "destination must retain newer {name} before restore"
+        );
+    }
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
@@ -2360,7 +2396,12 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         archived,
         "v14 restores starboard, voice and registry data"
     );
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "starboard_reaction_cursors",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -2416,7 +2457,8 @@ async fn v14_archive_restores_starboard_and_clears_newer_reaction_cursors() {
     let current_path = directory.path("current-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, DUMP_VERSION);
+    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.tables.len(), 108, "current v16 inventory");
     assert!(
         !old.buffers
             .remove("starboard_reaction_cursors")
@@ -2438,7 +2480,15 @@ async fn v14_archive_restores_starboard_and_clears_newer_reaction_cursors() {
         error.to_string().contains("starboard_reaction_cursors"),
         "{error}"
     );
+    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+        assert!(
+            !old.buffers.remove(name).unwrap().is_empty(),
+            "destination must start with newer {name} rows"
+        );
+        old.manifest.tables.retain(|table| table.name != name);
+    }
     old.manifest.version = 14;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-replay-cursors-v14.ndjson.gz");
     write_archive(&old_path, &old);
     let inspected = inspect(&old_path).expect("released v14 starboard archive remains readable");
@@ -2446,7 +2496,12 @@ async fn v14_archive_restores_starboard_and_clears_newer_reaction_cursors() {
     assert_eq!(inspected.manifest.tables.len(), 104);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["starboard_reaction_cursors"]
+        [
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "starboard_reaction_cursors",
+        ]
     );
     sqlx::query("UPDATE starboard_config SET threshold = threshold + 1")
         .execute(pool)
@@ -2467,6 +2522,24 @@ async fn v14_archive_restores_starboard_and_clears_newer_reaction_cursors() {
             "destination must differ for {name}"
         );
     }
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "starboard_reaction_cursors",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            count > 0,
+            "destination must retain newer {name} before restore"
+        );
+    }
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
@@ -2475,11 +2548,126 @@ async fn v14_archive_restores_starboard_and_clears_newer_reaction_cursors() {
         archived,
         "v14 restores archived starboard rows, not destination data"
     );
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "starboard_reaction_cursors",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v14 restore clears newer {name} destination rows");
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v15_archive_restores_giveaways_and_starboard_and_clears_newer_reaction_cursors() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let restored_tables = vec![
+        "starboard_config".to_owned(),
+        "starboard_starrers".to_owned(),
+        "starboard_posts".to_owned(),
+        "giveaways".to_owned(),
+        "giveaway_entries".to_owned(),
+        "giveaway_draws".to_owned(),
+    ];
+    let archived = snapshot(pool, &restored_tables).await;
+    for name in &restored_tables {
+        assert!(!archived[name].rows.is_empty(), "v15 contains {name}");
+    }
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("current-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.tables.len(), 108, "current v16 inventory");
+    assert!(
+        !old.buffers
+            .remove("starboard_reaction_cursors")
+            .unwrap()
+            .is_empty(),
+        "destination must start with replay cursor rows"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "starboard_reaction_cursors");
+    old.manifest.version = 15;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-replay-cursors-v15.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("released v15 giveaway archive remains readable");
+    assert_eq!(inspected.manifest.version, 15);
+    assert_eq!(
+        inspected.manifest.tables.len(),
+        107,
+        "released v15 inventory"
+    );
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["starboard_reaction_cursors"]
+    );
+    sqlx::query("UPDATE starboard_config SET threshold = threshold + 1")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM starboard_starrers")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE starboard_posts SET star_count = star_count + 10")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE giveaways SET prize = 'destination-only prize'")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM giveaway_entries")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM giveaway_draws")
+        .execute(pool)
+        .await
+        .unwrap();
+    let dirty = snapshot(pool, &restored_tables).await;
+    for name in &restored_tables {
+        assert_ne!(
+            dirty[name], archived[name],
+            "destination must differ for {name}"
+        );
+    }
+    let cursors_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM starboard_reaction_cursors")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        cursors_before > 0,
+        "destination must retain replay cursor rows"
+    );
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &restored_tables).await,
+        archived,
+        "v15 restores archived giveaway and starboard rows, not destination data"
+    );
     let cursors: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM starboard_reaction_cursors")
         .fetch_one(pool)
         .await
         .unwrap();
-    assert_eq!(cursors, 0, "v14 restore clears newer replay cursor rows");
+    assert_eq!(cursors, 0, "v15 restore clears newer replay cursor rows");
     db.close().await.unwrap();
 }
 
