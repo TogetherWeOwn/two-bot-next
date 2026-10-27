@@ -457,6 +457,22 @@ jobs:
 
       # Compile optional stores and run their safety and scratch-DB tests too.
       # Onboarding/sticky live tests remain explicitly ignored by default.
+      - name: Generate command reference before test-target compilation
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: |
+          python3 scripts/generate_command_reference.py
+          python3 scripts/check_docs_index.py --json
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_path_conformance.py' -v
+
+      - name: Upload generated command reference
+        if: needs.job-inputs.outputs.rust != 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: command-reference
+          path: docs/generated/commands.md
+          if-no-files-found: error
+          retention-days: 14
+
       - name: cargo clippy -D warnings
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -835,6 +851,9 @@ jobs:
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
+      - name: Generate command reference and verify isolated lifecycle
+        run: python3 scripts/generate_command_reference.py --verify-lifecycle
+
       - name: cargo test (unit and binary, including RSVP store)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -1224,6 +1243,9 @@ jobs:
       # coverage verdict fail independently. The `always()` gate still
       # collects coverage unless the run was cancelled or the database
       # prepare/verify failed.
+      - name: Generate command reference before coverage compilation
+        run: python3 scripts/generate_command_reference.py
+
       - name: Patch coverage (HARD, 80% of added lines)
         if: always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' && steps.verify_disposable_postgres.outcome == 'success'
         shell: bash
@@ -2214,6 +2236,9 @@ jobs:
             -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
             -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
+      - name: Generate command reference before runtime test compilation
+        run: python3 scripts/generate_command_reference.py
+
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -2538,6 +2563,9 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
+      - name: Generate command reference before self-role test compilation
+        run: python3 scripts/generate_command_reference.py
+
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role ticket acknowledgement columns and caps
@@ -2985,6 +3013,9 @@ jobs:
           apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
           rm -rf /var/lib/apt/lists/*
           createdb -h agent-testdb -U agent_test two_bot_test_ci
+      - name: Generate command reference before ticket test compilation
+        run: python3 scripts/generate_command_reference.py
+
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
