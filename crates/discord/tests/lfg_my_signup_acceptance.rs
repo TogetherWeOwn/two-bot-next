@@ -90,7 +90,7 @@ fn wire(id: u64, member: u64, kind: u8, data: Value, message: bool) -> Interacti
         value["message"] = json!({
             "id": MESSAGE, "guild_id": GUILD, "channel_id": CHANNEL, "type": 0,
             "author": {"id": BOT.to_string(), "username": "fixture-bot", "discriminator": "0", "avatar": null, "bot": true},
-            "content": "Fixture raid", "timestamp": "2026-10-20T10:00:00Z",
+            "content": "Fixture raid", "timestamp": "2026-10-20T10:00:00+00:00",
             "edited_timestamp": null, "tts": false, "mention_everyone": false,
             "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false,
             "components": [{"type": 1, "components": [{"type": 2, "style": 2,
