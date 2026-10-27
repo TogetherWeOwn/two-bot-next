@@ -335,6 +335,7 @@ fn inert(text: &str) -> String {
         match ch {
             '@' => safe.push_str("\\@\u{200b}"),
             ':' => safe.push_str(":\u{200b}"),
+            '.' => safe.push_str(".\u{200b}"),
             '\\' | '*' | '_' | '~' | '`' | '|' | '[' | ']' | '(' | ')' | '<' | '>' | '#' | '!' => {
                 safe.push('\\');
                 safe.push(ch);
@@ -364,6 +365,10 @@ mod tests {
         for token in ["<@", "<#", "@everyone", "@here", "**", "](", "://"] {
             assert!(!safe.contains(token), "{token} survived in {safe}");
         }
+        assert!(
+            !inert("example.com").contains("e.com"),
+            "bare domain stays linkable"
+        );
     }
 
     #[test]
