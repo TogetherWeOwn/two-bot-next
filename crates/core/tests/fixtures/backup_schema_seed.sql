@@ -582,6 +582,16 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
+-- V16 orphan evidence (0468): two channels in one guild and the same channel
+-- ID in another. Offset and microsecond timestamps must survive exactly.
+-- These channels deliberately have no tracked room or reservation.
+INSERT INTO voice_orphan_ledger (guild_id, channel_id, reason, recorded_at)
+VALUES ('100000000000000001', '100000000000000090', 'creator_compensation_failed',
+        '2026-08-03T10:00:00.123456+02:00'),
+       ('100000000000000001', '100000000000000091', 'creator_compensation_failed',
+        '2026-08-03T09:00:00.654321Z'),
+       ('100000000000000002', '100000000000000090', 'creator_compensation_failed',
+        '2026-08-04T00:00:00.000001Z');
 -- Retention queues (0438): one queued guild purge plus one pending and one
 -- completed user-deletion request, so the dump/restore round trip covers both
 -- the pending-NULL and completed-receipt shapes.
