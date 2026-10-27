@@ -546,7 +546,7 @@ fn giveaway_publish_set_carries_create_list_cancel() {
 
 #[test]
 fn giveaway_reference_docs_list_the_command() {
-    let docs = include_str!("../../../docs/commands.md");
+    let docs = include_str!("../../../docs/generated/commands.md");
     assert!(
         docs.contains("## `/giveaway`"),
         "regen lists the new command"
