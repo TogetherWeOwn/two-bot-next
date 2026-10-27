@@ -43,6 +43,8 @@ mod custom_command_list_pages_acceptance;
 mod custom_command_toggle_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
+#[path = "help_focus_acceptance.rs"]
+mod help_focus_acceptance;
 
 #[path = "game_mix_acceptance_tests.rs"]
 mod game_mix_acceptance_tests;
