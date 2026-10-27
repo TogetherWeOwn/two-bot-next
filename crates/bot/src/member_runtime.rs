@@ -288,11 +288,18 @@ impl MemberRuntime {
         match authority {
             Ok(actor) if actor.permissions & two_bot_core::commands::PERM_BAN_MEMBERS != 0 => {}
             Ok(_) => return "You need the current Ban Members permission to inspect saved expiries. Ask a server moderator or admin.".to_owned(),
-            Err(_) => return tempban_inventory::UNAVAILABLE.to_owned(),
+            Err(cause) => {
+                tracing::warn!(cause = cause.token(), "tempban inventory authority unavailable");
+                return tempban_inventory::UNAVAILABLE.to_owned();
+            }
         }
         match self.store.saved_expiries(&self.guild_id, page).await {
             Ok(rows) => tempban_inventory::render(page, &rows),
-            Err(_) => tempban_inventory::UNAVAILABLE.to_owned(),
+            Err(_) => {
+                // Fixed vocabulary only: store errors can carry database detail.
+                tracing::warn!("tempban inventory read unavailable");
+                tempban_inventory::UNAVAILABLE.to_owned()
+            }
         }
     }
 
