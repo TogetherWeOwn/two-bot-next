@@ -697,6 +697,25 @@ pub fn accepted_text_trigger(
 pub const INVALID_COMMAND_LIST_PAGE: &str =
     "Invalid page. Run /command-list page:1, then use the next-page hint.";
 
+/// Actionable, input-independent refusal for a malformed name-prefix filter.
+/// Never echoes the submitted value; the example uses a fixed safe prefix.
+pub const INVALID_COMMAND_LIST_PREFIX: &str =
+    "Invalid name prefix. Run /command-list name-prefix:faq to filter by name start, using 1-32 characters a-z 0-9 _ -.";
+
+/// Normalize a `name-prefix` filter using the command-name alphabet/case rules.
+/// Lowercases first (like management names), then requires
+/// `^[a-z0-9_-]{1,32}$`. Returns the normalized prefix, or `None` when the
+/// raw value is not a usable prefix.
+#[must_use]
+pub fn normalize_list_prefix(raw: &str) -> Option<String> {
+    let normalized = raw.to_lowercase();
+    if valid_name(&normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 /// Legacy callers select the first whole-row page.
 #[must_use]
 pub fn format_command_list(rows: &[StoredCommand]) -> String {
@@ -781,6 +800,128 @@ pub fn format_command_list_page(
     let mut reply = format!("{body}\n\nPage {page} of {total}");
     if page < total {
         reply.push_str(&format!("\nNext: /command-list page:{}", page + 1));
+    }
+    Ok(reply)
+}
+
+/// Filter the existing bounded guild snapshot by a normalized name prefix
+/// BEFORE whole-row paging, then pack the matches in stable store order.
+/// `prefix` must already be normalized via [`normalize_list_prefix`]: lowercase
+/// `^[a-z0-9_-]{1,32}$`. Name matching is start-only (`starts_with`), never
+/// substring, description, template or trigger; disabled rows stay visible with
+/// their existing fields. Every success page shows the active prefix, the
+/// filtered total and `Page N of M`; non-final pages carry a copyable
+/// `Next: /command-list name-prefix:<prefix> page:<next>` hint retaining the
+/// filter. An empty guild, zero matches and an out-of-range filtered page stay
+/// distinguishable; all replies fit Discord's 2,000 UTF-16-unit ceiling with
+/// whole rows only.
+pub fn format_command_list_page_with_prefix(
+    rows: &[StoredCommand],
+    prefix: &str,
+    page: usize,
+) -> Result<String, &'static str> {
+    if page == 0 {
+        return Err(INVALID_COMMAND_LIST_PAGE);
+    }
+    if rows.is_empty() {
+        return if page == 1 {
+            Ok(format!(
+                "No custom commands defined matching prefix \"{}\".",
+                escape_inspect_text(prefix)
+            ))
+        } else {
+            Err(INVALID_COMMAND_LIST_PAGE)
+        };
+    }
+    let filtered: Vec<&StoredCommand> = rows
+        .iter()
+        .filter(|row| row.name.to_ascii_lowercase().starts_with(prefix))
+        .collect();
+    if filtered.is_empty() {
+        return if page == 1 {
+            Ok(format!(
+                "No matching names for prefix \"{}\". Run /command-list to browse all commands.",
+                escape_inspect_text(prefix)
+            ))
+        } else {
+            Err(INVALID_COMMAND_LIST_PAGE)
+        };
+    }
+    let total_matches = filtered.len();
+    let lines: Vec<String> = filtered
+        .iter()
+        .map(|row| {
+            let trigger = row
+                .text_trigger
+                .as_deref()
+                .map(|trigger| format!(" (or {})", escape_inspect_text(trigger)))
+                .unwrap_or_default();
+            format!(
+                "/{}{} — {}",
+                escape_inspect_text(&row.name),
+                trigger,
+                if row.enabled { "on" } else { "off" }
+            )
+        })
+        .collect();
+    let noun = if total_matches == 1 {
+        "command"
+    } else {
+        "commands"
+    };
+    let header = format!(
+        "Matching \"{}\": {total_matches} {noun}",
+        escape_inspect_text(prefix)
+    );
+    let single_page = format!("{header}\n{}\n\nPage 1 of 1", lines.join("\n"));
+    if single_page.encode_utf16().count() <= MAX_RENDERED_CHARS {
+        return if page == 1 {
+            Ok(single_page)
+        } else {
+            Err(INVALID_COMMAND_LIST_PAGE)
+        };
+    }
+    // Multi-page: every page repeats the header, so reserve it plus the
+    // worst-case footer (there cannot be more pages than matches) before
+    // packing whole rows.
+    let header_units = header.encode_utf16().count() + 1;
+    let footer_units = format!(
+        "\n\nPage {total_matches} of {total_matches}\nNext: /command-list name-prefix:{prefix} page:{total_matches}"
+    )
+    .encode_utf16()
+    .count();
+    let reserved = header_units.saturating_add(footer_units);
+    let body_limit = MAX_RENDERED_CHARS.saturating_sub(reserved);
+    let mut pages = Vec::new();
+    let mut body = String::new();
+    let mut units = 0;
+    for line in lines {
+        let line_units = line.encode_utf16().count();
+        if line_units > body_limit {
+            return Err(
+                "A custom-command row is too long to list. Ask a server admin to repair it, then run /command-list page:1.",
+            );
+        }
+        if units + usize::from(!body.is_empty()) + line_units > body_limit {
+            pages.push(std::mem::take(&mut body));
+            units = 0;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+            units += 1;
+        }
+        body.push_str(&line);
+        units += line_units;
+    }
+    pages.push(body);
+    let total_pages = pages.len();
+    let body = pages.get(page - 1).ok_or(INVALID_COMMAND_LIST_PAGE)?;
+    let mut reply = format!("{header}\n{body}\n\nPage {page} of {total_pages}");
+    if page < total_pages {
+        reply.push_str(&format!(
+            "\nNext: /command-list name-prefix:{prefix} page:{}",
+            page + 1
+        ));
     }
     Ok(reply)
 }
@@ -1823,6 +1964,89 @@ mod tests {
             format_command_list(&rows),
             "/faq — on\n/rules (or !rules) — off\n\nPage 1 of 1"
         );
+    }
+
+    #[test]
+    fn list_prefix_normalizes_case_and_rejects_outside_alphabet() {
+        assert_eq!(normalize_list_prefix("FAQ"), Some("faq".to_owned()));
+        assert_eq!(normalize_list_prefix("M"), Some("m".to_owned()));
+        assert_eq!(normalize_list_prefix(&"A".repeat(32)), Some("a".repeat(32)));
+        for valid in ["0", "-", "_", "a-b_c9"] {
+            assert_eq!(
+                normalize_list_prefix(valid),
+                Some(valid.to_owned()),
+                "{valid:?} accepted"
+            );
+        }
+        for invalid in [
+            "",
+            " ",
+            " alpha",
+            "alpha ",
+            "a b",
+            "/alpha",
+            "!alpha",
+            "alpha*",
+            "a.b",
+            "a\nb",
+            "😀",
+            "аlpha",
+            "@everyone",
+            "a".repeat(33).as_str(),
+        ] {
+            assert_eq!(normalize_list_prefix(invalid), None, "{invalid:?} refused");
+        }
+        assert!(INVALID_COMMAND_LIST_PREFIX.encode_utf16().count() <= 300);
+        assert!(INVALID_COMMAND_LIST_PREFIX
+            .to_ascii_lowercase()
+            .contains("prefix"));
+        assert!(INVALID_COMMAND_LIST_PREFIX.contains("/command-list"));
+    }
+
+    #[test]
+    fn filtered_list_distinguishes_empty_guild_no_match_and_page_miss() {
+        let empty = format_command_list_page_with_prefix(&[], "zzz", 1).expect("empty reply");
+        assert!(empty.to_ascii_lowercase().contains("no custom commands"));
+        assert_ne!(empty, "No custom commands defined.");
+        assert_eq!(
+            format_command_list_page_with_prefix(&[], "zzz", 2),
+            Err(INVALID_COMMAND_LIST_PAGE)
+        );
+        let rows = vec![stored("alpha")];
+        let none = format_command_list_page_with_prefix(&rows, "zzz", 1).expect("no-match");
+        let lower = none.to_ascii_lowercase();
+        assert!(lower.contains("no") && lower.contains("match"), "{none}");
+        assert!(none.contains("zzz") && none.contains("/command-list"));
+        assert_ne!(empty, none);
+        assert_eq!(
+            format_command_list_page_with_prefix(&rows, "zzz", 2),
+            Err(INVALID_COMMAND_LIST_PAGE)
+        );
+        assert_eq!(
+            format_command_list_page_with_prefix(&rows, "alpha", 2),
+            Err(INVALID_COMMAND_LIST_PAGE)
+        );
+        assert_eq!(
+            format_command_list_page_with_prefix(&rows, "alpha", 0),
+            Err(INVALID_COMMAND_LIST_PAGE)
+        );
+    }
+
+    #[test]
+    fn filtered_list_matches_name_start_only_and_pages_before_truncation() {
+        let mut help = stored("faq-help");
+        help.enabled = false;
+        help.text_trigger = Some("!answer".to_owned());
+        let mut other = stored("pre-faq");
+        other.template = "faq".to_owned();
+        let rows = vec![stored("faq"), help, other, stored("unrelated")];
+        let page = format_command_list_page_with_prefix(&rows, "faq", 1).expect("filtered");
+        let lines: Vec<_> = page.lines().filter(|line| line.starts_with('/')).collect();
+        assert_eq!(lines, ["/faq — on", "/faq-help (or !answer) — off"]);
+        assert!(page.contains("Matching \"faq\": 2 commands"));
+        assert!(page.contains("Page 1 of 1"));
+        assert!(!page.contains("/command-list name-prefix:"));
+        assert!(page.encode_utf16().count() <= MAX_RENDERED_CHARS);
     }
 
     #[test]

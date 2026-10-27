@@ -119,12 +119,21 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
         CommandDefinition::new("command-list", "List this server's custom commands")
             .permissions(PERM_MANAGE_GUILD)
-            .options(vec![CommandOption::new(
-                "page",
-                "Page of the custom-command list (1-based)",
-                CommandOptionType::Integer,
-            )
-            .min_value(1)]),
+            .options(vec![
+                CommandOption::new(
+                    "page",
+                    "Page of the custom-command list (1-based)",
+                    CommandOptionType::Integer,
+                )
+                .min_value(1),
+                CommandOption::new(
+                    "name-prefix",
+                    "Filter by command name prefix, a-z 0-9 _ -",
+                    CommandOptionType::String,
+                )
+                .min_length(1)
+                .max_length(MAX_COMMAND_NAME_CHARS as u32),
+            ]),
         // Private saved inspection or unsaved preview; runtime requires exactly
         // one name/draft. Automation- and ManageGuild-gated like other admin commands.
         CommandDefinition::new(

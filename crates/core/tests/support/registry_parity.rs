@@ -42,6 +42,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("command-list", "docs/parity.md §1 #16 prefix"),
     ("reopen", "docs/parity.md §1 reopen"),
     ("feed-inspect", "docs/parity.md §1 feed-inspect"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
@@ -929,13 +930,16 @@ pub fn expected_registry() -> Value {
         .expect("page option serializes");
         command["options"] = json!([page]);
     }
-    // Custom-command paging changes ONLY the formerly empty option list.
-    // Keep descriptions, permissions and every other legacy field pinned.
+    // Custom-command paging and prefix filtering change ONLY the formerly
+    // empty option list. Keep descriptions, permissions and every other legacy
+    // field pinned.
     {
         let _ = INTENTIONAL_DIFFERENCES
             .iter()
             .find(|(command, _)| *command == "command-list")
             .expect("page has a documented command exception");
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("command-list", "docs/parity.md §1 #16 page")));
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("command-list", "docs/parity.md §1 #16 prefix")));
         let command = commands
             .iter_mut()
             .find(|command| command["name"] == "command-list")
@@ -956,7 +960,17 @@ pub fn expected_registry() -> Value {
             .min_value(1),
         )
         .expect("page option serializes");
-        command["options"] = json!([page]);
+        let prefix = serde_json::to_value(
+            CommandOption::new(
+                "name-prefix",
+                "Filter by command name prefix, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .min_length(1)
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+        )
+        .expect("prefix option serializes");
+        command["options"] = json!([page, prefix]);
     }
     // Next-only saved-relay inspection has no frozen legacy counterpart.
     // Pin the documented shape independently: guild-only, Manage Server, and

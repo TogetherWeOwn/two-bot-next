@@ -100,17 +100,24 @@ remaining gateway/accepted-prefix work:
    marker described under [Pending registry resync](#pending-registry-resync).
 4. `/command-list` lists complete rows in name order, including disabled commands
    and optional text triggers. It defaults to page 1; `/command-list page:2`
-   retrieves page 2. Each nonempty ephemeral reply identifies `Page N of M` and,
-   when there is another page, gives the next invocation. Rows plus navigation
-   fit Discord's 2,000 UTF-16-unit limit without truncating names, triggers or
-   on/off state. Page selection uses the existing quota-bounded guild snapshot,
-   not a new database pagination query. Missing `page` equals `page:1`; invalid,
+   retrieves page 2. The optional `name-prefix` (1–32 `a-z0-9_-`, lowercased)
+   filters the existing bounded guild snapshot by name start before whole-row
+   paging; omission preserves unfiltered semantics. Each nonempty ephemeral
+   reply identifies `Page N of M` and, when there is another page, gives the
+   next invocation (filtered pages retain `name-prefix:<prefix>` and show the
+   active prefix plus the filtered total). Rows plus navigation fit Discord's
+   2,000 UTF-16-unit limit without truncating names, triggers or on/off state.
+   Page selection uses the existing quota-bounded guild snapshot, not a new
+   database pagination query. Missing `page` equals `page:1`; invalid,
    duplicate, nonpositive or unavailable pages receive a short refusal pointing
-   to `/command-list page:1`, without writes or audit changes. Empty page 1
-   remains `No custom commands defined.`; empty page 2 is out of range.
-   Manage Server and automation gates still apply before page validation/store
-   access; mentions stay suppressed. This does not change quotas, registration
-   or the compiled-only commands CLI.
+   to `/command-list page:1`, without writes or audit changes. Wrong-type or
+   duplicate filters and prefixes outside the name alphabet refuse before any
+   store read. Empty page 1 remains `No custom commands defined.`; empty page 2
+   is out of range. With a filter, an empty guild, zero matching names and an
+   out-of-range filtered page stay distinguishable. Manage Server and automation
+   gates still apply before page/filter validation/store access; mentions stay
+   suppressed. This does not change quotas, registration or the compiled-only
+   commands CLI.
 5. Dynamic slash dispatch uses `adjudicate_run`; a known row while automations
    are off gets `AUTOMATIONS_DISABLED_REPLY`. Render inside the delivery/audit
    outcome path so both oversize output and REST failure leave a failed

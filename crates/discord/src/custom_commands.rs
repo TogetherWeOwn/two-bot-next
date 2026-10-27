@@ -24,12 +24,13 @@ use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
         accepted_text_trigger, builtin_command_names, escape_inspect_text,
-        format_command_list_page, format_draft_preview, format_inspect_miss,
-        format_inspect_preview, format_inspect_summary, format_inspect_template,
-        inspect_preview_context_unavailable, invalid_inspect_option_reply,
-        invalid_inspect_view_reply, render_template, validate_inspect_name, validate_template,
-        AuditRecord, AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand,
-        TemplateContext, ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        format_command_list_page, format_command_list_page_with_prefix, format_draft_preview,
+        format_inspect_miss, format_inspect_preview, format_inspect_summary,
+        format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
+        invalid_inspect_view_reply, normalize_list_prefix, render_template, validate_inspect_name,
+        validate_template, AuditRecord, AutomationMessageAcceptance, InspectView, PutCommandInput,
+        StoredCommand, TemplateContext, ToggleOutcome, INVALID_COMMAND_LIST_PAGE,
+        INVALID_COMMAND_LIST_PREFIX, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -831,6 +832,8 @@ impl CustomCommandRuntime {
         if data.name == "command-list" {
             // Routing already enforced guild/application, ManageGuild and the
             // feature gate. Reject forged types/duplicates before a store read.
+            // Both the page and the optional name-prefix filter validate before
+            // any store access; omission preserves unfiltered list semantics.
             let mut options = data.options.iter().filter(|option| option.name == "page");
             let page = match options.next().map(|option| &option.value) {
                 None => 1,
@@ -845,9 +848,21 @@ impl CustomCommandRuntime {
             if options.next().is_some() {
                 return Ok(INVALID_COMMAND_LIST_PAGE.to_owned());
             }
+            let prefix = match single_string_option(data, "name-prefix") {
+                SingleOption::Missing => None,
+                SingleOption::Malformed => return Ok(INVALID_COMMAND_LIST_PREFIX.to_owned()),
+                SingleOption::Value(raw) => match normalize_list_prefix(raw) {
+                    Some(prefix) => Some(prefix),
+                    None => return Ok(INVALID_COMMAND_LIST_PREFIX.to_owned()),
+                },
+            };
             let rows = store::list_commands(&self.pool, guild)
                 .await
                 .map_err(|_| CustomCommandError::Storage)?;
+            if let Some(prefix) = prefix {
+                return Ok(format_command_list_page_with_prefix(&rows, &prefix, page)
+                    .unwrap_or_else(str::to_owned));
+            }
             return Ok(format_command_list_page(&rows, page).unwrap_or_else(str::to_owned));
         }
         if data.name == "command-disable" || data.name == "command-enable" {
