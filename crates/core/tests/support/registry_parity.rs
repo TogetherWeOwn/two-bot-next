@@ -58,6 +58,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
+    ("rank", "docs/parity.md §1 rank details"),
+    ("leaderboard", "docs/parity.md §1 leaderboard scope"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -957,6 +959,51 @@ pub fn expected_registry() -> Value {
         )
         .expect("page option serializes");
         command["options"] = json!([page]);
+    }
+    // Leveling visibility adds ONLY an optional Boolean `details` after the
+    // legacy `member` on `/rank` and an optional string `scope` choice on the
+    // formerly option-less `/leaderboard`. Names, descriptions, permissions and
+    // every legacy option stay byte-identical.
+    {
+        let reference = "docs/parity.md §1 rank details";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("rank", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "rank")
+            .expect(reference);
+        let options = command["options"].as_array_mut().expect("rank options");
+        assert_eq!(options.len(), 1, "legacy rank keeps only member");
+        options.push(json!({
+            "name": "details",
+            "description": "Show message, voice and imported XP next to the stored total.",
+            "type": 5,
+            "required": false
+        }));
+    }
+    {
+        let reference = "docs/parity.md §1 leaderboard scope";
+        assert!(INTENTIONAL_DIFFERENCES.contains(&("leaderboard", reference)));
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "leaderboard")
+            .expect(reference);
+        assert!(
+            command["options"]
+                .as_array()
+                .expect("command options array")
+                .is_empty(),
+            "legacy leaderboard has no options"
+        );
+        command["options"] = json!([{
+            "name": "scope",
+            "description": "Which standings to show. Default: seasonal.",
+            "type": 3,
+            "choices": [
+                {"name": "Seasonal", "value": "seasonal"},
+                {"name": "Lifetime", "value": "lifetime"}
+            ],
+            "required": false
+        }]);
     }
     // Next-only saved-relay inspection has no frozen legacy counterpart.
     // Pin the documented shape independently: guild-only, Manage Server, and
