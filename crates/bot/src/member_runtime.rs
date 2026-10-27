@@ -257,6 +257,52 @@ impl MemberRuntime {
         self.store.clone()
     }
 
+    /// Private saved-state read. Unlike an effect it needs no target hierarchy,
+    /// bot identity, member lane, cooldown claim or applied-mutation audit.
+    /// Reuse the same strict current guild/member authority resolver first.
+    pub(crate) async fn inventory_reply(
+        &self,
+        executor: &ActionExecutor,
+        interaction: &Interaction,
+    ) -> String {
+        use two_bot_core::tempban_inventory;
+
+        let page = match inventory_page(interaction) {
+            Some(page) => page,
+            None => return tempban_inventory::SELECTOR_CORRECTION.to_owned(),
+        };
+        let actor_id = actor_id(interaction);
+        if actor_id.is_empty()
+            || interaction.guild_id.map(|id| id.to_string()).as_deref() != Some(&self.guild_id)
+        {
+            return tempban_inventory::UNAVAILABLE.to_owned();
+        }
+        let authority = async {
+            let facts = guild_facts(executor, &self.guild_id).await?;
+            let (roles, _) = fetched_member(executor, &self.guild_id, &actor_id)
+                .await?
+                .ok_or(AuthorityCause::MalformedRoles)?;
+            actor_authority(&actor_id, roles, &facts).ok_or(AuthorityCause::MalformedRoles)
+        }
+        .await;
+        match authority {
+            Ok(actor) if actor.permissions & two_bot_core::commands::PERM_BAN_MEMBERS != 0 => {}
+            Ok(_) => return "You need the current Ban Members permission to inspect saved expiries. Ask a server moderator or admin.".to_owned(),
+            Err(cause) => {
+                tracing::warn!(cause = cause.token(), "tempban inventory authority unavailable");
+                return tempban_inventory::UNAVAILABLE.to_owned();
+            }
+        }
+        match self.store.saved_expiries(&self.guild_id, page).await {
+            Ok(rows) => tempban_inventory::render(page, &rows),
+            Err(_) => {
+                // Fixed vocabulary only: store errors can carry database detail.
+                tracing::warn!("tempban inventory read unavailable");
+                tempban_inventory::UNAVAILABLE.to_owned()
+            }
+        }
+    }
+
     /// Policy stamped with the resolved bot identity; callers resolve it first.
     fn policy(&self, bot_id: &str) -> ModerationPolicy {
         ModerationPolicy {
@@ -337,6 +383,31 @@ impl MemberRuntime {
         } else {
             format!("{base} {target}.")
         }
+    }
+}
+
+/// Decode the complete inventory shape before authority or storage reads. No
+/// permissive lookup that could ignore a duplicate, nested or unknown selector.
+fn inventory_page(
+    interaction: &Interaction,
+) -> Option<two_bot_core::tempban_inventory::ExpiryPage> {
+    use two_bot_core::tempban_inventory::ExpiryPage;
+
+    let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
+        return None;
+    };
+    if data.name != "tempban-list"
+        || data.kind != twilight_model::application::command::CommandType::ChatInput
+    {
+        return None;
+    }
+    match data.options.as_slice() {
+        [] => ExpiryPage::new(1),
+        [option] if option.name == "page" => match option.value {
+            CommandOptionValue::Integer(number) => ExpiryPage::new(number),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

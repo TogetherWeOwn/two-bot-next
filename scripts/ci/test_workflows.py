@@ -3987,13 +3987,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("Patch coverage (HARD, 80% of added lines)", names)
 
     def test_patch_coverage_timeout_covers_the_measurement(self):
-        # The HARD patch-coverage measurement keeps the 60-minute ceiling the
-        # combined job needed: the llvm-cov replay alone measured ~30 min of
-        # a 42m16s job, and main heads have since reached 59m54s combined.
-        # A slow runner reports a coverage verdict, not a job timeout.
+        # The HARD patch-coverage measurement needs a 90-minute ceiling: runs
+        # were cancelled at the old 60-minute limit while still measuring
+        # (interim until the measurement is sharded). A slow runner reports a
+        # coverage verdict, not a job timeout.
         job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
-        # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
-        self.assertEqual(job["timeout-minutes"], "60")
+        # BaseLoader keeps scalars as strings; "90" is the 90-minute limit.
+        self.assertEqual(job["timeout-minutes"], "90")
 
     def test_rust_lane_cargo_cache_entries_are_pinned(self):
         # The `check` entry is written by `rust-tests` and restored by the two
