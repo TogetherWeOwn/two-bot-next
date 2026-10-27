@@ -987,11 +987,9 @@ pub fn expected_registry() -> Value {
             .iter_mut()
             .find(|command| command["name"] == "leaderboard")
             .expect(reference);
+        // The frozen legacy snapshot publishes no `options` key at all here.
         assert!(
-            command["options"]
-                .as_array()
-                .expect("command options array")
-                .is_empty(),
+            command["options"].is_null(),
             "legacy leaderboard has no options"
         );
         command["options"] = json!([{
