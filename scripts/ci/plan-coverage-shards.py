@@ -2,7 +2,7 @@
 """Plan coverage shards from changed files (two-bot-next CI sharding).
 
 Emits the coverage leg matrix: which of the 16 patch-coverage legs to run
-(2 workspace sweeps + 14 dedicated ignored/DB legs, matching the
+(2 workspace sweeps + 15 dedicated ignored/DB legs, matching the
 coverage-shard job in check.yml) and how to partition them into N shards.
 
 Fail-closed: any planning error (unreadable diff, malformed metadata,
@@ -29,7 +29,7 @@ ALL_CRATES = [
 ]
 
 # Match .github/workflows/check.yml's coverage-shard commands, including
-# sweep skip lists: 2 workspace sweeps + 14 dedicated cov legs.
+# sweep skip lists: 2 workspace sweeps + 15 dedicated cov legs.
 FULL_LEGS = [
     {
         "id": "sweep-nonignored",
@@ -38,6 +38,11 @@ FULL_LEGS = [
             "--features two-bot-core/db --locked --ignore-run-fail --no-report -- "
             "--skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump "
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only "
+            "--skip uses_one_above_i32_max_saturates_and_write_proceeds "
+            "--skip uses_u64_max_saturates_at_i32_max "
+            "--skip saturated_write_warns_with_identifiers_and_no_raw_counter "
+            "--skip normal_uses_round_trip_byte_identical "
+            "--skip exact_i32_max_writes_without_saturation_warn "
             "--skip settings_jobs::tests::ops_overrides_acceptance_tests::"
         ),
         "supplemental_commands": [
@@ -227,6 +232,16 @@ FULL_LEGS = [
             "--test-threads=1 --skip regenerate_reference_docs"
         ),
         "crates": ["two-bot-core"],
+    },
+    {
+        "id": "store-invite_uses_saturation_acceptance",
+        "command": (
+            "cargo llvm-cov --no-report -p two-bot-store "
+            "--features two-bot-core/db --locked "
+            "--test invite_uses_saturation_acceptance -- --test-threads=1 "
+            "--skip regenerate_reference_docs"
+        ),
+        "crates": ["two-bot-store"],
     },
 ]
 

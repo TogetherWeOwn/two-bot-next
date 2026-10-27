@@ -397,6 +397,22 @@ class SelectionTests(unittest.TestCase):
                     inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
 
 
+class DocsIndexWiringTests(unittest.TestCase):
+    def test_docs_index_inputs_and_ungated_execution(self):
+        for path in ("docs/README.md", "docs/nested/new-guide.md"):
+            with self.subTest(path=path):
+                selected = jobs([path])
+                self.assertTrue(selected[DOCS])
+                self.assertTrue(selected[WORKER])
+        for path in ("scripts/check_docs_index.py", "scripts/test_docs_index.py"):
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), {RUST, WORKER})
+        body = CHECK_YML.read_text()
+        step = body.split("- name: Docs index, orphan and byte-budget conformance (offline)\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("python3 -m unittest discover -s scripts -p 'test_docs_index.py' -v", step)
+        self.assertNotIn("if:", step, "docs-only selection must never skip the guard")
+
+
 class ReaderCoverageTests(unittest.TestCase):
     """Every repo-owned literal content reader must agree with the classifier.
 

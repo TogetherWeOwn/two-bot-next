@@ -104,6 +104,54 @@ lint-only `check` lane.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
+## Scanner dependency triage (review by 2026-10-29)
+
+The hash-pinned `scripts/ci/semgrep-requirements.txt` targets CI's CPython 3.11
+on Linux x86_64 in the Bookworm job container, not the bot or Worker runtime.
+Certifi 2026.10.19 fixes [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2).
+After the hash-checked install, the HARD Semgrep step runs
+`python3 scripts/ci/check-semgrep-trust-store.py` against that installed
+`certifi.where()` bundle before scanning. It rejects the compromised emSign ECC
+Root CA - G3 by its DER SHA-256, not its name, version or PEM formatting. Missing,
+invalid or empty bundles fail closed. The command is offline/read-only and emits
+JSON (`semgrep-trust-store.v1`): exit 0 is clean, 1 is a compromised anchor, and 2
+is an unavailable bundle, with `code`, `retryable` and `next_action` fields.
+
+Rerun the offline negative-case and CI-wiring regressions with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_semgrep_trust_store.py' -v
+```
+
+The public-certificate fixtures `scripts/ci/fixtures/emsign-g3.pem` and
+`isrg-x1.pem` are copied verbatim from the certifi 2026.7.22 wheel (SHA-256
+`62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775`).
+They contain no private keys. The old G3 anchor is the negative case; ISRG Root X1
+is the unaffected positive control. Tests pin both certificate identities and
+run the actual checker against both, separately and as a mixed bundle. Use
+`python3 scripts/ci/check-semgrep-trust-store.py --bundle PATH` to replay a bundle;
+CI always uses the default installed bundle so reverting the dependency pin
+restores G3 and fails the required lane. This is a targeted trust-anchor regression,
+not a general Python dependency advisory audit.
+
+As of 2026-10-23, Semgrep 1.180.0 and the latest release, 1.182.1, both require
+`mcp==1.29.0` and `opentelemetry-api~=1.37.0`. Those constraints exclude the
+fixes for the two medium advisories:
+[MCP GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv)
+(fixed in 1.30.0) and
+[OpenTelemetry GHSA-xcq7-p3pf-p88h](https://github.com/advisories/GHSA-xcq7-p3pf-p88h)
+(fixed in 1.45.1). Keep both alerts visible; do not override dependency
+constraints or remove hashes to force an incompatible graph.
+
+Bounded mitigation: use this environment only for the existing one-shot
+`semgrep scan` with vendored rules. Do not start an MCP/Streamable HTTP server
+or an inbound instrumented HTTP service with it. Those are the inbound paths
+these advisories require; this is a reachability assessment, not a claim that
+the packages are patched. CI maintainers must re-check upstream constraints by
+**2026-10-29** and upgrade the compatible graph when available. Reassess sooner
+if scanner invocation or advisory scope changes. No scan gate or permission
+is relaxed by this mitigation.
+
 ## Semgrep backlog (30 `panic!` hits, grandfathered until 2027-01-15)
 
 Grandfathered on the HARD promotion: these pre-existing hits stay silent

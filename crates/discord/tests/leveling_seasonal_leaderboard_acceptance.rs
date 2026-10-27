@@ -211,7 +211,14 @@ async fn routed_leaderboard_ranks_current_season_not_lifetime_or_prior_season() 
     let prior = previous_season(&current);
     assert_ne!(current, prior);
     db.seed_divergent(&current, &prior).await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, r#"{"id":"99"}"#),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock);
 
     assert!(runtime
@@ -219,7 +226,12 @@ async fn routed_leaderboard_ranks_current_season_not_lifetime_or_prior_season() 
         .await
         .unwrap());
     let bodies = reply_bodies(&mock);
-    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies.len(), 2, "one defer plus one completion edit");
+    assert_eq!(bodies[0]["type"], 5, "leveling acknowledges with a defer");
+    assert_ne!(
+        bodies[0]["data"]["flags"], 64,
+        "leaderboard defers publicly"
+    );
     let expected = vec![
         entry(SEASON_LEADER, 500, 1),
         entry(TIE_LOW_ID, 300, 2),
@@ -227,7 +239,7 @@ async fn routed_leaderboard_ranks_current_season_not_lifetime_or_prior_season() 
         entry(MID_PACK, 200, 4),
         entry(MEMBER, 10, 5),
     ];
-    let content = bodies[0]["data"]["content"].as_str().unwrap();
+    let content = bodies[1]["content"].as_str().unwrap();
     assert_eq!(
         content,
         leaderboard_reply_for_season(&expected, &current).content,
@@ -237,9 +249,8 @@ async fn routed_leaderboard_ranks_current_season_not_lifetime_or_prior_season() 
         !content.contains(&PRIOR_ONLY.to_string()),
         "prior-season-only member must not appear on the current-season board"
     );
-    // Public, mention-safe rendering is preserved.
-    assert_eq!(bodies[0]["data"]["allowed_mentions"]["parse"], json!([]));
-    assert!(bodies[0]["data"]["flags"].is_null());
+    // Public, mention-safe rendering is preserved on the completion edit.
+    assert_eq!(bodies[1]["allowed_mentions"]["parse"], json!([]));
     mock.shutdown().await;
     db.close().await;
 }
@@ -254,7 +265,14 @@ async fn routed_leaderboard_empty_current_season_never_falls_back_to_lifetime() 
     db.seed_lifetime(MEMBER, 9_000).await;
     db.seed_lifetime(PRIOR_ONLY, 9_500).await;
     db.seed_season(PRIOR_ONLY, &prior, 9_000).await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, r#"{"id":"99"}"#),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock);
 
     assert!(runtime
@@ -262,9 +280,10 @@ async fn routed_leaderboard_empty_current_season_never_falls_back_to_lifetime() 
         .await
         .unwrap());
     let bodies = reply_bodies(&mock);
-    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies.len(), 2, "one defer plus one completion edit");
+    assert_eq!(bodies[0]["type"], 5, "leveling acknowledges with a defer");
     assert_eq!(
-        bodies[0]["data"]["content"],
+        bodies[1]["content"],
         leaderboard_reply_for_season(&[], &current).content,
         "an empty current season must answer honestly empty, never lifetime totals"
     );
@@ -287,7 +306,14 @@ async fn routed_leaderboard_display_size_is_top_ten_of_current_season() {
         db.seed_lifetime(member_id, 100 + 100 * (offset as i64))
             .await;
     }
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, r#"{"id":"99"}"#),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock);
 
     assert!(runtime
@@ -295,7 +321,9 @@ async fn routed_leaderboard_display_size_is_top_ten_of_current_season() {
         .await
         .unwrap());
     let bodies = reply_bodies(&mock);
-    let content = bodies[0]["data"]["content"].as_str().unwrap();
+    assert_eq!(bodies.len(), 2, "one defer plus one completion edit");
+    assert_eq!(bodies[0]["type"], 5, "leveling acknowledges with a defer");
+    let content = bodies[1]["content"].as_str().unwrap();
     let expected: Vec<LeaderboardEntry> = (0..10_u64)
         .map(|offset| entry(first + offset, 1_200 - 100 * offset, offset + 1))
         .collect();
@@ -323,7 +351,14 @@ async fn routed_rank_stays_lifetime_and_foreign_guild_stays_fenced() {
     let current = current_season();
     let prior = previous_season(&current);
     db.seed_divergent(&current, &prior).await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, r#"{"id":"99"}"#),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock);
 
     for name in ["rank", "leaderboard"] {
@@ -346,15 +381,16 @@ async fn routed_rank_stays_lifetime_and_foreign_guild_stays_fenced() {
         .await
         .unwrap());
     let bodies = reply_bodies(&mock);
-    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies.len(), 2, "one defer plus one completion edit");
+    assert_eq!(bodies[0]["type"], 5, "leveling acknowledges with a defer");
+    assert_eq!(bodies[0]["data"]["flags"], 64, "/rank defers ephemerally");
     // MEMBER holds 9,000 lifetime XP: rank 2 of 6 behind PRIOR_ONLY (9,500),
     // whatever the seasonal board shows.
     assert_eq!(
-        bodies[0]["data"]["content"],
+        bodies[1]["content"],
         rank_text("Global name", level_for_xp(9_000), Some(2), 6, 9_000),
         "/rank must keep reading lifetime totals"
     );
-    assert_eq!(bodies[0]["data"]["flags"], 64, "/rank stays ephemeral");
     mock.shutdown().await;
     db.close().await;
 }

@@ -206,6 +206,23 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("unlock", "Allow @everyone to send messages")
             .permissions(PERM_MANAGE_CHANNELS)
             .options(vec![CommandOption::reason()]),
+        CommandDefinition::new(
+            "purge-preview",
+            "Privately preview a purge without deleting messages",
+        )
+        .permissions(PERM_MANAGE_MESSAGES)
+        .options(vec![CommandOption::new(
+            "count",
+            "Newest messages to sample (1-100)",
+            CommandOptionType::Integer,
+        )
+        .required()
+        .int_range(1, 100)]),
+        CommandDefinition::new(
+            "channel-inspect",
+            "Privately inspect saved lockdown and live slowmode",
+        )
+        .permissions(PERM_MANAGE_CHANNELS),
     ]
 }
 
@@ -597,10 +614,20 @@ mod tests {
         assert_eq!(
             names,
             [
-                "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
+                "ban",
+                "tempban",
+                "kick",
+                "timeout",
+                "warn",
+                "purge",
+                "slowmode",
+                "lockdown",
                 "unlock",
+                "purge-preview",
+                "channel-inspect",
             ]
         );
+        assert_eq!(ModerationAction::ALL.len(), 9, "reads are not mutations");
         for (action, name) in ModerationAction::ALL.iter().zip(names.iter()) {
             assert_eq!(action.command_name(), *name);
         }
@@ -610,18 +637,54 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 4 core + 16 slice-2 + 9 moderation.
-        assert_eq!(merged.len(), 29);
+        // 7 core + 25 slice-2 + 9 moderation mutations + 2 private reads.
+        assert_eq!(merged.len(), 43);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
-            &names[..5],
-            ["rank", "leaderboard", "help", "privacy", "attendance"]
+            &names[..8],
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview",
+                "game-mix",
+                "attendance"
+            ]
         );
+        for name in [
+            "command-inspect",
+            "command-disable",
+            "command-enable",
+            "reopen",
+            "giveaway",
+            "game-mix",
+            "lfg-edit",
+            "lfg-list",
+            "feed-inspect",
+        ] {
+            assert_eq!(
+                names.iter().filter(|n| **n == name).count(),
+                1,
+                "{name} must remain unique in the combined registry"
+            );
+        }
         assert_eq!(
-            &names[20..25],
+            &names[32..37],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
-        assert_eq!(&names[25..], ["purge", "slowmode", "lockdown", "unlock"]);
+        assert_eq!(
+            &names[37..],
+            [
+                "purge",
+                "slowmode",
+                "lockdown",
+                "unlock",
+                "purge-preview",
+                "channel-inspect"
+            ]
+        );
         assert!(merged.iter().all(|d| !d.dm_permission));
     }
 
@@ -718,6 +781,39 @@ mod tests {
         assert_eq!(json[5]["options"][0]["max_value"], 100);
         assert_eq!(json[7]["name"], "lockdown");
         assert_eq!(json[7]["options"].as_array().expect("array").len(), 1);
+    }
+
+    #[test]
+    fn private_reads_publish_exact_non_mutating_shapes() {
+        let json = serde_json::to_value(moderation_commands()).expect("serializes");
+        assert_eq!(
+            json[9],
+            serde_json::json!({
+                "name": "purge-preview",
+                "description": "Privately preview a purge without deleting messages",
+                "dm_permission": false,
+                "default_member_permissions": "8192",
+                "options": [{
+                    "name": "count",
+                    "description": "Newest messages to sample (1-100)",
+                    "type": 4,
+                    "required": true,
+                    "min_value": 1,
+                    "max_value": 100
+                }]
+            })
+        );
+        assert_eq!(
+            json[10],
+            serde_json::json!({
+                "name": "channel-inspect",
+                "description": "Privately inspect saved lockdown and live slowmode",
+                "options": [],
+                "dm_permission": false,
+                "default_member_permissions": "16"
+            })
+        );
+        assert_eq!(json.as_array().expect("array").len(), 11);
     }
 
     #[test]

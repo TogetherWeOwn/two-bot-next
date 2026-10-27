@@ -289,6 +289,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
+  "TWO_ASSISTANT_API_KEY": SECRET,
+  TWO_ASSISTANT_TOKEN: "unapproved credential-name decoy used only by the acceptance battery; never a binding",
+  TWO_ASSISTANT_SECRET: "unapproved credential-name decoy used only by the acceptance battery; never a binding",
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
@@ -345,6 +348,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_STAGING_RESTART_CONTAINMENT: LEGACY,
   TWO_STAGING_RESTART_SYNTHETIC_ACTORS: LEGACY,
   TWO_TEST_DATABASE_URL: TEST,
+  TWO_TEST_LIVE_EXCLUSIONS_CHILD: TEST,
   TWO_BOT_TEST_DATABASE_URL: TEST,
   TWO_GATEWAY_TEST_DATABASE_URL: TEST,
   TWO_ROLES_TEST_DATABASE_URL: TEST,
@@ -374,6 +378,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_TYPO_KEYS: TEST,
   TWO_UNKNOWN: TEST,
   TWO_TUNING_LOG_TEST_CHILD: TEST,
+  TWO_TEST_VOICE_OVERFLOW_METRICS_CHILD: TEST,
+  TWO_QUERY_OBSERVER_CALLSITE_CHILD: TEST,
   // Store-only guild setting: the invite responder resolves it from the live
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.

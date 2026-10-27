@@ -1,7 +1,7 @@
 # Channel moderation runtime integration
 
-TOG-10174 wires `/purge`, `/slowmode`, `/lockdown` and `/unlock` into the shared
-bot runtime. `TWO_MODERATION` remains default-off. This change does not activate
+`/purge`, `/slowmode`, `/lockdown` and `/unlock` share the channel moderation
+runtime with the private `/purge-preview` and `/channel-inspect` reads. `TWO_MODERATION` remains default-off. This change does not activate
 a live guild; verification uses synthetic interactions, loopback REST/gateway
 doubles, and isolated test-service schemas, never production/staging credentials.
 
@@ -54,6 +54,41 @@ lane; if that lane is full too the event is dropped with a log line only.
 Overlapping READY/RESUMED syncs coalesce while publication is in progress. A scope guard aborts admitted work
 when the shard exits or its supervisor cancels it. Interrupted channel work
 retains durable uncertainty; cancellation never releases an ambiguous effect.
+
+## Private inspection before acting
+
+`/purge-preview count:1..100` uses the same Manage Messages gate, history page,
+canonical message IDs and pin/own-bot filtering as `/purge`. It lists up to
+`count` newest messages once; it does not refill past exclusions. The private
+reply reports listed/targetable counts, first/last candidate IDs and localized
+creation times, pinned and own-bot exclusion counts (which can overlap), and
+system-message count. System messages are not excluded by the existing purge
+planner; Discord can still refuse their deletion. Age is a bulk exclusion, not
+a complete deletion exclusion: the shared planner sends older messages singly,
+uses a one-hour margin below 14 days, and never bulk-deletes a lone candidate.
+The preview says **not a guarantee**: history, pins, permissions and age can
+change between sampling and execution. It never echoes message content.
+
+`/channel-inspect` takes no options and requires Manage Channels. It reports
+saved lockdown presence via `get_lockdown`, not proof of the live overwrite.
+A missing recovery record is `none`, not a store error. A saved reason is capped
+at 512 characters and shown verbatim only in the staff-private response, with
+all mentions disabled. The stored RFC3339 timestamp supplies its calendar date;
+only a successful lockdown audit matching guild, channel, reason and saved time
+supplies the setter. Unknown or mismatched metadata is explicitly `unknown`.
+Live slowmode comes from a validated same-guild text/announcement channel GET;
+missing/zero delay is `off`. A failed live read preserves the saved half and
+shows `unknown` with retry guidance. Slowmode setter/time are unknown because
+those facts are not durably stored. Store failures and channel-identity
+mismatches refuse privately without exposing stored facts.
+
+Both reads use the shared ephemeral defer/original-response edit lifecycle.
+They take no audit reason and branch **before** audit, idempotency, claim or
+channel-lane admission, including refusals. They perform only SELECT/Discord
+GET operations apart from the private response itself. No channel/message,
+configuration, audit, claim or lease write occurs. Read requests do not increment
+moderation-enforcement metrics. They leave the mutating commands unchanged and
+authorize no registry publication or production activation on their own.
 
 ## Interaction lifecycle and durable exclusion
 

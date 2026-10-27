@@ -28,6 +28,7 @@ use tokio::sync::futures::Notified;
 use tokio::sync::{mpsc, Notify, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+use two_bot_core::metrics::{self, JoinQueueDropReason};
 use two_bot_core::onboarding::MentionPolicy;
 use two_bot_core::settings::SettingsCache;
 use two_bot_core::{
@@ -199,11 +200,11 @@ impl StoreSettings {
         let store = SettingsStore::new(&self.pool);
         let stale = self.cache.as_ref();
         let loaded = tokio::time::timeout(SETTINGS_READ_MAX, async {
-            let (revision, rows) = store.poll_marks().await?;
+            let (revision, rows) = store.poll_guild_marks(&self.guild_id).await?;
             if stale.is_some_and(|cache| !cache.needs_refresh(revision, rows)) {
                 return Ok::<_, sqlx::Error>(None);
             }
-            let snapshot = store.load_snapshot().await?;
+            let snapshot = store.load_guild_snapshot(&self.guild_id).await?;
             Ok(Some(SettingsCache::load(&snapshot)))
         })
         .await;
@@ -242,6 +243,7 @@ impl StoreSettings {
             Err(refusal) => {
                 if !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key()) {
                     error!(
+                        error_class = "raid_tuning_refused",
                         key = refusal.key(),
                         "raid_tuning_refused: observations disabled"
                     );
@@ -314,6 +316,7 @@ impl RaidDelivery {
     async fn announce(&self, alert: &RaidAlert, channel: Option<&str>) {
         // Always log first. If the post fails the evidence still exists.
         error!(
+            error_class = "raid_alert",
             guild_id = %alert.guild_id,
             count = alert.count,
             span_seconds = alert.span_seconds,
@@ -332,16 +335,23 @@ impl RaidDelivery {
         // The shared executor always sends empty allowed mentions; refuse a
         // proposal that asks for anything else rather than widen that boundary.
         if message.mentions != MentionPolicy::None {
-            error!(channel, "raid_alert_refused: mention policy is not empty");
+            error!(
+                error_class = "raid_alert_refused",
+                channel, "raid_alert_refused: mention policy is not empty"
+            );
             return;
         }
         match self.post_staff_message(channel, &message.content).await {
             Delivery::Posted => info!(channel, count = alert.count, "raid_alert_posted"),
             Delivery::Undeliverable => error!(
+                error_class = "raid_alert_undeliverable",
                 channel,
                 "raid_alert_undeliverable: channel missing, not text, or bot lacks View/Send"
             ),
-            Delivery::Failed => error!(channel, "raid_alert_post_failed"),
+            Delivery::Failed => error!(
+                error_class = "raid_alert_post_failed",
+                channel, "raid_alert_post_failed"
+            ),
         }
     }
 
@@ -563,7 +573,10 @@ impl<S: CheckedSettingsSource> RaidWorker<S> {
                         .await
                         .is_err()
                     {
-                        error!("raid_watch_failed: observation panicked");
+                        error!(
+                            error_class = "raid_watch_failed",
+                            "raid_watch_failed: observation panicked"
+                        );
                     }
                     self.shutdown.note_finished();
                 }
@@ -626,11 +639,20 @@ impl JoinObserver for RaidRuntime {
     fn observe_join(&self, join: JoinObservation) {
         match self.joins.try_send(join) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(join)) => warn!(
-                member_id = join.member_id,
-                "raid watch queue full; join not observed"
-            ),
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(join)) => {
+                metrics::global().raid_dropped_join(JoinQueueDropReason::QueueFull);
+                warn!(
+                    member_id = join.member_id,
+                    "raid watch queue full; join not observed"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::global().raid_dropped_join(JoinQueueDropReason::QueueClosed);
+                error!(
+                    error_class = "raid_queue_closed",
+                    "raid watch queue closed; join not observed"
+                );
+            }
         }
     }
 }

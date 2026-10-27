@@ -100,6 +100,17 @@ BEGIN
         VALUES (k, 'tank', 'Tank', 2, 1);
       INSERT INTO lfg_signups (lfg_id, user_id, role_key, joined_at)
         VALUES (k, u, 'tank', now());
+      INSERT INTO giveaways
+        (guild_id, id, prize, channel_id, message_id, created_by, winners_count, ends_at,
+         status, requirements_json, max_entries, draw_nonce, created_at, updated_at)
+        VALUES (g, k, 'fixture', '999999999999999999', 'm-' || k, u, 1, now(),
+         'open', '{}'::jsonb, 1, 'nonce-' || k, now(), now());
+      INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at)
+        VALUES (g, k, u, 1, now());
+      INSERT INTO giveaway_draws
+        (guild_id, giveaway_id, draw_no, drawn_at, eligible_count, eligible_hash, seed,
+         winner_ids, reroll_kind)
+        VALUES (g, k, 0, now(), 1, 'fixture', 'fixture', ('["' || u || '"]')::jsonb, NULL);
       INSERT INTO feed_relays (id, guild_id, channel_id, kind, source, created_by, created_at, updated_at)
         VALUES (k, g, u, 'rss', 'https://example.invalid/feed', u, now(), now());
       INSERT INTO feed_deliveries (feed_id, item_key, nonce, state, first_seen_at)

@@ -1,0 +1,113 @@
+name: dora-metrics
+
+# Weekly DORA delivery metrics (docs/dora-metrics.md). Every Monday the
+# `metrics` job reads 30 days of production Deployments (commit, compare and
+# Actions-run enrichment included) and commits one JSON file plus a short
+# markdown summary to ops/metrics/ as `dora-YYYY-Www.*`. Only Deployment rows
+# carrying a canonical deploy ID count; the Actions automatic `environment:`
+# rows carry none and are tallied as excluded, never scored.
+#
+# The commit goes to the `automation/dora-metrics` branch with the job
+# GITHUB_TOKEN (contents:write scoped to this job): the branch rulesets
+# require every main commit to arrive through a pull request with checks and
+# merge-queue processing, so a direct push to main would be refused, and a
+# weekly metrics PR would need a human merge every week to say nothing new.
+# The automation branch carries no rulesets; its history is the audit trail.
+# The checkout keeps persist-credentials false; the push authenticates per
+# command through a masked Basic extraheader, so the token never lands in
+# git config. A refused or conflicting push fails the run closed; the artifact
+# below still preserves the numbers for that week.
+#
+# `ops/**` sits in deploy-staging's push ignore list, so any future main-side
+# delivery evidence restarts nothing: without that entry a metrics merge
+# would bounce the staging gateway and feed the production promotion queue a
+# no-op SHA. The weekly side-branch push itself triggers no deploys.
+#
+# Proof: dispatch with dry_run from any branch to run the real computation
+# against the live API and upload the files as an artifact without committing.
+
+on:
+  schedule:
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Compute and upload without committing
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: dora-metrics
+  cancel-in-progress: false
+
+jobs:
+  metrics:
+    name: weekly DORA metrics
+    permissions:
+      contents: write # Commit the weekly JSON and summary to the automation branch.
+      deployments: read # Read 30 days of production Deployments.
+      actions: read # Verify the Actions run behind each recorded deploy.
+    if: github.ref == 'refs/heads/main' || inputs.dry_run == true
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'metrics') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compute the weekly DORA metrics
+        id: metrics
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/dora_metrics.py --out-dir ops/metrics
+      - name: Commit the weekly DORA file
+        if: inputs.dry_run != true && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEEK: ${{ steps.metrics.outputs.week }}
+        run: |
+          set -euo pipefail
+          branch=automation/dora-metrics
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Git HTTPS uses Basic auth, not the API bearer scheme. Mask the
+          # derived credential before use; keep it out of persistent config.
+          basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          printf '::add-mask::%s\n' "$basic_auth"
+          auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: Basic ${basic_auth}")
+          git "${auth[@]}" fetch origin
+          base=HEAD
+          if git rev-parse --verify -q "origin/${branch}" >/dev/null; then
+            base="origin/${branch}"
+          fi
+          # Compute with the checked-out code, but publish on the branch's
+          # existing tree so a same-week rerun modifies rather than adds files.
+          # Keep the original outputs intact for the always-uploaded artifact.
+          publish_dir=$(mktemp -d "${RUNNER_TEMP}/dora-metrics.XXXXXX")
+          git worktree add --detach "$publish_dir" "$base"
+          mkdir -p "$publish_dir/ops/metrics"
+          cp "ops/metrics/dora-${WEEK}.json" "ops/metrics/dora-${WEEK}.md" "$publish_dir/ops/metrics/"
+          cd "$publish_dir"
+          git add "ops/metrics/dora-${WEEK}.json" "ops/metrics/dora-${WEEK}.md"
+          if git diff --cached --quiet; then
+            echo "no DORA changes to commit"
+            exit 0
+          fi
+          git commit -m "chore(metrics): weekly DORA metrics for ${WEEK}"
+          git "${auth[@]}" push origin "HEAD:refs/heads/${branch}" || {
+            echo "::error::DORA publication to ${branch} was refused; evidence preserved"
+            exit 1
+          }
+      - name: Upload the DORA evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dora-metrics-${{ github.run_id }}
+          path: |
+            ops/metrics/dora-*.json
+            ops/metrics/dora-*.md
+          retention-days: 14
