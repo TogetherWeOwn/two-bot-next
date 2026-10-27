@@ -10,6 +10,7 @@ use two_bot_core::commands::{
 };
 use two_bot_core::community::{ClassifierConfig, ScorecardGates};
 use two_bot_core::feature_commands::FeatureGates;
+#[cfg(test)]
 use two_bot_core::help::help_text;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::onboarding::OnboardingGates;
@@ -18,6 +19,7 @@ use two_bot_core::router::{InteractionRouter, RouterGates};
 use two_bot_core::settings::classify_key;
 use two_bot_core::settings::{SettingClass, HOT_WIRED, SETTING_CLASSES};
 use two_bot_core::voice_assistant::assistant_commands;
+#[cfg(test)]
 use two_bot_core::voice_rooms::voice_commands;
 
 const COMMAND_LEAD: &str = "# Command reference\n\n\
@@ -1127,6 +1129,7 @@ fn reference_prose_cites_existing_tests_docs_and_tooling() {
     );
 }
 
+#[cfg(test)]
 fn rust_sources_under(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let entries = std::fs::read_dir(dir).expect("read source dir");
