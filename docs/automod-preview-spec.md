@@ -199,7 +199,7 @@ input excerpt in success, refusal, or error shapes.
 | Result | `matched` / `no_match` / `exempt` / `partial` / `not_evaluated` | `partial` means repeat evaluation is `indeterminate` (§5.1); `not_evaluated` covers disabled or out-of-scope (§5) with one generic line |
 | Deciding filter | one of the six `as_str` names, only for `matched` | **First match only**, exactly like live; absent for `partial`, which stops at the unproven repeat check without evaluating later filters |
 | Deciding knob | setting *name(s)* from the table below, only for a match or exemption | Never a value: no bad word, no threshold number, no list size, no "4 of 5 mentions" near-miss; absent for `partial` |
-| Exemption class | `exempt_channel` / `bypass_role` | The invoker's own channel/roles; no ids printed |
+| Exemption class | `exempt_channel` / `bypass_role`, only for `exempt` | The invoker's own channel/roles; no ids printed; choose `exempt_channel` when both apply, matching the live exemption order (`crates/core/src/automod.rs:238-246`) |
 | Mode consequence | fixed sentence for `dry_run` or `enforce` | §5; a consequence statement, not a sanction prediction; absent for `not_evaluated`, which has no effective mode |
 | Config currency | `current at <UTC time>` | No hash/fingerprint of the policy (a digest of the word list is dictionary-confirmable offline), no revision contents; absent for `not_evaluated` |
 | Fixed caveats | first-match order; preview not recorded (§5.1); sanction/protection not previewed | Same words every time |
@@ -225,7 +225,8 @@ can already read in this repo):
 | `invite_link` | none — fixed rule, no setting |
 | `external_link` | `TWO_AUTOMOD_ALLOWED_DOMAINS` |
 | `attachment_type` | `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` |
-| exemption | `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` or `TWO_AUTOMOD_BYPASS_ROLE_IDS` |
+| `exempt_channel` exemption | `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` |
+| `bypass_role` exemption | `TWO_AUTOMOD_BYPASS_ROLE_IDS` |
 
 What the verdict type must be *unable* to carry (enforced by a field-shape
 test in slice 1): threshold values, counts-observed-so-far, matched
@@ -491,11 +492,17 @@ target fetch, no `target_gate`, no `plan`, no executor call.
   (invoker), `action = automod.preview`, `target_key` (channel id),
   `outcome` (one of `matched`, `no_match`, `exempt`, `partial`,
   `rate_limited`), and `reason` built *only* from enums —
-  `filter=<name|none>;mode=<dry_run|enforce>;len=<bucket>` with input
-  length bucketed as `0_50` / `51_500` / `501_2000` UTF-16 units (a
-  length, never content). `partial` always means repeat evaluation was
-  `indeterminate`, with `filter=none`; replay reconstructs exactly the
-  partial reply of §3.2, never `no_match` or a later-filter verdict.
+  `filter=<name|none>;exemption=<exempt_channel|bypass_role|none>;mode=<dry_run|enforce>;len=<bucket>`
+  with input length bucketed as `0_50` / `51_500` / `501_2000` UTF-16
+  units (a length, never content). For `exempt`, store `filter=none` and
+  the selected exemption class (§3.2); all other outcomes store
+  `exemption=none`. Replay derives the exemption knob name from this
+  persisted enum using §3.2, never from current config or member roles.
+  A missing/invalid exemption class on an `exempt` row fails closed as
+  unavailable, not a guessed class or a fresh evaluation. `partial`
+  always means repeat evaluation was `indeterminate`, with `filter=none`;
+  replay reconstructs exactly the partial reply of §3.2, never `no_match`
+  or a later-filter verdict.
   Plus a fixed-label metric counter with these closed vocabularies:
   `result=matched|no_match|exempt|partial|rate_limited|not_evaluated|unavailable`,
   `filter=<one of the six names|none>`, and
@@ -605,7 +612,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T3 | Preview storm then real posts | N previews of identical text, then real CREATEs: streak counts only the real posts |
 | T4 | Order masking | Text matching `bad_words` + invite + repeats → `bad_words` only; text matching mention + invite → `mention_spam` only |
 | T5 | Cross-author isolation | Author B's real repeat streak never affects author A's preview verdict |
-| T6 | Exemptions | Invoker with bypass role / in exempt channel → `exempt` with class only, matcher not reached |
+| T6 | Exemptions | Bypass role alone → `exempt` with `bypass_role` and `TWO_AUTOMOD_BYPASS_ROLE_IDS`; exempt channel alone or both exemptions → `exempt` with `exempt_channel` and `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS`. Class + knob name only (no ids/values), no deciding filter, matcher not reached |
 | T7 | Scope/mode matrix | Disabled, out-of-scope guild, DM → identical `not_evaluated`, no audit row or mode/currency in reply, metric `result=not_evaluated,filter=none,mode=not_evaluated`; dry-run vs enforce → same filter, different consequence sentence |
 | T8 | Permission matrix | ManageGuild admitted; ManageMessages/ModerateMembers/everyone refused by router; picker default alone insufficient if bits absent |
 | T9 | Output disclosure | Verdict struct field inventory test; for a property set of inputs, replies contain no input substring and render no threshold value (only knob names) |
@@ -616,7 +623,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T14 | Audit fail-closed and abandoned claim | Inject insert failure, cancellation, and connection loss after lock acquisition and before commit: no verdict exposed, transaction/claim released, later delivery can retry, no permanent claimed-without-row state; ordinary errors return generic unavailable and increment metric. Lock/transaction timeout also fails closed; unknown commit outcome permits only a locked replay read, not an assumed rollback |
 | T15 | Config parity | Hot-changed word/threshold via live snapshot flips preview and next real delivery identically; invalid stored value keeps last-good in both |
 | T16 | Injection | Text with `<@everyone>`, markdown, URLs → reply byte-shape is a fixed template, `allowed_mentions` empty |
-| T17 | Redelivery and recovery | Successful sequential/concurrent delivery: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed row. Advance the clock between receipt, insert, commit, and replay; replay read includes `created_at`, and first/replayed currency times equal the stored receipt timestamp at database precision. Crash/failure before commit then redelivery: retry succeeds without a stranded claim; failed evaluations disclose nothing; idempotent actor/guild charges do not double in the same limiter lifetime. Unknown commit outcome: replay if committed, retry only if the locked read proves no row (§6) |
+| T17 | Redelivery and recovery | Successful non-exempt sequential/concurrent delivery: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed row. Repeat all T6 exemption cases: matcher count 0, stored class/derived knob identical on replay even after config/roles change; no extra charges. Missing/invalid stored class → unavailable without evaluation. Advance the clock between receipt, insert, commit, and replay; replay read includes `created_at`, and first/replayed currency times equal the stored receipt timestamp at database precision. Crash/failure before commit then redelivery: retry succeeds without a stranded claim; failed evaluations disclose nothing; idempotent actor/guild charges do not double in the same limiter lifetime. Unknown commit outcome: replay if committed, retry only if the locked read proves no row (§6) |
 | T18 | Registration scope | Publish set contains `automod-preview` only for the configured guild when the automod scope admits it; absent for the live guild without approval (§5.0) |
 | T19 | Unproven repeat equivalence | When repeat equivalence cannot be proven and execution reaches that check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
 
