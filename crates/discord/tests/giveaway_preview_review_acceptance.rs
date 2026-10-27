@@ -29,6 +29,9 @@ const CHANNEL: &str = "1550102030405060702";
 const COMPLETION: &str = "/api/v10/webhooks/1111/preview-review-fixture/messages/@original";
 const BOUND: Duration = Duration::from_secs(3);
 const SQL_HOLD: Duration = Duration::from_secs(60);
+// CI also runs this binary with libtest's default parallelism. Keep its four
+// scenarios independent; contention within each scenario still uses real EFFECTS.
+static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn invocation(id: u64, preview: Option<bool>, durations: &[&str]) -> Interaction {
     let mut options = vec![
@@ -169,6 +172,7 @@ fn assert_refusal(requests: &[RestRequest]) {
 
 #[tokio::test]
 async fn preview_completes_before_a_held_live_effect_is_released() {
+    let _serial = TEST_SERIAL.lock().await;
     let (live_pool, live_listener) = tripwire().await;
     let live_mock = rest().await;
     let (live, _) = runtime(&live_pool, &live_mock, ordinary_now());
@@ -234,6 +238,7 @@ async fn preview_completes_before_a_held_live_effect_is_released() {
 
 #[tokio::test]
 async fn held_preview_completion_does_not_retain_the_live_effect_lock() {
+    let _serial = TEST_SERIAL.lock().await;
     let (preview_pool, preview_listener) = tripwire().await;
     let (preview_mock, gate) = MockRest::start_gated(
         vec![ScriptedResponse::json(200, json!({"id": "5900"}))],
@@ -306,6 +311,7 @@ async fn held_preview_completion_does_not_retain_the_live_effect_lock() {
 
 #[tokio::test]
 async fn duration_alias_collision_refuses_in_both_orders_and_create_modes() {
+    let _serial = TEST_SERIAL.lock().await;
     for mode in [Some(true), Some(false), None] {
         for names in [
             ["duration", "duration-minutes"],
@@ -335,6 +341,7 @@ async fn duration_alias_collision_refuses_in_both_orders_and_create_modes() {
 
 #[tokio::test]
 async fn checked_deadline_overflow_refuses_in_preview_and_real_create() {
+    let _serial = TEST_SERIAL.lock().await;
     // Date::MAX exists in the pinned time crate and follows its large-dates
     // feature. Build a supported instant, rather than guessing an OffsetDateTime
     // MAX constant or injecting an already-invalid timestamp.

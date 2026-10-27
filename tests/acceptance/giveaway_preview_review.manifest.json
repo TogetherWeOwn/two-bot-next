@@ -6,7 +6,7 @@
   "protectedFiles": [
     {
       "path": "crates/discord/tests/giveaway_preview_review_acceptance.rs",
-      "sha256": "45855cfdd213d7ca6f0f83d6d85749119c62c699d68dda87a12e42cb1172732b",
+      "sha256": "191786b624b7d2be1b9f2ee52583149d7cb72df308c43a011a3851fbce91b385",
       "tests": 4
     }
   ],
@@ -33,7 +33,7 @@
     "previewResponseHeld": "Existing MockRest response gate observes the actual preview completion and withholds its HTTP response. A separate live create must reach its SQL socket before the response is released. Check the preview stayed held; release the response and abort/join held effect tasks before assertions.",
     "durationAliases": "Both duration/duration-minutes orders, unequal individually valid values, preview true/false/absent: six private validation refusals, zero SQL/nonce/publication.",
     "deadlineOverflow": "Construct a valid final-minute instant with time::Date::MAX.with_hms(...).assume_utc(); independently prove adding the valid one-minute duration overflows. Preview true/false/absent: three private refusals, zero SQL/nonce/publication and no panic.",
-    "synchronization": "Socket acceptance and the existing response gate, never sleeps. Three-second bounded observations; live SQL acquisition budget is sixty seconds. Check the held task remains unfinished before and after the observation.",
+    "synchronization": "Socket acceptance and the existing response gate, never sleeps. Three-second bounded observations; live SQL acquisition budget is sixty seconds. Check the held task remains unfinished before and after the observation. A test-only serial mutex prevents these four scenarios from interfering under CI default libtest parallelism; it never replaces the real runtime effect lock.",
     "cleanup": "Abort and join spawned tasks, drop held SQL sockets/listeners, close pools and shut down mock REST before expected RED assertions. JoinSet, sockets and MockRest also provide panic-path cancellation/drop.",
     "registration": "New non-ignored Cargo integration target is automatically discovered with --features db. No source hooks, workflow changes or live database are required. Existing CI workspace integration execution includes the target."
   },
