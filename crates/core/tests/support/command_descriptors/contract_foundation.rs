@@ -577,6 +577,21 @@ fn an_explicit_alternative_widens_only_the_command_that_declares_it() {
 }
 
 #[test]
+fn legal_name_boundaries_are_accepted() {
+    for name in [
+        "-",
+        "_",
+        "0",
+        "a",
+        "a-z_09",
+        "abcdefghijklmnopqrstuvwxyz012345",
+    ] {
+        let result = probe_builder(name, 1, 93).build();
+        assert!(result.is_ok(), "{name:?}: {result:?}");
+    }
+}
+
+#[test]
 fn malformed_names_are_refused() {
     let too_long: &'static str = Box::leak("a".repeat(33).into_boxed_str());
     for name in [
@@ -586,7 +601,6 @@ fn malformed_names_are_refused() {
         "slash/name",
         "dot.name",
         too_long,
-        "-",
         "emoji-\u{1F600}",
     ] {
         let result = CommandDescriptor::builder(name)
