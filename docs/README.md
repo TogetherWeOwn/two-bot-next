@@ -151,6 +151,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Calendar](event-calendar-handoff-spec.md)
 - [Event role](event-role-spec.md)
 - [Event recap](event-recap-spec.md)
+- [Play notes](event-play-spec.md)
 - [Native publish](event-native-publish-spec.md)
 - [Sticky debounce](sticky-debounce-acceptance.md)
 - [Sticky config](dashboard-sticky-config-spec.md)
