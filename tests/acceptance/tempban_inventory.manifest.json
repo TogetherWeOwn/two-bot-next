@@ -1,71 +1,118 @@
 {
   "schemaVersion": 1,
-  "purpose": "Immutable author-owned acceptance correction for privately inspecting saved temporary-ban expiry work. Consume the test-only correction in the existing product PR; do not open or merge a standalone failing PR.",
+  "purpose": "Immutable author-owned acceptance correction for four previously unpinned saved temporary-ban inventory behaviors. Consume these test-only changes unchanged in existing product PR #1853; do not open a standalone product PR.",
   "sourceBaseline": "92d85042527b756062bfc9e19c8d77aed0cee0b3",
-  "previousExecutionBase": "af442599e00cb839f6e349d9bf100fe054a0d1fe",
-  "executionBase": "a8a2b37372bee5f9139d47509b0af8364f0f4400",
-  "branch": "test/tempban-routing-restricted-pin",
+  "executionBase": "0785b04ad881de27187980a8cb96c1eb0ca8dd7e",
+  "branch": "test/tempban-inventory-behavior-pins",
+  "previousManifest": {
+    "commit": "0785b04ad881de27187980a8cb96c1eb0ca8dd7e",
+    "path": "tests/acceptance/tempban_inventory.manifest.json",
+    "sha256": "827acda6e1eee836054f80fa6f7377d102d72fc7eb0354665ed821eb076e566d",
+    "scope": "Immutable history of the original intended-RED evidence, registration-identity correction and restricted/publication pin corrections. Those historical runs are not execution evidence for this correction."
+  },
   "protectedFiles": [
-    {"path": "crates/bot/src/tempban_inventory_acceptance_tests.rs", "sha256": "d63bb41a849864fd3a936628900461070447e67aed12bc3ddd2913e647919b00", "tests": 10}
+    {
+      "path": "crates/bot/src/tempban_inventory_acceptance_tests.rs",
+      "sha256": "a9cb0de03cdce2e7fdc59ac96814027d1e615ca2d04bcde8d4e414b0f6865795",
+      "tests": 11
+    }
   ],
   "publicationPinFiles": [
-    {"path": "crates/bot/src/commands_cli.rs", "sha256": "fba9da7bd9cc5efbf17907930afd98a4c35dd4083adbad4c6f676be2390c38e2", "scope": "Existing cfg(test) module only; 44 non-voice and 65 with-voice definitions, three private moderation reads, explicit tempban-list presence in both registries. All unrelated assertions retained."},
-    {"path": "crates/discord/tests/interaction_routing.rs", "sha256": "18d16bc65f013f9b6212be0b2365849e4a0d7f9be53dd90302c3a35e25390d75", "scope": "Existing discord integration target only; restricted BuiltinSlash rows (required_permissions != 0) pinned at 37 including Ban Members-class tempban-list, adjacent comment and assertion message name fourteen Next-only management commands. Every other assertion retained."}
+    {
+      "path": "crates/bot/src/commands_cli.rs",
+      "sha256": "fba9da7bd9cc5efbf17907930afd98a4c35dd4083adbad4c6f676be2390c38e2",
+      "scope": "Unchanged: existing cfg(test) registry pins, 44 non-voice and 65 with-voice definitions."
+    },
+    {
+      "path": "crates/discord/tests/interaction_routing.rs",
+      "sha256": "18d16bc65f013f9b6212be0b2365849e4a0d7f9be53dd90302c3a35e25390d75",
+      "scope": "Unchanged: 37 restricted BuiltinSlash rows, including Ban Members-class tempban-list; all denial and audit assertions retained."
+    }
   ],
-  "restrictedPinCorrection": {
-    "reason": "The publication-pin correction (af442599e) bumped the other registry counts in interaction_routing.rs (47 permission rows, 44 builtins, 45 published) but not the restricted-row count in overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited. tempban-list is a Ban Members-class BuiltinSlash row, so the restricted set (required_permissions != 0) is 37, not 36. Production behavior is correct; this corrects a stale oracle count and weakens no gate: the same test still routes every restricted row unauthorized and audits each denial.",
-    "evidence": "Combined-head product PR #1853 run 40433723857 at a8a2b37372bee5f9139d47509b0af8364f0f4400, job rust tests, integration step: exactly one failure, left: 37 right: 36 at crates/discord/tests/interaction_routing.rs:283. Static parse of COMMAND_PERMISSIONS at the same head independently counts 47 rows, 44 BuiltinSlash, 37 restricted including tempban-list (PERM_BAN_MEMBERS). Historical CI evidence, not fresh execution of this correction.",
-    "laterTargetScan": "Cargo stops at the first failing target, so every integration target after interaction_routing was scanned statically: remaining crates/discord/tests targets plus crates/bot/tests, crates/cutover/tests and crates/store tests. Multiline length-pin scan (30-70), publish_set/COMMAND_PERMISSIONS consumers, exact name-list assertions, help goldens and hash pins found no further tempban-list-induced stale pin; registry_golden compares through registry_parity (already extended in af442599e), rsvp_runtime compares against publish_set dynamically, and narrowed boot sets exclude moderation-gated commands by design. This static scan is not compiled verification; Builder's combined-head CI remains the compiled proof for the later targets.",
-    "ownership": "Only the independent Test Author changes these test bytes. Builder owns combined-head product code, PR, CI and pre-review. No production source, permission gate, schema, CI route or live action changed by this correction."
-  },
-  "oracleCorrection": {
-    "previousProtectedSha256": "299b49ea3259b9a29eaeebd5d8328b3dd6765267c9bdd4dbe6901a898dfc0d86",
-    "reason": "The original foreign/DM fixture changed interaction.guild_id alone, leaving the configured registration guild in CommandData.guild_id. command_identity.rs:108-109 correctly silently rejects that mismatch before routing; the one-callback helper therefore failed before observing the intended guild refusal. Use the existing set_guild helper for coherent foreign/DM fixtures, retaining every assertion. A separate negative control deliberately preserves mismatched registration and invocation guilds and asserts zero REST callbacks/effects and zero storage queries. Never weaken the production identity fence.",
-    "evidence": "Initial product PR #1853 run 40426084820 at fa31b6930f30bbd1580532f21eb09fe846ed49cd, as recorded in the correction assignment: eight inventory tests PASS; guild_moderation_and_member_self_boundaries_refuse_before_reads fails at the callback count (0 versus 1), and desired_registry_uses_existing_feature_gates fails at 44 versus 43. These are historical results, not fresh execution of this correction.",
-    "ownership": "Only the independent Test Author changes protected bytes. Builder owns combined-head product code, PR, CI and pre-review. No production source, permission gate, schema, CI route or live action changed by this correction.",
-    "supplements": "Only the required registration-mismatch negative control was added. Optional oversized-ID/UTF-16, full page-10000 lookahead, exact percent-roundtrip and subsecond-order supplements remain outside this bounded correction. Existing coverage limits remain explicit below."
-  },
   "registration": {
     "path": "crates/bot/src/command_runtime_tests.rs",
     "module": "tempban_inventory_acceptance_tests",
-    "change": "Two-line test-only module registration. Preserve unrelated registrations when integrating; only the one new test file is hash-protected."
+    "change": "None: the existing test-only module registration discovers all eleven tests."
   },
+  "behaviorPinCorrection": {
+    "pagination": "The existing 24-row fixture must expose Next: /tempban-list page:2 and page:3 on the first two pages, with no end marker there. Its four-row final page must expose End of this saved page set and no next-page invocation. Existing complete identity, ten/ten/four row, repeat/default and write-probe assertions remain.",
+    "timing": "The October 2026 pending row must contain the separate due timing word and no future word; the 2099 pending row must contain the separate future timing word and no due word. Work-ID substrings and the header cannot satisfy these row-local assertions. The literal future timestamp assertion remains.",
+    "replyBound": "New runtime fixture reads ten long complete work IDs. Padding 85 produces 1898 UTF-16 units before the footer and 2032 including it at executionBase; padding 200 exceeds 2000 in the rows alone. Both must return a bounded cannot-fit refusal with an operator next action, no partial work/member IDs and no next-page claim. The shared private-answer helper independently enforces the 2000 UTF-16 limit on the actual REST payload.",
+    "workOrder": "Equal execute_at rows have opposing work/member IDs and permuted insertion order. The full cross-page sequence must be ascending work ID only; the former reverse/member-order alternative is removed. An earlier execute_at still outranks the tie key.",
+    "ownership": "Only the protected acceptance test and this manifest change. Production sources, authority/identity fences, schema, workflows, activation and unrelated tests are unchanged. Builder owns product integration, exact-head CI and re-review."
+  },
+  "sensitivityTargets": [
+    {
+      "id": "lookahead",
+      "path": "crates/core/src/member_moderation_store.rs",
+      "mutation": "Replace .bind((PAGE_SIZE + 1) as i64) with .bind(PAGE_SIZE as i64).",
+      "test": "multiple_pages_have_due_then_stable_identity_order_without_drops_or_writes",
+      "expectedFailure": "Page one has no Next: /tempban-list page:2."
+    },
+    {
+      "id": "timing-labels",
+      "path": "crates/core/src/tempban_inventory.rs",
+      "mutation": "Swap due and future in the row.due timing expression.",
+      "test": "every_saved_expiry_state_is_precise_private_and_mutation_free",
+      "expectedFailure": "The elapsed row lacks the due timing word."
+    },
+    {
+      "id": "constant-due-true",
+      "path": "crates/core/src/member_moderation_store.rs",
+      "mutation": "Replace execute_at <= CURRENT_TIMESTAMP AS due with TRUE AS due.",
+      "test": "every_saved_expiry_state_is_precise_private_and_mutation_free",
+      "expectedFailure": "The 2099 row lacks the future timing word."
+    },
+    {
+      "id": "constant-due-false",
+      "path": "crates/core/src/member_moderation_store.rs",
+      "mutation": "Replace execute_at <= CURRENT_TIMESTAMP AS due with FALSE AS due.",
+      "test": "every_saved_expiry_state_is_precise_private_and_mutation_free",
+      "expectedFailure": "The elapsed row lacks the due timing word."
+    },
+    {
+      "id": "final-utf16-guard",
+      "path": "crates/core/src/tempban_inventory.rs",
+      "mutation": "Disable the final output.encode_utf16().count() > 2000 condition after the footer, leaving the earlier per-row condition unchanged.",
+      "test": "oversized_saved_page_fails_closed_without_partial_or_oversized_rows",
+      "expectedFailure": "The padding-85 page sends more than 2000 UTF-16 units including framing. Disabling both guards is covered by the same fixture plus padding 200."
+    },
+    {
+      "id": "member-id-tiebreak",
+      "path": "crates/core/src/member_moderation_store.rs",
+      "mutation": "Replace ORDER BY expiry.execute_at, request_id COLLATE C with the same order using user_id as the tie key, retaining the SQL quotes around C.",
+      "test": "multiple_pages_have_due_then_stable_identity_order_without_drops_or_writes",
+      "expectedFailure": "The tied work-ID sequence is reverse, not the required ascending work-ID sequence."
+    }
+  ],
   "commands": {
-    "publication": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked tempban_inventory_is_a_private_staff_moderation_command_with_bounded_pages -- --nocapture && python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked existing_tempban_mutation_definition_remains_a_positive_control -- --nocapture",
     "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked tempban_inventory_acceptance_tests -- --nocapture --test-threads=1",
-    "cliPins": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked commands_cli::tests::desired_registry_uses_existing_feature_gates -- --nocapture",
-    "routingPins": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test interaction_routing --locked",
-    "unbanControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test moderation_tempban_path --test unban_sweep_bounds_acceptance -- --nocapture --test-threads=1",
-    "authorityControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot member_dispatch_authority_acceptance -- --nocapture --test-threads=1",
+    "runtimeWithSystemLinker": "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --features two-bot-core/db --locked tempban_inventory_acceptance_tests -- --nocapture --test-threads=1",
     "workspace": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test --workspace --features two-bot-core/db --locked",
     "format": "cargo fmt --all -- --check",
-    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref 5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
-    "inventory": "python3 scripts/ci/check-test-inventory.py"
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref 0785b04ad881de27187980a8cb96c1eb0ca8dd7e",
+    "inventory": "python3 scripts/ci/check-test-inventory.py",
+    "hosted": "gh workflow run check.yml -R TogetherWeOwn/two-bot-next --ref test/tempban-inventory-behavior-pins"
   },
   "contract": {
-    "command": "/tempban-list [page:1..10000]; default page one; ten complete rows per page except the final page. Read-only ephemeral Ban Members-class moderation command, not a new self/member lookup or reconciliation verb.",
-    "states": "pending due/future, staged expiry associated with a prepared ban, running, quarantined and a pending row with dispatch_uncertain. Preserve their distinctions; terminal done/cancelled/superseded history excluded. Standalone prepared permanent-ban intents without a saved expiry are outside this inventory.",
-    "order": "Saved execute_at ascending, then stable member/work identity; tests accept either lexical direction across the opposing member/work tie fixture but reject permuted insertion order. Publish the chosen tie key. Complete work and member IDs remain associated on each row.",
-    "privacy": "Current server-side actor authority, configured guild/moderation gates, no member-self authority, private reply/defer completion, suppressed mentions, complete finite content <=2000 UTF-16 units, no reasons/claim capability/raw errors/foreign guild data. Saved/due does not prove Discord unban; running is not completion.",
-    "spies": "Real router/runtime/executor/store; route-aware loopback authority fixture. SQLx executed-query receipts require scoped ordered LIMIT queries and <=11 returned rows including lookahead; malformed selectors and rejected authority require no expiry/ban reads. Full snapshots of five moderation ledgers plus nontransactional statement-write probes catch attempted claims/sweeps/repairs/audits, including zero-row or rolled-back writes. An independent read-only pool must still serve inventory. REST allows authority GETs and the one private interaction answer only, never bans lookup or guild mutations.",
-    "coverage": "All actual saved-work states, foreign and terminal rows, 24-row three-page fixture with ties and permuted insertion, default/repeat page identity controls, page 0/-1/10001/i64::MAX, string/bool/nested/duplicate/unknown/action selectors, inclusive 10000, stale ordinary/missing/cold actor, guild/DM/moderation/missing actor fences, empty vs out-of-range vs closed-pool query failure, hostile work identity and withheld hostile reasons.",
-    "limits": "This is not a concurrency-snapshot promise or a live Discord/database test. The upper-bound page test validates decode/read behavior on a small fixture, not a 100000-row load test. Query receipts bound materialized rows, not PostgreSQL scan cost. Existing sweep/mutation tests are not changed. No schema, runtime source, activation, policy, permission or CI changes."
+    "command": "/tempban-list [page:1..10000]; default page one; ten complete rows per page except the final page. Read-only ephemeral Ban Members-class moderation command, not a self/member lookup or reconciliation verb.",
+    "states": "Explicit due/future timing, pending, staged/prepared, running, quarantined and dispatch uncertain remain distinct; terminal history is excluded. Saved/due does not prove a Discord unban; running is not completion.",
+    "order": "Saved execute_at ascending, then work/request ID ascending in PostgreSQL C collation, never member-ID or insertion order. Complete work and member IDs stay associated on each row.",
+    "privacy": "Fresh actor authority, configured guild/moderation and registration/invocation fences, one ephemeral mention-suppressed bounded reply, no reasons/claim capabilities/raw errors/foreign data, no Discord ban lookup.",
+    "spies": "Real runtime/router/store, captured authority GETs and private REST reply, executed SQLx queries with at most eleven returned rows, five-ledger snapshots and nontransactional write probes, plus the unchanged independent read-only-pool control.",
+    "limits": "No concurrent-snapshot promise, 100000-row load claim or PostgreSQL scan-cost bound. Page-10000 deep lookahead, exact percent-roundtrip and subsecond-order supplements remain outside this correction. No production/staging tests or live actions."
   },
   "database": {
-    "guard": "two_bot_testsupport::TestDatabase with current cutover migrations; each test owns its disposable database and explicitly closes it.",
-    "missingEnvironment": "Fails fixture setup; never count missing DB, compile failure or cache refusal as behavioral RED.",
-    "ciRoute": "check.yml workspace lib/bins step runs all 10 registered tests with TWO_TEST_DATABASE_URL and two-bot-core/db; the 2 registry-shape tests, guild-boundary test and registration-mismatch negative control need no DB. Nothing depends on the workspace integration step, which CI skips while any unit test is RED by design. No ignored tests or bespoke CI route."
+    "guard": "two_bot_testsupport::TestDatabase with current cutover migrations; each test owns and explicitly closes its disposable database.",
+    "missingEnvironment": "Missing DB, setup/compile failure and cache refusal are not behavioral RED.",
+    "ciRoute": "Existing check.yml workspace lib/bins steps supply TWO_TEST_DATABASE_URL and two-bot-core/db and discover all eleven registered tests. Four tests need no DB. No new ignored test, workflow or CI route."
   },
   "verification": {
-    "restrictedPinLocalCompiled": "CURRENT CORRECTION NOT RUN: two attempts at the focused routingPins command (full interaction_routing target) were refused before Cargo, exit 75: no idle, below-budget slot; second attempt after a 75 s cooldown; no per-worktree fallback. No fresh compiled, RED or GREEN claim. The 37 pin is proven statically (COMMAND_PERMISSIONS parse at executionBase: 47 rows, 44 BuiltinSlash, 37 restricted including tempban-list) and by the recorded CI left: 37. Builder must verify the combined head in existing product CI.",
-    "restrictedPinOffline": "cargo fmt --all -- --check, git diff --check, floor guard against a8a2b37372bee5f9139d47509b0af8364f0f4400, and test inventory PASS. Protected file SHA-256 re-verified unchanged against protectedFiles before editing; new interaction_routing.rs SHA-256 recorded in publicationPinFiles and verified programmatically against the committed blob.",
-    "localCompiled": "PREVIOUS CORRECTION NOT RUN: corrected inventory acceptance, workspace test command and focused commands_cli::tests::desired_registry_uses_existing_feature_gates were each refused before Cargo, exit 75: no idle, below-budget slot; no per-worktree fallback. No fresh compiled, RED or GREEN claim. Builder must verify the combined head in existing product CI.",
-    "historicalLocalCompiled": "Original publication, runtime and workspace wrapper attempts were refused before Cargo, each exit 75: no idle, below-budget slot; no per-worktree fallback. Two further original contract-target attempts (22:35 and 22:37 UTC) were likewise refused after an 80 s cooldown.",
-    "correctionOffline": "cargo fmt --all -- --check, git diff --check, secret Debug guard and 23 self-tests, docs index, floor guard against af442599e00cb839f6e349d9bf100fe054a0d1fe, and test inventory PASS. Protected hash matched the prior HEAD before editing; new protected SHA-256 and ten-test count verified programmatically. Original assertions retained; only coherent foreign/DM fixture construction changed, plus the separate negative control and additive CLI pins.",
-    "redScope": "The behavioralRed and baselineCompatibility entries below are historical original-acceptance evidence, not runs of the corrected oracle. Baseline intended-RED evidence remains historical; cache refusal is neither RED nor GREEN. No new behavioral RED is invented or required to justify correcting a malformed test vehicle.",
-    "behavioralRed": "PARTIAL (7 of 9). Hosted run 40405157395 at e1cb457938645fe3a68d9dd3c2f60d765f296297: all 7 runtime tests fail behaviorally (\"I don't recognize that command\" for /tempban-list; 1857 passed, 462 ignored in the same binary; nextest retries both FAIL), with existing tempban/unban tests PASSing as unchanged controls. The 2 registry-shape tests lived in crates/core/tests/, whose workspace integration step CI skips while unit tests are RED, and the local cache pool refused admission; they were compile-verified only (clippy --all-targets green). This correction moves those 2 assertions (same checks, crate-qualified paths, no new logic) into the unit-test module so one hosted run observes all 9. Full 9-test RED is unverified until the new head's run completes.",
-    "offline": "cargo fmt --all -- --check, git diff --check, floor guard, test inventory, secret Debug guard (including 23 self-tests), and docs index passed before publication.",
-    "baselineCompatibility": "git diff sourceBaseline..executionBase for member_runtime.rs, member_moderation_store.rs and moderation.rs was empty. This static check is not compiled verification."
+    "localCompiled": "UNVERIFIED: initial focused --no-run attempt was refused before Cargo (exit 75). The subsequent focused test attempt entered the pool but failed build-script linking because the configured linker was absent (exit 101), before any test ran. A per-process override to the installed cc linker was then refused before Cargo (exit 75: no idle, below-budget slot; no per-worktree fallback). No runtime RED/GREEN, clippy or workspace-suite success claim.",
+    "mutants": "NOT EXECUTED: sensitivityTargets describe intended counterfactual checks, not results. No production source was edited to manufacture a mutant, no compiling command bypassed the bounded pool, and no compile/admission failure is counted as a killed mutant.",
+    "offline": "PASS: cargo fmt --all -- --check; git diff --check; floor guard against executionBase; test inventory; secret Debug guard and 23 self-tests; both offline Docker dependency shapes; 80 bounded-cache fixture tests; soak checker (211/211 non-DROP rows) and 49 tests; voice corpus (338 cases) and 22 tests. Protected-file hash, eleven-test count, previous-manifest hash, unchanged publication-pin hashes and the exact two-file test-only diff were checked programmatically.",
+    "contextPack": "context-pack --base origin/main was inspected. Its broad comparison includes inherited product changes from executionBase; this correction changes no production function, caller, constructor or registration. Existing test-module registration discovers the additive tokio test, so unrelated production callers are deliberately unchanged.",
+    "required": "Run the protected suite at the exact candidate head, then run each sensitivity target independently and record its actual assertion failure. Restore identical production bytes and re-run GREEN. Hosted CI is the verifier when local admission is refused; this manifest does not claim those pending runs passed."
   },
-  "handoff": "Builder consumes the exact immutable handoff commit on test/tempban-routing-restricted-pin (parent executionBase a8a2b37372bee5f9139d47509b0af8364f0f4400), unchanged, in existing product PR #1853. This correction commit touches only crates/discord/tests/interaction_routing.rs (restricted-row pin 36 to 37, comment and message) and this manifest; the protected suite bytes are unchanged and re-verified. No standalone PR or live action. Hash manifest itself is not self-hashed; its SHA-256 and immutable commit are recorded on the correction task. Historical intended-RED evidence is preserved, not replaced by cache refusals. Builder owns fresh combined-head CI and pre-review, which is also the compiled proof for integration targets after interaction_routing (statically scanned, no further stale pin found). Saved smoke inventory remains 43 plus the compiled-only lfg-edit extension, while the full non-voice registry is 44."
+  "handoff": "Consume the exact immutable commit published on test/tempban-inventory-behavior-pins, parent executionBase 0785b04ad881de27187980a8cb96c1eb0ca8dd7e, in existing product PR #1853. Only crates/bot/src/tempban_inventory_acceptance_tests.rs and this manifest change. Preserve the prior CLI/routing pins and every production fence. Manifest SHA-256 and immutable commit are recorded externally; the manifest is not self-hashed. Integration must still satisfy exact-head CI, independent review and the existing auto-merge gates."
 }

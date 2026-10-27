@@ -434,13 +434,23 @@ async fn every_saved_expiry_state_is_precise_private_and_mutation_free() {
         true,
     )
     .await;
-    assert!(row(&text, "due-pending-work", "777700000000000001")
-        .to_lowercase()
-        .contains("pending"));
+    let elapsed = row(&text, "due-pending-work", "777700000000000001");
+    assert!(elapsed.to_lowercase().contains("pending"));
     assert!(
-        row(&text, "future-pending-work", "777700000000000002").contains("<t:4070908800:"),
+        elapsed.split_whitespace().any(|word| word == "due"),
+        "past saved execute_at renders as due, not merely as pending: {elapsed}"
+    );
+    assert!(!elapsed.split_whitespace().any(|word| word == "future"));
+    let future = row(&text, "future-pending-work", "777700000000000002");
+    assert!(
+        future.contains("<t:4070908800:"),
         "localized saved future execute_at"
     );
+    assert!(
+        future.split_whitespace().any(|word| word == "future"),
+        "2099 saved execute_at renders as not yet due: {future}"
+    );
+    assert!(!future.split_whitespace().any(|word| word == "due"));
     let prepared = row(&text, "prepared-expiry-work", "777700000000000003").to_lowercase();
     assert!(prepared.contains("staged") || prepared.contains("prepared"));
     assert!(row(&text, "running-expiry-work", "777700000000000004")
@@ -521,6 +531,19 @@ async fn multiple_pages_have_due_then_stable_identity_order_without_drops_or_wri
             text.to_lowercase().contains("page"),
             "selected page discoverable"
         );
+        if page < 3 {
+            assert!(
+                text.contains(&format!("Next: /tempban-list page:{}", page + 1)),
+                "lookahead exposes the next saved page: {text}"
+            );
+            assert!(!text.contains("End of this saved page set"));
+        } else {
+            assert!(
+                text.contains("End of this saved page set"),
+                "the four-row last page has no further saved page: {text}"
+            );
+            assert!(!text.contains("Next: /tempban-list"));
+        }
         let identities: Vec<_> = text
             .lines()
             .filter_map(|line| {
@@ -555,10 +578,10 @@ async fn multiple_pages_have_due_then_stable_identity_order_without_drops_or_wri
     }
     assert_eq!(seen[0], "earlier-work", "due time outranks stable identity");
     let forward: Vec<_> = (0..23).map(|i| format!("page-work-{i:02}")).collect();
-    let reverse: Vec<_> = forward.iter().rev().cloned().collect();
-    assert!(
-        seen[1..] == forward || seen[1..] == reverse,
-        "ties use one documented stable member/work order, not insertion/clock order"
+    assert_eq!(
+        &seen[1..],
+        forward.as_slice(),
+        "equal execute_at uses work ID order only, never the opposing member ID order"
     );
     let (repeat, _, _) = invoke(
         db.pool().clone(),
@@ -810,6 +833,50 @@ async fn empty_out_of_range_and_query_failure_are_distinct_with_finite_next_acti
     );
     assert!(failure.to_lowercase().contains("try") || failure.to_lowercase().contains("operator"));
     db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
+async fn oversized_saved_page_fails_closed_without_partial_or_oversized_rows() {
+    // 85-unit padding exceeds the bound only after framing; 200 exceeds it in rows.
+    for padding in [85, 200] {
+        let db = database().await;
+        for i in 0..10 {
+            seed(
+                db.pool(),
+                GUILD_S,
+                &format!("oversized-work-{i:02}-{}-tail", "x".repeat(padding)),
+                &format!("777700000000{i:06}"),
+                "pending",
+                "2026-10-01T00:00:00+00:00",
+                false,
+            )
+            .await;
+        }
+        let before = snapshot(db.pool()).await;
+        install_write_probe(db.pool()).await;
+        let (text, _, queries) = invoke(
+            db.pool().clone(),
+            interaction(vec![]),
+            Authority::Staff,
+            true,
+        )
+        .await;
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("cannot fit") && lower.contains("operator"),
+            "oversized complete page has a bounded fail-closed reply and operator next action: {text}"
+        );
+        assert!(text.encode_utf16().count() <= 2000);
+        assert!(
+            !text.contains("oversized-work-") && !text.contains("777700000000"),
+            "fail closed rather than publish a clipped identity or a partial saved page"
+        );
+        assert!(!text.contains("Next: /tempban-list"));
+        bounded_reads(&queries);
+        assert_eq!(snapshot(db.pool()).await, before);
+        no_writes(db.pool()).await;
+        db.close().await.expect("fixture teardown");
+    }
 }
 
 #[tokio::test]
