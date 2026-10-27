@@ -1,29 +1,36 @@
 {
   "schemaVersion": 1,
   "purpose": "Protected behavioral acceptance for lossless, bounded community-fact drain recovery",
-  "baseCommit": "b5776432c5c1df36f14af5843c17140aae07b5f7",
-  "branch": "test/community-facts-requeue",
+  "baseCommit": "3067710ac546249e9ce66a1c80fd85e96ba33fbb",
+  "originalAcceptanceBaseCommit": "b5776432c5c1df36f14af5843c17140aae07b5f7",
+  "branch": "test/community-facts-recovery-controls",
   "protectedFiles": [
     {
       "path": "crates/discord/tests/support/community_facts_requeue.rs",
-      "sha256": "a43722ab63274eeea0e37b18ccab05daa7b0739ecf28fc9740cec0a1910f7827",
-      "tests": 25
+      "sha256": "9fb3d0acd993bbe675fc936030fd3db3fc1c169e99cbd5eb674bb557d1be1aab",
+      "tests": 31,
+      "healthyControls": 3
     },
     {
       "path": "crates/discord/tests/run_community_facts_requeue.py",
-      "sha256": "84725b8f5e0f871bfccc0cd4591ee40573d12861e4e899c5d2f2b294f8267314"
+      "sha256": "ecc22da072d6c5e7d6a273433baa950d2ba0e2fe5ba85e08fdead5babb57a551"
     }
   ],
   "commands": {
     "protectedRuntime": "python3 crates/discord/tests/run_community_facts_requeue.py",
     "healthyControls": "python3 crates/discord/tests/run_community_facts_requeue.py --controls",
     "lint": "python3 crates/discord/tests/run_community_facts_requeue.py --clippy",
-    "workspace": "python3 crates/discord/tests/run_community_facts_requeue.py --workspace"
+    "workspace": "python3 crates/discord/tests/run_community_facts_requeue.py --workspace",
+    "ruleFalseAckMutant": "python3 crates/discord/tests/run_community_facts_requeue.py --mutant rule-false-ack",
+    "joinFalseAckMutant": "python3 crates/discord/tests/run_community_facts_requeue.py --mutant join-false-ack",
+    "dropCountAssignmentMutant": "python3 crates/discord/tests/run_community_facts_requeue.py --mutant drop-count-assignment",
+    "poisonedZeroCountsMutant": "python3 crates/discord/tests/run_community_facts_requeue.py --controls --mutant poisoned-zero-counts"
   },
   "seam": {
     "runtime": "Actual DeferredCommunityFacts::drain and actual queue state, not a reimplementation",
-    "double": "Task-local record_fact boundary returns true, false, a typed store error, or a pending future; captures complete attempted/acknowledged FactWrite payloads",
+    "double": "Task-local record_fact boundary returns true, false, a typed store error, or a pending future; captures complete attempted/acknowledged FactWrite payloads. Duplicate responses select pending idempotency keys or transformed rules/join source-event IDs.",
     "baselineExecution": "Run-owned scratch snapshot changes only the external record_fact import and cfg(test) child-module registration; no drain/capture/classification/state implementation changes",
+    "mutationExecution": "Only explicit --mutant changes behavior: one uniquely matched regression in the run-owned scratch source. The author workspace source is never changed; each independent mutant starts from the same unmodified head.",
     "builderRegistration": "Register community_facts_requeue_acceptance at ../tests/support/community_facts_requeue.rs with cfg(test). Bind its record_fact under cfg(test), and two_bot_core::community_store::record_fact under cfg(not(test)); see runner.BINDING/REGISTRATION. Existing tests outside the task-local scope delegate to the real store.",
     "ciRoute": "Builder must retain the module registration and test-only binding so the existing db-feature library CI/nextest lanes execute the protected corpus, rather than leaving an orphan support file",
     "database": "Lazy passwordless test pool only; scoped test store never opens a connection. No database environment, database creation, HTTP or Discord required. Compilation always uses scripts/cargo_cache.py on the controller."
@@ -31,17 +38,17 @@
   "contract": {
     "storeErrors": "Fail at every one of the seven write positions: preserve failed and unattempted payloads across pending/rules/joins; consume only acknowledged prefix",
     "timeout": "Caller drops the real drain future through Tokio timeout at first write and mid-pending, mid-rules and mid-joins; retain exactly the unacknowledged suffix",
-    "duplicates": "Ok(false) acknowledges a duplicate/privacy-suppressed write without counting it inserted; never resubmit it after a later error or timeout",
+    "duplicates": "Ok(false) acknowledges a duplicate/privacy-suppressed write without counting it inserted; never resubmit it after a later error or timeout. Independently cover duplicate first pending, first rule, and first join, with complete retained payloads and exact fault/retry attempt order.",
     "noPool": "Repeated no-pool drains return zero with all previously queued payloads unchanged; arming later drains those facts exactly once",
     "concurrency": "Arrivals captured while the taken batch is being written survive error/cancellation; prepend the unwritten old batch ahead of arrivals within each family",
     "bounds": "Mirror the game-activity precedent: per-family cap 8192, evict oldest overflow, no cross-family capacity borrowing, no eviction at exactly the cap",
-    "observableDrops": "Expose dropped_counts() -> Result<(u64, u64, u64), CommunityFactsError> in (pending, rules, joins) order. Count exact cumulative evictions; successful/empty drains never reset counts. The baseline adapter returns truthful zero; it implements no recovery and an inherent runtime method overrides it.",
-    "poison": "Typed CommunityFactsError::Poisoned before store work or any family take; poison remains latched and every payload stays untrusted and queued",
+    "observableDrops": "Expose dropped_counts() -> Result<(u64, u64, u64), CommunityFactsError> in (pending, rules, joins) order. Count exact cumulative evictions; successful/empty drains never reset counts. Two positive overflows on the SAME buffer evict (2,2,2), then (3,4,5), for literal totals (5,6,7), with complete survivor payloads and retry order checked after both store errors and cancellation. The baseline adapter returns truthful zero; it implements no recovery and an inherent runtime method overrides it.",
+    "poison": "Typed CommunityFactsError::Poisoned before store work or any family take; repeated dropped_counts() calls before and after refused drains return Poisoned, never false healthy zero. Poison remains latched, every payload stays untrusted and queued, and no store attempts occur.",
     "controls": "Successful all-family drain, duplicate acknowledgement/count, and typed poison preservation"
   },
   "handoff": [
-    "Do not merge acceptance-only RED tests. Builder consumes the immutable pushed SHA and preserves every protected file hash, registering the child module and test binding in production source.",
-    "Expected baseline result: 22 assertion failures for discarded queues and 3 passing controls. This is not an observed result; actual execution evidence belongs in the task handoff document.",
+    "Do not merge acceptance-only RED tests or open a separate correction PR. Builder consumes the immutable pushed correction SHA into the combined PR and preserves every protected file hash, child-module registration and test binding.",
+    "The original 25 cases and their assertions remain; this correction adds four rules/join false-ack recovery cases and two cumulative-positive-overflow cases, for 31 cases including 3 healthy controls. Execution evidence, not this manifest, establishes RED/GREEN.",
     "Cache admission refusal (exit 75) is neither a compilation result nor acceptance RED. Never bypass the wrapper, create another target cache, clear sentinels or evict shared caches.",
     "Builder owns runtime GREEN, ordinary exact-head CI plus independent Paperclip Review 5/5, verified squash auto-merge and combined PR delivery. Oracle corrections return to the Test Author."
   ]

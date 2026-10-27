@@ -2,7 +2,9 @@
 
 Only test files are committed. In a run-owned scratch snapshot, bind the external
 record_fact function to the scoped store double and register its child module.
-No drain, capture, classification, error, or state implementation is changed.
+Normally no drain, capture, classification, error, or state implementation changes.
+An explicit --mutant injects exactly one regression ONLY into that scratch copy;
+exit 75 is cache refusal, not an observed assertion failure.
 Builder must keep the same cfg(test) binding/registration so ordinary library CI
 runs these protected tests. Non-test builds keep the real store import.
 
@@ -11,6 +13,10 @@ Commands (controller Cargo builds always use the bounded cache wrapper):
   python3 crates/discord/tests/run_community_facts_requeue.py --controls
   python3 crates/discord/tests/run_community_facts_requeue.py --clippy
   python3 crates/discord/tests/run_community_facts_requeue.py --workspace
+  python3 crates/discord/tests/run_community_facts_requeue.py --mutant rule-false-ack
+  python3 crates/discord/tests/run_community_facts_requeue.py --mutant join-false-ack
+  python3 crates/discord/tests/run_community_facts_requeue.py --mutant drop-count-assignment
+  python3 crates/discord/tests/run_community_facts_requeue.py --controls --mutant poisoned-zero-counts
 """
 
 import argparse
@@ -37,6 +43,50 @@ BINDING = (
 )
 
 
+MUTANTS = {
+    "rule-false-ack": (
+        "            if record_fact(&pool, &fact).await? {\n"
+        "                inserted += 1;\n"
+        "            }\n"
+        "            guard.rules_done += 1;",
+        "            if record_fact(&pool, &fact).await? {\n"
+        "                inserted += 1;\n"
+        "                guard.rules_done += 1;\n"
+        "            }",
+    ),
+    "join-false-ack": (
+        "            if record_fact(&pool, &fact).await? {\n"
+        "                inserted += 1;\n"
+        "            }\n"
+        "            guard.joins_done += 1;",
+        "            if record_fact(&pool, &fact).await? {\n"
+        "                inserted += 1;\n"
+        "                guard.joins_done += 1;\n"
+        "            }",
+    ),
+    "drop-count-assignment": (
+        "        *dropped += overflow as u64;",
+        "        *dropped = overflow as u64;",
+    ),
+    "poisoned-zero-counts": (
+        "    pub fn dropped_counts(&self) -> Result<(u64, u64, u64), CommunityFactsError> {\n"
+        "        let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;",
+        "    pub fn dropped_counts(&self) -> Result<(u64, u64, u64), CommunityFactsError> {\n"
+        "        let Ok(state) = self.0.lock() else {\n"
+        "            return Ok((0, 0, 0));\n"
+        "        };",
+    ),
+}
+
+
+def mutate(instrumented, name):
+    before, after = MUTANTS[name]
+    text = instrumented.decode()
+    if text.count(before) != 1:
+        raise ValueError(f"mutant {name}: expected exactly one mutation site")
+    return text.replace(before, after, 1).encode()
+
+
 def instrument(original):
     text = original.decode()
     if ORIGINAL_IMPORT in text:
@@ -57,7 +107,10 @@ def main():
     mode.add_argument("--controls", action="store_true")
     mode.add_argument("--clippy", action="store_true")
     mode.add_argument("--workspace", action="store_true")
+    parser.add_argument("--mutant", choices=tuple(MUTANTS), help="one scratch-only regression; never modifies the author workspace")
     args = parser.parse_args()
+    if args.mutant and (args.clippy or args.workspace):
+        parser.error("mutants run only the protected runtime or healthy controls")
     scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get(
         "PAPERCLIP_SCRATCH_DIR"
     )
@@ -66,6 +119,8 @@ def main():
     scratch = Path(scratch).resolve(strict=True)
     original = (ROOT / SOURCE).read_bytes()
     instrumented = instrument(original)
+    if args.mutant:
+        instrumented = mutate(instrumented, args.mutant)
     paths = subprocess.check_output(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
@@ -93,7 +148,11 @@ def main():
             command += ["test", "-p", "two-bot-discord", "--features", "db", "--lib", test_filter, "--", "--nocapture", "--test-threads=1"]
         print("Runtime SHA-256:", hashlib.sha256(original).hexdigest(), flush=True)
         print("Protected test SHA-256:", hashlib.sha256((ROOT / TEST).read_bytes()).hexdigest(), flush=True)
-        print("Scratch changes: external store import + cfg(test) registration only", flush=True)
+        if args.mutant:
+            print("Scratch-only mutant:", args.mutant, flush=True)
+            print("Mutant runtime SHA-256:", hashlib.sha256(instrumented).hexdigest(), flush=True)
+        else:
+            print("Scratch changes: external store import + cfg(test) registration only", flush=True)
         print("Command:", " ".join(command), flush=True)
         try:
             result = subprocess.run(command, cwd=workspace, check=False)

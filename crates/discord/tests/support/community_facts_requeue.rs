@@ -51,6 +51,7 @@ struct StoreState {
     attempts: Vec<FactWrite>,
     acknowledged: Vec<FactWrite>,
     duplicate_keys: BTreeSet<String>,
+    duplicate_event_ids: BTreeSet<String>,
     arrival: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -61,6 +62,7 @@ impl StoreState {
             attempts: Vec::new(),
             acknowledged: Vec::new(),
             duplicate_keys: BTreeSet::new(),
+            duplicate_event_ids: BTreeSet::new(),
             arrival: None,
         }
     }
@@ -91,7 +93,8 @@ pub(super) async fn record_fact(
             _ => Fault::None,
         };
         let arrival = state.arrival.take();
-        let duplicate = state.duplicate_keys.contains(&write.idempotency_key);
+        let duplicate = state.duplicate_keys.contains(&write.idempotency_key)
+            || state.duplicate_event_ids.contains(&write.source_event_id);
         if matches!(fault, Fault::None) {
             state.acknowledged.push(write.clone());
         }
@@ -217,6 +220,10 @@ fn suffix(original: &Batch, acknowledged: usize) -> Batch {
 }
 
 async fn failure_case(at: usize, timeout: bool, duplicate_first: bool) {
+    failure_case_with_duplicate(at, timeout, duplicate_first.then_some(0)).await;
+}
+
+async fn failure_case_with_duplicate(at: usize, timeout: bool, duplicate_at: Option<usize>) {
     let original = batch("old", (3, 2, 2));
     let expected_ids = ids(&original);
     let buffer = armed(original.clone());
@@ -226,12 +233,17 @@ async fn failure_case(at: usize, timeout: bool, duplicate_first: bool) {
         Fault::ErrorAt(at)
     };
     let store = Arc::new(Mutex::new(StoreState::new(fault)));
-    if duplicate_first {
-        store
-            .lock()
-            .expect("configure duplicate")
-            .duplicate_keys
-            .insert(original.0[0].idempotency_key.clone());
+    if let Some(index) = duplicate_at {
+        let mut state = store.lock().expect("configure duplicate");
+        if index < original.0.len() {
+            state
+                .duplicate_keys
+                .insert(original.0[index].idempotency_key.clone());
+        } else {
+            state
+                .duplicate_event_ids
+                .insert(expected_ids[index].clone());
+        }
     }
     STORE
         .scope(Arc::clone(&store), async {
@@ -253,6 +265,16 @@ async fn failure_case(at: usize, timeout: bool, duplicate_first: bool) {
                     store.attempts.len(),
                     at + 1,
                     "stop on the failed/unacknowledged write"
+                );
+                let attempts: Vec<_> = store
+                    .attempts
+                    .iter()
+                    .map(|write| write.source_event_id.clone())
+                    .collect();
+                assert_eq!(
+                    attempts,
+                    expected_ids[..=at],
+                    "attempt only the prefix through the fault"
                 );
                 let acknowledged: Vec<_> = store
                     .acknowledged
@@ -364,6 +386,26 @@ failure_test!(
     true,
     true
 );
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_rule_acknowledgement_is_not_retried_after_error() {
+    failure_case_with_duplicate(4, false, Some(3)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_rule_acknowledgement_is_not_retried_after_timeout() {
+    failure_case_with_duplicate(4, true, Some(3)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_join_acknowledgement_is_not_retried_after_error() {
+    failure_case_with_duplicate(6, false, Some(5)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_join_acknowledgement_is_not_retried_after_timeout() {
+    failure_case_with_duplicate(6, true, Some(5)).await;
+}
 
 #[tokio::test]
 async fn no_pool_retains_all_payloads_until_armed() {
@@ -483,6 +525,76 @@ async fn joins_overflow_never_consumes_pending_or_rule_capacity() {
     arrivals_case((1, 1, CAP), false, (0, 0, 2)).await;
 }
 
+async fn cumulative_arrivals_case(timeout: bool) {
+    let original = batch("old", (2, 2, 2));
+    let first_arrivals = batch("first", (CAP, CAP, CAP));
+    let second_arrivals = batch("second", (3, 4, 5));
+    let buffer = armed(original.clone());
+    let mut state = StoreState::new(Fault::None);
+    let captured = buffer.clone();
+    let first_to_append = first_arrivals.clone();
+    state.arrival = Some(Box::new(move || append(&captured, first_to_append)));
+    let store = Arc::new(Mutex::new(state));
+    STORE.scope(Arc::clone(&store), async {
+        let mut second_expected = (
+            first_arrivals.0[3..].to_vec(),
+            first_arrivals.1[4..].to_vec(),
+            first_arrivals.2[5..].to_vec(),
+        );
+        second_expected.0.extend(second_arrivals.0.clone());
+        second_expected.1.extend(second_arrivals.1.clone());
+        second_expected.2.extend(second_arrivals.2.clone());
+        for (at, expected, drops) in [
+            (0, first_arrivals.clone(), (2, 2, 2)),
+            (1, second_expected.clone(), (5, 6, 7)),
+        ] {
+            {
+                let mut state = store.lock().expect("arm successive write faults");
+                state.fault = if timeout { Fault::BlockAt(at) } else { Fault::ErrorAt(at) };
+                if at == 1 {
+                    let captured = buffer.clone();
+                    let to_append = second_arrivals.clone();
+                    state.arrival = Some(Box::new(move || append(&captured, to_append)));
+                }
+            }
+            if timeout {
+                assert!(tokio::time::timeout(Duration::from_secs(1), buffer.drain()).await.is_err());
+            } else {
+                assert!(matches!(buffer.drain().await, Err(CommunityFactsError::Store(_))));
+            }
+            assert_eq!(snapshot(&buffer), expected, "both positive overflows retain exactly the newest full payloads in each family");
+            assert_eq!(buffer.dropped_counts().expect("successive positive evictions"), drops, "add evictions to the SAME buffer's counters; never replace earlier drops");
+            let state = store.lock().expect("successive failure receipts");
+            assert_eq!(state.attempts.len(), at + 1, "each drain stops at its first unacknowledged write");
+            assert!(state.acknowledged.is_empty());
+        }
+        store.lock().expect("recover after both overflows").fault = Fault::None;
+        assert_eq!(buffer.drain().await.expect("healthy drain after both overflows"), 3 * CAP);
+        assert_eq!(buffer.dropped_counts().expect("healthy drain preserves cumulative counts"), (5, 6, 7));
+        assert_eq!(buffer.drain().await.expect("empty drain after both overflows"), 0);
+        assert_eq!(buffer.dropped_counts().expect("empty drain preserves cumulative counts"), (5, 6, 7));
+        assert_eq!(snapshot(&buffer), (vec![], vec![], vec![]));
+        let state = store.lock().expect("cumulative survivor receipts");
+        let written: Vec<_> = state.acknowledged.iter().map(|write| write.source_event_id.clone()).collect();
+        assert_eq!(written, ids(&second_expected), "drain every survivor once in family order");
+        assert_eq!(state.acknowledged[..CAP], second_expected.0, "pending survivor payloads are unchanged");
+        let attempts: Vec<_> = state.attempts.iter().map(|write| write.source_event_id.clone()).collect();
+        let mut expected_attempts = vec![original.0[0].source_event_id.clone(), first_arrivals.0[0].source_event_id.clone()];
+        expected_attempts.extend(ids(&second_expected));
+        assert_eq!(attempts, expected_attempts, "failed writes evicted by overflow never return on retry");
+    }).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_failed_requeues_accumulate_positive_evictions_per_family() {
+    cumulative_arrivals_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_cancelled_requeues_accumulate_positive_evictions_per_family() {
+    cumulative_arrivals_case(true).await;
+}
+
 #[tokio::test]
 async fn healthy_control_drains_each_family_once_and_preserves_payloads() {
     let original = batch("healthy", (3, 2, 2));
@@ -567,10 +679,18 @@ async fn healthy_control_poison_refuses_typed_before_taking_any_family() {
     STORE
         .scope(Arc::clone(&store), async {
             for _ in 0..2 {
+                assert!(
+                    matches!(buffer.dropped_counts(), Err(CommunityFactsError::Poisoned)),
+                    "poisoned counters must never look like healthy zero drops"
+                );
                 assert!(matches!(
                     buffer.drain().await,
                     Err(CommunityFactsError::Poisoned)
                 ));
+                assert!(
+                    matches!(buffer.dropped_counts(), Err(CommunityFactsError::Poisoned)),
+                    "neither observation nor drain may clear the poison latch"
+                );
                 let poisoned = buffer.0.lock().expect_err("poison remains latched");
                 let state = poisoned.get_ref();
                 assert_eq!(
