@@ -1,7 +1,6 @@
 # Documentation map
 
 Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
-Empty `{missing,stale,oversize}` = 0; else 1.
 Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References
@@ -89,6 +88,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution PII](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
+- [Lockdown preview](lockdown-preview-spec.md)
 - [Lockdown](time-boxed-lockdown-decision.md)
 - [Slowmode](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
