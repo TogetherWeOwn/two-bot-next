@@ -157,6 +157,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                 .int_range(TEMPBAN_DURATION_MIN_SECONDS, TEMPBAN_DURATION_MAX_SECONDS),
                 CommandOption::reason(),
             ]),
+        crate::tempban_inventory::command_definition(),
         CommandDefinition::new("kick", "Kick a member")
             .permissions(PERM_KICK_MEMBERS)
             .options(vec![CommandOption::target(), CommandOption::reason()]),

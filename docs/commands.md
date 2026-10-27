@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 64.
+Built-in commands: 65.
 
 ## `/access`
 
@@ -727,6 +727,17 @@ Temporarily ban a member
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `duration_seconds` | integer | true | 60 | 31536000 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/tempban-list`
+
+Inspect saved temporary-ban expiry work
+
+- Default permissions: BanMembers (`4`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | 10000 | — | — | Saved expiry page (10 rows, default 1; due time then work ID order) |
 
 ## `/textchannels`
 

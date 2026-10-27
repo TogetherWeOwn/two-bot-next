@@ -129,7 +129,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Bans",
         requires: Some("Ban Members"),
-        commands: &["ban", "tempban"],
+        commands: &["ban", "tempban", "tempban-list"],
         anchor: None,
     },
     HelpGroup {

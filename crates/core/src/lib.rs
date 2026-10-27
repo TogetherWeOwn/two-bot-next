@@ -135,6 +135,7 @@ pub mod scheduled_events;
 #[cfg(feature = "db")]
 pub mod scheduled_store;
 pub mod secret;
+pub mod tempban_inventory;
 pub use secret::Secret;
 pub mod self_roles;
 pub mod send_admission;

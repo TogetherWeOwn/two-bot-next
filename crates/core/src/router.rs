@@ -143,6 +143,7 @@ pub enum HandlerId {
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
+    TempbanList,
 }
 
 /// Which feature slice owns a routed component / modal submit (parity §2).
@@ -282,6 +283,7 @@ pub enum RouterRefusal {
     ModerationPermission(ModerationAction),
     PurgePreviewPermission,
     ChannelInspectPermission,
+    TempbanListPermission,
 }
 
 impl RouterRefusal {
@@ -299,6 +301,7 @@ impl RouterRefusal {
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
             // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
@@ -444,6 +447,7 @@ impl InteractionRouter {
             register(id);
         }
         if member_present {
+            register(HandlerId::TempbanList);
             // Member verbs (`CommandRuntime::build`, while the consumer exists).
             for action in [
                 ModerationAction::Ban,
@@ -473,6 +477,7 @@ impl InteractionRouter {
             Vec::new()
         } else {
             vec![
+                HandlerId::TempbanList,
                 HandlerId::Moderation(ModerationAction::Ban),
                 HandlerId::Moderation(ModerationAction::TempBan),
                 HandlerId::Moderation(ModerationAction::Kick),
@@ -577,6 +582,7 @@ impl InteractionRouter {
     ) -> Option<SlashOutcome> {
         // Moderation carries its own guild fence (refusal, not silence).
         let moderation = match name {
+            "tempban-list" => Some((HandlerId::TempbanList, RouterRefusal::TempbanListPermission)),
             "purge-preview" => Some((
                 HandlerId::PurgePreview,
                 RouterRefusal::PurgePreviewPermission,
