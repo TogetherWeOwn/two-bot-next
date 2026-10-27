@@ -146,11 +146,20 @@ probe answers `500` while the container starts (the six-second probe deadline
 trips long before the two-minute auto-start finishes), then `503` until the
 gateway connects. The two five-minute scheduled monitors (the
 `synthetic-user-flow` staging probe and `slow-burn-tracker`) renew activity on
-every scrape, so staging stays awake while they run and sleeps once they go
-quiet. Giving those monitors a bounded wake-and-wait is follow-up work. 15
+every scrape. Both run on main every five minutes, shorter than the 15-minute
+window, so **while they run staging never reaches the idle timeout and this
+change alone saves no container time**; it only removes the keepalive that
+would otherwise hold the container awake. Savings need those two monitors to
+stop waking the container (a no-wake probe path plus a bounded wake-and-wait),
+which changes pinned workflow contracts and is tracked as follow-up work. 15
 minutes outlasts the post-deploy voice synthetic, a 10-minute job that sends no
-Worker traffic. While staging sleeps it has no readiness or metrics alerts, and the
-bot is offline in the staging guild until something wakes it. An armed
+Worker traffic. `container_unready_alert` has one emitter, the keepalive tick,
+so staging emits no readiness alert at all, awake or asleep; staging readiness
+is observed by the `synthetic-user-flow` probe and its Discord alert, and the
+staging soak gate reads that probe's runs instead
+([soak entry gates](soak-entry-gates.md)). While staging sleeps it also has no
+metrics alerts, and the bot is offline in the staging guild until something
+wakes it. An armed
 remediation drill drops both vars from the generated staging config
 (`scripts/staging_rollout.py`), because its fault injector runs on keepalive
 ticks. Rollback: delete both vars from `[env.staging.vars]` and redeploy.

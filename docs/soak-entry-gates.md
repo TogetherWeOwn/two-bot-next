@@ -65,7 +65,7 @@ checks between the Gate 1 readiness probe and the final pre-`T` probe:
 
 | Check | Verification | Expected value |
 |---|---|---|
-| No readiness alerts | Worker-log query for `container_unready_alert` between the two probes | `0`; a `container_unready_recovery` without a preceding alert is fine |
+| No readiness failures | Every `synthetic-user-flow` staging-job run that executed between the two probes (read-only `gh run list --workflow synthetic-user-flow.yml --branch main`; each run reads `/readyz` and `/health`). Staging has no keepalive, so the Worker never emits `container_unready_alert` there ([staging idle sleep](container-readiness.md#staging-idle-sleep)) | At least one run in the interval and every one `success`; an empty or unreadable listing closes the gate |
 | No deployment | Existing authorized workflow execution-attempt verification for `main` over the recorded probe interval, including reruns and executions spanning either probe | `0` deployment executions; missing or incomplete attempt evidence closes the gate |
 | Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | `200` with all three components `ready` |
 
@@ -86,10 +86,11 @@ query failure, deployment execution or missing/incomplete attempt evidence
 closes Gate 2 and keeps `T` unset. No new attempt collector, verification route
 or execution authority is supplied by this document.
 
-The alert query counts only emitted `container_unready_alert` records. Short
-failure streaks can recover below the configured threshold without an alert or
-recovery log ([readiness runbook](container-readiness.md)); an empty alert query
-does not prove there were no brief unready streaks.
+The run listing proves only the probes that GitHub actually scheduled: its
+`*/5` cadence is best-effort, so gaps are possible, and a green run says nothing
+about the minutes between probes. Do not read an empty `container_unready_alert`
+query as readiness evidence on staging: the keepalive that emits it is off
+there. Production still emits it ([readiness runbook](container-readiness.md)).
 
 Any alert, deploy or non-200 probe closes Gate 2 until the cause is resolved
 and the Gate 1 preconditions pass again. Re-run the readiness checks; do not
