@@ -91,7 +91,7 @@ use PolicyHook::{
 /// `/game-mix` (43), and feed lifecycle `/feed-pause` (44) and
 /// `/feed-resume` (45). Only `/game-mix` admits Administrator
 /// alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 46] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 47] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -114,6 +114,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 46] = [
         PERM_BAN_MEMBERS,
         Some(MemberModeration),
     ),
+    row(46, "tempban-list", BuiltinSlash, PERM_BAN_MEMBERS, None),
     row(
         5,
         "kick",
