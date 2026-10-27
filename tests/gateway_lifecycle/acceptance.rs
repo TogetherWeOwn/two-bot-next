@@ -453,14 +453,12 @@ mod cache_adapter {
     #[test]
     fn control_missing_claim_recovers_durable_member_work() {
         let live = LiveInteractions::default();
-        let payload = OnboardingJob::Goodbye {
-            guild_id: 111,
-            username: "fixture".into(),
-            bot: false,
-            joined_at_ms: Some(123),
-        }
-        .durable_payload()
-        .expect("durable member work");
+        // Durable member-work payload as persisted JSON (not a struct literal):
+        // the spliced enum gains optional fields over time, and recovery
+        // accepts payloads captured before they existed.
+        let payload =
+            r#"{"Goodbye":{"guild_id":111,"username":"fixture","bot":false,"joined_at_ms":123}}"#
+                .to_string();
         let (cached, recovered) =
             claim(&live, &Saved { id: 51, payload }).expect("recover member work");
         assert!(cached.is_none());
