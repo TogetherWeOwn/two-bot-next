@@ -122,6 +122,55 @@ remaining gateway/accepted-prefix work:
    removable. `deregister_set` deduplicates that DB-derived set. Keep the
    in-flight refusal gate active during deregistration and surface incomplete
    REST deletes instead of declaring disable complete.
+8. `/command-inspect name:<name>` shows one private ephemeral view of a saved
+   definition without running it: `view:summary` (the default) carries the
+   saved description, enabled state, text trigger and correction examples;
+   `view:template` shows the saved template as stored; `view:preview` renders
+   it with the invoking member/channel and explicit bounded sample arguments
+   (`arguments`, at most 500 UTF-16 units — the four-variable language ignores
+   them, so no `{args}`). Untrusted text is Markdown-escaped, views that cannot
+   fit carry an explicit truncation marker, and invalid saved templates refuse
+   with a `/command name:<name> template:` correction. Inspection never sends
+   to the channel, republishes the registry, touches cooldowns/claims, mutates
+   the definition or records a `command.run` fact; disabled rows stay
+   inspectable. Unknown, other-guild-only and deleted names share one truthful
+   miss pointing at `/command-list`; lookup outages reuse the fixed
+   availability reply below.
+
+   To check proposed text before saving or replacing a response, use
+   `/command-inspect draft:Hello {username}` instead of a saved `name`.
+   Pass exactly one of `name` or `draft`; missing input, both inputs, duplicate
+   options, unknown options and non-text values refuse before any lookup.
+   Drafts default to preview; explicit `view:preview` is equivalent, while
+   `view:summary` and `view:template` require saved-name mode. The proposed
+   template must be 1–2000 UTF-16 units and uses only `{user}`, `{username}`,
+   `{server}` and `{channel}` with the same single-pass invocation context as
+   saved previews. Optional `arguments` remain ignored — no `{args}` or
+   second interpolation pass. The private response starts **Draft preview —
+   not saved or published**. Markdown escaping and empty allowed mentions keep
+   hostile text inert; framing-only truncation is explicit, but invalid
+   placeholders and expanded output over 2000 units refuse with a correction.
+   Missing context is reported separately. Draft mode works without storage
+   and never reads/writes saved commands, republishes registration, sends to a
+   channel, records audit facts, matches triggers or consumes cooldowns/claims.
+   It cannot overwrite or enable anything. Saving later is a distinct
+   `/command name:<name> template:<text>` invocation with fresh checks; a
+   preview is not permission or a guarantee that the later save will succeed.
+9. `/command-disable name:<name>` pauses one saved definition and
+   `/command-enable name:<name>` resumes it, without deleting anything.
+   Both take exactly one text `name` (a forged type, a duplicate or any
+   extra option refuses before any store read); names lowercase before
+   lookup. Only the enabled flag and update metadata change, and only on a
+   real flip, which commits with one content-free `command.disable` /
+   `command.enable` audit fact inside the guild lifecycle lock. Missing
+   rows, current-state requests and validation refusals are zero-write:
+   no audit fact, no timestamp touch, no republish. Resuming revalidates
+   the stored row against the write rules (a reserved or invalid saved
+   definition refuses without reactivating); pausing needs no content
+   check. The flip commits before the one full-set publication, so a
+   prefix or slash invocation racing a stale picker reads the saved
+   state. A failed publication reports saved-but-not-synchronized with a
+   safe next action; a repeated state never claims the picker repaired.
 
 ## Slash-run audit replay
 

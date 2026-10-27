@@ -100,6 +100,17 @@ BEGIN
         VALUES (k, 'tank', 'Tank', 2, 1);
       INSERT INTO lfg_signups (lfg_id, user_id, role_key, joined_at)
         VALUES (k, u, 'tank', now());
+      INSERT INTO giveaways
+        (guild_id, id, prize, channel_id, message_id, created_by, winners_count, ends_at,
+         status, requirements_json, max_entries, draw_nonce, created_at, updated_at)
+        VALUES (g, k, 'fixture', '999999999999999999', 'm-' || k, u, 1, now(),
+         'open', '{}'::jsonb, 1, 'nonce-' || k, now(), now());
+      INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at)
+        VALUES (g, k, u, 1, now());
+      INSERT INTO giveaway_draws
+        (guild_id, giveaway_id, draw_no, drawn_at, eligible_count, eligible_hash, seed,
+         winner_ids, reroll_kind)
+        VALUES (g, k, 0, now(), 1, 'fixture', 'fixture', ('["' || u || '"]')::jsonb, NULL);
       INSERT INTO feed_relays (id, guild_id, channel_id, kind, source, created_by, created_at, updated_at)
         VALUES (k, g, u, 'rss', 'https://example.invalid/feed', u, now(), now());
       INSERT INTO feed_deliveries (feed_id, item_key, nonce, state, first_seen_at)
@@ -164,6 +175,15 @@ BEGIN
         VALUES (g, 'v-' || k, u, 'fixture-owner-revision', TRUE);
       INSERT INTO voice_logging_mention_members (guild_id, member_id) VALUES (g, u);
       INSERT INTO member_catchup_members (guild_id, member_id) VALUES (g, u);
+      -- Starboard starrers are BIGINT snowflakes (one row per guild/message/user
+      -- here, like every other member table): four rows total, one matching the
+      -- erasure target, three survivors. The erasure predicate is
+      -- guild_id = $1::bigint AND user_id = $2::bigint (cast the retained text
+      -- binds, never the indexed columns); config.updated_by stays a
+      -- retained-attribution allowlist and posts carry no member column.
+      INSERT INTO starboard_starrers
+        (guild_id, source_channel_id, source_message_id, user_id)
+        VALUES (g::bigint, 155000000000000001, 156000000000000001, u::bigint);
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');

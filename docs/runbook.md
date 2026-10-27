@@ -1,5 +1,80 @@
 # two-bot-next operations runbook
 
+<!-- start-here -->
+**Start here — section map**
+
+- [Start here](#start-here)
+- [Is it alive?](#is-it-alive)
+- [Persisted ownership control](#persisted-ownership-control)
+- [Redeploy and rollback](#redeploy-and-rollback)
+- [Restart semantics: durable RESUME, not full state recovery](#restart-semantics-durable-resume-not-full-state-recovery)
+- [Containment, kill switches and feature flags](#containment-kill-switches-and-feature-flags)
+- [Backup, restore and drill commands](#backup-restore-and-drill-commands)
+- [Common failures](#common-failures)
+- [Incident playbooks](#incident-playbooks)
+- [Secret inventory: names only](#secret-inventory-names-only)
+- [Legacy review and deliberately unported operations](#legacy-review-and-deliberately-unported-operations)
+- [Keep the runbook honest](#keep-the-runbook-honest)
+- [Giveaways](#giveaways)
+
+**Alert anchors**
+
+- [job stale](#alert-job-stale)
+- [job unknown stale](#alert-job-unknown-stale)
+- [job failures](#alert-job-failures)
+- [job failure share](#alert-job-failure-share)
+- [REST 429](#alert-rest-429)
+- [REST 5xx](#alert-rest-5xx)
+- [REST admission breaker open](#alert-rest-admission-breaker-open)
+- [REST token invalid](#alert-rest-token-invalid)
+- [REST refusal surge](#alert-rest-refusal-surge)
+- [REST global responses stuck](#alert-rest-global-responses-stuck)
+- [DB pool](#alert-db-pool)
+- [DB errors](#alert-db-errors)
+- [send admission blocked](#alert-send-admission-blocked)
+- [voice failures](#alert-voice-failures)
+- [voice join fast burn](#alert-voice-join-fast-burn)
+- [voice join slow burn](#alert-voice-join-slow-burn)
+- [voice creator-map stale](#alert-voice-creator-map-stale)
+- [voice worker halted](#alert-voice-worker-halted)
+- [voice live self-heal](#alert-voice-live-self-heal)
+- [voice live not ready](#alert-voice-live-not-ready)
+- [voice queue stall](#alert-voice-queue-stall)
+- [error budget fast burn](#alert-error-budget-fast-burn)
+- [error budget slow burn](#alert-error-budget-slow-burn)
+- [gateway missed events](#alert-gateway-missed-events)
+- [gateway unpaired disconnect](#alert-gateway-unpaired-disconnect)
+- [gateway not ready](#alert-gateway-not-ready)
+- [gateway latency dead](#alert-gateway-latency-dead)
+- [gateway reconnect flapping](#alert-gateway-reconnect-flapping)
+- [ticker stale](#alert-ticker-stale)
+- [receiver refusals](#alert-receiver-refusals)
+- [checkpoint failures](#alert-checkpoint-failures)
+- [dispatch drops](#alert-dispatch-drops)
+- [handler duration saturated](#alert-handler-duration-saturated)
+- [prefix trigger verdict refusals](#alert-prefix-trigger-verdict-refusals)
+- [community facts drain failures](#alert-community-facts-drain-failures)
+- [EventSub post failed share](#alert-eventsub-post-failed-share)
+- [event-store consumer lag](#alert-event-store-consumer-lag)
+- [metrics scrape lost](#alert-metrics-scrape-lost)
+- [audit delivery halt](#alert-audit-delivery-halt)
+- [eventsub reconcile failed](#alert-eventsub-reconcile-failed)
+- [EventSub tampered](#alert-eventsub-tampered)
+- [retention replay needed](#alert-retention-replay-needed)
+- [voice dispatch timeouts](#alert-voice-dispatch-timeouts)
+- [voice watchdog stucks](#alert-voice-watchdog-stucks)
+- [voice halt recoveries](#alert-voice-halt-recoveries)
+- [REST breaker opens](#alert-rest-breaker-opens)
+- [REST global pauses](#alert-rest-global-pauses)
+- [feed fetch failures](#alert-feed-fetch-failures)
+- [EventSub receive gap](#alert-eventsub-receive-gap)
+- [EventSub reconcile prior failed](#alert-eventsub-reconcile-prior-failed)
+- [automod sanction refused](#alert-automod-sanction-refused)
+- [moderation enforcement failures](#alert-moderation-enforcement-failures)
+- [voice REST stuck](#alert-voice-rest-stuck)
+- [voice global backoff capped](#alert-voice-global-backoff-capped)
+<!-- /start-here -->
+
 For the on-call operator of the Rust bot and its Cloudflare Worker/Container.
 The bot is live in production on one Cloudflare Container; this describes the
 shipped source, not proof that a soak passed or that any specific recovery is
@@ -21,7 +96,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.151.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.152.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -120,7 +195,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.151.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.152.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 Container stdout is also in the Workers Observability `containers` dataset, which a
@@ -2183,7 +2258,9 @@ disarms the drill by redeploy.
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
    --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
-   Dispatches bypass the hold, so arm and disarm work while it is armed.
+   Explicit arm/disarm dispatches bypass the hold. Error-rate rollback proofs,
+   including the daily automated dispatch, honor it and fail without deploying
+   while it is armed; do not clear the hold for a proof.
    The arm run stays red by design: the history guard fails it after a green
    deploy and synthetic so the pin never reads as staging history for the
    head. Read the deploy and synthetic steps, not the run color.
@@ -2728,7 +2805,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.151 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.152 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
@@ -2753,8 +2830,8 @@ authorization, then repeat health/readiness/log observations. Confirm only one
 gateway session and record version, image, first ready time and remaining
 limitations. None of these examples were a live rollback drill.
 
-**Staging drill.** The manual `staging-rollback-drill` workflow (dispatch from
-`main`, input `target_version`) runs this procedure end to end in the protected
+**Staging drill.** The manual Worker-only option of `staging-rollback-drill`
+(dispatch from `main`, input `target_version`) runs this procedure end to end in the protected
 `staging` environment: fence, one unforced Cloudflare deployment of the target
 with `code_update_strategy: immediate`, epoch-checked takeover, a 2 s
 `/readyz` + `/health` poll, then the same sequence back to the original version.
@@ -2764,7 +2841,9 @@ refuses an unknown or never-deployed id). The job summary and evidence file hold
 the fence, rollback, takeover and first-ready times, the time-to-ready against
 the workflow's 60 s budget, probe counts, the container image digest and
 instance counts. This workflow interval is not an outage-start recovery
-measurement and cannot prove B2's under-60-second recovery criterion.
+measurement and cannot prove B2's under-60-second recovery criterion. An empty
+`target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
+which also runs on a daily schedule and verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
@@ -3571,3 +3650,104 @@ command existence, **not authorization, successful deployment, backup custody,
 Discord effects, or a live rollback**. Required exact-head merge gates remain
 `ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB test
 lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.
+
+## Giveaways
+
+`/giveaway create|list|cancel|end|pause|resume|extend|reroll` requires Manage
+Server; entry buttons are open to human members with per-interaction role and
+age checks. Limits: prize 1–200 characters, duration 1–43200 minutes,
+winners 1–100, 10 active giveaways per guild, 1000 entrants each (one paced
+membership re-check per entrant must fit the 300 s draw run). Entry
+attempts have a bounded process-local 10/minute member budget, and successful
+entries share a durable 10/minute guild/member budget across giveaways and
+restarts. Duplicates collapse to one row. `gw:<id>` carries only the opaque
+id; the server resolves guild, message, deadline, status, requirements and
+capacity.
+
+The giveaway row is recorded before its message posts. If sending or the
+message-id attachment fails, never blindly re-post: inspect the channel for
+a delivered message and cancel the recorded id if needed. An unconfirmed
+definition holds an active slot and takes no entries.
+
+`giveaway_countdown` ticks every 15 seconds; durable claims permit at most
+one cosmetic refresh at each 1h, 10min, 1min and ending-soon threshold
+through the shared REST pacing guard. Count edits are best-effort; the
+entry row stays authoritative when a display edit fails.
+
+`giveaway_draw` ticks every 15 seconds: it claims due giveaways under a
+10-minute lease, re-validates eligibility from fresh membership reads, runs
+the pure draw, commits one draw row and flips to drawn, then announces (edit
+the giveaway message, post the winners with seed and revealed nonce, mark
+announced). Drawn-but-unannounced rows re-announce from the stored row and
+never re-draw; a stale claim with a stored draw skips to announce. Pause
+excludes a giveaway from the due scan; resume extends the deadline by the
+paused span. Rerolls append a new draw round and leave history intact. No
+winner DMs: deferred until a DM send path exists. Staging smoke: create,
+enter from two test members, verify two rows plus ephemeral replies, end,
+verify the draw row plus winners post, reroll, verify a second round, then
+cancel a fresh giveaway and verify a later entry is refused.
+
+### Lifecycle audit and saved-versus-delivered state
+
+Successful pause, resume and extension commands commit one minimal fact in
+`automation_audit_log` in the **same transaction** as the lifecycle/deadline
+change. `actor_id` is the authenticated staff member, not the giveaway creator;
+store-only system calls use NULL. Actions are `giveaway.pause`,
+`giveaway.resume` and `giveaway.extend`, with `guild_id`, the giveaway id as
+`target_key`, `outcome = 'ok'`, a stable fact `id` and `created_at`; `reason`
+stays NULL. No prize/body, entrant roster, seed/nonce, claim capability or raw
+database error belongs in these facts or command logs.
+
+Pause still requires an unclaimed open row. Resume locks the paused row and
+adds the nonnegative paused span before reopening entries. Extend locks an
+open or paused row, adds the validated duration and preserves its status.
+Unknown/foreign targets, wrong states and invalid deadlines create neither a
+transition nor a success fact. Audit insertion failure rolls back the change
+and returns `Giveaway unavailable; try again later.` without a message refresh.
+A resume with a backwards clock still changes paused to open and records a fact,
+even when its deadline does not move.
+
+A fact's random per-write suffix distinguishes repeated valid extensions and
+pause/resume cycles, including equal-timestamp writes. It is **not** a durable
+interaction replay key: submitting a fresh extension can extend again. Existing
+create/cancel identities and round-numbered draw/reroll audit identities do not
+change. Do not infer ordering from the random suffix.
+
+With existing authorized database read access, inspect one guild and giveaway
+using this bounded read (replace both placeholders; no new endpoint or grant):
+
+```sql
+SELECT id, guild_id, actor_id, action, target_key, outcome, created_at
+FROM automation_audit_log
+WHERE guild_id = '<guild-id>' AND target_key = '<giveaway-id>'
+  AND action IN ('giveaway.pause', 'giveaway.resume', 'giveaway.extend')
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+```
+
+The result is a capped snapshot, not a full-history export. An empty successful
+read means no matching retained facts; a failed read means unknown, not empty.
+There is no automatic age-based expiry or actor pseudonymization for this table;
+the 45-day `operational_audit_log` cache policy applies to a different table.
+Existing [member erasure](privacy.md) deletes entire rows matching guild and
+`actor_id`, subject to safety checks, not every fact about that member's
+giveaways. NULL/system and other-actor facts can remain. A true guild removal
+queues guild-wide deletion, including these facts, but only a successful
+executing retention run deletes them: dry-run deletes nothing, rejoin cancels
+the queue entry and guards/failures can defer completion. No new retention
+window, purge trigger or grant is introduced. Existing MCP/ops audit readers
+are not giveaway-audit listing APIs.
+
+The transaction confirms **saved state**, not Discord delivery. The subsequent
+message edit is separate and best-effort: `Giveaway paused/resumed/extended; its
+message could not be refreshed.` means the state and audit are already saved.
+Inspect the saved giveaway and channel before retrying; in particular, do not
+repeat an extension just to repair its display. Even a saved success fact does
+not prove that the final interaction reply reached Discord. For a repeatable
+disposable-DB check, run the protected runtime corpus:
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
+  --test giveaway_actor_audit_acceptance -- --test-threads=1
+```

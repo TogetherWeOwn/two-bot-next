@@ -130,6 +130,13 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Timed-entry giveaways (0460/0461): every definition mutation stamps
+    // updated_at (create, claim, release, status, draw, announce), so its
+    // maximum is the row's last write. Entries and draws are insert-only;
+    // their insert stamps are the last write.
+    TableSpec { table: "giveaways", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "giveaway_entries", measure: TableMeasure::Columns(&["entered_at"]) },
+    TableSpec { table: "giveaway_draws", measure: TableMeasure::Columns(&["drawn_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
     TableSpec { table: "guild_analytics_settings", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -248,6 +255,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
     },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
+    TableSpec { table: "starboard_config", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "starboard_starrers", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec { table: "starboard_posts", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     // Claim/start/stamp/takeover transitions rewrite claimed_at,
     // send_started_at and delivered_at without touching the others, so the

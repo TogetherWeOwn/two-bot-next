@@ -7,7 +7,7 @@ import {
   type MetricsAlertState,
 } from "../src/alert-rules.ts";
 import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
-import { metricsBody } from "./fixtures/metrics.ts";
+import { metricsBody, rustLabels } from "./fixtures/metrics.ts";
 
 const NOW = 1_000_000;
 function body(extra: string[]): string {
@@ -1347,7 +1347,7 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   firing.push(...ev(feedErrors(1), ev(feedErrors(0)).state).firing);
   const gapLines = (received: number, classified: number) => [
     `two_bot_eventsub_received_total ${received}`,
-    ...["challenge", "notification", "revocation", "tampered", "ignored", "other"].map((k) =>
+    ...rustLabels("EVENTSUB_DELIVERY_KINDS").map((k) =>
       `two_bot_eventsub_classified_total{kind="${k}"} ${k === "notification" ? classified : 0}`),
   ];
   let gap = ev(gapLines(100, 100));
