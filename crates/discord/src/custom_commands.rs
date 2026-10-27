@@ -26,9 +26,9 @@ use two_bot_core::{
         accepted_text_trigger, builtin_command_names, format_command_list_page,
         format_draft_preview, format_inspect_miss, format_inspect_preview, format_inspect_summary,
         format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
-        invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
-        AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand, TemplateContext,
-        ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        invalid_inspect_view_reply, render_template, validate_inspect_name, validate_template,
+        AuditRecord, AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand,
+        TemplateContext, ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -36,6 +36,7 @@ use two_bot_core::{
 
 use crate::{
     automation_admission::ActorCooldowns,
+    custom_command_prefix_render::{render_prefix_response, PrefixRenderRefusal},
     interactions::{
         publish_commands, refusal_response, route_interaction, text_response, RoutedInteraction,
     },
@@ -92,6 +93,17 @@ type PublishedCommands = Option<Arc<[two_bot_core::CommandDefinition]>>;
 const LOOKUP_OUTAGE_REPLY: &str =
     "Custom commands are temporarily unavailable. Please try again shortly.";
 
+/// Saved-but-pending suffix for a committed management mutation whose
+/// registry publication failed. Names the durable pending state and the
+/// automatic resync, and deliberately carries no restart instruction and
+/// no advice to repeat or delete the saved mutation: repeating it would be
+/// a no-op that never republishes, and the pending marker already records
+/// the work. Pinned by the resync acceptance suite and the runtime suffix
+/// pin; keep every copy identical.
+const PENDING_RESYNC_SUFFIX: &str = "Registry publication failed; the command picker is not yet \
+    synchronized. Synchronization is pending and will resync automatically on the next \
+    publication; no further action is needed.";
+
 #[derive(Clone)]
 pub struct CustomCommandRuntime {
     pool: PgPool,
@@ -146,10 +158,51 @@ impl CustomCommandRuntime {
         self.publish_locked().await
     }
 
+    /// Runs under the registry lock held by every caller. A failed
+    /// publication persists one durable per-guild pending marker; a confirmed
+    /// publication clears it. The marker is recovery state, not a second
+    /// write of record: persisting or clearing it is best-effort and must
+    /// never mask the publication outcome itself, and retrying only ever
+    /// republishes the saved set — a committed mutation is not replayed.
     async fn publish_locked(&self) -> Result<(), CustomCommandError> {
         let gates = self.router.gates();
         let guild = gates.configured_guild.ok_or(CustomCommandError::Context)?;
-        let rows = if gates.automations {
+        let outcome = self.publish_full_set(guild, gates.automations).await;
+        let guild = guild.to_string();
+        match outcome {
+            Ok(()) => {
+                if store::clear_registry_resync_pending(&self.pool, &guild)
+                    .await
+                    .is_err()
+                {
+                    // The picker IS synchronized; a surviving marker only
+                    // costs one redundant republish at the next opportunity.
+                    tracing::error!(
+                        "custom-command registry published but pending resync marker was not cleared"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if store::mark_registry_resync_pending(&self.pool, &guild, &two_bot_core::now_iso())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        "custom-command registry publication failed and pending resync marker was not recorded"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn publish_full_set(
+        &self,
+        guild: u64,
+        automations: bool,
+    ) -> Result<(), CustomCommandError> {
+        let rows = if automations {
             store::list_commands(&self.pool, &guild.to_string())
                 .await
                 .map_err(|_| CustomCommandError::Storage)?
@@ -317,9 +370,17 @@ impl CustomCommandRuntime {
                             server: server.to_owned(),
                             channel: format!("<#{}>", channel.id),
                         });
-                let rendered = context
-                    .as_ref()
-                    .and_then(|context| render_template(&row.template, context).ok());
+                // A stored row can predate or bypass definition-time
+                // validation (import, corruption): re-validate before
+                // rendering, so invalid text never renders literally in
+                // front of members. The pure renderer stays literal; this
+                // boundary is what refuses. A refusal takes the existing
+                // content-free unavailable completion and `render_failed`
+                // fact below, and the saved row is left untouched.
+                let rendered = context.as_ref().and_then(|context| {
+                    validate_template(&row.template).ok()?;
+                    render_template(&row.template, context).ok()
+                });
                 let (result, reason) = match rendered {
                     Some(content) => (self.complete(interaction, &content).await, None),
                     None => (
@@ -449,20 +510,24 @@ impl CustomCommandRuntime {
         // The committed attempt is never cleared, including on cancellation,
         // rendering/audit failure, or an ambiguous network response. Nonce
         // enforcement is additional protection, not our durable replay guard.
-        let rendered = guild_name
-            .ok_or(CustomCommandError::Context)
-            .and_then(|server| {
-                render_template(
-                    &row.template,
-                    &TemplateContext {
-                        user: format!("<@{}>", message.author.id),
-                        username: message.author.name.clone(),
-                        server: server.to_owned(),
-                        channel: format!("<#{}>", message.channel_id),
-                    },
-                )
-                .map_err(|_| CustomCommandError::Render)
-            });
+        // Same stored-row re-validation as the slash boundary: an imported
+        // or corrupt template refuses as `Render` before any send, keeping
+        // the durable attempt/result pair and leaving the row untouched.
+        // The context check stays first, preserving `context_unavailable`;
+        // that ordering is pinned by the helper's unit tests.
+        let user_mention = format!("<@{}>", message.author.id);
+        let channel_mention = format!("<#{}>", message.channel_id);
+        let rendered = render_prefix_response(
+            guild_name,
+            &row.template,
+            &user_mention,
+            &message.author.name,
+            &channel_mention,
+        )
+        .map_err(|refusal| match refusal {
+            PrefixRenderRefusal::Context => CustomCommandError::Context,
+            PrefixRenderRefusal::Render => CustomCommandError::Render,
+        });
         let (result, reason) = match rendered {
             Ok(content) => {
                 let result = match self
@@ -884,12 +949,11 @@ impl CustomCommandRuntime {
             }
         };
         if resync && self.publish_locked().await.is_err() {
-            // The write is committed. Report the partial outcome, never tell the
-            // admin to retry a destructive mutation as if nothing happened.
+            // The write is committed and a durable pending marker is saved.
+            // Report the partial outcome, never tell the admin to retry a
+            // destructive mutation as if nothing happened.
             tracing::error!("custom-command definition committed but registry publication failed");
-            return Ok(format!(
-                "{reply} Registry publication failed; the command picker is not yet synchronized."
-            ));
+            return Ok(format!("{reply} {PENDING_RESYNC_SUFFIX}"));
         }
         Ok(reply)
     }
@@ -954,13 +1018,12 @@ impl CustomCommandRuntime {
             Err(error) => return Ok(error.to_string()),
         };
         if resync && self.publish_locked().await.is_err() {
-            // The flip is committed. Report the saved-but-not-synchronized
-            // state with a safe next action: never a delete recommendation,
-            // and never a claim that a later no-op repaired the picker.
+            // The flip is committed and a durable pending marker is saved.
+            // Report the saved-but-not-yet-synchronized state: never a delete
+            // or restart recommendation, and never a claim that repeating
+            // this no-op toggle repaired the picker.
             tracing::error!("custom-command toggle committed but registry publication failed");
-            return Ok(format!(
-                "{reply} The definition is saved but the command picker is not yet synchronized because registry publication failed. Repeating this command will not resync it; restart the bot after Discord recovers to resync."
-            ));
+            return Ok(format!("{reply} {PENDING_RESYNC_SUFFIX}"));
         }
         Ok(reply)
     }
