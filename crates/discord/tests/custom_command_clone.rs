@@ -752,7 +752,7 @@ async fn a_saved_reserved_source_is_not_a_backdoor_around_clone_name_validation(
 #[tokio::test]
 async fn invalid_saved_template_or_description_cannot_be_cloned() {
     for (template, description) in [
-        ("{not_allowed}".to_owned(), DESCRIPTION.to_owned()),
+        ("{usre}".to_owned(), DESCRIPTION.to_owned()),
         (TEMPLATE.to_owned(), "😀".repeat(51)),
         (String::new(), DESCRIPTION.to_owned()),
         ("😀".repeat(1001), DESCRIPTION.to_owned()),
