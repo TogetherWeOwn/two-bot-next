@@ -1104,6 +1104,17 @@ mod tests {
             RoleSpecError::DuplicateKey("tank".to_owned()).to_string(),
             "Duplicate LFG role key \"tank\"."
         );
+        // Parser-driven: the raw payload stays the normalized key while the
+        // refusal text shows an underscore key literally.
+        let duplicate = parse_role_spec("__forged__:Tank:1,__forged__:Other:1").unwrap_err();
+        assert_eq!(
+            duplicate,
+            RoleSpecError::DuplicateKey("__forged__".to_owned())
+        );
+        assert_eq!(
+            duplicate.to_string(),
+            "Duplicate LFG role key \"\\_\\_forged\\_\\_\"."
+        );
         assert_eq!(
             RoleSpecError::ReservedKey(LFG_LEAVE_VALUE.to_owned()).to_string(),
             "LFG role key \"\\_\\_leave\\_\\_\" is reserved for leaving the group."
