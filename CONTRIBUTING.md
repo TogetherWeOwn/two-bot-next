@@ -131,9 +131,20 @@ The toolchain comes from `rust-toolchain.toml` (rustup and CI honour it):
 
 ```sh
 cargo fmt --all -- --check
+python3 scripts/generate_command_reference.py
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
+
+Generate `docs/generated/commands.md` before compiling workspace tests or
+all-targets Clippy: one test embeds the generated Markdown at compile time.
+On the persistent controller use `python3 scripts/generate_command_reference.py --controller`,
+which builds only the generator through bounded Cargo admission. The output is
+ignored; never commit generated registry rows. The authored
+[command-reference landing page](docs/commands.md) links to same-head CI artifacts.
+Normal reference-doc tests compare bytes without writing. Missing or stale output
+fails until explicit generation; tracked configuration drift still fails and is
+never automatically repaired.
 
 The ops-override DB acceptance test mutates process environment. With the test
 DB configured, run it separately from parallel workspace tests (CI does this in
