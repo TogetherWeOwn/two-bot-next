@@ -228,7 +228,7 @@ pub struct CloneCommandInput {
 pub enum CommandError {
     #[error("Command name must match ^[a-z0-9_-]{{1,32}}$.")]
     InvalidName,
-    #[error("Command name \"{0}\" is reserved by Owen.")]
+    #[error("Command name \"{}\" is reserved by Owen.", escape_inspect_text(.0))]
     ReservedName(String),
     #[error("Description must be between 1 and 100 characters.")]
     InvalidDescription,
@@ -238,7 +238,7 @@ pub enum CommandError {
     InvalidTextTrigger,
     #[error("Text trigger must be lowercase.")]
     TextTriggerNotLowercase,
-    #[error("Text trigger \"{0}\" is reserved by Owen.")]
+    #[error("Text trigger \"{}\" is reserved by Owen.", escape_inspect_text(.0))]
     ReservedTextTrigger(String),
     #[error("Write would define more than {0} custom commands, but that is the guild limit.")]
     OverCapacity(usize),
@@ -734,11 +734,11 @@ pub fn format_command_list_page(
             let trigger = row
                 .text_trigger
                 .as_deref()
-                .map(|trigger| format!(" (or {trigger})"))
+                .map(|trigger| format!(" (or {})", escape_inspect_text(trigger)))
                 .unwrap_or_default();
             format!(
                 "/{}{} — {}",
-                row.name,
+                escape_inspect_text(&row.name),
                 trigger,
                 if row.enabled { "on" } else { "off" }
             )
@@ -822,7 +822,9 @@ impl InspectView {
     }
 
     /// Trusted plain-text heading, always the first line, always followed by
-    /// a newline before untrusted text.
+    /// a newline before untrusted text. The validated name still renders
+    /// through [`escape_inspect_text`]: a stored `__name__` is active
+    /// Markdown until escaped.
     #[must_use]
     pub fn heading(self, name: &str) -> String {
         let view = match self {
@@ -830,7 +832,7 @@ impl InspectView {
             Self::Template => "Saved template",
             Self::Preview => "Preview",
         };
-        format!("{view} /{name}")
+        format!("{view} /{}", escape_inspect_text(name))
     }
 }
 
@@ -940,7 +942,10 @@ pub fn invalid_inspect_view_reply(raw: Option<&str>) -> String {
 /// copy.
 #[must_use]
 pub fn format_inspect_miss(name: &str) -> String {
-    format!("No command /{name} found in this server. List saved commands with /command-list.")
+    format!(
+        "No command /{} found in this server. List saved commands with /command-list.",
+        escape_inspect_text(name)
+    )
 }
 
 /// Private definition summary: saved description, existing enabled state,
@@ -952,9 +957,9 @@ pub fn format_inspect_summary(row: &StoredCommand) -> String {
     let heading = InspectView::Summary.heading(&row.name);
     let status = if row.enabled { "Enabled" } else { "Disabled" };
     let trigger = escape_inspect_text(row.text_trigger.as_deref().unwrap_or("none (slash-only)"));
+    let shown = escape_inspect_text(&row.name);
     let examples = format!(
-        "\nSaved template: /command-inspect name:{} view:template\nPrivate preview: /command-inspect name:{} view:preview\nReplace the definition: /command name:{} template:...",
-        row.name, row.name, row.name
+        "\nSaved template: /command-inspect name:{shown} view:template\nPrivate preview: /command-inspect name:{shown} view:preview\nReplace the definition: /command name:{shown} template:..."
     );
     // Fixed overhead first: only the escaped description is unbounded (raw
     // rows predate validation), so only it can be cut — with an explicit
@@ -1020,8 +1025,9 @@ pub fn format_inspect_template(row: &StoredCommand) -> String {
 #[must_use]
 pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> String {
     if let Err(error) = validate_template(&row.template) {
-        let prefix = format!("Template for /{} is invalid: ", row.name);
-        let correction = format!(" Replace it with /command name:{} template:...", row.name);
+        let shown = escape_inspect_text(&row.name);
+        let prefix = format!("Template for /{shown} is invalid: ");
+        let correction = format!(" Replace it with /command name:{shown} template:...");
         let mut detail = escape_inspect_text(&error.to_string());
         let budget = MAX_RENDERED_CHARS
             .saturating_sub(prefix.encode_utf16().count() + correction.encode_utf16().count());
@@ -1040,15 +1046,15 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
     let rendered = match render_template(&row.template, ctx) {
         Ok(rendered) => rendered,
         Err(refusal @ TemplateError::RenderTooLong(_)) => {
+            let shown = escape_inspect_text(&row.name);
             return format!(
-                "Template for /{} renders too long to preview ({refusal}). Shorten it with /command name:{} template:...",
-                row.name, row.name
+                "Template for /{shown} renders too long to preview ({refusal}). Shorten it with /command name:{shown} template:..."
             );
         }
         Err(error) => {
+            let shown = escape_inspect_text(&row.name);
             return format!(
-                "Template for /{} cannot be previewed: {error} Replace it with /command name:{} template:...",
-                row.name, row.name
+                "Template for /{shown} cannot be previewed: {error} Replace it with /command name:{shown} template:..."
             );
         }
     };
@@ -1087,7 +1093,10 @@ pub fn format_draft_preview(template: &str, ctx: &TemplateContext) -> String {
 /// saved definition is not at fault.
 #[must_use]
 pub fn inspect_preview_context_unavailable(name: &str) -> String {
-    format!("Preview for /{name} is unavailable: command context is missing. Please try again.")
+    format!(
+        "Preview for /{} is unavailable: command context is missing. Please try again.",
+        escape_inspect_text(name)
+    )
 }
 
 /// DB-backed delete set for disable-time deregistration, sorted and deduped
@@ -2140,5 +2149,100 @@ mod tests {
         assert!(
             inspect_preview_context_unavailable("faq").contains("Preview for /faq is unavailable")
         );
+    }
+
+    /// A valid underscore name is Markdown-active until escaped. Each inspect
+    /// projection must show it literally; ordinary names stay byte-identical.
+    #[test]
+    fn inspect_projections_render_underscore_names_literally() {
+        for view in [
+            InspectView::Summary,
+            InspectView::Template,
+            InspectView::Preview,
+        ] {
+            let plain = view.heading("faq");
+            let hostile = view.heading("__forged__");
+            assert_eq!(hostile, plain.replace("faq", "\\_\\_forged\\_\\_"));
+        }
+        assert_eq!(
+            format_inspect_miss("__forged__"),
+            "No command /\\_\\_forged\\_\\_ found in this server. List saved commands with /command-list."
+        );
+        assert_eq!(
+            format_inspect_miss("faq"),
+            "No command /faq found in this server. List saved commands with /command-list."
+        );
+        assert_eq!(
+            inspect_preview_context_unavailable("__forged__"),
+            "Preview for /\\_\\_forged\\_\\_ is unavailable: command context is missing. Please try again."
+        );
+        assert_eq!(
+            inspect_preview_context_unavailable("faq"),
+            "Preview for /faq is unavailable: command context is missing. Please try again."
+        );
+    }
+
+    #[test]
+    fn inspect_invalid_template_refusal_escapes_underscore_names() {
+        let row = StoredCommand {
+            name: "__forged__".to_owned(),
+            template: "{nope}".to_owned(),
+            ..inspect_row()
+        };
+        let view = format_inspect_preview(&row, &inspect_ctx());
+        assert!(
+            view.starts_with("Template for /\\_\\_forged\\_\\_ is invalid: Unknown placeholder"),
+            "{view}"
+        );
+        assert!(
+            view.ends_with(" Replace it with /command name:\\_\\_forged\\_\\_ template:..."),
+            "{view}"
+        );
+        assert!(!view.contains("__forged__"), "{view}");
+    }
+
+    #[test]
+    fn inspect_summary_overflow_and_list_escape_underscore_names() {
+        let mut row = inspect_row();
+        row.name = "__forged__".to_owned();
+        row.text_trigger = Some("!__forged__".to_owned());
+        let summary = format_inspect_summary(&row);
+        assert!(
+            summary.contains(
+                "Saved template: /command-inspect name:\\_\\_forged\\_\\_ view:template\n\
+             Private preview: /command-inspect name:\\_\\_forged\\_\\_ view:preview\n\
+             Replace the definition: /command name:\\_\\_forged\\_\\_ template:..."
+            ),
+            "{summary}"
+        );
+        assert!(!summary.contains("name:__forged__"), "{summary}");
+
+        // 200 repetitions of a 32-unit username overflow the 2000-unit render cap.
+        row.template = "{username}".repeat(200);
+        let ctx = TemplateContext {
+            username: "u".repeat(32),
+            ..inspect_ctx()
+        };
+        let refusal = format_inspect_preview(&row, &ctx);
+        assert!(refusal.contains("renders too long to preview"), "{refusal}");
+        assert!(
+            refusal.starts_with("Template for /\\_\\_forged\\_\\_ renders"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("/command name:\\_\\_forged\\_\\_ template:..."),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("__forged__"), "{refusal}");
+
+        let list = format_command_list(&[row]);
+        assert!(
+            list.starts_with("/\\_\\_forged\\_\\_ (or !\\_\\_forged\\_\\_) — on"),
+            "{list}"
+        );
+        assert!(list.encode_utf16().count() <= MAX_RENDERED_CHARS);
+
+        let plain = format_command_list(&[inspect_row()]);
+        assert!(plain.starts_with("/faq (or !faq) — on"), "{plain}");
     }
 }
