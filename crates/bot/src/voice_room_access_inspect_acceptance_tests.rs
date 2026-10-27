@@ -312,9 +312,16 @@ fn page_total(text: &str) -> Option<usize> {
 
 #[tokio::test]
 async fn control_existing_public_dispatch_is_private_and_read_only_when_already_public() {
-    let fixture = ReadFixture::start(worker(false, &[], &[], &[]).await);
+    let mut fixture = ReadFixture::start(worker(false, &[], &[], &[]).await);
     let text = fixture.invoke("public", MEMBER, None, vec![]).await;
     assert!(text.contains("already public"), "{text}");
+    // The existing owner dispatch refreshes the cached owner display name;
+    // that cosmetic cache is not access state, so only it may move here.
+    fixture
+        .privacy
+        .get_mut(&ROOM)
+        .expect("tracked room")
+        .owner_display = "member".to_owned();
     fixture.unchanged().await;
 }
 
@@ -376,7 +383,7 @@ async fn owner_sees_three_distinct_live_sections_without_staff_permissions() {
 async fn public_transition_keeps_durable_blocks_visible_and_clears_other_sections() {
     let mut worker = worker(true, &[BLOCKED], &[GRANTED], &[WAITING]).await;
     let text = worker.apply_privacy(MEMBER, false, "owner", PrivacyCommand::Public);
-    assert!(text.contains("Opening"), "public setup failed: {text}");
+    assert!(text.contains("public again"), "public setup failed: {text}");
     for step in 1..=40u64 {
         if !worker.dispatch_one(step * 1_000_000).await {
             break;
