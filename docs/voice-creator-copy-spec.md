@@ -13,7 +13,7 @@ saved have not been measured; roadmap reserve is not implementation admission.
 
 | Option | Scope / tradeoff | Decision |
 | --- | --- | --- |
-| Manual per-creator commands | Existing controls; more steps, but no new copy state or concurrency protocol | Default now; reassess after settings-read lands |
+| Manual per-creator commands | Existing controls; more steps, but no new copy state or concurrency protocol | Default now; reassess on 2026-11-02 against the merged settings summaries |
 | Guild export/import | Broad configuration transfer with existing private review; not a one-creator copy primitive | Keep its scope; never edit an export to simulate this operation |
 | Explicit source-to-existing-target copy | Same guild, stable creator channel IDs, three scalar defaults only; new complete review and transactional freshness needed | Conditional proposal below, not a build authorization |
 | Clone/create target, copy permissions or cross-guild import | New identity, authority and lifecycle boundaries | Excluded |
@@ -33,9 +33,11 @@ fields, collapses inherited limit to zero on export and omits companion override
 Do not use it as a lossless snapshot for this proposal; preserve `null` versus 0.
 Manual `/position`, `/group`, `/defaultlimit` and other configuration controls
 remain separate. [PR #1838](https://github.com/TogetherWeOwn/two-bot-next/pull/1838)
-proposes private, write-free channel-only `/position`, `/group`, `/textchannels`
-reads; inspected open at head `07777b33e8a1ab65b8e6e0cf3f6ed1d5001bc2cb`.
-Do not advertise that pending contract as shipped or change its tests/scope here.
+merged as `1a87869f898cbe4e3c9171a4fcf9885119202ade`: channel-only `/position`,
+`/group`, `/textchannels` now reply with private, write-free prose summaries. Those
+summaries are human-readable, not a structured read of `default_limit`/revisions, so
+they do not supply this proposal's authorized read contract; do not change their
+tests/scope here.
 No existing upsert, import confirmation or read summary supplies this proposal's
 source-and-target concurrency guarantee automatically.
 
@@ -121,9 +123,9 @@ opaque, short-lived preview token bound to actor/application/guild, both creator
 IDs and incarnations/revisions, schema/allowlist version, exact proposed values,
 review digest and issuance/expiry; never put raw settings in component IDs or logs.
 Keep its complete review snapshot and page/cancel state in bounded process memory
-(<=2 active previews/actor, <=20/guild; refuse excess, expire after five minutes).
+(<=2 active previews/actor, <=20/guild; refuse excess `PREVIEW_LIMIT`, expire after five minutes).
 The token is a signed handle/digest, not plaintext configuration in a component ID.
-Restart or another worker without that record requires a fresh preview. Token
+Restart or another worker without that record refuses `PREVIEW_STATE_LOST`: fresh preview. Token
 issuance must fit existing signing authority; provisioning a new credential or
 persistent preview store is not silently included in this design.
 
@@ -208,7 +210,7 @@ token expiry or process restart. After retention, an authenticated original toke
 returns `EXPIRED`: verify its signed issuance/expiry against server time even when
 no receipt exists. A request ID alone cannot look up or execute an operation; no
 permanent tombstone is needed to reject that expired token. Invalid signatures or
-revoked signing generations fail closed, never execute or disclose a receipt.
+revoked signing generations fail closed (`TOKEN_REVOKED`), never execute or disclose a receipt.
 Request-ID conflict/replay guarantees last only while the receipt is retained.
 After deletion, that actor may reuse the ID **only with a fresh preview**, complete
 review and new explicit confirmation, subject to current authority and CAS. That
@@ -255,7 +257,10 @@ none`, never `applied_to_rooms`. Error recovery:
 | `REVIEW_TOO_LARGE` | false / `use_manual_commands` |
 | `IDEMPOTENCY_CONFLICT`, `OUTCOME_UNKNOWN` | false / `inspect_original_receipt` |
 | `UNAVAILABLE` | true / `retry_preview_after_recovery`; known no commit only |
-| `CAPACITY_REACHED` | false / `wait_for_receipt_expiry_then_preview` |
+| `CAPACITY_REACHED` | false / `wait_for_receipt_expiry_then_preview` (receipts only) |
+| `PREVIEW_LIMIT` | true / `cancel_or_wait_for_preview_expiry` (<=5 minutes) |
+| `PREVIEW_STATE_LOST` | false / `preview_both_again` (restart, other worker or evicted record) |
+| `TOKEN_REVOKED` | false / `preview_both_again` (revoked signing generation; no receipt data) |
 
 Offline documentation check from repository root (Python standard library; no
 network, DB, tokens or product execution). This checks discovery, links, field
@@ -311,7 +316,7 @@ configuration write count and zero Discord mutations; no live data.
 | F05 | Source edit after preview, including change-then-revert ABA -> STALE_PREVIEW; source values never refetched and silently substituted into old review |
 | F06 | Target edit/ABA, delete-recreate with same ID, import or restore -> stale/generation refusal; no blind update or reuse of revision |
 | F07 | Existing target room occupied and another creation admitted before commit: all existing/in-flight settings, owners, permissions and occupants unchanged; fresh later admission uses copied defaults |
-| F08 | Preview/cancel/expiry/restart halfway through pages -> zero durable writes; no confirm without complete current view; lost commit response -> inspect receipt |
+| F08 | Preview/cancel/expiry/restart halfway through pages -> zero durable writes; lost record -> PREVIEW_STATE_LOST, 3rd preview/actor or 21st/guild -> PREVIEW_LIMIT, revoked generation -> TOKEN_REVOKED, each with exact reason/next_action; no confirm without complete current view; lost commit response -> inspect receipt |
 | F09 | Same-key replay (even after token expiry), retained-key/input conflict, alternate key same preview, receipt expiry/erasure and capacity -> at most one commit per preview. Commit at t0; after t0+24h delete its receipt, resend the signed original token+ID -> EXPIRED, zero writes. Reuse that ID with a fresh fully reviewed/confirmed preview -> new operation subject to CAS; then resend the old token again -> EXPIRED, never the new receipt or a second commit |
 | F10 | Exact/one-over 4 KiB input, 32 KiB review, 20 pages and 2,000 UTF-16 units/page; a whole unrenderable field refuses; no truncated confirm |
 | F11 | Excluded template contains @everyone, Markdown, emoji, combining characters and bidi controls: escaped complete private diff, no ping; raw values preserved, byte/scalar/UTF-16 bounds distinguished |
@@ -326,9 +331,10 @@ matrix and offline check are **not** those tests and do not prove runtime safety
 Before **any implementation or test card**, record exact-spec commit + SHA-256
 CEO/host intent: a concrete second-lobby need that final manual settings reads do
 not adequately solve, plus acceptance of this narrow subset, complete private
-review and future-rooms-only limitation. Final settings-read PR contract must be
-merged and re-inspected; copy neither changes that owner's scope nor depends on
-an unreleased summary as an authoritative read API.
+review and future-rooms-only limitation. Re-inspect the merged settings
+summaries (`1a87869f898c`) and record what they lack (structured `default_limit`,
+revision witness); copy neither changes that owner's scope nor treats prose
+summaries as an authoritative read API.
 
 Independently settle genuine CISO boundaries for new receipt retention/erasure,
 signing/generation and saved-state authority. Permission-source copying remains
