@@ -15,6 +15,7 @@ mod flush_adapter {
     use two_bot_core::game_activity::{
         ActivitySnapshot, ActivityType, GuildGameAggregate, PresenceDelta,
     };
+    use two_bot_core::game_activity_store::GameActivityStoreError;
     use two_bot_core::Snowflake;
 
     const T0: i64 = 1_750_000_000_000;
@@ -50,7 +51,7 @@ mod flush_adapter {
         guild: Snowflake,
         gap_timeout_ms: i64,
         now_ms: i64,
-    ) -> Result<(), ()> {
+    ) -> Result<(), GameActivityStoreError> {
         let pause = pool.pause.lock().expect("sink lock").take();
         if let Some(pause) = pause {
             pause.await.expect("release persistence");

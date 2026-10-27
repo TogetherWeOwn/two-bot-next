@@ -7,6 +7,7 @@ so would freeze the implementation under test instead of reading live source.
 """
 
 import argparse
+import importlib.util
 from pathlib import Path
 import re
 import subprocess
@@ -62,7 +63,45 @@ def block(source, start):
     raise ValueError("unterminated source item")
 
 
-def prepare():
+def used_constants(source, region, excluded=()):
+    """Keep live constants used by an extracted region, including dependencies."""
+    candidates = re.findall(
+        r"(?m)^((?:pub(?:\(crate\))?\s+)?const (\w+)\s*:[^;]+;)", source
+    )
+    selected = {}
+    while True:
+        context = region + "\n" + "\n".join(selected.values())
+        needed = {
+            name: item for item, name in candidates
+            if name not in excluded and re.search(rf"\b{re.escape(name)}\b", context)
+        }
+        if needed == selected:
+            return "\n".join(selected.values())
+        selected = needed
+
+
+def loop_arguments(schedule):
+    signature = schedule[schedule.index("pub async fn flush_loop("):]
+    signature = signature[:signature.index("{")]
+    arguments = ["pool", "collector"]
+    if "shutdown" in signature:
+        arguments.append("shutdown")
+    return ", ".join(arguments)
+
+
+def without_final_flush(source):
+    """Mutation only in the generated adapter, never in a production file."""
+    call = re.compile(
+        r"flush_remaining_guilds\(&pool,\s*&collector,\s*now_ms\(\),\s*"
+        r"GAME_ACTIVITY_GAP_TIMEOUT_MS\)\.await;"
+    )
+    result, count = call.subn("", source)
+    if count != 1:
+        raise ValueError("final-flush mutant requires exactly one live shutdown call")
+    return result
+
+
+def prepare(mutant=None):
     if TARGET.exists():
         raise FileExistsError(f"refusing to overwrite {TARGET}")
     activity = (ROOT / "crates/bot/src/voice_rooms/game_activity.rs").read_text()
@@ -75,17 +114,17 @@ def prepare():
     schedule = schedule[:schedule.index("#[cfg(test)]")]
     clock = block(schedule, schedule.index("fn now_ms("))
     schedule = schedule.replace(clock, "", 1)
-    poll = re.search(r"const FLUSH_POLL_INTERVAL:.*?;", activity, re.S).group()
-    signature = schedule[schedule.index("pub async fn flush_loop("):]
-    signature = signature[:signature.index("{")]
-    # Baseline has no shutdown input: run that actual loop, not a test-written
-    # approximation. The behavioral tests still compile and show the lost tail.
-    arguments = "pool, collector" if "shutdown" not in signature else "pool, collector, shutdown"
+    if mutant == "drop-final-flush":
+        schedule = without_final_flush(schedule)
+    poll = used_constants(activity, schedule, excluded=("GAME_ACTIVITY_GAP_TIMEOUT_MS",))
+    # Keep the original cases runnable against the pre-shutdown baseline too;
+    # the production service, not this adapter, owns the absolute join budget.
+    arguments = loop_arguments(schedule)
     wrapper = f"""
     async fn launch(pool: sqlx::PgPool, collector: Arc<GameActivityCollector>,
                     shutdown: tokio::sync::watch::Receiver<bool>) {{
         let _ = &shutdown;
-        flush_loop({arguments}).await;
+        let _ = flush_loop({arguments}).await;
     }}
     """
 
@@ -121,8 +160,57 @@ def prepare():
         if template.count(marker) != 1:
             raise ValueError(f"missing or duplicate adapter marker {marker}")
         template = template.replace(marker, source)
-    TARGET.write_text(template)
-    subprocess.run(["rustfmt", "--edition", "2021", str(TARGET)], check=True)
+    # The added failure cases keep collector carry/drain/requeue and the
+    # complete persist path live. Only transaction I/O and time are doubled.
+    persistence_source = activity[activity.index("struct OpenSpan {"):]
+    persistence_source = persistence_source[:persistence_source.index("\n#[cfg(test)]\nmod tests")]
+    persistence_source = persistence_source.replace(clock, "", 1)
+    if mutant == "drop-final-flush":
+        persistence_source = without_final_flush(persistence_source)
+    due = block(activity, activity.index("pub fn flush_due("))
+    persistence_source = (
+        used_constants(activity, due + persistence_source) + "\n" + due + "\n" + persistence_source
+    )
+    persistence_source += f"""
+    async fn launch(pool: sqlx::PgPool, collector: std::sync::Arc<GameActivityCollector>,
+                    shutdown: tokio::sync::watch::Receiver<bool>,
+                    deadline: tokio::time::Instant) -> bool {{
+        trait Completion {{ fn clean(self) -> bool; }}
+        impl Completion for () {{ fn clean(self) -> bool {{ true }} }}
+        impl<T, E> Completion for Result<T, E> {{
+            fn clean(self) -> bool {{ self.is_ok() }}
+        }}
+        let _ = deadline;
+        flush_loop({arguments}).await.clean()
+    }}
+    """
+    persistence = Path(__file__).with_name("persistence.rs").read_text()
+    if persistence.count("// PERSISTENCE_SOURCE") != 1:
+        raise ValueError("missing or duplicate persistence adapter marker")
+    template += "\n" + persistence.replace("// PERSISTENCE_SOURCE", persistence_source)
+    spec = importlib.util.spec_from_file_location(
+        "gateway_lifecycle_composition", Path(__file__).with_name("composition.py")
+    )
+    composition = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(composition)
+    template += "\n" + composition.render(
+        ROOT, block, mutant=mutant if mutant == "drop-flush-retention" else None
+    )
+
+    # Exclusive creation keeps both the refusal and cleanup ownership safe if
+    # another invocation creates the target after the initial existence check.
+    output = TARGET.open("x")
+    try:
+        with output:
+            output.write(template)
+        subprocess.run(["rustfmt", "--edition", "2021", str(TARGET)], check=True)
+    except BaseException:
+        try:
+            TARGET.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup must never replace the original formatter/write error.
+            pass
+        raise
     print(f"Prepared {TARGET.relative_to(ROOT)} from current production source", flush=True)
 
 
@@ -131,8 +219,9 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--prepare", action="store_true")
     group.add_argument("--run", action="store_true")
+    parser.add_argument("--mutant", choices=("drop-final-flush", "drop-flush-retention"))
     args, extra = parser.parse_known_args()
-    prepare()
+    prepare(args.mutant)
     if args.prepare:
         return 0
     try:
