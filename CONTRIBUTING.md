@@ -53,8 +53,8 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
-`check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
-finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
+`check.yml` runs its Rust work as parallel lanes after `job-inputs`:
+`check` (lint: offline guards, cargo-deny, fmt, clippy), the sharded `rust tests`
 (unit, integration and doc tests), the sharded `patch coverage` measurement
 (`coverage-plan` selects the legs, the `coverage-shard` matrix runs them,
 `patch-coverage` merges and gates, so the unit-test signal and the coverage
@@ -65,6 +65,32 @@ cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
 SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.
+
+`test-partition-plan` emits five Rust partitions and five runtime-DB partitions
+through `scripts/ci/run-test-partition.py --lane <lane> --list`. Integration
+ownership is deterministic over Cargo-discovered package/target pairs; adding a
+target does not require an allowlist edit. Unit/bin, gateway and onboarding
+work have separate owners. Each worker retains its disposable database service,
+prepare/verify guards and isolated replays. Stable `rust tests` and
+`ignored db (runtime)` jobs require every worker result and exactly one successful
+receipt per partition. Rust receipts also preserve the original **combined**
+property-test execution budget below 30 seconds; compiling all integrations in
+one timing-only worker would reintroduce the critical path.
+
+Coverage splits both ignored and nonignored sweeps by package before assigning
+legs to eight runners. A remainder partition includes root/testsupport and future
+workspace packages; each package still discovers all of its targets. The
+`two-bot-core/db` feature is applied only where the selected dependency graph can
+accept it; unrelated packages cannot accept that dependency feature flag.
+Changed-crate/reverse-dependency selection, conservative widening, guarded replay
+ownership and the HARD added-line coverage bar remain mandatory. Synthetic
+ownership tests are not real LLVM coverage parity or latency evidence.
+
+A normal reviewed revert of a partitioning follow-up restores its prior sharded
+configuration. Restoring the historical single coverage job requires reverting
+both the follow-up and the coverage foundation together in one reviewed rollback
+commit, preserving later unrelated changes and passing the same required gates.
+
 A job added to `check.yml` must go into `ci-ok`'s `needs:`, result env and result
 evaluation, or carry a reviewed `# ci-ok: exempt <reason>` marker with a pin
 in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is

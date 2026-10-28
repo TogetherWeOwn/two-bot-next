@@ -555,14 +555,41 @@ jobs:
           python3 scripts/ci/check-semgrep-warn.py \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD" --semgrep semgrep
 
-  rust-tests:
-    name: rust tests
+  test-partition-plan:
+    name: test partition plan
     permissions:
       contents: read
     needs: [job-inputs]
+    if: needs.job-inputs.outputs.rust != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust-tests: ${{ steps.plan.outputs.rust-tests }}
+      ignored-db-runtime: ${{ steps.plan.outputs.ignored-db-runtime }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plan test partitions
+        id: plan
+        run: |
+          set -euo pipefail
+          for lane in rust-tests ignored-db-runtime; do
+            matrix=$(python3 scripts/ci/run-test-partition.py --lane "$lane" --list)
+            printf '%s=%s\n' "$lane" "$matrix" >> "$GITHUB_OUTPUT"
+          done
+
+  rust-tests-partition:
+    name: rust test partition
+    permissions:
+      contents: read
+    needs: [job-inputs, test-partition-plan]
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.test-partition-plan.outputs.rust-tests) }}
     # Runner routing: see the note on `check`.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # Suite-only since the HARD patch-coverage measurement split out of this
@@ -784,7 +811,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
-          shared-key: check
+          shared-key: rust-tests-${{ matrix.partition }}
           save-if: ${{ github.event_name == 'push' }}
 
       - name: Prepare isolated test databases
@@ -856,93 +883,22 @@ jobs:
       - name: Generate command reference and verify isolated lifecycle
         run: python3 scripts/generate_command_reference.py --verify-lifecycle
 
-      - name: cargo test (unit and binary, including RSVP store)
+      - name: Run selected test partition
+        id: run_partition
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        # The ticket skip/budget log-assertion modules assert exact counts via
-        # first-match on the process-wide tracing capture; they run serially
-        # in their own step below, so skip them here where sibling and
-        # revision tests emit the same messages concurrently.
-        run: |
-          cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+          CI_TEST_LANE: rust-tests
+          CI_TEST_PARTITION: ${{ matrix.partition }}
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-check-scratch
+        run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"
 
-      # The ops fixture mutates process env; a private DB/reader does not
-      # isolate it from the supervised guild poll in the threaded sweep.
-      - name: cargo test (isolated ops override acceptance)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: |
-          cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
+      - name: Upload successful test partition receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-partition-rust-tests-${{ matrix.partition }}
+          path: ${{ runner.temp }}/test-partition-receipts/rust-tests-${{ matrix.partition }}.json
+          if-no-files-found: error
+          retention-days: 7
 
-      # Global metric deltas must not be satisfied by a sibling hostile-name test.
-      # Reuse the compiled feature graph, in a fresh process with serial tests.
-      - name: cargo test (isolated voice-name filter acceptance)
-        run: cargo test -p two-bot --lib --features two-bot-core/db --locked voice_rooms::tests::name_filter_acceptance -- --test-threads=1
-
-      # Ticket skip/budget log-assertion modules assert exact skip/dropped
-      # counts via first-match on the process-wide tracing capture, while
-      # sibling and revision tests calling recovery_batch emit the same
-      # messages with different counts. Run these modules alone, serially, in
-      # a fresh process (skipped in the parallel step above); reused feature
-      # graph, no DB.
-      - name: cargo test (isolated ticket skip/budget acceptance)
-        run: cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked ticket_runtime::cursor_budget -- --test-threads=1
-
-      # The standalone backup fixture has its own scratch-only URL guard.
-      # Supplying it here executes the round trip rather than its local skip.
-      - name: cargo test (integration, including website acceptance and backup round trip)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-          # RSVP runtime acceptance isolates per-test schemas, so it shares the
-          # consolidated bootstrap; no slice-specific bootstrap names.
-          TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
-          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
-        # The publication regression has its own guarded DB and actual binary
-        # in the dedicated step below; never feed it the round-trip fixture URL.
-        # The invite saturation tests build throwaway schema names from a
-        # wall-clock nanos nonce plus pid, so two tests starting on sibling
-        # threads can observe the same tick and collide on CREATE SCHEMA;
-        # they run serially in their own step below, so skip them here.
-        run: >-
-          cargo test --workspace --test '*' --features two-bot-core/db --locked --
-          --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump
-          --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
-          --skip uses_one_above_i32_max_saturates_and_write_proceeds
-          --skip uses_u64_max_saturates_at_i32_max
-          --skip saturated_write_warns_with_identifiers_and_no_raw_counter
-          --skip normal_uses_round_trip_byte_identical
-          --skip exact_i32_max_writes_without_saturation_warn
-
-      # Invite saturation acceptance is DB-backed and racy under parallelism
-      # (nanos+pid schema nonce; one head collided on CREATE SCHEMA with a
-      # duplicate pg_namespace key), so it runs alone, serially, in a fresh
-      # process (skipped in the parallel sweep above). Sequential tests drop
-      # their schema at finish, so back-to-back nonces cannot collide.
-      - name: cargo test (isolated invite saturation acceptance)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-store --test invite_uses_saturation_acceptance --features two-bot-core/db --locked -- --test-threads=1
-
-      # Reuse the exact feature/target graph above so this measures execution,
-      # not a second compilation. Property tests are pure fixtures (64 cases).
-      - name: property tests stay under 30 seconds
-        run: |
-          start=$SECONDS
-          cargo test --workspace --lib --bins --test '*' --features two-bot-core/db --locked property_
-          elapsed=$((SECONDS - start))
-          printf 'Property suite: %s seconds (budget <30)\n' "$elapsed"
-          test "$elapsed" -lt 30
-
-      - name: cargo test (docs)
-        run: cargo test --workspace --doc --features two-bot-core/db --locked
-
-      - name: Measure metrics RSS (local fixtures only)
-        run: cargo run -p two-bot-core --example metrics_rss --locked
-
-      # Post-suite storage evidence: max_wal_size is a soft target, so the
-      # pre-suite report cannot show peak WAL. This always-runs report brackets
-      # the run with post-suite sizes for the next ENOSPC triage.
       - name: Report Postgres storage headroom (post-suite)
         if: always()
         run: |
@@ -951,8 +907,45 @@ jobs:
             -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
             -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
+  rust-tests:
+    name: rust tests
+    permissions:
+      contents: read
+    needs: [job-inputs, rust-tests-partition]
+    if: always() && needs.job-inputs.outputs.rust != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download successful partition receipts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: test-partition-rust-tests-*
+          path: test-partition-receipts
+          merge-multiple: true
+      - name: Require every test partition
+        env:
+          PARTITION_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          results = json.loads(os.environ['PARTITION_RESULTS'])
+          if not results or any(row.get('result') != 'success' for row in results.values()):
+              print('::error::required test partition did not succeed; failing closed')
+              sys.exit(1)
+          print('All required test partitions succeeded')
+          PY
+      - name: Verify exact successful partition receipts and property budget
+        env:
+          CI_TEST_LANE: rust-tests
+        run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --verify-receipts test-partition-receipts
+
   # Coverage sharding: the HARD patch-coverage measurement runs as N parallel
-  # `coverage-shard` legs. This planner emits which of the 16 legs to run
+  # `coverage-shard` legs. This planner emits which coverage legs to run
   # (changed crates plus reverse dependents; the full set on workspace-wide
   # changes, pushes to main and schedules) and partitions them into shards;
   # each shard runs its legs with --no-report and uploads its LCOV; the
@@ -1022,7 +1015,7 @@ jobs:
           set -euo pipefail
           python3 scripts/ci/plan-coverage-shards.py \
             --base-ref "$PLAN_BASE" --head-ref "$PLAN_HEAD" \
-            --shards 4 --event "$PLAN_EVENT" --ref "$PLAN_REF" \
+            --shards 8 --event "$PLAN_EVENT" --ref "$PLAN_REF" \
             --output plan.json
           python3 - <<'PY'
           import json
@@ -1030,6 +1023,11 @@ jobs:
           plan = json.load(open("plan.json"))
           legs = plan["legs"]
           shards = plan["shards"]
+          import importlib.util
+          spec = importlib.util.spec_from_file_location('coverage_planner', 'scripts/ci/plan-coverage-shards.py')
+          planner = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(planner)
+          planner.validate_plan(plan)
           nonempty = [(index, shard) for index, shard in enumerate(shards) if shard]
           include = [
               {"shard_index": index, "legs": " ".join(shard)}
@@ -1045,7 +1043,7 @@ jobs:
               out.write(f"expected-shards={len(nonempty)}\n")
               out.write(f"legs={' '.join(legs)}\n")
               out.write(f"widened={str(plan['widened']).lower()}\n")
-              out.write(f"reason={plan['reason']}\n")
+              out.write(f"reason={json.dumps(plan['reason'])}\n")
           PY
 
   coverage-shard:
@@ -1383,10 +1381,9 @@ jobs:
       # legs with --no-report, then exports its own LCOV for the
       # `patch-coverage` merge. The `always()` gate still collects coverage
       # unless the run was cancelled or the database prepare/verify failed.
-      # Every leg below is verbatim from the pre-shard single-job replay (same
-      # flags, same skips, same per-section database URLs): sharding changes
-      # where legs run, never what they run, so the merged verdict equals the
-      # old single-job verdict.
+      # The package sweeps retain automatic target discovery, skips and
+      # database boundaries. Real paired-head LCOV parity must still be
+      # measured; synthetic ownership checks alone do not prove it.
       - name: Patch coverage legs (shard instrumented run, no report)
         if: always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' && steps.verify_disposable_postgres.outcome == 'success'
         shell: bash
@@ -1443,12 +1440,37 @@ jobs:
             done
             return 1
           }
+          if [ -z "${SHARD_LEGS//[[:space:]]/}" ]; then
+            echo "::error::empty coverage leg selection" >&2
+            exit 1
+          fi
+          seen_legs=" "
           for leg in $SHARD_LEGS; do
-            case " sweep-nonignored sweep-ignored core-stream_live_store discord-mutation_429_proves_no_effect_channel core-channel_moderation discord-channel_moderation_runtime discord-internal_channel_moderation core-feeds_store cutover-legacy_verify_db cutover-legacy_tls_fence cutover-staging_migrate_db discord-internal_events cutover-raid_list_db cutover-reengagement_list_db cutover-game_activity_report_db core-member_moderation_db store-invite_uses_saturation_acceptance " in
+            case "$seen_legs" in
+              *" $leg "*) echo "::error::duplicate coverage leg: $leg" >&2; exit 1 ;;
+            esac
+            seen_legs+="$leg "
+            case " sweep-nonignored-core sweep-nonignored-discord sweep-nonignored-bot sweep-nonignored-cutover sweep-nonignored-store sweep-nonignored-other sweep-ignored-core sweep-ignored-discord sweep-ignored-bot sweep-ignored-cutover sweep-ignored-store sweep-ignored-other core-stream_live_store discord-mutation_429_proves_no_effect_channel core-channel_moderation discord-channel_moderation_runtime discord-internal_channel_moderation core-feeds_store cutover-legacy_verify_db cutover-legacy_tls_fence cutover-staging_migrate_db discord-internal_events cutover-raid_list_db cutover-reengagement_list_db cutover-game_activity_report_db core-member_moderation_db store-invite_uses_saturation_acceptance " in
               *" $leg "*) ;;
               *) echo "::error::unknown coverage leg: $leg" >&2; exit 1 ;;
             esac
           done
+          sweep_selector() {
+            sweep_features=(--features two-bot-core/db)
+            case "$1" in
+              core) sweep_args=(-p two-bot-core) ;;
+              discord) sweep_args=(-p two-bot-discord) ;;
+              bot) sweep_args=(-p two-bot) ;;
+              cutover) sweep_args=(-p two-bot-cutover) ;;
+              store) sweep_args=(-p two-bot-store) ;;
+              other)
+                sweep_args=(--workspace --exclude two-bot-core --exclude two-bot-discord --exclude two-bot --exclude two-bot-cutover --exclude two-bot-store)
+                feature_flags=$(python3 scripts/ci/plan-coverage-shards.py --sweep-features other) || exit 1
+                read -r -a sweep_features <<< "$feature_flags"
+                ;;
+              *) echo "::error::unknown sweep package" >&2; exit 1 ;;
+            esac
+          }
           # The member-moderation suite's guard panics without MEMBER_TESTDB. It
           # used to be exported just before the ignored sweep; every shard
           # exports it up front now, since the shard running the dedicated
@@ -1471,9 +1493,11 @@ jobs:
           # The invite saturation tests build throwaway schema names from a
           # wall-clock nanos nonce plus pid and collide under parallelism;
           # they run serially in the dedicated re-run below, never here.
-          if selected sweep-nonignored; then
-          cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
-            --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
+          for package in core discord bot cutover store other; do
+          if selected "sweep-nonignored-$package"; then
+          sweep_selector "$package"
+          cov_run "$COV" llvm-cov "${sweep_args[@]}" --lib --bins --tests \
+            "${sweep_features[@]}" --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
             --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only \
             --skip uses_one_above_i32_max_saturates_and_write_proceeds \
@@ -1484,8 +1508,11 @@ jobs:
             --skip settings_jobs::tests::ops_overrides_acceptance_tests::
           # Run the env-mutating ops acceptance alone, before switching away
           # from its disposable bootstrap URL. Failure remains fail-closed.
+          if [ "$package" = bot ]; then
           cov_run "$COV" llvm-cov --no-report -p two-bot --bin two-bot --features two-bot-core/db --locked -- settings_jobs::tests::ops_overrides_acceptance_tests:: --test-threads=1 --skip regenerate_reference_docs
           fi
+          fi
+          done
           # MEMBER_TESTDB is exported up front (see above): the ignored sweep's
           # member-moderation suite runs green here instead of printing 32
           # FAILED lines that the flake ledger misattributes as real flakes.
@@ -1521,9 +1548,11 @@ jobs:
           # two_bot_test_ci URL on this step; they run in their dedicated sweep
           # below after TWO_TEST_DATABASE_URL is pinned to agent_test.
           # The parity acceptance has an exact-URL guard; its dedicated re-run below uses the accepted endpoint.
-          if selected sweep-ignored; then
-          cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
-            --features two-bot-core/db --locked --ignore-run-fail \
+          for package in core discord bot cutover store other; do
+          if selected "sweep-ignored-$package"; then
+          sweep_selector "$package"
+          cov_run "$COV" llvm-cov "${sweep_args[@]}" --lib --bins --tests \
+            "${sweep_features[@]}" --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
             --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected \
             --skip list_is_guild_scoped_selector_shaped_and_read_only \
@@ -1570,6 +1599,7 @@ jobs:
             --skip persisted_rows_hold_ids_timestamps_enums_only \
             --skip resume_continues_from_persisted_cursors_per_family
           fi
+          done
           # Guarded channel suites accept the exact agent_test URL and the
           # workspace bootstrap URL (they always connect to agent_test with
           # an isolated schema). The sweep above already runs them green, and
@@ -1639,7 +1669,7 @@ jobs:
           # Keep the fail-closed starboard replay with the ignored sweep's
           # shard, not every shard. Its exact-URL fixtures cannot rely on
           # the broad sweep's --ignore-run-fail measurement.
-          if selected_any sweep-ignored; then
+          if selected_any sweep-ignored-store; then
           cov_run env TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test "$COV" llvm-cov --no-report -p two-bot-store --locked --test starboard_store --test starboard_api --test starboard_config_updated_at -- --ignored --test-threads=1 --skip regenerate_reference_docs
           fi
           # Export this shard's collected profiles into its own LCOV for the
@@ -2258,14 +2288,17 @@ jobs:
             -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
             -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
-  ignored-db-runtime:
-    name: ignored db (runtime)
+  ignored-db-runtime-partition:
+    name: runtime db partition
     permissions:
       contents: read
-    needs: [job-inputs]
+    needs: [job-inputs, test-partition-plan]
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.test-partition-plan.outputs.ignored-db-runtime) }}
     # Runner routing: see the note on `check`.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-runtime') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
@@ -2461,7 +2494,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
-          shared-key: check
+          shared-key: ignored-db-runtime-${{ matrix.partition }}
           save-if: false
 
       - name: Prepare isolated test databases
@@ -2530,159 +2563,22 @@ jobs:
       - name: Generate command reference before runtime test compilation
         run: python3 scripts/generate_command_reference.py
 
-      - name: onboarding shared runtime acceptance (mock Discord and CI service only)
+      - name: Run selected test partition
+        id: run_partition
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
+          CI_TEST_LANE: ignored-db-runtime
+          CI_TEST_PARTITION: ${{ matrix.partition }}
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-check-scratch
+        run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"
 
-      - name: raid runtime acceptance (mock Discord and CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
+      - name: Upload successful test partition receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-partition-ignored-db-runtime-${{ matrix.partition }}
+          path: ${{ runner.temp }}/test-partition-receipts/ignored-db-runtime-${{ matrix.partition }}.json
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: join-risk runtime acceptance (mock Discord and CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
-
-      - name: containment runtime acceptance (mock Discord and CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
-
-      # The shared observer is outside the runtime-name filters above.
-      - name: hot-path query observer acceptance (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked --lib --bins hotpath_settings_test_support::queries::observer_sees_actual_rows_and_rejects_unbounded_control -- --include-ignored --test-threads=1
-
-      # Fail-closed gate for the fail-open refusal acceptance: the
-      # `fail_open_containment_acceptance` tests are `#[ignore]`d and their
-      # paths do not match the `containment_worker_` filter above, so without
-      # this step a revert of the outcome-unknown + metrics change stays
-      # green. The protected acceptance file owns the test names; this step
-      # selects them by module path instead of renaming them.
-      - name: containment fail-open refusal acceptance (mock Discord and CI service only)
-        run: cargo test -p two-bot --locked --lib --bins fail_open_containment_acceptance -- --include-ignored
-
-      - name: containment worker-path soak (mock Discord and CI service only)
-        run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
-
-      # The evidence filter is its own step on purpose: `containment_worker_`
-      # does not substring-match `containment_runtime_evidence_*`, so these
-      # ten ignored tests ran only in the non-required nightly sweep and the
-      # fail-open coverage sweep until this lane routed them.
-      - name: containment evidence acceptance (mock Discord and CI service only)
-        run: cargo test -p two-bot --locked --lib --bins containment_runtime_evidence_ -- --include-ignored
-
-      # The seeded-frontier test needs the guarded bootstrap URL: its fixture
-      # creates a disposable database off two_bot_test_ci (prepared above) and
-      # refuses any other host, principal or database name.
-      - name: ops backfill frontier acceptance (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked --lib --bins configured_database_reports_seeded_family_frontier -- --include-ignored
-
-      - name: Raid cohort query (CI service container only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-cutover --test raid_list_db --locked -- --ignored
-
-      - name: Reengagement list query (CI service container only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-cutover --test reengagement_list_db --locked -- --ignored
-
-      - name: Game-activity report query (CI service container only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-cutover --test game_activity_report_db --locked
-
-      - name: settings database regressions (CI service only)
-        run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
-
-      - name: voice room store regressions (CI service only)
-        run: cargo test -p two-bot-cutover --test voice_rooms_store --locked -- --ignored
-
-      - name: Voice configuration store (CI service container only)
-        run: cargo test -p two-bot-cutover --test voice_config_store --locked -- --ignored
-
-      - name: Voice create admission store (isolated DBs, CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-cutover --test voice_create_admission_store --locked -- --ignored
-
-      - name: legacy copy acceptance (two owned databases on CI service only)
-        run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
-
-      - name: Legacy verification acceptance (two disposable CI databases)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-cutover --test legacy_verify_db --locked -- --ignored
-
-      - name: Legacy TLS fence acceptance (binaries honor the TLS policy)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored
-
-      - name: Staging migration runner acceptance (real SQLx, disposable CI database)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-cutover --test staging_migrate_db --locked -- --ignored
-
-      # Ignored-DB audit: every #[ignore]d store test file is routed to a step
-      # in this job. These three had no step, so they silently never ran. The
-      # doc-regeneration test in reference_docs.rs stays unrouted on purpose:
-      # it rewrites committed files and must only run as an explicit manual
-      # regen, never in CI.
-      - name: invite store atomicity (CI service container only)
-        run: cargo test -p two-bot-cutover --locked --test invite_store -- --ignored
-
-      - name: member-list catch-up acceptance (CI service container only)
-        run: cargo test -p two-bot-cutover --locked --test member_list_catchup -- --ignored
-
-      - name: cutover reward ladder lib regression (CI service container only)
-        run: cargo test -p two-bot-cutover --locked --lib -- --ignored
-
-      - name: Gateway restart and transaction tests (CI service only)
-        run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-
-      - name: Command runtime acceptance tests (sticky, feeds and leveling, CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked command_runtime_tests -- --ignored --test-threads=1
-
-      - name: Managed feed poller acceptance (CI service and REST doubles only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked feed_jobs -- --ignored --test-threads=1
-
-      - name: Real binary lifecycle acceptance (CI service only, under 60 s)
-        run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
-
-      - name: Consecutive retained restore drills (actual CLI, CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
-
-      - name: Community scorecard captured-stream coverage (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked --bin two-bot scorecard_marks_only_captured_streams -- --ignored
-
-      - name: Member join fact capture round trip (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot --locked --bin two-bot member_join_fact_round_trip_dedupes -- --ignored
-
-      - name: Community rules_accepted capture (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test community_facts_capture -- --ignored --test-threads=1
-
-      # Post-suite storage evidence: max_wal_size is a soft target, so the
-      # pre-suite report cannot show peak WAL. This always-runs report brackets
-      # the run with post-suite sizes for the next ENOSPC triage.
       - name: Report Postgres storage headroom (post-suite)
         if: always()
         run: |
@@ -2690,6 +2586,43 @@ jobs:
             -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
             -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
             -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
+
+  ignored-db-runtime:
+    name: ignored db (runtime)
+    permissions:
+      contents: read
+    needs: [job-inputs, ignored-db-runtime-partition]
+    if: always() && needs.job-inputs.outputs.rust != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download successful partition receipts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: test-partition-ignored-db-runtime-*
+          path: test-partition-receipts
+          merge-multiple: true
+      - name: Require every test partition
+        env:
+          PARTITION_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          results = json.loads(os.environ['PARTITION_RESULTS'])
+          if not results or any(row.get('result') != 'success' for row in results.values()):
+              print('::error::required test partition did not succeed; failing closed')
+              sys.exit(1)
+          print('All required test partitions succeeded')
+          PY
+      - name: Verify exact successful partition receipts and property budget
+        env:
+          CI_TEST_LANE: ignored-db-runtime
+        run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --verify-receipts test-partition-receipts
 
   moderation-db:
     name: moderation db
@@ -3670,7 +3603,7 @@ jobs:
     name: ci-ok
     permissions:
       contents: read
-    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
+    needs: [job-inputs, container-inputs, supply-chain, check, test-partition-plan, rust-tests-partition, ignored-db-runtime-partition, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
@@ -3688,6 +3621,9 @@ jobs:
           SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
+          TEST_PARTITION_PLAN_RESULT: ${{ needs.test-partition-plan.result }}
+          RUST_TEST_PARTITION_RESULT: ${{ needs.rust-tests-partition.result }}
+          RUNTIME_PARTITION_RESULT: ${{ needs.ignored-db-runtime-partition.result }}
           COVERAGE_PLAN_RESULT: ${{ needs.coverage-plan.result }}
           COVERAGE_SHARD_RESULT: ${{ needs.coverage-shard.result }}
           PATCH_COVERAGE_RESULT: ${{ needs.patch-coverage.result }}
@@ -3731,6 +3667,9 @@ jobs:
                   ("tickets-postgres", "TICKETS_RESULT", "RUST_SELECTED"),
                   ("moderation-db", "MODERATION_DB_RESULT", "RUST_SELECTED"),
                   ("rust-tests", "RUST_TESTS_RESULT", "RUST_SELECTED"),
+                  ("test-partition-plan", "TEST_PARTITION_PLAN_RESULT", "RUST_SELECTED"),
+                  ("rust-tests-partition", "RUST_TEST_PARTITION_RESULT", "RUST_SELECTED"),
+                  ("ignored-db-runtime-partition", "RUNTIME_PARTITION_RESULT", "RUST_SELECTED"),
                   ("coverage-plan", "COVERAGE_PLAN_RESULT", "RUST_SELECTED"),
                   ("coverage-shard", "COVERAGE_SHARD_RESULT", "RUST_SELECTED"),
                   ("patch-coverage", "PATCH_COVERAGE_RESULT", "RUST_SELECTED"),

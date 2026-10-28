@@ -49,12 +49,18 @@ def merge_lcov(paths, source_roots=()):
     merged = {}
     if not paths:
         raise ValueError("no shard reports provided")
+    identities = set()
     for raw_path in paths:
         path = Path(raw_path)
         try:
+            stat = path.stat()
+            identity = (stat.st_dev, stat.st_ino)
             text = path.read_text()
         except OSError as exc:
             raise ValueError(f"shard report unreadable: {raw_path}: {exc}")
+        if identity in identities:
+            raise ValueError(f"duplicate shard report identity: {raw_path}")
+        identities.add(identity)
         if not text.strip():
             raise ValueError(f"shard report is empty: {raw_path}")
         current = None

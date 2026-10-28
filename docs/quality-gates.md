@@ -32,7 +32,11 @@ lint-only `check` lane.
   sharded jobs so the unit-test signal and the coverage verdict fail
   independently, each legs step uses `always()` so a failure never suppresses
   coverage output, and the merge refuses anything but exactly N-of-N valid
-  shard reports. The merge converts absolute container `SF:` paths to
+  distinct shard reports (repeating a path, symlink or hard-link identity cannot
+  satisfy N-of-N). Both broad sweeps are package-partitioned; the remainder owns
+  root/testsupport and newly added workspace packages. Planning rejects missing,
+  duplicate, unknown or empty ownership before publishing a matrix. The merge
+  converts absolute container `SF:` paths to
   repository-relative paths with `--source-root /__w/two-bot-next/two-bot-next`;
   its own checkout root and already-relative paths are also accepted. Unknown
   absolute roots and parent traversal fail closed, rather than silently

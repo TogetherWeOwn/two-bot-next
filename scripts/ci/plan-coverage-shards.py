@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Plan coverage shards from changed files (two-bot-next CI sharding).
 
-Emits the coverage leg matrix: which of the 16 patch-coverage legs to run
-(2 workspace sweeps + 15 dedicated ignored/DB legs, matching the
-coverage-shard job in check.yml) and how to partition them into N shards.
+Emits the coverage leg matrix: package partitions of the two workspace
+sweeps plus dedicated guarded ignored/DB replays, matching the coverage-shard
+job in check.yml, and how to partition them into N shards.
 
 Fail-closed: any planning error (unreadable diff, malformed metadata,
 unknown paths) widens to the full set with ``widened: true``. ``main``
@@ -245,10 +245,45 @@ FULL_LEGS = [
     },
 ]
 
-# Minimal always-on set for docs-only / no-crate changes: the non-ignored
-# sweep only. Dedicated core/discord/cutover legs stay out so leaf-crate
-# changes select no dedicated legs (acceptance contract).
-ALWAYS_ON_LEGS = ["sweep-nonignored"]
+# Package partitions keep Cargo's automatic target discovery: a newly added
+# integration target is covered without adding its name here. The remainder
+# owns root/testsupport and any future workspace member, so widening cannot
+# accidentally omit a package that is not yet in the path classifier.
+SWEEP_PACKAGES = {
+    "core": "two-bot-core",
+    "discord": "two-bot-discord",
+    "bot": "two-bot",
+    "cutover": "two-bot-cutover",
+    "store": "two-bot-store",
+    "other": None,
+}
+
+
+def _expand_sweeps(legs):
+    expanded = []
+    for leg in legs:
+        if leg["id"] not in ("sweep-nonignored", "sweep-ignored"):
+            expanded.append(leg)
+            continue
+        for key, package in SWEEP_PACKAGES.items():
+            selector = (f"-p {package}" if package else "--workspace" + "".join(
+                f" --exclude {name}" for name in SWEEP_PACKAGES.values()
+                if name is not None
+            ))
+            part = dict(leg, id=f"{leg['id']}-{key}",
+                        command=leg["command"].replace("--workspace", selector, 1),
+                        crates=[package] if package else ["two-bot-next", "two-bot-testsupport"])
+            # Environment-mutating ops acceptance belongs only to the bot's
+            # nonignored sweep, never every package or every matrix runner.
+            part.pop("supplemental_commands", None)
+            if package == "two-bot" and "supplemental_commands" in leg:
+                part["supplemental_commands"] = leg["supplemental_commands"]
+            expanded.append(part)
+    return expanded
+
+
+FULL_LEGS = _expand_sweeps(FULL_LEGS)
+ALWAYS_ON_LEGS = ["sweep-nonignored-other"]
 
 _CRATE_DIRS = {
     "core": "two-bot-core",
@@ -391,6 +426,22 @@ def reverse_deps_from_metadata(metadata):
     return reverse
 
 
+def sweep_feature_flags(key, metadata):
+    """Apply core/db only when it belongs to a selected package's graph."""
+    if key != "other":
+        return ["--features", "two-bot-core/db"]
+    reverse = reverse_deps_from_metadata(metadata)
+    affected = {"two-bot-core"}
+    pending = list(affected)
+    while pending:
+        for dependent in reverse.get(pending.pop(), ()):
+            if dependent not in affected:
+                affected.add(dependent)
+                pending.append(dependent)
+    remainder = set(reverse) - set(SWEEP_PACKAGES.values())
+    return ["--features", "two-bot-core/db"] if remainder & affected else []
+
+
 def _full_plan(shard_count, reason):
     legs = [leg["id"] for leg in FULL_LEGS]
     return {
@@ -399,6 +450,26 @@ def _full_plan(shard_count, reason):
         "widened": True,
         "reason": reason,
     }
+
+
+def validate_plan(value):
+    """Reject partial or duplicate ownership before publishing a CI matrix."""
+    if not isinstance(value, dict):
+        raise ValueError("coverage plan must be an object")
+    legs, shards = value.get("legs"), value.get("shards")
+    known = {leg["id"] for leg in FULL_LEGS}
+    if (not isinstance(legs, list) or not legs
+            or any(not isinstance(leg, str) or leg not in known for leg in legs)
+            or len(set(legs)) != len(legs)):
+        raise ValueError("coverage plan has empty, duplicate or unknown legs")
+    if not isinstance(shards, list) or not shards:
+        raise ValueError("coverage plan has no shards")
+    if any(not isinstance(shard, list) for shard in shards):
+        raise ValueError("coverage plan shard must be a list")
+    flat = [leg for shard in shards for leg in shard]
+    if (any(not isinstance(leg, str) or leg not in known for leg in flat)
+            or len(flat) != len(set(flat)) or set(flat) != set(legs)):
+        raise ValueError("coverage plan does not assign every selected leg exactly once")
 
 
 def _partition(legs, shard_count):
@@ -533,7 +604,16 @@ def main(argv=None):
     parser.add_argument("--event", default="pull_request")
     parser.add_argument("--ref", default="refs/pull/1/merge")
     parser.add_argument("--output")
+    parser.add_argument("--sweep-features", choices=SWEEP_PACKAGES)
     args = parser.parse_args(argv)
+    if args.sweep_features:
+        try:
+            flags = sweep_feature_flags(args.sweep_features, _metadata_from_cargo())
+        except (ValueError, TypeError, KeyError):
+            print("::error::could not resolve coverage feature graph", file=sys.stderr)
+            return 1
+        print(" ".join(flags))
+        return 0
     try:
         changed = _changed_from_diff(args.base_ref, args.head_ref)
     except Exception:
