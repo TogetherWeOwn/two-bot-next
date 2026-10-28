@@ -18,6 +18,11 @@ tested and reviewable.
 Browse the [documentation map](docs/README.md) before searching individual guides.
 When adding a doc, add its purpose/link there; run `python3 scripts/check_docs_index.py --json`.
 The index merges with union (`.gitattributes`); after rebasing a docs change, run `python3 scripts/check_docs_index.py --dedupe --json` and repair any rows it still reports instead of hand-merging the index.
+Union is a local merge/rebase aid, not proof of GitHub mergeability: GitHub
+can still report an index conflict when local `git merge-tree` is clean.
+Check GitHub's mergeability;
+resolve a reported conflict locally, run the dedupe checker above and repair
+its remaining findings, then push the resolution before expecting GitHub to merge.
 
 ## Pull request contract
 

@@ -41,6 +41,7 @@
     "feed-inspect",
     "ban",
     "tempban",
+    "tempban-list",
     "kick",
     "timeout",
     "warn",
@@ -49,7 +50,8 @@
     "lockdown",
     "unlock",
     "purge-preview",
-    "channel-inspect"
+    "channel-inspect",
+    "moderation-recent"
   ],
   "example_dynamic": [
     { "name": "faq", "description": "Example automation-gated custom command", "enabled": true }
@@ -89,6 +91,7 @@
     "feed-inspect",
     "ban",
     "tempban",
+    "tempban-list",
     "kick",
     "timeout",
     "warn",
@@ -98,6 +101,7 @@
     "unlock",
     "purge-preview",
     "channel-inspect",
+    "moderation-recent",
     "faq"
   ],
   "voice": {

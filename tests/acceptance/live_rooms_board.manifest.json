@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Spec-first pure live-rooms board acceptance; no source changes, gateway, HTTP, database, command publication or production activation.",
+  "baseCommit": "92d85042527b756062bfc9e19c8d77aed0cee0b3",
+  "branch": "test/live-rooms-board-core-acceptance",
+  "protectedFiles": [
+    {"path": "crates/discord/tests/live_rooms_board_acceptance.rs", "sha256": "382ea0fb004d40853db73b86145726e666ed49a4e666a7bf2669574530753da3", "tests": 26},
+    {"path": "crates/discord/tests/support/live_rooms_board_contract.rs", "sha256": "716980bbe610f091b8b28957af1b83737ea01345ac454d9ad2ef4024930c0ef2", "tests": 0}
+  ],
+  "editableBridge": {
+    "path": "crates/discord/tests/support/live_rooms_board_adapter.rs",
+    "baselineSha256": "400e6285c7dd4936bc6f64540e929eda3f65662ac9193e522f299e3ca11019ab",
+    "contract": "Builder replaces only this test-only bridge with conversions and calls to real production pure board core and renderer. No permission policy, filtering, alias/majority logic, seat arithmetic, sorting, truncation or rendering in the bridge; no fixture-specific answers. Protected vocabulary is not a required production API. Preserve the MissingFeature enum variant; the public test contract deliberately keeps baseline distinguishable from legitimate refusals."
+  },
+  "registration": "Cargo automatically discovers the standalone discord integration target; no source or Cargo.toml edits. Existing workspace integration CI covers it without features or services.",
+  "commands": {
+    "acceptance": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test live_rooms_board_acceptance -- --nocapture",
+    "controls": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test live_rooms_board_acceptance control_existing_ -- --nocapture",
+    "format": "cargo fmt --all -- --check",
+    "inventory": "python3 scripts/ci/check-test-inventory.py"
+  },
+  "contract": {
+    "scope": "Snapshot facts through per-viewer entry selection and whole-content rendering, not the future live-state adapter or slash command.",
+    "permissions": "VIEW_CHANNEL AND CONNECT, not staff/manage permissions. Everyone private deny, direct member grant, combined-role allow/deny, final member vote-kick deny, missing assigned/everyone role, Administrator and guild-owner bypass. Unknown roles never reveal room IDs, names, games, counts or overflow.",
+    "occupants": "Humans only; bot-only/empty and untracked rooms absent; bots cannot consume displayed seats or dominate games.",
+    "games": "Existing folded whole-key aliases, majority and owner/force-single/count-idle settings; total humans with actual game facts supplies playing count. Two-way/three-way ties, no facts, disabled presence, and an actual game literally named General are distinguished from fallback. No game metadata when no label.",
+    "seatsAndSort": "None/0 unlimited Open; finite exact remaining seats; at/over limit Full and still linked; open before full, then human count descending and channel ID ascending independent of input order.",
+    "render": "Channel links only; empty-state copy; supplied as-of timestamp and generation; no wall-clock dependency; 26 eligible rooms -> 25 + truthful remaining count; filter before cap; Unicode label <=48 scalar values with visible truncation; <=2000 UTF-16 code units for whole content; shorten long games before discarding rows that can fit. Member-influenced raw and aliased labels cannot mint mentions, pills or active markdown, and retain readable text.",
+    "readiness": "Not ready or absent viewer-role entry -> catching-up refusal, not a partial list or empty-guild claim. Unknown assigned role may refuse or omit all, but cannot disclose.",
+    "fixtureControls": "Two tests call the existing real effective_permissions and apply_room_presence paths independently, using hand-derived expectations. They do not call the missing-feature bridge."
+  },
+  "redProtocol": {
+    "baseline": "There is no production board API on the base commit. Editable test-only bridge returns explicit MissingFeature without implementing the feature. Expected assertion-level RED: 24 contract tests; expected GREEN: 2 real existing-resolver controls. This is a missing-feature contract corpus, not a reproduction of a defective already-existing board.",
+    "requiredEvidence": "At least one admitted compiled execution must show the expected assertion failures and passing controls before final handoff. Admission refusal, compile error or zero selected tests is NOT behavioral RED.",
+    "observedLocal": "Baseline voice controls and the new acceptance target were both refused before Cargo: exit 75, no idle, below-budget slot; no per-worktree fallback. No tests executed, no compiled RED/GREEN claimed.",
+    "greenRequirement": "Builder imports protected files byte-for-byte, wires the editable bridge to production, and makes all 26 tests pass with exact-head CI/review and normal auto-merge gates. Never merge the deliberately red branch alone; test-author corrections return to the acceptance owner."
+  }
+}

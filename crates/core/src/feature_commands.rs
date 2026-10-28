@@ -198,7 +198,7 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
-        // Next-only in-place correction (parity row 46): PATCH-like, so an
+        // Next-only in-place correction (parity row 48): PATCH-like, so an
         // omitted `template`, `description` or `text-trigger` keeps its saved
         // value. `clear-trigger:true` is the only way to remove a trigger.
         // `/command` stays full replacement. Published after `command-enable`;

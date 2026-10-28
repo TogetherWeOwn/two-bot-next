@@ -197,12 +197,13 @@ remaining gateway/accepted-prefix work:
    zero-write: no audit fact, no timestamp touch, no republish. A real change
    republishes the full registry once. A failed publication reports
    saved-but-pending, records the same resync marker as a define and
-   resyncs automatically, with no advice to restart or repeat the edit.
+   resyncs automatically on the next successful full-set publication, with no
+   advice to restart or repeat the edit.
    Confirmations are private and mention-safe and never echo saved text.
 
 ## Pending registry resync
 
-A define, remove or toggle commits its saved definition (and its one audit
+A define, edit, remove or toggle commits its saved definition (and its one audit
 fact) before the full registry is republished. If that publication fails —
 for example Discord refuses the replace-all PUT during an outage — the
 picker would otherwise stay stale until a restart. Instead, the failed
@@ -213,7 +214,7 @@ idempotent, so repeated failures keep exactly one pending row.
 
 The private confirmation names both halves of the outcome truthfully — the
 definition is saved, synchronization is pending and will resync
-automatically on the next publication — and never advises restarting the
+automatically on the next successful full-set publication — and never advises restarting the
 bot, deleting the definition or repeating the mutation (a repeated toggle
 is a no-op that does not republish). The last confirmed discovery snapshot
 does not advance.
