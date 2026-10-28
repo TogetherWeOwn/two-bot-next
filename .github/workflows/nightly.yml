@@ -172,7 +172,10 @@ jobs:
       # used by TestDatabase suites. Skip only those tests here, then run ALL of
       # those suites below with their accepted URL.
       # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
-      # regenerate_reference_docs is a manual regen: it rewrites docs/commands.md and
+      - name: Generate command reference before workspace compilation
+        run: python3 scripts/generate_command_reference.py
+
+      # regenerate_reference_docs is a manual regen: it rewrites docs/generated/commands.md and
       # docs/configuration.md in the checkout, so later tests would compare against
       # regenerated docs and hide drift. It is skipped here on purpose.
       # Quarantine (TOG-34944): the 15 red backfill acceptance tests below run

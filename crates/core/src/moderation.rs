@@ -157,6 +157,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                 .int_range(TEMPBAN_DURATION_MIN_SECONDS, TEMPBAN_DURATION_MAX_SECONDS),
                 CommandOption::reason(),
             ]),
+        crate::tempban_inventory::command_definition(),
         CommandDefinition::new("kick", "Kick a member")
             .permissions(PERM_KICK_MEMBERS)
             .options(vec![CommandOption::target(), CommandOption::reason()]),
@@ -223,6 +224,17 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
             "Privately inspect saved lockdown and live slowmode",
         )
         .permissions(PERM_MANAGE_CHANNELS),
+        CommandDefinition::new(
+            "moderation-recent",
+            "Privately list recent saved moderation actions",
+        )
+        .permissions(PERM_MODERATE_MEMBERS)
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of saved moderation actions (1 is newest)",
+            CommandOptionType::Integer,
+        )
+        .int_range(1, crate::moderation_recent::RECENT_MAX_PAGE)]),
     ]
 }
 
@@ -616,6 +628,7 @@ mod tests {
             [
                 "ban",
                 "tempban",
+                "tempban-list",
                 "kick",
                 "timeout",
                 "warn",
@@ -625,11 +638,23 @@ mod tests {
                 "unlock",
                 "purge-preview",
                 "channel-inspect",
+                "moderation-recent",
             ]
         );
         assert_eq!(ModerationAction::ALL.len(), 9, "reads are not mutations");
-        for (action, name) in ModerationAction::ALL.iter().zip(names.iter()) {
-            assert_eq!(action.command_name(), *name);
+        let mutation_names: Vec<_> = names
+            .iter()
+            .copied()
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "tempban-list" | "purge-preview" | "channel-inspect" | "moderation-recent"
+                )
+            })
+            .collect();
+        assert_eq!(mutation_names.len(), 9);
+        for (action, name) in ModerationAction::ALL.iter().zip(mutation_names) {
+            assert_eq!(action.command_name(), name);
         }
     }
 
@@ -637,8 +662,8 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 7 core + 25 slice-2 + 9 moderation mutations + 2 private reads.
-        assert_eq!(merged.len(), 43);
+        // 7 core + 25 slice-2 + 9 moderation mutations + 4 private reads.
+        assert_eq!(merged.len(), 45);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             &names[..8],
@@ -671,18 +696,19 @@ mod tests {
             );
         }
         assert_eq!(
-            &names[32..37],
-            ["ban", "tempban", "kick", "timeout", "warn"]
+            &names[32..38],
+            ["ban", "tempban", "tempban-list", "kick", "timeout", "warn"]
         );
         assert_eq!(
-            &names[37..],
+            &names[38..],
             [
                 "purge",
                 "slowmode",
                 "lockdown",
                 "unlock",
                 "purge-preview",
-                "channel-inspect"
+                "channel-inspect",
+                "moderation-recent"
             ]
         );
         assert!(merged.iter().all(|d| !d.dm_permission));
@@ -704,6 +730,7 @@ mod tests {
         let channels = Some(PERM_MANAGE_CHANNELS.to_string());
         assert_eq!(is("ban"), ban);
         assert_eq!(is("tempban"), ban);
+        assert_eq!(is("tempban-list"), ban);
         assert_eq!(is("kick"), kick);
         assert_eq!(is("timeout"), moderate);
         assert_eq!(is("warn"), moderate);
@@ -775,19 +802,35 @@ mod tests {
             TEMPBAN_DURATION_MAX_SECONDS
         );
         assert_eq!(
-            json[3]["options"][1]["max_value"],
+            json[4]["options"][1]["max_value"],
             TIMEOUT_DURATION_MAX_SECONDS
         );
-        assert_eq!(json[5]["options"][0]["max_value"], 100);
-        assert_eq!(json[7]["name"], "lockdown");
-        assert_eq!(json[7]["options"].as_array().expect("array").len(), 1);
+        assert_eq!(json[6]["options"][0]["max_value"], 100);
+        assert_eq!(json[8]["name"], "lockdown");
+        assert_eq!(json[8]["options"].as_array().expect("array").len(), 1);
     }
 
     #[test]
     fn private_reads_publish_exact_non_mutating_shapes() {
         let json = serde_json::to_value(moderation_commands()).expect("serializes");
         assert_eq!(
-            json[9],
+            json[2],
+            serde_json::json!({
+                "name": "tempban-list",
+                "description": "Inspect saved temporary-ban expiry work",
+                "dm_permission": false,
+                "default_member_permissions": "4",
+                "options": [{
+                    "name": "page",
+                    "description": "Saved expiry page (10 rows, default 1; due time then work ID order)",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 10000
+                }]
+            })
+        );
+        assert_eq!(
+            json[10],
             serde_json::json!({
                 "name": "purge-preview",
                 "description": "Privately preview a purge without deleting messages",
@@ -804,7 +847,7 @@ mod tests {
             })
         );
         assert_eq!(
-            json[10],
+            json[11],
             serde_json::json!({
                 "name": "channel-inspect",
                 "description": "Privately inspect saved lockdown and live slowmode",
@@ -813,7 +856,23 @@ mod tests {
                 "default_member_permissions": "16"
             })
         );
-        assert_eq!(json.as_array().expect("array").len(), 11);
+        assert_eq!(
+            json[12],
+            serde_json::json!({
+                "name": "moderation-recent",
+                "description": "Privately list recent saved moderation actions",
+                "dm_permission": false,
+                "default_member_permissions": "1099511627776",
+                "options": [{
+                    "name": "page",
+                    "description": "Page of saved moderation actions (1 is newest)",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 20
+                }]
+            })
+        );
+        assert_eq!(json.as_array().expect("array").len(), 13);
     }
 
     #[test]

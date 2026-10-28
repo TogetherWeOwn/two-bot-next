@@ -90,7 +90,7 @@ pub fn picker_components(
             let selected = preselected_game_keys(member_roles);
             let apply = select_row(
                 GAME_SELECT_ID,
-                "What do you play?",
+                "Apply game roles (unselected are removed)",
                 0,
                 10,
                 GAME_PICKS
@@ -112,7 +112,7 @@ pub fn picker_components(
             // distinct from unknown-only input; max covers the full catalog.
             let preview = select_row(
                 GAME_PREVIEW_SELECT_ID,
-                "Preview proposed changes…",
+                "Preview only — no role changes",
                 0,
                 10,
                 GAME_PICKS

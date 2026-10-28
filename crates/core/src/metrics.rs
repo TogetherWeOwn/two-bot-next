@@ -787,6 +787,7 @@ struct Values {
     raid_dropped_joins: [u64; JOIN_QUEUE_DROP_REASONS.len()],
     join_risk_dropped_joins: [u64; JOIN_QUEUE_DROP_REASONS.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
+    gateway_drain_skips: u64,
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
     feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
     feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
@@ -1510,6 +1511,17 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
+    }
+
+    /// One auxiliary leveling drain skipped for a missing table or grant.
+    /// The checkpoint may advance without the failed awards. Label-free:
+    /// SQLSTATE, member ids and error text belong nowhere in labels.
+    pub fn gateway_drain_skip(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.gateway_drain_skips = values.gateway_drain_skips.saturating_add(1);
     }
 
     /// One ticket component interaction refused before spawning: the runtime
@@ -2561,6 +2573,16 @@ impl Metrics {
             out,
             "two_bot_audit_delivery_halt {}",
             values.audit_delivery_halt
+        )
+        .unwrap();
+        // Empty HELP: main sits within 131 bytes of the scrape byte budget
+        // (`eventsub_classification_growth_fits_the_scrape_byte_budget`), and
+        // this counter's three lines must fit without relaxing that headroom.
+        header(&mut out, "two_bot_gateway_drain_skips_total", "counter", "");
+        writeln!(
+            out,
+            "two_bot_gateway_drain_skips_total {}",
+            values.gateway_drain_skips
         )
         .unwrap();
         scalar(
@@ -3803,6 +3825,30 @@ mod tests {
         assert_eq!(series.len(), 1);
         let (_, value) = series[0].rsplit_once(' ').unwrap();
         assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn gateway_drain_skips_counter_is_label_free_and_saturates() {
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_gateway_drain_skips_total counter\n"));
+        assert!(text.contains("two_bot_gateway_drain_skips_total 0\n"));
+        metrics.gateway_drain_skip();
+        metrics.gateway_drain_skip();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_drain_skips_total 2\n"));
+        assert!(!text.contains("two_bot_gateway_drain_skips_total{"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_gateway_drain_skips_total "))
+                .count(),
+            1
+        );
+        metrics.0.lock().unwrap().gateway_drain_skips = u64::MAX;
+        metrics.gateway_drain_skip();
+        assert!(metrics
+            .render(None)
+            .contains(&format!("two_bot_gateway_drain_skips_total {}\n", u64::MAX)));
     }
 
     #[test]

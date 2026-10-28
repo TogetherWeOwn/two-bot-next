@@ -21,6 +21,8 @@ mod cold_authority;
 mod control_plane_overflow_acceptance;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
+#[path = "voice_creator_settings_read_acceptance_tests.rs"]
+mod creator_settings_read_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_disconnect_loud_acceptance_tests.rs"]
@@ -37,6 +39,8 @@ mod event_voice_channels_acceptance;
 mod event_voice_channels_regression;
 #[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
 mod fair_scheduling_acceptance;
+#[path = "voice_config_full_diff_acceptance_tests.rs"]
+mod full_diff_acceptance;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
 #[path = "voice_invite_responder_wiring_tests.rs"]
@@ -65,6 +69,8 @@ mod ownership_receipt_acceptance;
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
 mod responder_admission_acceptance;
+#[path = "voice_import_review_regressions_tests.rs"]
+mod review_regressions;
 #[path = "voice_setup_access_paging_acceptance_tests.rs"]
 mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
@@ -12981,6 +12987,55 @@ async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
     assert!(content.contains("<@303>"), "{content}");
     assert!(content.contains("too loud"), "{content}");
     assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
+}
+
+// The gateway bypasses `handle_voice_interaction` for `/kick`, so this sink is
+// the only production route to the malformed-reason correction. Reverting its
+// `KickReasonInvalid` claim hands the member the router's moderation refusal.
+#[tokio::test]
+async fn kick_vote_sink_answers_a_malformed_reason_with_one_private_correction() {
+    let malformed = [
+        (
+            "duplicated reason",
+            vec![
+                user_option("member", KICK_TARGET),
+                command_option("reason", "too loud"),
+                command_option("reason", "again"),
+            ],
+        ),
+        (
+            "non-text reason",
+            vec![
+                user_option("member", KICK_TARGET),
+                typed_option("reason", CommandOptionValue::Integer(7)),
+            ],
+        ),
+    ];
+    for (case, options) in malformed {
+        let trace = Trace::default();
+        let runtime = kick_room_runtime(
+            &trace,
+            true,
+            vec![
+                voice_member_in(KICK_VOTER, KICK_ROOM),
+                voice_member_in(KICK_TARGET, KICK_ROOM),
+            ],
+        );
+        let replies = Replies::new(trace.clone());
+        let interaction = with_user(
+            voice_interaction(Some(command_data("kick", options)), None, true),
+            KICK_VOTER,
+        );
+        let answered = VoiceResponder::start_kick_vote(&runtime, &replies, &interaction).await;
+        assert!(answered, "{case}: voice owns the callback");
+        let completed = replies.completed.lock().unwrap();
+        assert_eq!(completed.len(), 1, "{case}: exactly one reply");
+        let data = completed[0].data.as_ref().expect("correction body");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL), "{case}");
+        assert!(data.components.is_none(), "{case}: no public ballot");
+        let content = data.content.as_deref().unwrap_or_default();
+        assert!(content.contains("reason:"), "{case}: {content}");
+    }
 }
 
 // Every decline sends no callback at all: the router answers instead, so a

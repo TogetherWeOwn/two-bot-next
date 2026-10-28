@@ -928,14 +928,19 @@ async fn malformed_shapes_do_not_disclose_store_failure_or_consume_a_corrected_a
 
 #[tokio::test]
 async fn omitted_optional_fields_preserve_existing_receipts_and_state() {
-    // Seeded creator: text on, name `room-chat`, viewer role 901. Omitted
-    // optionals keep the stored values and save; only `channel` is required.
+    // Seeded creator: text on, name `room-chat`, viewer role 901. Only
+    // `channel` is required: all-omitted is a read (no save), while a
+    // partially-omitted update keeps the stored values and saves once.
     let on_with_stored = "Companion text channels are on for <#200>: named `room-chat`, visible to occupants, admins and <@&901>. Applies to rooms created from now on; open rooms keep their settings.";
-    let cases: Vec<(Vec<CommandDataOption>, &'static str, CreatorChannel)> = vec![
+    let cases: Vec<(
+        Vec<CommandDataOption>,
+        &'static str,
+        Option<CreatorChannel>,
+    )> = vec![
         (
             vec![option("channel", channel_value(CREATOR))],
             on_with_stored,
-            seeded_creator(),
+            None,
         ),
         (
             vec![
@@ -943,11 +948,11 @@ async fn omitted_optional_fields_preserve_existing_receipts_and_state() {
                 option("enabled", CommandOptionValue::Boolean(false)),
             ],
             "Companion text channels are off for <#200>. Rooms already open keep theirs; new rooms get none.",
-            {
+            Some({
                 let mut c = seeded_creator();
                 c.text_channels = false;
                 c
-            },
+            }),
         ),
         (
             vec![
@@ -955,11 +960,11 @@ async fn omitted_optional_fields_preserve_existing_receipts_and_state() {
                 option("name", string("lounge")),
             ],
             "Companion text channels are on for <#200>: named `lounge`, visible to occupants, admins and <@&901>. Applies to rooms created from now on; open rooms keep their settings.",
-            {
+            Some({
                 let mut c = seeded_creator();
                 c.text_channel_name = Some("lounge".into());
                 c
-            },
+            }),
         ),
         (
             vec![
@@ -967,11 +972,11 @@ async fn omitted_optional_fields_preserve_existing_receipts_and_state() {
                 option("viewer-role", CommandOptionValue::Role(Id::new(42))),
             ],
             "Companion text channels are on for <#200>: named `room-chat`, visible to occupants, admins and <@&42>. Applies to rooms created from now on; open rooms keep their settings.",
-            {
+            Some({
                 let mut c = seeded_creator();
                 c.text_viewer_role_id = Some(42);
                 c
-            },
+            }),
         ),
     ];
     for (options, receipt, expected) in &cases {
@@ -985,7 +990,7 @@ async fn omitted_optional_fields_preserve_existing_receipts_and_state() {
         let observed = fixture.state.lock().expect("observation lock");
         assert_eq!(
             observed.saved,
-            vec![expected.clone()],
+            expected.iter().cloned().collect::<Vec<_>>(),
             "/textchannels omission state"
         );
         assert!(

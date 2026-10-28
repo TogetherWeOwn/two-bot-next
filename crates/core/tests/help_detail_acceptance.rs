@@ -84,7 +84,11 @@ fn optional_command_selector_is_published_without_breaking_index_invocation() {
         help.default_member_permissions, None,
         "discovery is not admin-only"
     );
-    assert_eq!(help.options.len(), 1, "one optional command selector");
+    assert_eq!(
+        help.options.len(),
+        2,
+        "optional command and subcommand selectors"
+    );
     let selector = &help.options[0];
     assert_eq!(selector.name, "command");
     assert_eq!(selector.kind, 3);
@@ -96,6 +100,22 @@ fn optional_command_selector_is_published_without_breaking_index_invocation() {
     assert!(
         selector.choices.is_empty(),
         "custom names cannot be frozen choices"
+    );
+    let focus = &help.options[1];
+    assert_eq!(focus.name, "subcommand");
+    assert_eq!(
+        focus.description,
+        "Subcommand path, space-separated (requires command)"
+    );
+    assert_eq!(focus.kind, 3);
+    assert!(
+        !focus.required.unwrap_or(false),
+        "omission preserves root detail"
+    );
+    assert_eq!(focus.max_length, Some(96));
+    assert!(
+        focus.choices.is_empty(),
+        "branch paths cannot be frozen choices"
     );
 }
 
