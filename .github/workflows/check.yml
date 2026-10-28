@@ -291,6 +291,9 @@ jobs:
       - name: Docs index, orphan and byte-budget conformance (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_index.py' -v
 
+      - name: README-linked docs section acceptance (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_index_fragments.py' -v
+
       - name: parity soak checklist coverage (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py

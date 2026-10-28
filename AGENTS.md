@@ -16,8 +16,16 @@ tested and reviewable.
 5. [`CONSTRAINTS.md`](CONSTRAINTS.md): the quality bar. Read it before writing code. Do not weaken it to make a change pass.
 
 Browse the [documentation map](docs/README.md) before searching individual guides.
-When adding a doc, add its purpose/link there; run `python3 scripts/check_docs_index.py --json`.
-The index merges with union (`.gitattributes`); after rebasing a docs change, run `python3 scripts/check_docs_index.py --dedupe --json` and repair any rows it still reports instead of hand-merging the index.
+When adding a doc, add its purpose/link to the relevant README-linked
+`docs/index-*.md` section, not the central README. Only a new section needs a
+new README link. Rows use `- [Purpose](relative.md)` with destinations relative
+to `docs/`. Run `python3 scripts/check_docs_index.py --json`; README and each
+linked section must stay below 12,000 bytes.
+README and section indexes merge with union (`.gitattributes`); after rebasing
+a docs change, run `python3 scripts/check_docs_index.py --dedupe --json`.
+It removes exact duplicate lines within each linked file, never guesses between
+different labels or cross-section duplicate targets, and leaves unlinked sections
+as orphans. Repair remaining findings instead of hand-merging the indexes.
 Union is a local merge/rebase aid, not proof of GitHub mergeability: GitHub
 can still report an index conflict when local `git merge-tree` is clean.
 Check GitHub's mergeability;

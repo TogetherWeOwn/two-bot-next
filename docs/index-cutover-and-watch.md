@@ -1,0 +1,27 @@
+# Cutover and watch
+
+[Docs map](README.md). Guide destinations are relative to `docs/`.
+
+- [Cutover procedure](cutover.md)
+- [Cutover guard](cutover-guard-checklist.md)
+- [Preflight](cutover-preflight-checklist.md)
+- [Forward sequence](cutover-sequence.md)
+- [Takeover](cutover-production-takeover-design.md)
+- [Migration ledger](cutover-migration-ledger.md)
+- [Image inventory](cutover-image-inventory.md)
+- [T0 input pack](cutover-t0-input-pack.md)
+- [Freeze drill](cutover-freeze-drill.md)
+- [Rollback one-pager](cutover-rollback-onepager.md)
+- [Rollback procedure](cutover-rollback-runbook.md)
+- [Rollback tabletop](cutover-rollback-tabletop.md)
+- [Rollback delta](rollback-delta.md)
+- [Dashboard queries](cutover-dashboard-queries.md)
+- [Watch handover](cutover-watch-handover.md)
+- [Watch checklist](watch-checklist.md)
+- [Watch ack owners](watch-ack-owners.md)
+- [Watch escalation](watch-escalation-path.md)
+- [External uptime](watch-external-uptime.md)
+- [Watch record form](watch-run-record.md)
+- [Signal queries](watch-signal-queries.md)
+- [Signal dry run](watch-signal-dry-run.md)
+- [Error-budget alerts](error-budget-alerts.md)

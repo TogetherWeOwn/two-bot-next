@@ -1,0 +1,27 @@
+# Storage and internal actions
+
+[Docs map](README.md). Guide destinations are relative to `docs/`.
+
+- [Event store](event-store.md)
+- [Database roles](database-roles.md)
+- [Database TLS](database-tls.md)
+- [Migrations](migrations.md)
+- [Legacy data copy](legacy-copy.md)
+- [Legacy verify](legacy-verify.md)
+- [Store cutover gates](store-cutover.md)
+- [Member erasure](privacy.md)
+- [Membership](membership-contract.md)
+- [Send admission](discord-send-admission.md)
+- [REST guard](rest-guard.md)
+- [Audit domain](audit-core.md)
+- [Audit mirror](audit-service.md)
+- [Audit persistence](audit-store.md)
+- [Action signing v2](internal-action-signing-v2.md)
+- [Action persistence](internal-action-store.md)
+- [Action ingress](internal-actions-receiver.md)
+- [Announcements](internal-action-executor.md)
+- [Settings actions](internal-action-settings.md)
+- [Channel executor](internal-channel-moderation.md)
+- [Event executors](internal-event-executors.md)
+- [Member executors](internal-member-execution.md)
+- [Moderation executor](internal-member-moderation.md)

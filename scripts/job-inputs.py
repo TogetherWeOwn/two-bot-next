@@ -303,7 +303,11 @@ def classify(path):
         if PARITY_SCRIPT_MARKER in Path(path).name:
             jobs.add(PARITY)
         return frozenset(jobs)
-    if path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT:
+    # The discoverability control reads README-linked sibling sections at
+    # runtime, so new section names must select Rust without an explicit list.
+    if (path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT
+            or (path.startswith("docs/index-") and path.endswith(".md")
+                and "/" not in path.removeprefix("docs/"))):
         return frozenset({RUST, WORKER})
     if path.startswith(WORKER_PREFIX):
         return frozenset({WORKER})
