@@ -33,6 +33,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -546,11 +547,15 @@ def main(argv=None, env=None):
         return 1
 
     exposition_path = Path(args.exposition_out)
-    ring_path = Path("slow-burn-ring-prev.json")
-    ring_path.write_text(json.dumps(ring) + "\n", encoding="utf-8")
     try:
-        verdict = run_driver(args.node, args.driver, exposition_path, ring_path, now)
-    except TrackError as error:
+        with tempfile.TemporaryDirectory(
+                prefix="slow-burn-ring-", dir=exposition_path.resolve().parent) as scratch:
+            ring_path = Path(scratch) / "prev.json"
+            ring_path.write_text(json.dumps(ring) + "\n", encoding="utf-8")
+            verdict = run_driver(args.node, args.driver, exposition_path, ring_path, now)
+    except (TrackError, OSError) as error:
+        if isinstance(error, OSError):
+            error = TrackError("burn evaluation failed: ring scratch I/O failed")
         print(f"::error::{error}")
         Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
                                            encoding="utf-8")

@@ -551,7 +551,10 @@ async fn queued_commands(
     assert_eq!(requests.len(), 14);
     for (token, content) in [
         ("mock-rsvp-2", "RSVP saved: going."),
-        ("mock-rsvp-3", "RSVP saved: interested."),
+        (
+            "mock-rsvp-3",
+            "RSVP saved: interested (changed from going).",
+        ),
     ] {
         let edits: Vec<_> = requests
             .iter()
@@ -854,7 +857,7 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&edits[1].body).unwrap()["content"],
-        "RSVP saved: interested."
+        "RSVP saved: interested (changed from going)."
     );
     let status: String = tokio::time::timeout(
         Duration::from_secs(60),
