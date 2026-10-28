@@ -19,9 +19,11 @@ NEXTEST_WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github/workflows/reusable-rust-nextest.yml"
 )
 NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
-# The four Rust test lanes (rust-tests, coverage-shard, ignored-db-stores,
-# ignored-db-runtime) each run their own copy of this service; the first one
-# in the file is the reference and the others must match it exactly.
+# The four Rust test lanes (rust-tests-partition, coverage-shard,
+# ignored-db-stores, ignored-db-runtime-partition) each run their own copy
+# of this service; the first one in the file is the reference and the
+# others must match it exactly. The stable rust-tests / ignored-db-runtime
+# jobs are receipt aggregates with no service or shell of their own.
 SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("      agent-testdb:\n")[1:]]
 SERVICE = SERVICES[0]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
@@ -37,14 +39,20 @@ NEXTEST_VERIFY_TAILS = NEXTEST_WORKFLOW_TEXT.split("      - name: Verify disposa
 NEXTEST_SCRIPT = textwrap.dedent(
     NEXTEST_VERIFY_TAILS[0].split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
 )
-POSTGRES_LANES = ("rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime")
+POSTGRES_LANES = ("rust-tests-partition", "coverage-shard", "ignored-db-stores", "ignored-db-runtime-partition")
+# The stable final aggregate each partition worker feeds, keyed by worker.
+# The other two lanes are their own final checks (no partition worker).
+LANE_AGGREGATES = {
+    "rust-tests-partition": ("rust-tests", "rust test partition"),
+    "ignored-db-runtime-partition": ("ignored-db-runtime", "runtime db partition"),
+}
 # Coverage legs need earlier checkpoints on the same 1 GiB tmpfs. Only
 # its WAL targets differ; all five probes must enforce the same safety checks.
 WAL_BUDGETS = {
-    "rust-tests": ("128MB", "32MB"),
+    "rust-tests-partition": ("128MB", "32MB"),
     "coverage-shard": ("128MB", "32MB"),
     "ignored-db-stores": ("512MB", "64MB"),
-    "ignored-db-runtime": ("512MB", "64MB"),
+    "ignored-db-runtime-partition": ("512MB", "64MB"),
     "nextest": ("512MB", "64MB"),
 }
 PROBES = list(zip(POSTGRES_LANES, SCRIPTS)) + [("nextest", NEXTEST_SCRIPT)]
@@ -155,6 +163,35 @@ class PostgresStorageTests(unittest.TestCase):
                 script = textwrap.dedent(
                     verify_tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
                 )
+                # Per-matrix-leg enforcement: prepare/verify run on every leg
+                # of the worker, on the service that leg owns, before the leg
+                # executes its partition. A guard that runs only once, on the
+                # aggregate, or after the partition bounds nothing.
+                if lane in LANE_AGGREGATES:
+                    aggregate, worker_name = LANE_AGGREGATES[lane]
+                    self.assertIn(f"    name: {worker_name}\n", job)
+                    self.assertIn("strategy:", job)
+                    self.assertIn("matrix:", job)
+                    self.assertIn(f"CI_TEST_LANE: {aggregate}\n", job)
+                    self.assertIn("CI_TEST_PARTITION: ${{ matrix.partition }}\n", job)
+                    self.assertIn(
+                        'run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"\n',
+                        job,
+                    )
+                    runner_at = job.index("run-test-partition.py")
+                    self.assertLess(job.index("Prepare isolated test databases"), runner_at)
+                    self.assertLess(job.index("Verify disposable Postgres defaults"), runner_at)
+                    # The stable aggregate must stay a strict receipt check:
+                    # it needs the worker, verifies its receipts, and never
+                    # hosts a dummy service or monolithic test marker.
+                    final = job_text(aggregate)
+                    self.assertIn(f"needs: [job-inputs, {lane}]\n", final)
+                    self.assertIn(
+                        'run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --verify-receipts test-partition-receipts\n',
+                        final,
+                    )
+                    self.assertNotIn("agent-testdb:", final)
+                    self.assertNotIn("cargo test", final)
                 self.assertIn(f"'max_wal_size': '{max_wal}'", script)
                 self.assertIn(f"'min_wal_size': '{min_wal}'", script)
                 # Normalize only the separately pinned WAL literals. Any change

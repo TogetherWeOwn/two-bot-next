@@ -26,6 +26,7 @@ No real compiler, database, network request, timing or LCOV-parity claim occurs.
 import importlib.util
 import json
 import re
+import shutil
 import shlex
 import sys
 import unittest
@@ -421,6 +422,69 @@ class TestLanePartitionAcceptance(unittest.TestCase):
                         sys.executable, str(RUNNER), "--lane", lane, "--partition", row["partition"]]),
                         {"FAIL_NEEDLE": "--locked"})
                     self.assertNotEqual(proc.returncode, 0, "partition swallowed a failed test")
+
+    def test_integration_partitions_prepare_effective_scratch_root_before_cargo(self):
+        # A scratch-child test (backup_response_redaction.rs:25) creates a
+        # child of PAPERCLIP_RUN_SCRATCH_DIR with fs::create_dir. When the
+        # runner rewrites that root for integration commands it must create
+        # the effective root before Cargo inventory/execution; relying on
+        # some sibling target or partition to have created it made a fresh
+        # integration partition fail with ENOENT. This isolates the rewrite
+        # case: the fixture deletes every pre-created root first.
+        shutil.rmtree(self.sandbox.root / "two-bot-check-scratch")
+        rewritten = set()
+        for index in range(3):
+            partition = f"integration-{index}"
+            with self.subTest(partition=partition):
+                self.sandbox.clear()
+                proc = self.sandbox.run(shlex.join([
+                    sys.executable, str(RUNNER), "--lane", "rust-tests",
+                    "--partition", partition]))
+                self.assertEqual(proc.returncode, 0, assertions_message(proc))
+                histories = [
+                    record for record in self.sandbox.records()
+                    if record.get("effective_paperclip_run_scratch_dir") is not None
+                    and record.get("env", {}).get("PAPERCLIP_RUN_SCRATCH_DIR")
+                        != "$RUNNER_TEMP/two-bot-check-scratch"
+                ]
+                self.assertTrue(histories, "no integration command rewrote the scratch root")
+                for record in histories:
+                    effective = Path(record["effective_paperclip_run_scratch_dir"])
+                    rewritten.add(effective)
+                    self.assertTrue(
+                        effective.is_dir(),
+                        f"integration command ran with unprepared scratch root {effective}",
+                    )
+                    child = effective / "s3-response-redaction-fixture"
+                    child.mkdir(exist_ok=True)
+                    self.assertTrue(child.is_dir())
+        self.assertEqual(len(rewritten), 1, "the integration scratch rewrite drifted")
+
+    def test_scratch_preparation_failure_is_fatal_before_cargo_without_receipt(self):
+        # Same contract from the failure side: if preparing the effective
+        # scratch root fails (here a regular file blocks its path), the
+        # runner must fail closed before any Cargo execution and write no
+        # success receipt.
+        blocker = self.sandbox.root / "two-bot-backup-tests"
+        blocker.write_text("not a directory\n")
+        for index in range(3):
+            partition = f"integration-{index}"
+            with self.subTest(partition=partition):
+                self.sandbox.clear()
+                proc = self.sandbox.run(shlex.join([
+                    sys.executable, str(RUNNER), "--lane", "rust-tests",
+                    "--partition", partition]))
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    "scratch preparation failure was tolerated: " + assertions_message(proc),
+                )
+                self.assertEqual(
+                    self.sandbox.records(), [],
+                    "Cargo executed despite the unpreparable scratch root",
+                )
+                receipt = (self.sandbox.root / "test-partition-receipts"
+                           / f"rust-tests-{partition}.json")
+                self.assertFalse(receipt.exists(), "preparation failure wrote a receipt")
 
 
 if __name__ == "__main__":

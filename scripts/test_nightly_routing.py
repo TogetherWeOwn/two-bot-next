@@ -1,11 +1,45 @@
 """Keep guarded fixtures, mock deadlines and strict docs correctly separated."""
+import importlib.util
+import os
 import re
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/nightly.yml"
 CHECK = ROOT / ".github/workflows/check.yml"
+PARTITION_RUNNER = ROOT / "scripts/ci/run-test-partition.py"
+
+
+def job_block(workflow_text, job_key):
+    """Raw text of one top-level job block in a workflow."""
+    lines = workflow_text.splitlines(keepends=True)
+    start = next(
+        i for i, line in enumerate(lines)
+        if re.match(rf"^  {re.escape(job_key)}:\s*$", line)
+    )
+    taken = []
+    for line in lines[start + 1:]:
+        if line.strip() and re.match(r"^  \S", line):
+            break
+        taken.append(line)
+    return "".join(taken)
+
+
+def partition_runner():
+    """The partition runner module, loaded like its workflow callers see it."""
+    sys.path.insert(0, str(PARTITION_RUNNER.parent))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "nightly_routing_run_test_partition", PARTITION_RUNNER,
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(PARTITION_RUNNER.parent))
 
 
 class NightlyRoutingTests(unittest.TestCase):
@@ -242,15 +276,69 @@ class NightlyRoutingTests(unittest.TestCase):
             "store tests are ordinary; an ignore would silently drop PR coverage",
         )
         check = CHECK.read_text()
-        broad = check.split(
+        # The monolithic integration step is gone; ordinary integration
+        # targets are owned by the rust-tests-partition workers through the
+        # partition runner. Retarget the pin at the actual executable
+        # routing: leveling_store must resolve to exactly one integration
+        # partition and run there with the disposable-service environment.
+        self.assertNotIn(
             "- name: cargo test (integration, including website acceptance and backup round trip)",
-            1,
-        )[1].split("\n      - name: ", 1)[0]
-        self.assertIn(
-            "TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
-            broad,
+            check,
+            "the removed monolithic integration step must not return as a marker",
         )
-        self.assertIn("cargo test --workspace --test '*'", broad)
+        # Historical comments may still name the old selector; what must be
+        # gone is the executable form on a run: line.
+        self.assertNotIn("run: cargo test --workspace --test '*'", check)
+        worker = job_block(check, "rust-tests-partition")
+        self.assertIn("CI_TEST_LANE: rust-tests\n", worker)
+        self.assertIn("CI_TEST_PARTITION: ${{ matrix.partition }}\n", worker)
+        self.assertIn(
+            'run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"\n',
+            worker,
+        )
+        runner = partition_runner()
+        targets = []
+        for index in range(3):
+            commands = runner.integration_commands(index)
+            for args, database, integration, _timeout, budget in commands:
+                # Each owning package command also carries a property_ replay
+                # of the same targets; ownership is the ordinary execution.
+                if budget:
+                    continue
+                selected = [
+                    args[i + 1] for i, word in enumerate(args[:-1]) if word == "--test"
+                ]
+                if "leveling_store" in selected:
+                    targets.append((index, args, database, integration))
+        self.assertEqual(
+            len(targets), 1,
+            "leveling_store must have exactly one ordinary integration-partition owner",
+        )
+        _index, args, database, integration = targets[0]
+        self.assertIn("-p", args)
+        self.assertEqual(args[args.index("-p") + 1], "two-bot-core")
+        self.assertIn("--locked", args)
+        self.assertTrue(integration, "the leveling_store owner must be an integration command")
+        self.assertEqual(
+            database, "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        with mock.patch.dict(os.environ, {"RUNNER_TEMP": "/fixture/runner-temp"}, clear=True):
+            env = runner.environment(database, integration)
+        self.assertEqual(
+            env["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        self.assertEqual(env["TWO_RSVP_RUNTIME_TEST_DATABASE_URL"], database)
+        self.assertEqual(
+            env["TWO_BOT_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_next_backup_ci",
+        )
+        # The stable aggregate keeps the result required; the worker, not
+        # the aggregate, carries the execution.
+        aggregate = job_block(check, "rust-tests")
+        self.assertIn("needs: [job-inputs, rust-tests-partition]\n", aggregate)
+        aggregate_header = check.split("\n  ci-ok:", 1)[1].split("steps:", 1)[0]
+        self.assertIn("rust-tests", aggregate_header)
         nightly = WORKFLOW.read_text()
         sweep = nightly.split("- name: Full workspace sweep including ignored tests", 1)[1]
         sweep = sweep.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]

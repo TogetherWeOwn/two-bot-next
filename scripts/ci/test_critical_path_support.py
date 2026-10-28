@@ -395,6 +395,10 @@ class Sandbox:
         self.rows = rows if rows is not None else inventory()
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        # Pre-create the shared fixture scratch root. Focused acceptance tests
+        # may delete it to prove runners prepare the root themselves, but
+        # unrelated fixtures must not depend on a sibling target creating it.
+        (self.root / "two-bot-check-scratch").mkdir()
         self.log = self.root / "calls.jsonl"
         (self.root / "inventory.json").write_text(json.dumps(self.rows))
         self.graph = graph if graph is not None else metadata(self.rows)
@@ -445,7 +449,8 @@ effective_env = {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
 if 'PAPERCLIP_RUN_SCRATCH_DIR' in effective_env:
     effective_env['PAPERCLIP_RUN_SCRATCH_DIR'] = effective_env['PAPERCLIP_RUN_SCRATCH_DIR'].replace(os.environ['RUNNER_TEMP'], '$RUNNER_TEMP')
 with open(os.environ['ACCEPTANCE_LOG'], 'a') as out:
-    out.write(json.dumps({'argv': args, 'env': effective_env}) + '\\n')
+    out.write(json.dumps({'argv': args, 'env': effective_env,
+                         'effective_paperclip_run_scratch_dir': os.environ.get('PAPERCLIP_RUN_SCRATCH_DIR')}) + '\\n')
 needle = os.environ.get('FAIL_NEEDLE')
 if needle and needle in ' '.join(args):
     raise SystemExit(41)
