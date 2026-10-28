@@ -17,12 +17,17 @@ use std::time::Duration;
 
 use common::{MockRest, RestRequest, ScriptedResponse};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{
+    postgres::{PgConnectOptions, PgPoolOptions},
+    PgPool,
+};
 use twilight_model::{application::interaction::Interaction, channel::Message};
 use two_bot_core::{
+    custom_command_service::{self as service, ServiceError},
     custom_command_store as store,
     custom_commands::{
-        reserved_command_names, AuditRecord, AutomationMessageAcceptance, StoredCommand,
+        reserved_command_names, AuditRecord, AutomationMessageAcceptance, CloneCommandInput,
+        CommandError, StoredCommand,
     },
     InteractionRouter, RouterGates,
 };
@@ -678,19 +683,34 @@ refusal_test!(
 async fn mixed_case_names_normalize_and_boundary_length_is_admitted() {
     let f = Fixture::new(true).await;
     let before = f.definitions().await;
-    let destination = "123456789012345678901234567890_-";
+    let destination = "abcdefghijklmnopqrstuvwxyz1234_-";
+    let requested_destination = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234_-";
     assert_eq!(destination.len(), 32);
+    assert_eq!(requested_destination.len(), 32);
+    assert_ne!(destination, requested_destination);
     let result = f
         .runtime
         .handle_interaction(
-            &clone_request(6200, "SOURCE", &destination.to_uppercase()),
+            &clone_request(6200, "SOURCE", requested_destination),
             Some("Fixture Guild"),
         )
         .await;
     let rows = f.definitions().await;
+    let requests = f.http.requests();
     f.close().await;
     assert_success(result);
     assert_copy(&rows, &before, destination, true);
+    let publications: Vec<_> = requests.iter().filter(|r| is_publish(r)).collect();
+    assert_eq!(publications.len(), 1);
+    let published = body(publications[0]);
+    let names: Vec<_> = published
+        .as_array()
+        .expect("full-set registry")
+        .iter()
+        .map(|d| d["name"].as_str().expect("published command name"))
+        .collect();
+    assert_eq!(names.iter().filter(|name| **name == destination).count(), 1);
+    assert!(!names.contains(&requested_destination));
 }
 
 #[tokio::test]
@@ -726,6 +746,40 @@ async fn forged_missing_duplicate_or_wrong_typed_options_never_select_a_partial_
         assert!(!reply.contains("saved /"));
     }
     assert_eq!(rows, before);
+    assert!(!requests.iter().any(is_publish));
+}
+
+#[tokio::test]
+async fn unknown_options_with_valid_names_refuse_without_side_effects() {
+    let f = Fixture::new(true).await;
+    let before = f.definitions().await;
+    let history = f.audits().await;
+    let result = f
+        .runtime
+        .handle_interaction(
+            &interaction(
+                6307,
+                "command-clone",
+                json!([
+                    {"name":"source","type":3,"value":"source"},
+                    {"name":"destination","type":3,"value":"copy"},
+                    {"name":"template","type":3,"value":"evil"}
+                ]),
+            ),
+            Some("Fixture Guild"),
+        )
+        .await;
+    let rows = f.definitions().await;
+    let audits = f.audits().await;
+    let requests = f.http.requests();
+    f.close().await;
+    assert_success(result);
+    assert_eq!(
+        private_reply(&requests, 6307),
+        "Only source and destination name options are supported."
+    );
+    assert_eq!(rows, before);
+    assert_eq!(audits, history);
     assert!(!requests.iter().any(is_publish));
 }
 
@@ -824,6 +878,53 @@ async fn permission_and_feature_refusals_precede_store_access_and_are_private() 
     let disabled_reply = private_reply(&requests, 6501).to_lowercase();
     assert!(disabled_reply.contains("disabled"));
     assert!(!requests.iter().any(is_publish));
+}
+
+#[tokio::test]
+async fn disabled_service_refuses_before_pool_access_with_enabled_tripwire_control() {
+    // Close a lazy pool before either call: any store access gets PoolClosed,
+    // and neither the test nor the enabled control can open a connection.
+    let pool = PgPoolOptions::new().connect_lazy_with(
+        PgConnectOptions::new()
+            .host("agent-testdb")
+            .port(5432)
+            .username("agent_test")
+            .password("")
+            .database("two_bot_test_clone_tripwire"),
+    );
+    pool.close().await;
+    let input = CloneCommandInput {
+        source: "source".to_owned(),
+        destination: "copy".to_owned(),
+    };
+    let disabled = service::clone_command(
+        &pool,
+        false,
+        GUILD,
+        ACTOR,
+        &input,
+        "clone-service-disabled",
+        OLD_AT,
+    )
+    .await;
+    let enabled = service::clone_command(
+        &pool,
+        true,
+        GUILD,
+        ACTOR,
+        &input,
+        "clone-service-enabled",
+        OLD_AT,
+    )
+    .await;
+    assert!(matches!(
+        disabled,
+        Err(ServiceError::Validation(CommandError::AutomationsDisabled))
+    ));
+    assert!(matches!(
+        enabled,
+        Err(ServiceError::Storage(sqlx::Error::PoolClosed))
+    ));
 }
 
 #[tokio::test]
@@ -1250,8 +1351,8 @@ async fn store_insert_collision_after_validation_cannot_fall_back_to_overwriting
         "clone must reach the actual INSERT, not silently remain unknown"
     );
     assert!(
-        matches!(result, Err(CustomCommandError::Storage) | Ok(true)),
-        "bounded create conflict: {result:?}"
+        matches!(result, Ok(true)),
+        "create-only collision must return an actionable refusal: {result:?}"
     );
     assert_eq!(
         definition(&rows, GUILD, "copy"),
@@ -1269,9 +1370,10 @@ async fn store_insert_collision_after_validation_cannot_fall_back_to_overwriting
         .iter()
         .any(|a| !history.contains(a) && a["outcome"] == "ok"));
     assert!(!requests.iter().any(is_publish));
-    assert!(!private_reply(&requests, 7050)
-        .to_lowercase()
-        .contains("saved"));
+    assert_eq!(
+        private_reply(&requests, 7050),
+        "Destination command already exists. Choose a new name; cloning never overwrites."
+    );
 }
 
 // Unchanged public behaviors are controls: a missing clone handler cannot
