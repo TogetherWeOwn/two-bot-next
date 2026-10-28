@@ -1,7 +1,9 @@
 //! Protected acceptance: personal `/remind` with channel delivery.
 //!
-//! Keep this file verbatim in the implementation handoff. Only the
-//! registration in `command_runtime_tests.rs` is unprotected. The tests drive
+//! Original implementation-handoff acceptance. The review repair updates only
+//! the successful-create fixture to carry resolved channel posting authority;
+//! its behavioral assertions remain unchanged. The registration in
+//! `command_runtime_tests.rs` is unprotected. The tests drive
 //! the product through its generic seams only — the shared interaction router,
 //! the guild publish set, `CommandRuntime::on_interaction`, and the existing
 //! scheduled ticker — with a recording REST double and an injected tick clock.
@@ -13,7 +15,8 @@
 //! to the acceptance author, never get edited on the build card):
 //!
 //! - Surface: top-level `remind`, guild-only (`dm_permission = false`, DMs out
-//!   of scope), no permission gate (any member). Subcommands: `me` (required
+//!   of scope), no staff permission gate. Creation requires channel posting
+//!   authority; list/cancel remain available without it. Subcommands: `me` (required
 //!   integer `in` = minutes, required string `text`), `list`, `cancel`
 //!   (required string `target`: full id, unique id prefix, or unique reminder
 //!   text; ambiguous or unknown targets refuse without cancelling anything).
@@ -117,7 +120,7 @@ fn remind_me(member: u64, minutes: i64, text: &str) -> Interaction {
             )],
         ),
         member,
-        Permissions::empty(),
+        Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES,
     )
 }
 

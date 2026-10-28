@@ -15,7 +15,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -24,6 +24,7 @@ use std::{
 use crate::voice_room_plan::{
     category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
 };
+use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -53,7 +54,9 @@ use twilight_model::{
 };
 use two_bot_core::voice_presence::MemberPresence;
 use two_bot_core::{
-    evaluate_permissions as evaluate_health, metrics, now_iso,
+    evaluate_permissions as evaluate_health,
+    message_safety::{text_len, CONTENT_LIMIT},
+    metrics, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
@@ -65,8 +68,9 @@ use two_bot_core::{
         VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
-        diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
-        DIFF_HASH_CHARS,
+        diff_configuration, diff_content_hash, render_preview, render_review_preview,
+        serialize_full_review, skip_unknown_channels, ConfigDiff, FullReviewError, DIFF_HASH_CHARS,
+        FULL_REVIEW_BYTE_LIMIT,
     },
     voice_create_admission::{
         CreateAdmissionConfig, RefusalReason, MAX_CREATE_COOLDOWN_SECS, MAX_ROOMS_PER_GUILD,
@@ -158,6 +162,18 @@ impl std::fmt::Display for StoreError {
             Self::Conflict => "the store reported a conflict",
         })
     }
+}
+
+/// One live event-voice binding: the Discord channel hosting an event
+/// instance's voice room, for the guild presence repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventVoiceBinding {
+    /// The bound Discord voice channel.
+    pub channel: Snowflake,
+    /// The scheduled event id.
+    pub event_id: String,
+    /// The event instance start (`instance_starts_at`).
+    pub instance: OffsetDateTime,
 }
 
 /// No synchronous database work is allowed on the gateway event loop.
@@ -369,6 +385,64 @@ pub trait RoomPersistence: Send + Sync {
         room: Snowflake,
         member: Snowflake,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Open an event-voice presence span for a join/move-in: the store
+    /// resolves (event, instance) from the channel binding. Channels with no
+    /// event mapping write nothing, and an already-open span is kept.
+    /// Default no-op for stores without the event voice tables.
+    fn record_event_voice_join(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let _ = (channel, member);
+        async { Ok::<(), StoreError>(()) }
+    }
+    /// Stamp `left_at` on the member's open event-voice span in the
+    /// channel's event. Idempotent: no open span is success. Default no-op
+    /// for stores without the event voice tables.
+    fn record_event_voice_leave(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let _ = (channel, member);
+        async { Ok::<(), StoreError>(()) }
+    }
+    /// Live event-voice bindings for one guild, for the presence repair.
+    /// Guild scope comes from the scheduled-event mirror. Default empty for
+    /// stores without the event voice tables.
+    fn event_voice_guild_bindings(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<EventVoiceBinding>, StoreError>> + Send {
+        let _ = guild;
+        async { Ok::<Vec<EventVoiceBinding>, StoreError>(Vec::new()) }
+    }
+    /// Repair-only backstop: ensure one open span per occupant of the
+    /// instance. Never closes spans; returns rows inserted. Default no-op
+    /// for stores without the event voice tables.
+    fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        occupants: &[Snowflake],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (event_id, instance, occupants);
+        async { Ok::<u64, StoreError>(0) }
+    }
+    /// Stamp `left_at` on the open spans of members absent from the
+    /// authoritative occupant list; returns rows closed. An empty list
+    /// closes every open span of the instance. Default no-op for stores
+    /// without the event voice tables.
+    fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        present: &[Snowflake],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (event_id, instance, present);
+        async { Ok::<u64, StoreError>(0) }
+    }
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -614,6 +688,75 @@ impl RoomPersistence for PgRoomStore {
         member: Snowflake,
     ) -> Result<(), StoreError> {
         self.remove_join_grant(guild, room, member)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn record_event_voice_join(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.record_event_voice_join(&channel.to_string(), &member.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn record_event_voice_leave(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.record_event_voice_leave(&channel.to_string(), &member.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn event_voice_guild_bindings(
+        &self,
+        guild: Snowflake,
+    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
+        // A corrupt (non-numeric) binding cannot map to live channels; the
+        // bound reconcile pass already reports it, so the repair skips it.
+        self.bound_event_voice_channels_for_guild(&guild.to_string())
+            .await
+            .map_err(store_error)
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|(event_id, instance, channel)| {
+                        channel
+                            .parse::<Snowflake>()
+                            .ok()
+                            .map(|channel| EventVoiceBinding {
+                                channel,
+                                event_id,
+                                instance,
+                            })
+                    })
+                    .collect()
+            })
+    }
+
+    async fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        occupants: &[Snowflake],
+    ) -> Result<u64, StoreError> {
+        let occupants: Vec<String> = occupants.iter().map(|id| id.to_string()).collect();
+        self.flush_event_voice_presence(event_id, instance, &occupants)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        present: &[Snowflake],
+    ) -> Result<u64, StoreError> {
+        let present: Vec<String> = present.iter().map(|id| id.to_string()).collect();
+        self.close_event_voice_spans_absent(event_id, instance, &present)
             .await
             .map_err(store_error)
     }
@@ -2265,6 +2408,16 @@ impl LiveGuild {
         self.voice_update_at(member, channel, bot, wall_ms())
     }
 
+    /// The member's currently tracked voice channel, if any. Read before
+    /// `voice_update_*` so the sink can tell joins, leaves and moves apart
+    /// for the event-voice presence transition.
+    fn member_channel(&self, member: Snowflake) -> Option<Snowflake> {
+        self.read_state()
+            .members
+            .get(&member)
+            .and_then(|state| state.channel_id)
+    }
+
     /// Ticket plus the seeding-TEST occupancy sample: the humans already
     /// present in the target channel when the join arrived, excluding the
     /// joiner. The sample is `None` for mechanical transitions (joining a
@@ -3162,7 +3315,7 @@ const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 /// to 10 s for a connection, but a lobby join must not wait that long.
 const CREATORS_REFRESH_DEBOUNCE_MS: u64 = 10_000;
 const CREATORS_REFRESH_INTERVAL_MS: u64 = 300_000;
-const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
+pub(crate) const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 /// How long join-path creator re-reads back off after a failed, timed-out or
 /// refused bulk store read: one slow pool must not serialize every later
 /// join behind another long wait. A successful store read clears it early.
@@ -7460,6 +7613,162 @@ pub trait VoiceEventSink: Send + Sync {
 struct GuildActor {
     live: LiveGuild,
     tx: mpsc::UnboundedSender<ActorCommand>,
+    backpressure: ActorInboxBackpressure,
+}
+
+/// Cap on outstanding fire-and-forget inbox entries per guild actor. Past
+/// the cap [`GuildActor::try_send_command`] refuses (never blocks or
+/// evicts) and counts the drop; the actor loop releases one permit per
+/// received bufferable command, so a draining actor never wedges.
+/// Reply-bearing commands bypass the gate: dropping a reply would hang its
+/// caller, while fire-and-forget state reconverges on the next frame, with
+/// exceptions: a refused ticketed `Join` drops its ticket, and only a
+/// fresh channel transition re-tickets, so the member rejoins to get a room;
+/// and control-plane updates bypass losslessly — saved creation-policy and
+/// naming-settings switches, plus the startup display-name seed batch — so
+/// a saved switch never leaves the worker on the previous state past the cap.
+const VOICE_ACTOR_INBOX_CAP: usize = 256;
+
+/// Backpressure ledger for one guild actor's inbox
+/// ([`VOICE_ACTOR_INBOX_CAP`]). Cloned into the actor task: every gated
+/// send consumes one permit and every receive of a bufferable command
+/// releases one, so the in-flight count is the live inbox depth.
+/// Reply-bearing traffic never touches the ledger (see
+/// [`ActorCommand::is_bufferable`]), which keeps the acquire/release
+/// pairing exact: every gated bufferable send goes through
+/// [`GuildActor::try_send_command`], and the rare lossless control-plane
+/// sends claim an uncounted slot up front (see
+/// [`GuildActor::send_command_lossless`]), so every bufferable receive
+/// releases exactly one held slot.
+#[derive(Debug, Clone, Default)]
+struct ActorInboxBackpressure {
+    in_flight: Arc<AtomicUsize>,
+    overflow_dropped: Arc<AtomicU64>,
+}
+
+impl ActorInboxBackpressure {
+    /// Admit one fire-and-forget command, or refuse at capacity. A refusal
+    /// rolls its optimistic increment back immediately and counts the drop;
+    /// the caller must not touch the channel afterwards.
+    fn try_acquire(&self) -> bool {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= VOICE_ACTOR_INBOX_CAP {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.overflow_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics::global().voice_inbox_overflow_dropped();
+            return false;
+        }
+        true
+    }
+
+    /// Claim a slot that can never refuse, for bufferable lossless sends:
+    /// the send cannot fail closed, so the slot is held without consulting
+    /// the cap and without counting. Reception still releases it, which
+    /// keeps the acquire/release pairing exact (a lossless send that never
+    /// acquired would let its receive spend a gated send's slot and admit
+    /// past the cap over the actor's lifetime).
+    fn acquire_unchecked(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Release the permit a received command consumed. Only bufferable
+    /// commands consume permits, so only they release: reply-bearing
+    /// receives must not inflate capacity. Saturating: a receive must
+    /// never drive the count negative (which would wedge the gate shut);
+    /// every production send acquires first, so saturation only engages
+    /// for test-only direct sends.
+    fn release_for(&self, command: &ActorCommand) {
+        if command.is_bufferable() {
+            let _ = self
+                .in_flight
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |in_flight| {
+                    in_flight.checked_sub(1)
+                });
+        }
+    }
+
+    /// Roll back an acquisition whose channel send failed (actor gone):
+    /// not an overflow, so the counter stays untouched.
+    fn rollback(&self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Outstanding gated entries: the live inbox depth.
+    fn depth(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Lifetime refused sends. Monotonic per actor.
+    fn dropped(&self) -> u64 {
+        self.overflow_dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl GuildActor {
+    /// Send a command unless the inbox already holds
+    /// [`VOICE_ACTOR_INBOX_CAP`] outstanding fire-and-forget entries, in
+    /// which case the command is refused (`false`) and counted by
+    /// [`Self::inbox_overflow_dropped`]. A refusal touches no channel.
+    /// Reply-bearing commands bypass the gate and are never refused: a
+    /// dropped reply would hang its caller.
+    fn try_send_command(&self, command: ActorCommand) -> bool {
+        if !command.is_bufferable() {
+            return self.tx.send(command).is_ok();
+        }
+        if !self.backpressure.try_acquire() {
+            return false;
+        }
+        if self.tx.send(command).is_ok() {
+            true
+        } else {
+            self.backpressure.rollback();
+            false
+        }
+    }
+
+    /// Deliver a control-plane command past the inbox gate. The channel is
+    /// unbounded, so this only fails when the actor is gone; it never blocks
+    /// and never counts a refusal. Saved creation-policy and naming-settings
+    /// updates use this: a refused `AccessChanged` would leave the worker
+    /// enforcing the previous policy after the administrator already saw
+    /// "Saved", and a refused `NameSettingsChanged` would likewise keep the
+    /// previous settings and skip the prompt reload. Persisted creator
+    /// updates (including default privacy) and the startup display-name seed
+    /// use the same lossless path.
+    /// Bufferable commands still claim an uncounted ledger slot up front,
+    /// released on reception like any other: without it the receive would
+    /// spend a gated send's slot and the gate would admit past the cap.
+    /// The depth gauge briefly includes concurrent lossless entries;
+    /// administrator saves are rare enough that the bound stays effective.
+    fn send_command_lossless(&self, command: ActorCommand) -> bool {
+        let acquired = command.is_bufferable();
+        if acquired {
+            self.backpressure.acquire_unchecked();
+        }
+        if self.tx.send(command).is_ok() {
+            return true;
+        }
+        if acquired {
+            self.backpressure.rollback();
+        }
+        false
+    }
+
+    /// Fire-and-forget sends refused past the inbox cap. Monotonic per actor.
+    /// Test-observable seam: production reads this through `WorkerStatus`
+    /// (the `Status` branch reports the same ledger), so the accessor is
+    /// compiled for tests only instead of warning as unused.
+    #[cfg(test)]
+    fn inbox_overflow_dropped(&self) -> u64 {
+        self.backpressure.dropped()
+    }
+
+    /// Outstanding gated inbox entries: the live inbox depth. Test-only,
+    /// like [`Self::inbox_overflow_dropped`]; production reads the depth
+    /// through `WorkerStatus::inbox_pending`.
+    #[cfg(test)]
+    fn inbox_depth(&self) -> usize {
+        self.backpressure.depth()
+    }
 }
 
 enum ActorCommand {
@@ -7470,6 +7779,11 @@ enum ActorCommand {
         member_id: Snowflake,
         display: String,
     },
+    /// Startup display-name seed: one batch for every cached member, so a
+    /// guild with more members than inbox slots still seeds every name
+    /// (room owners included) instead of refusing the tail. Sent losslessly
+    /// like other control-plane updates; each entry applies as a `Display`.
+    DisplaySeed(Vec<(Snowflake, String)>),
     /// The guild's voice configuration was written (`/import`): automatic
     /// names use the same settings `/name` Restore reads from now on.
     NameSettingsChanged(NameSettings),
@@ -7491,6 +7805,15 @@ enum ActorCommand {
         seed: u64,
         created_at: String,
         received: tokio::time::Instant,
+    },
+    /// A member's voice channel changed (join, leave or move): the worker
+    /// records the event-voice presence transition. Sent only on actual
+    /// transitions (same-channel frames send none), alongside Join/Reconcile.
+    /// Idempotent at the store, so buffering and replays are safe.
+    EventVoicePresence {
+        member_id: Snowflake,
+        previous: Option<Snowflake>,
+        current: Option<Snowflake>,
     },
     /// A new or edited creator row (`/create`, `/textchannels`): the worker
     /// swaps it in for rooms created from here on.
@@ -7572,11 +7895,32 @@ enum ActorCommand {
     },
 }
 
+#[derive(PartialEq, Eq)]
+enum ActorInitStateKey {
+    DisplaySeed,
+    NameSettings,
+    Access,
+    Creator(Snowflake),
+}
+
 impl ActorCommand {
+    /// Startup snapshots and acknowledged saves must survive ordinary init
+    /// churn. Only the latest value for each key is needed before loading.
+    fn init_state_key(&self) -> Option<ActorInitStateKey> {
+        match self {
+            Self::DisplaySeed(_) => Some(ActorInitStateKey::DisplaySeed),
+            Self::NameSettingsChanged(_) => Some(ActorInitStateKey::NameSettings),
+            Self::AccessChanged(_) => Some(ActorInitStateKey::Access),
+            Self::CreatorAdded(creator) => Some(ActorInitStateKey::Creator(creator.channel_id)),
+            _ => None,
+        }
+    }
+
     /// True for fire-and-forget state that can wait for the worker:
-    /// snapshots, voice frames and config swaps apply in arrival order
-    /// once it loads. Anything else carries a one-shot reply no worker
-    /// exists to answer yet (status, room commands, vote-kick, test
+    /// snapshots, voice frames, config swaps and public ballot message
+    /// references apply in arrival order once it loads. Anything else carries
+    /// a one-shot reply no worker exists to answer yet (status, room commands,
+    /// vote-kick start/ballot/room queries, test
     /// probes), so [`load_actor_worker`] drops it while initialization is
     /// pending: the caller sees `None` and takes the existing "syncing,
     /// try again shortly" path instead of hanging until recovery.
@@ -7587,29 +7931,50 @@ impl ActorCommand {
             self,
             ActorCommand::Reconcile
                 | ActorCommand::Display { .. }
+                | ActorCommand::DisplaySeed(_)
                 | ActorCommand::NameSettingsChanged(_)
                 | ActorCommand::RoomFactsChanged(_)
                 | ActorCommand::Join { .. }
+                | ActorCommand::EventVoicePresence { .. }
                 | ActorCommand::CreatorAdded(_)
                 | ActorCommand::RefreshCreators
                 | ActorCommand::AccessChanged(_)
+                | ActorCommand::KickMessage { .. }
         )
     }
 }
 
-/// Cap on commands buffered while actor initialization is pending: voice
-/// state converges on the latest frame and `Reconcile` is idempotent, so
-/// a long outage sheds the oldest instead of growing without bound.
+/// Cap on ordinary commands buffered while actor initialization is pending:
+/// voice state converges and `Reconcile` is idempotent, so an outage sheds
+/// the oldest ordinary entry. Saved control state has a separate budget:
+/// one latest value per init-state key, never evicted by ordinary churn.
 const VOICE_ACTOR_INIT_BUFFER_CAP: usize = 512;
 
-/// Buffer one command that arrived during a load attempt. Everything waits
-/// (capped, oldest shed): when the attempt succeeds the worker answers the
-/// reply-bearing commands in arrival order, so a status or vote-kick sent
-/// right after the snapshot still resolves. Shedding the oldest at the cap
-/// drops its one-shot sender, so an overflowed caller fails fast with `None`.
+/// Buffer one command that arrived during a load attempt. Replies wait in
+/// the ordinary FIFO; shedding one drops its sender so its caller fails
+/// fast with `None`. Keep saved state and the startup seed outside that
+/// eviction budget. Replacing a control key appends the latest value at its
+/// arrival position, preserving the order of all surviving commands.
 fn buffer_attempt_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
-    if buffered.len() >= VOICE_ACTOR_INIT_BUFFER_CAP {
-        let _ = buffered.pop_front();
+    if let Some(key) = command.init_state_key() {
+        if let Some(index) = buffered
+            .iter()
+            .position(|previous| previous.init_state_key().as_ref() == Some(&key))
+        {
+            let _ = buffered.remove(index);
+        }
+    } else if buffered
+        .iter()
+        .filter(|entry| entry.init_state_key().is_none())
+        .count()
+        >= VOICE_ACTOR_INIT_BUFFER_CAP
+    {
+        if let Some(index) = buffered
+            .iter()
+            .position(|entry| entry.init_state_key().is_none())
+        {
+            let _ = buffered.remove(index);
+        }
     }
     buffered.push_back(command);
 }
@@ -7693,6 +8058,101 @@ mod voice_actor_init_buffer_tests {
             buffer_init_command(&mut buffered, ActorCommand::Reconcile);
         }
         assert_eq!(buffered.len(), VOICE_ACTOR_INIT_BUFFER_CAP);
+    }
+}
+
+#[cfg(test)]
+mod voice_actor_inbox_backpressure_tests {
+    use super::{
+        ActorCommand, ActorInboxBackpressure, GuildActor, LiveGuild, VOICE_ACTOR_INBOX_CAP,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    fn actor() -> (GuildActor, mpsc::UnboundedReceiver<ActorCommand>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            GuildActor {
+                live: LiveGuild::new(7),
+                tx,
+                backpressure: ActorInboxBackpressure::default(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn gate_admits_to_cap_then_refuses_and_counts() {
+        let (actor, rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        for _ in 0..10 {
+            assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert_eq!(actor.inbox_overflow_dropped(), 10);
+        assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP);
+    }
+
+    #[test]
+    fn release_on_receive_restores_capacity() {
+        let (actor, mut rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        let command = rx.try_recv().expect("queued command");
+        actor.backpressure.release_for(&command);
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP - 1);
+        assert!(actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_overflow_dropped(), 1);
+    }
+
+    #[test]
+    fn lossless_sends_hold_a_slot_until_received() {
+        // Ledger pairing for the control-plane bypass: a lossless send
+        // claims an uncounted slot and its receive releases exactly that
+        // slot, so repeated lossless deliveries never spend a gated
+        // send's slot and the gate keeps refusing at the cap.
+        let (actor, mut rx) = actor();
+        assert!(actor.send_command_lossless(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 1);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+        let command = rx.try_recv().expect("queued command");
+        actor.backpressure.release_for(&command);
+        assert_eq!(actor.inbox_depth(), 0);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+    }
+
+    #[test]
+    fn lossless_closed_channel_rolls_back_without_counting() {
+        let (actor, rx) = actor();
+        drop(rx);
+        assert!(!actor.send_command_lossless(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 0);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+    }
+
+    #[test]
+    fn closed_channel_rolls_back_without_counting() {
+        let (actor, rx) = actor();
+        drop(rx);
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 0);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+    }
+
+    #[test]
+    fn reply_bearing_sends_bypass_the_gate() {
+        let (actor, rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        let (reply, _inbox) = oneshot::channel();
+        assert!(actor.try_send_command(ActorCommand::Status(reply)));
+        assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP + 1);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
     }
 }
 
@@ -8049,6 +8509,7 @@ where
         let actor = GuildActor {
             live: LiveGuild::new(guild),
             tx,
+            backpressure: ActorInboxBackpressure::default(),
         };
         actor
             .live
@@ -8081,9 +8542,11 @@ where
         let name_policy = Arc::clone(&self.name_policy);
         let live_source = Arc::clone(&self.live_source);
         let admission_config = self.admission_config;
+        let backpressure = actor.backpressure.clone();
         tokio::spawn(async move {
             let mut rx = rx;
-            let Some((worker, buffered)) = load_actor_worker(make.as_ref(), live, &mut rx).await
+            let Some((worker, buffered)) =
+                load_actor_worker(make.as_ref(), live, &mut rx, &backpressure).await
             else {
                 return;
             };
@@ -8102,7 +8565,7 @@ where
             if let Some(config) = admission_config {
                 worker.set_admission_config(config);
             }
-            run_actor_with_initial(&mut worker, rx, tick, buffered).await;
+            run_actor_with_initial(&mut worker, rx, tick, buffered, &backpressure).await;
         });
         actors.insert(guild, actor.clone());
         Some(actor)
@@ -8123,7 +8586,7 @@ where
         let Some(actor) = self.ensure_actor(guild) else {
             return false;
         };
-        actor.live.publish(snapshot) && actor.tx.send(ActorCommand::Reconcile).is_ok()
+        actor.live.publish(snapshot) && actor.try_send_command(ActorCommand::Reconcile)
     }
 
     /// READY or RESUMED was handled: the gateway is connected again. Any
@@ -8217,6 +8680,7 @@ where
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
+        let previous = actor.live.member_channel(member);
         let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
             Some((ticket, occupancy_at_join)) => {
                 // Seeding TEST (occupancy-to-join curve): one label-free
@@ -8240,7 +8704,7 @@ where
             }
             None => {
                 if channel.is_some() {
-                    let _ = actor.tx.send(ActorCommand::Display {
+                    let _ = actor.try_send_command(ActorCommand::Display {
                         member_id: member,
                         display,
                     });
@@ -8248,7 +8712,17 @@ where
                 ActorCommand::Reconcile
             }
         };
-        actor.tx.send(command).is_ok()
+        // Event-voice presence persists on the transition itself, ahead of
+        // room handling: same-channel frames (mute, video, role-only) send
+        // nothing, so this costs one command per join/leave/move only.
+        if previous != channel {
+            let _ = actor.try_send_command(ActorCommand::EventVoicePresence {
+                member_id: member,
+                previous,
+                current: channel,
+            });
+        }
+        actor.try_send_command(command)
     }
 
     /// Fresh store/http pair from the actor factory (used by the S4 command
@@ -8392,10 +8866,7 @@ where
 
     fn kick_message(&self, guild: Snowflake, vote_id: Snowflake, message: MessageRef) -> bool {
         let queued = self.live_actor(guild).is_some_and(|actor| {
-            actor
-                .tx
-                .send(ActorCommand::KickMessage { vote_id, message })
-                .is_ok()
+            actor.try_send_command(ActorCommand::KickMessage { vote_id, message })
         });
         if !queued {
             warn!(
@@ -8449,7 +8920,7 @@ where
     fn presence_frame(&self, guild: Snowflake, member: Snowflake, facts: MemberPresence) {
         if let Some(actor) = self.live_actor(guild) {
             if let Some(room) = actor.live.set_presence(member, facts) {
-                let _ = actor.tx.send(ActorCommand::RoomFactsChanged(room));
+                let _ = actor.try_send_command(ActorCommand::RoomFactsChanged(room));
             }
         }
     }
@@ -8458,7 +8929,7 @@ where
     fn stream_frame(&self, guild: Snowflake, member: Snowflake, streaming: bool) {
         if let Some(actor) = self.live_actor(guild) {
             if let Some(room) = actor.live.set_self_stream(member, streaming) {
-                let _ = actor.tx.send(ActorCommand::RoomFactsChanged(room));
+                let _ = actor.try_send_command(ActorCommand::RoomFactsChanged(room));
             }
         }
         // Game-activity wiring: fold the flag into the member's voice span.
@@ -8476,7 +8947,7 @@ where
     fn update_live(&self, guild: Snowflake, update: impl FnOnce(&LiveGuild)) {
         if let Some(actor) = self.live_actor(guild) {
             update(&actor.live);
-            let _ = actor.tx.send(ActorCommand::Reconcile);
+            let _ = actor.try_send_command(ActorCommand::Reconcile);
         }
     }
 
@@ -8485,15 +8956,17 @@ where
     /// before the first GuildCreate have no worker to flag.
     fn refresh_creators(&self, guild: Snowflake) {
         if let Some(actor) = self.live_actor(guild) {
-            let _ = actor.tx.send(ActorCommand::RefreshCreators);
+            let _ = actor.try_send_command(ActorCommand::RefreshCreators);
         }
     }
 
     /// Push freshly saved access controls to the live actor, so a creation
-    /// switch takes effect without a restart.
+    /// switch takes effect without a restart. Lossless: the store write
+    /// already succeeded and the administrator is told "Saved", so the
+    /// update must reach the worker even past the inbox cap.
     fn access_changed(&self, guild: Snowflake, controls: AccessControls) {
         if let Some(actor) = self.live_actor(guild) {
-            let _ = actor.tx.send(ActorCommand::AccessChanged(controls));
+            let _ = actor.send_command_lossless(ActorCommand::AccessChanged(controls));
         }
     }
 
@@ -8519,7 +8992,7 @@ where
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
             actor.live.protect_creators([creator.channel_id]);
-            let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
+            let _ = actor.try_send_command(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
 
@@ -8589,8 +9062,15 @@ where
         let Some(actor) = self.live_actor(guild_id) else {
             return;
         };
-        for (member_id, display) in cached_display_names(cache, guild_id) {
-            let _ = actor.tx.send(ActorCommand::Display { member_id, display });
+        // One lossless batch, not one gated send per member: a guild with
+        // more cached members than inbox slots would otherwise refuse the
+        // tail (room-owner names included), and the periodic settings reload
+        // never repopulates the directory. The batch holds one uncounted
+        // ledger slot until the worker receives it (see
+        // `send_command_lossless`).
+        let seed = cached_display_names(cache, guild_id);
+        if !seed.is_empty() {
+            let _ = actor.send_command_lossless(ActorCommand::DisplaySeed(seed));
         }
     }
 
@@ -8612,10 +9092,13 @@ where
         inbox.await.ok()
     }
 
-    /// Hand freshly written voice settings to the guild worker.
+    /// Hand freshly written voice settings to the guild worker. Lossless:
+    /// the store write already succeeded and the administrator saw "Saved",
+    /// so a full inbox must not leave the worker on the previous settings
+    /// (or skip the `name_settings_read_ms` reset that prompts a reload).
     fn name_settings_updated(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
         if let Some(actor) = self.live_actor(guild_id) {
-            let _ = actor.tx.send(ActorCommand::NameSettingsChanged(
+            let _ = actor.send_command_lossless(ActorCommand::NameSettingsChanged(
                 NameSettings::from_config(config),
             ));
         }
@@ -8624,7 +9107,7 @@ where
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.protect_creators([creator.channel_id]);
-            let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
+            let _ = actor.send_command_lossless(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
 
@@ -8917,7 +9400,7 @@ where
                     .unwrap_or_else(|| updated.user.name.clone());
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
-                    let _ = actor.tx.send(ActorCommand::Display { member_id, display });
+                    let _ = actor.try_send_command(ActorCommand::Display { member_id, display });
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -8974,9 +9457,11 @@ where
 /// [`voice_actor_load_backoff_jittered`] between attempts, and the same single
 /// spawned task owns every attempt — retries never spawn a second actor.
 ///
-/// While a load attempt is in flight, every inbox command waits in order
-/// (capped, oldest shed) and is handed to `run_actor_with_initial` on
-/// success, so a status sent right after the snapshot still resolves once
+/// While a load attempt is in flight, ordinary inbox commands wait in a
+/// capped FIFO (oldest ordinary entry shed). The startup seed and saved
+/// naming/access/per-creator state retain one latest value per key outside
+/// that eviction budget. Surviving commands reach `run_actor_with_initial`
+/// in order on success, so a status sent after the snapshot still resolves once
 /// the worker exists. When the attempt fails or times out, buffered
 /// reply-bearing commands are purged (see [`ActorCommand::is_bufferable`])
 /// so their callers get the existing "syncing" fallback instead of hanging
@@ -8991,6 +9476,7 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
     make: &(dyn Fn() -> (S, H) + Send + Sync),
     live: LiveGuild,
     inbox: &mut mpsc::UnboundedReceiver<ActorCommand>,
+    backpressure: &ActorInboxBackpressure,
 ) -> Option<(GuildRoomWorker<S, H>, VecDeque<ActorCommand>)> {
     let guild_id = live.guild_id;
     let mut buffered = VecDeque::new();
@@ -9014,7 +9500,10 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                     break;
                 }
                 command = inbox.recv() => match command {
-                    Some(command) => buffer_attempt_command(&mut buffered, command),
+                    Some(command) => {
+                        backpressure.release_for(&command);
+                        buffer_attempt_command(&mut buffered, command);
+                    }
                     None => return None,
                 },
             }
@@ -9028,7 +9517,10 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                 // (guild removed) is discarded, never published.
                 loop {
                     match inbox.try_recv() {
-                        Ok(command) => buffer_attempt_command(&mut buffered, command),
+                        Ok(command) => {
+                            backpressure.release_for(&command);
+                            buffer_attempt_command(&mut buffered, command);
+                        }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return None,
                     }
@@ -9058,7 +9550,10 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
             tokio::select! {
                 () = &mut wait => break,
                 command = inbox.recv() => match command {
-                    Some(command) => buffer_init_command(&mut buffered, command),
+                    Some(command) => {
+                        backpressure.release_for(&command);
+                        buffer_init_command(&mut buffered, command);
+                    }
                     None => return None,
                 },
             }
@@ -9084,7 +9579,8 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
 ) {
-    run_actor_with_limits(worker, inbox, tick, ActorLimits::default()).await;
+    let backpressure = ActorInboxBackpressure::default();
+    run_actor_with_limits(worker, inbox, tick, ActorLimits::default(), &backpressure).await;
 }
 
 /// Run the actor loop after [`load_actor_worker`], applying the commands
@@ -9095,8 +9591,17 @@ async fn run_actor_with_initial<S: RoomPersistence, H: RoomWrites + 'static>(
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
     initial: VecDeque<ActorCommand>,
+    backpressure: &ActorInboxBackpressure,
 ) {
-    run_actor_inner(worker, inbox, tick, ActorLimits::default(), initial).await;
+    run_actor_inner(
+        worker,
+        inbox,
+        tick,
+        ActorLimits::default(),
+        initial,
+        backpressure,
+    )
+    .await;
 }
 
 /// Bounds for the per-guild actor loop (TOG stall follow-up). All bounds are
@@ -9414,8 +9919,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
     limits: ActorLimits,
+    backpressure: &ActorInboxBackpressure,
 ) {
-    run_actor_inner(worker, inbox, tick, limits, VecDeque::new()).await;
+    run_actor_inner(worker, inbox, tick, limits, VecDeque::new(), backpressure).await;
 }
 
 async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
@@ -9424,6 +9930,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     tick: Duration,
     limits: ActorLimits,
     initial: VecDeque<ActorCommand>,
+    backpressure: &ActorInboxBackpressure,
 ) {
     let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
@@ -9431,6 +9938,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
+    let mut ev_repair_due_ms: u64 = 0;
     let mut dispatch_budget = 8u8;
     let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
@@ -9499,7 +10007,22 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         if let ActorCommand::Join { ticket, .. } = &command {
             worker.revalidate_creator(ticket.creator_id).await;
         }
-        let accepted = apply_command(worker, command, now_ms);
+        if let ActorCommand::EventVoicePresence {
+            member_id,
+            previous,
+            current,
+        } = &command
+        {
+            crate::event_voice_channels::record_transition(
+                &worker.store,
+                worker.live.guild_id,
+                *member_id,
+                *previous,
+                *current,
+            )
+            .await;
+        }
+        let accepted = apply_command(worker, command, now_ms, backpressure);
         // An Ownership command stages its reply on the durable commit;
         // drive it before the next command so replies stay ordered.
         worker.drive_staged_ownership(now_ms).await;
@@ -9509,6 +10032,27 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         }
         dispatch_ready |= accepted;
     }
+    // Snapshot occupants never sent a transition (`publish_snapshot` only
+    // sends `Reconcile`): flush them join-only so a member already sitting
+    // in a bound event channel owns an open span. Collected before any
+    // await so no live-state lock crosses a store write; the helper caps
+    // the whole flush at one total budget and the 60s repair picks up any
+    // occupants skipped past it.
+    let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
+        let live = worker.live.read_state();
+        live.members
+            .iter()
+            .filter_map(|(member_id, member)| {
+                member.channel_id.map(|channel| (*member_id, channel))
+            })
+            .collect()
+    };
+    let _ = crate::event_voice_channels::flush_bootstrap_presence(
+        &worker.store,
+        worker.live.guild_id,
+        &snapshot_occupants,
+    )
+    .await;
     stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
@@ -9520,6 +10064,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             // progressing dispatch keeps the park (see below).
             command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
                 let Some(command) = command else { break };
+                backpressure.release_for(&command);
                 let now_ms = start
                     .elapsed()
                     .as_millis()
@@ -9530,7 +10075,24 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 if let ActorCommand::Join { ticket, .. } = &command {
                     worker.revalidate_creator(ticket.creator_id).await;
                 }
-                let accepted = apply_command(worker, command, now_ms);
+                // Event-voice presence persists on the transition, before the
+                // room handling below; the store write is idempotent.
+                if let ActorCommand::EventVoicePresence {
+                    member_id,
+                    previous,
+                    current,
+                } = &command
+                {
+                    crate::event_voice_channels::record_transition(
+                        &worker.store,
+                        worker.live.guild_id,
+                        *member_id,
+                        *previous,
+                        *current,
+                    )
+                    .await;
+                }
+                let accepted = apply_command(worker, command, now_ms, backpressure);
                 // An Ownership command stages its reply on the durable commit;
                 // drive it before the next command so replies stay ordered.
                 worker.drive_staged_ownership(now_ms).await;
@@ -9664,6 +10226,31 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
+                // Event-voice presence repair (at most every 60s): re-open a
+                // lost join and close a lost leave against the live occupant
+                // snapshot. The snapshot is collected before any await so no
+                // live-state lock crosses a store write; guilds with no
+                // bound event channels cost one cheap bindings read.
+                if now_ms >= ev_repair_due_ms {
+                    ev_repair_due_ms = now_ms.saturating_add(
+                        crate::event_voice_channels::EVENT_VOICE_REPAIR_INTERVAL_MS,
+                    );
+                    let repair_snapshot: Vec<(Snowflake, Snowflake)> = {
+                        let live = worker.live.read_state();
+                        live.members
+                            .iter()
+                            .filter_map(|(member_id, member)| {
+                                member.channel_id.map(|channel| (*member_id, channel))
+                            })
+                            .collect()
+                    };
+                    crate::event_voice_channels::repair_guild_presence(
+                        &worker.store,
+                        worker.live.guild_id,
+                        &repair_snapshot,
+                    )
+                    .await;
+                }
                 dispatch_budget = 8;
                 consecutive_inbox_turns = 0;
             }
@@ -9692,12 +10279,18 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     worker: &mut GuildRoomWorker<S, H>,
     command: ActorCommand,
     now_ms: u64,
+    backpressure: &ActorInboxBackpressure,
 ) -> bool {
     let mut accepted_join = false;
     match command {
         ActorCommand::Reconcile => worker.reconcile(),
         ActorCommand::Display { member_id, display } => {
             worker.name_directory.insert(member_id, display);
+        }
+        ActorCommand::DisplaySeed(entries) => {
+            for (member_id, display) in entries {
+                worker.name_directory.insert(member_id, display);
+            }
         }
         ActorCommand::NameSettingsChanged(settings) => {
             worker.update_name_settings(settings);
@@ -9735,6 +10328,10 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
                 worker.accept_join_received(ticket, &display, seed, created_at, received);
             worker.reconcile();
         }
+        ActorCommand::EventVoicePresence { .. } => {
+            // Recorded by the actor loop before apply (the store write is
+            // async); nothing left to do here.
+        }
         ActorCommand::CreatorAdded(creator) => {
             worker.live.protect_creators([creator.channel_id]);
             let _ = worker.creator_misses.remove(&creator.channel_id);
@@ -9762,6 +10359,8 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
                 tracked_rooms: worker.tracked().len(),
                 failures: worker.failures().iter().map(failure_line).collect(),
                 halted: worker.halted(),
+                inbox_pending: backpressure.depth(),
+                inbox_overflow_dropped: backpressure.dropped(),
             });
         }
         ActorCommand::Ownership {
@@ -10322,8 +10921,8 @@ pub fn decide_create_channel(request: CreateChannelRequest) -> CreateChannelPlan
 }
 
 /// `/textchannels` input after parsing. Unset options keep the stored value;
-/// `enabled` defaults to on, so naming a channel or role also switches the
-/// companions on.
+/// an absent `enabled` never switches the companions on, so naming a
+/// channel or role alone leaves the toggle untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextChannelsRequest {
     pub enabled: Option<bool>,
@@ -10352,7 +10951,9 @@ pub fn decide_text_channels(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.text_channels = request.enabled.unwrap_or(true);
+    if let Some(enabled) = request.enabled {
+        creator.text_channels = enabled;
+    }
     if let Some(name) = &request.name {
         if !is_usable_channel_name(name) {
             return TextChannelsPlan::Refuse {
@@ -10420,7 +11021,8 @@ pub fn decide_position(creator: Option<CreatorChannel>, request: &PositionReques
     PositionPlan::Update(creator)
 }
 
-/// `/group` input after parsing. An omitted toggle turns grouping on.
+/// `/group` input after parsing. An omitted toggle refuses: the request
+/// carries nothing else, so there is nothing to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupRequest {
     pub enabled: Option<bool>,
@@ -10442,7 +11044,10 @@ pub fn decide_group(creator: Option<CreatorChannel>, request: &GroupRequest) -> 
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.group_by_category = request.enabled.unwrap_or(true);
+    let Some(enabled) = request.enabled else {
+        return refuse("Choose whether to group rooms by category, then try again.");
+    };
+    creator.group_by_category = enabled;
     if creator.validate().is_err() {
         return refuse("Those grouping settings are not valid. Try again.");
     }
@@ -10656,7 +11261,8 @@ pub fn decide_default_limit(
     DefaultLimitPlan::Update(creator)
 }
 
-/// `/alwaysprivate` input after parsing. An omitted toggle turns it on.
+/// `/alwaysprivate` input after parsing. An omitted toggle refuses: the
+/// request carries nothing else, so there is nothing to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlwaysPrivateRequest {
     pub enabled: Option<bool>,
@@ -10681,7 +11287,10 @@ pub fn decide_always_private(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.private_default = request.enabled.unwrap_or(true);
+    let Some(enabled) = request.enabled else {
+        return refuse("Choose whether new rooms start private, then try again.");
+    };
+    creator.private_default = enabled;
     if creator.validate().is_err() {
         return refuse("Those privacy settings are not valid. Try again.");
     }
@@ -10814,8 +11423,40 @@ pub fn setup_member_panel(halted: bool, needs_attention: bool) -> SetupPanel {
     }
 }
 
-#[must_use]
-pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
+/// Budget for an admin `/setup` description: the transport bound minus the
+/// `**Voice rooms**\n` reply prefix the handler adds, so paging budgets
+/// before sending instead of relying on the final safety clip.
+const SETUP_DESCRIPTION_BOUND: usize = CONTENT_LIMIT - "**Voice rooms**\n".len();
+
+/// One admin `/setup` creator row. Rows sort by channel id at pack time;
+/// this only renders.
+fn setup_creator_row(creator: &CreatorChannel) -> String {
+    let position = match creator.position {
+        RoomPosition::Above => "above",
+        RoomPosition::Below => "below",
+    };
+    format!("- <#{}>: new rooms {position}", creator.channel_id)
+}
+
+/// Sorted creator rows for the admin view (channel id ascending, stable).
+/// A failed creator read shows no rows: the error line below says so, and a
+/// partial list must not pose as the complete set.
+fn setup_sorted_rows(summary: &SetupSummary) -> Vec<String> {
+    if summary.store_error.is_some() {
+        return Vec::new();
+    }
+    let mut creators: Vec<&CreatorChannel> = summary.creators.iter().collect();
+    creators.sort_by_key(|creator| creator.channel_id);
+    creators
+        .iter()
+        .map(|creator| setup_creator_row(creator))
+        .collect()
+}
+
+/// Fixed description lines above the creator rows: status, store error, and
+/// the empty-list line or creator header. `row_total` is the full sorted row
+/// count, so the header stays truthful on every page.
+fn setup_prefix_lines(summary: &SetupSummary, row_total: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if summary.halted {
         lines.push(
@@ -10830,22 +11471,18 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
         lines.push(format!(
             "Could not load creator channels ({error}); the worker state below is current."
         ));
-    }
-    if summary.creators.is_empty() {
-        if summary.store_error.is_none() {
-            lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
-        }
+    } else if row_total == 0 {
+        lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
     } else {
-        lines.push(format!("Creator channels ({})", summary.creators.len()));
-        for creator in &summary.creators {
-            let position = match creator.position {
-                RoomPosition::Above => "above",
-                RoomPosition::Below => "below",
-            };
-            lines.push(format!("- <#{}>: new rooms {position}", creator.channel_id));
-        }
+        lines.push(format!("Creator channels ({row_total})"));
     }
-    lines.push(format!("Tracked rooms: {}.", summary.tracked_rooms));
+    lines
+}
+
+/// Fixed description lines below the creator rows: room count and the newest
+/// failures. Rendered on every page so health never hides behind pagination.
+fn setup_suffix_lines(summary: &SetupSummary) -> Vec<String> {
+    let mut lines = vec![format!("Tracked rooms: {}.", summary.tracked_rooms)];
     if summary.failures.is_empty() {
         lines.push("No recent failures.".to_owned());
     } else {
@@ -10854,10 +11491,170 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
             lines.push(format!("- {failure}"));
         }
     }
+    lines
+}
+
+/// Worst-case navigation cost: page numbers fit the creator count's digits.
+fn setup_page_chrome(row_total: usize) -> usize {
+    if row_total <= 1 {
+        return 0;
+    }
+    let wide = "9".repeat(row_total.to_string().len());
+    text_len(&format!("Page {wide} of {wide}"))
+        + 1
+        + text_len(&format!("Next page: /setup page:{wide}"))
+        + 1
+}
+
+/// Keep the fixed status and diagnostic lines within budget too. Prefer the
+/// unchanged single-page view when it fits; otherwise reserve navigation and
+/// one complete creator row before admitting whole diagnostic lines. Health
+/// findings come first from the caller; omitted diagnostics are counted,
+/// never clipped through an ID or mention token.
+fn setup_page_lines(summary: &SetupSummary, rows: &[String]) -> (Vec<String>, Vec<String>) {
+    let prefix = setup_prefix_lines(summary, rows.len());
+    let mut suffix = setup_suffix_lines(summary);
+    let units = |lines: &[String]| lines.iter().map(|line| text_len(line) + 1).sum::<usize>();
+    if units(&prefix) + units(&suffix) + units(rows) <= SETUP_DESCRIPTION_BOUND + 1 {
+        return (prefix, suffix);
+    }
+    let row = rows.iter().map(|row| text_len(row) + 1).max().unwrap_or(0);
+    let budget = SETUP_DESCRIPTION_BOUND
+        .saturating_sub(units(&prefix) + row + setup_page_chrome(rows.len()));
+    if !summary.failures.is_empty() {
+        loop {
+            let omitted = summary.failures.len().saturating_sub(suffix.len() - 2);
+            let notice = format!("Additional failure details not shown: {omitted}.");
+            let notice_units = if omitted > 0 {
+                text_len(&notice) + 1
+            } else {
+                0
+            };
+            if units(&suffix) + notice_units <= budget || suffix.len() == 2 {
+                if omitted > 0 {
+                    suffix.push(notice);
+                }
+                break;
+            }
+            suffix.pop();
+        }
+    }
+    (prefix, suffix)
+}
+
+/// Greedy row ranges that fit [`SETUP_DESCRIPTION_BOUND`] with worst-case
+/// page chrome reserved. Empty when there are no rows; otherwise every page
+/// holds at least one row, so packing always makes progress.
+fn setup_row_pages(summary: &SetupSummary) -> Vec<(usize, usize)> {
+    let rows = setup_sorted_rows(summary);
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let (prefix, suffix) = setup_page_lines(summary, &rows);
+    // Each line plus its joining newline; the one extra newline this counts
+    // keeps every estimate conservative, never over the bound.
+    let fixed: usize = prefix
+        .iter()
+        .chain(suffix.iter())
+        .map(|line| text_len(line) + 1)
+        .sum();
+    let all_rows: usize = rows.iter().map(|row| text_len(row) + 1).sum();
+    if fixed + all_rows <= SETUP_DESCRIPTION_BOUND + 1 {
+        return vec![(0, rows.len())];
+    }
+    let capacity = SETUP_DESCRIPTION_BOUND
+        .saturating_sub(fixed + setup_page_chrome(rows.len()))
+        .max(1);
+    let mut pages = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, row) in rows.iter().enumerate() {
+        let need = text_len(row) + 1;
+        if index > start && used + need > capacity {
+            pages.push((start, index));
+            start = index;
+            used = 0;
+        }
+        used += need;
+    }
+    pages.push((start, rows.len()));
+    pages
+}
+
+/// Page count for the admin `/setup` view: 1 when there are no creator rows
+/// (empty or failed read), otherwise the greedy bounded pack.
+#[must_use]
+pub fn setup_page_total(summary: &SetupSummary) -> usize {
+    setup_row_pages(summary).len().max(1)
+}
+
+/// Render admin `/setup` page `page` (1-based). Out-of-range pages clamp to
+/// the nearest page; callers that must refuse past-end input check
+/// [`setup_page_total`] first. A fitting single-page view keeps its diagnostic
+/// lines unchanged; oversized diagnostics omit whole tail lines with a count.
+/// Page metadata and the next-page hint appear only with multiple pages.
+#[must_use]
+pub fn setup_panel_page(summary: &SetupSummary, page: usize) -> SetupPanel {
+    let rows = setup_sorted_rows(summary);
+    let pages = setup_row_pages(summary);
+    let total = pages.len().max(1);
+    let page = page.clamp(1, total);
+    let (mut lines, suffix) = setup_page_lines(summary, &rows);
+    if let Some((start, end)) = pages.get(page - 1) {
+        lines.extend(rows[*start..*end].iter().cloned());
+    }
+    lines.extend(suffix);
+    if total > 1 {
+        lines.push(format!("Page {page} of {total}"));
+        if page < total {
+            lines.push(format!("Next page: /setup page:{}", page + 1));
+        }
+    }
     SetupPanel {
         title: "Voice rooms".to_owned(),
         description: lines.join("\n"),
     }
+}
+
+#[must_use]
+pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
+    setup_panel_page(summary, 1)
+}
+
+/// Short refusal for a malformed `/setup` page: names the remedy and a valid
+/// start, serves no rows.
+fn setup_page_refusal() -> String {
+    "Unknown page. Use /setup page:1 to see the first page.".to_owned()
+}
+
+/// Short refusal past the last `/setup` page: same shape, plus the real total.
+fn setup_past_end_refusal(total: usize) -> String {
+    let pages = if total == 1 { "page" } else { "pages" };
+    format!("Unknown page. /setup has {total} {pages}; use /setup page:1 to start over.")
+}
+
+/// Private correction for a malformed setup option: names the option and a
+/// copyable invocation. Static per (command, field): no payload bytes, store
+/// errors or mentions can leak into it.
+fn setup_shape_correction(command: &str, field: &str) -> String {
+    let usage = match command {
+        "create" => "name: lobby",
+        "textchannels" => {
+            "channel: #voice-creator enabled: true name: voice-chat viewer-role: @role"
+        }
+        "position" => "channel: #voice-creator position: below first-number: 5",
+        "group" => "channel: #voice-creator enabled: true",
+        "inheritpermissions" => {
+            "channel: #voice-creator source: channel source-channel: #voice-creator"
+        }
+        "defaultlimit" => "channel: #voice-creator limit: 4",
+        "alwaysprivate" => "channel: #voice-creator enabled: true",
+        _ => "channel: #voice-creator",
+    };
+    format!(
+        "That `/{command}` call has a problem with its `{field}` option: send it exactly once, \
+         with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
+    )
 }
 
 /// Voice definitions for the guild command merge, gated on `TWO_VOICE=1`.
@@ -10910,12 +11707,13 @@ pub enum ImportDecision {
     /// Nothing to confirm (empty diff, cancel, expiry): reply with `text`
     /// alone and store nothing.
     Notice { text: String },
-    /// Show `text` with Confirm/Cancel bound to (`member_id`, `hash`) and
-    /// remember `candidate` for Confirm.
+    /// Show `text` and the complete `review` attachment with Confirm/Cancel
+    /// bound to (`member_id`, `hash`); remember `candidate` for Confirm.
     Preview {
         candidate: VoiceConfiguration,
         hash: String,
         text: String,
+        review: Vec<u8>,
     },
     /// Confirm verified against fresh state: apply `candidate`, then reply
     /// with `message`.
@@ -10976,14 +11774,43 @@ pub fn plan_import_preview(
     // report an empty skipped list and an unknown-channels-only file would
     // read as `No changes`. The pruned `remaining` stays the candidate.
     let diff = diff_configuration(current, &incoming, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    plan_reviewable_import(current, remaining, &diff)
+}
+
+/// One admitted snapshot supplies the summary, full review and pending hash.
+/// Serialize before a Preview can exist, so no failure path can offer Confirm
+/// or insert temporary pending state for an unreviewable diff.
+fn plan_reviewable_import(
+    current: &VoiceConfiguration,
+    candidate: VoiceConfiguration,
+    diff: &ConfigDiff,
+) -> ImportDecision {
     if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
+        return ImportDecision::Notice {
+            text: render_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        };
     }
+    let hash = diff_content_hash(current, &candidate);
+    let review = match serialize_full_review(diff, &candidate.guild_id, &hash) {
+        Ok(bytes) => bytes,
+        Err(FullReviewError::TooLarge) => {
+            return ImportDecision::Refuse {
+                message: format!(
+                    "The complete review diff is too large (limit: {FULL_REVIEW_BYTE_LIMIT} serialized bytes). Reduce the proposed changes in the file and try again. Nothing was changed.",
+                ),
+            };
+        }
+        Err(FullReviewError::Serialization) => {
+            return ImportDecision::Refuse {
+                message: "Could not build the complete review diff. Nothing was changed; try uploading the file again.".to_owned(),
+            };
+        }
+    };
     ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
+        hash,
+        candidate,
+        text: render_review_preview(diff, MAX_IMPORT_PREVIEW_LINES),
+        review,
     }
 }
 
@@ -11021,16 +11848,10 @@ pub fn plan_import_confirm(
             ),
         };
     }
-    let diff = diff_configuration(current, &remaining, inventory);
-    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
-    if diff.change_count() == 0 {
-        return ImportDecision::Notice { text };
-    }
-    ImportDecision::Preview {
-        hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
-        text,
-    }
+    // Retain facts about channels newly skipped by this inventory. The
+    // remembered candidate is already pruned by the original preview.
+    let diff = diff_configuration(current, candidate, inventory);
+    plan_reviewable_import(current, remaining, &diff)
 }
 
 /// How many creator channels `candidate` adds over `current`.
@@ -11114,11 +11935,22 @@ fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> Inte
 /// Ephemeral `/import` preview reply with Confirm/Cancel buttons. Mentions
 /// are disabled: the preview quotes uploaded template text, which must never
 /// ping.
-fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
+fn import_preview_response(
+    text: &str,
+    member_id: Snowflake,
+    hash: &str,
+    guild_id: Snowflake,
+    review: Vec<u8>,
+) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             content: Some(text.to_owned()),
+            attachments: Some(vec![Attachment::from_bytes(
+                format!("voice-config-diff-guild-{guild_id}-v1.json"),
+                review,
+                0,
+            )]),
             components: Some(import_preview_components(member_id, hash)),
             flags: Some(MessageFlags::EPHEMERAL),
             allowed_mentions: Some(AllowedMentions {
@@ -11196,7 +12028,9 @@ pub enum VoiceCommand {
     Create {
         name: String,
     },
-    Setup,
+    Setup {
+        page: PageArg,
+    },
     Ping,
     Invite,
     TextChannels {
@@ -11227,6 +12061,28 @@ pub enum VoiceCommand {
     AlwaysPrivate {
         channel_id: Snowflake,
         request: AlwaysPrivateRequest,
+    },
+    /// A setup command (`/create`, `/textchannels`, `/position`, `/group`,
+    /// `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) arrived with
+    /// a malformed option shape: a known option sent twice, with the wrong
+    /// wire type, or (for `/textchannels`) the required `channel` missing.
+    /// Answered with a private correction before guild authority, role gates
+    /// and every read or effect.
+    SetupShapeInvalid {
+        command: &'static str,
+        field: &'static str,
+    },
+    /// `/logging` arrived with an ambiguous shape: a known option sent twice,
+    /// with the wrong wire type, or more than one action. Answered with a
+    /// private correction before the role gate and every read or effect.
+    LoggingShapeInvalid {
+        field: &'static str,
+    },
+    /// `/kick` arrived with a repeated or wrong-typed `reason`. Answered with
+    /// a private correction before any read, ballot or ledger claim; the
+    /// vote never starts with a silently dropped reason.
+    KickReasonInvalid {
+        target: Snowflake,
     },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
@@ -11279,11 +12135,161 @@ pub enum LoggingAction {
     Invalid,
 }
 
+/// Decoded `page` option for the `/setup` and `/access show` read paths.
+/// `Missing` behaves as page 1; `Invalid` (zero, negative, overflowing,
+/// wrong-typed or duplicated) refuses without touching the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageArg {
+    Missing,
+    Page(usize),
+    Invalid,
+}
+
+impl PageArg {
+    /// 1-based page number, or `None` for [`PageArg::Invalid`].
+    #[must_use]
+    pub fn number(self) -> Option<usize> {
+        match self {
+            Self::Missing => Some(1),
+            Self::Page(number) => Some(number),
+            Self::Invalid => None,
+        }
+    }
+}
+
+/// Strictly decode the optional `page` option: exactly one Integer of at
+/// least 1. Duplicates and every non-integer shape refuse, as do zero,
+/// negatives and values that cannot index a page. Huge but well-typed
+/// integers stay `Page` and refuse past-end at dispatch with the real total.
+/// Unrelated options are ignored.
+fn decode_page(options: &[CommandDataOption]) -> PageArg {
+    let mut seen: Option<PageArg> = None;
+    for option in options {
+        if option.name != "page" {
+            continue;
+        }
+        if seen.is_some() {
+            return PageArg::Invalid;
+        }
+        seen = Some(match &option.value {
+            CommandOptionValue::Integer(number) => match usize::try_from(*number) {
+                Ok(number) if number >= 1 => PageArg::Page(number),
+                _ => PageArg::Invalid,
+            },
+            _ => PageArg::Invalid,
+        });
+    }
+    match seen {
+        Some(page) => page,
+        None => PageArg::Missing,
+    }
+}
+
+/// Expected wire type of one known setup option, for strict shape decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupOptionKind {
+    String,
+    Integer,
+    Boolean,
+    Channel,
+    Role,
+}
+
+impl SetupOptionKind {
+    fn matches(self, value: &CommandOptionValue) -> bool {
+        matches!(
+            (self, value),
+            (Self::String, CommandOptionValue::String(_))
+                | (Self::Integer, CommandOptionValue::Integer(_))
+                | (Self::Boolean, CommandOptionValue::Boolean(_))
+                | (Self::Channel, CommandOptionValue::Channel(_))
+                | (Self::Role, CommandOptionValue::Role(_))
+        )
+    }
+}
+
+/// Known options of one setup command as `(name, expected wire type)`.
+/// Unknown names stay ignored; only these refuse when duplicated, mistyped,
+/// or (for the [`setup_shape_required`] option) missing. `None` for commands
+/// without a strict shape.
+fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOptionKind)]> {
+    match command {
+        "create" => Some(&[("name", SetupOptionKind::String)]),
+        "textchannels" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+            ("name", SetupOptionKind::String),
+            ("viewer-role", SetupOptionKind::Role),
+        ]),
+        "position" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("position", SetupOptionKind::String),
+            ("first-number", SetupOptionKind::Integer),
+        ]),
+        "group" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        "inheritpermissions" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("source", SetupOptionKind::String),
+            ("source-channel", SetupOptionKind::Channel),
+        ]),
+        "defaultlimit" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("limit", SetupOptionKind::Integer),
+        ]),
+        "alwaysprivate" => Some(&[
+            ("channel", SetupOptionKind::Channel),
+            ("enabled", SetupOptionKind::Boolean),
+        ]),
+        _ => None,
+    }
+}
+
+/// The one registration-required option of a strict-shape command:
+/// `/textchannels` requires `channel`; its other options stay optional so
+/// omission keeps the stored value.
+fn setup_shape_required(command: &str) -> Option<&'static str> {
+    match command {
+        "textchannels" => Some("channel"),
+        _ => None,
+    }
+}
+
+/// Strictly decode one setup command's option shape: each known option at
+/// most once and with its registered wire type, and the required option
+/// present. Returns the first malformed known option in payload order, or
+/// the required option when it is the only fault. Unknown names (even
+/// duplicated, even with nested known names beneath them) stay ignored, and
+/// value validation stays in the handlers, so omission semantics are
+/// unchanged.
+fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&'static str> {
+    let fields = setup_shape_fields(command)?;
+    let mut seen: Vec<&'static str> = Vec::new();
+    for option in options {
+        let Some(&(name, kind)) = fields.iter().find(|field| option.name.as_str() == field.0)
+        else {
+            continue;
+        };
+        if seen.contains(&name) || !kind.matches(&option.value) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    match setup_shape_required(command) {
+        Some(required) if !seen.contains(&required) => Some(required),
+        _ => None,
+    }
+}
+
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
 /// is answered, never silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessAction {
-    Show,
+    Show {
+        page: PageArg,
+    },
     Creation(bool),
     RequiredRole(Option<Snowflake>),
     Restrict {
@@ -11334,6 +12340,12 @@ fn parse_voice_command_with_registry(
     let name = identities.slash_name(interaction)?;
     match name.as_str() {
         "create" => {
+            if let Some(field) = setup_shape_refusal("create", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "create",
+                    field,
+                });
+            }
             let name = command
                 .options
                 .iter()
@@ -11345,10 +12357,18 @@ fn parse_voice_command_with_registry(
                 .unwrap_or_default();
             Some(VoiceCommand::Create { name })
         }
-        "setup" => Some(VoiceCommand::Setup),
+        "setup" => Some(VoiceCommand::Setup {
+            page: decode_page(&command.options),
+        }),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
         "textchannels" => {
+            if let Some(field) = setup_shape_refusal("textchannels", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "textchannels",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = TextChannelsRequest {
                 enabled: None,
@@ -11376,6 +12396,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "position" => {
+            if let Some(field) = setup_shape_refusal("position", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "position",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = PositionRequest {
                 position: None,
@@ -11403,6 +12429,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "group" => {
+            if let Some(field) = setup_shape_refusal("group", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "group",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = GroupRequest { enabled: None };
             for option in &command.options {
@@ -11420,6 +12452,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "inheritpermissions" => {
+            if let Some(field) = setup_shape_refusal("inheritpermissions", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "inheritpermissions",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = InheritPermissionsRequest {
                 source: None,
@@ -11443,6 +12481,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "defaultlimit" => {
+            if let Some(field) = setup_shape_refusal("defaultlimit", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "defaultlimit",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = DefaultLimitRequest { limit: None };
             for option in &command.options {
@@ -11460,6 +12504,12 @@ fn parse_voice_command_with_registry(
             })
         }
         "alwaysprivate" => {
+            if let Some(field) = setup_shape_refusal("alwaysprivate", &command.options) {
+                return Some(VoiceCommand::SetupShapeInvalid {
+                    command: "alwaysprivate",
+                    field,
+                });
+            }
             let mut channel_id = 0;
             let mut request = AlwaysPrivateRequest { enabled: None };
             for option in &command.options {
@@ -11495,9 +12545,10 @@ fn parse_voice_command_with_registry(
             Some(VoiceCommand::Transfer { target_id })
         }
         "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
-        "logging" => Some(VoiceCommand::Logging(parse_logging_action(
-            &command.options,
-        ))),
+        "logging" => Some(match logging_shape_refusal(&command.options) {
+            Some(field) => VoiceCommand::LoggingShapeInvalid { field },
+            None => VoiceCommand::Logging(parse_logging_action(&command.options)),
+        }),
         "export" => Some(VoiceCommand::Export),
         "import" => Some(VoiceCommand::Import {
             file_id: command.options.iter().find_map(|option| {
@@ -11516,9 +12567,15 @@ fn parse_voice_command_with_registry(
         // the published shape, decides vote-kick versus moderation kick, so
         // accept both. An unparsable shape stays silent here so the shared
         // router keeps the interaction.
-        "kick" => parse_kick_target(&command.options).map(|target| VoiceCommand::Kick {
-            target,
-            reason: parse_kick_reason(&command.options),
+        "kick" => parse_kick_target(&command.options).map(|target| {
+            if kick_reason_malformed(&command.options) {
+                VoiceCommand::KickReasonInvalid { target }
+            } else {
+                VoiceCommand::Kick {
+                    target,
+                    reason: parse_kick_reason(&command.options),
+                }
+            }
         }),
         "limit" => Some(VoiceCommand::Limit(limit::parse_limit_arg(
             &command.options,
@@ -11716,6 +12773,67 @@ fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
         })
 }
 
+/// Whether `reason` is sent twice or with a non-text wire type. An omitted
+/// reason is well formed (the vote starts without a reason line); a malformed
+/// one must refuse, never post a ballot that drops the stated reason.
+fn kick_reason_malformed(options: &[CommandDataOption]) -> bool {
+    matches!(
+        decode_strict_arg(options, "reason", |value| {
+            matches!(value, CommandOptionValue::String(_)).then_some(())
+        }),
+        StrictArg::Invalid
+    )
+}
+
+/// Private correction for a malformed `/kick` reason. Echoes no input.
+fn kick_reason_correction() -> String {
+    "That `/kick` call has a problem with its `reason` option: send it at most once, as text. \
+     Nothing was changed and no vote was started. Try:\n`/kick member: @member reason: too loud`"
+        .to_owned()
+}
+
+/// Strictly decode `/logging`'s shape: exactly one action, and the selected
+/// action's known option sent at most once. Returns the offending field
+/// (`subcommand` for more than one action). Unknown names inside the action
+/// stay ignored. A single missing or wrong-typed option keeps today's
+/// [`LoggingAction::Invalid`] refusal (or clear, for an omitted optional
+/// `channel`/`role`), so only the ambiguous duplicates change.
+fn logging_shape_refusal(options: &[CommandDataOption]) -> Option<&'static str> {
+    if options.len() > 1 {
+        return Some("subcommand");
+    }
+    let sub = options.first()?;
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return None;
+    };
+    let field = match sub.name.as_str() {
+        "level" => "level",
+        "channel" => "channel",
+        "mention" => "role",
+        _ => return None,
+    };
+    (args.iter().filter(|option| option.name == field).count() > 1).then_some(field)
+}
+
+/// Private correction for a malformed `/logging` call. Names the field and a
+/// copyable invocation; echoes no input.
+fn logging_shape_correction(field: &str) -> String {
+    if field == "subcommand" {
+        return "That `/logging` call has more than one action: send exactly one of show, level, \
+                channel or mention. Nothing was changed. Try:\n`/logging show`"
+            .to_owned();
+    }
+    let usage = match field {
+        "level" => "level level: full",
+        "channel" => "channel channel: #logs",
+        _ => "mention role: @role",
+    };
+    format!(
+        "That `/logging` call has a problem with its `{field}` option: send it exactly once, \
+         with the right type. Nothing was changed. Try:\n`/logging {usage}`"
+    )
+}
+
 /// The invoker's server display name: nickname, then global name, then user
 /// name. Empty when the interaction carries no user.
 fn interaction_display_name(interaction: &Interaction) -> String {
@@ -11764,49 +12882,104 @@ fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
     }
 }
 
+/// Strictly decoded single-occurrence option: `Missing` when absent,
+/// `Invalid` when duplicated or carrying the wrong value type, so callers
+/// refuse before any store touch instead of guessing a value.
+enum StrictArg<T> {
+    Missing,
+    Value(T),
+    Invalid,
+}
+
+/// Strictly decode one named option: `Missing` when absent, `Invalid` when
+/// the name repeats or `decode` rejects its value type. Unrelated names are
+/// ignored, so unknown or inapplicable options never refuse a shape.
+fn decode_strict_arg<T>(
+    args: &[CommandDataOption],
+    name: &str,
+    decode: impl Fn(&CommandOptionValue) -> Option<T>,
+) -> StrictArg<T> {
+    let mut seen: Option<StrictArg<T>> = None;
+    for option in args {
+        if option.name != name {
+            continue;
+        }
+        if seen.is_some() {
+            return StrictArg::Invalid;
+        }
+        seen = Some(match decode(&option.value) {
+            Some(value) => StrictArg::Value(value),
+            None => StrictArg::Invalid,
+        });
+    }
+    seen.unwrap_or(StrictArg::Missing)
+}
+
+/// Strictly decode role slots in listed order. A duplicated slot name or a
+/// non-`Role` value refuses (`None`); well-typed ids keep slot order and
+/// drop duplicate *values* — only duplicate *names* refuse.
+fn decode_access_roles(args: &[CommandDataOption], names: &[&str]) -> Option<Vec<Snowflake>> {
+    let mut roles: Vec<Snowflake> = Vec::new();
+    for name in names {
+        match decode_strict_arg(args, name, |value| match value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        }) {
+            StrictArg::Missing => {}
+            StrictArg::Value(role) => {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+            StrictArg::Invalid => return None,
+        }
+    }
+    Some(roles)
+}
+
+/// Strictly decode one `/access` invocation: exactly one top-level option,
+/// a known `SubCommand`, whose own options decode strictly (a wrong value
+/// type or a duplicated name refuses) while unknown or inapplicable names
+/// are ignored. Refusing here keeps a malformed shape from reaching the
+/// store read in `execute_access`. An omitted `role` is still a genuine
+/// clear, and `page` keeps the strict [`decode_page`] contract.
 fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
-    let Some(sub) = options.first() else {
+    let [sub] = options else {
         return AccessAction::Invalid;
     };
     let CommandOptionValue::SubCommand(args) = &sub.value else {
         return AccessAction::Invalid;
     };
-    let roles: Vec<Snowflake> = ["role", "role2", "role3"]
-        .iter()
-        .filter_map(|name| args.iter().find(|option| option.name == *name))
-        .filter_map(|option| match option.value {
-            CommandOptionValue::Role(role) => Some(role.get()),
-            _ => None,
-        })
-        .fold(Vec::new(), |mut roles, role| {
-            if !roles.contains(&role) {
-                roles.push(role);
-            }
-            roles
-        });
-    let command = args
-        .iter()
-        .find(|option| option.name == "command")
-        .and_then(|option| match &option.value {
-            CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
-            _ => None,
-        });
+    let command = decode_strict_arg(args, "command", |value| match value {
+        CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
+        _ => None,
+    });
     match sub.name.as_str() {
-        "show" => AccessAction::Show,
-        "creation" => args
-            .iter()
-            .find(|option| option.name == "enabled")
-            .and_then(|option| match option.value {
-                CommandOptionValue::Boolean(enabled) => Some(AccessAction::Creation(enabled)),
-                _ => None,
-            })
-            .unwrap_or(AccessAction::Invalid),
-        "role" => AccessAction::RequiredRole(roles.first().copied()),
-        "restrict" => command.map_or(AccessAction::Invalid, |command| AccessAction::Restrict {
+        "show" => AccessAction::Show {
+            page: decode_page(args),
+        },
+        "creation" => match decode_strict_arg(args, "enabled", |value| match value {
+            CommandOptionValue::Boolean(enabled) => Some(*enabled),
+            _ => None,
+        }) {
+            StrictArg::Value(enabled) => AccessAction::Creation(enabled),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
+        "role" => match decode_access_roles(args, &["role"]) {
+            Some(roles) => AccessAction::RequiredRole(roles.first().copied()),
+            None => AccessAction::Invalid,
+        },
+        "restrict" => match (
             command,
-            roles,
-        }),
-        "unrestrict" => command.map_or(AccessAction::Invalid, AccessAction::Unrestrict),
+            decode_access_roles(args, &["role", "role2", "role3"]),
+        ) {
+            (StrictArg::Value(command), Some(roles)) => AccessAction::Restrict { command, roles },
+            _ => AccessAction::Invalid,
+        },
+        "unrestrict" => match command {
+            StrictArg::Value(command) => AccessAction::Unrestrict(command),
+            StrictArg::Missing | StrictArg::Invalid => AccessAction::Invalid,
+        },
         _ => AccessAction::Invalid,
     }
 }
@@ -11832,7 +13005,7 @@ impl VoiceCommand {
     fn name(&self) -> &'static str {
         match self {
             Self::Create { .. } => "create",
-            Self::Setup => "setup",
+            Self::Setup { .. } => "setup",
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::TextChannels { .. } => "textchannels",
@@ -11841,17 +13014,18 @@ impl VoiceCommand {
             Self::InheritPermissions { .. } => "inheritpermissions",
             Self::DefaultLimit { .. } => "defaultlimit",
             Self::AlwaysPrivate { .. } => "alwaysprivate",
+            Self::SetupShapeInvalid { command, .. } => command,
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Private => "private",
             Self::Public => "public",
             Self::Transfer { .. } => "transfer",
-            Self::Logging(_) => "logging",
+            Self::Logging(_) | Self::LoggingShapeInvalid { .. } => "logging",
             Self::Export => "export",
             Self::Import { .. } => "import",
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
-            Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Kick { .. } | Self::KickReasonInvalid { .. } | Self::Ballot { .. } => "kick",
             Self::Limit(_) => "limit",
             Self::Unlimit => "unlimit",
             Self::Name => "name",
@@ -12129,6 +13303,11 @@ pub struct WorkerStatus {
     pub health: Vec<String>,
     pub failures: Vec<String>,
     pub halted: bool,
+    /// Outstanding gated inbox entries when the status was read: the live
+    /// inbox depth (see `VOICE_ACTOR_INBOX_CAP`).
+    pub inbox_pending: usize,
+    /// Fire-and-forget sends refused past the inbox cap. Monotonic per actor.
+    pub inbox_overflow_dropped: u64,
 }
 
 /// Notice body for one failure. `brief` includes actionable permission/name
@@ -12266,9 +13445,9 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
-/// Render the controls for `/access show` and as the confirmation after a change.
-fn access_summary(controls: &AccessControls) -> String {
-    let mut lines = vec![
+/// Creation and required-role context, rendered on every `/access show` page.
+fn access_context_lines(controls: &AccessControls) -> Vec<String> {
+    vec![
         format!(
             "Room creation: {}",
             if controls.room_creation_enabled {
@@ -12281,25 +13460,233 @@ fn access_summary(controls: &AccessControls) -> String {
             Some(role) => format!("Required role: <@&{role}>"),
             None => "Required role: none".to_owned(),
         },
-    ];
+    ]
+}
+
+/// One restriction row, roles in stored order. An empty role list fails
+/// closed (`admins only`). The command name is mention-neutralized so a
+/// stored key can never page a mass mention.
+fn access_row(command: &str, roles: &[Snowflake]) -> String {
+    let who = if roles.is_empty() {
+        "admins only".to_owned()
+    } else {
+        roles
+            .iter()
+            .map(|role| format!("<@&{role}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    format!("- /{safe}: {who}")
+}
+
+/// Render units for one restriction: the whole row when it fits `capacity`,
+/// else explicitly labeled deterministic continuation segments
+/// (`- /cmd (part i of k): ...`), roles in stored order, never splitting a
+/// mention token. Empty roles never split: the whole row is short.
+fn access_row_units(command: &str, roles: &[Snowflake], capacity: usize) -> Vec<String> {
+    let whole = access_row(command, roles);
+    if roles.is_empty() || text_len(&whole) <= capacity {
+        return vec![whole];
+    }
+    // Worst-case segment label over every segment (a segment holds at least
+    // one role, so the segment count never exceeds the role count).
+    let wide = "9".repeat(roles.len().to_string().len().max(1));
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    let label = |index: usize, total: usize| format!("- /{safe} (part {index} of {total}): ");
+    let worst_label = text_len(&format!("- /{safe} (part {wide} of {wide}): "));
+    let segment_capacity = capacity.saturating_sub(worst_label).max(1);
+    let mut segments: Vec<Vec<Snowflake>> = vec![Vec::new()];
+    let mut used = 0;
+    for role in roles {
+        let mention = format!("<@&{role}>");
+        let need = text_len(&mention) + 1;
+        let current_is_empty = segments.last().is_some_and(Vec::is_empty);
+        if !current_is_empty && used + need > segment_capacity {
+            segments.push(Vec::new());
+            used = 0;
+        }
+        if let Some(current) = segments.last_mut() {
+            current.push(*role);
+        }
+        used += need;
+    }
+    let total = segments.len().max(1);
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let mentions = segment
+                .iter()
+                .map(|role| format!("<@&{role}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{}{mentions}", label(index + 1, total))
+        })
+        .collect()
+}
+
+/// Row budget for `/access show`: a fitting whole reply needs no navigation.
+/// Otherwise reserve fixed context and worst-case page chrome (the page count
+/// never exceeds the unit count, and every page number fits its digits).
+fn access_page_capacity(controls: &AccessControls) -> usize {
+    let fixed: usize = access_context_lines(controls)
+        .iter()
+        .map(|line| text_len(line) + 1)
+        .sum::<usize>()
+        + text_len("Restricted commands:")
+        + 1;
+    // Check the complete legacy reply before reserving navigation: chrome
+    // that will never be shown must not split a fitting restriction row.
+    let whole_rows: usize = controls
+        .command_roles
+        .iter()
+        .map(|(command, roles)| text_len(&access_row(command, roles)) + 1)
+        .sum();
+    if fixed + whole_rows <= CONTENT_LIMIT + 1 {
+        return CONTENT_LIMIT + 1 - fixed;
+    }
+    let upper = (controls.command_roles.len()
+        + controls.command_roles.values().map(Vec::len).sum::<usize>())
+    .max(1);
+    let wide = "9".repeat(upper.to_string().len());
+    let chrome = text_len(&format!("Page {wide} of {wide}"))
+        + 1
+        + text_len(&format!("Next page: /access show page:{wide}"))
+        + 1;
+    CONTENT_LIMIT.saturating_sub(fixed + chrome).max(1)
+}
+
+/// All restriction render units in command-name ascending order
+/// (`command_roles` is a `BTreeMap`, so iteration already sorts).
+fn access_units(controls: &AccessControls, capacity: usize) -> Vec<String> {
+    let mut units = Vec::new();
+    for (command, roles) in &controls.command_roles {
+        units.extend(access_row_units(command, roles, capacity));
+    }
+    units
+}
+
+/// Greedy unit ranges that fit [`CONTENT_LIMIT`] with worst-case page chrome
+/// reserved. Empty when there are no restrictions; otherwise every page
+/// holds at least one unit, so packing always makes progress.
+fn access_show_pages(controls: &AccessControls) -> Vec<(usize, usize)> {
+    let capacity = access_page_capacity(controls);
+    let units = access_units(controls, capacity);
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let fixed: usize = access_context_lines(controls)
+        .iter()
+        .map(|line| text_len(line) + 1)
+        .sum::<usize>()
+        + text_len("Restricted commands:")
+        + 1;
+    let all_units: usize = units.iter().map(|unit| text_len(unit) + 1).sum();
+    if fixed + all_units <= CONTENT_LIMIT + 1 {
+        return vec![(0, units.len())];
+    }
+    let mut pages = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, unit) in units.iter().enumerate() {
+        let need = text_len(unit) + 1;
+        if index > start && used + need > capacity {
+            pages.push((start, index));
+            start = index;
+            used = 0;
+        }
+        used += need;
+    }
+    pages.push((start, units.len()));
+    pages
+}
+
+/// Page count for `/access show`: 1 when there are no restrictions,
+/// otherwise the greedy bounded pack.
+fn access_show_total(controls: &AccessControls) -> usize {
+    access_show_pages(controls).len().max(1)
+}
+
+/// Render `/access show` page `page` (1-based). Out-of-range pages clamp to
+/// the nearest page; callers that must refuse past-end input check
+/// [`access_show_total`] first. Single-page output is byte-identical to the
+/// legacy summary; page metadata and the next-page hint appear only when
+/// there is more than one page.
+fn access_show_page(controls: &AccessControls, page: usize) -> String {
+    let capacity = access_page_capacity(controls);
+    let units = access_units(controls, capacity);
+    let pages = access_show_pages(controls);
+    let total = pages.len().max(1);
+    let page = page.clamp(1, total);
+    let mut lines = access_context_lines(controls);
     if controls.command_roles.is_empty() {
         lines.push("Restricted commands: none".to_owned());
     } else {
         lines.push("Restricted commands:".to_owned());
-        for (command, roles) in &controls.command_roles {
-            let who = if roles.is_empty() {
-                "admins only".to_owned()
-            } else {
-                roles
-                    .iter()
-                    .map(|role| format!("<@&{role}>"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            lines.push(format!("- /{command}: {who}"));
+        if let Some((start, end)) = pages.get(page - 1) {
+            lines.extend(units[*start..*end].iter().cloned());
+        }
+    }
+    if total > 1 {
+        lines.push(format!("Page {page} of {total}"));
+        if page < total {
+            lines.push(format!("Next page: /access show page:{}", page + 1));
         }
     }
     lines.join("\n")
+}
+
+/// Short refusal for a malformed `/access` shape: names a copyable
+/// invocation, says nothing changed, and echoes none of the bad input.
+fn access_invalid_refusal() -> String {
+    "That /access option is not valid. Nothing was changed. Use /access show page:1 to see the current settings.".to_owned()
+}
+
+/// Short refusal for a malformed `/access show` page: names the remedy and a
+/// valid start, serves no rows and leaks no role mentions.
+fn access_page_refusal() -> String {
+    "Unknown page. Use /access show page:1 to see the first page.".to_owned()
+}
+
+/// Short refusal past the last `/access show` page: same shape, plus the
+/// real total.
+fn access_past_end_refusal(total: usize) -> String {
+    let pages = if total == 1 { "page" } else { "pages" };
+    format!(
+        "Unknown page. /access show has {total} {pages}; use /access show page:1 to start over."
+    )
+}
+
+/// Short truthful post-save confirmations: what changed plus a pointer at
+/// the paged read view. Never the full restriction list.
+fn access_creation_ack(enabled: bool) -> String {
+    let state = if enabled {
+        "on"
+    } else {
+        "off (existing rooms and commands keep working)"
+    };
+    format!("Saved.\nRoom creation: {state}\nSee /access show page:1 for the current settings.")
+}
+
+fn access_required_role_ack(role: Option<Snowflake>) -> String {
+    let line = match role {
+        Some(role) => format!("Required role: <@&{role}>"),
+        None => "Required role: none".to_owned(),
+    };
+    format!("Saved.\n{line}\nSee /access show page:1 for the current settings.")
+}
+
+fn access_restrict_ack(command: &str, roles: &[Snowflake]) -> String {
+    format!(
+        "Saved.\n{}\nSee /access show page:1 for the current settings.",
+        access_row(command, roles)
+    )
+}
+
+fn access_unrestrict_ack(command: &str) -> String {
+    let safe = two_bot_core::message_safety::neutralize_mentions(command);
+    format!("Saved.\n`{safe}` is no longer restricted.\nSee /access show page:1 for the current settings.")
 }
 
 /// Apply one `/access` action: read, change, validate, save, then hand the
@@ -12311,6 +13698,18 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
+    // Malformed shapes refuse before any store touch: no read cost,
+    // no save, no actor/config/audit mutation.
+    if matches!(&action, AccessAction::Invalid) {
+        return access_invalid_refusal();
+    }
+    let show_page_invalid = matches!(
+        &action,
+        AccessAction::Show { page } if page.number().is_none()
+    );
+    if show_page_invalid {
+        return access_page_refusal();
+    }
     let mut controls = match store.access_controls(guild_id).await {
         Ok(controls) => controls,
         Err(error) => {
@@ -12319,34 +13718,49 @@ async fn execute_access<S: RoomPersistence>(
                 .to_owned();
         }
     };
-    match action {
-        AccessAction::Show => return access_summary(&controls),
-        AccessAction::Invalid => {
-            return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
-                .to_owned()
+    let ack = match action {
+        AccessAction::Show { page } => {
+            let Some(number) = page.number() else {
+                return access_page_refusal();
+            };
+            let total = access_show_total(&controls);
+            if number > total {
+                return access_past_end_refusal(total);
+            }
+            return access_show_page(&controls, number);
         }
-        AccessAction::Creation(enabled) => controls.room_creation_enabled = enabled,
-        AccessAction::RequiredRole(role) => controls.required_role = role,
+        // Refused before the store read above; kept for exhaustiveness.
+        AccessAction::Invalid => return access_invalid_refusal(),
+        AccessAction::Creation(enabled) => {
+            controls.room_creation_enabled = enabled;
+            access_creation_ack(enabled)
+        }
+        AccessAction::RequiredRole(role) => {
+            controls.required_role = role;
+            access_required_role_ack(role)
+        }
         AccessAction::Restrict { command, roles } => {
             if !is_voice_command(&command) {
                 return format!("/{command} is not a voice-room command, so nothing was changed.");
             }
+            let ack = access_restrict_ack(&command, &roles);
             controls.command_roles.insert(command, roles);
+            ack
         }
         AccessAction::Unrestrict(command) => {
             if controls.command_roles.remove(&command).is_none() {
                 return format!("/{command} has no role restriction, so nothing was changed.");
             }
+            access_unrestrict_ack(&command)
         }
-    }
+    };
     if validate_access_controls(&controls).is_err() {
         return "Those settings are not valid, so nothing was changed.".to_owned();
     }
     match store.save_access_controls(guild_id, &controls).await {
         Ok(()) => {
-            let summary = access_summary(&controls);
             on_saved(controls);
-            format!("Saved.\n{summary}")
+            ack
         }
         Err(error) => {
             log_admin_store_failure("access_save", guild_id, error);
@@ -12510,6 +13924,30 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
+    // Keep the command state machine shared across initial-response capture and
+    // deferred completion; only this small adapter depends on the callback type.
+    let reply: VoiceReply<'_> = Box::new(move |response| Box::pin(reply(response)));
+    handle_voice_interaction_shared(runtime, interaction, invite_code, inventory, names, reply)
+        .await
+}
+
+type VoiceReply<'a> = Box<
+    dyn FnOnce(InteractionResponse) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + 'a,
+>;
+
+#[inline(never)]
+async fn handle_voice_interaction_shared<S, H>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    invite_code: Option<&str>,
+    inventory: Option<&GuildInventory>,
+    names: &NameDirectory,
+    reply: VoiceReply<'_>,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+{
     let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };
@@ -12527,6 +13965,23 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Ambiguous setup options refuse before guild authority, role gates and
+    // every read or effect: the parser already proved the shape unusable.
+    if let VoiceCommand::SetupShapeInvalid { command, field } = &command {
+        reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+        return true;
+    }
+    // Ambiguous `/logging` and `/kick` options refuse the same way, so a
+    // duplicate or wrong-typed option never saves a setting or posts a
+    // ballot that silently dropped the stated reason.
+    if let VoiceCommand::LoggingShapeInvalid { field } = &command {
+        reply(ephemeral_response(&logging_shape_correction(field))).await;
+        return true;
+    }
+    if matches!(command, VoiceCommand::KickReasonInvalid { .. }) {
+        reply(ephemeral_response(&kick_reason_correction())).await;
+        return true;
+    }
     // Cold guild-role facts are not a permanent denial: a command that
     // needs that authority gets the retryable warming-up reply and fails
     // closed before any gate read or protected effect. Missing-member
@@ -12675,41 +14130,57 @@ where
             }
             true
         }
-        VoiceCommand::Setup => {
+        VoiceCommand::Setup { page } => {
             let permissions = runtime.guild_permissions(interaction);
             let status = runtime.worker_status(guild_id).await;
-            let panel = if is_voice_admin(permissions) {
-                let (store, _) = runtime.make_pair();
-                let (creators, store_error) = match store.creators(guild_id).await {
-                    Ok(creators) => (creators, None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
-                };
-                setup_panel(&SetupSummary {
-                    guild_id,
-                    creators,
-                    tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                    // Current health findings first: they are live, failures are history.
-                    failures: status.as_ref().map_or_else(Vec::new, |status| {
-                        status
-                            .health
-                            .iter()
-                            .chain(status.failures.iter())
-                            .cloned()
-                            .collect()
-                    }),
-                    halted: status.as_ref().is_some_and(|status| status.halted),
-                    store_error,
-                })
-            } else {
+            if !is_voice_admin(permissions) {
                 // No store read for a member: the generic view needs none, and
                 // an open command should not cost a query per invocation.
-                setup_member_panel(
+                // Forged `page` input never enters the admin/store path.
+                let panel = setup_member_panel(
                     status.as_ref().is_some_and(|status| status.halted),
                     status.as_ref().is_some_and(|status| {
                         !status.health.is_empty() || !status.failures.is_empty()
                     }),
-                )
+                );
+                reply(ephemeral_response(&format!(
+                    "**{}**\n{}",
+                    panel.title, panel.description
+                )))
+                .await;
+                return true;
+            }
+            let Some(page_number) = page.number() else {
+                reply(ephemeral_response(&setup_page_refusal())).await;
+                return true;
             };
+            let (store, _) = runtime.make_pair();
+            let (creators, store_error) = match store.creators(guild_id).await {
+                Ok(creators) => (creators, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
+            let summary = SetupSummary {
+                guild_id,
+                creators,
+                tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
+                // Current health findings first: they are live, failures are history.
+                failures: status.as_ref().map_or_else(Vec::new, |status| {
+                    status
+                        .health
+                        .iter()
+                        .chain(status.failures.iter())
+                        .cloned()
+                        .collect()
+                }),
+                halted: status.as_ref().is_some_and(|status| status.halted),
+                store_error,
+            };
+            let total = setup_page_total(&summary);
+            if page_number > total {
+                reply(ephemeral_response(&setup_past_end_refusal(total))).await;
+                return true;
+            }
+            let panel = setup_panel_page(&summary, page_number);
             reply(ephemeral_response(&format!(
                 "**{}**\n{}",
                 panel.title, panel.description
@@ -12764,6 +14235,14 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.enabled.is_none()
+                        && request.name.is_none()
+                        && request.viewer_role.is_none() =>
+                {
+                    text_channels_summary(&creator)
+                }
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
                     TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -12796,6 +14275,12 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.position.is_none() && request.first_number.is_none() =>
+                {
+                    position_summary(&creator)
+                }
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
                     PositionPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -12828,6 +14313,8 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator)) if request.enabled.is_none() => group_summary(&creator),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
                     GroupPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -12953,6 +14440,21 @@ where
                 },
             };
             reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::SetupShapeInvalid { command, field } => {
+            // Unreachable through the shared handler (answered above before
+            // any read), but a second dispatch path must still refuse here,
+            // never run.
+            reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+            true
+        }
+        VoiceCommand::LoggingShapeInvalid { field } => {
+            reply(ephemeral_response(&logging_shape_correction(field))).await;
+            true
+        }
+        VoiceCommand::KickReasonInvalid { .. } => {
+            reply(ephemeral_response(&kick_reason_correction())).await;
             true
         }
         VoiceCommand::Reclaim => {
@@ -13242,13 +14744,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { .. } => {
             warn!(
@@ -13360,13 +14866,17 @@ where
             candidate,
             hash,
             text,
+            review,
         } => {
             if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
                 reply(ephemeral_response(&message)).await;
                 return true;
             }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
-            reply(import_preview_response(&text, member_id, &hash)).await;
+            reply(import_preview_response(
+                &text, member_id, &hash, guild_id, review,
+            ))
+            .await;
         }
         ImportDecision::Apply { candidate, message } => {
             if let Some(refusal) = import_creator_gate(&current, &candidate, permissions) {
@@ -13397,11 +14907,15 @@ where
                                     candidate,
                                     hash,
                                     text,
+                                    review,
                                 } => {
                                     runtime.remember_pending_import(
                                         guild_id, member_id, &hash, candidate,
                                     );
-                                    reply(import_preview_response(&text, member_id, &hash)).await;
+                                    reply(import_preview_response(
+                                        &text, member_id, &hash, guild_id, review,
+                                    ))
+                                    .await;
                                 }
                                 ImportDecision::Apply {
                                     candidate: retry,
@@ -13699,7 +15213,7 @@ where
         // would race it and could answer twice.
         if matches!(
             runtime.parse_voice_command(interaction),
-            Some(VoiceCommand::Kick { .. })
+            Some(VoiceCommand::Kick { .. } | VoiceCommand::KickReasonInvalid { .. })
         ) {
             return;
         }
@@ -13806,7 +15320,8 @@ where
         if !runtime.enabled {
             return false;
         }
-        let Some(VoiceCommand::Kick { target, .. }) = runtime.parse_voice_command(interaction)
+        let Some(VoiceCommand::Kick { target, .. } | VoiceCommand::KickReasonInvalid { target }) =
+            runtime.parse_voice_command(interaction)
         else {
             return false;
         };
@@ -13908,7 +15423,10 @@ where
         if let Event::InteractionCreate(created) = event {
             let command = self.runtime.parse_voice_command(&created.0);
             // The shared router answers `/kick`; see `kick_vote`.
-            if matches!(command, Some(VoiceCommand::Kick { .. })) {
+            if matches!(
+                command,
+                Some(VoiceCommand::Kick { .. } | VoiceCommand::KickReasonInvalid { .. })
+            ) {
                 return;
             }
             if command.is_none()

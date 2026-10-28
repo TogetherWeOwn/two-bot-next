@@ -8,7 +8,11 @@ reminders per server. Reminders require `TWO_AUTOMATIONS=1` and the existing
 live-identity automations clearance, just like their delivery ticker.
 
 - Any member of the configured guild may use the command; no staff permission
-  is needed. Creation, listing and cancellation replies are ephemeral.
+  is needed. Creating a reminder requires View Channel and Send Messages in
+  that channel (Send Messages in Threads for threads), using the requester's
+  resolved channel permissions including overwrites. Missing permission or
+  channel metadata is refused before storing anything. List and cancel do not
+  require posting authority. All command replies are ephemeral.
 - The delay is an integer number of minutes. Natural-language dates, recurring
   reminders and DMs are not supported.
 - Delivery goes to the original requesting channel, names the requester by

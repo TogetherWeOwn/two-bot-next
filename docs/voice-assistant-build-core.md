@@ -31,7 +31,8 @@ without changing this pipeline.
 
 `parse_reply_each` (in `voice_assistant_request`) splits the old all-or-nothing
 `parse_reply` into one result per suggestion. Envelope failures (oversize,
-non-JSON, error object, wrong shape, empty or over-long suggestion list) and
+non-JSON, duplicate keys, error object, wrong shape, empty or over-long
+suggestion list) and
 per-suggestion shape failures (missing fields, over-long explanation) still
 fail the whole reply. A suggestion whose template the strict parse rejects is
 returned as `Err(issue)` at its own position instead, so the pipeline can try

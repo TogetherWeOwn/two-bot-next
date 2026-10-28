@@ -430,3 +430,104 @@ async fn cancelling_a_claim_clears_ownership_and_stale_completion_cannot_resurre
         .is_empty());
     db.close().await.expect("drop disposable DB");
 }
+
+async fn reserved_row_rejects_staff_write(delete: bool) {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    for state in ["pending", "completed", "cancelled"] {
+        let original = row(&format!("remind-staff-{state}"));
+        assert_eq!(
+            remind_store::create(db.pool(), &original).await.unwrap(),
+            Admission::Created
+        );
+        if state == "completed" {
+            let claimed = scheduled_store::claim_due(
+                db.pool(),
+                GUILD,
+                NOW,
+                "staff-guard-claim",
+                LATER,
+                "staff-guard-nonce",
+            )
+            .await
+            .unwrap();
+            // A previously pending row also exists; complete only this row's claim.
+            assert!(claimed.iter().any(|candidate| candidate.id == original.id));
+            assert!(scheduled_store::complete_run(
+                db.pool(),
+                GUILD,
+                &original.id,
+                NOW,
+                Some("9001"),
+                "staff-guard-claim"
+            )
+            .await
+            .unwrap()
+            .is_some());
+        } else if state == "cancelled" {
+            assert!(
+                remind_store::cancel(db.pool(), GUILD, OWNER, &original.id, NOW)
+                    .await
+                    .unwrap()
+            );
+        }
+        let before = scheduled_store::get_scheduled(db.pool(), GUILD, &original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        if delete {
+            assert!(
+                !scheduled_store::delete_scheduled(db.pool(), GUILD, &original.id)
+                    .await
+                    .unwrap(),
+                "staff delete must refuse {state}"
+            );
+        } else {
+            let mut replacement = original.clone();
+            replacement.body = "staff overwrite".to_owned();
+            replacement.channel_id = "9999".to_owned();
+            replacement.enabled = true;
+            replacement.interval_seconds = Some(60);
+            replacement.updated_by = "staff".to_owned();
+            replacement.updated_at = LATER.to_owned();
+            assert!(
+                !scheduled_store::put_scheduled(db.pool(), &replacement)
+                    .await
+                    .unwrap(),
+                "staff put must refuse {state}"
+            );
+        }
+        let after = scheduled_store::get_scheduled(db.pool(), GUILD, &original.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            before == after,
+            "all persisted {state} fields are unchanged"
+        );
+        assert_eq!(
+            remind_store::create(db.pool(), &original).await.unwrap(),
+            Admission::Existing,
+            "replay stays fenced for {state}"
+        );
+        assert!(
+            before
+                == scheduled_store::get_scheduled(db.pool(), GUILD, &original.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+        );
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn staff_put_cannot_overwrite_reserved_pending_rows_or_replay_tombstones() {
+    reserved_row_rejects_staff_write(false).await;
+}
+
+#[tokio::test]
+async fn staff_delete_cannot_erase_reserved_pending_rows_or_replay_tombstones() {
+    reserved_row_rejects_staff_write(true).await;
+}

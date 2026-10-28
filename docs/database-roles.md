@@ -86,6 +86,28 @@ transaction, and reads the guild high-water back through it before touching
 the mirror. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
+The event voice pair (`event_voice_channels`, `event_voice_presence`) is
+ordinary `table` kind for the same reason: the claim path, the presence
+transition hook and the reconcile passes read and write both tables through
+the app pool. The presence spans carry a member column (`user_id`, erased
+via the scheduled-event mirror); the channel row carries no member identity.
+
+The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
+for the same reason: the container authorizer reads the token row through
+the app pool when the later transport slices land (slice 0 ships the table
+with no reader yet). Secrets are hash-only; `issued_by` is operator
+attribution retained by the erasure allowlist. The table carries no member
+column, so there is nothing to erase and no reader grant beyond the app
+pool.
+
+The giveaway tables (`giveaways`, `giveaway_entries`, `giveaway_draws`) are
+ordinary `table` kind for the same reason: the giveaway store creates,
+enters, leases and draws through the app pool. Unlike the tables above they
+do carry member columns (`created_by`, `user_id`, `winner_ids`, and the
+`single:<id>` replaced-winner id inside `reroll_kind`), so member erasure
+and guild purge cover all three tables in the reviewed erasure plan; there
+is no reader grant beyond the app pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not

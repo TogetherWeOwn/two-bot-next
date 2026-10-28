@@ -55,7 +55,7 @@ fn command(
             vec![option(name, CommandOptionValue::SubCommand(options))],
         ),
         member,
-        Permissions::empty(),
+        Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES,
     );
     interaction.id = Id::new(invocation);
     interaction

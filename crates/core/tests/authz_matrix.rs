@@ -146,8 +146,8 @@ fn role_x_route_matrix_matches_expected_status() {
             checked += 1;
         }
     }
-    // 30 routes x 10 roles: a silently emptied fixture must not pass.
-    assert_eq!(checked, 300, "matrix size drifted");
+    // 46 routes x 10 roles: a silently emptied fixture must not pass.
+    assert_eq!(checked, 460, "matrix size drifted");
 }
 
 #[test]
@@ -163,7 +163,11 @@ fn guild_fence_and_unresolved_permissions() {
             let name = route_row["name"].as_str().unwrap();
             let is_moderation = ModerationAction::ALL
                 .iter()
-                .any(|action| action.command_name() == name);
+                .any(|action| action.command_name() == name)
+                || matches!(
+                    name,
+                    "purge-preview" | "channel-inspect" | "tempban-list" | "moderation-recent"
+                );
             let open = route_row["allow"] == "*";
             let expected_key = if is_moderation {
                 "moderation"

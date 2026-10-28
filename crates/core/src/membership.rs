@@ -174,42 +174,75 @@ pub fn set_observation(row: &mut StoredRow, hint: &str) {
 /// Shared with the sqlx adapter so the durable read model projects exactly
 /// like memory, from the events log rather than arrival-ordered columns.
 pub fn project<'a>(rows: impl Iterator<Item = &'a StoredRow>) -> Option<Membership> {
-    let rows: Vec<_> = rows.collect();
-    let join = rows
-        .iter()
-        .filter(|r| r.event_type == EventType::MemberJoin)
-        .filter_map(|r| Some((normalize_timestamp(&r.occurred_at)?, *r)))
-        .max_by(|(a, ra), (b, rb)| {
-            a.cmp(b)
-                .then_with(|| rb.idempotency_key.cmp(&ra.idempotency_key))
-        });
-    let presence = rows
-        .iter()
-        .filter(|r| is_membership(r.event_type))
-        .filter_map(|r| Some((observation(r)?, *r)))
-        .max_by(|(a, ra), (b, rb)| {
-            a.cmp(b)
-                .then_with(|| {
-                    (ra.event_type == EventType::MemberLeave)
-                        .cmp(&(rb.event_type == EventType::MemberLeave))
-                })
-                .then_with(|| ra.idempotency_key.cmp(&rb.idempotency_key))
-        });
-    let flag = rows
-        .iter()
-        .filter(|r| r.event_type == EventType::MemberInactive)
-        .filter_map(|r| normalize_timestamp(&r.occurred_at))
-        .max();
-    if join.is_none() && presence.is_none() && flag.is_none() {
-        return None;
+    let mut projection = MembershipProjection::default();
+    for row in rows {
+        projection.observe(row);
     }
-    let inactive_flagged_at = flag.filter(|f| join.as_ref().is_none_or(|(at, _)| f > at));
-    Some(Membership {
-        joined_at: join.as_ref().map(|(at, _)| at.clone()),
-        join_source: join.map(|(_, row)| row.source.clone()),
-        left_at: presence
-            .filter(|(_, r)| r.event_type == EventType::MemberLeave)
-            .and_then(|(_, r)| normalize_timestamp(&r.occurred_at)),
-        inactive_flagged_at,
-    })
+    projection.finish()
+}
+
+/// Incremental chronological fold for paged durable reads. Retains only the
+/// winning join, presence and inactive timestamp, never the member's history.
+#[derive(Default)]
+pub struct MembershipProjection {
+    join: Option<(String, StoredRow)>,
+    presence: Option<(String, StoredRow)>,
+    flag: Option<String>,
+}
+
+impl MembershipProjection {
+    pub fn observe(&mut self, row: &StoredRow) {
+        if row.event_type == EventType::MemberJoin {
+            if let Some(at) = normalize_timestamp(&row.occurred_at) {
+                if self.join.as_ref().is_none_or(|(old, previous)| {
+                    at.cmp(old)
+                        .then_with(|| previous.idempotency_key.cmp(&row.idempotency_key))
+                        .is_ge()
+                }) {
+                    self.join = Some((at, row.clone()));
+                }
+            }
+        }
+        if is_membership(row.event_type) {
+            if let Some(at) = observation(row) {
+                if self.presence.as_ref().is_none_or(|(old, previous)| {
+                    at.cmp(old)
+                        .then_with(|| {
+                            (row.event_type == EventType::MemberLeave)
+                                .cmp(&(previous.event_type == EventType::MemberLeave))
+                        })
+                        .then_with(|| row.idempotency_key.cmp(&previous.idempotency_key))
+                        .is_ge()
+                }) {
+                    self.presence = Some((at, row.clone()));
+                }
+            }
+        }
+        if row.event_type == EventType::MemberInactive {
+            if let Some(at) = normalize_timestamp(&row.occurred_at) {
+                if self.flag.as_ref().is_none_or(|old| at >= *old) {
+                    self.flag = Some(at);
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Option<Membership> {
+        if self.join.is_none() && self.presence.is_none() && self.flag.is_none() {
+            return None;
+        }
+        let inactive_flagged_at = self
+            .flag
+            .filter(|f| self.join.as_ref().is_none_or(|(at, _)| f > at));
+        Some(Membership {
+            joined_at: self.join.as_ref().map(|(at, _)| at.clone()),
+            join_source: self.join.map(|(_, row)| row.source),
+            left_at: self
+                .presence
+                .filter(|(_, r)| r.event_type == EventType::MemberLeave)
+                .and_then(|(_, r)| normalize_timestamp(&r.occurred_at)),
+            inactive_flagged_at,
+        })
+    }
 }

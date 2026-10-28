@@ -2,7 +2,7 @@
 //! `/warn`) plus the tempban unban sweep.
 //!
 //! Thin wiring over the `member_moderation` domain + `PgMemberModerationStore`:
-//! decode options → resolve actor/target role facts over REST → validate →
+//! strictly decode options → resolve actor/target role facts over REST → validate →
 //! exactly-once execute through the shared REST executor → ephemeral outcome.
 //! Routing, the `TWO_MODERATION` gate and the handler-level permission check
 //! all happen in the shared router before these run. Dispatch still derives
@@ -26,18 +26,21 @@ use sqlx::{Pool, Postgres};
 use tokio::sync::OnceCell;
 use twilight_model::{
     application::interaction::{
-        application_command::CommandOptionValue, Interaction, InteractionData,
+        application_command::{CommandDataOption, CommandOptionValue},
+        Interaction, InteractionData,
     },
     id::{marker::UserMarker, Id},
 };
 use two_bot_core::{
     member_moderation::{
         DiscordError as MemberDiscordError, MemberAuthority, MemberError, MemberExecution,
-        MemberModerationService, MemberOutcome, MemberResult, UNBAN_SWEEP_INTERVAL_SECONDS,
+        MemberModerationService, MemberOutcome, MemberResult, MAX_TEMPBAN_SECONDS,
+        MAX_TIMEOUT_SECONDS, MIN_DURATION_SECONDS, UNBAN_SWEEP_INTERVAL_SECONDS,
     },
     member_moderation_store::PgMemberModerationStore,
     moderation::{
-        ModerationAction, ModerationActor, ModerationGates, ModerationPolicy, ModerationTarget,
+        require_moderation_reason, ModerationAction, ModerationActor, ModerationGates,
+        ModerationPolicy, ModerationTarget,
     },
 };
 use two_bot_discord::ActionExecutor;
@@ -77,7 +80,7 @@ const COOLDOWN_REPLY: &str = "Wait 5 seconds before using another member moderat
 /// Fixed diagnostic vocabulary only: never carry Discord bodies, parser errors,
 /// transport details or member-supplied strings into refusal logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AuthorityCause {
+pub(crate) enum AuthorityCause {
     Discord403,
     Transport,
     MalformedRoles,
@@ -86,7 +89,7 @@ enum AuthorityCause {
 }
 
 impl AuthorityCause {
-    fn token(self) -> &'static str {
+    pub(crate) fn token(self) -> &'static str {
         match self {
             Self::Discord403 => "discord_403",
             Self::Transport => "transport",
@@ -254,6 +257,52 @@ impl MemberRuntime {
         self.store.clone()
     }
 
+    /// Private saved-state read. Unlike an effect it needs no target hierarchy,
+    /// bot identity, member lane, cooldown claim or applied-mutation audit.
+    /// Reuse the same strict current guild/member authority resolver first.
+    pub(crate) async fn inventory_reply(
+        &self,
+        executor: &ActionExecutor,
+        interaction: &Interaction,
+    ) -> String {
+        use two_bot_core::tempban_inventory;
+
+        let page = match inventory_page(interaction) {
+            Some(page) => page,
+            None => return tempban_inventory::SELECTOR_CORRECTION.to_owned(),
+        };
+        let actor_id = actor_id(interaction);
+        if actor_id.is_empty()
+            || interaction.guild_id.map(|id| id.to_string()).as_deref() != Some(&self.guild_id)
+        {
+            return tempban_inventory::UNAVAILABLE.to_owned();
+        }
+        let authority = async {
+            let facts = guild_facts(executor, &self.guild_id).await?;
+            let (roles, _) = fetched_member(executor, &self.guild_id, &actor_id)
+                .await?
+                .ok_or(AuthorityCause::MalformedRoles)?;
+            actor_authority(&actor_id, roles, &facts).ok_or(AuthorityCause::MalformedRoles)
+        }
+        .await;
+        match authority {
+            Ok(actor) if actor.permissions & two_bot_core::commands::PERM_BAN_MEMBERS != 0 => {}
+            Ok(_) => return "You need the current Ban Members permission to inspect saved expiries. Ask a server moderator or admin.".to_owned(),
+            Err(cause) => {
+                tracing::warn!(cause = cause.token(), "tempban inventory authority unavailable");
+                return tempban_inventory::UNAVAILABLE.to_owned();
+            }
+        }
+        match self.store.saved_expiries(&self.guild_id, page).await {
+            Ok(rows) => tempban_inventory::render(page, &rows),
+            Err(_) => {
+                // Fixed vocabulary only: store errors can carry database detail.
+                tracing::warn!("tempban inventory read unavailable");
+                tempban_inventory::UNAVAILABLE.to_owned()
+            }
+        }
+    }
+
     /// Policy stamped with the resolved bot identity; callers resolve it first.
     fn policy(&self, bot_id: &str) -> ModerationPolicy {
         ModerationPolicy {
@@ -337,6 +386,31 @@ impl MemberRuntime {
     }
 }
 
+/// Decode the complete inventory shape before authority or storage reads. No
+/// permissive lookup that could ignore a duplicate, nested or unknown selector.
+fn inventory_page(
+    interaction: &Interaction,
+) -> Option<two_bot_core::tempban_inventory::ExpiryPage> {
+    use two_bot_core::tempban_inventory::ExpiryPage;
+
+    let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
+        return None;
+    };
+    if data.name != "tempban-list"
+        || data.kind != twilight_model::application::command::CommandType::ChatInput
+    {
+        return None;
+    }
+    match data.options.as_slice() {
+        [] => ExpiryPage::new(1),
+        [option] if option.name == "page" => match option.value {
+            CommandOptionValue::Integer(number) => ExpiryPage::new(number),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Current epoch millis as the service clock expects.
 fn now_millis_i64() -> i64 {
     std::time::SystemTime::now()
@@ -347,7 +421,7 @@ fn now_millis_i64() -> i64 {
 }
 
 /// Role positions plus the guild owner, read live per command.
-struct GuildFacts {
+pub(crate) struct GuildFacts {
     guild_id: String,
     owner_id: String,
     positions: HashMap<String, i64>,
@@ -361,7 +435,7 @@ fn text(value: &serde_json::Value, key: &str) -> Option<String> {
 /// One `GET /guilds/{id}`: owner id plus every role position. Any malformed
 /// or missing piece fails the command — hierarchy never runs on a partial
 /// snapshot.
-async fn guild_facts(
+pub(crate) async fn guild_facts(
     executor: &ActionExecutor,
     guild_id: &str,
 ) -> Result<GuildFacts, AuthorityCause> {
@@ -420,7 +494,7 @@ fn valid_id(id: &str) -> bool {
 /// an unknown role is incomplete evidence, not an implicit privilege grant.
 /// Owners and administrators hold every permission, but only the guild owner
 /// is exempt from role hierarchy: an administrator keeps the real top position.
-fn actor_authority(
+pub(crate) fn actor_authority(
     user_id: &str,
     held: Vec<String>,
     facts: &GuildFacts,
@@ -454,35 +528,244 @@ fn top_position(held: &[String], facts: &GuildFacts) -> Option<i64> {
     Some(top)
 }
 
-/// `/ban` etc. options: `target` (user), `reason` (string),
-/// `duration_seconds` (integer, tempban/timeout only). Missing values decode
-/// to `None`; validation owns the refusal text.
-fn command_options(
+/// Strictly decoded member-verb options: `target` + `reason` for all five
+/// verbs, plus `duration_seconds` for tempban/timeout. Decode runs before
+/// any cooldown admission, membership read, policy evaluation, mutation,
+/// audit write or idempotency claim; any `Err` is already the user-facing
+/// ephemeral refusal text, with zero stored effects.
+#[derive(Debug)]
+struct StrictOptions {
+    target: Id<UserMarker>,
+    reason: String,
+    duration_seconds: Option<i64>,
+}
+
+/// A strict-decode refusal: the private reply plus the fixed-vocabulary
+/// problem kind for logging (never a member-supplied string).
+#[derive(Debug)]
+struct StrictRefusal {
+    reply: String,
+    problem: &'static str,
+}
+
+/// The ONE shared member-verb option decoder. Wrong types, duplicate
+/// options, missing required options, unknown options and invalid values
+/// all refuse here, before anything else observes the invocation.
+fn strict_command_options(
+    action: ModerationAction,
     interaction: &Interaction,
-) -> (Option<Id<UserMarker>>, Option<String>, Option<i64>) {
-    let mut target = None;
-    let mut reason = None;
-    let mut duration_seconds = None;
-    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
-        return (target, reason, duration_seconds);
+) -> Result<StrictOptions, StrictRefusal> {
+    let options: &[CommandDataOption] = match &interaction.data {
+        Some(InteractionData::ApplicationCommand(data)) => &data.options,
+        _ => &[],
     };
-    for option in &data.options {
-        match (option.name.as_str(), &option.value) {
-            ("target", CommandOptionValue::User(id)) => target = Some(*id),
-            ("reason", CommandOptionValue::String(value)) => reason = Some(value.clone()),
-            ("duration_seconds", CommandOptionValue::Integer(value)) => {
-                duration_seconds = Some(*value);
+    strict_decode_options(action, options)
+}
+
+fn strict_decode_options(
+    action: ModerationAction,
+    options: &[CommandDataOption],
+) -> Result<StrictOptions, StrictRefusal> {
+    let verb = action.command_name();
+    let wants_duration = matches!(
+        action,
+        ModerationAction::TempBan | ModerationAction::Timeout
+    );
+    let mut target: Option<Id<UserMarker>> = None;
+    let mut reason: Option<String> = None;
+    let mut duration_seconds: Option<i64> = None;
+    for option in options {
+        match option.name.as_str() {
+            "target" => {
+                if target.is_some() {
+                    return Err(strict_refuse(
+                        verb,
+                        wants_duration,
+                        "duplicate",
+                        "target",
+                        "was sent twice",
+                    ));
+                }
+                match &option.value {
+                    CommandOptionValue::User(id) => target = Some(*id),
+                    _ => {
+                        return Err(strict_refuse(
+                            verb,
+                            wants_duration,
+                            "wrong_type",
+                            "target",
+                            "must be a user",
+                        ));
+                    }
+                }
             }
-            _ => {}
+            "reason" => {
+                if reason.is_some() {
+                    return Err(strict_refuse(
+                        verb,
+                        wants_duration,
+                        "duplicate",
+                        "reason",
+                        "was sent twice",
+                    ));
+                }
+                match &option.value {
+                    CommandOptionValue::String(value) => reason = Some(value.clone()),
+                    _ => {
+                        return Err(strict_refuse(
+                            verb,
+                            wants_duration,
+                            "wrong_type",
+                            "reason",
+                            "must be text",
+                        ));
+                    }
+                }
+            }
+            "duration_seconds" => {
+                if !wants_duration {
+                    return Err(strict_refuse_unexpected(
+                        verb,
+                        wants_duration,
+                        "duration_seconds",
+                    ));
+                }
+                if duration_seconds.is_some() {
+                    return Err(strict_refuse(
+                        verb,
+                        wants_duration,
+                        "duplicate",
+                        "duration_seconds",
+                        "was sent twice",
+                    ));
+                }
+                match &option.value {
+                    CommandOptionValue::Integer(value) => duration_seconds = Some(*value),
+                    _ => {
+                        return Err(strict_refuse(
+                            verb,
+                            wants_duration,
+                            "wrong_type",
+                            "duration_seconds",
+                            "must be an integer number of seconds",
+                        ));
+                    }
+                }
+            }
+            unknown => {
+                return Err(strict_refuse_unexpected(verb, wants_duration, unknown));
+            }
         }
     }
-    (target, reason, duration_seconds)
+    let Some(target) = target else {
+        return Err(strict_refuse(
+            verb,
+            wants_duration,
+            "missing",
+            "target",
+            "is missing",
+        ));
+    };
+    let Some(reason) = reason else {
+        return Err(strict_refuse(
+            verb,
+            wants_duration,
+            "missing",
+            "reason",
+            "is missing",
+        ));
+    };
+    if wants_duration && duration_seconds.is_none() {
+        return Err(strict_refuse(
+            verb,
+            wants_duration,
+            "missing",
+            "duration_seconds",
+            "is missing",
+        ));
+    }
+    // Same reason rule the domain enforces downstream, so a strict refusal
+    // and a domain refusal never disagree about what is valid.
+    let reason = match require_moderation_reason(&reason) {
+        Ok(reason) => reason,
+        Err(error) => {
+            return Err(StrictRefusal {
+                reply: format!(
+                    "Cannot run /{verb}: {error}. Try: /{verb} {}",
+                    strict_usage(wants_duration)
+                ),
+                problem: "invalid",
+            });
+        }
+    };
+    if let Some(value) = duration_seconds {
+        // Same per-verb bounds the domain enforces downstream.
+        let (min, max) = if matches!(action, ModerationAction::TempBan) {
+            (MIN_DURATION_SECONDS, MAX_TEMPBAN_SECONDS)
+        } else {
+            (MIN_DURATION_SECONDS, MAX_TIMEOUT_SECONDS)
+        };
+        if !(min..=max).contains(&value) {
+            return Err(StrictRefusal {
+                reply: format!(
+                    "Cannot run /{verb}: \"duration_seconds\" must be an integer between {min} and {max}. Try: /{verb} {}",
+                    strict_usage(wants_duration)
+                ),
+                problem: "invalid",
+            });
+        }
+    }
+    Ok(StrictOptions {
+        target,
+        reason,
+        duration_seconds,
+    })
+}
+
+/// Copyable corrected invocation for the verb shape. The duration example
+/// is the per-verb minimum, valid for both tempban and timeout.
+fn strict_usage(wants_duration: bool) -> &'static str {
+    if wants_duration {
+        "target:@user reason:text duration_seconds:60"
+    } else {
+        "target:@user reason:text"
+    }
+}
+
+fn strict_refuse(
+    verb: &str,
+    wants_duration: bool,
+    problem: &'static str,
+    name: &'static str,
+    detail: &str,
+) -> StrictRefusal {
+    StrictRefusal {
+        reply: format!(
+            "Cannot run /{verb}: option \"{name}\" {detail}. Try: /{verb} {}",
+            strict_usage(wants_duration)
+        ),
+        problem,
+    }
+}
+
+/// Unknown options and `duration_seconds` on verbs that take no duration.
+/// The echoed name is sanitized: hostile option names never reach the reply
+/// raw, and hostile option values are never echoed at all.
+fn strict_refuse_unexpected(verb: &str, wants_duration: bool, name: &str) -> StrictRefusal {
+    StrictRefusal {
+        reply: format!(
+            "Cannot run /{verb}: option \"{}\" is not a /{verb} option. Try: /{verb} {}",
+            sanitize_option_name(name),
+            strict_usage(wants_duration)
+        ),
+        problem: "unknown",
+    }
 }
 
 /// Membership plus bot flag from `GET /guilds/{g}/members/{u}`. `None` is a
 /// departed or never-joined user (ban tolerates; kick/timeout/warn refuse).
 /// An id mismatch or malformed body fails closed.
-async fn fetched_member(
+pub(crate) async fn fetched_member(
     executor: &ActionExecutor,
     guild_id: &str,
     target: &str,
@@ -542,7 +825,7 @@ pub(crate) async fn handle_command(
 ) {
     let reply = match execute(member, executor, interaction, action).await {
         Ok(result) => {
-            let target = target_display(interaction);
+            let target = target_display(interaction, action);
             MemberRuntime::outcome_text_with_target(&result, &target)
         }
         Err(reply) => reply,
@@ -558,8 +841,10 @@ pub(crate) async fn handle_command(
 /// Moderator-visible target slot: the resolved interaction user's display
 /// name when Discord sent it, else the raw target user id. The reply
 /// sanitizer neutralizes anything hostile in either.
-fn target_display(interaction: &Interaction) -> String {
-    let target = command_options(interaction).0;
+fn target_display(interaction: &Interaction, action: ModerationAction) -> String {
+    let target = strict_command_options(action, interaction)
+        .ok()
+        .map(|strict| strict.target);
     if let (Some(id), Some(InteractionData::ApplicationCommand(data))) =
         (target, interaction.data.as_ref())
     {
@@ -576,14 +861,24 @@ fn target_display(interaction: &Interaction) -> String {
 /// helper, split mention pills so they render literally, then cap the slot
 /// at 512 chars on char boundaries. Markdown-escaping is NOT applied here.
 fn sanitize_target_display(display: &str) -> String {
-    let folded = display.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    sanitize_reply_slot(display, 512)
+}
+
+/// Same reply-slot sanitizer for an echoed option name, capped tighter so
+/// the strict refusal always stays a short private reply.
+pub(crate) fn sanitize_option_name(name: &str) -> String {
+    sanitize_reply_slot(name, 64)
+}
+
+fn sanitize_reply_slot(value: &str, cap: usize) -> String {
+    let folded = value.replace("\r\n", " ").replace(['\r', '\n'], " ");
     let neutralized = two_bot_core::message_safety::neutralize_mentions(&folded);
     let split = neutralized
         .replace("<@", "<\u{200b}@")
         .replace("<#", "<\u{200b}#")
         .replace("<:", "<\u{200b}:")
         .replace("<a:", "<\u{200b}a:");
-    split.chars().take(512).collect()
+    split.chars().take(cap).collect()
 }
 
 fn error_text(err: MemberError) -> String {
@@ -621,6 +916,20 @@ async fn execute(
     if actor_id.is_empty() {
         return Err(FAILURE_REPLY.to_owned());
     }
+    // Strict decode precedes every cooldown, read, claim and mutation: a
+    // malformed invocation refuses with a correction and zero stored
+    // effects, and never consumes the actor cooldown.
+    let strict = match strict_command_options(action, interaction) {
+        Ok(strict) => strict,
+        Err(refusal) => {
+            tracing::info!(
+                verb = action.command_name(),
+                problem = refusal.problem,
+                "member moderation strict decode refused"
+            );
+            return Err(refusal.reply);
+        }
+    };
     let admitted = member
         .actor_cooldowns
         .lock()
@@ -630,7 +939,6 @@ async fn execute(
         tracing::info!(actor = %actor_id, guild = %member.guild_id, "member moderation cooldown refused");
         return Err(COOLDOWN_REPLY.to_owned());
     }
-    let (target, reason, duration_seconds) = command_options(interaction);
     let guild_id = member.guild_id.clone();
     // Identity and command content only: no interaction-time authority survives
     // into dispatch. The callback below fills these deliberately empty facts.
@@ -643,16 +951,16 @@ async fn execute(
             highest_role_position: 0,
             permissions: 0,
         },
-        target: target.map(|id| ModerationTarget {
-            user_id: id.to_string(),
+        target: Some(ModerationTarget {
+            user_id: strict.target.to_string(),
             role_ids: Vec::new(),
             highest_role_position: 0,
             is_bot: false,
             is_guild_owner: false,
         }),
         bot_highest_role_position: 0,
-        reason: reason.unwrap_or_default(),
-        duration_seconds,
+        reason: strict.reason,
+        duration_seconds: strict.duration_seconds,
         request_id: new_id(),
         idempotency_key: interaction.id.get().to_string(),
     };
@@ -831,8 +1139,10 @@ mod diagnostics_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use twilight_model::application::command::CommandOptionType;
     use two_bot_core::{
         member_moderation::StoreError,
+        message_safety::contains_mass_mention,
         moderation::{PolicyError, ReasonError},
     };
 
@@ -1242,6 +1552,424 @@ mod tests {
                 "dave"
             ),
             "Unbanned dave. Already applied."
+        );
+    }
+
+    fn strict_option(name: &str, value: CommandOptionValue) -> CommandDataOption {
+        CommandDataOption {
+            name: name.to_owned(),
+            value,
+        }
+    }
+
+    fn strict_valid_options(verb: &str) -> Vec<CommandDataOption> {
+        let mut options = vec![
+            strict_option("target", CommandOptionValue::User(Id::new(3333))),
+            strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
+        ];
+        if matches!(verb, "tempban" | "timeout") {
+            options.push(strict_option(
+                "duration_seconds",
+                CommandOptionValue::Integer(60),
+            ));
+        }
+        options
+    }
+
+    fn assert_strict_unit_refusal(reply: &str, verb: &str, offending: &str) {
+        // Pin the quoted option name, not the bare token: the always-present
+        // Try usage lists every valid option name but never quotes one, so a
+        // quoted `contains` stays red if the refusal stops naming the
+        // offending option. One quoted check covers every refusal shape:
+        // `option "x" ...` plus the domain-copy value refusals (`"x" must
+        // be ...`, `"x" is longer ...`).
+        let quoted = format!("\"{offending}\"");
+        assert!(
+            reply.contains(&quoted),
+            "{verb}: refusal names {quoted}, got {reply:?}"
+        );
+        assert_strict_unit_refusal_shape(reply, verb);
+    }
+
+    fn assert_strict_unit_refusal_shape(reply: &str, verb: &str) {
+        assert!(
+            reply.contains(&format!("/{verb}")),
+            "{verb}: refusal carries a /{verb} correction, got {reply:?}"
+        );
+        assert!(
+            !reply.is_empty() && reply.len() < 1000,
+            "{verb}: bounded private refusal, got {reply:?}"
+        );
+        assert!(
+            !reply.contains("@everyone") && !reply.contains("@here"),
+            "{verb}: refusal is mention-safe, got {reply:?}"
+        );
+        assert!(
+            !contains_mass_mention(reply),
+            "{verb}: refusal carries no live mention, got {reply:?}"
+        );
+    }
+
+    fn strict_wrong_values() -> Vec<CommandOptionValue> {
+        vec![
+            CommandOptionValue::Boolean(true),
+            CommandOptionValue::Number(1.5),
+            CommandOptionValue::Channel(Id::new(7)),
+            CommandOptionValue::Role(Id::new(8)),
+            CommandOptionValue::Mentionable(Id::new(9)),
+            CommandOptionValue::Attachment(Id::new(10)),
+            CommandOptionValue::Focused("3333".to_owned(), CommandOptionType::User),
+            CommandOptionValue::SubCommand(vec![]),
+            CommandOptionValue::SubCommandGroup(vec![]),
+        ]
+    }
+
+    #[test]
+    fn strict_decode_accepts_all_five_valid_shapes() {
+        for action in [
+            ModerationAction::Ban,
+            ModerationAction::TempBan,
+            ModerationAction::Kick,
+            ModerationAction::Timeout,
+            ModerationAction::Warn,
+        ] {
+            let verb = action.command_name();
+            let strict = strict_decode_options(action, &strict_valid_options(verb))
+                .expect("valid member-verb options decode");
+            assert_eq!(strict.target.get(), 3333, "{verb}");
+            assert_eq!(strict.reason, "wiring", "{verb}");
+            assert_eq!(
+                strict.duration_seconds,
+                if matches!(verb, "tempban" | "timeout") {
+                    Some(60)
+                } else {
+                    None
+                },
+                "{verb}"
+            );
+        }
+        // Option order is irrelevant and padding trims exactly as the domain
+        // would, so the validated request stays byte-identical downstream.
+        let strict = strict_decode_options(
+            ModerationAction::Ban,
+            &[
+                strict_option(
+                    "reason",
+                    CommandOptionValue::String("  wiring  ".to_owned()),
+                ),
+                strict_option("target", CommandOptionValue::User(Id::new(3333))),
+            ],
+        )
+        .expect("reordered options decode");
+        assert_eq!(strict.reason, "wiring");
+    }
+
+    #[test]
+    fn strict_decode_refuses_every_wrong_type_per_option() {
+        for action in [
+            ModerationAction::Ban,
+            ModerationAction::TempBan,
+            ModerationAction::Kick,
+            ModerationAction::Timeout,
+            ModerationAction::Warn,
+        ] {
+            let verb = action.command_name();
+            // `target` accepts only User; every other wire type refuses.
+            for value in [
+                vec![CommandOptionValue::String("3333".to_owned())],
+                vec![CommandOptionValue::Integer(3333)],
+                strict_wrong_values(),
+            ]
+            .concat()
+            {
+                let mut options = vec![strict_option("target", value)];
+                options.push(strict_option(
+                    "reason",
+                    CommandOptionValue::String("wiring".to_owned()),
+                ));
+                if matches!(verb, "tempban" | "timeout") {
+                    options.push(strict_option(
+                        "duration_seconds",
+                        CommandOptionValue::Integer(60),
+                    ));
+                }
+                let refusal = strict_decode_options(action, &options)
+                    .expect_err("wrong-typed target refuses");
+                assert_eq!(refusal.problem, "wrong_type", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "target");
+            }
+            // `reason` accepts only String; every other wire type refuses.
+            for value in [
+                vec![CommandOptionValue::User(Id::new(3333))],
+                vec![CommandOptionValue::Integer(123)],
+                strict_wrong_values(),
+            ]
+            .concat()
+            {
+                let mut options = vec![strict_option(
+                    "target",
+                    CommandOptionValue::User(Id::new(3333)),
+                )];
+                options.push(strict_option("reason", value));
+                if matches!(verb, "tempban" | "timeout") {
+                    options.push(strict_option(
+                        "duration_seconds",
+                        CommandOptionValue::Integer(60),
+                    ));
+                }
+                let refusal = strict_decode_options(action, &options)
+                    .expect_err("wrong-typed reason refuses");
+                assert_eq!(refusal.problem, "wrong_type", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "reason");
+            }
+            if !matches!(verb, "tempban" | "timeout") {
+                continue;
+            }
+            // `duration_seconds` accepts only Integer; every other wire type
+            // refuses.
+            for value in [
+                vec![CommandOptionValue::User(Id::new(3333))],
+                vec![CommandOptionValue::String("60".to_owned())],
+                strict_wrong_values(),
+            ]
+            .concat()
+            {
+                let options = vec![
+                    strict_option("target", CommandOptionValue::User(Id::new(3333))),
+                    strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
+                    strict_option("duration_seconds", value),
+                ];
+                let refusal = strict_decode_options(action, &options)
+                    .expect_err("wrong-typed duration refuses");
+                assert_eq!(refusal.problem, "wrong_type", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "duration_seconds");
+            }
+        }
+    }
+
+    #[test]
+    fn strict_decode_refuses_duplicates_missing_and_unknown() {
+        for action in [
+            ModerationAction::Ban,
+            ModerationAction::TempBan,
+            ModerationAction::Kick,
+            ModerationAction::Timeout,
+            ModerationAction::Warn,
+        ] {
+            let verb = action.command_name();
+            let wants_duration = matches!(verb, "tempban" | "timeout");
+            // Duplicates refuse instead of last-wins.
+            for (offending, extra) in [
+                (
+                    "target",
+                    strict_option("target", CommandOptionValue::User(Id::new(9999))),
+                ),
+                (
+                    "reason",
+                    strict_option("reason", CommandOptionValue::String("second".to_owned())),
+                ),
+            ] {
+                let mut options = strict_valid_options(verb);
+                options.push(extra);
+                let refusal =
+                    strict_decode_options(action, &options).expect_err("duplicate option refuses");
+                assert_eq!(refusal.problem, "duplicate", "{verb}/{offending}");
+                assert_strict_unit_refusal(&refusal.reply, verb, offending);
+            }
+            if wants_duration {
+                let mut options = strict_valid_options(verb);
+                options.push(strict_option(
+                    "duration_seconds",
+                    CommandOptionValue::Integer(120),
+                ));
+                let refusal = strict_decode_options(action, &options)
+                    .expect_err("duplicate duration refuses");
+                assert_eq!(refusal.problem, "duplicate", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "duration_seconds");
+            }
+            // Missing required options refuse.
+            for offending in ["target", "reason"] {
+                let options: Vec<CommandDataOption> = strict_valid_options(verb)
+                    .into_iter()
+                    .filter(|option| option.name != offending)
+                    .collect();
+                let refusal = strict_decode_options(action, &options)
+                    .expect_err("missing required option refuses");
+                assert_eq!(refusal.problem, "missing", "{verb}/{offending}");
+                assert_strict_unit_refusal(&refusal.reply, verb, offending);
+            }
+            if wants_duration {
+                let options = vec![
+                    strict_option("target", CommandOptionValue::User(Id::new(3333))),
+                    strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
+                ];
+                let refusal =
+                    strict_decode_options(action, &options).expect_err("missing duration refuses");
+                assert_eq!(refusal.problem, "missing", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "duration_seconds");
+            }
+            // Unknown options refuse instead of being ignored.
+            let mut options = strict_valid_options(verb);
+            options.push(strict_option("count", CommandOptionValue::Integer(5)));
+            let refusal =
+                strict_decode_options(action, &options).expect_err("unknown option refuses");
+            assert_eq!(refusal.problem, "unknown", "{verb}");
+            assert_strict_unit_refusal(&refusal.reply, verb, "count");
+            // `duration_seconds` on ban/kick/warn is unexpected.
+            if !wants_duration {
+                let mut options = strict_valid_options(verb);
+                options.push(strict_option(
+                    "duration_seconds",
+                    CommandOptionValue::Integer(60),
+                ));
+                let refusal = strict_decode_options(action, &options)
+                    .expect_err("unexpected duration refuses");
+                assert_eq!(refusal.problem, "unknown", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "duration_seconds");
+            }
+        }
+        // No options at all names the first required slot.
+        let refusal =
+            strict_decode_options(ModerationAction::Ban, &[]).expect_err("empty options refuse");
+        assert_eq!(refusal.problem, "missing");
+        assert_strict_unit_refusal(&refusal.reply, "ban", "target");
+    }
+
+    #[test]
+    fn strict_decode_refuses_invalid_values_with_domain_bounds() {
+        for action in [
+            ModerationAction::Ban,
+            ModerationAction::TempBan,
+            ModerationAction::Kick,
+            ModerationAction::Timeout,
+            ModerationAction::Warn,
+        ] {
+            let verb = action.command_name();
+            // Empty, whitespace and overlong reasons refuse; the 512-unit
+            // boundary matches the domain rule exactly, astral chars included.
+            for reason in [
+                String::new(),
+                "   ".to_owned(),
+                "x".repeat(513),
+                "\u{1F600}".repeat(257),
+            ] {
+                let mut options = vec![
+                    strict_option("target", CommandOptionValue::User(Id::new(3333))),
+                    strict_option("reason", CommandOptionValue::String(reason)),
+                ];
+                if matches!(verb, "tempban" | "timeout") {
+                    options.push(strict_option(
+                        "duration_seconds",
+                        CommandOptionValue::Integer(60),
+                    ));
+                }
+                let refusal =
+                    strict_decode_options(action, &options).expect_err("invalid reason refuses");
+                assert_eq!(refusal.problem, "invalid", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "reason");
+            }
+            for reason in ["x".repeat(512), "\u{1F600}".repeat(256)] {
+                let mut options = vec![
+                    strict_option("target", CommandOptionValue::User(Id::new(3333))),
+                    strict_option("reason", CommandOptionValue::String(reason)),
+                ];
+                if matches!(verb, "tempban" | "timeout") {
+                    options.push(strict_option(
+                        "duration_seconds",
+                        CommandOptionValue::Integer(60),
+                    ));
+                }
+                strict_decode_options(action, &options).expect("boundary reason decodes");
+            }
+            if !matches!(verb, "tempban" | "timeout") {
+                continue;
+            }
+            let max = if verb == "tempban" {
+                MAX_TEMPBAN_SECONDS
+            } else {
+                MAX_TIMEOUT_SECONDS
+            };
+            for duration in [0, -1, 59, max + 1, i64::MAX] {
+                let options = vec![
+                    strict_option("target", CommandOptionValue::User(Id::new(3333))),
+                    strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
+                    strict_option("duration_seconds", CommandOptionValue::Integer(duration)),
+                ];
+                let refusal = strict_decode_options(action, &options)
+                    .expect_err("out-of-range duration refuses");
+                assert_eq!(refusal.problem, "invalid", "{verb}");
+                assert_strict_unit_refusal(&refusal.reply, verb, "duration_seconds");
+                assert!(
+                    refusal.reply.contains(&max.to_string()),
+                    "{verb}: refusal names the per-verb ceiling, got {:?}",
+                    refusal.reply
+                );
+            }
+            for duration in [MIN_DURATION_SECONDS, max] {
+                let options = vec![
+                    strict_option("target", CommandOptionValue::User(Id::new(3333))),
+                    strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
+                    strict_option("duration_seconds", CommandOptionValue::Integer(duration)),
+                ];
+                strict_decode_options(action, &options).expect("boundary duration decodes");
+            }
+        }
+    }
+
+    #[test]
+    fn strict_refusal_is_bounded_mention_safe_and_silent() {
+        // Hostile option values are never echoed: the refusal names the slot,
+        // never the payload.
+        let hostile = "@everyone <@&1> exfiltrate-me";
+        let options = vec![
+            strict_option("target", CommandOptionValue::String(hostile.to_owned())),
+            strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
+        ];
+        let refusal = strict_decode_options(ModerationAction::Ban, &options)
+            .expect_err("wrong-typed target refuses");
+        assert!(!refusal.reply.contains("exfiltrate-me"));
+        assert_strict_unit_refusal(&refusal.reply, "ban", "target");
+        // A hostile unknown name is sanitized before it reaches the reply, so the
+        // raw name cannot be quoted back: pin the `option "` naming segment
+        // (absent from the Try usage) plus the shared refusal shape.
+        let options = vec![
+            strict_option("target", CommandOptionValue::User(Id::new(3333))),
+            strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
+            strict_option("@everyone\n<@1>", CommandOptionValue::Integer(5)),
+        ];
+        let refusal = strict_decode_options(ModerationAction::Warn, &options)
+            .expect_err("unknown option refuses");
+        assert!(
+            refusal.reply.contains("option \""),
+            "warn: refusal names the sanitized unknown option, got {:?}",
+            refusal.reply
+        );
+        assert!(
+            !refusal.reply.contains("@everyone\n<@1>"),
+            "warn: refusal never echoes the raw hostile name, got {:?}",
+            refusal.reply
+        );
+        assert_strict_unit_refusal_shape(&refusal.reply, "warn");
+        // The correction is a copyable invocation for the verb shape.
+        let options = vec![strict_option(
+            "reason",
+            CommandOptionValue::String("wiring".to_owned()),
+        )];
+        let refusal = strict_decode_options(ModerationAction::Ban, &options)
+            .expect_err("missing target refuses");
+        assert!(
+            refusal.reply.contains("/ban target:@user reason:text"),
+            "ban correction is copyable, got {:?}",
+            refusal.reply
+        );
+        let refusal = strict_decode_options(ModerationAction::TempBan, &options)
+            .expect_err("missing target refuses");
+        assert!(
+            refusal
+                .reply
+                .contains("/tempban target:@user reason:text duration_seconds:60"),
+            "tempban correction is copyable, got {:?}",
+            refusal.reply
         );
     }
 

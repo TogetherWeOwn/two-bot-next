@@ -49,8 +49,15 @@ claim. Staging deploys from `main`; production deploys through the manual
 
 ## Operator references
 
+Browse the [documentation map](docs/README.md) for every guide, contract and evidence form.
+
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
+- [Event help and attendee reminders](docs/event-reminders.md): fixed 15-minute,
+  channel-only reminders, delivery limits and restart-safe failure behavior.
+- [Proposed RSVP seats and waitlist](docs/rsvp-capacity-spec.md): design only;
+  optional Going capacity, explicit queue consent, race/privacy contracts and
+  unresolved existing-post assumptions. Not an enabled feature.
 - [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
   inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
@@ -63,6 +70,8 @@ claim. Staging deploys from `main`; production deploys through the manual
   the reference names every reader — automod, feed, audit, ticket, gateway
   classifier and voice — alongside the per-runtime store and per-event
   refresh paths (re-checked at `1643438`).
+- [Hot-path read bounds](docs/store-cutover.md#hot-path-store-read-bounds): scoped settings, 25-row
+  decay/retention passes, burst inspection and complete paged membership.
 - [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
   source configuration, fetch cadence as-coded, failure signals and triage,
   read-only guarantees, and worked examples.
@@ -79,8 +88,9 @@ claim. Staging deploys from `main`; production deploys through the manual
   generation fencing, atomic audit and preserved lockdown recovery.
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
-- [Game-activity aggregate report](docs/game-activity-report.md): on-demand
-  read-only per-game play/in-voice/session JSON for one guild.
+- [Game-activity aggregate report](docs/game-activity-report.md): private staff
+  `/game-mix` and read-only per-game play/in-voice/session CLI JSON for one guild;
+  Discord reads remain unavailable in the live guild.
 - [Automod operator guide](docs/automod-operator-guide.md): filter/effect
   semantics, repeat expiry, corpus management, failure signals and triage.
 
@@ -124,18 +134,33 @@ catalog has no descriptions; its checked supplement lives in
 key requires updating that supplement. Defaults without a typed-loader mapping
 are explicitly marked **Not specified in Next**, not guessed from legacy.
 
-On the persistent controller, after the bounded pool is admitted:
+The command rows are no longer committed. The authored
+[command-reference landing page](docs/commands.md) points to the ignored
+`docs/generated/commands.md` and the **command-reference** artifact on each
+Rust-selected check run. Generate explicitly before compiling workspace tests or
+all-targets Clippy. The generator validates tracked configuration first and
+never rewrites it or the saved publication fixtures.
+
+On the persistent controller, after bounded pool admission:
 
 ```sh
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored
+python3 scripts/generate_command_reference.py --controller
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs
 ```
 
-On ephemeral/local developer machines outside the controller, the equivalent is
-`cargo test -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored`,
-then `cargo test -p two-bot-core --test reference_docs`. Ordinary tests compare
-committed files byte-for-byte and never regenerate them silently. CI discovers
-these tests in its existing integration-test step.
+Outside the controller, use `python3 scripts/generate_command_reference.py`, then
+`cargo test -p two-bot-core --test reference_docs --locked`. The script builds the
+small core example that reuses the canonical renderer; no database, deployment
+or live environment values are needed.
+
+Configuration remains tracked. When deliberately changing its catalog or
+supplement, explicitly regenerate both references with
+`cargo test -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored`
+(put the Cargo arguments through `scripts/cargo_cache.py` on the controller).
+Review and commit only the configuration change, never generated command rows.
+Ordinary reference tests compare bytes and never regenerate silently: absent,
+stale or malformed generated output fails, and configuration drift remains a
+failure. CI generates before consumers, then runs these read-only tests.
 
 ## Contributing
 
@@ -159,6 +184,9 @@ fail-closed retention auditing, `/home` available-byte alarms and the Operator r
   data and command-registry checks, 48-hour watch and preservation of Next-window
   writes on rollback. Planned tools are explicitly marked; this is not cutover approval.
 - [Staging soak](docs/staging-soak.md) and [gateway recovery](docs/gateway-recovery.md).
+- [Weekly DORA metrics](docs/dora-metrics.md): change failure rate, recovery
+  time, merge-to-prod lead time and throughput, committed to `ops/metrics/`
+  on the `automation/dora-metrics` branch.
 
 Migration changes must pass the [numbering and checksum guard](docs/migrations.md).
 Add new SQL files and their `migrations.lock` entries together; existing migration

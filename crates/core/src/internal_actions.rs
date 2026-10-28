@@ -2027,6 +2027,124 @@ impl<'de> serde::de::Visitor<'de> for UniqueKeys {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Admin API scope map v0 (slice 0: token registry + container authorize)
+// ---------------------------------------------------------------------------
+
+/// Scope literals held by admin API tokens. Scope changes ship as code in
+/// [`InternalFlags::required_admin_scope`], never as registry data.
+pub const ADMIN_SCOPE_READ: &str = "read";
+/// Moderate scope: reversible member/message actions.
+pub const ADMIN_SCOPE_MODERATE: &str = "moderate";
+/// Admin scope: irreversible, privilege, broadcast and server-wide effects.
+pub const ADMIN_SCOPE_ADMIN: &str = "admin";
+
+impl InternalFlags {
+    /// Scope the admin API requires for `action` (scope map v0).
+    ///
+    /// Covers the 19 verbs the endpoint runs today: 3 read, 8 moderate and
+    /// 8 admin. `role.assign` is deliberately admin (a privilege grant, not
+    /// membership tooling). Later slices extend the map with new verbs;
+    /// anything unmapped — including strings that can never be verbs —
+    /// resolves to no scope, which every allowance check refuses.
+    #[must_use]
+    pub fn required_admin_scope(action: &str) -> Option<&'static str> {
+        match action {
+            "settings.get" | "event.read" | "automations.export" => Some(ADMIN_SCOPE_READ),
+            "moderation.warn"
+            | "moderation.timeout"
+            | "moderation.kick"
+            | "moderation.purge"
+            | "moderation.slowmode"
+            | "guild.add_member"
+            | "event.upsert"
+            | "event.cancel" => Some(ADMIN_SCOPE_MODERATE),
+            "moderation.ban"
+            | "moderation.tempban"
+            | "moderation.lockdown"
+            | "moderation.unlock"
+            | "role.assign"
+            | "announcement.post"
+            | "settings.set"
+            | "automations.import" => Some(ADMIN_SCOPE_ADMIN),
+            _ => None,
+        }
+    }
+
+    /// Whether a token holding `scopes` may run `action`.
+    ///
+    /// Higher scope implies lower for reads only: any held scope allows a
+    /// read verb, while a write needs its exact listed scope. Scope
+    /// names are exact lowercase literals; unknown or empty scope sets
+    /// allow nothing, and unmapped actions refuse even for admin.
+    #[must_use]
+    pub fn admin_scope_allows(scopes: &[&str], action: &str) -> bool {
+        match Self::required_admin_scope(action) {
+            // Reads: any held scope allows.
+            Some(ADMIN_SCOPE_READ) => scopes.iter().any(|scope| {
+                *scope == ADMIN_SCOPE_READ
+                    || *scope == ADMIN_SCOPE_MODERATE
+                    || *scope == ADMIN_SCOPE_ADMIN
+            }),
+            // Writes: only an explicit grant of the listed scope.
+            Some(required @ (ADMIN_SCOPE_MODERATE | ADMIN_SCOPE_ADMIN)) => {
+                scopes.contains(&required)
+            }
+            // Unmapped actions — and any future scope the map has not named
+            // yet — fail closed.
+            Some(_) | None => false,
+        }
+    }
+
+    /// Whether a registry row authorizes `action` on `guild_id` at `now_unix`.
+    ///
+    /// Pure form of the container authorize step: live (not revoked, `now`
+    /// strictly before expiry), guild-allowlisted, and scope-allowed. The
+    /// expiry instant itself refuses. Runs after the HMAC/flag gate; it
+    /// narrows, never widens, what that gate allowed.
+    #[must_use]
+    pub fn admin_token_authorizes(
+        scopes: &[&str],
+        guild_ids: &[i64],
+        expires_at_unix: i64,
+        revoked: bool,
+        action: &str,
+        guild_id: i64,
+        now_unix: i64,
+    ) -> bool {
+        !revoked
+            && now_unix < expires_at_unix
+            && guild_ids.contains(&guild_id)
+            && Self::admin_scope_allows(scopes, action)
+    }
+
+    /// Whether `id` has the registry token-id shape: `adm_` plus 16
+    /// lowercase hex chars, nothing more.
+    #[must_use]
+    pub fn is_valid_admin_token_id(id: &str) -> bool {
+        const PREFIX: &str = "adm_";
+        id.len() == PREFIX.len() + 16
+            && id.starts_with(PREFIX)
+            && id.as_bytes()[PREFIX.len()..]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+
+    /// Sha256 hex of an admin token secret for hash-only registry storage.
+    ///
+    /// Secrets shorter than 32 bytes have no hash (`None`): the registry
+    /// never stores a weak secret's digest. The digest reveals nothing
+    /// about the input; refusal values elsewhere are bools and static
+    /// strings only.
+    #[must_use]
+    pub fn hash_admin_token_secret(secret: &[u8]) -> Option<String> {
+        if secret.len() < 32 {
+            return None;
+        }
+        Some(hex::encode(Sha256::digest(secret)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2841,11 +2959,20 @@ mod tests {
         // TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID, TWO_EVENTSUB_INVITE_URL).
         // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
         // shifting one entry between those classes. The stored invite-code
-        // slice adds one hot key (TWO_GUILD_INVITE_CODE).
+        // slice adds one hot key (TWO_GUILD_INVITE_CODE). The ticket/feed/
+        // self-role live-keys slice moves TWO_TICKET_COOLDOWN_SECONDS,
+        // TWO_ANNOUNCEMENTS and TWO_SELF_ROLE_PANELS from cold to hot.
+        // The community slice moves TWO_COMMUNITY_SCORECARD,
+        // TWO_COMMUNITY_RECOMMENDATIONS, TWO_COMMUNITY_CORRECTION_CYCLES,
+        // TWO_PRESENCE_PROBE and TWO_INACTIVITY_DAYS from cold to hot.
+        // Together these shift eight entries between those classes. The
+        // assistant credential binding and required event-voice category
+        // slices add two env-only keys
+        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
         for (class, expected) in [
-            (SettingClass::Hot, 44),
-            (SettingClass::Cold, 26),
-            (SettingClass::EnvOnly, 64),
+            (SettingClass::Hot, 52),
+            (SettingClass::Cold, 18),
+            (SettingClass::EnvOnly, 66),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

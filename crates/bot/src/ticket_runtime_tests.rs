@@ -109,7 +109,7 @@ async fn stored_destination_rows_move_the_live_ticket_config_without_restart() {
 
     let (mut writer, live) = live_channel();
     // A stored category row wins over the boot deployment value on the next
-    // refresh; panel, staff and the cold cooldown are untouched.
+    // refresh; panel, staff and cooldown have no rows so are untouched.
     writer.publish(&SettingsSnapshot {
         revision: 1,
         rows: vec![SettingRow {
@@ -152,6 +152,129 @@ async fn stored_destination_rows_move_the_live_ticket_config_without_restart() {
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn stored_cooldown_rows_move_the_live_ticket_cooldown_without_restart() {
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let executor =
+        ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
+    // Production filters deployment to the destination keys; new() carries
+    // the effective boot cooldown itself, so build the map the same way.
+    let deployment = deployment_vars();
+    let runtime = TicketRuntime::new(
+        pool,
+        executor,
+        TicketConfig::from_vars(&deployment, 100, COOLDOWN_SECONDS).unwrap(),
+        deployment,
+    )
+    .unwrap();
+
+    let (mut writer, live) = live_channel();
+    let cooldown_row = |value: serde_json::Value| SettingRow {
+        guild_id: "100".to_owned(),
+        key: COOLDOWN_KEY.to_owned(),
+        value,
+        version: 1,
+    };
+    // Stored rows win in both directions over the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![cooldown_row(json!(600))],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, 600);
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![cooldown_row(json!(60))],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, 60);
+
+    // A malformed stored row keeps the last good cooldown while destinations
+    // still move.
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![
+            SettingRow {
+                guild_id: "100".to_owned(),
+                key: COOLDOWN_KEY.to_owned(),
+                value: json!("never"),
+                version: 1,
+            },
+            SettingRow {
+                guild_id: "100".to_owned(),
+                key: "DISCORD_TICKET_CATEGORY_ID".to_owned(),
+                value: json!("201"),
+                version: 1,
+            },
+        ],
+    });
+    runtime.refresh_config_with(Some(&live));
+    let config = runtime.config_for_test();
+    assert_eq!(config.cooldown_seconds, 60);
+    assert_eq!(config.category_id, "201");
+
+    // Deleting the row hands the cooldown back to the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 4,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn ops_cooldown_apply_clear_and_expiry_refresh_without_a_database_revision() {
+    use two_bot_core::settings::{OpsApplyOutcome, OpsRecord, MAX_OPS_STALENESS};
+
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let runtime = runtime(&mock);
+    let (mut writer, live) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    let now = std::time::Instant::now();
+    for (epoch, overrides, expected) in [
+        (
+            1,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "60".to_owned())]),
+            60,
+        ),
+        (2, HashMap::new(), COOLDOWN_SECONDS),
+        (
+            3,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "30".to_owned())]),
+            30,
+        ),
+    ] {
+        assert!(matches!(
+            writer.apply_ops(Some(&OpsRecord { epoch, overrides }), now),
+            OpsApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(live.revision(), 1, "ops does not move the DB revision");
+        runtime.refresh_config_with(Some(&live));
+        assert_eq!(runtime.config_for_test().cooldown_seconds, expected);
+    }
+    assert_eq!(
+        writer.apply_ops(None, now + MAX_OPS_STALENESS + Duration::from_secs(1)),
+        OpsApplyOutcome::Expired
+    );
+    assert_eq!(live.revision(), 1);
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    assert!(
+        mock.requests().is_empty(),
+        "refresh needs no REST or DB I/O"
+    );
+    mock.shutdown().await;
+}
+
 #[test]
 fn ordinary_messages_without_optional_components_do_not_block_panel_ensure() {
     let messages = panels(vec![
@@ -178,6 +301,69 @@ fn malformed_panel_rows_are_counted_without_echoing_content() {
     assert_eq!(isolated.len(), 1);
     assert_eq!(isolated[0].author_id, "400");
     assert!(panel_isolated_count_for_test() > before);
+}
+
+#[test]
+fn open_retry_backoff_doubles_to_the_hourly_cap() {
+    assert_eq!(open_retry_backoff(0), Duration::from_secs(300));
+    assert_eq!(open_retry_backoff(1), Duration::from_secs(600));
+    assert_eq!(open_retry_backoff(2), Duration::from_secs(1200));
+    assert_eq!(open_retry_backoff(3), Duration::from_secs(2400));
+    assert_eq!(open_retry_backoff(4), Duration::from_secs(3600));
+    assert_eq!(open_retry_backoff(u32::MAX), Duration::from_secs(3600));
+    // The first step is exactly one recovery cadence: an immediate
+    // recover/Ready burst at the same clock reading replays nothing, and the
+    // next periodic pass is already eligible.
+    assert_eq!(open_retry_backoff(0), RECOVERY_CADENCE);
+}
+
+#[test]
+fn open_retry_bounds_match_the_acceptance_envelope() {
+    // Pinned against the protected retry acceptance envelope: retention is
+    // finite but never discards every failure, and one pass never spends
+    // more than the per-pass work cap on retries.
+    assert_eq!(OPEN_RETRY_RETAINED_CAP, 128);
+    assert_eq!(OPEN_RETRY_PER_PASS_CAP, 64);
+    // Const context: clippy `assertions_on_constants` rejects this as a
+    // runtime assert, and a cap edited out of order fails the build here.
+    const _: () = {
+        assert!(OPEN_RETRY_PER_PASS_CAP <= OPEN_RETRY_RETAINED_CAP);
+    };
+}
+
+#[test]
+fn open_retry_reasons_are_bounded_machine_tokens() {
+    use two_bot_cutover::tickets::StoreError;
+    let failures = [
+        Failure::Store(StoreError::NotFound),
+        Failure::Store(StoreError::InvalidRow("status")),
+        Failure::Store(StoreError::Domain(
+            two_bot_core::tickets::TicketError::AlreadyClaimed,
+        )),
+        Failure::Rest(DiscordError::Timeout),
+        Failure::Rest(DiscordError::RateLimited),
+        Failure::Rest(DiscordError::Rejected("rejected".into())),
+        Failure::Rest(DiscordError::Unavailable("unavailable".into())),
+        Failure::InvalidEvidence,
+        Failure::Timeout,
+        Failure::LaneBusy,
+        Failure::NoTicket,
+        Failure::TicketClaimedBy("1".into()),
+        Failure::TicketNotOpen,
+    ];
+    for failure in failures {
+        let reason = open_retry_reason(&failure);
+        assert!(
+            !reason.is_empty()
+                && reason.len() <= 64
+                && reason
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "bounded machine token: {reason:?}"
+        );
+    }
+    // Database failures reuse the shared `db_cause` vocabulary, whose own
+    // token shape is pinned in `two_bot_core::error_chain` tests.
 }
 
 #[tokio::test]

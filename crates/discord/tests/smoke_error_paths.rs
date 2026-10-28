@@ -174,6 +174,22 @@ fn all_refusals() -> Vec<(RouterRefusal, String)> {
             RouterRefusal::GuildRestricted,
             GUILD_RESTRICTED_REPLY.to_owned(),
         ),
+        (
+            RouterRefusal::PurgePreviewPermission,
+            "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
+        ),
+        (
+            RouterRefusal::ChannelInspectPermission,
+            "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+        ),
+        (
+            RouterRefusal::TempbanListPermission,
+            "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
+        ),
+        (
+            RouterRefusal::ModerationRecentPermission,
+            "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it.".to_owned(),
+        ),
     ];
     for action in ModerationAction::ALL {
         rows.push((
@@ -201,6 +217,10 @@ fn refusal_name(refusal: RouterRefusal) -> &'static str {
         RouterRefusal::ManageEventsRequired => "manage-events-required",
         RouterRefusal::GuildRestricted => "guild-restricted",
         RouterRefusal::ModerationPermission(_) => "moderation-permission",
+        RouterRefusal::PurgePreviewPermission => "purge-preview-permission",
+        RouterRefusal::ChannelInspectPermission => "channel-inspect-permission",
+        RouterRefusal::TempbanListPermission => "tempban-list-permission",
+        RouterRefusal::ModerationRecentPermission => "moderation-recent-permission",
     }
 }
 
@@ -237,8 +257,8 @@ fn unknown_slash_answers_with_the_router_owned_unknown_copy() {
 #[test]
 fn every_refusal_matches_its_owning_copy() {
     let rows = all_refusals();
-    // Seven fixed refusals plus one row per moderation verb (nine verbs).
-    assert_eq!(rows.len(), 7 + ModerationAction::ALL.len());
+    // Eleven fixed refusals plus one row per moderation mutation (nine verbs).
+    assert_eq!(rows.len(), 11 + ModerationAction::ALL.len());
     let mut seen = std::collections::BTreeSet::new();
     for (refusal, expected) in &rows {
         assert_eq!(

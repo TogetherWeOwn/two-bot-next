@@ -5,6 +5,10 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_access_strict_shapes_acceptance_tests.rs"]
+mod access_strict_shapes_acceptance;
+#[path = "voice_actor_inbox_backpressure_acceptance_tests.rs"]
+mod actor_inbox_backpressure_acceptance;
 #[path = "voice_admission_config_acceptance_tests.rs"]
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
@@ -13,8 +17,12 @@ mod admission_spawn;
 mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_control_plane_overflow_acceptance_tests.rs"]
+mod control_plane_overflow_acceptance;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
+#[path = "voice_creator_settings_read_acceptance_tests.rs"]
+mod creator_settings_read_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_disconnect_loud_acceptance_tests.rs"]
@@ -23,8 +31,16 @@ mod disconnect_loud_acceptance_tests;
 mod drop_poison_acceptance_tests;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "event_voice_category_acceptance_tests.rs"]
+mod event_voice_category_acceptance;
+#[path = "event_voice_channels_acceptance_tests.rs"]
+mod event_voice_channels_acceptance;
+#[path = "event_voice_channels_regression_tests.rs"]
+mod event_voice_channels_regression;
 #[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
 mod fair_scheduling_acceptance;
+#[path = "voice_config_full_diff_acceptance_tests.rs"]
+mod full_diff_acceptance;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
 #[path = "voice_invite_responder_wiring_tests.rs"]
@@ -53,6 +69,10 @@ mod ownership_receipt_acceptance;
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
 mod responder_admission_acceptance;
+#[path = "voice_import_review_regressions_tests.rs"]
+mod review_regressions;
+#[path = "voice_setup_access_paging_acceptance_tests.rs"]
+mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 #[path = "voice_snapshot_fence_acceptance_tests.rs"]
@@ -170,7 +190,7 @@ fn room(channel_id: u64) -> VoiceRoom {
 
 struct Store {
     trace: Trace,
-    creators: Mutex<Vec<CreatorChannel>>,
+    creators: Arc<Mutex<Vec<CreatorChannel>>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     rooms_errors: Mutex<VecDeque<StoreError>>,
     /// One-shot hang for the next `rooms()` call, consumed when it
@@ -249,13 +269,16 @@ struct Store {
     /// V4 audit rows appended so far, in append order.
     kick_audit: Mutex<Vec<KickAuditRow>>,
     kick_audit_errors: Mutex<VecDeque<StoreError>>,
+    /// Scripted live event-voice bindings for the guild repair; empty by
+    /// default, so the repair is a no-op unless the test seeds a binding.
+    ev_bindings: Mutex<Vec<EventVoiceBinding>>,
 }
 
 impl Store {
     fn new(trace: Trace) -> Self {
         Self {
             trace,
-            creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
+            creators: Arc::new(Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)])),
             rooms: Mutex::new(HashMap::new()),
             rooms_errors: Mutex::new(VecDeque::new()),
             rooms_delay: Mutex::new(None),
@@ -306,6 +329,7 @@ impl Store {
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
             kick_audit_errors: Mutex::new(VecDeque::new()),
+            ev_bindings: Mutex::new(Vec::new()),
         }
     }
 }
@@ -523,6 +547,50 @@ impl RoomPersistence for Store {
         self.owner_intents.lock().unwrap().remove(&channel);
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
+    }
+    async fn record_event_voice_join(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evjoin:{channel}:{member}"));
+        Ok(())
+    }
+    async fn record_event_voice_leave(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evleave:{channel}:{member}"));
+        Ok(())
+    }
+    async fn event_voice_guild_bindings(
+        &self,
+        _: u64,
+    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
+        Ok(self.ev_bindings.lock().unwrap().clone())
+    }
+    async fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        occupants: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_flush:{event_id}:{}", occupants.len()));
+        Ok(0)
+    }
+    async fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        present: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_close:{event_id}:{}", present.len()));
+        Ok(0)
     }
     async fn claim_create(
         &self,
@@ -2455,6 +2523,7 @@ async fn actor_creator_added_command_feeds_creator_channels() {
         &mut worker,
         ActorCommand::CreatorAdded(CreatorChannel::new(GUILD, COMMANDED)),
         0,
+        &ActorInboxBackpressure::default(),
     );
     let (_, sample) = worker
         .live
@@ -2684,6 +2753,7 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
             reply,
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     worker.drive_staged_ownership(0).await;
     assert_eq!(inbox.await.unwrap(), OWNERSHIP_FINALIZING);
@@ -2709,6 +2779,7 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
             reply,
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     let observe = async {
         gate.sent.notified().await;
@@ -2762,6 +2833,7 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
             reply,
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     let observe = async {
         gate.sent.notified().await;
@@ -5127,9 +5199,12 @@ async fn creator_join_moves_without_waiting_for_the_actor_tick() {
         tokio::task::yield_now().await;
     }
     assert_eq!(received.elapsed(), Duration::ZERO);
+    // The presence hook records each join ahead of room handling.
     assert_eq!(
         *trace.lock().unwrap(),
         [
+            "evjoin:200:300",
+            "evjoin:200:301",
             "create",
             "persist:500",
             "move:300:500",
@@ -5170,9 +5245,18 @@ async fn runtime_actor_creates_persists_and_moves_room() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // The join is recorded twice: once by the buffered transition, once by
+    // the bootstrap occupant flush (the store join is idempotent, so the
+    // second write is a no-op in production).
     assert_eq!(
         *trace.lock().unwrap(),
-        ["create", "persist:500", "move:300:500"]
+        [
+            "evjoin:200:300",
+            "evjoin:200:300",
+            "create",
+            "persist:500",
+            "move:300:500"
+        ]
     );
 }
 
@@ -5455,7 +5539,9 @@ async fn registered_voice_identity_drives_parsing_and_refused_ids_have_no_effect
     data.guild_id = Some(Id::new(GUILD));
     assert_eq!(
         runtime.parse_voice_command(&voice_interaction(Some(data), None, true)),
-        Some(VoiceCommand::Setup)
+        Some(VoiceCommand::Setup {
+            page: PageArg::Missing,
+        })
     );
     for id in [9001, 9999] {
         let mut data = command_data("create", vec![command_option("name", "lobby")]);
@@ -5490,7 +5576,12 @@ async fn registered_voice_identity_drives_parsing_and_refused_ids_have_no_effect
 #[test]
 fn parse_setup_command() {
     let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
-    assert_eq!(parse_voice_command(&interaction), Some(VoiceCommand::Setup));
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Setup {
+            page: PageArg::Missing,
+        })
+    );
 }
 
 #[test]
@@ -5683,8 +5774,16 @@ async fn channel_manage_channels_never_bypasses_voice_restrictions_or_configurat
         "defaultlimit",
         "alwaysprivate",
     ] {
+        // `/textchannels` strictly decodes its options before the
+        // permission check, so it needs its required `channel` option to
+        // reach the authority refusal under test.
+        let options = if name == "textchannels" {
+            vec![channel_option("channel", CREATOR)]
+        } else {
+            vec![]
+        };
         let mut interaction = voice_interaction(
-            Some(command_data(name, vec![])),
+            Some(command_data(name, options)),
             Some(Permissions::MANAGE_CHANNELS),
             true,
         );
@@ -6518,7 +6617,9 @@ fn access_action(sub: CommandDataOption) -> AccessAction {
 fn parse_access_subcommands() {
     assert_eq!(
         access_action(sub_option("show", vec![])),
-        AccessAction::Show
+        AccessAction::Show {
+            page: PageArg::Missing,
+        }
     );
     assert_eq!(
         access_action(sub_option(
@@ -7383,6 +7484,7 @@ async fn access_changed_refreshes_a_loaded_worker() {
                 ..AccessControls::default()
             }),
             0,
+            &ActorInboxBackpressure::default(),
         );
         let ticket = worker
             .live
@@ -7393,6 +7495,174 @@ async fn access_changed_refreshes_a_loaded_worker() {
             after
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn access_changed_delivers_past_a_full_inbox() {
+    // Mutation: dropping runtime.access_changed, or making its send lossy,
+    // leaves the worker enforcing the opposite policy after a saved update.
+    for (before, after) in [(false, true), (true, false)] {
+        let (live, store, http, trace) = fixture();
+        *store.access.lock().unwrap() = AccessControls {
+            room_creation_enabled: before,
+            ..AccessControls::default()
+        };
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let runtime = test_runtime(trace);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime.actors.lock().unwrap().insert(
+            GUILD,
+            GuildActor {
+                live: worker.live.clone(),
+                tx,
+                backpressure: ActorInboxBackpressure::default(),
+            },
+        );
+        let actor = runtime.ensure_actor(GUILD).expect("registered actor");
+        // Hold the receiver: all sends below are synchronous and the ledger
+        // is exactly full before the sole policy update enters the channel.
+        for member in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Display {
+                member_id: 900_000 + member as u64,
+                display: "x".to_owned(),
+            }));
+        }
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        let dropped = actor.inbox_overflow_dropped();
+        runtime.access_changed(
+            GUILD,
+            AccessControls {
+                room_creation_enabled: after,
+                ..AccessControls::default()
+            },
+        );
+        assert_eq!(actor.inbox_overflow_dropped(), dropped);
+        // Drain through the real worker command handler; send success alone
+        // cannot satisfy this test, nor can an earlier direct lossless send.
+        while let Ok(command) = rx.try_recv() {
+            actor.backpressure.release_for(&command);
+            apply_command(&mut worker, command, 0, &actor.backpressure);
+        }
+        assert_eq!(actor.inbox_depth(), 0);
+        let ticket = worker
+            .live
+            .voice_update(MEMBER, Some(CREATOR), Some(false))
+            .expect("fresh creator join");
+        assert_eq!(
+            worker.accept_join(ticket, "new room", 7, NOW.to_owned()),
+            after,
+            "join acceptance must use the policy delivered through runtime.access_changed"
+        );
+        assert_eq!(worker.queue.pending_counts(GUILD), (usize::from(after), 0));
+        runtime.remove_guild(GUILD);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_confirmed_import_hands_its_settings_to_the_worker_past_a_full_inbox() {
+    // Full-inbox sibling of `a_confirmed_import_hands_its_settings_to_the_worker`:
+    // `/import` already wrote the store and replied "Saved", so the saved
+    // settings must reach the worker even when fire-and-forget sends refuse.
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let (probe_store, _) = runtime.make_pair();
+    let reads = probe_store.config_reads.clone();
+    let initial_reads = reads.load(Ordering::Relaxed);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    // Preview reads shared storage and ensure_actor only spawns. Await a
+    // worker-applied probe before the save, otherwise a lost notification
+    // escapes through the worker's first read of the NEW durable settings.
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("loaded worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    assert_ne!(before, NameSettings::from_config(&full_config()));
+    // The first timer maintenance is also a read-through escape: let it
+    // finish on OLD state before the save. This harness has one preview
+    // read, one load read, then the first paced worker reload.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reads.load(Ordering::Relaxed) < initial_reads + 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("old-state worker maintenance read before the save");
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("warm worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    // Current-thread execution: there is no yield between filling this gate
+    // and the synchronous persistence/notification in the Confirm harness.
+    let actor = runtime.ensure_actor(GUILD).expect("live actor");
+    let mut refused = false;
+    for member in 0..10_000u64 {
+        if !actor.try_send_command(ActorCommand::Display {
+            member_id: 900_000 + member,
+            display: "x".to_owned(),
+        }) {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "burst must fill the inbox gate to refusal");
+    assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    // The probe queues behind the flood and the saved update, so its answer
+    // proves the update applied despite the full gate.
+    let (settings, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("probe answers after a full-gate save");
+    assert_eq!(settings, NameSettings::from_config(&full_config()));
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn display_seed_batch_applies_every_entry() {
+    // Startup seeding travels as one batch so a guild with more cached
+    // members than inbox slots still seeds every name (owners included).
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    apply_command(
+        &mut worker,
+        ActorCommand::DisplaySeed(vec![
+            (MEMBER, "Alex".to_owned()),
+            (MEMBER + 1, "Blair".to_owned()),
+        ]),
+        0,
+        &ActorInboxBackpressure::default(),
+    );
+    assert!(
+        worker.name_directory.knows(MEMBER),
+        "seed batch must carry every entry"
+    );
+    assert!(
+        worker.name_directory.knows(MEMBER + 1),
+        "seed batch must carry every entry"
+    );
+}
+
+#[test]
+fn display_seed_buffers_while_actor_initializes() {
+    // The seed batch is fire-and-forget state: it must survive the init
+    // window instead of failing fast like reply-bearing commands.
+    let mut buffered = std::collections::VecDeque::new();
+    buffer_init_command(
+        &mut buffered,
+        ActorCommand::DisplaySeed(vec![(MEMBER, "Alex".to_owned())]),
+    );
+    assert_eq!(buffered.len(), 1, "seed batch must buffer during init");
+    purge_unanswerable_buffered(&mut buffered);
+    assert_eq!(buffered.len(), 1, "seed batch must survive a failure purge");
 }
 
 async fn wait_for_trace(trace: &Trace, entry: &str) -> bool {
@@ -7540,6 +7810,78 @@ fn parse_textchannels_leaves_unset_options_unset() {
     );
 }
 
+#[test]
+fn parse_textchannels_strict_shape_names_the_offending_field() {
+    let valid_options = || {
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(true)),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ]
+    };
+    let mut cases: Vec<(&'static str, Vec<CommandDataOption>)> = Vec::new();
+    for (field, wrong) in [
+        ("channel", CommandOptionValue::String("bad".to_owned())),
+        ("enabled", CommandOptionValue::String("bad".to_owned())),
+        ("name", CommandOptionValue::Boolean(true)),
+        ("viewer-role", CommandOptionValue::String("bad".to_owned())),
+    ] {
+        let mut options = valid_options();
+        options
+            .iter_mut()
+            .find(|option| option.name == field)
+            .expect("known field")
+            .value = wrong;
+        cases.push((field, options));
+    }
+    for (field, good) in [
+        ("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+        ("enabled", CommandOptionValue::Boolean(true)),
+        ("name", CommandOptionValue::String("lounge".to_owned())),
+        ("viewer-role", CommandOptionValue::Role(Id::new(42))),
+    ] {
+        let mut options = valid_options();
+        options.push(typed_option(field, good));
+        cases.push((field, options));
+    }
+    cases.push((
+        "channel",
+        valid_options()
+            .into_iter()
+            .filter(|option| option.name != "channel")
+            .collect(),
+    ));
+
+    for (expected, options) in cases {
+        let interaction = textchannels_interaction(options, Some(Permissions::MANAGE_CHANNELS));
+        assert_eq!(
+            parse_voice_command(&interaction),
+            Some(VoiceCommand::SetupShapeInvalid {
+                command: "textchannels",
+                field: expected,
+            }),
+            "malformed {expected} must be reported as {expected}"
+        );
+    }
+}
+
+#[test]
+fn textchannels_shape_correction_names_the_field_before_the_usage_example() {
+    for field in ["channel", "enabled", "name", "viewer-role"] {
+        let text = setup_shape_correction("textchannels", field);
+        // The usage example names every option, so only the diagnostic
+        // before it can prove which field the correction blames.
+        let (diagnostic, usage) = text.split_once("Try:").expect("copyable invocation");
+        assert!(diagnostic.contains(&format!("`{field}`")), "{text}");
+        if field != "channel" {
+            assert!(!diagnostic.contains("`channel`"), "{text}");
+        }
+        assert!(usage.contains("/textchannels channel:"), "{text}");
+        assert!(!text.contains("ambiguous"), "{text}");
+    }
+}
+
 fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
     TextChannelsRequest {
         enabled,
@@ -7556,16 +7898,23 @@ fn plan_creator(plan: TextChannelsPlan) -> CreatorChannel {
 }
 
 #[test]
-fn decide_text_channels_defaults_to_on_and_keeps_unset_fields() {
+fn decide_text_channels_absent_toggle_keeps_the_stored_value() {
     let base = CreatorChannel::new(GUILD, CREATOR);
     let creator = plan_creator(decide_text_channels(
         Some(base.clone()),
         &request(None, None, None),
     ));
-    assert!(creator.text_channels, "omitted toggle turns companions on");
+    assert!(
+        !creator.text_channels,
+        "absent toggle preserves stored off, never enables"
+    );
     assert_eq!(creator.text_channel_name, None);
     assert_eq!(creator.text_viewer_role_id, None);
     assert_eq!(creator.name_template, base.name_template);
+    let mut on = CreatorChannel::new(GUILD, CREATOR);
+    on.text_channels = true;
+    let kept = plan_creator(decide_text_channels(Some(on), &request(None, None, None)));
+    assert!(kept.text_channels, "absent toggle preserves stored on");
 }
 
 #[test]
@@ -7633,7 +7982,9 @@ fn command_names_key_the_role_restrictions() {
         VoiceCommand::Create {
             name: String::new(),
         },
-        VoiceCommand::Setup,
+        VoiceCommand::Setup {
+            page: PageArg::Missing,
+        },
         VoiceCommand::Ping,
         VoiceCommand::Invite,
         VoiceCommand::TextChannels {
@@ -7688,9 +8039,20 @@ async fn handle_textchannels_refuses_without_manage_channels() {
 }
 
 #[tokio::test]
-async fn handle_textchannels_saves_settings_for_a_creator_channel() {
+async fn handle_textchannels_preserves_stored_toggle_on_rename_only() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store.creators.lock().unwrap()[0].text_channels = true;
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
     let interaction = textchannels_interaction(
         vec![
             typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
@@ -7949,15 +8311,14 @@ fn decide_position_refuses_empty_and_bad_numbers() {
 }
 
 #[test]
-fn decide_group_defaults_to_on() {
-    let on = match decide_group(
+fn decide_group_refuses_without_a_toggle() {
+    let GroupPlan::Refuse { message } = decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest { enabled: None },
-    ) {
-        GroupPlan::Update(creator) => creator,
-        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.group_by_category);
+    assert!(message.contains("group"), "{message}");
     let off = match decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest {
@@ -8127,15 +8488,14 @@ fn decide_default_limit_sets_and_clears() {
 }
 
 #[test]
-fn decide_always_private_defaults_to_on() {
-    let on = match decide_always_private(
+fn decide_always_private_refuses_without_a_toggle() {
+    let AlwaysPrivatePlan::Refuse { message } = decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest { enabled: None },
-    ) {
-        AlwaysPrivatePlan::Update(creator) => creator,
-        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.private_default);
+    assert!(message.contains("private"), "{message}");
     let off = match decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest {
@@ -8376,7 +8736,7 @@ async fn handle_defaultlimit_saves_the_limit() {
 }
 
 #[tokio::test]
-async fn handle_alwaysprivate_saves_the_default() {
+async fn handle_alwaysprivate_refuses_without_enabled() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let interaction = v8_interaction(
@@ -8389,13 +8749,18 @@ async fn handle_alwaysprivate_saves_the_default() {
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
     assert!(
-        response_text(response.as_ref().expect("reply")).contains("private"),
-        "alwaysprivate defaults on and reports it"
+        response_text(response.as_ref().expect("reply"))
+            .contains("Choose whether new rooms start private, then try again."),
+        "alwaysprivate refuses an absent toggle instead of defaulting on"
     );
-    assert!(trace
-        .lock()
-        .unwrap()
-        .contains(&format!("add_creator:{CREATOR}")));
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.starts_with("add_creator")),
+        "a refused toggle writes nothing"
+    );
 }
 
 #[test]
@@ -8610,6 +8975,722 @@ fn setup_member_panel_is_generic() {
     }
 }
 
+// --- `/setup` + `/access show` paging (builder) --------------------------------
+
+fn paging_page_option(value: CommandOptionValue) -> CommandDataOption {
+    CommandDataOption {
+        name: "page".to_owned(),
+        value,
+    }
+}
+
+fn paging_setup_page(options: Vec<CommandDataOption>) -> PageArg {
+    match parse_voice_command(&voice_interaction(
+        Some(command_data("setup", options)),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    )) {
+        Some(VoiceCommand::Setup { page }) => page,
+        other => panic!("not a /setup command: {other:?}"),
+    }
+}
+
+#[test]
+fn setup_page_decoding_is_strict_about_shape() {
+    assert_eq!(paging_setup_page(Vec::new()), PageArg::Missing);
+    assert_eq!(
+        paging_setup_page(vec![paging_page_option(CommandOptionValue::Integer(1))]),
+        PageArg::Page(1)
+    );
+    assert_eq!(
+        paging_setup_page(vec![paging_page_option(CommandOptionValue::Integer(50))]),
+        PageArg::Page(50)
+    );
+    // Huge but well-typed integers stay pages and refuse past-end at dispatch
+    // with the real total.
+    assert!(matches!(
+        paging_setup_page(vec![paging_page_option(CommandOptionValue::Integer(
+            i64::MAX
+        ))]),
+        PageArg::Page(_)
+    ));
+    for options in [
+        vec![paging_page_option(CommandOptionValue::Integer(0))],
+        vec![paging_page_option(CommandOptionValue::Integer(-1))],
+        vec![paging_page_option(CommandOptionValue::Integer(i64::MIN))],
+        vec![paging_page_option(CommandOptionValue::String(
+            "2".to_owned(),
+        ))],
+        vec![paging_page_option(CommandOptionValue::Boolean(true))],
+        vec![paging_page_option(CommandOptionValue::Number(1.0))],
+        vec![paging_page_option(CommandOptionValue::SubCommand(
+            Vec::new(),
+        ))],
+        vec![
+            paging_page_option(CommandOptionValue::Integer(1)),
+            paging_page_option(CommandOptionValue::Integer(1)),
+        ],
+        vec![
+            paging_page_option(CommandOptionValue::Integer(1)),
+            paging_page_option(CommandOptionValue::Integer(2)),
+        ],
+    ] {
+        assert_eq!(paging_setup_page(options), PageArg::Invalid);
+    }
+    // Unrelated options stay ignored, as before paging existed.
+    assert_eq!(
+        paging_setup_page(vec![command_option("other", "x")]),
+        PageArg::Missing
+    );
+}
+
+#[test]
+fn access_show_page_decoding_is_strict_about_shape() {
+    assert_eq!(
+        access_action(sub_option("show", Vec::new())),
+        AccessAction::Show {
+            page: PageArg::Missing,
+        }
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "show",
+            vec![paging_page_option(CommandOptionValue::Integer(2))]
+        )),
+        AccessAction::Show {
+            page: PageArg::Page(2),
+        }
+    );
+    for args in [
+        vec![paging_page_option(CommandOptionValue::Integer(0))],
+        vec![paging_page_option(CommandOptionValue::Integer(-3))],
+        vec![paging_page_option(CommandOptionValue::String(
+            "1".to_owned(),
+        ))],
+        vec![paging_page_option(CommandOptionValue::Boolean(false))],
+        vec![
+            paging_page_option(CommandOptionValue::Integer(1)),
+            paging_page_option(CommandOptionValue::Integer(2)),
+        ],
+    ] {
+        assert_eq!(
+            access_action(sub_option("show", args)),
+            AccessAction::Show {
+                page: PageArg::Invalid,
+            }
+        );
+    }
+    // Other subcommands ignore a stray page: no new surface there.
+    assert_eq!(
+        access_action(sub_option(
+            "role",
+            vec![paging_page_option(CommandOptionValue::Integer(2))]
+        )),
+        AccessAction::RequiredRole(None)
+    );
+}
+
+#[test]
+fn setup_reply_prefix_budget_matches_the_handler_format() {
+    // The handler prefixes every panel with `**{title}**\n` and both panels
+    // title "Voice rooms"; the paging budget subtracts exactly that prefix.
+    assert_eq!(
+        two_bot_core::message_safety::text_len("**Voice rooms**\n"),
+        16
+    );
+    assert_eq!(
+        setup_panel(&SetupSummary {
+            guild_id: GUILD,
+            creators: Vec::new(),
+            tracked_rooms: 0,
+            failures: Vec::new(),
+            halted: false,
+            store_error: None,
+        })
+        .title,
+        "Voice rooms"
+    );
+}
+
+#[test]
+fn setup_single_page_sorts_rows_and_keeps_legacy_lines() {
+    let mut below = CreatorChannel::new(GUILD, 201);
+    below.position = RoomPosition::Below;
+    let summary = SetupSummary {
+        guild_id: GUILD,
+        creators: vec![
+            CreatorChannel::new(GUILD, 203),
+            below,
+            CreatorChannel::new(GUILD, 202),
+        ],
+        tracked_rooms: 2,
+        failures: vec!["create <#200>: rate limited".to_owned()],
+        halted: false,
+        store_error: None,
+    };
+    assert_eq!(setup_page_total(&summary), 1);
+    let panel = setup_panel(&summary);
+    assert_eq!(
+        panel.description,
+        "Voice rooms are running.\n\
+         Creator channels (3)\n\
+         - <#201>: new rooms below\n\
+         - <#202>: new rooms above\n\
+         - <#203>: new rooms above\n\
+         Tracked rooms: 2.\n\
+         Recent failures (1)\n\
+         - create <#200>: rate limited"
+    );
+    assert!(!panel.description.contains("Page "));
+    // One page renders identically through every entry point; out-of-range
+    // render requests clamp (the handler refuses past-end instead).
+    assert_eq!(setup_panel_page(&summary, 1).description, panel.description);
+    assert_eq!(setup_panel_page(&summary, 0).description, panel.description);
+    assert_eq!(
+        setup_panel_page(&summary, 99).description,
+        panel.description
+    );
+}
+
+#[test]
+fn setup_many_pages_stay_bounded_and_cover_every_row_once() {
+    // Descending insertion, an astral failure line (emoji counts 2 UTF-16
+    // units) and halted status: every page budgets before sending.
+    let creators: Vec<CreatorChannel> = (0..120u64)
+        .rev()
+        .map(|index| CreatorChannel::new(GUILD, 10_000 + index))
+        .collect();
+    let summary = SetupSummary {
+        guild_id: GUILD,
+        creators,
+        tracked_rooms: 7,
+        failures: vec!["create <#200>: rate limited 🐢".to_owned()],
+        halted: true,
+        store_error: None,
+    };
+    let total = setup_page_total(&summary);
+    assert!(total > 1, "120 rows cannot fit one bounded reply");
+    let mut covered = Vec::new();
+    for number in 1..=total {
+        let panel = setup_panel_page(&summary, number);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        assert!(
+            two_bot_core::message_safety::text_len(&reply) <= 2000,
+            "page {number} over budget"
+        );
+        assert!(
+            panel
+                .description
+                .contains(&format!("Page {number} of {total}")),
+            "page {number} metadata"
+        );
+        assert!(panel.description.contains("paused"));
+        assert!(panel.description.contains("Tracked rooms: 7."));
+        assert!(panel.description.contains("rate limited"));
+        if number < total {
+            assert!(
+                panel
+                    .description
+                    .contains(&format!("/setup page:{}", number + 1)),
+                "copyable next page on {number}"
+            );
+        }
+        for line in panel.description.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("- <#") {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                covered.push(digits.parse::<u64>().unwrap());
+                assert!(rest[digits.len()..].starts_with('>'), "clipped token");
+            }
+        }
+        assert_eq!(
+            setup_panel_page(&summary, number).description,
+            panel.description,
+            "page {number} is deterministic"
+        );
+    }
+    let expected: Vec<u64> = (0..120u64).map(|index| 10_000 + index).collect();
+    assert_eq!(covered, expected);
+}
+
+fn setup_move_permission_failure(channel_id: Snowflake) -> String {
+    failure_line(&LifecycleFailure::MissingPermission {
+        write: RefusedWrite::Move,
+        channel_id,
+        findings: [
+            VoicePermission::ManageChannels,
+            VoicePermission::MoveMembers,
+            VoicePermission::ViewChannel,
+            VoicePermission::Connect,
+        ]
+        .into_iter()
+        .map(|permission| PermissionFinding {
+            permission,
+            scope: VoicePermissionScope::Channel,
+            category_id: None,
+            channel_id: Some(channel_id),
+        })
+        .collect(),
+    })
+}
+
+#[test]
+fn setup_fitting_diagnostics_keep_the_exact_reply_at_the_transport_boundary() {
+    let channel_id = 100_000_000;
+    let failures: Vec<_> = (0..5)
+        .map(|index| setup_move_permission_failure(channel_id + index))
+        .collect();
+    let diagnostic_lines = failures
+        .iter()
+        .map(|failure| format!("- {failure}"))
+        .collect::<Vec<_>>();
+    // Adding a tracked-room digit crosses 1998/1999/2000/2001 UTF-16 units
+    // without changing the production-shaped diagnostics or creator rows.
+    for (tracked_rooms, expected_units) in [(7, 1998), (77, 1999), (777, 2000), (7777, 2001)] {
+        let summary = SetupSummary {
+            guild_id: GUILD,
+            creators: vec![
+                CreatorChannel::new(GUILD, channel_id),
+                CreatorChannel::new(GUILD, channel_id + 1),
+            ],
+            tracked_rooms,
+            failures: failures.clone(),
+            halted: false,
+            store_error: None,
+        };
+        let prefix = format!(
+            "**Voice rooms**\n\
+             Voice rooms are running.\n\
+             Creator channels (2)\n\
+             - <#100000000>: new rooms above\n\
+             - <#100000001>: new rooms above\n\
+             Tracked rooms: {tracked_rooms}.\n\
+             Recent failures (5)\n"
+        );
+        let full_reply = format!("{prefix}{}", diagnostic_lines.join("\n"));
+        assert_eq!(text_len(&full_reply), expected_units, "boundary fixture");
+        assert_eq!(setup_page_total(&summary), 1);
+        let panel = setup_panel_page(&summary, 1);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        if expected_units <= CONTENT_LIMIT {
+            assert_eq!(reply, full_reply, "keep every fitting diagnostic unchanged");
+            assert!(!reply.contains("Additional failure details not shown"));
+        } else {
+            assert_eq!(
+                reply,
+                format!(
+                    "{prefix}{}\nAdditional failure details not shown: 1.",
+                    diagnostic_lines[..4].join("\n")
+                ),
+                "omit only the complete trailing diagnostic at 2001 units"
+            );
+            assert!(!reply.contains(&failures[4]));
+        }
+        assert!(text_len(&reply) <= CONTENT_LIMIT);
+        assert!(!reply.contains("Page "));
+        assert!(!reply.contains("Next page:"));
+        assert_eq!(setup_panel(&summary), panel);
+        assert_eq!(setup_panel_page(&summary, 1), panel);
+    }
+}
+
+#[test]
+fn setup_overflow_keeps_live_health_then_leading_history_on_every_page() {
+    let channel_id = 1_844_674_407_370_955_615;
+    // Match dispatch order: live health precedes distinct historical failures.
+    let mut failures = vec![health_line(&PermissionFinding {
+        permission: VoicePermission::ManageChannels,
+        scope: VoicePermissionScope::Channel,
+        category_id: None,
+        channel_id: Some(channel_id),
+    })];
+    failures.extend((1..5).map(|index| setup_move_permission_failure(channel_id + index)));
+    let expected_diagnostics = format!(
+        "{}\nAdditional failure details not shown: 1.",
+        failures[..4]
+            .iter()
+            .map(|failure| format!("- {failure}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let summary = SetupSummary {
+        guild_id: GUILD,
+        creators: (0..120)
+            .map(|index| CreatorChannel::new(GUILD, channel_id + index))
+            .collect(),
+        tracked_rooms: 7,
+        failures,
+        halted: true,
+        store_error: None,
+    };
+    let total = setup_page_total(&summary);
+    assert!(total > 1, "exercise diagnostic selection on multiple pages");
+    for number in 1..=total {
+        let panel = setup_panel_page(&summary, number);
+        let reply = format!("**{}**\n{}", panel.title, panel.description);
+        assert!(text_len(&reply) <= CONTENT_LIMIT, "page {number} bound");
+        assert!(reply.contains("paused"));
+        assert!(reply.contains("Tracked rooms: 7."));
+        let (_, diagnostics_and_navigation) = panel
+            .description
+            .split_once("Recent failures (5)\n")
+            .expect("truthful full diagnostic count");
+        let (diagnostics, _) = diagnostics_and_navigation
+            .split_once("\nPage ")
+            .expect("page metadata follows diagnostics");
+        assert_eq!(
+            diagnostics, expected_diagnostics,
+            "page {number} retains the exact ordered prefix, not any subset"
+        );
+        assert!(!reply.contains(&summary.failures[4]), "omit the tail only");
+        assert!(reply.contains(&format!("Page {number} of {total}")));
+        if number < total {
+            assert!(reply.ends_with(&format!("Next page: /setup page:{}", number + 1)));
+        } else {
+            assert!(reply.ends_with(&format!("Page {number} of {total}")));
+        }
+        assert_eq!(setup_panel_page(&summary, number), panel);
+    }
+}
+
+#[test]
+fn setup_worst_case_diagnostics_leave_room_for_rows_and_navigation() {
+    let channel_id = 1_844_674_407_370_955_615;
+    let failure = setup_move_permission_failure(channel_id);
+    assert!(
+        text_len(&failure) > 400,
+        "production-shaped permission failure"
+    );
+    for creators in [
+        Vec::new(),
+        (0..120)
+            .map(|index| CreatorChannel::new(GUILD, channel_id + index))
+            .collect(),
+    ] {
+        for store_error in [None, Some(StoreError::Unavailable.to_string())] {
+            let summary = SetupSummary {
+                guild_id: GUILD,
+                creators: creators.clone(),
+                tracked_rooms: 7,
+                failures: vec![failure.clone(); 5],
+                halted: true,
+                store_error,
+            };
+            let total = setup_page_total(&summary);
+            let mut covered = Vec::new();
+            for number in 1..=total {
+                let panel = setup_panel_page(&summary, number);
+                let reply = format!("**{}**\n{}", panel.title, panel.description);
+                assert!(
+                    text_len(&reply) <= CONTENT_LIMIT,
+                    "page {number}: {} units",
+                    text_len(&reply)
+                );
+                assert!(reply.contains("paused"));
+                assert!(reply.contains("Tracked rooms: 7."));
+                assert!(reply.contains("Recent failures (5)"));
+                assert!(
+                    reply.contains(&failure),
+                    "retain complete actionable diagnostics"
+                );
+                let shown = reply.matches(&format!("- {failure}")).count();
+                assert!(shown < summary.failures.len(), "exercise diagnostic budget");
+                assert!(
+                    reply.contains(&format!(
+                        "Additional failure details not shown: {}.",
+                        summary.failures.len() - shown
+                    )),
+                    "disclose the exact omitted count"
+                );
+                if summary.store_error.is_some() {
+                    assert!(reply.contains("Could not load creator channels"));
+                    assert!(!reply.contains("No creator channels yet"));
+                }
+                if total > 1 {
+                    assert!(reply.contains(&format!("Page {number} of {total}")));
+                    if number < total {
+                        assert!(reply.ends_with(&format!("Next page: /setup page:{}", number + 1)));
+                    }
+                }
+                for line in panel.description.lines() {
+                    if let Some(rest) = line.strip_prefix("- <#") {
+                        let (id, _) = rest.split_once('>').expect("complete creator mention");
+                        covered.push(id.parse::<u64>().unwrap());
+                    }
+                }
+                assert_eq!(
+                    setup_panel_page(&summary, number).description,
+                    panel.description
+                );
+            }
+            let expected: Vec<_> = if summary.store_error.is_some() {
+                Vec::new()
+            } else {
+                creators.iter().map(|creator| creator.channel_id).collect()
+            };
+            assert_eq!(covered, expected);
+        }
+    }
+}
+
+#[test]
+fn setup_oversized_astral_failure_is_omitted_as_a_whole_line() {
+    let summary = SetupSummary {
+        failures: vec![format!("health: <#200> {}", "🐢".repeat(2000))],
+        ..empty_like_summary()
+    };
+    let panel = setup_panel(&summary);
+    let reply = format!("**{}**\n{}", panel.title, panel.description);
+    assert!(text_len(&reply) <= CONTENT_LIMIT);
+    assert!(reply.contains("Recent failures (1)"));
+    assert!(reply.contains("Additional failure details not shown: 1."));
+    assert!(!reply.contains("<#"), "never truncate a diagnostic mention");
+    assert!(!reply.contains('🐢'));
+}
+
+#[test]
+fn setup_empty_and_error_views_stay_single_page() {
+    let empty = SetupSummary {
+        guild_id: GUILD,
+        creators: Vec::new(),
+        tracked_rooms: 0,
+        failures: Vec::new(),
+        halted: false,
+        store_error: None,
+    };
+    assert_eq!(setup_page_total(&empty), 1);
+    assert!(!setup_panel(&empty).description.contains("Page "));
+    let error = SetupSummary {
+        store_error: Some("the store is unavailable".to_owned()),
+        ..empty_like_summary()
+    };
+    assert_eq!(setup_page_total(&error), 1);
+    assert!(!setup_panel(&error).description.contains("Page "));
+}
+
+fn empty_like_summary() -> SetupSummary {
+    SetupSummary {
+        guild_id: GUILD,
+        creators: Vec::new(),
+        tracked_rooms: 0,
+        failures: Vec::new(),
+        halted: false,
+        store_error: None,
+    }
+}
+
+#[test]
+fn setup_page_refusals_stay_short_and_actionable() {
+    for refusal in [
+        setup_page_refusal(),
+        setup_past_end_refusal(1),
+        setup_past_end_refusal(12),
+    ] {
+        assert!(
+            two_bot_core::message_safety::text_len(&refusal) <= 500,
+            "{refusal}"
+        );
+        assert!(refusal.to_ascii_lowercase().contains("page"), "{refusal}");
+        assert!(refusal.contains("/setup"), "{refusal}");
+        assert!(refusal.contains('1'), "{refusal}");
+        assert!(!refusal.contains("<#"), "{refusal}");
+        assert!(!refusal.contains("Creator channels ("), "{refusal}");
+        assert!(!refusal.contains("No creator channels yet."), "{refusal}");
+    }
+    assert!(setup_past_end_refusal(12).contains("12"));
+    assert!(setup_past_end_refusal(1).contains("1 page;"));
+}
+
+#[test]
+fn access_show_single_page_matches_the_legacy_summary() {
+    let mut controls = AccessControls::default();
+    controls.command_roles.insert("kick".to_owned(), vec![7, 8]);
+    controls
+        .command_roles
+        .insert("template".to_owned(), Vec::new());
+    assert_eq!(access_show_total(&controls), 1);
+    let text = access_show_page(&controls, 1);
+    assert_eq!(
+        text,
+        "Room creation: on\n\
+         Required role: none\n\
+         Restricted commands:\n\
+         - /kick: <@&7> <@&8>\n\
+         - /template: admins only"
+    );
+    assert!(!text.contains("Page "));
+    // Out-of-range render requests clamp (the handler refuses past-end).
+    assert_eq!(access_show_page(&controls, 0), text);
+    assert_eq!(access_show_page(&controls, 99), text);
+
+    let empty = AccessControls::default();
+    assert_eq!(access_show_total(&empty), 1);
+    assert_eq!(
+        access_show_page(&empty, 1),
+        "Room creation: on\nRequired role: none\nRestricted commands: none"
+    );
+}
+
+#[test]
+fn access_row_units_keep_exact_capacity_rows_whole() {
+    let roles = vec![7; 314];
+    let whole = format!("- /kick: {}", vec!["<@&7>"; 314].join(" "));
+    let length = text_len(&whole);
+    for capacity in [length, length + 1] {
+        assert_eq!(
+            access_row_units("kick", &roles, capacity),
+            std::slice::from_ref(&whole)
+        );
+    }
+    let segments = access_row_units("kick", &roles, length - 1);
+    assert!(segments.len() > 1, "capacity+1 must split");
+    assert!(segments.iter().all(|segment| text_len(segment) < length));
+    assert_eq!(
+        segments
+            .iter()
+            .map(|segment| segment.matches("<@&7>").count())
+            .sum::<usize>(),
+        roles.len()
+    );
+}
+
+#[test]
+fn access_show_checks_the_whole_reply_before_reserving_page_chrome() {
+    let mut exact = vec![7; 322];
+    *exact.last_mut().unwrap() = 10;
+    let cases = [
+        vec![1_844_674_407_370_955_615; 79],
+        vec![1_844_674_407_370_955_615; 80],
+        vec![7; 314],
+        exact,
+    ];
+    let mut largest = 0;
+    for roles in cases {
+        let expected = format!(
+            "Room creation: on\nRequired role: none\nRestricted commands:\n- /kick: {}",
+            roles
+                .iter()
+                .map(|role| format!("<@&{role}>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(text_len(&expected) <= CONTENT_LIMIT, "single-page fixture");
+        largest = largest.max(text_len(&expected));
+        let mut controls = AccessControls::default();
+        controls.command_roles.insert("kick".to_owned(), roles);
+        assert_eq!(access_show_total(&controls), 1);
+        assert_eq!(
+            access_show_page(&controls, 1),
+            expected,
+            "no continuation labels or extra pages for a fitting reply"
+        );
+    }
+    assert_eq!(largest, CONTENT_LIMIT, "cover the exact transport boundary");
+    let mut controls = AccessControls::default();
+    let mut roles = vec![7; 322];
+    *roles.last_mut().unwrap() = 100;
+    controls.command_roles.insert("kick".to_owned(), roles);
+    let total = access_show_total(&controls);
+    assert!(total > 1, "a 2001-unit reply really does need paging");
+    for number in 1..=total {
+        assert!(text_len(&access_show_page(&controls, number)) <= CONTENT_LIMIT);
+    }
+}
+
+#[test]
+fn access_show_splits_rows_without_clipping_tokens() {
+    let mut controls = AccessControls::default();
+    let roles: Vec<u64> = (0..100).map(|index| u64::MAX - index).collect();
+    controls
+        .command_roles
+        .insert("kick".to_owned(), roles.clone());
+    let total = access_show_total(&controls);
+    assert!(total > 1, "one 100-role row cannot fit one reply");
+    let mut covered = Vec::new();
+    for number in 1..=total {
+        let text = access_show_page(&controls, number);
+        assert!(
+            two_bot_core::message_safety::text_len(&text) <= 2000,
+            "page {number} over budget"
+        );
+        assert!(text.contains("/kick"), "command recurs: {text:.200}");
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("part") || lower.contains("continu"),
+            "continuation label: {text:.200}"
+        );
+        assert!(text.contains("Room creation:"));
+        assert!(text.contains("Required role:"));
+        let mut rest = text.as_str();
+        let marker = "<@&";
+        while let Some(start) = rest.find(marker) {
+            rest = &rest[start + marker.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            covered.push(digits.parse::<u64>().unwrap());
+            assert!(rest[digits.len()..].starts_with('>'), "clipped token");
+        }
+    }
+    assert_eq!(covered, roles);
+}
+
+#[test]
+fn access_post_save_acks_stay_short_and_point_at_show() {
+    let acks = [
+        access_creation_ack(true),
+        access_creation_ack(false),
+        access_required_role_ack(Some(9)),
+        access_required_role_ack(None),
+        access_restrict_ack("kick", &[7]),
+        access_restrict_ack("template", &[]),
+        access_unrestrict_ack("kick"),
+    ];
+    for ack in &acks {
+        assert!(ack.starts_with("Saved."), "{ack}");
+        assert!(two_bot_core::message_safety::text_len(ack) <= 600, "{ack}");
+        assert!(ack.contains("/access show"), "{ack}");
+        assert!(
+            !ack.contains("@everyone") && !ack.contains("@here"),
+            "{ack}"
+        );
+    }
+    assert!(acks[2].contains("Required role: <@&9>"));
+    assert!(acks[3].contains("Required role: none"));
+    assert!(acks[4].contains("- /kick: <@&7>"));
+    assert!(acks[5].contains("- /template: admins only"));
+    assert!(!acks[6].contains("/kick"));
+    // Stored and forged command names can never page a mass mention.
+    assert!(!access_row("@everyone", &[1]).contains("@everyone"));
+    assert!(
+        !access_unrestrict_ack("@everyone").contains("@everyone"),
+        "forged names stay neutralized"
+    );
+}
+
+#[test]
+fn access_page_refusals_stay_short_and_actionable() {
+    for refusal in [
+        access_page_refusal(),
+        access_past_end_refusal(1),
+        access_past_end_refusal(4),
+    ] {
+        assert!(
+            two_bot_core::message_safety::text_len(&refusal) <= 500,
+            "{refusal}"
+        );
+        assert!(refusal.to_ascii_lowercase().contains("page"), "{refusal}");
+        assert!(refusal.contains("/access"), "{refusal}");
+        assert!(refusal.contains('1'), "{refusal}");
+        assert!(
+            !refusal
+                .lines()
+                .any(|line| line.trim_start().starts_with("- /")),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("Restricted commands:"), "{refusal}");
+        assert!(!refusal.contains("<@&"), "{refusal}");
+    }
+    assert!(access_past_end_refusal(4).contains("4 pages"));
+}
+
 #[test]
 fn store_errors_read_as_plain_words() {
     for (error, variant) in [
@@ -8742,11 +9823,14 @@ fn stalled_worker_runtime() -> (
     let live = LiveGuild::new(GUILD);
     live.publish(command_snapshot());
     let (tx, rx) = mpsc::unbounded_channel();
-    runtime
-        .actors
-        .lock()
-        .unwrap()
-        .insert(GUILD, GuildActor { live, tx });
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live,
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
     (runtime, rx)
 }
 
@@ -9395,7 +10479,12 @@ async fn creator_edit_applies_to_new_rooms_only() {
     let mut edited = text_creator();
     edited.text_channel_name = Some("lounge".to_owned());
     edited.text_viewer_role_id = Some(42);
-    apply_command(&mut worker, ActorCommand::CreatorAdded(edited), now);
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(edited),
+        now,
+        &ActorInboxBackpressure::default(),
+    );
     assert_eq!(
         worker.companions[&500].settings, before,
         "the existing companion keeps its creation-time snapshot"
@@ -10461,10 +11550,12 @@ fn import_harness(
     let shared_config = Arc::new(Mutex::new(config));
     let shared_downloads = Arc::new(Mutex::new(downloads.into_iter().collect::<VecDeque<_>>()));
     let closure_config = shared_config.clone();
+    let config_reads = Arc::new(AtomicU64::new(0));
     let runtime = VoiceRuntime::new(
         move || {
             let mut store = Store::new(trace.clone());
             store.config = closure_config.clone();
+            store.config_reads = config_reads.clone();
             store.snapshot_uses_creator_rows = false;
             let mut http = Http::new(trace.clone());
             http.download_results = shared_downloads.clone();
@@ -11898,6 +12989,55 @@ async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
     assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
 }
 
+// The gateway bypasses `handle_voice_interaction` for `/kick`, so this sink is
+// the only production route to the malformed-reason correction. Reverting its
+// `KickReasonInvalid` claim hands the member the router's moderation refusal.
+#[tokio::test]
+async fn kick_vote_sink_answers_a_malformed_reason_with_one_private_correction() {
+    let malformed = [
+        (
+            "duplicated reason",
+            vec![
+                user_option("member", KICK_TARGET),
+                command_option("reason", "too loud"),
+                command_option("reason", "again"),
+            ],
+        ),
+        (
+            "non-text reason",
+            vec![
+                user_option("member", KICK_TARGET),
+                typed_option("reason", CommandOptionValue::Integer(7)),
+            ],
+        ),
+    ];
+    for (case, options) in malformed {
+        let trace = Trace::default();
+        let runtime = kick_room_runtime(
+            &trace,
+            true,
+            vec![
+                voice_member_in(KICK_VOTER, KICK_ROOM),
+                voice_member_in(KICK_TARGET, KICK_ROOM),
+            ],
+        );
+        let replies = Replies::new(trace.clone());
+        let interaction = with_user(
+            voice_interaction(Some(command_data("kick", options)), None, true),
+            KICK_VOTER,
+        );
+        let answered = VoiceResponder::start_kick_vote(&runtime, &replies, &interaction).await;
+        assert!(answered, "{case}: voice owns the callback");
+        let completed = replies.completed.lock().unwrap();
+        assert_eq!(completed.len(), 1, "{case}: exactly one reply");
+        let data = completed[0].data.as_ref().expect("correction body");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL), "{case}");
+        assert!(data.components.is_none(), "{case}: no public ballot");
+        let content = data.content.as_deref().unwrap_or_default();
+        assert!(content.contains("reason:"), "{case}: {content}");
+    }
+}
+
 // Every decline sends no callback at all: the router answers instead, so a
 // callback here would be a second answer to the same interaction.
 #[tokio::test]
@@ -12876,7 +14016,12 @@ async fn voice_name_settings_notification_invalidates_cached_renders() {
     settings
         .lists
         .insert("maps".to_owned(), vec!["new".to_owned()]);
-    apply_command(&mut worker, ActorCommand::NameSettingsChanged(settings), 1);
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(settings),
+        1,
+        &ActorInboxBackpressure::default(),
+    );
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&700], "new");
     assert!(
@@ -12914,6 +14059,7 @@ async fn voice_name_import_refreshes_creator_template_without_waiting_for_reload
         &mut worker,
         ActorCommand::NameSettingsChanged(settings),
         100_000,
+        &ActorInboxBackpressure::default(),
     );
     assert_eq!(
         worker.name_settings_read_ms, None,
@@ -12948,7 +14094,12 @@ async fn voice_name_creator_notification_invalidates_cached_renders() {
     dispatch(&mut worker, 0).await;
     let mut creator = worker.creators[&CREATOR].clone();
     creator.name_template = "new".to_owned();
-    apply_command(&mut worker, ActorCommand::CreatorAdded(creator), 1);
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(creator),
+        1,
+        &ActorInboxBackpressure::default(),
+    );
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&700], "new");
     assert!(!worker.dispatch_one(1).await);
@@ -13015,6 +14166,7 @@ async fn a_voice_display_update_reaches_the_owner_token() {
             display: "Sam".to_owned(),
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     worker.refresh_template_names(0);
     dispatch(&mut worker, 0).await;
@@ -13040,6 +14192,7 @@ async fn a_restarted_worker_waits_for_the_owner_name_instead_of_renaming_to_memb
             display: "Alex".to_owned(),
         },
         1,
+        &ActorInboxBackpressure::default(),
     );
     worker.refresh_template_names(1);
     dispatch(&mut worker, 1).await;
@@ -13056,6 +14209,7 @@ async fn written_settings_reach_automatic_names() {
         &mut worker,
         ActorCommand::NameSettingsChanged(NameSettings::from_config(&config)),
         5,
+        &ActorInboxBackpressure::default(),
     );
     assert_eq!(worker.name_settings.no_game_label, "Hangout");
     assert!(worker.name_settings_loaded);
@@ -14665,12 +15819,22 @@ async fn join_commands_count_received_on_accept_and_on_refusal() {
         .live
         .voice_update(MEMBER, Some(CREATOR), Some(false))
         .unwrap();
-    assert!(apply_command(&mut worker, join_command(ticket), 0));
+    assert!(apply_command(
+        &mut worker,
+        join_command(ticket),
+        0,
+        &ActorInboxBackpressure::default()
+    ));
     // Same ticket twice: the second delivery is refused as a duplicate, but
     // both deliveries count as received. Lower bounds, not exact diffs: these
     // counters are process-global and sink tests deliver joins through the
     // same Join arm concurrently, so concurrent runs can only add.
-    assert!(!apply_command(&mut worker, join_command(ticket), 1));
+    assert!(!apply_command(
+        &mut worker,
+        join_command(ticket),
+        1,
+        &ActorInboxBackpressure::default()
+    ));
     assert!(
         global_series("two_bot_voice_joins_received_total") >= received_before + 2,
         "both deliveries count as received"
@@ -14946,11 +16110,13 @@ async fn actor_join_revalidates_a_stale_creator_view() {
         .expect("ticket for a joined channel");
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
+        let backpressure = ActorInboxBackpressure::default();
         run_actor_with_limits(
             &mut worker,
             rx,
             Duration::from_millis(100),
             ActorLimits::default(),
+            &backpressure,
         )
         .await;
         worker
@@ -14982,7 +16148,12 @@ async fn refresh_creators_command_flags_a_debounced_merge() {
     let (live, store, http, _) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     assert!(!worker.creators_refresh_due);
-    apply_command(&mut worker, ActorCommand::RefreshCreators, 0);
+    apply_command(
+        &mut worker,
+        ActorCommand::RefreshCreators,
+        0,
+        &ActorInboxBackpressure::default(),
+    );
     assert!(worker.creators_refresh_due);
 }
 
@@ -14999,11 +16170,13 @@ async fn maintenance_tick_runs_the_creator_refresh() {
     assert!(worker.creators_read_ms.is_none());
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
+        let backpressure = ActorInboxBackpressure::default();
         run_actor_with_limits(
             &mut worker,
             rx,
             Duration::from_millis(100),
             ActorLimits::default(),
+            &backpressure,
         )
         .await;
         worker
@@ -15538,7 +16711,15 @@ async fn halt_reprobe_clears_the_credential_latch_without_a_restart() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Pump the actor once so its probe baseline starts at t=0 (a Status
     // round-trip also proves the halted actor is still alive to answer).
@@ -15588,7 +16769,15 @@ async fn halt_reprobe_keeps_a_discord_401_latch_set() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Pump the actor once so its probe baseline starts at t=0 (a Status
     // round-trip also proves the halted actor is still alive to answer).
@@ -15698,7 +16887,15 @@ async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive the actor until the limit write is held mid-flight. The clock
     // only moves here, so the waiter must be registered before advancing.
@@ -15790,7 +16987,15 @@ async fn watchdog_sibling_exits_when_its_actor_dies() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive the actor until the panicking write kills it: the unwind drops
     // the inbox receiver, which closes the sender's side.
@@ -15851,7 +17056,15 @@ async fn actor_exit_on_inbox_close_retires_its_stall_contribution() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive ticks until the running actor's halted contribution lands.
     let mut contribution = None;
@@ -15910,7 +17123,15 @@ async fn actor_panic_unwind_retires_its_stall_contribution() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     let mut ticks = 0;
     while !tx.is_closed() {
@@ -16237,7 +17458,15 @@ async fn watchdog_fires_while_a_backed_off_queue_makes_no_progress() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Liveness first: the actor answers Status probes while stalled.
     let (reply, reply_rx) = oneshot::channel();

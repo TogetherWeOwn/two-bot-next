@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use twilight_model::application::interaction::{
     application_command::CommandOptionValue, Interaction, InteractionData,
 };
+use twilight_model::{channel::ChannelType, guild::Permissions};
 use two_bot_core::{
     funnel::now_millis_for_test,
     remind::{self, delivery_body, TEXT_LIMIT},
@@ -99,6 +100,34 @@ fn reminder_id(
     format!("{}{}", remind::ID_PREFIX, hex::encode(hash.finalize()))
 }
 
+/// Discord supplies the invoker's resolved channel permissions, including
+/// overwrites, in `member.permissions`. Slash-command access alone is not
+/// authority to have the bot publish member-authored text. Require channel
+/// metadata so missing/unknown types cannot accidentally use regular send bits.
+fn posting_channel(interaction: &Interaction) -> Option<String> {
+    let channel = interaction.channel.as_ref()?;
+    if channel
+        .guild_id
+        .is_some_and(|guild| Some(guild) != interaction.guild_id)
+    {
+        return None;
+    }
+    let send = match channel.kind {
+        ChannelType::AnnouncementThread
+        | ChannelType::PublicThread
+        | ChannelType::PrivateThread => Permissions::SEND_MESSAGES_IN_THREADS,
+        ChannelType::GuildText
+        | ChannelType::GuildAnnouncement
+        | ChannelType::GuildVoice
+        | ChannelType::GuildStageVoice => Permissions::SEND_MESSAGES,
+        _ => return None,
+    };
+    let permissions = interaction.member.as_ref()?.permissions?;
+    permissions
+        .contains(Permissions::VIEW_CHANNEL | send)
+        .then(|| channel.id.to_string())
+}
+
 pub(crate) async fn handle(
     pool: &PgPool,
     executor: &ActionExecutor,
@@ -125,11 +154,11 @@ pub(crate) async fn handle(
                     return;
                 }
             };
-            let Some(channel) = crate::command_runtime::interaction_channel(interaction) else {
+            let Some(channel) = posting_channel(interaction) else {
                 finish(
                     executor,
                     interaction,
-                    "This command only works in a channel.",
+                    "You need permission to send messages in this channel to create a reminder.",
                 )
                 .await;
                 return;

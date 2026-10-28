@@ -28,6 +28,7 @@ mod command_runtime;
 #[cfg(test)]
 mod command_runtime_tests;
 mod commands_cli;
+mod community_classifier;
 mod community_jobs;
 mod containment_runtime;
 #[cfg(test)]
@@ -71,6 +72,9 @@ mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod giveaway_runtime;
+#[cfg(test)]
+mod hotpath_settings_test_support;
 mod interaction_admission;
 #[cfg(test)]
 mod interaction_composition_tests;
@@ -83,6 +87,11 @@ mod join_risk_runtime;
 mod join_risk_runtime_tests;
 #[cfg(test)]
 mod join_risk_tuning_refusal_tests;
+mod lfg_jobs;
+#[cfg(test)]
+mod lfg_jobs_tests;
+#[cfg(test)]
+mod lfg_lifecycle_jobs_acceptance;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -92,10 +101,14 @@ mod member_cli;
 mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
+mod moderation_recent_command;
 mod moderation_release_cli;
+mod music_capture;
 #[cfg(test)]
 mod observability_event_conformance_tests;
 mod onboarding;
+#[cfg(test)]
+mod onboarding_preview_review_tests;
 #[cfg(test)]
 mod onboarding_queue_cause_forwarding_tests;
 #[cfg(test)]
@@ -700,7 +713,15 @@ async fn run(cli_args: &[String]) {
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.
                     if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {
-                        pipeline.enable_community_facts(pool.clone());
+                        // A fresh pipeline cannot be poisoned yet, but the
+                        // refusal is typed so boot says so instead of panicking:
+                        // capture stays disabled, exactly like the flag being off.
+                        if let Err(error) = pipeline.enable_community_facts(pool.clone()) {
+                            tracing::warn!(
+                                reason = %error,
+                                "community facts arming refused; capture disabled"
+                            );
+                        }
                     }
                     // Join-burst watch is always on, as legacy raid watch was (TWO-56),
                     // and independent of the anti-nuke flags. It shares the command
@@ -827,6 +848,11 @@ async fn run(cli_args: &[String]) {
                             Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
+                    // Staging-only music voice-update capture (dry-run): wraps
+                    // the voice sink so VoiceServerUpdate/self VoiceStateUpdate
+                    // feed the Lavalink pairing without touching rooms. Inert
+                    // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
+                    let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
                     let intents = intents_from_env(&activation);
                     // Voice-room game names need GUILD_PRESENCES; record
@@ -1020,7 +1046,8 @@ fn build_interaction_runtime(
             executor,
             0,
             two_bot_core::ClassifierConfig::from_env(),
-        ),
+        )
+        .with_classifier_provider(Arc::new(community_classifier::LiveClassifier)),
     ))
 }
 

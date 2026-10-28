@@ -15,9 +15,11 @@
 //! - sticky (`/sticky`, `/sticky-remove` + the accepted-message re-post hook;
 //!   legacy order pinned below: claim → post → record → delete previous →
 //!   audit, with `post_failed`/orphan cleanup on the failure edges).
-//! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
-//!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
-//!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//! - feed relays (`/feed-add`, `/feed-remove`, `/feed-pause`, `/feed-resume`,
+//!   `/feed-list`, `/feed-inspect`; TOG-10085 domain and store): plan →
+//!   guild-scoped CRUD → `announcements_audit_log` row → ephemeral completion.
+//!   The generated relay/audit ids replace legacy `randomUUID()`. List and
+//!   inspect are pure reads and write no audit row.
 //! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
 //!   router authorization → ephemeral defer → durable claim/lane → REST effect →
 //!   atomic result/audit → original-response edit. Ambiguity retains the lane.
@@ -25,9 +27,11 @@
 //!   over the TOG-10081 domain and store): validate → guild-scoped CRUD →
 //!   `automation_audit_log` row → ephemeral completion. The handlers live in
 //!   [`crate::schedule_runtime`]; the runtime only registers and dispatches.
-//! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
-//!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
-//!   award path shares this runtime's pool, executor and onboarding gates.
+//! - leveling (`/rank [member]`, `/leaderboard`): defer first (ephemeral rank,
+//!   public mention-suppressed top ten), then one completion edit; an
+//!   acknowledged store failure completes with a sanitized unavailable reply.
+//!   The ordered gateway award path shares this runtime's pool, executor and
+//!   onboarding gates.
 //! - discovery (`/help`): one immediate ephemeral callback rendered from the
 //!   live publish set, grouped with permission hints; never deferred, never
 //!   stored.
@@ -65,19 +69,26 @@ use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
+    custom_command_store,
     feeds::{
-        feed_list_page, feed_list_page_invalid_text, feed_list_page_underflow_text,
-        feed_removed_text, plan_command, FeedCommand, FeedCommandContext, FeedCommandPlan,
-        FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        feed_already_paused_text, feed_already_resumed_text, feed_existing_text, feed_list_page,
+        feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
+        feed_pending_evidence_refusal_text, feed_removed_text, feed_resumed_text, plan_command,
+        FeedCommand, FeedCommandContext, FeedCommandPlan, FeedKind, FeedPendingEvidenceOperation,
     },
-    feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
+    feeds_store::{
+        add_feed, list_feeds, pause_feed_with_evidence, remove_feed_with_evidence, resume_feed,
+        write_audit, FeedAddOutcome, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence,
+        FeedResumeOutcome,
+    },
     funnel::now_millis_for_test,
+    help::{canonical_help_selector, unknown_help_branch_correction, unknown_help_correction},
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
-        activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
-        sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
-        RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
+        activity_eligible, decide_activity, sticky_removed_reply, sticky_set_reply, store,
+        ActivityDecision, ActivityOutcome, PutSticky, RemoveOutcome, StickyAudit,
+        StickyAuditAction, StickyAuditOutcome, StickySetup,
     },
     tickets::TicketAction,
     ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
@@ -85,9 +96,9 @@ use two_bot_core::{
     SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
-    help_response, publish_commands, register_channel_handlers, response_for_slash,
-    route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError, LevelingRuntime,
-    RoutedInteraction,
+    help_detail_response, help_response, publish_commands, register_channel_handlers,
+    response_for_slash, route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError,
+    LevelingRuntime, RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -267,6 +278,7 @@ pub struct CommandRuntime {
     gateway_commands: tokio::sync::OnceCell<crate::gateway_commands::GatewayCommands>,
     channel: ChannelModerationRuntime,
     tasks: Mutex<DispatchTasks>,
+    giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
     user_slots: UserSlots,
     /// Shared self-role surface; production boot stays parked pending acceptance.
@@ -283,6 +295,9 @@ pub struct CommandRuntime {
     automations: bool,
     /// Serialize publication and remember a successful sync for this process.
     /// Repeated RESUMED events need no work; READY still replaces the full set.
+    /// A durable pending marker overrides the RESUMED no-op so a reconnect
+    /// heals a failed publication; the governed path republishes on reconnect
+    /// only through [`Self::publish_registry_if_resync_pending`].
     registry_synced: tokio::sync::Mutex<bool>,
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
@@ -330,6 +345,7 @@ impl CommandRuntime {
         // Registration documents the ownership the router outcome names; the
         // shared router routes member verbs by name table regardless.
         if member.is_some() {
+            router.register(Box::new(SliceHandler(HandlerId::TempbanList)));
             for action in [
                 ModerationAction::Ban,
                 ModerationAction::TempBan,
@@ -346,12 +362,16 @@ impl CommandRuntime {
             executor.clone(),
             0,
             two_bot_core::ClassifierConfig::from_env(),
-        );
+        )
+        .with_classifier_provider(Arc::new(crate::community_classifier::LiveClassifier));
         let channel = ChannelModerationRuntime::new(
             ChannelModerationStore::from_pool(pool.clone()),
             executor.clone(),
         );
+        let giveaways =
+            crate::giveaway_runtime::GiveawayRuntime::new(pool.clone(), executor.clone());
         Arc::new(Self {
+            giveaways,
             pool,
             executor,
             interactions,
@@ -682,10 +702,27 @@ impl CommandRuntime {
                     );
                 }
                 self.dispatch_ticket_connection(event);
+                // A reconnect still heals a failed publication: republish the
+                // full set when a durable pending marker says the picker is
+                // stale. Without a marker this spawns no REST work, so the
+                // boot sync stays the single writer.
+                let runtime = Arc::clone(self);
+                let application_id = ready.application.id.get();
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime
+                        .publish_registry_if_resync_pending(Some(application_id))
+                        .await;
+                });
                 return;
             }
             Event::Resumed => {
                 self.dispatch_ticket_connection(event);
+                // Same reconnect-time healing as READY: the marker read keeps
+                // this publication-free unless a publication actually failed.
+                let runtime = Arc::clone(self);
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime.publish_registry_if_resync_pending(None).await;
+                });
                 return;
             }
             Event::InteractionCreate(interaction)
@@ -1000,10 +1037,25 @@ impl CommandRuntime {
                 else {
                     return true;
                 };
-                // The gateway also delivers these to the live voice sink. Yield
-                // before user-slot/lane admission so overload cannot answer a
-                // voice-owned command with the shared runtime's busy callback.
-                if self.voice_owns_interaction(&interaction) {
+                // The gateway also delivers these to their feature owners. Yield
+                // before user-slot/lane admission so overload cannot race the
+                // voice, onboarding preview or reopen defer with the shared
+                // busy callback. Preview picker clicks yield the same way:
+                // onboarding owns their defer and guidance, so a saturated
+                // shared lane must not race it with a competing busy callback.
+                if self.voice_owns_interaction(&interaction)
+                    || crate::onboarding::owns_welcome_preview(&interaction)
+                    || crate::onboarding::is_preview_control(&interaction)
+                    || matches!(
+                        route_interaction(&self.interactions.router, &interaction, None),
+                        RoutedInteraction::Slash {
+                            outcome: SlashOutcome::Handled {
+                                handler: HandlerId::Reopen
+                            },
+                            ..
+                        }
+                    )
+                {
                     return true;
                 }
                 let runtime = Arc::clone(self);
@@ -1197,12 +1249,33 @@ impl CommandRuntime {
         }
     }
 
+    /// Reconnect-triggered resync for the governed path: republish the full
+    /// set only when a durable pending marker says a previous publication
+    /// failed. Without a marker this is one SELECT and no REST work, so the
+    /// boot sync stays the single writer.
+    async fn publish_registry_if_resync_pending(&self, application_id: Option<u64>) {
+        if !self.registry_resync_pending().await {
+            return;
+        }
+        self.publish_registry(application_id).await;
+    }
+
+    /// Best-effort pending-marker read. An unreadable marker counts as no
+    /// pending work: a store outage keeps reconnects publication-free, and a
+    /// later management publish or the boot resync still heals.
+    async fn registry_resync_pending(&self) -> bool {
+        custom_command_store::is_registry_resync_pending(&self.pool, &self.guild_id.to_string())
+            .await
+            .unwrap_or(false)
+    }
+
     /// Publish the ONE complete merged registry (legacy `CommandRegistry::sync`
     /// on `ready`). `publish_set` assembles every gated builtin plus DB custom
     /// rows. Unknown custom rows defer publication rather than deleting commands.
     /// `set_guild_commands` is a full replace, making duplicate READY idempotent.
     /// RESUMED supplies no application id: resolve it through the same executor
-    /// and synchronize once per process. Failed syncs remain eligible to retry
+    /// and synchronize once per process. A durable pending marker is the one
+    /// reconnect-time exception. Failed syncs remain eligible to retry
     /// on a later gateway connection event, never a polling timer.
     pub(crate) async fn publish_registry(&self, application_id: Option<u64>) {
         if self.publish_registry_checked(application_id).await.is_err() {
@@ -1213,13 +1286,21 @@ impl CommandRuntime {
     /// [`Self::publish_registry`] with the outcome returned. `Ok(())` covers a
     /// completed sync and a deferred one (custom-command rows unknown, nothing
     /// sent); `Err` means an attempted sync failed and a later READY/RESUMED retries it.
+    /// A durable pending marker overrides the already-synced RESUMED no-op so
+    /// a reconnect heals a failed publication.
     pub(crate) async fn publish_registry_checked(
         &self,
         application_id: Option<u64>,
     ) -> Result<(), RegistrySyncError> {
         let mut synced = self.registry_synced.lock().await;
         if application_id.is_none() && *synced {
-            return Ok(());
+            // A management publication failed after this flag was set, so the
+            // picker is stale and this reconnect republishes. An absent or
+            // unreadable marker keeps the no-op; a later management publish
+            // or the boot resync still heals.
+            if !self.registry_resync_pending().await {
+                return Ok(());
+            }
         }
         // Once bootstrapped, custom commands own the full-set publisher: it
         // loads persisted rows and serializes add/remove republication.
@@ -1308,8 +1389,8 @@ impl CommandRuntime {
     /// Route slash commands and LFG selects once through the shared router. An
     /// injected self-role service handles only its owned component surface.
     /// Refusals get the existing ephemeral text; LFG/sticky/feed/schedule defer
-    /// before I/O; leveling sends its own immediate callback. Channel commands
-    /// own their defer/audit lifecycle. Unwired builtins
+    /// before I/O; leveling defers, then completes with one edit. Channel
+    /// commands own their defer/audit lifecycle. Unwired builtins
     /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         let application_id = self.application_id.load(Ordering::Relaxed);
@@ -1324,6 +1405,11 @@ impl CommandRuntime {
             return;
         };
         let interaction = interaction.as_ref();
+        // The onboarding ingress already owns the preview's receive-relative
+        // ACK and private refusal. Never double-answer it here.
+        if crate::onboarding::owns_welcome_preview(interaction) {
+            return;
+        }
         if ChannelModerationRuntime::accepts(interaction) {
             if let Err(error) = self
                 .channel
@@ -1339,7 +1425,10 @@ impl CommandRuntime {
             &routed,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Handled {
-                    handler: HandlerId::Lfg | HandlerId::LfgClose,
+                    handler: HandlerId::Lfg
+                        | HandlerId::LfgClose
+                        | HandlerId::LfgEdit
+                        | HandlerId::LfgList,
                 },
                 ..
             } | RoutedInteraction::Component {
@@ -1369,6 +1458,11 @@ impl CommandRuntime {
         } = &routed
         {
             match handler {
+                ComponentHandler::GiveawayEntry => {
+                    if self.defer(interaction, "giveaway").await {
+                        self.giveaways.enter(interaction, custom_id).await;
+                    }
+                }
                 ComponentHandler::SelfRole => {
                     self.self_role_component(interaction).await;
                 }
@@ -1424,9 +1518,23 @@ impl CommandRuntime {
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if handler == HandlerId::Reopen {
+            // The onboarding worker owns `/reopen` end to end (ingress defer
+            // at reception plus the durable menu job through the same
+            // pipeline as the picker components). Answering here — even the
+            // unavailable terminal below — would race that owner for the
+            // single initial callback, so this runtime stays silent exactly
+            // like it does for the `GamePicker`/`SessionPicker` components.
+            return;
+        }
         if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
-            // Leveling owns its immediate rank-ephemeral/leaderboard-public
-            // callback. Never send the generic ephemeral defer as well.
+            // Leveling owns its defer-then-edit lifecycle: an ephemeral defer
+            // for rank, a public defer for leaderboard, each completed by one
+            // original-response edit (a sanitized unavailable reply when the
+            // acknowledged store read fails). Never send the generic ephemeral
+            // defer as well, and never answer here: a failed or uncertain
+            // defer already returned with zero reads and nothing further to
+            // send, so this branch only logs the sanitized cause.
             if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
                 warn!(interaction_id = %interaction.id.get(), command = %name, reason = leveling_class(&error), "leveling interaction failed");
             }
@@ -1435,8 +1543,37 @@ impl CommandRuntime {
         if handler == HandlerId::Help {
             // Read the actual confirmed publication, including DB-backed
             // custom rows and successful add/remove refreshes. No store wait.
+            // An omitted selector keeps the grouped index; a selector reads
+            // one confirmed definition, never an unconfirmed refresh.
             let response = match self.published_commands() {
-                Some(defs) => help_response(&defs),
+                Some(defs) => match (
+                    help_command_selector(interaction),
+                    help_focus_selector(interaction),
+                ) {
+                    (None, HelpSubcommand::Absent) => help_response(&defs),
+                    // A focused path without a root is malformed, not an index.
+                    (None, _) => help_detail_response(unknown_help_branch_correction()),
+                    (Some(raw), focus) => {
+                        let def = canonical_help_selector(&raw).and_then(|name| {
+                            defs.iter().find(|def| def.name.eq_ignore_ascii_case(&name))
+                        });
+                        match (def, focus) {
+                            (Some(def), HelpSubcommand::Absent) => {
+                                help_detail_response(def.help_detail_text())
+                            }
+                            (Some(def), HelpSubcommand::Path(path)) => {
+                                def.help_branch_text(&path).map_or_else(
+                                    || help_detail_response(unknown_help_branch_correction()),
+                                    help_detail_response,
+                                )
+                            }
+                            (None, HelpSubcommand::Absent) => {
+                                help_detail_response(unknown_help_correction())
+                            }
+                            (_, _) => help_detail_response(unknown_help_branch_correction()),
+                        }
+                    }
+                },
                 None => ephemeral("The command list is still refreshing. Try /help again shortly."),
             };
             self.answer(interaction, response).await;
@@ -1447,14 +1584,20 @@ impl CommandRuntime {
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
             "remind" => Some(HandlerId::Remind),
+            "game-mix" => Some(HandlerId::GameMix),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
+            "giveaway" => Some(HandlerId::Giveaway),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
+            "feed-pause" => Some(HandlerId::FeedPause),
+            "feed-resume" => Some(HandlerId::FeedResume),
             "feed-list" => Some(HandlerId::FeedList),
+            "feed-inspect" => Some(HandlerId::FeedInspect),
             // Member verbs are owned only while the consumer exists; without
             // it they keep the immediate, non-deferred unavailable reply.
+            "tempban-list" if self.member.is_some() => Some(HandlerId::TempbanList),
             "ban" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Ban)),
             "tempban" if self.member.is_some() => {
                 Some(HandlerId::Moderation(ModerationAction::TempBan))
@@ -1464,6 +1607,9 @@ impl CommandRuntime {
                 Some(HandlerId::Moderation(ModerationAction::Timeout))
             }
             "warn" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Warn)),
+            // The staff ledger read shares the member consumer's presence:
+            // without it the immediate unavailable reply is kept.
+            "moderation-recent" if self.member.is_some() => Some(HandlerId::ModerationRecent),
             _ => None,
         };
         if owner != Some(handler) {
@@ -1489,11 +1635,79 @@ impl CommandRuntime {
                 )
                 .await;
             }
+            "game-mix" => {
+                let guild_id = self.guild_id.to_string();
+                // The CLI requires an explicit live-guild opt-in. This
+                // Discord read has no rollout approval mechanism, and the
+                // browse selectors never become one.
+                if guild_id == two_bot_core::backup::guild_config::LIVE_GUILD_ID {
+                    self.finish(interaction, "Game activity reports are not enabled for the live guild. This command does not authorize production reporting.").await;
+                    return;
+                }
+                // Strict selector decode before any storage read: an
+                // invalid, duplicated, unknown or type-confused option is
+                // one private correction, never a silently served report.
+                let browse = match game_mix_browse_request(interaction) {
+                    Ok(browse) => browse,
+                    Err(correction) => {
+                        self.finish(interaction, correction).await;
+                        return;
+                    }
+                };
+                match two_bot_core::game_activity_store::read_guild_aggregates(
+                    &self.pool, &guild_id,
+                )
+                .await
+                {
+                    Ok(rows) => {
+                        let reply = match browse {
+                            // The optionless default render is byte-stable:
+                            // browse rendering applies only once a selector
+                            // was explicitly chosen.
+                            None => {
+                                two_bot_core::game_activity::render_game_activity_discord_report(
+                                    self.guild_id,
+                                    &rows,
+                                )
+                            }
+                            Some((page, sort, format)) => {
+                                match two_bot_core::game_activity::render_game_activity_discord_browse(
+                                    self.guild_id, &rows, page, sort, format,
+                                ) {
+                                    two_bot_core::game_activity::GameMixBrowseView::Page(text) => {
+                                        text
+                                    }
+                                    two_bot_core::game_activity::GameMixBrowseView::OutOfRange {
+                                        ..
+                                    } => game_mix_page_range_correction(page),
+                                }
+                            }
+                        };
+                        self.finish(interaction, reply).await;
+                    }
+                    Err(two_bot_core::game_activity_store::GameActivityStoreError::Db(err)) => {
+                        warn!(
+                            msg = "game_mix_aggregate_read_failed",
+                            reason = db_class(&err),
+                            "game-mix aggregate read failed",
+                        );
+                        self.finish(
+                            interaction,
+                            "Game activity is unavailable right now. Please try again shortly.",
+                        )
+                        .await;
+                    }
+                }
+            }
+            "giveaway" => self.giveaways.command(interaction).await,
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
             "feed-add" => self.feed_add(interaction).await,
             "feed-remove" => self.feed_remove(interaction).await,
+            "feed-pause" => self.feed_pause(interaction).await,
+            "feed-resume" => self.feed_resume(interaction).await,
             "feed-list" => self.feed_list(interaction).await,
+            "feed-inspect" => self.feed_inspect(interaction).await,
             "schedule" => {
                 crate::schedule_runtime::schedule_create(
                     &self.pool,
@@ -1521,6 +1735,12 @@ impl CommandRuntime {
                 )
                 .await;
             }
+            "tempban-list" => {
+                if let Some(member) = &self.member {
+                    let reply = member.inventory_reply(&self.executor, interaction).await;
+                    self.finish(interaction, reply).await;
+                }
+            }
             "ban" => {
                 self.member_command(interaction, ModerationAction::Ban)
                     .await;
@@ -1540,6 +1760,15 @@ impl CommandRuntime {
             "warn" => {
                 self.member_command(interaction, ModerationAction::Warn)
                     .await;
+            }
+            "moderation-recent" => {
+                crate::moderation_recent_command::handle_command(
+                    &self.pool,
+                    self.guild_id,
+                    &self.executor,
+                    interaction,
+                )
+                .await;
             }
             _ => {}
         }
@@ -1590,7 +1819,30 @@ impl CommandRuntime {
         let reply = match tickets.execute(interaction, action).await {
             Ok(reply) => reply,
             Err(error) => {
-                warn!(error_class = ?error.class(), "ticket action incomplete");
+                let action_token = ticket_action_token(action);
+                // Best-effort enrichment: when the failure is itself a SQL
+                // storage failure, skip the decorating lookup instead of
+                // spending a second pool acquisition on a sick store. The
+                // lookup is also time-boxed so a slow store cannot delay the
+                // user-visible error reply; expiry degrades to no context.
+                let context = if error.is_storage_failure() {
+                    None
+                } else {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tickets.warn_ticket_context(interaction, action),
+                    )
+                    .await
+                    .unwrap_or(None)
+                };
+                match context {
+                    Some((ticket_id, status)) => {
+                        warn!(error_class = ?error.class(), action = %action_token, ticket_id = %ticket_id, status = %status, "ticket action incomplete")
+                    }
+                    None => {
+                        warn!(error_class = ?error.class(), action = %action_token, "ticket action incomplete")
+                    }
+                }
                 error.reply()
             }
         };
@@ -1802,6 +2054,10 @@ impl CommandRuntime {
     /// Rejected input still audits (`rejected`, Create vs Update by whether a
     /// row already exists — the read only names the audit action). A store
     /// failure audits that same refusal shape with the `db_class` token.
+    /// Malformed options refuse before any store read or audit via
+    /// [`sticky_preview_option`] and [`sticky_options_strict`]: no row, no audit,
+    /// one private correction. Preview validates and renders before all store
+    /// access, including rejected-input auditing; it never enters delivery.
     async fn sticky_set(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1809,12 +2065,32 @@ impl CommandRuntime {
             return;
         };
         let actor_id = actor_id(interaction);
-        let (body, debounce_option) = sticky_options(interaction);
-        let body = body.unwrap_or_default();
+        let preview = match sticky_preview_option(interaction) {
+            Ok(preview) => preview,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
+        let (body, debounce_option) = match sticky_options_strict(interaction) {
+            Ok(decoded) => decoded,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
 
-        let debounce = match validate_body(&body).and_then(|()| normalize_debounce(debounce_option))
-        {
-            Ok(debounce) => debounce,
+        let setup = StickySetup::validate(&body, debounce_option);
+        if preview {
+            let reply = match setup {
+                Ok(setup) => setup.preview_reply(),
+                Err(err) => err.to_string(),
+            };
+            self.finish(interaction, reply).await;
+            return;
+        }
+        let setup = match setup {
+            Ok(setup) => setup,
             Err(err) => {
                 let existed = store::get_sticky(&self.pool, &guild_id, &channel_id)
                     .await
@@ -1844,8 +2120,8 @@ impl CommandRuntime {
             &PutSticky {
                 guild_id: &guild_id,
                 channel_id: &channel_id,
-                body: &body,
-                debounce_seconds: debounce,
+                body: setup.body,
+                debounce_seconds: setup.debounce_seconds,
                 enabled: true,
                 actor_id: &actor_id,
                 now_ms: now_millis_for_test(),
@@ -1867,7 +2143,8 @@ impl CommandRuntime {
                     None,
                 )
                 .await;
-                let reply = sticky_set_reply(&channel_id, debounce_option.map(|_| debounce));
+                let reply =
+                    sticky_set_reply(&channel_id, debounce_option.map(|_| setup.debounce_seconds));
                 self.finish(interaction, reply).await;
             }
             Err(err) => {
@@ -1956,20 +2233,26 @@ impl CommandRuntime {
     /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
     /// audit → ephemeral confirmation. The relay id is generated here (legacy
     /// `randomUUID()`); plan errors reply with the domain text and write
-    /// neither a row nor an audit (legacy parity). A store failure audits one
-    /// `feed.create`/`rejected` refusal row, then replies safe. The relay
-    /// binds to the invoking channel.
+    /// neither a row nor an audit (legacy parity). An exact saved tuple replies
+    /// with its original id/state, without a write or creation/rejection audit.
+    /// A store failure audits one `feed.create`/`rejected` refusal row, then
+    /// replies safe. The relay
+    /// binds to the invoking channel. Malformed options refuse before any
+    /// store read or audit via [`feed_add_options_strict`].
     async fn feed_add(&self, interaction: &Interaction) {
         let Some(channel_id) = interaction_channel(interaction) else {
             self.finish(interaction, NO_CHANNEL_REPLY).await;
             return;
         };
         let inputs = self.feed_inputs(interaction);
-        let (kind, source) = feed_add_options(interaction);
-        let kind = match kind
-            .as_deref()
-            .map_or(Err(FeedError::InvalidKind), FeedKind::parse)
-        {
+        let (kind, source) = match feed_add_options_strict(interaction) {
+            Ok(decoded) => decoded,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
+        let kind = match FeedKind::parse(&kind) {
             Ok(kind) => kind,
             Err(err) => {
                 self.finish(interaction, err.to_string()).await;
@@ -1980,27 +2263,31 @@ impl CommandRuntime {
         let command = FeedCommand::Add {
             id: new_id(),
             kind,
-            source: source.unwrap_or_default(),
+            source,
         };
         match plan_command(&context, command) {
-            Ok(FeedCommandPlan::Add(relay)) => {
-                if let Err(err) = add_feed(&self.pool, &relay).await {
-                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
-                        self.finish(interaction, quota.to_string()).await;
-                    } else {
-                        let class = feed_store_class(&err);
-                        warn!(reason = class, "feed insert failed");
-                        self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
-                            .await;
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
-                    }
-                    return;
+            Ok(FeedCommandPlan::Add(relay)) => match add_feed(&self.pool, &relay).await {
+                Ok(FeedAddOutcome::Created) => {
+                    self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
+                        .await;
+                    self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
+                        .await;
                 }
-                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
-                    .await;
-                self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
-                    .await;
-            }
+                Ok(FeedAddOutcome::Existing { id, enabled }) => {
+                    self.finish(interaction, feed_existing_text(&id, enabled))
+                        .await;
+                }
+                Err(two_bot_core::feeds_store::FeedStoreError::Capacity(quota)) => {
+                    self.finish(interaction, quota.to_string()).await;
+                }
+                Err(err) => {
+                    let class = feed_store_class(&err);
+                    warn!(reason = class, "feed insert failed");
+                    self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
+                        .await;
+                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                }
+            },
             // `FeedCommand::Add` can only plan to `Add`; the other arms are
             // unreachable, not silently wrong.
             Ok(plan) => {
@@ -2013,28 +2300,44 @@ impl CommandRuntime {
     /// `/feed-remove`: decode `id` → plan → guild-scoped delete → `feed.remove`
     /// audit (`removed`/`missing`/`recovery_required` outcome) → ephemeral
     /// confirmation. A relay carrying unresolved pending delivery evidence is
-    /// retained with a fixed recovery reply, never claimed removed. A store
-    /// failure audits one `feed.remove`/`rejected` refusal row, then replies
-    /// safe.
+    /// retained with a snapshot reply carrying the fenced pending count,
+    /// never claimed removed. A store failure audits one
+    /// `feed.remove`/`rejected` refusal row, then replies safe. Malformed `id`
+    /// options refuse before any store read or audit via
+    /// [`feed_remove_option_strict`].
     async fn feed_remove(&self, interaction: &Interaction) {
         // Remove does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
-        let command = FeedCommand::Remove {
-            id: feed_remove_option(interaction).unwrap_or_default(),
+        let id = match feed_remove_option_strict(interaction) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
         };
+        let command = FeedCommand::Remove { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Remove { guild_id, id }) => {
-                match remove_feed(&self.pool, &guild_id, &id).await {
+                match remove_feed_with_evidence(&self.pool, &guild_id, &id).await {
                     Ok(outcome) => {
                         let (audit_outcome, reply) = match outcome {
-                            FeedRemoval::Removed => ("removed", feed_removed_text(true)),
-                            FeedRemoval::Missing => ("missing", feed_removed_text(false)),
-                            FeedRemoval::RecoveryRequired => {
-                                ("recovery_required", FEED_REMOVAL_RECOVERY_REQUIRED_TEXT)
+                            FeedRemovalEvidence::Removed => {
+                                ("removed", feed_removed_text(true).to_owned())
                             }
+                            FeedRemovalEvidence::Missing => {
+                                ("missing", feed_removed_text(false).to_owned())
+                            }
+                            FeedRemovalEvidence::RecoveryRequired { pending } => (
+                                "recovery_required",
+                                feed_pending_evidence_refusal_text(
+                                    FeedPendingEvidenceOperation::Remove,
+                                    &id,
+                                    pending,
+                                ),
+                            ),
                         };
                         self.feed_audit(&inputs, "feed.remove", &id, audit_outcome, None)
                             .await;
@@ -2056,11 +2359,141 @@ impl CommandRuntime {
         }
     }
 
+    /// `/feed-pause`: decode `id` → plan → guild-scoped disable →
+    /// `feed.pause` audit (`paused`/`already_paused`/`missing`/`recovery_required`
+    /// outcome) → ephemeral confirmation. URL, destination, seen-item and
+    /// delivery history are preserved; only lifecycle state changes. An enabled
+    /// relay carrying unresolved pending delivery evidence stays enabled with a
+    /// snapshot reply carrying the fenced pending count, so recovery is never
+    /// stranded behind disabled discovery. Already-admitted work is not
+    /// cancelled, and no fresh post claim may begin after a successful pause.
+    /// A store failure audits one `feed.pause`/`rejected` refusal row, then
+    /// replies safe.
+    async fn feed_pause(&self, interaction: &Interaction) {
+        // Pause does not bind to the invoking channel; `channel_id` is only
+        // context the planner ignores for this command.
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        let id = match feed_id_option_strict(
+            interaction,
+            FEED_PAUSE_INVALID_ID,
+            FEED_PAUSE_DUPLICATE_ID,
+            FEED_PAUSE_MISSING_ID,
+        ) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
+        let command = FeedCommand::Pause { id };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Pause { guild_id, id }) => {
+                match pause_feed_with_evidence(&self.pool, &guild_id, &id, inputs.now_ms).await {
+                    Ok(outcome) => {
+                        let (audit_outcome, reply) = match outcome {
+                            FeedPauseEvidence::Paused => ("paused", feed_paused_text(&id)),
+                            FeedPauseEvidence::AlreadyPaused => {
+                                ("already_paused", feed_already_paused_text(&id))
+                            }
+                            FeedPauseEvidence::Missing => {
+                                ("missing", feed_removed_text(false).to_owned())
+                            }
+                            FeedPauseEvidence::RecoveryRequired { pending } => (
+                                "recovery_required",
+                                feed_pending_evidence_refusal_text(
+                                    FeedPendingEvidenceOperation::Pause,
+                                    &id,
+                                    pending,
+                                ),
+                            ),
+                        };
+                        self.feed_audit(&inputs, "feed.pause", &id, audit_outcome, None)
+                            .await;
+                        self.finish(interaction, reply).await;
+                    }
+                    Err(err) => {
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed pause failed");
+                        self.feed_audit(&inputs, "feed.pause", &id, "rejected", Some(class))
+                            .await;
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
+                }
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-pause planned to a non-pause variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// `/feed-resume`: decode `id` → plan → guild-scoped enable →
+    /// `feed.resume` audit (`resumed`/`already_resumed`/`missing` outcome) →
+    /// ephemeral confirmation. Seen-item/high-water and nonce/dedup history
+    /// are preserved; resume never reposts an accepted item and keeps the
+    /// existing per-poll post budget rather than draining a backlog. A store
+    /// failure audits one `feed.resume`/`rejected` refusal row, then replies
+    /// safe.
+    async fn feed_resume(&self, interaction: &Interaction) {
+        // Resume does not bind to the invoking channel; `channel_id` is only
+        // context the planner ignores for this command.
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        let id = match feed_id_option_strict(
+            interaction,
+            FEED_RESUME_INVALID_ID,
+            FEED_RESUME_DUPLICATE_ID,
+            FEED_RESUME_MISSING_ID,
+        ) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
+        let command = FeedCommand::Resume { id };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Resume { guild_id, id }) => {
+                match resume_feed(&self.pool, &guild_id, &id, inputs.now_ms).await {
+                    Ok(outcome) => {
+                        let (audit_outcome, reply) = match outcome {
+                            FeedResumeOutcome::Resumed => ("resumed", feed_resumed_text(&id)),
+                            FeedResumeOutcome::AlreadyResumed => {
+                                ("already_resumed", feed_already_resumed_text(&id))
+                            }
+                            FeedResumeOutcome::Missing => {
+                                ("missing", feed_removed_text(false).to_owned())
+                            }
+                        };
+                        self.feed_audit(&inputs, "feed.resume", &id, audit_outcome, None)
+                            .await;
+                        self.finish(interaction, reply).await;
+                    }
+                    Err(err) => {
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed resume failed");
+                        self.feed_audit(&inputs, "feed.resume", &id, "rejected", Some(class))
+                            .await;
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
+                }
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-resume planned to a non-resume variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
     /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
     /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
     /// only) and writes no audit row. An omitted `page` means page 1; a
-    /// present-but-unusable option refuses without a store read, and
-    /// out-of-range refuses after the same bounded read every list uses.
+    /// duplicated, wrong-typed, unknown or nested option refuses without a
+    /// store read, and out-of-range refuses after the same bounded read
+    /// every list uses.
     async fn feed_list(&self, interaction: &Interaction) {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
@@ -2069,6 +2502,8 @@ impl CommandRuntime {
             Ok(FeedCommandPlan::List { guild_id }) => {
                 let reply = match feed_list_page_request(interaction) {
                     FeedListPage::Invalid => feed_list_page_invalid_text().to_owned(),
+                    FeedListPage::Duplicate => FEED_LIST_DUPLICATE_PAGE.to_owned(),
+                    FeedListPage::Unknown => FEED_LIST_UNKNOWN_OPTION.to_owned(),
                     FeedListPage::Default => self.list_feed_page(&guild_id, 1).await,
                     FeedListPage::Page(page) if page < 1 => {
                         feed_list_page_underflow_text().to_owned()
@@ -2079,6 +2514,48 @@ impl CommandRuntime {
             }
             Ok(plan) => {
                 warn!(?plan, "feed-list planned to a non-list variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// `/feed-inspect`: decode `id` → plan → one bounded guild-scoped read →
+    /// ephemeral detail. A pure read: no fetch, schedule change, relay
+    /// mutation, audit write, claim renewal or delivery reset on any path,
+    /// including store failure (legacy list parity). Absent, invalid-id and
+    /// store-failure replies stay distinct; the raw source never reaches logs.
+    /// Malformed `id` options refuse before any store read via
+    /// [`feed_inspect_options_strict`].
+    async fn feed_inspect(&self, interaction: &Interaction) {
+        // Inspect does not bind to the invoking channel; `channel_id` is only
+        // context the planner ignores for this command.
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        if let Err(refusal) = feed_inspect_options_strict(interaction) {
+            self.finish(interaction, refusal).await;
+            return;
+        }
+        let command = FeedCommand::Inspect {
+            id: feed_id_option(interaction).unwrap_or_default(),
+        };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Inspect { guild_id, id }) => {
+                let reply = match list_feeds(&self.pool, &guild_id, false).await {
+                    Ok(feeds) => feeds
+                        .iter()
+                        .find(|feed| feed.id == id)
+                        .map(|feed| feed.inspect_text())
+                        .unwrap_or_else(|| feed_removed_text(false).to_owned()),
+                    Err(err) => {
+                        warn!(reason = feed_store_class(&err), "feed inspect failed");
+                        FEED_STORE_FAILURE_REPLY.to_owned()
+                    }
+                };
+                self.finish(interaction, reply).await;
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-inspect planned to a non-inspect variant");
             }
             Err(err) => self.finish(interaction, err.to_string()).await,
         }
@@ -2326,6 +2803,16 @@ impl CommandRuntime {
     }
 }
 
+/// Fixed-vocabulary token for the `ticket action incomplete` warn's `action`
+/// field.
+fn ticket_action_token(action: TicketAction) -> &'static str {
+    match action {
+        TicketAction::Open => "open",
+        TicketAction::Claim => "claim",
+        TicketAction::Close => "close",
+    }
+}
+
 /// Invoking channel as a snowflake string. `channel_id` is deprecated on the
 /// wire but still the field Discord populates for guild slash commands; the
 /// replacement `channel` object carries the id plus a payload we never read.
@@ -2381,30 +2868,162 @@ pub(crate) fn new_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-/// `/feed-add`'s options: `kind` (choice string) + `source` (string). A
-/// missing `kind` replies `InvalidKind`; a missing `source` plans against an
-/// empty string, which the SSRF guard rejects.
-pub(crate) fn feed_add_options(interaction: &Interaction) -> (Option<String>, Option<String>) {
-    let mut kind = None;
-    let mut source = None;
+/// Refusal literals for malformed feed command options.
+/// Each names the offending option and carries a copyable corrected
+/// invocation, echoes no user input (mention-safe), and stays far under
+/// Discord's 2,000-unit cap (bounded). Handlers reply with these before any
+/// store read or audit write.
+const FEED_ADD_INVALID_KIND: &str = "Invalid kind. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_DUPLICATE_KIND: &str = "Duplicate kind. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_MISSING_KIND: &str = "Missing kind. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_INVALID_SOURCE: &str = "Invalid source. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_DUPLICATE_SOURCE: &str =
+    "Duplicate source. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_MISSING_SOURCE: &str = "Missing source. Use /feed-add kind:rss source:<https-url>.";
+const FEED_REMOVE_INVALID_ID: &str = "Invalid id. Use /feed-remove id:<relay-id>.";
+const FEED_REMOVE_DUPLICATE_ID: &str = "Duplicate id. Use /feed-remove id:<relay-id>.";
+const FEED_REMOVE_MISSING_ID: &str = "Missing id. Use /feed-remove id:<relay-id>.";
+const FEED_PAUSE_INVALID_ID: &str = "Invalid id. Use /feed-pause id:<relay-id>.";
+const FEED_PAUSE_DUPLICATE_ID: &str = "Duplicate id. Use /feed-pause id:<relay-id>.";
+const FEED_PAUSE_MISSING_ID: &str = "Missing id. Use /feed-pause id:<relay-id>.";
+const FEED_RESUME_INVALID_ID: &str = "Invalid id. Use /feed-resume id:<relay-id>.";
+const FEED_RESUME_DUPLICATE_ID: &str = "Duplicate id. Use /feed-resume id:<relay-id>.";
+const FEED_RESUME_MISSING_ID: &str = "Missing id. Use /feed-resume id:<relay-id>.";
+const FEED_INSPECT_INVALID_ID: &str = "Invalid id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_DUPLICATE_ID: &str = "Duplicate id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_MISSING_ID: &str = "Missing id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-inspect id:<relay-id>.";
+const FEED_LIST_DUPLICATE_PAGE: &str = "Duplicate page. Use /feed-list page:<number>.";
+const FEED_LIST_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-list page:<number>.";
+
+/// Strictly decode `/feed-add`'s options: `kind` and `source` must each
+/// appear exactly once with a string value. Duplicates win over wrong types
+/// win over missing options, and `kind` wins over `source` within a phase;
+/// unknown names stay ignored. A non-command interaction carries no options,
+/// so it refuses as a missing `kind`. Valid invocations decode to the same
+/// `kind`/`source` values the previous lenient decoder extracted.
+pub(crate) fn feed_add_options_strict(
+    interaction: &Interaction,
+) -> Result<(String, String), &'static str> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return (kind, source);
+        return Err(FEED_ADD_MISSING_KIND);
     };
+    let mut kinds: Vec<&CommandOptionValue> = Vec::new();
+    let mut sources: Vec<&CommandOptionValue> = Vec::new();
     for option in &data.options {
-        match (option.name.as_str(), &option.value) {
-            ("kind", CommandOptionValue::String(value)) => kind = Some(value.clone()),
-            ("source", CommandOptionValue::String(value)) => source = Some(value.clone()),
+        match option.name.as_str() {
+            "kind" => kinds.push(&option.value),
+            "source" => sources.push(&option.value),
             _ => {}
         }
     }
-    (kind, source)
+    if kinds.len() > 1 {
+        return Err(FEED_ADD_DUPLICATE_KIND);
+    }
+    if sources.len() > 1 {
+        return Err(FEED_ADD_DUPLICATE_SOURCE);
+    }
+    // Wrong-type phase: a present-but-unusable option refuses before any
+    // missing option is named, in declared order.
+    if !matches!(kinds.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(FEED_ADD_INVALID_KIND);
+    }
+    if !matches!(sources.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(FEED_ADD_INVALID_SOURCE);
+    }
+    let kind = match kinds.first() {
+        None => return Err(FEED_ADD_MISSING_KIND),
+        Some(CommandOptionValue::String(value)) => (*value).clone(),
+        Some(_) => return Err(FEED_ADD_INVALID_KIND),
+    };
+    let source = match sources.first() {
+        None => return Err(FEED_ADD_MISSING_SOURCE),
+        Some(CommandOptionValue::String(value)) => (*value).clone(),
+        Some(_) => return Err(FEED_ADD_INVALID_SOURCE),
+    };
+    Ok((kind, source))
 }
 
-/// `/feed-remove`'s `id` option; `None` plans against an empty id, which
-/// `validate_id` rejects with `InvalidId`.
-pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
+/// Strictly decode `/feed-remove`'s `id` option: it must appear exactly once
+/// with a string value. A duplicated name wins over a wrong wire type, which
+/// wins over a missing option; unknown names stay ignored. A non-command
+/// interaction carries no options, so it refuses as a missing `id`.
+/// Present-but-empty still decodes (the planner's `validate_id` owns that
+/// refusal), so valid invocations plan byte-identically to before.
+pub(crate) fn feed_remove_option_strict(interaction: &Interaction) -> Result<String, &'static str> {
+    feed_id_option_strict(
+        interaction,
+        FEED_REMOVE_INVALID_ID,
+        FEED_REMOVE_DUPLICATE_ID,
+        FEED_REMOVE_MISSING_ID,
+    )
+}
+
+/// Share strict relay-id decoding without sharing command-worded refusals.
+/// Malformed options refuse before planning, store access or audit writes;
+/// typed-empty values still reach the planner's `validate_id` check.
+fn feed_id_option_strict(
+    interaction: &Interaction,
+    invalid_id: &'static str,
+    duplicate_id: &'static str,
+    missing_id: &'static str,
+) -> Result<String, &'static str> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Err(missing_id);
+    };
+    let mut ids: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        if option.name.as_str() == "id" {
+            ids.push(&option.value);
+        }
+    }
+    if ids.len() > 1 {
+        return Err(duplicate_id);
+    }
+    match ids.first() {
+        None => Err(missing_id),
+        Some(CommandOptionValue::String(value)) => Ok((*value).clone()),
+        Some(_) => Err(invalid_id),
+    }
+}
+
+/// Guard the complete `/feed-inspect` option namespace before extracting
+/// `id` with [`feed_id_option`]: exactly one string `id` and no other
+/// options. An unknown name (including a nested group) wins over a
+/// duplicated `id`, which wins over a wrong wire type, which wins over a
+/// missing `id` — the same namespace-first layering as
+/// [`sticky_preview_option`], with the `id` checks themselves delegated to
+/// [`feed_id_option_strict`]. Unlike the writer decoders, unknown names
+/// refuse here, so a malformed read never silently inspects an arbitrarily
+/// chosen relay. A non-command interaction refuses as a missing `id`.
+fn feed_inspect_options_strict(interaction: &Interaction) -> Result<(), &'static str> {
+    if let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(
+        data,
+    )) = &interaction.data
+    {
+        if data.options.iter().any(|option| option.name != "id") {
+            return Err(FEED_INSPECT_UNKNOWN_OPTION);
+        }
+    }
+    feed_id_option_strict(
+        interaction,
+        FEED_INSPECT_INVALID_ID,
+        FEED_INSPECT_DUPLICATE_ID,
+        FEED_INSPECT_MISSING_ID,
+    )
+    .map(|_| ())
+}
+
+/// `/feed-inspect`'s `id` option. The handler runs
+/// [`feed_inspect_options_strict`] first, so a missing, duplicated or
+/// wrong-typed `id` never reaches this extractor; a present-but-empty id
+/// still extracts as `Some("")`, which `validate_id` rejects with
+/// `InvalidId` and inspect's distinct recovery copy.
+pub(crate) fn feed_id_option(interaction: &Interaction) -> Option<String> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
@@ -2418,14 +3037,93 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
-/// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
-/// omitted option means page 1, while a present option with a non-integer
-/// wire value is unusable and must refuse rather than silently list page 1.
+/// `/help`'s optional `command` selector. Omitted means the grouped index.
+/// A present option with a non-string wire value is malformed and decodes
+/// to an empty selector, which answers the unknown-name correction rather
+/// than silently listing the index.
+pub(crate) fn help_command_selector(interaction: &Interaction) -> Option<String> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return None;
+    };
+    let option = data
+        .options
+        .iter()
+        .find(|option| option.name == "command")?;
+    match &option.value {
+        CommandOptionValue::String(value) => Some(value.clone()),
+        _ => Some(String::new()),
+    }
+}
+
+/// The optional focused `/help subcommand:` path. A present option with a
+/// non-string wire value, or a duplicated option, is malformed and answers
+/// the branch correction rather than silently showing the root detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HelpSubcommand {
+    Absent,
+    Path(String),
+    Malformed,
+}
+
+/// The focused path as the runtime consumes it: a duplicated `command`
+/// selector makes a focused request malformed instead of letting the first
+/// duplicate pick the root. An unfocused request keeps its existing decode.
+pub(crate) fn help_focus_selector(interaction: &Interaction) -> HelpSubcommand {
+    let focus = help_subcommand_selector(interaction);
+    let duplicated = matches!(
+        &interaction.data,
+        Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data))
+            if data.options.iter().filter(|option| option.name == "command").count() > 1
+    );
+    if duplicated && focus != HelpSubcommand::Absent {
+        HelpSubcommand::Malformed
+    } else {
+        focus
+    }
+}
+
+pub(crate) fn help_subcommand_selector(interaction: &Interaction) -> HelpSubcommand {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return HelpSubcommand::Absent;
+    };
+    let mut selected = data
+        .options
+        .iter()
+        .filter(|option| option.name == "subcommand");
+    let (Some(option), None) = (selected.next(), selected.next()) else {
+        return if data
+            .options
+            .iter()
+            .any(|option| option.name == "subcommand")
+        {
+            HelpSubcommand::Malformed
+        } else {
+            HelpSubcommand::Absent
+        };
+    };
+    match &option.value {
+        CommandOptionValue::String(value) => HelpSubcommand::Path(value.clone()),
+        _ => HelpSubcommand::Malformed,
+    }
+}
+
+/// `/feed-list`'s optional 1-based `page` option, decoded over the complete
+/// option shape: an omitted option means page 1, while a duplicated,
+/// wrong-typed, unknown or nested option must refuse rather than silently
+/// list an arbitrarily chosen page. An unknown name wins over a duplicated
+/// `page`, which wins over a wrong wire type; range stays the reply
+/// composer's refusal, not the decoder's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeedListPage {
     Default,
     Page(i64),
     Invalid,
+    Duplicate,
+    Unknown,
 }
 
 pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage {
@@ -2434,13 +3132,113 @@ pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage 
     else {
         return FeedListPage::Default;
     };
-    let Some(page) = data.options.iter().find(|option| option.name == "page") else {
-        return FeedListPage::Default;
-    };
-    match &page.value {
-        CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
-        _ => FeedListPage::Invalid,
+    let mut pages: Vec<&CommandOptionValue> = Vec::new();
+    let mut unknown = false;
+    for option in &data.options {
+        match option.name.as_str() {
+            "page" => pages.push(&option.value),
+            _ => unknown = true,
+        }
     }
+    if unknown {
+        return FeedListPage::Unknown;
+    }
+    if pages.len() > 1 {
+        return FeedListPage::Duplicate;
+    }
+    match pages.first() {
+        None => FeedListPage::Default,
+        Some(CommandOptionValue::Integer(value)) => FeedListPage::Page(*value),
+        Some(_) => FeedListPage::Invalid,
+    }
+}
+
+/// Strict `/game-mix` browse selectors, decoded before any storage read.
+///
+/// Every option must be one of the published selectors, appear at most
+/// once, and carry the published wire type: `page` is an integer within
+/// the published bounds, `sort` is `play` or `voice`, `format` is `json`
+/// or `summary`. Anything else — an unknown name such as a guild, member
+/// or live-guild override, a duplicate, a wrong-typed value — returns one
+/// bounded correction naming the offending selector. `Ok(None)` is the
+/// optionless legacy call, which keeps the default JSON render.
+pub(crate) fn game_mix_browse_request(
+    interaction: &Interaction,
+) -> Result<
+    Option<(
+        usize,
+        two_bot_core::game_activity::GameMixBrowseSort,
+        two_bot_core::game_activity::GameMixBrowseFormat,
+    )>,
+    String,
+> {
+    use two_bot_core::game_activity::{GameMixBrowseFormat, GameMixBrowseSort};
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Ok(None);
+    };
+    if data.options.is_empty() {
+        return Ok(None);
+    }
+    let correction = |selector: &'static str| {
+        format!(
+            "That {selector} value is not valid for /game-mix. Use page 1 to {}, \
+             sort play or voice, and format json or summary — and no other options.",
+            two_bot_core::game_activity::GAME_MIX_MAX_PAGE
+        )
+    };
+    let mut page = 1usize;
+    let mut sort = GameMixBrowseSort::Play;
+    let mut format = GameMixBrowseFormat::Json;
+    let mut seen: Vec<&str> = Vec::new();
+    for option in &data.options {
+        if seen.contains(&option.name.as_str()) {
+            return Err(correction(match option.name.as_str() {
+                "page" => "page",
+                "sort" => "sort",
+                "format" => "format",
+                _ => "game-mix",
+            }));
+        }
+        seen.push(option.name.as_str());
+        match (option.name.as_str(), &option.value) {
+            ("page", CommandOptionValue::Integer(value))
+                if (1..=two_bot_core::game_activity::GAME_MIX_MAX_PAGE).contains(value) =>
+            {
+                page = usize::try_from(*value).map_err(|_| correction("page"))?;
+            }
+            ("page", _) => return Err(correction("page")),
+            ("sort", CommandOptionValue::String(value)) => {
+                sort = match value.as_str() {
+                    "play" => GameMixBrowseSort::Play,
+                    "voice" => GameMixBrowseSort::Voice,
+                    _ => return Err(correction("sort")),
+                };
+            }
+            ("sort", _) => return Err(correction("sort")),
+            ("format", CommandOptionValue::String(value)) => {
+                format = match value.as_str() {
+                    "json" => GameMixBrowseFormat::Json,
+                    "summary" => GameMixBrowseFormat::Summary,
+                    _ => return Err(correction("format")),
+                };
+            }
+            ("format", _) => return Err(correction("format")),
+            _ => return Err(correction("game-mix")),
+        }
+    }
+    Ok(Some((page, sort, format)))
+}
+
+/// Bounded correction for a well-formed page past the saved games. The
+/// saved totals stay out of the reply: page bounds follow from the
+/// request, never from data a refused-at-decode call could not see.
+fn game_mix_page_range_correction(page: usize) -> String {
+    format!(
+        "Page {page} is past the saved games for this server. \
+         Run /game-mix with page 1 to start from the first saved games."
+    )
 }
 
 /// Shared sticky/feed/channel/leveling registrations over the narrowed boot
@@ -2451,10 +3249,14 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
     if gates.moderation {
         register_channel_handlers(&mut router);
+        // The staff ledger read executes in this runtime (member consumer
+        // present); registration documents the ownership the router names.
+        router.register(Box::new(SliceHandler(HandlerId::ModerationRecent)));
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));
         router.register(Box::new(SliceHandler(HandlerId::Remind)));
+        router.register(Box::new(SliceHandler(HandlerId::Giveaway)));
         // Custom commands are an automations capability: a refused identity
         // must not even resolve their handlers (4014 isolation depends on the
         // narrowed intent too). Dispatch refuses and publish withholds when
@@ -2465,7 +3267,10 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
         for id in [
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
             HandlerId::FeedList,
+            HandlerId::FeedInspect,
             // The ordered RSVP surface executes these ids; registration
             // documents the ownership the router outcome names.
             HandlerId::Rsvp,
@@ -2488,6 +3293,15 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/privacy` member self-serve is never activation-fenced either: every
     // member may opt out of analytics in any guild.
     router.register(Box::new(SliceHandler(HandlerId::Privacy)));
+    // `/reopen` picker recovery is never activation-fenced either: every
+    // member may reopen their own pickers in any gate state. Execution
+    // lives in the onboarding worker (`on_interaction` below stays silent
+    // for it, exactly like the picker components); this registration only
+    // advertises the ownership the router outcome names.
+    router.register(Box::new(SliceHandler(HandlerId::Reopen)));
+    // Onboarding ingress owns the preview, including its private refusal.
+    router.register(Box::new(SliceHandler(HandlerId::WelcomePreview)));
+    router.register(Box::new(SliceHandler(HandlerId::GameMix)));
     router
 }
 
@@ -2529,25 +3343,95 @@ pub(crate) fn actor_id(interaction: &Interaction) -> String {
         .unwrap_or_default()
 }
 
-/// Extract `/sticky`'s options: `body` (required string) + `debounce`
-/// (optional integer). Missing `body` becomes `None` → validation rejects it
-/// with the legacy body-length text.
-pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Option<i64>) {
-    let mut body = None;
-    let mut debounce = None;
+/// Refusal literals for malformed `/sticky` options. Each names the
+/// offending option and carries a copyable corrected invocation, echoes no
+/// user input (mention-safe), and stays far under Discord's 2,000-unit cap
+/// (bounded). Handlers reply with these before any store read or audit write.
+const STICKY_INVALID_BODY: &str = "Invalid body. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_DUPLICATE_BODY: &str = "Duplicate body. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_MISSING_BODY: &str = "Missing body. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_INVALID_DEBOUNCE: &str =
+    "Invalid debounce. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_DUPLICATE_DEBOUNCE: &str =
+    "Duplicate debounce. Use /sticky body:<text> debounce:<seconds>.";
+
+/// Guard the complete setup option namespace before decoding body/debounce.
+/// Unknown names (including misspelled preview flags) must never silently save.
+/// Keep the existing body/debounce decoder and its refusal precedence unchanged.
+fn sticky_preview_option(interaction: &Interaction) -> Result<bool, &'static str> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return (body, debounce);
+        return Err(STICKY_MISSING_BODY);
     };
+    let mut preview = None;
     for option in &data.options {
-        match (option.name.as_str(), &option.value) {
-            ("body", CommandOptionValue::String(value)) => body = Some(value.clone()),
-            ("debounce", CommandOptionValue::Integer(value)) => debounce = Some(*value),
+        match option.name.as_str() {
+            "body" | "debounce" => {}
+            "preview" => match (&option.value, preview) {
+                (CommandOptionValue::Boolean(value), None) => preview = Some(*value),
+                _ => return Err("Invalid preview. Use /sticky body:<text> [debounce:<seconds>] preview:true or preview:false; supply preview only once."),
+            },
+            _ => return Err("Unknown option. Use /sticky body:<text> [debounce:<seconds>] [preview:true|false]."),
+        }
+    }
+    Ok(preview.unwrap_or(false))
+}
+
+/// Strictly decode `/sticky`'s options: `body` must appear exactly once with
+/// a string value, while `debounce` stays optional (an omitted option means
+/// the default quiet window). Duplicates win over wrong types win over a
+/// missing `body`, and `body` wins over `debounce` within a phase. This helper
+/// decodes only these two fields; [`sticky_preview_option`] must run first to
+/// reject unknown names and malformed preview flags. A non-command interaction
+/// refuses as a missing `body`. Present-but-empty and out-of-range values
+/// still decode (validation owns those refusals), so valid invocations
+/// decode byte-identically to before.
+pub(crate) fn sticky_options_strict(
+    interaction: &Interaction,
+) -> Result<(String, Option<i64>), &'static str> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Err(STICKY_MISSING_BODY);
+    };
+    let mut bodies: Vec<&CommandOptionValue> = Vec::new();
+    let mut debounces: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        match option.name.as_str() {
+            "body" => bodies.push(&option.value),
+            "debounce" => debounces.push(&option.value),
             _ => {}
         }
     }
-    (body, debounce)
+    if bodies.len() > 1 {
+        return Err(STICKY_DUPLICATE_BODY);
+    }
+    if debounces.len() > 1 {
+        return Err(STICKY_DUPLICATE_DEBOUNCE);
+    }
+    // Wrong-type phase: a present-but-unusable option refuses before a
+    // missing `body` is named, in declared order.
+    if !matches!(bodies.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(STICKY_INVALID_BODY);
+    }
+    if !matches!(
+        debounces.first(),
+        None | Some(CommandOptionValue::Integer(_))
+    ) {
+        return Err(STICKY_INVALID_DEBOUNCE);
+    }
+    let body = match bodies.first() {
+        None => return Err(STICKY_MISSING_BODY),
+        Some(CommandOptionValue::String(value)) => (*value).clone(),
+        Some(_) => return Err(STICKY_INVALID_BODY),
+    };
+    let debounce = match debounces.first() {
+        None => None,
+        Some(CommandOptionValue::Integer(value)) => Some(*value),
+        Some(_) => return Err(STICKY_INVALID_DEBOUNCE),
+    };
+    Ok((body, debounce))
 }
 
 #[cfg(test)]

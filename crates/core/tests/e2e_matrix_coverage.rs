@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
         matrix_names, published_names,
         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
     );
-    assert_eq!(matrix.len(), 30, "contract covers the 30 built-in commands");
+    assert_eq!(matrix.len(), 46, "contract covers the 46 built-in commands");
 }
 
 #[test]
@@ -77,12 +77,27 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "/{} permission row drifted from the permission table",
             row.command
         );
+        assert_eq!(
+            row.parity_row, table.parity_row,
+            "/{} parity row drifted from the permission table",
+            row.command
+        );
         assert!(
             !def.dm_permission,
             "/{} must stay guild-only (dm_permission false)",
             row.command
         );
-        let expected_gate = if ["rank", "leaderboard", "help", "privacy"].contains(&row.command) {
+        let expected_gate = if [
+            "rank",
+            "leaderboard",
+            "help",
+            "privacy",
+            "reopen",
+            "welcome-preview",
+            "game-mix",
+        ]
+        .contains(&row.command)
+        {
             E2eGate::Always
         } else if row.command == "attendance" {
             E2eGate::Scorecard
@@ -90,12 +105,16 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "command",
             "command-remove",
             "command-list",
+            "command-inspect",
+            "command-disable",
+            "command-enable",
             "schedule",
             "schedule-remove",
             "schedule-list",
             "sticky",
             "sticky-remove",
             "remind",
+            "giveaway",
         ]
         .contains(&row.command)
         {
@@ -105,9 +124,14 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "rsvp-attendance",
             "lfg",
             "lfg-close",
+            "lfg-edit",
+            "lfg-list",
             "feed-add",
             "feed-remove",
+            "feed-pause",
+            "feed-resume",
             "feed-list",
+            "feed-inspect",
         ]
         .contains(&row.command)
         {
