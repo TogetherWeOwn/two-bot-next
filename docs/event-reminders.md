@@ -21,7 +21,16 @@ revalidates that total alongside the capped member list before admission. The
 fallback counts as the event's one delivery attempt.
 
 The existing activation-fenced automation scheduler must be enabled; its normal
-15-second cadence also handles these reminders, at most two events per tick.
+15-second cadence also handles these reminders, at most two events in the
+ordinary pass. After a healthy tick, one immediate **urgent follow-up** may
+attempt at most two more events whose starts fall within the next 15 seconds.
+This avoids stranding a third event that first receives an eligible RSVP just
+before its start. Nonurgent events wait for the next ordinary tick. The
+follow-up shares the same activation fence, supervisor ownership, cancellation
+and overall deadline; it never reruns ordinary scheduled messages, resets the
+timeout or admits an event after its start. There is no unbounded drain: at
+most four reminder attempts run in one supervised invocation. Larger urgent
+bursts, slow delivery or exhausted deadlines remain best effort.
 Ordinary scheduled messages run first as a separate phase: a completed
 schedule-store failure that stops their batch still permits the bounded
 reminder attempt on the same tick when activation and supervisor ownership

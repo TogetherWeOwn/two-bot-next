@@ -76,7 +76,13 @@ pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Op
         Arc::new(move || {
             let context = context.clone();
             Box::pin(async move {
-                tick(context.pool().await?, &context.rest, &context.guild, now_ms).await
+                tick_with_deadline_follow_up(
+                    context.pool().await?,
+                    &context.rest,
+                    &context.guild,
+                    now_ms,
+                )
+                .await
             })
         }),
     )
@@ -104,8 +110,8 @@ fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {
     gates.automations.then(|| job(action))
 }
 
-/// Ten occurrences at the 5 s REST timeout, each with a possible orphan
-/// delete, stay well inside the attempt timeout.
+/// Scheduled occurrences and both bounded reminder passes share this deadline.
+/// Slow work may exhaust it; no reminder follow-up renews the budget.
 fn job(action: JobAction) -> Job {
     let cadence = Duration::from_millis(SCHEDULER_TICK_MS);
     Job {
@@ -161,7 +167,7 @@ pub(crate) async fn tick(
     clock: impl Fn() -> u64 + Send + Sync,
 ) -> Result<(), ErrorClass> {
     let schedule_error = run_schedule_phase(pool, rest, guild, &clock).await;
-    let reminder_error = remind_event_attendees(pool, rest, guild, &clock)
+    let reminder_error = remind_event_attendees(pool, rest, guild, &clock, None)
         .await
         .err();
     match (schedule_error, reminder_error) {
@@ -171,6 +177,23 @@ pub(crate) async fn tick(
         // failures map to the existing Database class today.
         (Some(schedule), Some(_)) => Err(schedule),
     }
+}
+
+/// A healthy ordinary tick may leave a tail that expires before the next 15 s
+/// tick. Give only that urgent tail one immediate, separately bounded reminder
+/// pass. Each read still selects at most two events: at most four attempts per
+/// supervised invocation, never an unbounded drain or an ordinary-message rerun.
+/// This future remains inside the existing activation fence, cancellation and
+/// 120 s supervisor deadline; dispatch still rejects events after their start.
+async fn tick_with_deadline_follow_up(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    clock: impl Fn() -> u64 + Send + Sync,
+) -> Result<(), ErrorClass> {
+    tick(pool, rest, guild, &clock).await?;
+    let latest_start = clock().saturating_add(SCHEDULER_TICK_MS);
+    remind_event_attendees(pool, rest, guild, &clock, Some(latest_start)).await
 }
 
 /// Claim and run due scheduled occurrences, stopping the batch on the first
@@ -228,13 +251,23 @@ async fn remind_event_attendees(
     rest: &ActionExecutor,
     guild: &str,
     clock: &impl Fn() -> u64,
+    latest_start: Option<u64>,
 ) -> Result<(), ErrorClass> {
     use two_bot_core::event_reminder_store::{begin_event_reminder_delivery, due_event_reminders};
 
+    let latest_start = latest_start.map(format_iso_ms);
     for event in due_event_reminders(pool, guild, clock())
         .await
         .map_err(reminder_database)?
     {
+        // The store orders by start time. Nonurgent tails retain the ordinary
+        // two-per-tick budget; no audit fence is armed merely by selection.
+        if latest_start
+            .as_ref()
+            .is_some_and(|latest| event.starts_at.as_str() > latest.as_str())
+        {
+            break;
+        }
         let now = clock();
         if !begin_event_reminder_delivery(pool, guild, &event, now)
             .await
