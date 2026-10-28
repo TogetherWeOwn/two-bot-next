@@ -591,9 +591,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 45 all-gate builtins: 7 core + 1 scorecard + 13 automation
-            // + 12 announcements + 9 moderation mutations + 3 private reads.
-            45
+            // 46 all-gate builtins: 7 core + 1 scorecard + 13 automation
+            // + 12 announcements + 9 moderation mutations + 4 private reads.
+            46
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -637,7 +637,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 66);
+        assert_eq!(with_voice.len(), 67);
         assert!(
             with_voice.iter().any(|def| def.name == "tempban-list"),
             "tempban-list survives the voice registry"

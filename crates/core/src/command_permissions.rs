@@ -89,10 +89,11 @@ use PolicyHook::{
 /// `/command-disable` and `/command-enable` (parity rows 40 and 41),
 /// `/welcome-preview` admin preview (parity row 42), staff aggregate
 /// `/game-mix` (43), and feed lifecycle `/feed-pause` (44) and
-/// `/feed-resume` (45), saved expiry inspection `/tempban-list` (46), and
-/// management-only `/command-clone` (47). Only `/game-mix` admits
+/// `/feed-resume` (45), saved expiry inspection `/tempban-list` (46),
+/// staff-only saved-ledger read `/moderation-recent` (47), and
+/// management-only `/command-clone` (48). Only `/game-mix` admits
 /// Administrator alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 49] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -155,6 +156,13 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
         PERM_MANAGE_CHANNELS,
         None,
     ),
+    row(
+        47,
+        "moderation-recent",
+        BuiltinSlash,
+        PERM_MODERATE_MEMBERS,
+        None,
+    ),
     row(12, "attendance", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(
         13,
@@ -169,7 +177,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
     row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(40, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(41, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(47, "command-clone", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(48, "command-clone", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),

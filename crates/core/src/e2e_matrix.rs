@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 44 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 46 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -123,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 44-row contract in publish order (core, scorecard, automation,
+/// The 46-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -274,7 +274,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "command-clone",
-            47,
+            48,
             E2eGate::Automations,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -403,7 +403,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Rsvp",
-            "Ephemeral `RSVP saved: <status>.` confirmation (pasted links append the event id).",
+            "Ephemeral `RSVP saved: <status>.` confirmation; a changed or repeated choice adds `(changed from <previous>)` or `(saved again; time updated)` (pasted links append the event id).",
             &[
                 "Gate:AnnouncementsDisabled",
                 "Valid:event-id:required,max128",
@@ -755,6 +755,22 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:ModerationDisabled",
                 "Perm:ChannelInspectPermission",
                 "Valid:options:none",
+            ],
+        ),
+        row(
+            "moderation-recent",
+            47,
+            E2eGate::Moderation,
+            PERM_MODERATE_MEMBERS,
+            "ModerateMembers",
+            "ModerationRecent",
+            "Deferred ephemeral newest-first page of saved moderation ledger rows labelled not live-verified; staff rechecked live; applied, denied and uncertain outcomes stay distinct; no claim, audit, retry or Discord mutation.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:ModerationRecentPermission",
+                "Valid:page:optional,1..=20",
+                "Valid:options:page-only",
             ],
         ),
     ]

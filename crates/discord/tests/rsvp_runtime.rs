@@ -34,6 +34,12 @@ mod event_link_acceptance;
 #[path = "support/event_link_id_controls.rs"]
 mod event_link_id_controls;
 
+#[path = "support/rsvp_saved_response_kinds.rs"]
+mod saved_response_kinds;
+
+#[path = "support/rsvp_link_receipts.rs"]
+mod link_receipts;
+
 fn router() -> InteractionRouter {
     InteractionRouter::new(RouterGates {
         configured_guild: Some(GUILD.parse().unwrap()),
@@ -373,12 +379,20 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         ScriptedResponse::status(500),
     )
     .await;
-    for (i, status) in ["going", "interested", "declined", "declined"]
+    // First saves the legacy sentence; rewrites distinguish changed vs repeat.
+    let expected = [
+        "RSVP saved: going.",
+        "RSVP saved: interested (changed from going).",
+        "RSVP saved: declined (changed from interested).",
+        "RSVP saved: declined (saved again; time updated).",
+    ];
+    for (i, (status, want)) in ["going", "interested", "declined", "declined"]
         .iter()
+        .zip(expected)
         .enumerate()
     {
         run(fixture.pool(), &mock, &rsvp(100 + i as u64, status)).await;
-        assert_reply(&mock, &format!("RSVP saved: {status}."), true);
+        assert_reply(&mock, want, true);
         let stored: String = sqlx::query_scalar(
             "SELECT status FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
         )
