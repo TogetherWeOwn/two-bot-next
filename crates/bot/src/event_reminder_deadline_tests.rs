@@ -160,7 +160,10 @@ async fn urgent_tail() {
                 .fetch_one(db.pool())
                 .await
                 .expect("read reminder outcomes");
-                if count == 3 {
+                // A committed result can become visible before the action
+                // returns. Observe supervisor completion before shutdown, so
+                // this success-path test cannot abort that final return.
+                if count == 3 && status.read().await[NAMES[0]].last_success.is_some() {
                     break;
                 }
             }
