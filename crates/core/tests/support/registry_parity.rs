@@ -58,6 +58,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
+    ("tempban-list", "docs/parity.md §1 tempban-list"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -197,7 +198,13 @@ pub fn expected_registry() -> Value {
                 "Command name (case-insensitive; optional leading /)",
                 CommandOptionType::String,
             )
-            .max_length(32)],
+            .max_length(32),
+            CommandOption::new(
+                "subcommand",
+                "Subcommand path, space-separated (requires command)",
+                CommandOptionType::String,
+            )
+            .max_length(96)],
     ))
     .expect("help serializes");
     commands.insert(2, help);
@@ -552,6 +559,18 @@ pub fn expected_registry() -> Value {
                         .max_length(64),
                     CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
                 ]),
+                CommandOption::new(
+                    "inspect",
+                    "Privately inspect saved giveaway details in this channel",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
             ]),
     )
     .expect("giveaway serializes");
@@ -968,6 +987,29 @@ pub fn expected_registry() -> Value {
                 "type": 3,
                 "required": true,
                 "max_length": 128
+            }]
+        }),
+    );
+    let after_tempban = commands
+        .iter()
+        .position(|command| command["name"] == "tempban")
+        .expect("tempban anchors saved-expiry inspection")
+        + 1;
+    commands.insert(
+        after_tempban,
+        json!({
+            "name": "tempban-list",
+            "description": "Inspect saved temporary-ban expiry work",
+            "type": 1,
+            "default_member_permissions": "4",
+            "dm_permission": false,
+            "options": [{
+                "name": "page",
+                "description": "Saved expiry page (10 rows, default 1; due time then work ID order)",
+                "type": 4,
+                "required": false,
+                "min_value": 1,
+                "max_value": 10000
             }]
         }),
     );

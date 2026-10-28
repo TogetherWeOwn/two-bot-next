@@ -93,6 +93,10 @@ pub const BOOT_BLOCKED_RETRY_SLEEP_MS: u64 = 250;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
+/// Extra time for a governed read to settle storage after its wire deadline.
+/// This never extends the wire attempt or authorizes another request. If
+/// completion cannot be confirmed within the bound, admission stays occupied.
+const READ_SETTLEMENT_GRACE_MS: u64 = 1_000;
 /// Wire marker for a stalled response body: headers arrived but the body never
 /// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
 /// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
@@ -728,8 +732,48 @@ impl HyperTransport {
     /// `deadline` is the caller's absolute attempt instant: admission,
     /// headers and body together stay inside it. The unadmitted loopback path
     /// passes `None` (headers unbounded, body at the fixed
-    /// [`RESPONSE_BODY_TIMEOUT_MS`]).
+    /// [`RESPONSE_BODY_TIMEOUT_MS`]). Governed GETs own their bounded attempt
+    /// independently of the caller: cancelling a fetch must not abandon its
+    /// admission or 429 body accounting. No caller continuation or retry lives
+    /// in that owner. Mutations retain their cancellation/uncertainty fences.
     pub async fn send_request(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(RawResponse, bool), String> {
+        if self.admission.is_some() && request.method() == Method::Get {
+            let transport = self.clone();
+            let request = request.clone();
+            let deadline = deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS)
+            });
+            // The inner phase timers retain the original wire deadline. The
+            // later watchdog leaves time for their storage cleanup, but also
+            // bounds a stuck completion. Dropping the join handle detaches
+            // only this one read, never a retry loop or a mutation.
+            let owner = tokio::spawn(async move {
+                let settled_by = deadline + Duration::from_millis(READ_SETTLEMENT_GRACE_MS);
+                match tokio::time::timeout_at(
+                    settled_by,
+                    transport.send_request_inner(&request, Some(deadline)),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!("Discord read settlement timed out; lane held");
+                        Err("Discord read settlement timed out".to_owned())
+                    }
+                }
+            });
+            return owner
+                .await
+                .map_err(|_| "Discord read owner unavailable".to_owned())?;
+        }
+        self.send_request_inner(request, deadline).await
+    }
+
+    async fn send_request_inner(
         &self,
         request: &Request,
         deadline: Option<tokio::time::Instant>,
@@ -4671,6 +4715,7 @@ mod tests {
             key: TokenKey,
             entered: Arc<AtomicUsize>,
             dropped: Arc<AtomicUsize>,
+            started: Arc<tokio::sync::Notify>,
         }
         impl SendAdmission for PendingAdmission {
             fn token_key(&self) -> &TokenKey {
@@ -4681,6 +4726,7 @@ mod tests {
                 Box::pin(async move {
                     let _drop = AdmissionDrop(self.dropped.clone());
                     self.entered.fetch_add(1, Ordering::SeqCst);
+                    self.started.notify_one();
                     std::future::pending().await
                 })
             }
@@ -4689,6 +4735,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let entered = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
         let token = "fixture-lazy-send-token";
         let executor = ActionExecutor::with_admission(
             token.to_owned(),
@@ -4697,6 +4744,7 @@ mod tests {
                 key: TokenKey::for_bot_token(token).expect("fixture token key"),
                 entered: entered.clone(),
                 dropped: dropped.clone(),
+                started: started.clone(),
             }),
         )
         .expect("fixture executor");
@@ -4711,16 +4759,41 @@ mod tests {
         let mut pending = Box::pin(executor.send_admitted_for(&request, budget));
         // Construction must not start the deadline or durable admission.
         tokio::time::advance(budget * 2).await;
+        assert_eq!(executor.requests(), 0);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
         std::future::poll_fn(|cx| {
             assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
             Poll::Ready(())
         })
         .await;
         assert_eq!(executor.requests(), 1);
+        // A governed GET owns admission independently of its awaiting caller.
+        // Wait for the owner rather than requiring admission in the first poll.
+        tokio::time::timeout(budget, started.notified())
+            .await
+            .expect("governed read owner entered admission");
         assert_eq!(entered.load(Ordering::SeqCst), 1);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(pending);
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "caller cancellation must not abandon the admission before its deadline"
+        );
+        // The original attempt gets at most one extra second for settlement.
+        tokio::time::advance(Duration::from_millis(1) + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "pending admission must be dropped by the read settlement bound"
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "no detached retry");
+        assert_eq!(executor.requests(), 1);
     }
 
     fn boot_executor() -> ActionExecutor {
