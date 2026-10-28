@@ -55,6 +55,16 @@
           "max_value": null,
           "max_length": 32,
           "choices": []
+        },
+        {
+          "name": "subcommand",
+          "description": "Subcommand path, space-separated (requires command)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 96,
+          "choices": []
         }
       ],
       "smoke": "deferred",
