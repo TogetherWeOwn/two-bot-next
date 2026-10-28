@@ -2,6 +2,8 @@
 //! RSVP can first become eligible less than one ordinary cadence before start;
 //! preserving two attempts per tick must not strand the third event until then.
 
+#![cfg(test)]
+
 use std::{process::Command, sync::Arc, time::Duration};
 
 use serde_json::json;
@@ -90,7 +92,7 @@ async fn urgent_tail() {
         id: id.to_owned(),
         name: "Late eligibility".to_owned(),
         starts_at: format_iso_ms(starts),
-        channel_id: Some("4444".to_owned()),
+        channel_id: Some("1546451670500642111".to_owned()),
         description: None,
         status: EventStatus::Scheduled,
     });
@@ -105,7 +107,7 @@ async fn urgent_tail() {
             &RsvpRecord {
                 guild_id: guild.to_owned(),
                 event_id: id.to_owned(),
-                user_id: "5555".to_owned(),
+                user_id: "1546451670500642888".to_owned(),
                 status: RsvpStatus::Going,
                 responded_at: format_iso_ms(now),
             },
