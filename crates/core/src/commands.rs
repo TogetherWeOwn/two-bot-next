@@ -308,11 +308,18 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::String,
                 )
                 .max_length(32),
+                CommandOption::new(
+                    "subcommand",
+                    "Subcommand path, space-separated (requires command)",
+                    CommandOptionType::String,
+                )
+                .max_length(96),
             ])
             .examples(vec![
                 "/help".to_owned(),
                 "/help command:rank".to_owned(),
                 "/help command:privacy".to_owned(),
+                "/help command:privacy subcommand:deletion-status".to_owned(),
             ]),
         CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
             CommandOption::new(

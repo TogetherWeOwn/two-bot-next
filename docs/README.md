@@ -1,4 +1,4 @@
-# Documentation map
+# Docs map
 
 Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
 Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
@@ -141,6 +141,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Redirect safety](redirect-configuration.md)
 - [Time helper](time-helper-spec.md)
 - [Queue order](schedule-queue-order.md)
+- [Post page](dashboard-scheduled-posts-spec.md)
 - [Skips](scheduled-events-skip-acceptance.md)
 - [Event reminders](event-reminders.md)
 - [RSVP](dashboard-event-rsvp-spec.md)
@@ -198,7 +199,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Channel-info](voice-channelinfo-core.md)
 - [Component IDs](voice-custom-id-core.md)
 - [Defaults](voice-creator-defaults-acceptance.md)
-- [Perm overrides](voice-permissions-core.md)
+- [Overrides](voice-permissions-core.md)
 - [Permission health](voice-permission-health-core.md)
 - [Placement](voice-placement-core.md)
 - [Companion text](voice-text-channel-core.md)
@@ -294,5 +295,5 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Image supply chain](supply-chain.md)
 - [Distroless](distroless-evaluation.md)
 - [Threat model](threat-model.md)
-- [Command wiring gates](command-wiring-security.md)
+- [Wiring gates](command-wiring-security.md)
 - [Rejection telemetry](rejection-telemetry.md)
