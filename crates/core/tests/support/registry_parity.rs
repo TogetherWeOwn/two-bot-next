@@ -55,10 +55,12 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("moderation-recent", "docs/parity.md §1 moderation-recent"),
     ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("lfg-inspect", "docs/parity.md §1 lfg-inspect"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
+    ("tempban-list", "docs/parity.md §1 tempban-list"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -198,7 +200,13 @@ pub fn expected_registry() -> Value {
                 "Command name (case-insensitive; optional leading /)",
                 CommandOptionType::String,
             )
-            .max_length(32)],
+            .max_length(32),
+            CommandOption::new(
+                "subcommand",
+                "Subcommand path, space-separated (requires command)",
+                CommandOptionType::String,
+            )
+            .max_length(96)],
     ))
     .expect("help serializes");
     commands.insert(2, help);
@@ -292,7 +300,8 @@ pub fn expected_registry() -> Value {
     .expect("welcome preview serializes");
     commands.insert(5, welcome_preview);
     // Next-only private staff aggregate, immediately after welcome-preview. Keep the
-    // legacy snapshot frozen and pin the whole additive definition literally.
+    // legacy snapshot frozen and pin the whole additive definition literally,
+    // including the optional browse selectors (never a guild/member override).
     commands.insert(
         6,
         json!({
@@ -300,7 +309,33 @@ pub fn expected_registry() -> Value {
             "description": "Show this server's aggregate game activity.",
             "dm_permission": false,
             "default_member_permissions": "32",
-            "options": []
+            "options": [
+                {
+                    "name": "page",
+                    "description": "Page of saved games to show (10 per page). Default: 1.",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 10000
+                },
+                {
+                    "name": "sort",
+                    "description": "Order games by play time or in-voice time. Default: play.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "Play time", "value": "play"},
+                        {"name": "In-voice time", "value": "voice"}
+                    ]
+                },
+                {
+                    "name": "format",
+                    "description": "Show raw JSON or a readable summary. Default: JSON.",
+                    "type": 3,
+                    "choices": [
+                        {"name": "JSON", "value": "json"},
+                        {"name": "Summary", "value": "summary"}
+                    ]
+                }
+            ]
         }),
     );
     // Next-only saved-response inspection or unsaved draft preview. This
@@ -547,6 +582,18 @@ pub fn expected_registry() -> Value {
                         .max_length(64),
                     CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
                 ]),
+                CommandOption::new(
+                    "inspect",
+                    "Privately inspect saved giveaway details in this channel",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
             ]),
     )
     .expect("giveaway serializes");
@@ -608,6 +655,18 @@ pub fn expected_registry() -> Value {
             "options": [],
             "dm_permission": false,
             "default_member_permissions": "16"
+        }),
+    );
+    commands.insert(
+        after_unlock + 2,
+        json!({
+            "name": "moderation-recent",
+            "description": "Privately list recent saved moderation actions",
+            "dm_permission": false,
+            "default_member_permissions": "1099511627776",
+            "options": [{"name": "page",
+                "description": "Page of saved moderation actions (1 is newest)",
+                "type": 4, "min_value": 1, "max_value": 20}]
         }),
     );
     // Picker-copy exceptions (registry golden exceptions table): command and
@@ -963,6 +1022,29 @@ pub fn expected_registry() -> Value {
                 "type": 3,
                 "required": true,
                 "max_length": 128
+            }]
+        }),
+    );
+    let after_tempban = commands
+        .iter()
+        .position(|command| command["name"] == "tempban")
+        .expect("tempban anchors saved-expiry inspection")
+        + 1;
+    commands.insert(
+        after_tempban,
+        json!({
+            "name": "tempban-list",
+            "description": "Inspect saved temporary-ban expiry work",
+            "type": 1,
+            "default_member_permissions": "4",
+            "dm_permission": false,
+            "options": [{
+                "name": "page",
+                "description": "Saved expiry page (10 rows, default 1; due time then work ID order)",
+                "type": 4,
+                "required": false,
+                "min_value": 1,
+                "max_value": 10000
             }]
         }),
     );

@@ -24,36 +24,20 @@ pub enum OnboardingConfigError {
     Missing(&'static str),
 }
 
-fn id(value: &str, key: &'static str) -> Result<u64, OnboardingConfigError> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|v| *v != 0)
-        .ok_or(OnboardingConfigError::InvalidId(key))
-}
-
 fn optional_id(
     vars: &HashMap<String, String>,
     key: &'static str,
 ) -> Result<Option<u64>, OnboardingConfigError> {
-    vars.get(key)
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| id(v, key))
-        .transpose()
+    two_bot_core::onboarding_destination::parse_optional_id(vars.get(key).map(String::as_str))
+        .map_err(|_| OnboardingConfigError::InvalidId(key))
 }
 
 pub fn channel_ids(
     value: Option<&str>,
     key: &'static str,
 ) -> Result<Vec<u64>, OnboardingConfigError> {
-    value
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| id(v, key))
-        .collect()
+    two_bot_core::onboarding_destination::parse_channel_ids(value)
+        .map_err(|_| OnboardingConfigError::InvalidId(key))
 }
 
 impl OnboardingConfig {

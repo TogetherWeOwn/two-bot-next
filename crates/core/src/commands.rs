@@ -308,11 +308,18 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::String,
                 )
                 .max_length(32),
+                CommandOption::new(
+                    "subcommand",
+                    "Subcommand path, space-separated (requires command)",
+                    CommandOptionType::String,
+                )
+                .max_length(96),
             ])
             .examples(vec![
                 "/help".to_owned(),
                 "/help command:rank".to_owned(),
                 "/help command:privacy".to_owned(),
+                "/help command:privacy subcommand:deletion-status".to_owned(),
             ]),
         CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
             CommandOption::new(
@@ -383,11 +390,53 @@ pub fn core_commands() -> Vec<CommandDefinition> {
             "Privately preview the current welcome for a synthetic newcomer. No delivery.",
         )
         .permissions(PERM_MANAGE_GUILD),
+        // Optional browse selectors only: every call stays scoped to the
+        // invoking guild; there is deliberately no guild, member or
+        // live-guild override. The page ceiling mirrors
+        // `game_activity::GAME_MIX_MAX_PAGE` (pinned there for the runtime).
         CommandDefinition::new(
             "game-mix",
             "Show this server's aggregate game activity.",
         )
-        .permissions(PERM_MANAGE_GUILD),
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "page",
+                "Page of saved games to show (10 per page). Default: 1.",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, crate::game_activity::GAME_MIX_MAX_PAGE),
+            CommandOption::new(
+                "sort",
+                "Order games by play time or in-voice time. Default: play.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "Play time".to_owned(),
+                    value: "play".to_owned(),
+                },
+                CommandChoice {
+                    name: "In-voice time".to_owned(),
+                    value: "voice".to_owned(),
+                },
+            ]),
+            CommandOption::new(
+                "format",
+                "Show raw JSON or a readable summary. Default: JSON.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "JSON".to_owned(),
+                    value: "json".to_owned(),
+                },
+                CommandChoice {
+                    name: "Summary".to_owned(),
+                    value: "summary".to_owned(),
+                },
+            ]),
+        ]),
     ]
 }
 
@@ -529,6 +578,7 @@ mod tests {
                 .chain(crate::feature_commands::automation_commands()).collect::<Vec<_>>();
             for (command, option, min, max, required) in [
                 ("tempban", "duration_seconds", 60, Some(31_536_000), true),
+                ("tempban-list", "page", 1, Some(10_000), false),
                 ("timeout", "duration_seconds", 60, Some(2_419_200), true),
                 ("purge", "count", 1, Some(100), true),
                 ("purge-preview", "count", 1, Some(100), true),
@@ -557,7 +607,10 @@ mod tests {
                 // still requires one.
                 if !matches!(
                     definition.name.as_str(),
-                    "purge-preview" | "channel-inspect"
+                    "purge-preview"
+                        | "channel-inspect"
+                        | "tempban-list"
+                        | "moderation-recent"
                 ) {
                     let reason = definition
                         .options

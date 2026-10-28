@@ -22,12 +22,24 @@ pub enum FeedStoreError {
     Capacity(AutomationQuota),
 }
 
+/// An add either creates a relay or observes the exact saved tuple unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedAddOutcome {
+    Created,
+    Existing { id: String, enabled: bool },
+}
+
 /// Add is insert-only: an externally supplied id cannot hijack an existing
 /// relay, or change its source while retaining that source's delivery ledger.
-/// The guild's 25-definition cap includes disabled feeds, and is checked in
-/// the insert transaction under a guild-scoped capacity lock.
-pub async fn add_feed(pool: &Pool<Postgres>, feed: &FeedRelay) -> Result<(), FeedStoreError> {
-    crate::feeds::normalize_source(feed.kind, &feed.source)?;
+/// The guild's 25-definition cap includes disabled feeds, and is checked first
+/// in the insert transaction under a guild-scoped capacity lock. Only the
+/// guild/channel/kind/normalized-source uniqueness conflict is recoverable;
+/// unrelated unique violations and database failures remain errors.
+pub async fn add_feed(
+    pool: &Pool<Postgres>,
+    feed: &FeedRelay,
+) -> Result<FeedAddOutcome, FeedStoreError> {
+    let source = crate::feeds::normalize_source(feed.kind, &feed.source)?;
     let mut tx = pool.begin().await?;
     lock_quota(&mut tx, &feed.guild_id, AutomationQuota::Feeds).await?;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM feed_relays WHERE guild_id = $1")
@@ -37,17 +49,40 @@ pub async fn add_feed(pool: &Pool<Postgres>, feed: &FeedRelay) -> Result<(), Fee
     if count >= AutomationQuota::Feeds.limit() {
         return Err(FeedStoreError::Capacity(AutomationQuota::Feeds));
     }
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO feed_relays
          (id, guild_id, channel_id, kind, source, enabled, last_checked_at, created_by, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::bigint::double precision / 1000),
-                 $8, to_timestamp($9::bigint::double precision / 1000), to_timestamp($10::bigint::double precision / 1000))"
+                 $8, to_timestamp($9::bigint::double precision / 1000), to_timestamp($10::bigint::double precision / 1000))
+         ON CONFLICT (guild_id, channel_id, kind, source) DO NOTHING"
     )
     .bind(&feed.id).bind(&feed.guild_id).bind(&feed.channel_id).bind(feed.kind.as_str())
-    .bind(&feed.source).bind(feed.enabled).bind(feed.last_checked_at).bind(&feed.created_by)
-    .bind(feed.created_at).bind(feed.updated_at).execute(&mut *tx).await?;
+    .bind(&source).bind(feed.enabled).bind(feed.last_checked_at).bind(&feed.created_by)
+    .bind(feed.created_at).bind(feed.updated_at).execute(&mut *tx).await?.rows_affected();
+    let outcome = if inserted == 1 {
+        FeedAddOutcome::Created
+    } else {
+        // A separate READ COMMITTED statement sees a concurrently committed
+        // tuple. Never UPDATE it to obtain RETURNING data: even timestamps,
+        // paused state and the delivery ledger must remain untouched. A row
+        // removed before this read is an error, not invented recovery evidence.
+        let row = sqlx::query(
+            "SELECT id, enabled FROM feed_relays
+             WHERE guild_id = $1 AND channel_id = $2 AND kind = $3 AND source = $4",
+        )
+        .bind(&feed.guild_id)
+        .bind(&feed.channel_id)
+        .bind(feed.kind.as_str())
+        .bind(&source)
+        .fetch_one(&mut *tx)
+        .await?;
+        FeedAddOutcome::Existing {
+            id: row.try_get("id")?,
+            enabled: row.try_get("enabled")?,
+        }
+    };
     tx.commit().await?;
-    Ok(())
+    Ok(outcome)
 }
 
 pub async fn list_feeds(

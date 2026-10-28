@@ -5,7 +5,7 @@
 //! `fixtures/smoke_surface_inventory.json` exactly, in publish order. The
 //! fixture additionally marks the five smoke-covered commands (one per
 //! routing family, matching `crates/discord/tests/top5_reply_fixtures.rs`)
-//! versus the 37 saved deferrals (39 with compiled-only LFG edit/inspect).
+//! versus the 39 saved deferrals (41 with compiled-only LFG edit/inspect).
 //!
 //! Offline only: no staging guild, no live Discord, no network, no database.
 
@@ -34,17 +34,18 @@ fn fixture() -> Value {
     let mut fixture: Value =
         serde_json::from_str(include_str!("fixtures/smoke_surface_inventory.json"))
             .expect("smoke surface inventory fixture parses");
-    // Preserve the saved publication inventory (42 rows including
-    // welcome-preview and feed pause/resume); extend only the compiled registry oracle with the
+    // Preserve the saved publication inventory (44 rows including
+    // welcome-preview, feed pause/resume, tempban-list and moderation-recent);
+    // extend only the compiled registry oracle with the
     // lfg-edit companion. No smoke coverage or deployment is claimed for edit.
     assert_eq!(
-        fixture["count"], 42,
-        "saved inventory retains the feed pair"
+        fixture["count"], 44,
+        "saved inventory retains the feed pair and both staff reads"
     );
     let rows = fixture["commands"]
         .as_array_mut()
         .expect("saved command rows");
-    assert_eq!(rows.len(), 42);
+    assert_eq!(rows.len(), 44);
     assert!(rows.iter().all(|row| row["name"] != "lfg-edit"));
     let after_close = rows
         .iter()
@@ -97,7 +98,7 @@ fn fixture() -> Value {
         "expected_response": null,
         "deferral_reason": "Compiled-only saved-roster inspection; live publication and smoke remain unapproved."
     }));
-    fixture["count"] = serde_json::json!(44);
+    fixture["count"] = serde_json::json!(46);
     fixture
 }
 
@@ -117,14 +118,14 @@ fn option_type_name(kind: u8) -> &'static str {
 fn inventory_matches_registry_output_in_publish_order() {
     let published = all_on_router().publish_set(&[]).expect("publish set");
     let fixture = fixture();
-    assert_eq!(fixture["count"], 44, "44 built-ins");
+    assert_eq!(fixture["count"], 46, "46 built-ins");
     assert_eq!(
         fixture["dm_permission_all_false"], true,
         "fixture claims guild-only"
     );
     let rows = fixture["commands"].as_array().expect("command rows");
     assert_eq!(published.len(), rows.len(), "registry row count matches");
-    assert_eq!(published.len(), 44, "44 built-ins in the registry");
+    assert_eq!(published.len(), 46, "46 built-ins in the registry");
 
     for (definition, row) in published.iter().zip(rows.iter()) {
         let name = row["name"].as_str().expect("row name");
@@ -270,8 +271,8 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
     assert_eq!(covered.len(), 5, "exactly the top five");
-    assert_eq!(deferred.len(), 39, "every non-smoke row deferred");
-    assert_eq!(covered.len() + deferred.len(), 44, "every row marked");
+    assert_eq!(deferred.len(), 41, "every non-smoke row deferred");
+    assert_eq!(covered.len() + deferred.len(), 46, "every row marked");
 
     let mut covered_names: Vec<&str> = covered
         .iter()
