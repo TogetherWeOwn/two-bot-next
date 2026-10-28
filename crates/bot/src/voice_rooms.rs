@@ -7677,9 +7677,14 @@ impl ActorInboxBackpressure {
     /// every production send acquires first, so saturation only engages
     /// for test-only direct sends.
     fn release_for(&self, command: &ActorCommand) {
+        self.release_for_with_before_cas(command, || {});
+    }
+
+    fn release_for_with_before_cas(&self, command: &ActorCommand, before_cas: impl FnOnce()) {
         if command.is_bufferable() {
             // Keep the 1.94 floor without using the deprecated `fetch_update` API.
             let mut in_flight = self.in_flight.load(Ordering::Relaxed);
+            before_cas();
             while let Some(next) = in_flight.checked_sub(1) {
                 match self.in_flight.compare_exchange_weak(
                     in_flight,
