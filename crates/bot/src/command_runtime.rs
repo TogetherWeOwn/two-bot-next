@@ -82,7 +82,7 @@ use two_bot_core::{
         FeedResumeOutcome,
     },
     funnel::now_millis_for_test,
-    help::{canonical_help_selector, unknown_help_correction},
+    help::{canonical_help_selector, unknown_help_branch_correction, unknown_help_correction},
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
@@ -345,6 +345,7 @@ impl CommandRuntime {
         // Registration documents the ownership the router outcome names; the
         // shared router routes member verbs by name table regardless.
         if member.is_some() {
+            router.register(Box::new(SliceHandler(HandlerId::TempbanList)));
             for action in [
                 ModerationAction::Ban,
                 ModerationAction::TempBan,
@@ -1545,14 +1546,33 @@ impl CommandRuntime {
             // An omitted selector keeps the grouped index; a selector reads
             // one confirmed definition, never an unconfirmed refresh.
             let response = match self.published_commands() {
-                Some(defs) => match help_command_selector(interaction) {
-                    None => help_response(&defs),
-                    Some(raw) => match canonical_help_selector(&raw).and_then(|name| {
-                        defs.iter().find(|def| def.name.eq_ignore_ascii_case(&name))
-                    }) {
-                        Some(def) => help_detail_response(def.help_detail_text()),
-                        None => help_detail_response(unknown_help_correction()),
-                    },
+                Some(defs) => match (
+                    help_command_selector(interaction),
+                    help_focus_selector(interaction),
+                ) {
+                    (None, HelpSubcommand::Absent) => help_response(&defs),
+                    // A focused path without a root is malformed, not an index.
+                    (None, _) => help_detail_response(unknown_help_branch_correction()),
+                    (Some(raw), focus) => {
+                        let def = canonical_help_selector(&raw).and_then(|name| {
+                            defs.iter().find(|def| def.name.eq_ignore_ascii_case(&name))
+                        });
+                        match (def, focus) {
+                            (Some(def), HelpSubcommand::Absent) => {
+                                help_detail_response(def.help_detail_text())
+                            }
+                            (Some(def), HelpSubcommand::Path(path)) => {
+                                def.help_branch_text(&path).map_or_else(
+                                    || help_detail_response(unknown_help_branch_correction()),
+                                    help_detail_response,
+                                )
+                            }
+                            (None, HelpSubcommand::Absent) => {
+                                help_detail_response(unknown_help_correction())
+                            }
+                            (_, _) => help_detail_response(unknown_help_branch_correction()),
+                        }
+                    }
                 },
                 None => ephemeral("The command list is still refreshing. Try /help again shortly."),
             };
@@ -1576,6 +1596,7 @@ impl CommandRuntime {
             "feed-inspect" => Some(HandlerId::FeedInspect),
             // Member verbs are owned only while the consumer exists; without
             // it they keep the immediate, non-deferred unavailable reply.
+            "tempban-list" if self.member.is_some() => Some(HandlerId::TempbanList),
             "ban" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Ban)),
             "tempban" if self.member.is_some() => {
                 Some(HandlerId::Moderation(ModerationAction::TempBan))
@@ -1700,6 +1721,12 @@ impl CommandRuntime {
                     interaction,
                 )
                 .await;
+            }
+            "tempban-list" => {
+                if let Some(member) = &self.member {
+                    let reply = member.inventory_reply(&self.executor, interaction).await;
+                    self.finish(interaction, reply).await;
+                }
             }
             "ban" => {
                 self.member_command(interaction, ModerationAction::Ban)
@@ -3005,6 +3032,60 @@ pub(crate) fn help_command_selector(interaction: &Interaction) -> Option<String>
     match &option.value {
         CommandOptionValue::String(value) => Some(value.clone()),
         _ => Some(String::new()),
+    }
+}
+
+/// The optional focused `/help subcommand:` path. A present option with a
+/// non-string wire value, or a duplicated option, is malformed and answers
+/// the branch correction rather than silently showing the root detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HelpSubcommand {
+    Absent,
+    Path(String),
+    Malformed,
+}
+
+/// The focused path as the runtime consumes it: a duplicated `command`
+/// selector makes a focused request malformed instead of letting the first
+/// duplicate pick the root. An unfocused request keeps its existing decode.
+pub(crate) fn help_focus_selector(interaction: &Interaction) -> HelpSubcommand {
+    let focus = help_subcommand_selector(interaction);
+    let duplicated = matches!(
+        &interaction.data,
+        Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data))
+            if data.options.iter().filter(|option| option.name == "command").count() > 1
+    );
+    if duplicated && focus != HelpSubcommand::Absent {
+        HelpSubcommand::Malformed
+    } else {
+        focus
+    }
+}
+
+pub(crate) fn help_subcommand_selector(interaction: &Interaction) -> HelpSubcommand {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return HelpSubcommand::Absent;
+    };
+    let mut selected = data
+        .options
+        .iter()
+        .filter(|option| option.name == "subcommand");
+    let (Some(option), None) = (selected.next(), selected.next()) else {
+        return if data
+            .options
+            .iter()
+            .any(|option| option.name == "subcommand")
+        {
+            HelpSubcommand::Malformed
+        } else {
+            HelpSubcommand::Absent
+        };
+    };
+    match &option.value {
+        CommandOptionValue::String(value) => HelpSubcommand::Path(value.clone()),
+        _ => HelpSubcommand::Malformed,
     }
 }
 
