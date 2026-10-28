@@ -158,6 +158,7 @@ RUST_DOCS = frozenset({
     "docs/parity.md",
     "docs/cutover.md",
     "docs/commands.md",
+    "docs/generated/commands.md",
     "docs/configuration.md",
     "docs/voice-rooms.md",
     "docs/voice-conditions-core.md",

@@ -21,12 +21,9 @@ use std::{collections::HashMap, sync::Mutex, time::Instant};
 
 use sqlx::PgPool;
 use time::OffsetDateTime;
-use twilight_model::application::interaction::{
-    application_command::{CommandDataOption, CommandOptionValue},
-    Interaction, InteractionData,
-};
+use twilight_model::application::interaction::{Interaction, InteractionData};
 use two_bot_core::{
-    giveaway::{self, MemberStanding, NewGiveawayInput},
+    giveaway::{self, MemberStanding},
     giveaway_store::{
         self as store, EntryAdmission, GiveawayDrawRow, GiveawayEntryRow, GiveawayRow, NewDraw,
         NewGiveaway,
@@ -34,6 +31,14 @@ use two_bot_core::{
 };
 
 use crate::{ActionExecutor, DiscordError};
+
+#[path = "giveaway_list.rs"]
+mod list;
+#[cfg(test)]
+#[path = "giveaway_list_tests.rs"]
+mod list_tests;
+mod options;
+use options::{valid_id, Create, Management};
 
 const FAILURE: &str = "Giveaway unavailable; try again later.";
 const INVALID: &str = "Invalid giveaway options. Use a prize up to 200 characters, 1–43200 minutes and 1–100 winners.";
@@ -146,50 +151,22 @@ impl GiveawayRuntime {
         let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
             return Ok(INVALID.into());
         };
-        let [sub] = data.options.as_slice() else {
-            return Ok(INVALID.into());
+        // One strict decode before any store read, budget, audit, draw or
+        // Discord work; a refusal is a private reply with no other effect.
+        let command = match options::decode(&data.options) {
+            Ok(command) => command,
+            Err(refusal) => return Ok(refusal.text()),
         };
-        let CommandOptionValue::SubCommand(options) = &sub.value else {
-            return Ok(INVALID.into());
-        };
-        match sub.name.as_str() {
-            "create" => self.create(interaction, &guild, options).await,
-            "inspect" => {
-                let [option] = options.as_slice() else {
-                    return Ok(INVALID.into());
-                };
-                let ("id", CommandOptionValue::String(id)) = (option.name.as_str(), &option.value)
-                else {
-                    return Ok(INVALID.into());
-                };
-                if !valid_id(id) {
-                    return Ok(INVALID.into());
-                }
-                self.inspect(interaction, &guild, id).await
-            }
-            "list" => {
+        match command {
+            Management::Create(create) => self.create(interaction, &guild, &create).await,
+            Management::Inspect { id } => self.inspect(interaction, &guild, &id).await,
+            Management::List => {
                 let rows = store::list_active(&self.pool, &guild).await?;
-                if rows.is_empty() {
-                    return Ok("No open giveaways.".into());
-                }
-                let mut text = String::from("Open giveaways:\n");
-                // A bounded preview keeps 10 maximum-length prizes below Discord's ceiling.
-                for row in rows {
-                    let prize: String = row.prize.chars().take(32).collect();
-                    let line = format!("`{}` — {} ({})\n", row.id, prize, row.status);
-                    if text.len() + line.len() > 1800 {
-                        break;
-                    }
-                    text.push_str(&line);
-                }
-                Ok(text)
+                Ok(list::render_active_list(&rows))
             }
-            "cancel" => {
-                let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
-                    return Ok(INVALID.into());
-                };
+            Management::Cancel { id } => {
                 let Some(row) =
-                    store::cancel_audited(&self.pool, &guild, id, &actor_id(interaction)).await?
+                    store::cancel_audited(&self.pool, &guild, &id, &actor_id(interaction)).await?
                 else {
                     return Ok("Giveaway is unknown or already closed.".into());
                 };
@@ -198,20 +175,12 @@ impl GiveawayRuntime {
                 }
                 Ok("Giveaway cancelled.".into())
             }
-            "end" => {
-                let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
-                    return Ok(INVALID.into());
-                };
-                self.end(&guild, id, &actor_id(interaction)).await
-            }
-            "pause" => {
-                let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
-                    return Ok(INVALID.into());
-                };
+            Management::End { id } => self.end(&guild, &id, &actor_id(interaction)).await,
+            Management::Pause { id } => {
                 if !store::pause_audited(
                     &self.pool,
                     &guild,
-                    id,
+                    &id,
                     Some(&actor_id(interaction)),
                     OffsetDateTime::now_utc(),
                 )
@@ -219,21 +188,18 @@ impl GiveawayRuntime {
                 {
                     return Ok("Giveaway is unknown, already closed, or mid-draw.".into());
                 }
-                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, id).await {
+                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, &id).await {
                     if self.update(&row).await.is_err() {
                         return Ok("Giveaway paused; its message could not be refreshed.".into());
                     }
                 }
                 Ok("Giveaway paused.".into())
             }
-            "resume" => {
-                let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
-                    return Ok(INVALID.into());
-                };
+            Management::Resume { id } => {
                 if store::resume_audited(
                     &self.pool,
                     &guild,
-                    id,
+                    &id,
                     Some(&actor_id(interaction)),
                     OffsetDateTime::now_utc(),
                 )
@@ -242,30 +208,18 @@ impl GiveawayRuntime {
                 {
                     return Ok("Giveaway is unknown or not paused.".into());
                 }
-                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, id).await {
+                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, &id).await {
                     if self.update(&row).await.is_err() {
                         return Ok("Giveaway resumed; its message could not be refreshed.".into());
                     }
                 }
                 Ok("Giveaway resumed.".into())
             }
-            "extend" => {
-                let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
-                    return Ok(INVALID.into());
-                };
-                let Some(minutes) = minutes_option(options) else {
-                    return Ok(INVALID.into());
-                };
-                let Some(seconds) = minutes.checked_mul(60) else {
-                    return Ok(INVALID.into());
-                };
-                if giveaway::extend_deadline_ms(0, seconds).is_err() {
-                    return Ok(INVALID.into());
-                }
+            Management::Extend { id, seconds } => {
                 if store::extend_audited(
                     &self.pool,
                     &guild,
-                    id,
+                    &id,
                     seconds,
                     Some(&actor_id(interaction)),
                     OffsetDateTime::now_utc(),
@@ -275,31 +229,17 @@ impl GiveawayRuntime {
                 {
                     return Ok("Giveaway is unknown or already closed.".into());
                 }
-                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, id).await {
+                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, &id).await {
                     if self.update(&row).await.is_err() {
                         return Ok("Giveaway extended; its message could not be refreshed.".into());
                     }
                 }
                 Ok("Giveaway extended.".into())
             }
-            "reroll" => {
-                let Some(id) = string_option(options, "id").filter(|id| valid_id(id)) else {
-                    return Ok(INVALID.into());
-                };
-                let mut target = None;
-                for option in options {
-                    match (&*option.name, &option.value) {
-                        ("id", CommandOptionValue::String(_)) => {}
-                        ("user", CommandOptionValue::User(id)) => {
-                            target = Some(id.get().to_string());
-                        }
-                        _ => return Ok(INVALID.into()),
-                    }
-                }
-                self.reroll(&guild, id, target, &actor_id(interaction))
+            Management::Reroll { id, target } => {
+                self.reroll(&guild, &id, target, &actor_id(interaction))
                     .await
             }
-            _ => Ok(INVALID.into()),
         }
     }
 
@@ -329,49 +269,8 @@ impl GiveawayRuntime {
         &self,
         interaction: &Interaction,
         guild: &str,
-        options: &[CommandDataOption],
+        create: &Create,
     ) -> Result<String, sqlx::Error> {
-        let Some(prize) = string_option(options, "prize") else {
-            return Ok(INVALID.into());
-        };
-        let Some(seconds) = minutes_option(options).and_then(|n| n.checked_mul(60)) else {
-            return Ok(INVALID.into());
-        };
-        let Some(winners) = integer_option(options, "winners") else {
-            return Ok(INVALID.into());
-        };
-        let Ok(validated) = giveaway::validate_new_giveaway(&NewGiveawayInput {
-            prize: prize.to_owned(),
-            winners_count: winners,
-            duration_seconds: seconds,
-        }) else {
-            return Ok(INVALID.into());
-        };
-        let mut roles = Vec::new();
-        let mut account_days = 0;
-        let mut server_days = 0;
-        for option in options {
-            match (option.name.as_str(), &option.value) {
-                ("prize", CommandOptionValue::String(_))
-                | ("duration" | "winners" | "duration-minutes", CommandOptionValue::Integer(_)) => {
-                }
-                ("required-role", CommandOptionValue::Role(id)) => roles.push(id.get().to_string()),
-                ("min-account-age-days", CommandOptionValue::Integer(n))
-                    if (0..=3650).contains(n) =>
-                {
-                    account_days = *n
-                }
-                ("min-server-age-days", CommandOptionValue::Integer(n))
-                    if (0..=3650).contains(n) =>
-                {
-                    server_days = *n
-                }
-                // Accepted for forward compatibility: creation always posts in
-                // the invocation channel, so a channel argument never steers.
-                ("channel", CommandOptionValue::Channel(_)) => {}
-                _ => return Ok(INVALID.into()),
-            }
-        }
         let Some(channel) = super::channel_moderation::invoking_channel_id(interaction) else {
             return Ok(INVALID.into());
         };
@@ -386,13 +285,13 @@ impl GiveawayRuntime {
         let input = NewGiveaway {
             guild_id: guild.into(),
             id: id.clone(),
-            prize: validated.prize,
+            prize: create.prize.clone(),
             channel_id: channel,
             message_id: "pending".into(),
             created_by: actor,
-            winners_count: validated.winners_count as i32,
-            ends_at: now + time::Duration::seconds(validated.duration_seconds),
-            requirements_json: serde_json::json!({"roles": roles, "min_account_age_days": account_days, "min_guild_age_days": server_days}),
+            winners_count: create.winners as i32,
+            ends_at: now + time::Duration::seconds(create.seconds),
+            requirements_json: serde_json::json!({"roles": create.roles, "min_account_age_days": create.account_days, "min_guild_age_days": create.server_days}),
             max_entries: store::MAX_GIVEAWAY_ENTRIES,
             draw_nonce: giveaway::mint_draw_nonce(),
             created_at: now,
@@ -1186,38 +1085,6 @@ fn actor_id(interaction: &Interaction) -> String {
         .or(interaction.user.as_ref())
         .map(|user| user.id.get().to_string())
         .unwrap_or_default()
-}
-
-fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-fn string_option<'a>(options: &'a [CommandDataOption], name: &str) -> Option<&'a str> {
-    options
-        .iter()
-        .find_map(|option| match (&*option.name, &option.value) {
-            (key, CommandOptionValue::String(value)) if key == name => Some(value.as_str()),
-            _ => None,
-        })
-}
-
-fn integer_option(options: &[CommandDataOption], name: &str) -> Option<i64> {
-    options
-        .iter()
-        .find_map(|option| match (&*option.name, &option.value) {
-            (key, CommandOptionValue::Integer(value)) if key == name => Some(*value),
-            _ => None,
-        })
-}
-
-/// Duration in minutes under either accepted name: `duration-minutes` (the
-/// timed-draw contract) or `duration` (the create/entry registry pin).
-fn minutes_option(options: &[CommandDataOption]) -> Option<i64> {
-    integer_option(options, "duration-minutes").or_else(|| integer_option(options, "duration"))
 }
 
 /// Winners announcement, chunked so every post stays under the packing

@@ -16,6 +16,8 @@ pub mod channel_access;
 pub mod channel_moderation;
 pub mod command_identity;
 pub mod command_registry;
+#[cfg(any(test, feature = "db"))]
+mod custom_command_prefix_render;
 #[cfg(feature = "db")]
 pub mod custom_commands;
 #[cfg(test)]
@@ -62,6 +64,7 @@ mod test_clock;
 #[path = "../tests/common/mod.rs"]
 pub mod test_wire;
 pub mod voice_rooms;
+pub mod voice_rooms_board;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{

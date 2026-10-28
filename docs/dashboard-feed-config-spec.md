@@ -19,7 +19,7 @@ cadence edits read-only until typed validation is shared with its real reader.
 Relay editing needs missing signed verbs and concurrency rules, not a direct
 website database writer. This is not an approval to build those prerequisites.
 
-Source inventory is pinned to `92d85042527b756062bfc9e19c8d77aed0cee0b3`, not a
+Source inventory is pinned to `89c4fba7e0fe502d4ec9ec71c43c21253695f407`, not a
 claim about a deployed image. Existing runtime readers are source witnesses,
 not an acknowledgement that any particular stored revision was consumed.
 
@@ -27,27 +27,27 @@ not an acknowledgement that any particular stored revision was consumed.
 
 | Stable ID / field | Writer → actual reader | State and limitation |
 | --- | --- | --- |
-| `FC-K1` / `TWO_FEED_POLL_SECONDS` | Environment or settings store → `live_poll_seconds_with` (`crates/bot/src/feed_jobs.rs:206-236`), supervisor cadence and per-tick schedule (`:276-327`). Both catalogue Hot and HOT_WIRED (`crates/core/src/settings.rs:267`, `:299`). | Conditionally live, boot default 300 s, reader accepts 60..86400. Missing/deleted, wrong-type, unparsable or out-of-range snapshot value falls back to **boot**, not last-good. Invalid boot interval refuses job construction even if stored interval is valid (`feed_jobs.rs:294-299`). Generic write validation has no cadence-specific bound (`settings.rs:1061-1140`): keep edit/reset read-only; validation-first. |
-| `FC-K2` / `TWO_ANNOUNCEMENTS` | Environment or settings store → `live_announcements_with` and pre-pass gate (`feed_jobs.rs:239-266`, `:402-418`). Hot/HOT_WIRED (`settings.rs:191`, `:310`); store gate validation (`:1035-1042`, `:1088-1094`). | Conditionally live for an **existing** boot-enabled, identity-permitted poller: rendering `1` runs, `0` parks; unset falls back to boot. Not an immediate cancellation: a pass already running can finish. Parking skips pending-delivery recovery too. |
-| `FC-S1` / job existence and slash surface | Boot `FeatureGates` plus activation constrain registration (`feed_jobs.rs:329-395`); command publication uses boot map (`crates/bot/src/commands_cli.rs:110-130`); routing uses boot gates (`crates/bot/src/command_runtime.rs:419-470`, `:2468-2483`). | **Restart/boot-only** prerequisites. Boot-off cannot become a job through stored `1`. Changing slash surface requires a permitted boot configuration and publication; stored gate is **unwired for slash dispatch at this head**. Restart alone does not turn stored data into environment. |
-| `FC-R1` / `id,guild_id,channel_id,kind,source` | `/feed-add` planner sets context guild/channel and normalized source (`crates/core/src/feeds.rs:129-185`); create-or-identify store (`crates/core/src/feeds_store.rs:26-95`). Poller uses guild-scoped enabled rows and source/kind/destination. | Runtime-read relay definition; no in-place edit. Add validates but never fetches. Destination is invoking channel. An exact guild/channel/kind/source duplicate is reported as the existing saved relay (typed `Existing`, no update, no audit), never a second row or a changed source; 25 definitions/guild including paused rows. No dashboard verb. |
-| `FC-R2` / `enabled` | Add initializes true (`crates/cutover/migrations/0180_feeds.sql:8`; `feeds.rs:148`); slash pause/resume update it (`feeds_store.rs:279-396`). List/claim/recovery readers honor it (`:88-119`, `:451-550`); each poll rechecks it (`feed_jobs.rs:431-450`). | Runtime reader and **slash lifecycle writer exist**; dashboard transport is absent. Paused rows remain inspectable. Pause preserves history and refuses an enabled relay with pending evidence; resume permits recovery. Removal is not pause: it refuses pending evidence, otherwise cascades settled history (`feeds_store.rs:122-190`). |
-| `FC-R3` / `last_checked_at` | Poller `mark_checked` after processing, including fetch failure (`feed_jobs.rs:431-503`); inspect/list render qualified last attempt (`feeds.rs:354-361`, `:593-620`). | Read-only attempt metadata, not success/health or a consumed-config revision. Cancellation can leave it unchanged. |
-| `FC-R4` / `created_by,created_at,updated_at` | Add supplies actor/time (`feeds.rs:150-152`); ordering uses created_at/id (`feeds_store.rs:52-119`). Successful pause/resume transitions also set updated_at (`:339-393`); `mark_checked` changes only last_checked_at (`:594-602`). | Stored metadata, not settings or a concurrency token. Already-state lifecycle calls leave timestamps unchanged. No dashboard editor exists. Do not call updated_at the last poll time or a monotonic revision. |
+| `FC-K1` / `TWO_FEED_POLL_SECONDS` | Environment or settings store → `live_poll_seconds_with` (`crates/bot/src/feed_jobs.rs:206-236`), supervisor cadence and per-tick schedule (`:276-327`). Both catalogue Hot and HOT_WIRED (`crates/core/src/settings.rs:267`, `:299`). | Conditionally live, boot default 300 s, reader accepts 60..86400. Missing/deleted, wrong-type, unparsable or out-of-range snapshot value falls back to **boot**, not last-good. Invalid boot interval refuses job construction even if stored interval is valid (`feed_jobs.rs:294-299`). Generic write validation has no cadence-specific bound (`settings.rs:1066-1166`): keep edit/reset read-only; validation-first. |
+| `FC-K2` / `TWO_ANNOUNCEMENTS` | Environment or settings store → `live_announcements_with` and pre-pass gate (`feed_jobs.rs:239-266`, `:402-418`). Hot/HOT_WIRED (`settings.rs:191`, `:310`); store gate validation (`:1040-1047`, `:1114-1120`). | Conditionally live for an **existing** boot-enabled, identity-permitted poller: rendering `1` runs, `0` parks; unset falls back to boot. Not an immediate cancellation: a pass already running can finish. Parking skips pending-delivery recovery too. |
+| `FC-S1` / job existence and slash surface | Boot `FeatureGates` plus activation constrain registration (`feed_jobs.rs:329-395`); command publication uses boot map (`crates/bot/src/commands_cli.rs:110-130`); routing uses boot gates (`crates/bot/src/command_runtime.rs:424-475`, `:2566-2581`). | **Restart/boot-only** prerequisites. Boot-off cannot become a job through stored `1`. Changing slash surface requires a permitted boot configuration and publication; stored gate is **unwired for slash dispatch at this head**. Restart alone does not turn stored data into environment. |
+| `FC-R1` / `id,guild_id,channel_id,kind,source` | `/feed-add` planner sets context guild/channel and normalized source (`crates/core/src/feeds.rs:130-186`); create-or-identify store (`crates/core/src/feeds_store.rs:26-95`). Poller uses guild-scoped enabled rows and source/kind/destination. | Runtime-read relay definition; no in-place edit. Add validates but never fetches. Destination is invoking channel. An exact guild/channel/kind/source duplicate is reported as the existing saved relay (typed `Existing`, no update, no audit), never a second row or a changed source; 25 definitions/guild including paused rows. No dashboard verb. |
+| `FC-R2` / `enabled` | Add initializes true (`crates/cutover/migrations/0180_feeds.sql:8`; `feeds.rs:149`); slash pause/resume update it (`feeds_store.rs:279-396`). List/claim/recovery readers honor it (`:88-119`, `:451-550`); each poll rechecks it (`feed_jobs.rs:431-450`). | Runtime reader and **slash lifecycle writer exist**; dashboard transport is absent. Paused rows remain inspectable. Pause preserves history and refuses an enabled relay with pending evidence; resume permits recovery. Removal is not pause: it refuses pending evidence, otherwise cascades settled history (`feeds_store.rs:122-190`). |
+| `FC-R3` / `last_checked_at` | Poller `mark_checked` after processing, including fetch failure (`feed_jobs.rs:431-503`); inspect/list render qualified last attempt (`feeds.rs:355-362`, `:594-621`). | Read-only attempt metadata, not success/health or a consumed-config revision. Cancellation can leave it unchanged. |
+| `FC-R4` / `created_by,created_at,updated_at` | Add supplies actor/time (`feeds.rs:151-153`); ordering uses created_at/id (`feeds_store.rs:52-119`). Successful pause/resume transitions also set updated_at (`:339-393`); `mark_checked` changes only last_checked_at (`:594-602`). | Stored metadata, not settings or a concurrency token. Already-state lifecycle calls leave timestamps unchanged. No dashboard editor exists. Do not call updated_at the last poll time or a monotonic revision. |
 
 Schema: `feed_relays` has exactly these ten fields
 (`crates/cutover/migrations/0180_feeds.sql:2-14`); `feed_deliveries` is a separate
 runtime claim/history ledger, never page-editable. There is **no per-relay
 interval**, template, source-sampling setting or feed runtime dry-run key.
 Kinds are RSS, YouTube and Twitch feed URLs; YouTube channel IDs normalize to
-a feed URL (`feeds.rs:201-216`), not a new provider/Helix integration.
+a feed URL (`feeds.rs:202-217`), not a new provider/Helix integration.
 
 **Other classifications:** no separate feed-specific Cold catalogue row exists;
 restart-only above describes construction/publication, not a made-up Cold key.
 No whole feed key is stored-unwired: the **slash consumer** of the shared
 announcements key is. Deployment identity (`DISCORD_GUILD_ID`,
 `DISCORD_STAGING_GUILD_ID`) and `TWO_INTERNAL_*` are EnvOnly and refused by
-both get/set (`settings.rs:105-106`, `:1071-1080`). EventSub ingress/delivery,
+both get/set (`settings.rs:105-106`, `:1076-1085`). EventSub ingress/delivery,
 announcement destination and Twitch credentials/callbacks stay EnvOnly
 (`settings.rs:149-164`), outside this feed editor. SSRF policy is code-owned,
 not a configurable network allowlist. The recognized live identity is cleared
@@ -66,8 +66,8 @@ boot/identity refusal and an in-flight pass invalidate a wall-clock assertion.
 
 **Read-only precedent and safety:** `/feed-inspect` makes a bounded guild read,
 not a source fetch, audit, schedule edit, claim renewal or repair
-(`command_runtime.rs:2420-2454`). All six feed commands require ManageGuild
-and the existing guild/announcements gate (`feeds.rs:129-185`). Preserve HTTPS
+(`command_runtime.rs:2512-2552`). All six feed commands require ManageGuild
+and the existing guild/announcements gate (`feeds.rs:130-186`). Preserve HTTPS
 443/no credentials, 2048-byte source bound, all-public DNS answers and repinned
 same-host redirects (maximum 3), no proxy/second-resolution bypass
 (`crates/core/src/feeds_http.rs:8-11`, `:58-190`;
@@ -83,7 +83,7 @@ removal and fresh-admission fence is transaction-scoped: READ COMMITTED,
 This is state-idempotence, not request/audit idempotence or CAS: no lifecycle
 expected-version/durable intent key exists. Opposing commands serialize without
 detecting stale intent. Post-operation audit is separate and best effort, even
-for no-op/refused outcomes (`command_runtime.rs:2273-2381`, `:2486-2516`).
+for no-op/refused outcomes (`command_runtime.rs:2362-2470`, `:2584-2614`).
 
 A poll recheck skips a false/missing relay at that check (`feed_jobs.rs:431-450`),
 not a pass-wide cancellation: work already past it can still fetch or write
@@ -216,7 +216,7 @@ an existing reader rejects or a boot-only prerequisite.
 ```json
 {
   "schema":"dashboard.feed_config.v1",
-  "source_sha":"1a87869f898cbe4e3c9171a4fcf9885119202ade",
+  "source_sha":"89c4fba7e0fe502d4ec9ec71c43c21253695f407",
   "decision":"wiring_first_or_no_build",
   "relay_identity":["guild_id","id"],
   "keys":[
@@ -245,7 +245,7 @@ an existing reader rejects or a boot-only prerequisite.
     "E-GATE":{"path":"crates/bot/src/feed_jobs.rs","line":250,"contains":"fn live_announcements_with"},
     "E-TICK":{"path":"crates/bot/src/feed_jobs.rs","line":412,"contains":"if !gate()"},
     "E-BOOT":{"path":"crates/bot/src/feed_jobs.rs","line":386,"contains":"if !gates.announcements"},
-    "E-SLASH":{"path":"crates/bot/src/command_runtime.rs","line":2474,"contains":"self.interactions.router.gates().announcements"},
+    "E-SLASH":{"path":"crates/bot/src/command_runtime.rs","line":2572,"contains":"self.interactions.router.gates().announcements"},
     "E-RELAY-READ":{"path":"crates/core/src/feeds_store.rs","line":98,"contains":"WHERE guild_id = $1 AND (NOT $2 OR enabled)"},
     "E-FETCH":{"path":"crates/bot/src/feed_jobs.rs","line":469,"contains":"fetch.fetch(feed.clone())"},
     "E-ADD":{"path":"crates/core/src/feeds_store.rs","line":38,"contains":"pub async fn add_feed"},
@@ -253,13 +253,13 @@ an existing reader rejects or a boot-only prerequisite.
     "E-RESUME":{"path":"crates/core/src/feeds_store.rs","line":358,"contains":"pub async fn resume_feed"},
     "E-LIFECYCLE-LOCK":{"path":"crates/core/src/feeds_store.rs","line":417,"contains":"async fn lock_feed_delivery"},
     "E-POLL-LIFECYCLE":{"path":"crates/bot/src/feed_jobs.rs","line":448,"contains":"if live != Some(true)"},
-    "E-LIFECYCLE-AUDIT":{"path":"crates/bot/src/command_runtime.rs","line":2490,"contains":"async fn feed_audit"},
+    "E-LIFECYCLE-AUDIT":{"path":"crates/bot/src/command_runtime.rs","line":2588,"contains":"async fn feed_audit"},
     "E-SCHEMA":{"path":"crates/cutover/migrations/0180_feeds.sql","line":2,"contains":"CREATE TABLE IF NOT EXISTS feed_relays"},
-    "E-COMMANDS":{"path":"crates/core/src/feeds.rs","line":88,"contains":"pub enum FeedCommand"},
+    "E-COMMANDS":{"path":"crates/core/src/feeds.rs","line":89,"contains":"pub enum FeedCommand"},
     "E-MARK":{"path":"crates/bot/src/feed_jobs.rs","line":499,"contains":"store::mark_checked"},
-    "E-INSPECT":{"path":"crates/bot/src/command_runtime.rs","line":2425,"contains":"async fn feed_inspect"},
+    "E-INSPECT":{"path":"crates/bot/src/command_runtime.rs","line":2519,"contains":"async fn feed_inspect"},
     "E-ENV":{"path":"crates/core/src/settings.rs","line":105,"contains":"SettingClass::EnvOnly"},
-    "E-PREFIX":{"path":"crates/core/src/settings.rs","line":1071,"contains":"ENV_ONLY_KEY_PREFIXES"},
+    "E-PREFIX":{"path":"crates/core/src/settings.rs","line":1076,"contains":"ENV_ONLY_KEY_PREFIXES"},
     "E-EVENTSUB":{"path":"crates/core/src/settings.rs","line":149,"contains":"SettingClass::EnvOnly"},
     "E-VERBS":{"path":"crates/core/src/internal_actions.rs","line":674,"contains":"pub const IMPLEMENTED_ACTIONS"},
     "E-ACTIVATION":{"path":"crates/core/src/activation.rs","line":52,"contains":"&[LiveCapability::SelfRoles]"}
