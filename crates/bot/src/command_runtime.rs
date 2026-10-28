@@ -70,18 +70,20 @@ use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
+    custom_command_store,
     feeds::{
-        feed_already_paused_text, feed_already_resumed_text, feed_list_page,
+        feed_already_paused_text, feed_already_resumed_text, feed_existing_text, feed_list_page,
         feed_list_page_invalid_text, feed_list_page_underflow_text, feed_paused_text,
         feed_pending_evidence_refusal_text, feed_removed_text, feed_resumed_text, plan_command,
         FeedCommand, FeedCommandContext, FeedCommandPlan, FeedKind, FeedPendingEvidenceOperation,
     },
     feeds_store::{
         add_feed, list_feeds, pause_feed_with_evidence, remove_feed_with_evidence, resume_feed,
-        write_audit, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence, FeedResumeOutcome,
+        write_audit, FeedAddOutcome, FeedAudit, FeedPauseEvidence, FeedRemovalEvidence,
+        FeedResumeOutcome,
     },
     funnel::now_millis_for_test,
-    help::{canonical_help_selector, unknown_help_correction},
+    help::{canonical_help_selector, unknown_help_branch_correction, unknown_help_correction},
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
@@ -294,6 +296,9 @@ pub struct CommandRuntime {
     automations: bool,
     /// Serialize publication and remember a successful sync for this process.
     /// Repeated RESUMED events need no work; READY still replaces the full set.
+    /// A durable pending marker overrides the RESUMED no-op so a reconnect
+    /// heals a failed publication; the governed path republishes on reconnect
+    /// only through [`Self::publish_registry_if_resync_pending`].
     registry_synced: tokio::sync::Mutex<bool>,
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
@@ -341,6 +346,7 @@ impl CommandRuntime {
         // Registration documents the ownership the router outcome names; the
         // shared router routes member verbs by name table regardless.
         if member.is_some() {
+            router.register(Box::new(SliceHandler(HandlerId::TempbanList)));
             for action in [
                 ModerationAction::Ban,
                 ModerationAction::TempBan,
@@ -697,10 +703,27 @@ impl CommandRuntime {
                     );
                 }
                 self.dispatch_ticket_connection(event);
+                // A reconnect still heals a failed publication: republish the
+                // full set when a durable pending marker says the picker is
+                // stale. Without a marker this spawns no REST work, so the
+                // boot sync stays the single writer.
+                let runtime = Arc::clone(self);
+                let application_id = ready.application.id.get();
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime
+                        .publish_registry_if_resync_pending(Some(application_id))
+                        .await;
+                });
                 return;
             }
             Event::Resumed => {
                 self.dispatch_ticket_connection(event);
+                // Same reconnect-time healing as READY: the marker read keeps
+                // this publication-free unless a publication actually failed.
+                let runtime = Arc::clone(self);
+                self.spawn(LANE_REGISTRY, async move {
+                    runtime.publish_registry_if_resync_pending(None).await;
+                });
                 return;
             }
             Event::InteractionCreate(interaction)
@@ -1235,12 +1258,33 @@ impl CommandRuntime {
         }
     }
 
+    /// Reconnect-triggered resync for the governed path: republish the full
+    /// set only when a durable pending marker says a previous publication
+    /// failed. Without a marker this is one SELECT and no REST work, so the
+    /// boot sync stays the single writer.
+    async fn publish_registry_if_resync_pending(&self, application_id: Option<u64>) {
+        if !self.registry_resync_pending().await {
+            return;
+        }
+        self.publish_registry(application_id).await;
+    }
+
+    /// Best-effort pending-marker read. An unreadable marker counts as no
+    /// pending work: a store outage keeps reconnects publication-free, and a
+    /// later management publish or the boot resync still heals.
+    async fn registry_resync_pending(&self) -> bool {
+        custom_command_store::is_registry_resync_pending(&self.pool, &self.guild_id.to_string())
+            .await
+            .unwrap_or(false)
+    }
+
     /// Publish the ONE complete merged registry (legacy `CommandRegistry::sync`
     /// on `ready`). `publish_set` assembles every gated builtin plus DB custom
     /// rows. Unknown custom rows defer publication rather than deleting commands.
     /// `set_guild_commands` is a full replace, making duplicate READY idempotent.
     /// RESUMED supplies no application id: resolve it through the same executor
-    /// and synchronize once per process. Failed syncs remain eligible to retry
+    /// and synchronize once per process. A durable pending marker is the one
+    /// reconnect-time exception. Failed syncs remain eligible to retry
     /// on a later gateway connection event, never a polling timer.
     pub(crate) async fn publish_registry(&self, application_id: Option<u64>) {
         if self.publish_registry_checked(application_id).await.is_err() {
@@ -1251,13 +1295,21 @@ impl CommandRuntime {
     /// [`Self::publish_registry`] with the outcome returned. `Ok(())` covers a
     /// completed sync and a deferred one (custom-command rows unknown, nothing
     /// sent); `Err` means an attempted sync failed and a later READY/RESUMED retries it.
+    /// A durable pending marker overrides the already-synced RESUMED no-op so
+    /// a reconnect heals a failed publication.
     pub(crate) async fn publish_registry_checked(
         &self,
         application_id: Option<u64>,
     ) -> Result<(), RegistrySyncError> {
         let mut synced = self.registry_synced.lock().await;
         if application_id.is_none() && *synced {
-            return Ok(());
+            // A management publication failed after this flag was set, so the
+            // picker is stale and this reconnect republishes. An absent or
+            // unreadable marker keeps the no-op; a later management publish
+            // or the boot resync still heals.
+            if !self.registry_resync_pending().await {
+                return Ok(());
+            }
         }
         // Once bootstrapped, custom commands own the full-set publisher: it
         // loads persisted rows and serializes add/remove republication.
@@ -1503,14 +1555,33 @@ impl CommandRuntime {
             // An omitted selector keeps the grouped index; a selector reads
             // one confirmed definition, never an unconfirmed refresh.
             let response = match self.published_commands() {
-                Some(defs) => match help_command_selector(interaction) {
-                    None => help_response(&defs),
-                    Some(raw) => match canonical_help_selector(&raw).and_then(|name| {
-                        defs.iter().find(|def| def.name.eq_ignore_ascii_case(&name))
-                    }) {
-                        Some(def) => help_detail_response(def.help_detail_text()),
-                        None => help_detail_response(unknown_help_correction()),
-                    },
+                Some(defs) => match (
+                    help_command_selector(interaction),
+                    help_focus_selector(interaction),
+                ) {
+                    (None, HelpSubcommand::Absent) => help_response(&defs),
+                    // A focused path without a root is malformed, not an index.
+                    (None, _) => help_detail_response(unknown_help_branch_correction()),
+                    (Some(raw), focus) => {
+                        let def = canonical_help_selector(&raw).and_then(|name| {
+                            defs.iter().find(|def| def.name.eq_ignore_ascii_case(&name))
+                        });
+                        match (def, focus) {
+                            (Some(def), HelpSubcommand::Absent) => {
+                                help_detail_response(def.help_detail_text())
+                            }
+                            (Some(def), HelpSubcommand::Path(path)) => {
+                                def.help_branch_text(&path).map_or_else(
+                                    || help_detail_response(unknown_help_branch_correction()),
+                                    help_detail_response,
+                                )
+                            }
+                            (None, HelpSubcommand::Absent) => {
+                                help_detail_response(unknown_help_correction())
+                            }
+                            (_, _) => help_detail_response(unknown_help_branch_correction()),
+                        }
+                    }
                 },
                 None => ephemeral("The command list is still refreshing. Try /help again shortly."),
             };
@@ -1534,6 +1605,7 @@ impl CommandRuntime {
             "feed-inspect" => Some(HandlerId::FeedInspect),
             // Member verbs are owned only while the consumer exists; without
             // it they keep the immediate, non-deferred unavailable reply.
+            "tempban-list" if self.member.is_some() => Some(HandlerId::TempbanList),
             "ban" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Ban)),
             "tempban" if self.member.is_some() => {
                 Some(HandlerId::Moderation(ModerationAction::TempBan))
@@ -1543,6 +1615,9 @@ impl CommandRuntime {
                 Some(HandlerId::Moderation(ModerationAction::Timeout))
             }
             "warn" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Warn)),
+            // The staff ledger read shares the member consumer's presence:
+            // without it the immediate unavailable reply is kept.
+            "moderation-recent" if self.member.is_some() => Some(HandlerId::ModerationRecent),
             _ => None,
         };
         if owner != Some(handler) {
@@ -1659,6 +1734,12 @@ impl CommandRuntime {
                 )
                 .await;
             }
+            "tempban-list" => {
+                if let Some(member) = &self.member {
+                    let reply = member.inventory_reply(&self.executor, interaction).await;
+                    self.finish(interaction, reply).await;
+                }
+            }
             "ban" => {
                 self.member_command(interaction, ModerationAction::Ban)
                     .await;
@@ -1678,6 +1759,15 @@ impl CommandRuntime {
             "warn" => {
                 self.member_command(interaction, ModerationAction::Warn)
                     .await;
+            }
+            "moderation-recent" => {
+                crate::moderation_recent_command::handle_command(
+                    &self.pool,
+                    self.guild_id,
+                    &self.executor,
+                    interaction,
+                )
+                .await;
             }
             _ => {}
         }
@@ -2142,8 +2232,10 @@ impl CommandRuntime {
     /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
     /// audit → ephemeral confirmation. The relay id is generated here (legacy
     /// `randomUUID()`); plan errors reply with the domain text and write
-    /// neither a row nor an audit (legacy parity). A store failure audits one
-    /// `feed.create`/`rejected` refusal row, then replies safe. The relay
+    /// neither a row nor an audit (legacy parity). An exact saved tuple replies
+    /// with its original id/state, without a write or creation/rejection audit.
+    /// A store failure audits one `feed.create`/`rejected` refusal row, then
+    /// replies safe. The relay
     /// binds to the invoking channel. Malformed options refuse before any
     /// store read or audit via [`feed_add_options_strict`].
     async fn feed_add(&self, interaction: &Interaction) {
@@ -2173,24 +2265,28 @@ impl CommandRuntime {
             source,
         };
         match plan_command(&context, command) {
-            Ok(FeedCommandPlan::Add(relay)) => {
-                if let Err(err) = add_feed(&self.pool, &relay).await {
-                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
-                        self.finish(interaction, quota.to_string()).await;
-                    } else {
-                        let class = feed_store_class(&err);
-                        warn!(reason = class, "feed insert failed");
-                        self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
-                            .await;
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
-                    }
-                    return;
+            Ok(FeedCommandPlan::Add(relay)) => match add_feed(&self.pool, &relay).await {
+                Ok(FeedAddOutcome::Created) => {
+                    self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
+                        .await;
+                    self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
+                        .await;
                 }
-                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
-                    .await;
-                self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
-                    .await;
-            }
+                Ok(FeedAddOutcome::Existing { id, enabled }) => {
+                    self.finish(interaction, feed_existing_text(&id, enabled))
+                        .await;
+                }
+                Err(two_bot_core::feeds_store::FeedStoreError::Capacity(quota)) => {
+                    self.finish(interaction, quota.to_string()).await;
+                }
+                Err(err) => {
+                    let class = feed_store_class(&err);
+                    warn!(reason = class, "feed insert failed");
+                    self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
+                        .await;
+                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                }
+            },
             // `FeedCommand::Add` can only plan to `Add`; the other arms are
             // unreachable, not silently wrong.
             Ok(plan) => {
@@ -2394,8 +2490,9 @@ impl CommandRuntime {
     /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
     /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
     /// only) and writes no audit row. An omitted `page` means page 1; a
-    /// present-but-unusable option refuses without a store read, and
-    /// out-of-range refuses after the same bounded read every list uses.
+    /// duplicated, wrong-typed, unknown or nested option refuses without a
+    /// store read, and out-of-range refuses after the same bounded read
+    /// every list uses.
     async fn feed_list(&self, interaction: &Interaction) {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
@@ -2404,6 +2501,8 @@ impl CommandRuntime {
             Ok(FeedCommandPlan::List { guild_id }) => {
                 let reply = match feed_list_page_request(interaction) {
                     FeedListPage::Invalid => feed_list_page_invalid_text().to_owned(),
+                    FeedListPage::Duplicate => FEED_LIST_DUPLICATE_PAGE.to_owned(),
+                    FeedListPage::Unknown => FEED_LIST_UNKNOWN_OPTION.to_owned(),
                     FeedListPage::Default => self.list_feed_page(&guild_id, 1).await,
                     FeedListPage::Page(page) if page < 1 => {
                         feed_list_page_underflow_text().to_owned()
@@ -2424,12 +2523,18 @@ impl CommandRuntime {
     /// mutation, audit write, claim renewal or delivery reset on any path,
     /// including store failure (legacy list parity). Absent, invalid-id and
     /// store-failure replies stay distinct; the raw source never reaches logs.
+    /// Malformed `id` options refuse before any store read via
+    /// [`feed_inspect_options_strict`].
     async fn feed_inspect(&self, interaction: &Interaction) {
         // Inspect does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
+        if let Err(refusal) = feed_inspect_options_strict(interaction) {
+            self.finish(interaction, refusal).await;
+            return;
+        }
         let command = FeedCommand::Inspect {
             id: feed_id_option(interaction).unwrap_or_default(),
         };
@@ -2762,7 +2867,7 @@ pub(crate) fn new_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-/// Refusal literals for malformed `/feed-add` and `/feed-remove` options.
+/// Refusal literals for malformed feed command options.
 /// Each names the offending option and carries a copyable corrected
 /// invocation, echoes no user input (mention-safe), and stays far under
 /// Discord's 2,000-unit cap (bounded). Handlers reply with these before any
@@ -2783,6 +2888,12 @@ const FEED_PAUSE_MISSING_ID: &str = "Missing id. Use /feed-pause id:<relay-id>."
 const FEED_RESUME_INVALID_ID: &str = "Invalid id. Use /feed-resume id:<relay-id>.";
 const FEED_RESUME_DUPLICATE_ID: &str = "Duplicate id. Use /feed-resume id:<relay-id>.";
 const FEED_RESUME_MISSING_ID: &str = "Missing id. Use /feed-resume id:<relay-id>.";
+const FEED_INSPECT_INVALID_ID: &str = "Invalid id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_DUPLICATE_ID: &str = "Duplicate id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_MISSING_ID: &str = "Missing id. Use /feed-inspect id:<relay-id>.";
+const FEED_INSPECT_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-inspect id:<relay-id>.";
+const FEED_LIST_DUPLICATE_PAGE: &str = "Duplicate page. Use /feed-list page:<number>.";
+const FEED_LIST_UNKNOWN_OPTION: &str = "Unknown option. Use /feed-list page:<number>.";
 
 /// Strictly decode `/feed-add`'s options: `kind` and `source` must each
 /// appear exactly once with a string value. Duplicates win over wrong types
@@ -2879,9 +2990,38 @@ fn feed_id_option_strict(
     }
 }
 
-/// `/feed-inspect`'s `id` option; `None` plans against an empty id, which
-/// `validate_id` rejects with `InvalidId` and inspect's distinct recovery
-/// copy (`/feed-remove` decodes strictly via [`feed_remove_option_strict`]).
+/// Guard the complete `/feed-inspect` option namespace before extracting
+/// `id` with [`feed_id_option`]: exactly one string `id` and no other
+/// options. An unknown name (including a nested group) wins over a
+/// duplicated `id`, which wins over a wrong wire type, which wins over a
+/// missing `id` — the same namespace-first layering as
+/// [`sticky_preview_option`], with the `id` checks themselves delegated to
+/// [`feed_id_option_strict`]. Unlike the writer decoders, unknown names
+/// refuse here, so a malformed read never silently inspects an arbitrarily
+/// chosen relay. A non-command interaction refuses as a missing `id`.
+fn feed_inspect_options_strict(interaction: &Interaction) -> Result<(), &'static str> {
+    if let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(
+        data,
+    )) = &interaction.data
+    {
+        if data.options.iter().any(|option| option.name != "id") {
+            return Err(FEED_INSPECT_UNKNOWN_OPTION);
+        }
+    }
+    feed_id_option_strict(
+        interaction,
+        FEED_INSPECT_INVALID_ID,
+        FEED_INSPECT_DUPLICATE_ID,
+        FEED_INSPECT_MISSING_ID,
+    )
+    .map(|_| ())
+}
+
+/// `/feed-inspect`'s `id` option. The handler runs
+/// [`feed_inspect_options_strict`] first, so a missing, duplicated or
+/// wrong-typed `id` never reaches this extractor; a present-but-empty id
+/// still extracts as `Some("")`, which `validate_id` rejects with
+/// `InvalidId` and inspect's distinct recovery copy.
 pub(crate) fn feed_id_option(interaction: &Interaction) -> Option<String> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
@@ -2916,14 +3056,73 @@ pub(crate) fn help_command_selector(interaction: &Interaction) -> Option<String>
     }
 }
 
-/// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
-/// omitted option means page 1, while a present option with a non-integer
-/// wire value is unusable and must refuse rather than silently list page 1.
+/// The optional focused `/help subcommand:` path. A present option with a
+/// non-string wire value, or a duplicated option, is malformed and answers
+/// the branch correction rather than silently showing the root detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HelpSubcommand {
+    Absent,
+    Path(String),
+    Malformed,
+}
+
+/// The focused path as the runtime consumes it: a duplicated `command`
+/// selector makes a focused request malformed instead of letting the first
+/// duplicate pick the root. An unfocused request keeps its existing decode.
+pub(crate) fn help_focus_selector(interaction: &Interaction) -> HelpSubcommand {
+    let focus = help_subcommand_selector(interaction);
+    let duplicated = matches!(
+        &interaction.data,
+        Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data))
+            if data.options.iter().filter(|option| option.name == "command").count() > 1
+    );
+    if duplicated && focus != HelpSubcommand::Absent {
+        HelpSubcommand::Malformed
+    } else {
+        focus
+    }
+}
+
+pub(crate) fn help_subcommand_selector(interaction: &Interaction) -> HelpSubcommand {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return HelpSubcommand::Absent;
+    };
+    let mut selected = data
+        .options
+        .iter()
+        .filter(|option| option.name == "subcommand");
+    let (Some(option), None) = (selected.next(), selected.next()) else {
+        return if data
+            .options
+            .iter()
+            .any(|option| option.name == "subcommand")
+        {
+            HelpSubcommand::Malformed
+        } else {
+            HelpSubcommand::Absent
+        };
+    };
+    match &option.value {
+        CommandOptionValue::String(value) => HelpSubcommand::Path(value.clone()),
+        _ => HelpSubcommand::Malformed,
+    }
+}
+
+/// `/feed-list`'s optional 1-based `page` option, decoded over the complete
+/// option shape: an omitted option means page 1, while a duplicated,
+/// wrong-typed, unknown or nested option must refuse rather than silently
+/// list an arbitrarily chosen page. An unknown name wins over a duplicated
+/// `page`, which wins over a wrong wire type; range stays the reply
+/// composer's refusal, not the decoder's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeedListPage {
     Default,
     Page(i64),
     Invalid,
+    Duplicate,
+    Unknown,
 }
 
 pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage {
@@ -2932,12 +3131,24 @@ pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage 
     else {
         return FeedListPage::Default;
     };
-    let Some(page) = data.options.iter().find(|option| option.name == "page") else {
-        return FeedListPage::Default;
-    };
-    match &page.value {
-        CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
-        _ => FeedListPage::Invalid,
+    let mut pages: Vec<&CommandOptionValue> = Vec::new();
+    let mut unknown = false;
+    for option in &data.options {
+        match option.name.as_str() {
+            "page" => pages.push(&option.value),
+            _ => unknown = true,
+        }
+    }
+    if unknown {
+        return FeedListPage::Unknown;
+    }
+    if pages.len() > 1 {
+        return FeedListPage::Duplicate;
+    }
+    match pages.first() {
+        None => FeedListPage::Default,
+        Some(CommandOptionValue::Integer(value)) => FeedListPage::Page(*value),
+        Some(_) => FeedListPage::Invalid,
     }
 }
 
@@ -3037,6 +3248,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
     if gates.moderation {
         register_channel_handlers(&mut router);
+        // The staff ledger read executes in this runtime (member consumer
+        // present); registration documents the ownership the router names.
+        router.register(Box::new(SliceHandler(HandlerId::ModerationRecent)));
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));

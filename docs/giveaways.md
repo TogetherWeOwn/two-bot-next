@@ -1,4 +1,4 @@
-# Giveaway saved details and entry rules
+# Giveaway lists, saved details and entry rules
 
 Use `/giveaway list` to find active IDs, then `/giveaway inspect id:<saved-id>`
 in the giveaway's channel. `/help command:giveaway` lists the published
@@ -6,6 +6,54 @@ subcommands and their arguments. Administration requires Manage Server, the
 configured guild and the existing automations feature. Inspection does not add
 cross-channel visibility: an unknown ID, another guild's ID and a giveaway in
 another channel produce the same private miss.
+
+## Private active list
+
+`/giveaway list` shows the existing same-guild staff inventory, in saved deadline
+and ID order. Each complete row carries its stable ID, an inert prize preview,
+saved destination, and `open` with a localized saved deadline or `paused (no
+countdown)`. Paused rows do not show a ticking timestamp. This does not grant
+cross-channel inspection rights or perform Discord visibility or message reads.
+
+Only recorded, valid guild/channel/message IDs become message links. A saved
+channel without a recorded message says `message unconfirmed`; an unavailable
+destination says so and has no link. Links are historical saved references, not
+proof the post still exists or that delivery succeeded. Check the destination
+before recreating an unconfirmed giveaway.
+
+All ten active IDs fit one private reply of at most 2,000 UTF-16 units. Prize
+previews use at most 32 display characters, shortened further when needed;
+`…` explicitly marks shortening and `?` means the saved prize has no displayable
+text. Escaping and mention neutralization count toward the final budget. IDs,
+links and deadlines are never cut and rows are never silently dropped. Empty
+inventory says `No open giveaways.`; a failed read says unavailable, not empty.
+The list makes no entry, lifecycle, audit, budget, claim or scheduling changes.
+
+## Strict management options
+
+Every `/giveaway` subcommand is checked as a whole before the bot reads or
+changes anything. A payload that is ambiguous is refused with one private,
+mention-safe reply that names the option to repair; it never picks a winner
+among duplicates and never fills a default after bad input.
+
+- Exactly one subcommand per invocation: `create`, `list`, `inspect`, `cancel`,
+  `end`, `pause`, `resume`, `extend` or `reroll`.
+- Each option may appear once, with its registered type. Unknown options are
+  refused, including on `list`, which takes none.
+- `id` is required for every subcommand except `create` and `list`: 1–64
+  letters, digits, `_` or `-`.
+- `create` needs `prize` (1–200 characters), a duration and `winners`
+  (1–100). `required-role`, `min-account-age-days` and `min-server-age-days`
+  (0–3650) are optional. A `channel` value is still accepted for older
+  callers but never moves the post: giveaways open in the invoking channel.
+- The duration (1–43200 minutes) is `duration` on `create` and
+  `duration-minutes` on `extend`. Each command also accepts the other name for
+  compatibility, but only one of the two, once. Supplying both is refused.
+- `reroll` takes an optional `user`, at most once.
+
+The refusal never repeats what was submitted. A refusal does not take an entry
+budget, an audit row or any lifecycle step, and member entry buttons are
+unaffected.
 
 ## Private saved-state inspection
 
@@ -47,7 +95,10 @@ refresh runs; inspection itself never edits them.
 
 ## Verification
 
-The protected `giveaway_inspect_acceptance` integration target covers saved
+The protected `giveaway_options_acceptance` integration target covers every
+malformed management shape above against the real routed runtime with a
+connection-acquisition spy. The protected `giveaway_inspect_acceptance`
+integration target covers saved
 states, counts, same-channel privacy, malformed options, unavailable reads,
 shared static summaries, hostile Unicode and no-effect controls. Run against
 an authorized disposable database as described in [Contributing](../CONTRIBUTING.md#database-tests):

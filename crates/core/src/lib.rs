@@ -111,8 +111,12 @@ pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
+pub mod moderation_recent;
+#[cfg(feature = "db")]
+pub mod moderation_recent_store;
 pub mod music_voice;
 pub mod onboarding;
+pub mod onboarding_destination;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
 pub mod ops_fetch;
@@ -135,6 +139,7 @@ pub mod scheduled_events;
 #[cfg(feature = "db")]
 pub mod scheduled_store;
 pub mod secret;
+pub mod tempban_inventory;
 pub use secret::Secret;
 pub mod self_roles;
 pub mod send_admission;
@@ -411,10 +416,11 @@ pub use rsvp::{
     checkin_idempotency_key, checkin_metadata_json, checkin_occurrence_full_text,
     checkin_recorded_text, checkin_source, checkin_source_event_id, is_snowflake,
     normalize_event_link, parse_attendance_occurrence, partition_rsvps, require_manage_events,
-    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text, rsvp_saved_text_with_event,
-    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceOccurrence,
-    AttendanceProof, CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals,
-    RsvpTransition, ATTENDANCE_EVENT_TYPE, AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION,
+    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text, rsvp_saved_text_for_transition,
+    rsvp_saved_text_for_transition_with_event, rsvp_saved_text_with_event, validate_event_id,
+    validate_occurrence_id, AttendanceClassification, AttendanceOccurrence, AttendanceProof,
+    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
+    ATTENDANCE_EVENT_TYPE, AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION,
     CHECKIN_AUDIT_OUTCOME_RECORDED, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
     MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
 };

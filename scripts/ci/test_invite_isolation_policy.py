@@ -43,7 +43,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
     def test_unmodified_workflow_passes_invite_policy(self):
         for name in (
             "test_invite_saturation_isolation_in_both_lanes",
-            "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+            "test_coverage_shard_runs_with_db_and_includes_ignored_tests",
         ):
             with self.subTest(policy=name):
                 result = self.policy_result(name)
@@ -89,7 +89,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         with patch.object(Path, "read_text", read_text):
             for name in (
                 "test_invite_saturation_isolation_in_both_lanes",
-                "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                "test_coverage_shard_runs_with_db_and_includes_ignored_tests",
             ):
                 with self.subTest(policy=name, declaration=declaration):
                     case = policy.WorkflowTests(name)
@@ -192,6 +192,36 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         sweep["run"] = sweep["run"].replace("--skip uses_u64_max_saturates_at_i32_max", "")
         self.assert_isolation_rejected()
 
+    def test_coverage_lane_rejects_missing_fixture_skip(self):
+        steps = self.case.workflows["check.yml"]["jobs"]["coverage-shard"]["steps"]
+        sweep = next(step for step in steps if "--skip uses_u64_max_saturates_at_i32_max" in step.get("run", ""))
+        sweep["run"] = sweep["run"].replace("--skip uses_u64_max_saturates_at_i32_max", "")
+        self.assert_isolation_rejected(jobs=("coverage-shard",))
+        result = self.policy_result(
+            "test_coverage_shard_runs_with_db_and_includes_ignored_tests",
+        )
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn(
+            "saturation_skip='uses_u64_max_saturates_at_i32_max'",
+            result.failures[0][0].id(),
+        )
+
+    def test_coverage_lane_rejects_missing_replay(self):
+        steps = self.case.workflows["check.yml"]["jobs"]["coverage-shard"]["steps"]
+        replay = next(step for step in steps if "--test invite_uses_saturation_acceptance" in step.get("run", ""))
+        replay["run"] = "".join(
+            line for line in replay["run"].splitlines(keepends=True)
+            if "--test invite_uses_saturation_acceptance" not in line
+        )
+        self.assert_isolation_rejected(jobs=("coverage-shard",))
+        result = self.policy_result(
+            "test_coverage_shard_runs_with_db_and_includes_ignored_tests",
+        )
+        self.assertTrue(
+            result.failures,
+            "coverage shard policy accepted a missing invite replay",
+        )
+
     def test_new_fixture_cannot_hide_behind_attributes_or_trivia(self):
         source_path = policy.ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
         original = source_path.read_text(encoding="utf-8")
@@ -227,13 +257,13 @@ class InviteIsolationPolicyTests(unittest.TestCase):
                         with patch.object(Path, "read_text", read_text):
                             with self.subTest(policy="both lanes"):
                                 result = self.assert_isolation_rejected(
-                                    jobs=("rust-tests", "patch-coverage"),
+                                    jobs=("rust-tests", "coverage-shard"),
                                 )
                                 for case, _ in result.failures:
                                     self.assertIn("fixture='unskipped_future_fixture'", case.id())
-                            with self.subTest(policy="patch coverage"):
+                            with self.subTest(policy="coverage shard"):
                                 result = self.policy_result(
-                                    "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                                    "test_coverage_shard_runs_with_db_and_includes_ignored_tests",
                                 )
                                 self.assertEqual(len(result.failures), 1, result.failures)
                                 self.assertIn(
@@ -268,7 +298,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
                     with patch.object(Path, "read_text", read_text):
                         for name in (
                             "test_invite_saturation_isolation_in_both_lanes",
-                            "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                            "test_coverage_shard_runs_with_db_and_includes_ignored_tests",
                         ):
                             with self.subTest(policy=name):
                                 case = policy.WorkflowTests(name)
@@ -311,7 +341,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
             with patch.object(Path, "read_text", read_text):
                 for name in (
                     "test_invite_saturation_isolation_in_both_lanes",
-                    "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                    "test_coverage_shard_runs_with_db_and_includes_ignored_tests",
                 ):
                     with self.subTest(declaration=declaration, policy=name):
                         case = policy.WorkflowTests(name)

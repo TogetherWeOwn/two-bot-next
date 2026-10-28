@@ -9,19 +9,19 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 43 compiled built-ins plus the voice set
-  (64 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 46 compiled built-ins plus the voice set
+  (66 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
 Saved inventory: 7 core + 1 scorecard + 12 automations + 11 announcements +
-9 moderation + 3 private reads = **43 built-ins**. Machine-readable mirror:
+9 moderation + 5 private reads = **45 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
-The test extends this saved fixture in memory with `/lfg-edit`: **44 compiled
-built-ins**, five covered and 39 deferred. The saved JSON deliberately excludes
+The test extends this saved fixture in memory with `/lfg-edit`: **46 compiled
+built-ins**, five covered and 41 deferred. The saved JSON deliberately excludes
 edit; this extension is not a live-publication or smoke-acceptance claim.
 
 ## Covered: the smoke five (one per routing family)
@@ -45,7 +45,7 @@ are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
 per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
 type-4 reply on an isolated gate-safe router).
 
-## Deferred: 37 saved commands with reasons
+## Deferred: 39 saved commands with reasons
 
 Deferred means out of the read-only smoke, not untested: every row below
 is published by the same registry the unit test pins, and most share a
@@ -81,6 +81,7 @@ handler family with a covered command.
 | `/feed-list` | announcements | Needs seeded feed relays (DB); the no-DB rule excludes it. |
 | `/feed-inspect` | announcements | Needs a live feed id; sequenced after a feed-add, not standalone. |
 | `/tempban` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
+| `/tempban-list` | moderation | Read-only saved-expiry inventory needs seeded saved work; offline acceptance only, outside the unchanged live smoke five. |
 | `/kick` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/timeout` | moderation | Same handler family as `/ban` (covered); the live membership effect is excluded from the read-only smoke. |
 | `/warn` | moderation | Same handler family as `/ban` (covered); writes a live audit record, excluded from the read-only smoke. |
@@ -91,6 +92,7 @@ handler family with a covered command.
 | `/purge-preview` | moderation | Next-only private read with no legacy counterpart; the sampled preview is pinned by the offline preview/inspect acceptance tests rather than the live smoke five. |
 | `/channel-inspect` | moderation | Next-only private read with no legacy counterpart; the restriction snapshot is pinned by the offline preview/inspect acceptance tests rather than the live smoke five. |
 | `/lockdown-records` | moderation | Next-only private read with no legacy counterpart; the saved-recovery inventory is pinned by the offline inventory acceptance tests rather than the live smoke five. |
+| `/moderation-recent` | moderation | Next-only private staff read of saved ledger rows with no legacy counterpart; pinned by the offline recent-actions acceptance tests rather than the live smoke five. |
 
 ## How the live-guild pass uses this inventory
 

@@ -89,10 +89,11 @@ use PolicyHook::{
 /// `/command-disable` and `/command-enable` (parity rows 40 and 41),
 /// `/welcome-preview` admin preview (parity row 42), staff aggregate
 /// `/game-mix` (43), and feed lifecycle `/feed-pause` (44) and
-/// `/feed-resume` (45), plus the private moderation read
-/// `/lockdown-records` (parity row 46). Only `/game-mix` admits Administrator
+/// `/feed-resume` (45), saved expiry inspection `/tempban-list` (46),
+/// the staff-only ledger read `/moderation-recent` (47), and saved recovery
+/// inventory `/lockdown-records` (48). Only `/game-mix` admits Administrator
 /// alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 47] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 49] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -115,6 +116,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 47] = [
         PERM_BAN_MEMBERS,
         Some(MemberModeration),
     ),
+    row(46, "tempban-list", BuiltinSlash, PERM_BAN_MEMBERS, None),
     row(
         5,
         "kick",
@@ -155,7 +157,14 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 47] = [
         None,
     ),
     row(
-        46,
+        47,
+        "moderation-recent",
+        BuiltinSlash,
+        PERM_MODERATE_MEMBERS,
+        None,
+    ),
+    row(
+        48,
         "lockdown-records",
         BuiltinSlash,
         PERM_MANAGE_CHANNELS,
