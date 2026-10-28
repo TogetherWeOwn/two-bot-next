@@ -181,6 +181,15 @@ export function allowlistedHeaders(
     }
     headers.set(name, value);
   }
+  if (source.has("x-two-scope") || source.has("x-two-guild")) {
+    const scope = source.get("x-two-scope") ?? "";
+    const guild = source.get("x-two-guild") ?? "";
+    if (!/^(read|moderate|admin)$/.test(scope) || !/^\d{1,20}$/.test(guild)) {
+      return { refusal: envelope(401, "unauthorized", false, {}, requestId) };
+    }
+    headers.set("x-two-scope", scope);
+    headers.set("x-two-guild", guild);
+  }
   const [name, max] = IDEMPOTENCY_HEADER;
   const key = source.get(name);
   if (key !== null) {
@@ -565,6 +574,12 @@ export async function relayReceiverResponse(
     return refuse(503, "unavailable", true, undefined, requestId, release);
   }
   const headers = relayHeaders(upstream.headers);
+  // Only this exact registry challenge survives either relay. Never forward
+  // arbitrary upstream challenge text, or a challenge on a transport error.
+  if (!projected.ok && projected.error.code === "unauthorized"
+    && upstream.headers.get("www-authenticate") === "Bearer") {
+    headers.set("www-authenticate", "Bearer");
+  }
   return Response.json(projected, { status: upstream.status, headers });
 }
 

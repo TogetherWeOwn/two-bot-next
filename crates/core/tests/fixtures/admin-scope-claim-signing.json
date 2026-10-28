@@ -1,0 +1,48 @@
+{
+  "description": "Public, synthetic scope-claim signing vectors for the slice-1 canonical-string extension (approved admin API spec section 3.2). Test-only low-entropy secrets: never deploy these keys or register them as caller credentials. Generated with python3 hmac/hashlib, cross-checked with node:crypto. The canonical string carries NO idempotency-key line: Idempotency-Key stays outside the MAC (spec: unchanged).",
+  "canonical_layout": [
+    "two-internal-action/scope-claim/v1",
+    "POST",
+    "/internal/actions",
+    "{timestamp}",
+    "{nonce}",
+    "{sha256_hex(body)}",
+    "{scope}",
+    "{guild}"
+  ],
+  "vectors": [
+    {
+      "scope": "read",
+      "guild": "123456789012345678",
+      "body": "{\"action\":\"probe.no_such_verb_acceptance\"}",
+      "timestamp": "1720000000",
+      "nonce": "0123456789abcdef0123456789abcdef",
+      "secret": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "body_hash": "e3925abcec2e97b8c84e9673b79257162acac7b782bad9fcec110dd3e380a0bc",
+      "canonical": "two-internal-action/scope-claim/v1\nPOST\n/internal/actions\n1720000000\n0123456789abcdef0123456789abcdef\ne3925abcec2e97b8c84e9673b79257162acac7b782bad9fcec110dd3e380a0bc\nread\n123456789012345678",
+      "signature": "sha256=b1b3fa742c7e08fe14fab65974d7ccc1dd342a22805e87d2b2169ec52ec18dfa"
+    },
+    {
+      "scope": "moderate",
+      "guild": "987654321098765432",
+      "body": "{\"action\":\"probe.no_such_verb_acceptance\",\"note\":\"second-field\"}",
+      "timestamp": "1720000060",
+      "nonce": "abcdef0123456789abcdef0123456789",
+      "secret": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",
+      "body_hash": "06cbbcd00eaa7185721e24159cfa3d5a5896d1e7e2f5a1f9f27f8abcf52547ed",
+      "canonical": "two-internal-action/scope-claim/v1\nPOST\n/internal/actions\n1720000060\nabcdef0123456789abcdef0123456789\n06cbbcd00eaa7185721e24159cfa3d5a5896d1e7e2f5a1f9f27f8abcf52547ed\nmoderate\n987654321098765432",
+      "signature": "sha256=8d7ba644d14fdd71afd3d2a83827f2dd54345a3fbc6c371a733057a0ecf6146d"
+    },
+    {
+      "scope": "admin",
+      "guild": "1545644954272137297",
+      "body": "{\"action\":\"probe.no_such_verb_acceptance\"}",
+      "timestamp": "1720000120",
+      "nonce": "00112233445566778899aabbccddeeff",
+      "secret": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body_hash": "e3925abcec2e97b8c84e9673b79257162acac7b782bad9fcec110dd3e380a0bc",
+      "canonical": "two-internal-action/scope-claim/v1\nPOST\n/internal/actions\n1720000120\n00112233445566778899aabbccddeeff\ne3925abcec2e97b8c84e9673b79257162acac7b782bad9fcec110dd3e380a0bc\nadmin\n1545644954272137297",
+      "signature": "sha256=48b065359d8da9d3c4d45a9fd631b816029b0b4c31001617eed521994c1e5a9c"
+    }
+  ]
+}

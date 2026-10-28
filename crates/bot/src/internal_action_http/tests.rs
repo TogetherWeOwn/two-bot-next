@@ -4542,3 +4542,150 @@ async fn listeners_fail_closed_and_drain_sibling_on_unexpected_exit() {
     assert!(result.is_err());
     assert!(*shutdown.borrow());
 }
+
+#[test]
+fn only_registry_bearer_refusals_receive_a_bearer_challenge() {
+    let make_error =
+        || ActionError::new(ErrorCode::Unauthorized, "refused", "admin_bearer_refused");
+    let registry = Failure::from_admin(make_error()).response("fixture");
+    assert_eq!(registry.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        registry.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+        "Bearer"
+    );
+    let transport = Failure::from_action(make_error()).response("fixture");
+    assert_eq!(transport.status(), StatusCode::UNAUTHORIZED);
+    assert!(!transport.headers().contains_key(header::WWW_AUTHENTICATE));
+    for code in [ErrorCode::ActionNotAllowed, ErrorCode::Internal] {
+        let response =
+            Failure::from_admin(ActionError::new(code, "refused", "fixture")).response("fixture");
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
+}
+
+#[derive(Default)]
+struct CountingScopedEventMutate {
+    calls: AtomicUsize,
+}
+
+impl EventMutateEffect for CountingScopedEventMutate {
+    fn execute_mutation<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a EventCall,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"event_id": CREATE_EVENT_ID}))
+        })
+    }
+}
+
+#[tokio::test]
+async fn scoped_receiver_challenges_registry_refusals_but_not_service_faults() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let mutates = Arc::new(CountingScopedEventMutate::default());
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect.clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        mutates.clone(),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )));
+    // Use the same valid event input for scoped refusals and the legacy
+    // positive control: a malformed event must not hide a misplaced fence.
+    let bearer_secret = hex::encode(rand::random::<[u8; 32]>());
+    let mut payload: Value = serde_json::from_str(&upsert_payload("scoped-refusal")).unwrap();
+    payload["guild_id"] = json!(staging_guild());
+    payload["admin_bearer"] = json!(format!("adm_0123456789abcdef.{bearer_secret}"));
+    let raw = payload.to_string();
+    let make = |key_id: &str, signing_secret: Vec<u8>, seconds_ago: u64| {
+        let timestamp = (now_ms() / 1000 - seconds_ago).to_string();
+        let nonce = nonce();
+        let key = two_bot_core::internal_actions::SigningKey {
+            id: key_id.to_owned(),
+            secret: two_bot_core::Secret::new(signing_secret),
+        };
+        let signature = key.sign_scoped(
+            &timestamp,
+            &nonce,
+            raw.as_bytes(),
+            "moderate",
+            staging_guild(),
+        );
+        Request::builder()
+            .method(Method::POST)
+            .uri(ACTIONS_PATH)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-two-key-id", key_id)
+            .header("x-two-timestamp", timestamp)
+            .header("x-two-nonce", nonce)
+            .header("x-two-signature", signature)
+            .header("x-two-scope", "moderate")
+            .header("x-two-guild", staging_guild())
+            .header("idempotency-key", "intent-scoped-refusal")
+            .body(Body::from(raw.clone()))
+            .unwrap()
+    };
+    let (status, headers, body) = answer(app.clone(), make("old", secret(0).into_bytes(), 0)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers.get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+    assert_eq!(body["error"]["code"], "unauthorized");
+    // Fresh incorrect key material exercises the bad-MAC path without
+    // introducing a hard-coded cryptographic key into the test source.
+    let wrong_secret = rand::random::<[u8; 32]>().to_vec();
+    assert_ne!(wrong_secret, secret(0).as_bytes());
+    for (key_id, signing_secret, seconds_ago, code) in [
+        ("unknown", secret(0).into_bytes(), 0, "unauthorized"),
+        ("old", wrong_secret, 0, "unauthorized"),
+        ("old", secret(0).into_bytes(), 10000, "stale_request"),
+    ] {
+        let (status, headers, body) =
+            answer(app.clone(), make(key_id, signing_secret, seconds_ago)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], code);
+        assert!(!headers.contains_key(header::WWW_AUTHENTICATE));
+    }
+    // The same bearer becomes live authority, but the scoped surface must
+    // still refuse before an execution intent or event effect can exist.
+    sqlx::query(
+        "INSERT INTO admin_api_tokens
+         (token_id, secret_hash, scopes, guild_ids, holder_id, holder_kind, issued_at, expires_at)
+         VALUES ($1, $2, ARRAY['moderate'], $3, 'scope-test-holder', 'human',
+                 now(), now() + interval '1 hour')",
+    )
+    .bind("adm_0123456789abcdef")
+    .bind(InternalFlags::hash_admin_token_secret(bearer_secret.as_bytes()).unwrap())
+    .bind(vec![staging_guild().parse::<i64>().unwrap()])
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let (status, headers, body) = answer(app.clone(), make("old", secret(0).into_bytes(), 0)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert!(!headers.contains_key(header::WWW_AUTHENTICATE));
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(mutates.calls.load(Ordering::SeqCst), 0);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        receipts, 0,
+        "scoped refusals must precede execution intents"
+    );
+
+    // Prove the payload and counting seam can reach the event executor when
+    // authenticated with the existing unscoped scheme, not merely fail input
+    // validation before it. This is a disposable database and offline effect.
+    let (status, _, body) = answer(app, signed(&raw, "old", "intent-scoped-refusal")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["event_id"], CREATE_EVENT_ID);
+    assert_eq!(mutates.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(effect.calls(), 0);
+    db.close().await.unwrap();
+}

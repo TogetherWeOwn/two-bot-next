@@ -235,7 +235,9 @@ fn authenticate(
         &expected_signature(secret, timestamp, nonce, raw),
         signature,
     );
-    if !(ring.keys.contains_key(key_id) && matched) {
+    if !(ring.keys.contains_key(key_id) && matched)
+        || crate::internal_action_admin::requires_scope(key_id)
+    {
         return Err(Denial::Mismatch);
     }
     let guarded = ring.clock.evaluate(now_ms).map_err(|_| Denial::Stale)?;
@@ -579,6 +581,25 @@ mod tests {
                 "snapshot 503 must not attribute {other}: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn admin_service_key_cannot_authenticate_a_legacy_backfill_read() {
+        let secret = fixture_secret();
+        let key_id = "fixture-admin-service";
+        let ring = SharedRing::new(vec![two_bot_core::internal_actions::SigningKey {
+            id: key_id.to_owned(),
+            secret: two_bot_core::Secret::new(secret.clone()),
+        }]);
+        let mut headers = HeaderMap::new();
+        for (name, value) in signed_headers_for(key_id, &secret, BACKFILL_PATH) {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+        let mut inner = ring.0.lock().unwrap();
+        assert!(authenticate(&mut inner, &headers, b"", now_ms()).is_err());
     }
 
     #[tokio::test]

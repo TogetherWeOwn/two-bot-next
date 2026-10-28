@@ -1042,3 +1042,57 @@ test("relay stream errors and oversize sentinels become the fixed envelope", asy
   const oversizeText = await fixedEnvelope(oversize);
   assert.ok(!oversizeText.includes(leak));
 });
+
+test("admin gateway crosses the real DO with ingress dark and preserves covered scope and guild", async (t) => {
+  const env = { ...DARK_ENV, ...RECEIVER_SECRETS,
+    ADMIN_GATEWAY_SERVICE_KEY_ID: "fixture-admin-service",
+    ADMIN_GATEWAY_SERVICE_KEY: randomBytes(32).toString("hex") };
+  const h = await harness(t, env);
+  await h.warm();
+  h.setReceiver((req) => Response.json({ ok: false, request_id: req.headers["x-request-id"],
+    error: { code: "action_not_allowed", retryable: false } }, { status: 403 }));
+  const response = await h.call(new Request("https://worker.invalid/admin/v1/settings.get/123", {
+    headers: { authorization: `Bearer adm_0123456789abcdef.${randomBytes(32).toString("hex")}`,
+      "cf-connecting-ip": "fixture-gateway-do" },
+  }));
+  assert.equal(response.status, 403);
+  assert.equal((await response.json() as { error: { code: string } }).error.code, "action_not_allowed");
+  const calls = h.receiverCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.headers["x-two-key-id"], env.ADMIN_GATEWAY_SERVICE_KEY_ID);
+  assert.equal(calls[0]!.headers["x-two-scope"], "read");
+  assert.equal(calls[0]!.headers["x-two-guild"], "123");
+  assert.equal(calls[0]!.headers["authorization"], undefined);
+  assert.equal(JSON.parse(new TextDecoder().decode(calls[0]!.body!)).guild_id, "123");
+  for (const [code, challenge, expected] of [
+    ["unauthorized", "Bearer", 401],
+    ["unauthorized", undefined, 503],
+    ["stale_request", "Bearer", 503],
+  ] as const) {
+    h.setReceiver((req) => Response.json({ ok: false, request_id: req.headers["x-request-id"],
+      error: { code, retryable: false } }, { status: 401,
+      headers: challenge ? { "www-authenticate": challenge } : {} }));
+    const response = await h.call(new Request("https://worker.invalid/admin/v1/settings.get/123", {
+      headers: { authorization: `Bearer adm_0123456789abcdef.${randomBytes(32).toString("hex")}`,
+        "cf-connecting-ip": "fixture-gateway-do" },
+    }));
+    assert.equal(response.status, expected, `${code}/${challenge} across the DO`);
+    assert.equal(response.headers.get("www-authenticate"), expected === 401 ? "Bearer" : null);
+  }
+  assert.equal(h.receiverCalls().length, 4, "each refusal forwards once, without retry");
+});
+
+test("DO receiver remains dark with gateway and ingress off, or receiver disabled", async (t) => {
+  for (const env of [
+    { ...DARK_ENV, ...RECEIVER_SECRETS },
+    { ...DARK_ENV, ...RECEIVER_SECRETS, TWO_INTERNAL_ACTIONS: "0",
+      ADMIN_GATEWAY_SERVICE_KEY_ID: "fixture-admin-service", ADMIN_GATEWAY_SERVICE_KEY: randomBytes(32).toString("hex") },
+  ]) {
+    const h = await harness(t, env);
+    const response = await h.bot.fetch(new Request(`https://worker.invalid${ACTIONS_PATH}`, {
+      method: "POST", body: BODY, headers: { ...SIGNED_HEADERS, "x-two-scope": "read", "x-two-guild": "123", [DEPLOYMENT_HEADER]: ID },
+    }));
+    assert.equal(response.status, 404);
+    assert.equal(h.receiverCalls().length, 0);
+  }
+});

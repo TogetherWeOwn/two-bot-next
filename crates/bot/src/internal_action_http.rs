@@ -68,7 +68,8 @@ use two_bot_core::{
         require_field_str, require_snowflake, unmapped_event_key, validate_announcement,
         validate_event_input, validate_event_key, validate_idempotency_key, ActionError,
         AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode, GuildAddMemberRequest,
-        InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        InternalFlags, RoleAssignRequest, ScopeClaim, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES,
+        SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -1470,15 +1471,21 @@ async fn receive(
             )
         }
     };
+    if headers.scope_claim.is_none()
+        && crate::internal_action_admin::requires_scope(headers.auth.key_id)
+    {
+        return reject(Failure::code(ErrorCode::Unauthorized), ActionLabel::Unknown);
+    }
     let verified = {
         let mut clock = state.clock.lock().expect("clock lock");
-        AuthenticatedRequest::verify(
+        AuthenticatedRequest::verify_scoped(
             &headers.auth,
             &raw,
             state.config.keys(),
             SKEW_SECONDS,
             now_ms(),
             &mut clock,
+            headers.scope_claim,
         )
     };
     let verified = match verified {
@@ -1505,6 +1512,11 @@ async fn receive(
         }
     };
     let action = ActionLabel::new(Some(&decision.action));
+    if let Some(claim) = headers.scope_claim {
+        let error =
+            crate::internal_action_admin::refuse_closed(state.store.pool(), &decision, claim).await;
+        return reject(Failure::from_admin(error), action);
+    }
     // Read-only verbs are keyless: no Idempotency-Key header and no durable
     // idempotency claim. The committed nonce above is their replay guard.
     if decision.action == "event.read" {
@@ -3164,6 +3176,7 @@ fn import_success_response(outcome: &ImportOutcome, id: &str, replayed: bool) ->
 
 struct WireHeaders<'a> {
     auth: AuthHeaders<'a>,
+    scope_claim: Option<ScopeClaim<'a>>,
     idempotency: Option<&'a str>,
 }
 
@@ -3235,7 +3248,19 @@ fn wire_headers(headers: &HeaderMap) -> Result<WireHeaders<'_>, Failure> {
             .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| Failure::code(ErrorCode::Unauthorized))
     };
+    let scope_claim = if headers.contains_key("x-two-scope") || headers.contains_key("x-two-guild")
+    {
+        let pair = || {
+            let scope = one_header(headers, "x-two-scope", 8).ok()??;
+            let guild = one_header(headers, "x-two-guild", 20).ok()??;
+            ScopeClaim::parse(scope, guild)
+        };
+        Some(pair().ok_or_else(|| Failure::code(ErrorCode::Unauthorized))?)
+    } else {
+        None
+    };
     Ok(WireHeaders {
+        scope_claim,
         auth: AuthHeaders {
             key_id: required("x-two-key-id", 128)?,
             timestamp: required("x-two-timestamp", 15)?,
@@ -3252,6 +3277,7 @@ struct Failure {
     retryable: bool,
     retry_after: Option<u64>,
     class_code: ErrorCode,
+    bearer_challenge: bool,
 }
 
 impl Failure {
@@ -3271,6 +3297,16 @@ impl Failure {
         failure
     }
 
+    // Only the registry path can identify a bearer refusal. Transport MAC,
+    // clock and wire failures keep the same uniform 401 body, without the
+    // challenge, so the edge cannot mistake deployment faults for guesses.
+    fn from_admin(error: ActionError) -> Self {
+        let bearer_challenge = error.code == ErrorCode::Unauthorized;
+        let mut failure = Self::from_action(error);
+        failure.bearer_challenge = bearer_challenge;
+        failure
+    }
+
     fn http(
         status: StatusCode,
         code: &'static str,
@@ -3283,6 +3319,7 @@ impl Failure {
             retryable,
             retry_after: None,
             class_code,
+            bearer_challenge: false,
         }
     }
 
@@ -3310,6 +3347,11 @@ impl Failure {
             })),
         )
             .into_response();
+        if self.bearer_challenge {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
         if let Some(seconds) = self.retry_after {
             if let Ok(header) = HeaderValue::from_str(&seconds.to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, header);

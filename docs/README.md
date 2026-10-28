@@ -11,6 +11,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Settings](configuration.md)
 - [Parity ledger](parity.md)
 - [Containment](containment.md)
+- [Admin API](admin-api.md)
 - [Prototype](s2-prototype.md)
 - [Baseline](b1-baseline.md)
 - [Process](process-history-contract.md)
