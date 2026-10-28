@@ -47,6 +47,8 @@ default = []
 db = ["dep:sqlx"]
 
 [dev-dependencies]
+# Parse discoverability fixtures as CommonMark instead of duplicating its block grammar.
+pulldown-cmark = { version = "=0.13.5", default-features = false }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 two-bot-testsupport = { path = "../testsupport", version = "0.4.0" }

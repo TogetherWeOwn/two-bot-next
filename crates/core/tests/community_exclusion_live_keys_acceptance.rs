@@ -1079,21 +1079,6 @@ fn community_jobs_doc_documents_this_offline_verification() {
     );
 }
 
-// A CommonMark fence line: up to three spaces of indent, then a run of three
-// or more backticks or tildes. Returns (marker, run length, remainder).
-fn fence_marker(line: &str) -> Option<(char, usize, &str)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    if indent > 3 {
-        return None;
-    }
-    let rest = &line[indent..];
-    let marker = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let run = rest.chars().take_while(|c| *c == marker).count();
-    (run >= 3).then(|| (marker, run, &rest[run..]))
-}
-
-// Whether a line leaves an HTML comment open, given whether it started inside
-// one. A comment closed and reopened on one line stays open.
 fn comment_open_after(line: &str, mut in_comment: bool) -> bool {
     let mut rest = line;
     loop {
@@ -1106,153 +1091,29 @@ fn comment_open_after(line: &str, mut in_comment: bool) -> bool {
     }
 }
 
-// CommonMark HTML block starts that hide their content from the renderer.
-// Type 1 (script, pre, style, textarea) ends at its closing tag; type 6
-// (block-level tags) ends at the next blank line.
-const RAW_HTML_BLOCK_TAGS: &[&str] = &[
-    "address",
-    "article",
-    "aside",
-    "base",
-    "basefont",
-    "blockquote",
-    "body",
-    "caption",
-    "center",
-    "col",
-    "colgroup",
-    "dd",
-    "details",
-    "dialog",
-    "dir",
-    "div",
-    "dl",
-    "dt",
-    "fieldset",
-    "figcaption",
-    "figure",
-    "footer",
-    "form",
-    "frame",
-    "frameset",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "head",
-    "header",
-    "hr",
-    "html",
-    "iframe",
-    "legend",
-    "li",
-    "link",
-    "main",
-    "menu",
-    "menuitem",
-    "nav",
-    "noframes",
-    "ol",
-    "optgroup",
-    "option",
-    "p",
-    "param",
-    "search",
-    "section",
-    "summary",
-    "table",
-    "tbody",
-    "td",
-    "tfoot",
-    "th",
-    "thead",
-    "title",
-    "tr",
-    "track",
-    "ul",
-];
-const RAW_HTML_VERBATIM_TAGS: &[&str] = &["script", "pre", "style", "textarea"];
+// Use parser-emitted links and source offsets to preserve the exact row contract
+// without duplicating CommonMark's block grammar. Track comments only in emitted
+// raw HTML: a comment reopened after a block terminator can hide later link HTML,
+// whereas a comment marker in escaped code/text cannot.
+fn rendered_link_lines(text: &str) -> Vec<&str> {
+    use pulldown_cmark::{Event, Parser, Tag};
 
-// The tag name opening a line (`<name` or `</name`), lowercased, when it is
-// followed by whitespace, `>`, `/>` or the end of the line.
-fn html_block_tag(line: &str) -> Option<(String, bool)> {
-    let body = line.trim_start_matches(' ');
-    if line.len() - body.len() > 3 {
-        return None;
-    }
-    let after = body.strip_prefix('<')?;
-    let (closing, after) = match after.strip_prefix('/') {
-        Some(rest) => (true, rest),
-        None => (false, after),
-    };
-    let name_len = after
-        .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(after.len());
-    let (name, tail) = after.split_at(name_len);
-    let boundary = tail.is_empty() || tail.starts_with([' ', '\t', '>']) || tail.starts_with("/>");
-    (!name.is_empty() && boundary).then(|| (name.to_ascii_lowercase(), closing))
-}
-
-// Lines a Markdown renderer shows as text. Fenced code blocks (``` or ~~~),
-// HTML comments and raw HTML blocks are not index rows, so a link inside one
-// is not discoverable. A fence closes only on the same marker at least as long
-// as its opener with nothing but spaces or tabs after it; a backtick opener
-// may not carry a backtick in its info string.
-fn rendered_lines(text: &str) -> Vec<&str> {
-    let mut fence: Option<(char, usize)> = None;
     let mut in_comment = false;
-    let mut verbatim: Option<String> = None;
-    let mut in_block = false;
     let mut rendered = Vec::new();
-    for line in text.lines() {
-        if let Some((open, len)) = fence {
-            if fence_marker(line).is_some_and(|(c, run, rest)| {
-                c == open && run >= len && rest.trim_matches([' ', '\t']).is_empty()
-            }) {
-                fence = None;
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Html(html) | Event::InlineHtml(html) => {
+                in_comment = comment_open_after(&html, in_comment);
             }
-            continue;
-        }
-        if in_comment {
-            in_comment = comment_open_after(line, true);
-            continue;
-        }
-        if let Some(tag) = &verbatim {
-            if line.to_ascii_lowercase().contains(&format!("</{tag}>")) {
-                verbatim = None;
+            Event::Start(Tag::Link { .. }) if !in_comment => {
+                let start = text[..range.start].rfind('\n').map_or(0, |at| at + 1);
+                let end = text[range.end..]
+                    .find('\n')
+                    .map_or(text.len(), |at| range.end + at);
+                rendered.push(text[start..end].trim_end_matches('\r'));
             }
-            continue;
+            _ => {}
         }
-        if in_block {
-            in_block = !line.trim().is_empty();
-            continue;
-        }
-        if let Some((c, run, rest)) = fence_marker(line) {
-            if c == '~' || !rest.contains('`') {
-                fence = Some((c, run));
-                continue;
-            }
-        }
-        let body = line.trim_start_matches(' ');
-        if line.len() - body.len() <= 3 && body.starts_with("<!--") {
-            in_comment = comment_open_after(body, false);
-            continue;
-        }
-        if let Some((tag, closing)) = html_block_tag(line) {
-            if !closing && RAW_HTML_VERBATIM_TAGS.contains(&tag.as_str()) {
-                if !line.to_ascii_lowercase().contains(&format!("</{tag}>")) {
-                    verbatim = Some(tag);
-                }
-                continue;
-            }
-            if RAW_HTML_BLOCK_TAGS.contains(&tag.as_str()) {
-                in_block = true;
-                continue;
-            }
-        }
-        rendered.push(line);
     }
     rendered
 }
@@ -1268,7 +1129,7 @@ fn community_jobs_is_indexed(read: impl Fn(&str) -> Option<String>) -> bool {
         return false;
     }
     let has_guide_row = |text: &str| {
-        rendered_lines(text)
+        rendered_link_lines(text)
             .into_iter()
             .any(|line| line == "- [Community jobs](community-jobs.md)")
     };
@@ -1277,7 +1138,7 @@ fn community_jobs_is_indexed(read: impl Fn(&str) -> Option<String>) -> bool {
     }
     let fragment_row = regex::Regex::new(r"^- \[([^\]\n]+)\]\((index-[A-Za-z0-9_.-]+\.md)\)$")
         .expect("index fragment row pattern");
-    rendered_lines(&index).into_iter().any(|line| {
+    rendered_link_lines(&index).into_iter().any(|line| {
         fragment_row.captures(line).is_some_and(|row| {
             !row[1].trim().is_empty()
                 && read(&format!("docs/{}", &row[2]))
@@ -1538,9 +1399,71 @@ fn control_docs_index_rejects_rows_hidden_by_raw_html_and_odd_markup() {
     shown(format!("<script>\nx\n</script>\n{guide}\n"));
     shown(format!("```\nx\n```\t\n{guide}\n"));
     shown(format!("<!-- a --> <!-- b -->\n{guide}\n"));
-    // Inline or unknown tags and tag-prefixed words are not block starts.
+    // Inline tags with trailing content are not type-7 block starts; complete
+    // tags alone are, even when their names are not in the block-tag list.
     shown(format!("<span>x</span>\n{guide}\n"));
-    shown(format!("<divider>\n{guide}\n"));
+    hidden(format!("<divider>\n{guide}\n"));
+}
+
+#[test]
+fn control_docs_index_obeys_all_html_block_boundaries() {
+    let guide = "- [Community jobs](community-jobs.md)";
+    let fragment = "- [Community](index-community.md)";
+    for (markup, indexed) in [
+        ("<?php\nROW\n?>\n", false),
+        ("<?php\n\nROW\n", false),
+        ("<?php\nx\n?>\nROW\n", true),
+        ("<?php ?>\nROW\n", true),
+        ("<!DOCTYPE\nROW\n>\n", false),
+        ("<!DOCTYPE\n\nROW\n", false),
+        ("<!DOCTYPE\nx>\nROW\n", true),
+        ("<!DOCTYPE html>\nROW\n", true),
+        ("<![CDATA[\nROW\n]]>\n", false),
+        ("<![CDATA[\n\nROW\n", false),
+        ("<![CDATA[\nx\n]]>\nROW\n", true),
+        ("<![CDATA[x]]>\nROW\n", true),
+        ("<divider>\nROW\n", false),
+        ("</divider>\nROW\n", false),
+        ("<x-widget attr='value'>\nROW\n", false),
+        ("<divider>\nx\n\nROW\n", true),
+        ("<divider>\nx\n \t\nROW\n", true),
+        ("<div>\n\u{a0}\nROW\n", false),
+        ("<divider>\n\u{a0}\nROW\n", false),
+        ("<div>\n \t\nROW\n", true),
+        // HTML blocks have the same three-space indentation boundary as fences.
+        ("   <div>\nROW\n", false),
+        ("    <div>\nROW\n", true),
+        ("<div:note> body\nROW\n", true),
+        // Type 7 cannot interrupt a paragraph, unlike type 6.
+        ("paragraph\n<divider>\nROW\n", true),
+        ("paragraph\n<div>\nROW\n", false),
+        // Comment markers emitted as escaped code/text do not hide later HTML.
+        ("```\n<!--\n```\nROW\n", true),
+        ("inline `<!--`\nROW\n", true),
+        ("<!-- a\n--> <!-- b\nROW\n-->\n", false),
+        ("<!-- a --> <!-- b\nROW\n-->\n", false),
+        ("<!-- a --> <!-- b -->\nROW\n", true),
+        // Link byte ranges still recover the exact row after Unicode and CRLF.
+        ("# café\r\n\r\nROW\r\n", true),
+    ] {
+        let guide_markup = markup.replace("ROW", guide);
+        let fragment_markup = markup.replace("ROW", fragment);
+        for (layout, readme, contents) in [
+            ("direct", guide_markup.as_str(), guide),
+            ("linked row", fragment_markup.as_str(), guide),
+            ("linked guide", fragment, guide_markup.as_str()),
+        ] {
+            assert_eq!(
+                community_jobs_fixture_is_indexed(&[
+                    ("docs/README.md", readme),
+                    ("docs/index-community.md", contents),
+                    ("docs/community-jobs.md", "# Community jobs\n"),
+                ]),
+                indexed,
+                "{layout}: {markup:?}"
+            );
+        }
+    }
 }
 
 #[test]
