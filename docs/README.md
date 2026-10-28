@@ -1,7 +1,6 @@
 # Documentation map
 
 Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
-Empty `{missing,stale,oversize}` = 0; else 1.
 Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References
@@ -12,11 +11,11 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Settings](configuration.md)
 - [Parity ledger](parity.md)
 - [Containment](containment.md)
-- [Prototype metrics](s2-prototype.md)
-- [Legacy baseline](b1-baseline.md)
-- [Process history](process-history-contract.md)
-- [MCP tools](mcp.md)
-- [Token registry](admin-registry.md)
+- [Prototype](s2-prototype.md)
+- [Baseline](b1-baseline.md)
+- [Process](process-history-contract.md)
+- [MCP](mcp.md)
+- [Tokens](admin-registry.md)
 
 ## Operations
 
@@ -25,9 +24,9 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Metrics](metrics.md)
 - [Readiness](container-readiness.md)
 - [Startup](startup-diagnostics.md)
-- [Gateway recovery](gateway-recovery.md)
-- [Gateway failures](gateway-failure-classification.md)
-- [Capture poison](deferred-capture-poison.md)
+- [Recovery](gateway-recovery.md)
+- [Failures](gateway-failure-classification.md)
+- [Capture](deferred-capture-poison.md)
 - [Backups](backup.md)
 - [Backfill](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
@@ -89,6 +88,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Attribution PII](classifier-pii-absence.md)
 - [Channel access](channel-access-acceptance.md)
 - [Channel locking](channel-lockdown-acceptance.md)
+- [Lockdown preview](lockdown-preview-spec.md)
 - [Lockdown](time-boxed-lockdown-decision.md)
 - [Slowmode](time-boxed-slowmode-decision.md)
 - [Channel runtime](channel-moderation-runtime.md)
@@ -110,6 +110,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Settings tests](internal-settings-acceptance.md)
 - [Settings refresh](settings-catalog-acceptance.md)
 - [Live keys](ticket-feed-self-role-live-keys-acceptance.md)
+- [Giveaway check](giveaway-self-check-spec.md)
 - [Community jobs](community-jobs.md)
 - [Giveaways](giveaways.md)
 - [Snapshot edges](community-snapshot-edges.md)
@@ -174,7 +175,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Room spec](voice-rooms.md)
 - [Presets proposal](voice-presets-spec.md)
 - [Prefix seam](router-voice-prefix.md)
-- [Room creation plan](voice-room-creation-plan.md)
+- [Create plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
 - [Ownership domain](voice-ownership-core.md)
 - [Room controls](voice-room-controls-core.md)
@@ -281,14 +282,14 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Quality gates](quality-gates.md)
 - [CI security](ci-security.md)
 - [CI speed rollout](ci-speed-rollout.md)
-- [Delivery metrics](dora-metrics.md)
-- [Docs queue timing](ci-docs-only-queue-note.md)
-- [Subprocess checks](bounded-subprocess-checks.md)
-- [Build-cache safety](build-cache.md)
-- [Flake ledger](flake-ledger.md)
+- [Delivery](dora-metrics.md)
+- [Docs queue](ci-docs-only-queue-note.md)
+- [Subprocess](bounded-subprocess-checks.md)
+- [Build cache](build-cache.md)
+- [Flakes](flake-ledger.md)
 - [Load fixtures](load-sensitive-test-fixtures.md)
-- [Parser properties](property-tests.md)
-- [Pipeline benchmark](pipeline-benchmark.md)
+- [Properties](property-tests.md)
+- [Pipeline](pipeline-benchmark.md)
 - [Unwrap backlog](unwrap-backlog.md)
 - [Image supply chain](supply-chain.md)
 - [Distroless](distroless-evaluation.md)
