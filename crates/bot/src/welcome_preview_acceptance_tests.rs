@@ -744,15 +744,17 @@ async fn preview_rendered_picker_clicks_are_read_only_before_config_lookup() {
                 );
                 let click = click_rendered_picker(&body, mode);
                 if broken_config {
-                    SettingsStore::new(&db.pool)
-                        .set(
-                            "22",
-                            "DISCORD_LANDING_CHANNEL_IDS",
-                            Some(json!(["bogus"])),
-                            "test",
-                        )
-                        .await
-                        .unwrap();
+                    // Seed a corrupt legacy row without the validated settings writer.
+                    sqlx::query(
+                        "INSERT INTO guild_settings (guild_id, key, value, updated_by) VALUES ($1, $2, $3, $4)",
+                    )
+                    .bind("22")
+                    .bind("DISCORD_LANDING_CHANNEL_IDS")
+                    .bind(json!(["bogus"]))
+                    .bind("test")
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
                 }
                 // A separate strict responder records only the click lifecycle.
                 // Any member read/role write on a sample click panics here.
@@ -911,15 +913,17 @@ async fn preview_broken_stored_config_fails_privately_with_retry_guidance() {
     // a link smuggled through stored config.
     let db = TestSchema::new().await;
     let result = std::panic::AssertUnwindSafe(async {
-        SettingsStore::new(&db.pool)
-            .set(
-                "22",
-                "DISCORD_LANDING_CHANNEL_IDS",
-                Some(json!(["@everyone <@&1> https://evil.example/x"])),
-                "test",
-            )
-            .await
-            .unwrap();
+        // Seed a corrupt legacy row without the validated settings writer.
+        sqlx::query(
+            "INSERT INTO guild_settings (guild_id, key, value, updated_by) VALUES ($1, $2, $3, $4)",
+        )
+        .bind("22")
+        .bind("DISCORD_LANDING_CHANNEL_IDS")
+        .bind(json!(["@everyone <@&1> https://evil.example/x"]))
+        .bind("test")
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let mock = preview_discord(Arc::new(Mutex::new(PreviewDiscordState::default()))).await;
         let runtime = runtime(&db.pool, &mock, &vars("legacy", false));
         let interaction = preview();
@@ -990,15 +994,17 @@ async fn preview_broken_stored_config_fails_privately_with_retry_guidance() {
     // Non-snowflake session pick in session mode.
     let db = TestSchema::new().await;
     let result = std::panic::AssertUnwindSafe(async {
-        SettingsStore::new(&db.pool)
-            .set(
-                "22",
-                "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID",
-                Some(json!(["bogus"])),
-                "test",
-            )
-            .await
-            .unwrap();
+        // Seed a corrupt legacy row without the validated settings writer.
+        sqlx::query(
+            "INSERT INTO guild_settings (guild_id, key, value, updated_by) VALUES ($1, $2, $3, $4)",
+        )
+        .bind("22")
+        .bind("DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID")
+        .bind(json!(["bogus"]))
+        .bind("test")
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let mock = preview_discord(Arc::new(Mutex::new(PreviewDiscordState::default()))).await;
         let runtime = runtime(&db.pool, &mock, &vars("session", false));
         runtime.handle(job(preview()), NOW).await.unwrap();

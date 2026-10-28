@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "feed_read_strict_decode_acceptance_tests.rs"]
+mod feed_read_strict_decode_acceptance_tests;
 #[path = "feed_sticky_strict_decode_acceptance_tests.rs"]
 mod feed_sticky_strict_decode_acceptance_tests;
 #[path = "reopen_dispatch_review_acceptance_tests.rs"]
@@ -36,6 +38,8 @@ mod member_strict_decode_acceptance;
 mod sticky_uncertain_acceptance_tests;
 #[path = "sticky_unsaved_preview_acceptance_tests.rs"]
 mod sticky_unsaved_preview_acceptance_tests;
+#[path = "tempban_inventory_acceptance_tests.rs"]
+mod tempban_inventory_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
@@ -43,6 +47,8 @@ mod custom_command_list_pages_acceptance;
 mod custom_command_toggle_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
+#[path = "help_focus_acceptance.rs"]
+mod help_focus_acceptance;
 
 #[path = "game_mix_acceptance_tests.rs"]
 mod game_mix_acceptance_tests;
@@ -60,6 +66,10 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
+#[path = "giveaway_list_facts_acceptance_tests.rs"]
+mod giveaway_list_facts_acceptance_tests;
+#[path = "privacy_action_scope_acceptance_tests.rs"]
+mod privacy_action_scope_acceptance_tests;
 #[path = "schedule_absolute_acceptance_tests.rs"]
 mod schedule_absolute_acceptance;
 #[path = "schedule_absolute_correction_tests.rs"]
@@ -108,8 +118,9 @@ use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options_strict, feed_id_option, feed_list_page_request,
-    feed_remove_option_strict, help_command_selector, new_id, router_with_commands,
-    sticky_options_strict, CommandRuntime, FeedListPage, RegistrySyncError,
+    feed_remove_option_strict, help_command_selector, help_focus_selector, new_id,
+    router_with_commands, sticky_options_strict, CommandRuntime, FeedListPage, HelpSubcommand,
+    RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
@@ -3550,6 +3561,116 @@ fn help_command_selector_keeps_omitted_absent_and_malformed_present() {
 }
 
 #[test]
+fn help_focus_selector_rejects_duplicate_command_with_a_path() {
+    let command = |name: &str| option("command", CommandOptionValue::String(name.to_owned()));
+    let path = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    let focused = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank"), path.clone()],
+    );
+    assert_eq!(help_focus_selector(&focused), HelpSubcommand::Malformed);
+    // One root keeps the focused path.
+    let single = slash("help", Some(CHANNEL), vec![command("privacy"), path]);
+    assert_eq!(
+        help_focus_selector(&single),
+        HelpSubcommand::Path("deletion-status".to_owned())
+    );
+    // Without a path the existing root decode is untouched.
+    let root_only = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank")],
+    );
+    assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
+}
+
+#[tokio::test]
+async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let runtime = CommandRuntime::new(
+        pool,
+        executor,
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    runtime.set_identity(1111, 1111);
+    runtime
+        .publish_registry_checked(Some(1111))
+        .await
+        .expect("confirmed registry");
+    let command = |root: &str| option("command", CommandOptionValue::String(root.to_owned()));
+    let focus = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    // A valid control ensures the confirmed snapshot can actually render the
+    // focused detail that a first-root-wins regression would leak.
+    for roots in [
+        vec!["privacy"],
+        vec!["privacy", "rank"],
+        vec!["rank", "privacy"],
+    ] {
+        let mut options: Vec<_> = roots.iter().map(|root| command(root)).collect();
+        options.push(focus.clone());
+        let mut interaction = slash("help", Some(CHANNEL), options);
+        interaction.member.as_mut().expect("member").permissions = Some(Permissions::empty());
+        let before = mock.requests().len();
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            runtime.on_interaction(&interaction),
+        )
+        .await
+        .expect("help cannot wait on the closed pool");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), before + 1, "only one help callback");
+        let callback = &requests[before];
+        assert_eq!(callback.method, "POST");
+        assert!(callback.path.ends_with("/callback"));
+        let reply: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback JSON");
+        assert_eq!(reply["type"], 4, "immediate response, never defer");
+        assert_eq!(reply["data"]["flags"], 64, "private response");
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        let content = reply["data"]["content"].as_str().expect("help content");
+        if roots.len() == 1 {
+            assert!(
+                content.contains("Usage: /privacy deletion-status <request-id>"),
+                "{content}"
+            );
+        } else {
+            assert!(content.contains("/help"), "{content}");
+            assert!(content.contains("confirmed"), "{content}");
+            assert!(content.contains("Unknown subcommand"), "{content}");
+            assert!(content.encode_utf16().count() <= 2000, "finite correction");
+            assert!(
+                !content.contains("/privacy"),
+                "no focused detail: {content}"
+            );
+            assert!(!content.contains("/rank"), "no root detail: {content}");
+            assert!(
+                !content.contains("deletion-status"),
+                "no input echo: {content}"
+            );
+        }
+    }
+    mock.shutdown().await;
+}
+
+#[test]
 fn new_id_is_unique_hex_that_validate_id_accepts() {
     let first = new_id();
     let second = new_id();
@@ -4324,6 +4445,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedInspect,
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
+            HandlerId::TempbanList,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids
@@ -4345,6 +4467,7 @@ fn production_router_matches_composed_production_wiring() {
             ] {
                 router.register(Box::new(Marker(HandlerId::Moderation(action))));
             }
+            router.register(Box::new(Marker(HandlerId::TempbanList)));
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
@@ -4410,13 +4533,13 @@ fn production_router_matches_composed_production_wiring() {
                                  moderation={moderation} member={member_present})"
                             );
                         }
-                        // The exception list is the same five verbs the owner
-                        // map guards on the consumer, and nothing else.
+                        // The exception list is the five verbs plus the private
+                        // expiry read the owner map guards on the consumer.
                         let exceptions =
                             InteractionRouter::intentional_registration_exceptions(member_present);
                         assert_eq!(
                             exceptions.len(),
-                            if member_present { 0 } else { 5 },
+                            if member_present { 0 } else { 6 },
                             "member={member_present}"
                         );
                     }
@@ -11354,12 +11477,23 @@ fn privacy_action_decodes_known_analytics_and_deletion_subcommands() {
         privacy_action(&privacy_interaction(88, Some("delete"))),
         PrivacyAction::DeletionRequest
     );
+    // Lookup actions require their complete published request-id shape.
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-status"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-status",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionStatus
     );
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-receipt"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-receipt",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionReceipt
     );
     // Missing options, a non-subcommand value and an unknown name all
