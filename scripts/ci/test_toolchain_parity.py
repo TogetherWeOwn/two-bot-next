@@ -93,7 +93,14 @@ def _rust_stages(text):
     versa) once this file grows a second rust stage. Optional `FROM` flags
     such as `--platform=$BUILDPLATFORM` are skipped so flagged rust stages
     stay covered instead of silently invisible to the tag and digest checks.
+    Continued FROM instructions and non-default escape directives are deliberately
+    unsupported: refuse them instead of silently omitting a logical Rust stage.
     """
+    for escape in re.findall(r"(?im)^[ \t]*#[ \t]*escape[ \t]*=([^\r\n]*)", text):
+        if escape.strip() != "\\":
+            raise ValueError("unsupported Docker escape directive; use the default backslash escape")
+    if re.search(r"(?im)^[ \t]*FROM\b[^\r\n]*[\\`][ \t]*\r?$", text):
+        raise ValueError("unsupported Docker FROM continuation; keep each FROM on one physical line")
     stages = []
     for reference in re.findall(r"(?im)^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(rust:\S+)", text):
         tag, _, digest = reference.removeprefix("rust:").partition("@")
@@ -119,7 +126,11 @@ def dockerfile_parity_errors(root):
         except Exception as exc:
             errors.append(f"{name} unreadable: {exc}")
             continue
-        stages = _rust_stages(text)
+        try:
+            stages = _rust_stages(text)
+        except ValueError as exc:
+            errors.append(f"{name}: {exc}")
+            continue
         if not stages:
             errors.append(f"{name}: no FROM rust:<tag> builder found")
         for index, (tag, _digest) in enumerate(stages):
@@ -144,6 +155,9 @@ def container_image_errors(root):
     for name in DOCKERFILES:
         try:
             stages = _rust_stages((root / name).read_text())
+        except ValueError as exc:
+            errors.append(f"{name}: {exc}")
+            continue
         except Exception:
             stages = []
         if not stages or not stages[0][1]:
