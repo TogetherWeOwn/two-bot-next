@@ -77,6 +77,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
     TableSpec { table: "automation_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
+    // Pending-publication marker (0468): requested_at is stamped once at the
+    // first failed publication and the row is deleted on the next confirmed
+    // one, so it is the row's only write time.
+    TableSpec { table: "automation_command_registry_resync", measure: TableMeasure::Columns(&["requested_at"]) },
     TableSpec { table: "automation_commands", measure: TableMeasure::Columns(&["updated_at"]) },
     // Flag flips (matched/mutation_started/counted/released) happen inside the
     // claim's lifetime, so a delta claim shows up via claimed_at/completed_at.
@@ -282,7 +286,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // on intent; a revocation or refused grant deletes the row, so only
     // approvals are measurable.
     TableSpec { table: "voice_join_grants", measure: TableMeasure::Columns(&["created_at"]) },
-    // Insert-once orphan evidence (0468); oldest-out retention removes rows,
+    // Insert-once orphan evidence (0469); oldest-out retention removes rows,
     // so only retained evidence is measurable, not historical deletions.
     TableSpec { table: "voice_orphan_ledger", measure: TableMeasure::Columns(&["recorded_at"]) },
     // Insert-once creation snapshot plus V2 ownership handoffs, whose

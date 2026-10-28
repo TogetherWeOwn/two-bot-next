@@ -181,9 +181,16 @@ impl PgRoomStore {
             return Err(invalid_argument("invalid voice orphan page"));
         }
         let rows = sqlx::query(
-            "SELECT channel_id, recorded_at, count(*) OVER () AS total
-             FROM voice_orphan_ledger WHERE guild_id = $1
-             ORDER BY recorded_at DESC, channel_id DESC LIMIT $2 OFFSET $3",
+            "WITH evidence AS MATERIALIZED (
+                 SELECT channel_id, recorded_at FROM voice_orphan_ledger WHERE guild_id = $1
+             ), page AS (
+                 SELECT channel_id, recorded_at FROM evidence
+                 ORDER BY recorded_at DESC, channel_id DESC LIMIT $2 OFFSET $3
+             )
+             SELECT page.channel_id, page.recorded_at, totals.total
+             FROM (SELECT count(*) AS total FROM evidence) totals
+             LEFT JOIN page ON TRUE
+             ORDER BY page.recorded_at DESC, page.channel_id DESC",
         )
         .bind(guild.to_string())
         .bind(ORPHAN_LEDGER_PAGE_SIZE as i64)
@@ -195,17 +202,21 @@ impl PgRoomStore {
             .map(|row| row.try_get::<i64, _>("total"))
             .transpose()?
             .unwrap_or(0) as usize;
-        let rows = rows
-            .iter()
-            .map(|row| {
-                let channel: String = row.try_get("channel_id")?;
-                Ok(OrphanEvidence {
+        let mut evidence = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // The LEFT JOIN returns a count-only row for an empty slice, so
+            // past-end pages retain their total from the same SQL snapshot.
+            if let Some(channel) = row.try_get::<Option<String>, _>("channel_id")? {
+                evidence.push(OrphanEvidence {
                     channel_id: channel.parse().map_err(invalid_argument)?,
                     recorded_at: row.try_get("recorded_at")?,
-                })
-            })
-            .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        Ok(OrphanEvidencePage { rows, total })
+                });
+            }
+        }
+        Ok(OrphanEvidencePage {
+            rows: evidence,
+            total,
+        })
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {

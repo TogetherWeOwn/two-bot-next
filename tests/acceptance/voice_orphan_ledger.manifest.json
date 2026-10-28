@@ -30,8 +30,8 @@
     "purpose": "Unmodified scoped SQLx executed-query observer, including its own three controls."
   },
   "commands": {
-    "focused": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked voice_rooms::tests::orphan_ledger_acceptance:: -- --nocapture --test-threads=1",
-    "voiceControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked voice_rooms::tests:: -- --test-threads=1",
+    "focused": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --lib --locked voice_rooms::tests::orphan_ledger_acceptance:: -- --nocapture --test-threads=1",
+    "voiceControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --lib --locked voice_rooms::tests:: -- --test-threads=1",
     "format": "cargo fmt --all -- --check"
   },
   "database": {

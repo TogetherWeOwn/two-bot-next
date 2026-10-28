@@ -20,7 +20,9 @@ lanes cover them) while the advisory filter stays conservative.
 
 import importlib.util
 from pathlib import Path
+import subprocess
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -34,6 +36,17 @@ SPEC.loader.exec_module(job_inputs)
 
 # Pinned selector action: a moved tag would change what "affected" means.
 DORNY_PIN = "dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d"  # v4.0.3
+
+# Explicit preparation produces this one ignored content input. Its renderer,
+# materializer and fixture remain tracked behavioral inputs below; no other
+# missing path is permitted before preparation.
+GENERATED_RUST_CONTENT = "docs/generated/commands.md"
+COMMAND_REFERENCE_SOURCES = (
+    "scripts/generate_command_reference.py",
+    "crates/core/examples/generate_command_reference.rs",
+    "crates/core/tests/reference_docs.rs",
+    "crates/core/tests/fixtures/reference_settings.json",
+)
 
 # Every path here can change what the nextest lane executes: sources, the
 # compiled-in fixtures, manifests, the nextest profile, the lane definition
@@ -59,7 +72,7 @@ NEXTEST_BEHAVIOR_INPUTS = (
     ".github/workflows/reusable-rust-nextest.yml",
     ".github/workflows/ci-speed.yml",
     ".github/workflows/check.yml",
-)
+) + COMMAND_REFERENCE_SOURCES
 
 # Content-read docs and config paths classified as Rust by the authoritative
 # selector. Derive these from the selector itself so additions cannot be
@@ -106,10 +119,39 @@ class NextestAffectedPathsTests(unittest.TestCase):
         self.assertEqual(uses, DORNY_PIN)
 
     def test_behavior_inputs_exist(self):
+        tracked = set(subprocess.check_output(
+            ["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0"))
+        self.assertIn(GENERATED_RUST_CONTENT, job_inputs.RUST_DOCS)
+        self.assertNotIn(GENERATED_RUST_CONTENT, tracked)
         for path in (NEXTEST_BEHAVIOR_INPUTS + tuple(JOB_INPUT_RUST_CONTENT)
                      + IMAGE_ONLY_INPUTS + DOCS_ONLY_INPUTS):
             with self.subTest(path=path):
-                self.assertTrue((ROOT / path).exists(), f"{path} no longer exists")
+                if path != GENERATED_RUST_CONTENT:
+                    self.assertTrue((ROOT / path).exists(), f"{path} no longer exists")
+                    self.assertIn(path, tracked, f"{path} must remain a tracked input")
+
+    def test_absent_generated_reference_is_allowed_before_preparation(self):
+        exists = Path.exists
+        with mock.patch.object(Path, "exists", autospec=True, side_effect=lambda path:
+                               path != ROOT / GENERATED_RUST_CONTENT and exists(path)):
+            result = unittest.TestResult()
+            NextestAffectedPathsTests("test_behavior_inputs_exist").run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+
+    def test_missing_authored_or_canonical_input_is_rejected(self):
+        exists = Path.exists
+        for missing in ("docs/parity.md", *COMMAND_REFERENCE_SOURCES):
+            with self.subTest(missing=missing), mock.patch.object(
+                    Path, "exists", autospec=True, side_effect=lambda path:
+                    path != ROOT / missing and exists(path)):
+                result = unittest.TestResult()
+                NextestAffectedPathsTests("test_behavior_inputs_exist").run(result)
+                self.assertEqual(result.testsRun, 1)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(len(result.failures), 1)
+                self.assertIn(f"{missing} no longer exists", result.failures[0][1])
 
     def test_rust_filter_covers_nextest_behavior_inputs(self):
         _, filters = paths_filter_step()

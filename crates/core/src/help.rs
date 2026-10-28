@@ -129,7 +129,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Bans",
         requires: Some("Ban Members"),
-        commands: &["ban", "tempban"],
+        commands: &["ban", "tempban", "tempban-list"],
         anchor: None,
     },
     HelpGroup {
@@ -141,7 +141,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Timeouts and warnings",
         requires: Some("Moderate Members"),
-        commands: &["timeout", "warn"],
+        commands: &["timeout", "warn", "moderation-recent"],
         anchor: None,
     },
     HelpGroup {
@@ -314,12 +314,23 @@ pub fn unknown_help_correction() -> String {
         .to_owned()
 }
 
+/// Concise correction for a focused `/help command:… subcommand:…` request
+/// that resolves to nothing: unknown, prefix, over-deep, malformed, duplicate
+/// or rootless input. Never echoes the input or advertises unpublished paths.
+#[must_use]
+pub fn unknown_help_branch_correction() -> String {
+    "Unknown subcommand — no confirmed command path matches that.\n\
+     Use /help to see this server's last confirmed command list, then \
+     /help command:<name> for that command's subcommands."
+        .to_owned()
+}
+
 /// Render untrusted definition text inert: strip markdown/mention-active
 /// punctuation and flatten newlines so a hostile description cannot forge
 /// markup, links or mentions. Reply-level mention suppression stays the
 /// mention backstop. Generated framing (usage brackets, section headers)
 /// never passes through here.
-fn inert(text: &str) -> String {
+pub(crate) fn inert(text: &str) -> String {
     text.chars()
         .filter_map(|ch| match ch {
             '*' | '`' | '<' | '>' | '[' | ']' | '(' | ')' | '\\' => None,
@@ -732,6 +743,120 @@ impl CommandDefinition {
     }
 }
 
+/// Resolve exact space-separated subcommand/group segments below the root.
+/// Segments compare ASCII case-insensitively against nested options only;
+/// leaf arguments, prefixes and over-deep paths resolve to nothing.
+fn resolve_branch<'a>(root: &'a [CommandOption], path: &str) -> Option<Vec<&'a CommandOption>> {
+    let segments: Vec<&str> = path.split_whitespace().collect();
+    if segments.is_empty() || segments.len() > NESTING_CAP + 1 {
+        return None;
+    }
+    let mut chain = Vec::with_capacity(segments.len());
+    let mut level = root;
+    for segment in segments {
+        let found = level
+            .iter()
+            .find(|option| is_nested(option) && option.name.eq_ignore_ascii_case(segment))?;
+        chain.push(found);
+        level = &found.options;
+    }
+    Some(chain)
+}
+
+impl CommandDefinition {
+    /// Render one subcommand or group of this confirmed command: the same
+    /// definition-driven vocabulary as [`Self::help_detail_text`], but scoped
+    /// to the branch named by `path` with its own option budget, so later
+    /// siblings neither consume nor leak into the focused reply.
+    ///
+    /// `path` is space-separated exact segments, trimmed and ASCII
+    /// case-insensitive. Returns `None` for an empty, unknown, prefix or
+    /// over-deep path, and for roots without nested branches; the caller
+    /// answers [`unknown_help_branch_correction`].
+    #[must_use]
+    pub fn help_branch_text(&self, path: &str) -> Option<String> {
+        let chain = resolve_branch(&self.options, path)?;
+        let branch = *chain.last()?;
+        let parent = chain[..chain.len() - 1]
+            .iter()
+            .fold(format!("/{}", inert(&self.name)), |acc, option| {
+                format!("{acc} {}", inert(&option.name))
+            });
+        let here = format!("{parent} {}", inert(&branch.name));
+        let mut detail = Detail::default();
+        let description = cap(&inert(&branch.description), DESCRIPTION_CAP);
+        detail.push(&format!("{here} — {description}\n"));
+        let (nested, leaves): (Vec<&CommandOption>, Vec<&CommandOption>) =
+            branch.options.iter().partition(|child| is_nested(child));
+        if nested.is_empty() {
+            detail.push(&format!("Usage: {here}{}\n", usage_suffix(&leaves)));
+        } else {
+            detail.push("Usage:\n");
+            let mut lines = 0usize;
+            let mut omitted = 0usize;
+            if chain.len() > NESTING_CAP {
+                // The whole-command render never lists below this depth.
+                omitted += nested.len();
+            } else {
+                for child in &nested {
+                    collect_usage(
+                        &mut detail,
+                        &here,
+                        child,
+                        chain.len(),
+                        &mut lines,
+                        &mut omitted,
+                    );
+                }
+            }
+            if !leaves.is_empty() {
+                detail.push(&format!("- {here}{}\n", usage_suffix(&leaves)));
+            }
+            if omitted > 0 {
+                detail.push(&format!("- …({omitted} more paths omitted.)\n"));
+            }
+        }
+        let mut state = DetailState::default();
+        if !leaves.is_empty() {
+            detail.push("Arguments:\n");
+            push_option_lines(&mut detail, &leaves, &mut state);
+        }
+        if !nested.is_empty() {
+            detail.push("Subcommands:\n");
+            if chain.len() > NESTING_CAP {
+                state.omitted += nested.len();
+            } else {
+                for child in &nested {
+                    push_nested(&mut detail, &here, child, chain.len(), &mut state);
+                }
+            }
+        }
+        if state.omitted > 0 {
+            detail.push(&format!(
+                "(+{} more options, omitted from this detail.)\n",
+                state.omitted
+            ));
+        }
+        let prefix = format!("{here} ");
+        let examples: Vec<&String> = self
+            .examples
+            .iter()
+            .filter(|example| example.starts_with(&prefix) || **example == here)
+            .collect();
+        if !examples.is_empty() {
+            detail.push("Examples:\n");
+            for example in examples {
+                detail.push(&format!("- {example}\n"));
+            }
+        }
+        detail.push(&permission_sentence(
+            self.default_member_permissions.as_deref(),
+        ));
+        detail.push("\n");
+        Some(detail.finish())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,12 +908,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 43 non-voice commands (7 core + 25 feature + 9 moderation + 2 reads),
+        // 45 non-voice commands (7 core + 25 feature + 9 moderation + 4 reads),
         // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
-        // purge-preview and channel-inspect, plus 22 additional voice commands (voice
+        // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 22 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (65 live)"));
+        assert!(text.contains("**Server commands** (67 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -817,6 +942,7 @@ mod tests {
             );
         }
         for line in [
+            "**Bans** — needs Ban Members\n/ban · /tempban · /tempban-list\n",
             "**Giveaways** — needs Manage Server\n/giveaway\n",
             "**Message cleanup** — needs Manage Messages\n/purge · /purge-preview\n",
             "**Channel slowmode and locks** — needs Manage Channels\n/slowmode · /lockdown · /unlock · /channel-inspect\n",
@@ -914,11 +1040,12 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 43 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
-        // giveaway, lfg-edit, lfg-list, feed-inspect, purge-preview and channel-inspect, plus
+        // 45 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
+        // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
+        // and moderation-recent, plus
         // 22 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 65);
+        assert_eq!(grouped.len(), 67);
         for name in [
             "rank",
             "leaderboard",
@@ -945,6 +1072,7 @@ mod tests {
             "feed-inspect",
             "ban",
             "tempban",
+            "tempban-list",
             "kick",
             "timeout",
             "warn",
@@ -954,6 +1082,7 @@ mod tests {
             "unlock",
             "purge-preview",
             "channel-inspect",
+            "moderation-recent",
         ]
         .into_iter()
         .chain(
@@ -1121,5 +1250,119 @@ mod tests {
         let rendered = mixed.help_detail_text();
         assert!(rendered.contains("/mixed group leaf"));
         assert!(rendered.contains("[top]"));
+    }
+
+    /// l1 > l2 > ... > l6, each level holding the next as a sub-command and
+    /// l6 holding a leaf argument.
+    fn deep_chain() -> CommandDefinition {
+        use crate::commands::{CommandOption, CommandOptionType};
+        let mut option =
+            CommandOption::new("l6", "Level six", CommandOptionType::SubCommand).sub_options(vec![
+                CommandOption::new("arg", "Deep argument", CommandOptionType::String),
+            ]);
+        for level in (1..=5).rev() {
+            option = CommandOption::new(
+                &format!("l{level}"),
+                &format!("Level {level}"),
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![option]);
+        }
+        CommandDefinition::new("deep", "Deep nesting").options(vec![option])
+    }
+
+    #[test]
+    fn focused_depth_matches_the_whole_command_nesting_cap() {
+        let def = deep_chain();
+        let whole = def.help_detail_text();
+        // The whole render lists l5 and omits l6 entirely.
+        assert!(whole.contains("/deep l1 l2 l3 l4 l5 — Level 5"));
+        assert!(!whole.contains("l6"));
+        // Focusing the parent of l5 must list l5 as the whole render does.
+        let l4 = def.help_branch_text("l1 l2 l3 l4").expect("l4 resolves");
+        assert!(l4.contains("/deep l1 l2 l3 l4 l5 — Level 5"), "{l4}");
+        assert!(!l4.contains("l6"), "{l4}");
+        // Focusing l5 omits l6 in usage and subcommands alike, with a count.
+        let l5 = def.help_branch_text("l1 l2 l3 l4 l5").expect("l5 resolves");
+        assert!(!l5.contains("l6"), "{l5}");
+        assert!(l5.contains("omitted"), "{l5}");
+        // A sixth segment stays unresolved.
+        assert!(def.help_branch_text("l1 l2 l3 l4 l5 l6").is_none());
+    }
+
+    #[test]
+    fn focused_examples_keep_only_the_matching_branch() {
+        use crate::commands::{CommandOption, CommandOptionType};
+        let def = CommandDefinition::new("proj", "Project tools")
+            .options(vec![
+                CommandOption::new("alpha", "Alpha", CommandOptionType::SubCommand).sub_options(
+                    vec![CommandOption::new(
+                        "member",
+                        "Member",
+                        CommandOptionType::String,
+                    )],
+                ),
+                CommandOption::new("beta", "Beta", CommandOptionType::SubCommand),
+                CommandOption {
+                    kind: 2,
+                    ..CommandOption::new("team", "Team tools", CommandOptionType::SubCommand)
+                }
+                .sub_options(vec![CommandOption::new(
+                    "alpha",
+                    "Team alpha",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "member",
+                    "Member",
+                    CommandOptionType::String,
+                )])]),
+            ])
+            .examples(vec![
+                "/proj alpha".to_owned(),
+                "/proj alpha member:42".to_owned(),
+                "/proj beta".to_owned(),
+                "/proj alphabet".to_owned(),
+                "/proj team alpha".to_owned(),
+                "/proj team alpha member:42".to_owned(),
+                "/proj team beta member:42".to_owned(),
+                "/proj team alphabet member:42".to_owned(),
+            ]);
+        let alpha = def.help_branch_text("alpha").expect("alpha resolves");
+        assert!(alpha.contains("Examples:\n- /proj alpha\n"), "{alpha}");
+        assert!(alpha.contains("Usage: /proj alpha [member]"), "{alpha}");
+        assert!(alpha.contains("- /proj alpha member:42\n"), "{alpha}");
+        for (path, expected) in [
+            ("alpha", vec!["- /proj alpha", "- /proj alpha member:42"]),
+            (
+                "team alpha",
+                vec!["- /proj team alpha", "- /proj team alpha member:42"],
+            ),
+        ] {
+            let focused = def.help_branch_text(path).expect("branch resolves");
+            let examples: Vec<_> = focused
+                .lines()
+                .skip_while(|line| *line != "Examples:")
+                .skip(1)
+                .take_while(|line| line.starts_with("- "))
+                .collect();
+            assert_eq!(examples, expected, "{focused}");
+        }
+        assert!(!alpha.contains("/proj beta"), "{alpha}");
+        // A shared name prefix is not a match: the example must be exact or
+        // continue after a space.
+        assert!(!alpha.contains("/proj alphabet"), "{alpha}");
+        // A branch with no matching example prints no Examples section.
+        let none = CommandDefinition::new("proj", "Project tools")
+            .options(vec![CommandOption::new(
+                "gamma",
+                "Gamma",
+                CommandOptionType::SubCommand,
+            )])
+            .examples(vec!["/proj other".to_owned()]);
+        assert!(!none
+            .help_branch_text("gamma")
+            .expect("gamma")
+            .contains("Examples:"));
     }
 }

@@ -16,8 +16,8 @@
 // - `/create`, `/textchannels`, `/position`, `/group`,
 //   `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate` check
 //   `may_create` (Manage Channels);
-// - `/access` and `/logging` check `member.is_admin` (same Manage Channels
-//   helper);
+// - `/access`, `/logging` and `/voice-orphans` require trusted Manage Channels
+//   or Administrator authority before persistence (same admin helper);
 // - `/export`, `/import` (upload + Confirm/Cancel) check
 //   `may_manage_server` (Manage Guild).
 // Representative protected commands below plus the cold-to-ready transition
@@ -616,4 +616,83 @@ async fn cold_import_upload_replies_warming_up_without_side_effects() {
         "cold /import must not send or persist, trace: {:?}",
         trace.lock().unwrap()
     );
+}
+
+#[tokio::test]
+async fn cold_to_ready_orphans_preserves_authority_states_before_store_construction() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let trace = Trace::default();
+    let constructions = std::sync::Arc::new(AtomicUsize::new(0));
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            let constructions = constructions.clone();
+            move || {
+                constructions.fetch_add(1, Ordering::SeqCst);
+                (Store::new(trace.clone()), Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    let staff = voice_interaction(
+        Some(command_data("voice-orphans", vec![])),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (owned, response) = cold_handle(&runtime, &staff).await;
+    assert!(owned);
+    let response = response.expect("cold orphan inspection replies");
+    assert_warming_up(&response_text(&response), "cold /voice-orphans");
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+    assert_eq!(
+        constructions.load(Ordering::SeqCst),
+        0,
+        "cold facts must not construct a store"
+    );
+    assert!(trace.lock().unwrap().is_empty());
+
+    // Publish trusted facts without a background worker that could hide SQL or effects.
+    let live = LiveGuild::new(GUILD);
+    live.publish(command_snapshot());
+    let (tx, _inbox) = mpsc::unbounded_channel();
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live,
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
+    let (owned, response) = cold_handle(&runtime, &staff).await;
+    assert!(owned);
+    let text = response_text(&response.expect("ready staff replies"));
+    // The memory adapter deliberately has no evidence store. Its explicit read
+    // error proves authorization reached storage, rather than inventing success.
+    assert!(
+        text.contains("Could not read voice orphan evidence"),
+        "{text}"
+    );
+    assert!(!text.contains("You need Manage Channels"));
+    assert!(!text.to_ascii_lowercase().contains("warm"));
+    assert!(constructions.load(Ordering::SeqCst) > 0);
+
+    let before_denied = constructions.load(Ordering::SeqCst);
+    let denied = voice_interaction(Some(command_data("voice-orphans", vec![])), None, true);
+    let (owned, response) = cold_handle(&runtime, &denied).await;
+    assert!(owned);
+    assert_permanent_denial(
+        &response_text(&response.expect("known denial replies")),
+        "ready denied /voice-orphans",
+    );
+    assert_eq!(
+        constructions.load(Ordering::SeqCst),
+        before_denied,
+        "known denial must not construct a store"
+    );
+    assert!(trace.lock().unwrap().is_empty());
 }

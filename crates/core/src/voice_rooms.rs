@@ -1568,13 +1568,13 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("invite", "Show this server's invite link"),
         CommandDefinition::new(
             "textchannels",
-            "Toggle companion text channels for one creator channel",
+            "Toggle companion text channels for one creator channel; channel alone shows current settings",
         )
         .permissions(PERM_MANAGE_CHANNELS)
         .options(vec![
             CommandOption::new(
                 "channel",
-                "Creator voice channel to configure",
+                "Creator voice channel to configure (alone: show current settings)",
                 CommandOptionType::Channel,
             )
             .required(),
@@ -1753,13 +1753,13 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         .required()]),
         CommandDefinition::new(
             "position",
-            "Set where new rooms appear and the first room number",
+            "Set where new rooms appear and the first room number; channel alone shows current settings",
         )
         .permissions(PERM_MANAGE_CHANNELS)
         .options(vec![
             CommandOption::new(
                 "channel",
-                "Creator voice channel to configure",
+                "Creator voice channel to configure (alone: show current settings)",
                 CommandOptionType::Channel,
             )
             .required(),
@@ -1787,19 +1787,19 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         ]),
         CommandDefinition::new(
             "group",
-            "Toggle shared numbering per category for one creator channel",
+            "Toggle shared numbering per category for one creator channel; channel alone shows current settings",
         )
         .permissions(PERM_MANAGE_CHANNELS)
         .options(vec![
             CommandOption::new(
                 "channel",
-                "Creator voice channel to configure",
+                "Creator voice channel to configure (alone: show current settings)",
                 CommandOptionType::Channel,
             )
             .required(),
             CommandOption::new(
                 "enabled",
-                "Share numbering across the category (required: choose on or off)",
+                "Share numbering across the category (leave empty to show current settings)",
                 CommandOptionType::Boolean,
             ),
         ]),

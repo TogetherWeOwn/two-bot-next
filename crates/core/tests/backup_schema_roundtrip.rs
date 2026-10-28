@@ -1575,10 +1575,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
@@ -1593,6 +1593,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1619,7 +1620,8 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "voice_orphan_ledger"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1640,6 +1642,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1666,10 +1669,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -1682,6 +1685,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1706,7 +1710,8 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "voice_orphan_ledger"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1725,6 +1730,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1751,10 +1757,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // event voice pair and starboard tables.
@@ -1769,6 +1775,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1792,7 +1799,8 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "voice_orphan_ledger"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1810,6 +1818,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1844,10 +1853,10 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
@@ -1860,6 +1869,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1882,7 +1892,8 @@ async fn v11_archive_restores_and_clears_newer_registry() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "voice_orphan_ledger"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1899,6 +1910,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1933,10 +1945,10 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for table in [
         "event_voice_channels",
         "event_voice_presence",
@@ -1946,6 +1958,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
@@ -1967,7 +1980,8 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "voice_orphan_ledger"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1983,6 +1997,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2017,10 +2032,10 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen registry-present v12 shape: the released writer carried the
     // token registry but predates the event voice pair and starboard tables.
     for name in [
@@ -2032,6 +2047,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2059,7 +2075,8 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "voice_orphan_ledger"
         ]
     );
     assert_eq!(
@@ -2095,6 +2112,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2141,10 +2159,10 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "starboard_config",
         "starboard_starrers",
@@ -2152,6 +2170,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         assert!(
             !old.buffers.remove(name).unwrap().is_empty(),
@@ -2185,7 +2204,8 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "voice_orphan_ledger"
         ]
     );
     for name in &restored_tables {
@@ -2234,6 +2254,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "voice_orphan_ledger",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2270,11 +2291,16 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    assert_eq!(old.manifest.version, 16);
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "voice_orphan_ledger",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -2293,7 +2319,12 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
     assert_eq!(inspected.manifest.version, 14);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["giveaways", "giveaway_entries", "giveaway_draws"]
+        [
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "voice_orphan_ledger"
+        ]
     );
     sqlx::query("DELETE FROM starboard_starrers")
         .execute(pool)
@@ -2335,7 +2366,12 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         archived,
         "v14 restores starboard, voice and registry data"
     );
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "voice_orphan_ledger",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -3010,4 +3046,83 @@ async fn restore_refences_pre_0142_pending_scheduled_rows() {
     assert_eq!(nonce.as_deref(), Some("synthetic-nonce"));
     assert!(fenced, "an old archive never proves the occurrence unsent");
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v16_recovers_retained_orphan_evidence_into_a_fresh_database() {
+    let source = database()
+        .await
+        .expect("explicit disposable source required");
+    let target = database()
+        .await
+        .expect("explicit disposable recovery target required");
+    seed(source.pool()).await;
+    let ledger = vec!["voice_orphan_ledger".to_owned()];
+    let expected = snapshot(source.pool(), &ledger).await;
+    assert_eq!(expected["voice_orphan_ledger"].rows.len(), 3);
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("retained-orphans-v16.ndjson.gz");
+    dump(source.pool(), &path).await.unwrap();
+    let archive = inspect(&path).unwrap();
+    assert_eq!(archive.manifest.version, 16);
+    assert_eq!(archive.manifest.tables.len(), 108);
+    assert_eq!(archive.buffers["voice_orphan_ledger"].len(), 3);
+    assert!(
+        snapshot(target.pool(), &ledger).await["voice_orphan_ledger"]
+            .rows
+            .is_empty()
+    );
+    assert!(restore(target.pool(), &path).await.unwrap().ok);
+    assert_eq!(snapshot(target.pool(), &ledger).await, expected);
+    target.close().await.unwrap();
+    source.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_v15_restore_clears_newer_orphans_without_losing_giveaways() {
+    let source = database()
+        .await
+        .expect("explicit disposable source required");
+    let target = database()
+        .await
+        .expect("explicit disposable recovery target required");
+    seed(source.pool()).await;
+    let preserved = vec![
+        "giveaways".to_owned(),
+        "giveaway_entries".to_owned(),
+        "giveaway_draws".to_owned(),
+    ];
+    let expected = snapshot(source.pool(), &preserved).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("current-v16.ndjson.gz");
+    dump(source.pool(), &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.buffers.remove("voice_orphan_ledger").unwrap().len(), 3);
+    old.manifest
+        .tables
+        .retain(|table| table.name != "voice_orphan_ledger");
+    assert_eq!(old.manifest.tables.len(), 107, "released v15 inventory");
+    old.manifest.version = 15;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("frozen-pre-ledger-v15.ndjson.gz");
+    write_archive(&old_path, &old);
+    assert_eq!(
+        inspect(&old_path).unwrap().manifest.missing_tables(),
+        ["voice_orphan_ledger"]
+    );
+    sqlx::query("INSERT INTO voice_orphan_ledger (guild_id, channel_id, reason) VALUES ('999', '888', 'creator_compensation_failed')")
+        .execute(target.pool()).await.unwrap();
+    assert!(restore(target.pool(), &old_path).await.unwrap().ok);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_orphan_ledger")
+        .fetch_one(target.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "old recovery points must clear unrelated destination evidence"
+    );
+    assert_eq!(snapshot(target.pool(), &preserved).await, expected);
+    target.close().await.unwrap();
+    source.close().await.unwrap();
 }

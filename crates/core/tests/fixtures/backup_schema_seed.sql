@@ -708,3 +708,13 @@ VALUES (100000000000000001, 100000000000000003, 100000000000000006,
         100000000000000010, 100000000000000020, 2, 'posted'),
        (100000000000000001, 100000000000000003, 100000000000000007,
         100000000000000010, NULL, 1, 'below_threshold');
+
+-- Untracked creator compensation evidence has no room/creator foreign key.
+-- Multiple guilds and equal timestamps must survive byte-for-byte recovery.
+INSERT INTO voice_orphan_ledger (guild_id, channel_id, reason, recorded_at)
+VALUES ('100000000000000001', '100000000000000091', 'creator_compensation_failed',
+        '2026-08-03T10:06:00.123456Z'),
+       ('100000000000000001', '100000000000000092', 'creator_compensation_failed',
+        '2026-08-03T10:06:00.123456Z'),
+       ('100000000000000009', '100000000000000091', 'creator_compensation_failed',
+        '2026-08-04T11:00:00.987654Z');

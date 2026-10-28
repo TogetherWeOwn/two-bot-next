@@ -8285,6 +8285,7 @@ fn requires_guild_authority(command: &VoiceCommand) -> bool {
             | VoiceCommand::AlwaysPrivate { .. }
             | VoiceCommand::Access(_)
             | VoiceCommand::Logging(_)
+            | VoiceCommand::Orphans { .. }
             | VoiceCommand::Export
             | VoiceCommand::Import { .. }
     )
@@ -12116,6 +12117,18 @@ pub enum VoiceCommand {
         command: &'static str,
         field: &'static str,
     },
+    /// `/logging` arrived with an ambiguous shape: a known option sent twice,
+    /// with the wrong wire type, or more than one action. Answered with a
+    /// private correction before the role gate and every read or effect.
+    LoggingShapeInvalid {
+        field: &'static str,
+    },
+    /// `/kick` arrived with a repeated or wrong-typed `reason`. Answered with
+    /// a private correction before any read, ballot or ledger claim; the
+    /// vote never starts with a silently dropped reason.
+    KickReasonInvalid {
+        target: Snowflake,
+    },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
     /// Owner (or admin) hands the room to an occupant, who becomes the
@@ -12580,9 +12593,10 @@ fn parse_voice_command_with_registry(
             Some(VoiceCommand::Transfer { target_id })
         }
         "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
-        "logging" => Some(VoiceCommand::Logging(parse_logging_action(
-            &command.options,
-        ))),
+        "logging" => Some(match logging_shape_refusal(&command.options) {
+            Some(field) => VoiceCommand::LoggingShapeInvalid { field },
+            None => VoiceCommand::Logging(parse_logging_action(&command.options)),
+        }),
         "export" => Some(VoiceCommand::Export),
         "import" => Some(VoiceCommand::Import {
             file_id: command.options.iter().find_map(|option| {
@@ -12601,9 +12615,15 @@ fn parse_voice_command_with_registry(
         // the published shape, decides vote-kick versus moderation kick, so
         // accept both. An unparsable shape stays silent here so the shared
         // router keeps the interaction.
-        "kick" => parse_kick_target(&command.options).map(|target| VoiceCommand::Kick {
-            target,
-            reason: parse_kick_reason(&command.options),
+        "kick" => parse_kick_target(&command.options).map(|target| {
+            if kick_reason_malformed(&command.options) {
+                VoiceCommand::KickReasonInvalid { target }
+            } else {
+                VoiceCommand::Kick {
+                    target,
+                    reason: parse_kick_reason(&command.options),
+                }
+            }
         }),
         "limit" => Some(VoiceCommand::Limit(limit::parse_limit_arg(
             &command.options,
@@ -12801,6 +12821,67 @@ fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
         })
 }
 
+/// Whether `reason` is sent twice or with a non-text wire type. An omitted
+/// reason is well formed (the vote starts without a reason line); a malformed
+/// one must refuse, never post a ballot that drops the stated reason.
+fn kick_reason_malformed(options: &[CommandDataOption]) -> bool {
+    matches!(
+        decode_strict_arg(options, "reason", |value| {
+            matches!(value, CommandOptionValue::String(_)).then_some(())
+        }),
+        StrictArg::Invalid
+    )
+}
+
+/// Private correction for a malformed `/kick` reason. Echoes no input.
+fn kick_reason_correction() -> String {
+    "That `/kick` call has a problem with its `reason` option: send it at most once, as text. \
+     Nothing was changed and no vote was started. Try:\n`/kick member: @member reason: too loud`"
+        .to_owned()
+}
+
+/// Strictly decode `/logging`'s shape: exactly one action, and the selected
+/// action's known option sent at most once. Returns the offending field
+/// (`subcommand` for more than one action). Unknown names inside the action
+/// stay ignored. A single missing or wrong-typed option keeps today's
+/// [`LoggingAction::Invalid`] refusal (or clear, for an omitted optional
+/// `channel`/`role`), so only the ambiguous duplicates change.
+fn logging_shape_refusal(options: &[CommandDataOption]) -> Option<&'static str> {
+    if options.len() > 1 {
+        return Some("subcommand");
+    }
+    let sub = options.first()?;
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return None;
+    };
+    let field = match sub.name.as_str() {
+        "level" => "level",
+        "channel" => "channel",
+        "mention" => "role",
+        _ => return None,
+    };
+    (args.iter().filter(|option| option.name == field).count() > 1).then_some(field)
+}
+
+/// Private correction for a malformed `/logging` call. Names the field and a
+/// copyable invocation; echoes no input.
+fn logging_shape_correction(field: &str) -> String {
+    if field == "subcommand" {
+        return "That `/logging` call has more than one action: send exactly one of show, level, \
+                channel or mention. Nothing was changed. Try:\n`/logging show`"
+            .to_owned();
+    }
+    let usage = match field {
+        "level" => "level level: full",
+        "channel" => "channel channel: #logs",
+        _ => "mention role: @role",
+    };
+    format!(
+        "That `/logging` call has a problem with its `{field}` option: send it exactly once, \
+         with the right type. Nothing was changed. Try:\n`/logging {usage}`"
+    )
+}
+
 /// The invoker's server display name: nickname, then global name, then user
 /// name. Empty when the interaction carries no user.
 fn interaction_display_name(interaction: &Interaction) -> String {
@@ -12988,12 +13069,12 @@ impl VoiceCommand {
             Self::Private => "private",
             Self::Public => "public",
             Self::Transfer { .. } => "transfer",
-            Self::Logging(_) => "logging",
+            Self::Logging(_) | Self::LoggingShapeInvalid { .. } => "logging",
             Self::Export => "export",
             Self::Import { .. } => "import",
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
-            Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Kick { .. } | Self::KickReasonInvalid { .. } | Self::Ballot { .. } => "kick",
             Self::Limit(_) => "limit",
             Self::Unlimit => "unlimit",
             Self::Name => "name",
@@ -13979,15 +14060,15 @@ where
         reply(ephemeral_response(&setup_shape_correction(command, field))).await;
         return true;
     }
-    // Evidence is staff-only even when the payload claims Administrator.
-    // Do this before the shared role gate constructs a store or reads SQL.
-    if matches!(command, VoiceCommand::Orphans { .. })
-        && !is_voice_admin(runtime.guild_permissions(interaction))
-    {
-        reply(ephemeral_response(
-            "You need Manage Channels to use /voice-orphans. If permissions are syncing, try again shortly.",
-        ))
-        .await;
+    // Ambiguous `/logging` and `/kick` options refuse the same way, so a
+    // duplicate or wrong-typed option never saves a setting or posts a
+    // ballot that silently dropped the stated reason.
+    if let VoiceCommand::LoggingShapeInvalid { field } = &command {
+        reply(ephemeral_response(&logging_shape_correction(field))).await;
+        return true;
+    }
+    if matches!(command, VoiceCommand::KickReasonInvalid { .. }) {
+        reply(ephemeral_response(&kick_reason_correction())).await;
         return true;
     }
     // Cold guild-role facts are not a permanent denial: a command that
@@ -13997,6 +14078,17 @@ where
     let authority = runtime.guild_authority(interaction);
     if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
         reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        return true;
+    }
+    // Evidence is staff-only even when the payload claims Administrator.
+    // Do this before the shared role gate constructs a store or reads SQL.
+    if matches!(command, VoiceCommand::Orphans { .. })
+        && !is_voice_admin(runtime.guild_permissions(interaction))
+    {
+        reply(ephemeral_response(
+            "You need Manage Channels to use /voice-orphans. If permissions are syncing, try again shortly.",
+        ))
+        .await;
         return true;
     }
     // Guild-level role gate first. Settings that cannot be read fail closed for
@@ -14260,6 +14352,14 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.enabled.is_none()
+                        && request.name.is_none()
+                        && request.viewer_role.is_none() =>
+                {
+                    text_channels_summary(&creator)
+                }
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
                     TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14292,6 +14392,12 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator))
+                    if request.position.is_none() && request.first_number.is_none() =>
+                {
+                    position_summary(&creator)
+                }
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
                     PositionPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14324,6 +14430,8 @@ where
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
+                // Channel alone reads back the saved settings; nothing is saved.
+                Ok(Some(creator)) if request.enabled.is_none() => group_summary(&creator),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
                     GroupPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -14456,6 +14564,14 @@ where
             // any read), but a second dispatch path must still refuse here,
             // never run.
             reply(ephemeral_response(&setup_shape_correction(command, field))).await;
+            true
+        }
+        VoiceCommand::LoggingShapeInvalid { field } => {
+            reply(ephemeral_response(&logging_shape_correction(field))).await;
+            true
+        }
+        VoiceCommand::KickReasonInvalid { .. } => {
+            reply(ephemeral_response(&kick_reason_correction())).await;
             true
         }
         VoiceCommand::Reclaim => {
@@ -15214,7 +15330,7 @@ where
         // would race it and could answer twice.
         if matches!(
             runtime.parse_voice_command(interaction),
-            Some(VoiceCommand::Kick { .. })
+            Some(VoiceCommand::Kick { .. } | VoiceCommand::KickReasonInvalid { .. })
         ) {
             return;
         }
@@ -15321,7 +15437,8 @@ where
         if !runtime.enabled {
             return false;
         }
-        let Some(VoiceCommand::Kick { target, .. }) = runtime.parse_voice_command(interaction)
+        let Some(VoiceCommand::Kick { target, .. } | VoiceCommand::KickReasonInvalid { target }) =
+            runtime.parse_voice_command(interaction)
         else {
             return false;
         };
@@ -15423,7 +15540,10 @@ where
         if let Event::InteractionCreate(created) = event {
             let command = self.runtime.parse_voice_command(&created.0);
             // The shared router answers `/kick`; see `kick_vote`.
-            if matches!(command, Some(VoiceCommand::Kick { .. })) {
+            if matches!(
+                command,
+                Some(VoiceCommand::Kick { .. } | VoiceCommand::KickReasonInvalid { .. })
+            ) {
                 return;
             }
             if command.is_none()

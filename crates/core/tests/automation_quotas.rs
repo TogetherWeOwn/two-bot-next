@@ -316,7 +316,8 @@ async fn write(pool: &PgPool, quota: AutomationQuota, id: &str) -> Result<(), Qu
                 .map(|_| ())
         }
         AutomationQuota::Feeds => match feeds_store::add_feed(pool, &feed(GUILD, id, true)).await {
-            Ok(()) => Ok(()),
+            Ok(feeds_store::FeedAddOutcome::Created) => Ok(()),
+            Ok(feeds_store::FeedAddOutcome::Existing { .. }) => panic!("quota fixture must be new"),
             Err(FeedStoreError::Capacity(quota)) => Err(QuotaWriteError::Capacity(quota)),
             Err(FeedStoreError::Db(error)) => Err(error.into()),
             Err(error) => panic!("valid fixture feed rejected: {error}"),
