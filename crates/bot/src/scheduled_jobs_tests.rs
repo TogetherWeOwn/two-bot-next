@@ -1,5 +1,7 @@
 #[path = "event_reminder_acceptance_tests.rs"]
 mod event_reminder_acceptance;
+#[path = "event_reminder_deadline_tests.rs"]
+mod event_reminder_deadline;
 #[path = "event_reminder_regression_tests.rs"]
 mod event_reminder_regression;
 #[path = "scheduled_phase_isolation_acceptance_tests.rs"]
