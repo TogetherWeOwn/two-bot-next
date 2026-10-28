@@ -1,4 +1,4 @@
-"""Lock the Rust CI lanes' disk-hygiene surface; no GitHub or PyYAML needed.
+"""Lock disk hygiene to executing Rust CI workers, with offline process doubles.
 
 Two consecutive main `check` failures died in the `cargo test --workspace
 --test '*'` link step on hosted overflow runners: the job-container overlay
@@ -6,8 +6,8 @@ ran out of space (98 MB left), then `rust-lld` bus error. Unit tests passed
 in the same jobs; infra disk-fit, not a code regression.
 
 The old single `check` job is now parallel lanes (`check` lints,
-`rust-tests`, `coverage-shard`, `ignored-db-stores` and `ignored-db-runtime`
-test); each runs in its own job container, so each keeps the guards (TOG-12134):
+`rust-tests-partition`, `coverage-shard`, `ignored-db-stores` and
+`ignored-db-runtime-partition` test); each execution worker keeps the guards:
 - every lane pins dev/test debuginfo to `line-tables-only`: smaller linked
   binaries, backtraces stay useful.
 - every lane disables dev/test incremental compilation: a cold CI link never
@@ -18,9 +18,9 @@ test); each runs in its own job container, so each keeps the guards (TOG-12134):
   and every compile/link step: the deny image ships its own toolchain and
   rustup-syncs the pinned one (a second ~1 GB toolchain download), so it
   must run while the disk is at its freest (CHANGES on PR #232, 07:31Z).
-- the `rust-tests` integration step still runs the full
-  `--workspace --test '*'` graph: coverage must not be narrowed as a
-  substitute for freeing disk.
+- the Rust partition workers still execute the full integration graph,
+  including future targets, with the same features, replays and isolation:
+  coverage must not be narrowed as a substitute for freeing disk.
 - every lane carries a disk-headroom guard right after its prerequisites
   step: it logs `df` evidence and fails fast below a 1 GiB floor instead of
   dying mid-suite (run 39209332791: ignored-db-stores died with Postgres
@@ -41,14 +41,23 @@ roughly half the runs. Every lane that runs pip installs the components
 before its first pip run.
 """
 
+import json
 import re
+import sys
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/check.yml"
+sys.path.insert(0, str(ROOT / "scripts/ci"))
 
-FULL_INTEGRATION_RUN = "cargo test --workspace --test '*' --features two-bot-core/db --locked"
+from test_critical_path_partitions_acceptance import (
+    BASELINE, evolving_inventory, list_partitions, matrix_entries,
+)
+from test_critical_path_gates_acceptance import run_gate
+from test_critical_path_support import Sandbox, assertions_message, ledger, resolved_env
 
 
 def job_body_lines(text, job_key):
@@ -95,7 +104,11 @@ def step_body(body, step_name):
     return "\n".join(taken)
 
 
-LANES = ("check", "rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime")
+LANES = ("check", "rust-tests-partition", "coverage-shard", "ignored-db-stores", "ignored-db-runtime-partition")
+PARTITION_LANES = {
+    "rust-tests-partition": "rust-tests",
+    "ignored-db-runtime-partition": "ignored-db-runtime",
+}
 PREREQUISITES = "Job-container prerequisites"
 GUARD = "Guard runner disk headroom"
 VERIFY = "Verify disposable Postgres defaults"
@@ -117,6 +130,7 @@ class CheckDiskHygieneTests(unittest.TestCase):
         cls.text = WORKFLOW.read_text()
         cls.jobs = {lane: job_body_lines(cls.text, lane) for lane in LANES}
         cls.envs = {lane: child_block(body, "env:", 4) for lane, body in cls.jobs.items()}
+        cls.specs = yaml.safe_load(cls.text)["jobs"]
 
     def assertEnv(self, lane, key, value):
         line = next(
@@ -145,11 +159,83 @@ class CheckDiskHygieneTests(unittest.TestCase):
                 self.assertIn("rm -rf /var/lib/apt/lists", step_body(body, name))
 
     def test_integration_coverage_not_narrowed(self):
-        integration = step_body(
-            self.jobs["rust-tests"],
-            "cargo test (integration, including website acceptance and backup round trip)",
-        )
-        self.assertIn(FULL_INTEGRATION_RUN, integration)
+        # Execute the real planner/matrix/runner with Cargo doubled below the
+        # selection boundary. The immutable pre-partition ledger independently
+        # specifies targets, features, multiplicities, serial/quarantine bounds
+        # and environments; an echo, comment or arbitrary Cargo marker has no
+        # selected executions and cannot satisfy it. Future targets and a new
+        # workspace member are added without editing the frozen recording.
+        rows = evolving_inventory()
+        sandbox = Sandbox(rows)
+        self.addCleanup(sandbox.close)
+        for worker, lane in PARTITION_LANES.items():
+            with self.subTest(worker=worker):
+                job = self.specs[worker]
+                dispatch = [s for s in job["steps"] if s.get("id") == "run_partition"]
+                self.assertEqual(len(dispatch), 1, "worker lost its executable dispatch")
+                step = dispatch[0]
+                expected = list_partitions(self, sandbox, lane)
+                entries = matrix_entries(self, sandbox, job, self.specs)
+                self.assertEqual(entries, expected, "workflow disconnected or narrowed its planner")
+                executions = []
+                for entry in entries:
+                    sandbox.clear()
+                    env = resolved_env(job, step, sandbox, entry)
+                    self.assertEqual(env.get("CI_TEST_LANE"), lane)
+                    self.assertEqual(env.get("CI_TEST_PARTITION"), entry["partition"])
+                    proc = sandbox.run(step["run"], env)
+                    self.assertEqual(proc.returncode, 0, assertions_message(proc))
+                    records = sandbox.records()
+                    self.assertTrue(records, "partition mention did not execute any tests")
+                    executions.extend(records)
+                self.assertEqual(
+                    ledger(executions, rows, environments=True),
+                    ledger(BASELINE["lanes"][lane], rows, environments=True),
+                    "partition dispatch lost or changed baseline executions",
+                )
+
+    def test_guarded_workers_feed_strict_stable_final_checks(self):
+        sandbox = Sandbox()
+        self.addCleanup(sandbox.close)
+        for worker, lane in PARTITION_LANES.items():
+            with self.subTest(worker=worker):
+                job = self.specs[worker]
+                self.assertEqual(job["needs"], ["job-inputs", "test-partition-plan"])
+                self.assertEqual(job.get("if"), "needs.job-inputs.outputs.rust != 'false'")
+                self.assertFalse(job.get("continue-on-error", False))
+                self.assertFalse(job["strategy"]["fail-fast"])
+                dispatch = [s for s in job["steps"] if s.get("id") == "run_partition"]
+                self.assertEqual(len(dispatch), 1)
+                env = job.get("env", {}) | dispatch[0].get("env", {})
+                self.assertEqual(env.get("CI_TEST_LANE"), lane)
+                self.assertEqual(env.get("CI_TEST_PARTITION"), "${{ matrix.partition }}")
+                self.assertEqual(dispatch[0].get("if", "success()"), "success()")
+                self.assertFalse(dispatch[0].get("continue-on-error", False))
+                self.assertIn("agent-testdb", job.get("services", {}))
+
+                final = self.specs[lane]
+                self.assertEqual(final["needs"], ["job-inputs", worker])
+                self.assertEqual(final.get("if"), "always() && needs.job-inputs.outputs.rust != 'false'")
+                self.assertFalse(final.get("continue-on-error", False))
+                self.assertNotIn("services", final)
+                self.assertNotIn("matrix", final.get("strategy", {}))
+                self.assertNotIn("cargo test", "\n".join(job_body_lines(self.text, lane)))
+                download = [s for s in final["steps"]
+                            if s.get("uses", "").startswith("actions/download-artifact@")]
+                self.assertEqual(len(download), 1)
+                self.assertEqual(download[0]["with"], {
+                    "pattern": f"test-partition-{lane}-*", "path": "test-partition-receipts",
+                    "merge-multiple": True,
+                })
+                for step in final["steps"]:
+                    self.assertEqual(step.get("if", "success()"), "success()")
+                    self.assertFalse(step.get("continue-on-error", False))
+                self.assertEqual(run_gate(sandbox, final).returncode, 0)
+                for outcome in ("failure", "cancelled", "skipped", ""):
+                    self.assertNotEqual(run_gate(sandbox, final, {worker: outcome}).returncode, 0)
+                self.assertNotEqual(run_gate(sandbox, final, receipts=None).returncode, 0)
+                self.assertIn(lane, self.specs["ci-ok"]["needs"])
+                self.assertNotEqual(run_gate(sandbox, self.specs["ci-ok"], {lane: "failure"}).returncode, 0)
 
     def test_deny_runs_before_toolchain_and_compiles(self):
         names = step_names(self.jobs["check"])
@@ -182,6 +268,9 @@ class CheckDiskHygieneTests(unittest.TestCase):
                     "before the toolchain install and cache restore",
                 )
                 guard = step_body(body, GUARD)
+                spec = next(s for s in self.specs[lane]["steps"] if s.get("name") == GUARD)
+                self.assertEqual(spec.get("if", "success()"), "success()")
+                self.assertFalse(spec.get("continue-on-error", False))
                 self.assertIn("shell: bash", guard)
                 self.assertIn("df -h", guard)
                 self.assertIn("floor=1073741824", guard)
@@ -229,14 +318,55 @@ class CheckDiskHygieneTests(unittest.TestCase):
                 self.assertIn("pg_ls_waldir()", post)
                 self.assertIn("max_wal_size", post)
                 self.assertIn("min_wal_size", post)
-                test_steps = [
-                    index for index, name in enumerate(names)
-                    if "cargo test" in step_body(body, name)
-                    or "cargo nextest" in step_body(body, name)
-                    or "Patch coverage" in name
-                ]
-                self.assertTrue(test_steps)
-                self.assertGreater(names.index(POST_REPORT), max(test_steps))
+                job = self.specs[lane]
+                self.assertIn("agent-testdb", job.get("services", {}))
+                steps = job["steps"]
+                if lane in PARTITION_LANES:
+                    # This is the executable dispatch independently replayed
+                    # above, not a step name or a script mention in trivia.
+                    test_steps = [i for i, s in enumerate(steps) if s.get("id") == "run_partition"]
+                    self.assertEqual(len(test_steps), 1)
+                elif lane == "coverage-shard":
+                    test_steps = [i for i, s in enumerate(steps) if "SHARD_LEGS" in s.get("env", {})]
+                    self.assertEqual(len(test_steps), 1)
+                else:
+                    # Direct Cargo commands only: echo/comment/env strings
+                    # containing "cargo test" are not executable suite steps.
+                    test_steps = [i for i, s in enumerate(steps) if re.search(
+                        r"(?m)^\s*(?:env(?:\s+-u\s+\w+)*\s+)?cargo\s+(?:test|nextest)\s",
+                        s.get("run", ""),
+                    )]
+                self.assertTrue(test_steps, "worker has no executable suite dispatch")
+                positions = {s.get("name"): i for i, s in enumerate(steps)}
+                self.assertLess(positions[REPORT], min(test_steps))
+                self.assertGreater(positions[POST_REPORT], max(test_steps))
+                self.assertEqual(steps[positions[POST_REPORT]].get("if"), "always()")
+
+    def test_storage_reports_execute_exact_queries_and_fail_closed(self):
+        sandbox = Sandbox()
+        self.addCleanup(sandbox.close)
+        log = sandbox.root / "headroom-calls.jsonl"
+        sandbox.executable("psql", '''import json, os, sys
+with open(os.environ["HEADROOM_LOG"], "a") as out:
+    out.write(json.dumps(sys.argv[1:]) + "\\n")
+raise SystemExit(int(os.environ.get("PSQL_EXIT", "0")))
+''')
+        expected = [
+            "postgres://agent_test:@agent-testdb:5432/agent_test", "-X", "-w", "-v", "ON_ERROR_STOP=1",
+            "-c", "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1",
+            "-c", "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()",
+            "-c", "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1",
+        ]
+        for lane in LANES[1:]:
+            for name in (REPORT, POST_REPORT):
+                with self.subTest(lane=lane, report=name):
+                    step = next(s for s in self.specs[lane]["steps"] if s.get("name") == name)
+                    log.unlink(missing_ok=True)
+                    env = resolved_env(self.specs[lane], step, sandbox) | {"HEADROOM_LOG": str(log)}
+                    proc = sandbox.run(step["run"], env)
+                    self.assertEqual(proc.returncode, 0, assertions_message(proc))
+                    self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], [expected])
+                    self.assertNotEqual(sandbox.run(step["run"], env | {"PSQL_EXIT": "43"}).returncode, 0)
 
     def test_toolchain_components_installed_before_first_pip_run(self):
         install = "Install pinned Rust toolchain components"
