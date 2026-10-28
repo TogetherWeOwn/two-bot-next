@@ -13,11 +13,11 @@
     },
     {
       "path": "crates/discord/tests/run_community_facts_requeue.py",
-      "sha256": "09da46c1ca69c7fcc5cfec17dd83e75fade088136546140051f20e76bc08b9d5"
+      "sha256": "84c6384af958b290b627049f40c0e037d6bfa82bc8c97fefc6bf213bd2110dd5"
     },
     {
       "path": "scripts/ci/test_community_facts_runner.py",
-      "sha256": "f7e7003427ef6934714bd79aaf4d7005e31a126847af03ac9a424fdc5b8f80d9"
+      "sha256": "b8e41e098968a4c853c14d6f39b18ce993de0ac7226c6717d2f7d8faddc81a79"
     }
   ],
   "commands": {
@@ -35,7 +35,7 @@
     "runtime": "Actual DeferredCommunityFacts::drain and actual queue state, not a reimplementation",
     "double": "Task-local record_fact boundary returns true, false, a typed store error, or a pending future; captures complete attempted/acknowledged FactWrite payloads. Duplicate responses select pending idempotency keys or transformed rules/join source-event IDs.",
     "baselineExecution": "Run-owned scratch snapshot changes only the external record_fact import and cfg(test) child-module registration; no drain/capture/classification/state implementation changes",
-    "snapshotPrerequisites": "Only --workspace compiles bot tests embedding the ignored command reference. Run scripts/generate_command_reference.py --controller inside the snapshot first; propagate any nonzero exit (including cache refusal 75) without workspace compilation. Discord-only runtime, controls, mutants and Clippy do not need generation.",
+    "snapshotPrerequisites": "Only --workspace compiles bot tests embedding the ignored command reference. Run scripts/generate_command_reference.py --controller inside the snapshot first. Explicitly set REFERENCE_DOCS_ROOT to the snapshot for both generation and verification, preserving the rest of the environment; inherited source/external roots must remain unchanged. Propagate any nonzero exit (including cache refusal 75) without workspace compilation. Discord-only runtime, controls, mutants and Clippy do not need generation.",
     "mutationExecution": "Only explicit --mutant changes behavior: one uniquely matched regression in the run-owned scratch source. The author workspace source is never changed; each independent mutant starts from the same unmodified head.",
     "builderRegistration": "Register community_facts_requeue_acceptance at ../tests/support/community_facts_requeue.rs with cfg(test). Bind its record_fact under cfg(test), and two_bot_core::community_store::record_fact under cfg(not(test)); see runner.BINDING/REGISTRATION. Existing tests outside the task-local scope delegate to the real store.",
     "ciRoute": "Builder must retain the module registration and test-only binding so the existing db-feature library CI/nextest lanes execute the protected corpus, rather than leaving an orphan support file",

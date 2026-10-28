@@ -9,6 +9,7 @@ Builder must keep the same cfg(test) binding/registration so ordinary library CI
 runs these protected tests. Non-test builds keep the real store import.
 --workspace generates the ignored command reference inside the scratch snapshot
 before compiling bot tests; Discord-only modes do not need that prerequisite.
+Generation and verification override any inherited REFERENCE_DOCS_ROOT with the snapshot.
 
 Commands (controller Cargo builds always use the bounded cache wrapper):
   python3 crates/discord/tests/run_community_facts_requeue.py
@@ -140,6 +141,7 @@ def main():
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination, follow_symlinks=False)
         (workspace / SOURCE).write_bytes(instrumented)
+        environment = dict(os.environ, REFERENCE_DOCS_ROOT=str(workspace))
         command = ["python3", "scripts/cargo_cache.py", "run", "--"]
         if args.clippy:
             command += ["clippy", "-p", "two-bot-discord", "--features", "db", "--lib", "--tests", "--", "-D", "warnings"]
@@ -159,11 +161,11 @@ def main():
             if args.workspace:
                 prerequisite = ["python3", "scripts/generate_command_reference.py", "--controller"]
                 print("Prerequisite:", " ".join(prerequisite), flush=True)
-                generated = subprocess.run(prerequisite, cwd=workspace, check=False)
+                generated = subprocess.run(prerequisite, cwd=workspace, env=environment, check=False)
                 if generated.returncode:
                     return generated.returncode
             print("Command:", " ".join(command), flush=True)
-            result = subprocess.run(command, cwd=workspace, check=False)
+            result = subprocess.run(command, cwd=workspace, env=environment, check=False)
         finally:
             if (ROOT / SOURCE).read_bytes() != original:
                 raise RuntimeError("author workspace source changed during verification")

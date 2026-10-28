@@ -30,9 +30,13 @@ from pathlib import Path
 import sys
 
 root = Path.cwd()
+# Mirror the compiled renderer: the environment overrides its manifest-root fallback.
+reference_root = Path(os.environ.get("REFERENCE_DOCS_ROOT",
+                                    str(Path(__file__).resolve().parents[1])))
 args = sys.argv[1:]
 name = Path(__file__).name
 reference = root / "docs/generated/commands.md"
+selected_reference = reference_root / "docs/generated/commands.md"
 if name == "cargo":
     stage = "unbounded-cargo"
 elif name == "cargo_cache.py":
@@ -41,6 +45,7 @@ else:
     stage = "generate"
 with Path(os.environ["FACTS_RUNNER_EVENTS"]).open("a") as log:
     log.write(json.dumps({"stage": stage, "cwd": str(root), "args": args,
+                          "reference_root": str(reference_root),
                           "reference": reference.read_text() if reference.exists() else None}) + "\n")
 if stage == "unbounded-cargo":
     raise SystemExit("real Cargo is forbidden in this offline fixture")
@@ -55,13 +60,19 @@ if stage == "build":
                       "target": {"name": "generate_command_reference", "kind": ["example"]},
                       "executable": str(root / "fixture/generate_command_reference")}))
 elif stage == "generate":
-    reference.parent.mkdir(parents=True, exist_ok=True)
-    reference.write_text("# Snapshot command reference\n")
+    if (reference_root / "docs/configuration.md").read_text() != "# Fixture configuration reference\n":
+        raise SystemExit("generation requires a matching configuration reference")
+    selected_reference.parent.mkdir(parents=True, exist_ok=True)
+    selected_reference.write_text("# Snapshot command reference\n")
     print(json.dumps({"schema": "command_reference.v1", "status": "ok"}))
-elif "--workspace" in args and (not reference.exists()
-                               or reference.read_text() != "# Snapshot command reference\n"):
-    print("workspace compilation requires its own generated reference", file=sys.stderr)
-    raise SystemExit(86)
+elif "--workspace" in args:
+    if not reference.exists() or reference.read_text() != "# Snapshot command reference\n":
+        print("workspace compilation requires its own generated reference", file=sys.stderr)
+        raise SystemExit(86)
+    if (not selected_reference.exists()
+            or selected_reference.read_text() != "# Snapshot command reference\n"):
+        print("workspace verification requires its own generated reference", file=sys.stderr)
+        raise SystemExit(87)
 '''
 
 
@@ -84,6 +95,7 @@ class CommunityFactsRunnerPrerequisites(unittest.TestCase):
         self.source = b"use fixture::{message_fact, record_fact, rules_accepted_fact,};\n"
         for path, contents in (
             (SOURCE, self.source), (PROTECTED, b"// protected corpus sentinel\n"),
+            ("docs/configuration.md", b"# Fixture configuration reference\n"),
             ("docs/generated/.gitignore", b"/commands.md\n"),
         ):
             destination = self.checkout / path
@@ -100,6 +112,8 @@ class CommunityFactsRunnerPrerequisites(unittest.TestCase):
         self.env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
                         PAPERCLIP_RUN_SCRATCH_DIR=str(self.scratch),
                         FACTS_RUNNER_EVENTS=str(self.events))
+        # Keep inherited-root cases inside this fixture, never the caller's checkout.
+        self.env.pop("REFERENCE_DOCS_ROOT", None)
         # Require explicit --controller; accidental direct Cargo is a refusing stub.
         self.env.pop("PAPERCLIP_RUN_ID", None)
         self.env["PATH"] = str(self.checkout / "bin") + os.pathsep + os.environ["PATH"]
@@ -121,6 +135,18 @@ class CommunityFactsRunnerPrerequisites(unittest.TestCase):
         self.assertEqual(workspace.parent, self.scratch)
         self.assertNotEqual(workspace, self.checkout)
         self.assertTrue(all(event["cwd"] == str(workspace) for event in events))
+        self.assertTrue(all(event["reference_root"] == str(workspace) for event in events),
+                        "generation and verification must select the snapshot reference root")
+
+    def assert_workspace_success(self, result, events):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_snapshot_events(events, ["build", "generate", "compile"])
+        self.assertIsNone(events[0]["reference"], "ignored source output must not be copied")
+        self.assertIsNone(events[1]["reference"])
+        self.assertEqual(events[2]["reference"], GENERATED)
+        self.assertEqual(events[2]["args"], [
+            "run", "--", "test", "--workspace", "--features",
+            "two-bot-discord/db", "--locked"])
 
     def test_workspace_generates_in_snapshot_before_compilation(self):
         for source_reference in (None, "# Stale ignored source-checkout output\n"):
@@ -129,21 +155,48 @@ class CommunityFactsRunnerPrerequisites(unittest.TestCase):
                 if source_reference is not None:
                     reference.write_text(source_reference)
                 result, events = self.run_runner("--workspace")
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_snapshot_events(events, ["build", "generate", "compile"])
-                self.assertIsNone(events[0]["reference"], "ignored source output must not be copied")
-                self.assertIsNone(events[1]["reference"])
-                self.assertEqual(events[2]["reference"], GENERATED)
-                self.assertEqual(events[2]["args"], [
-                    "run", "--", "test", "--workspace", "--features",
-                    "two-bot-discord/db", "--locked"])
+                self.assert_workspace_success(result, events)
                 self.assertEqual(reference.read_text() if reference.exists() else None,
                                  source_reference, "generation must not modify the source checkout")
+
+    def test_workspace_ignores_inherited_source_reference_root(self):
+        for source_reference in (None, "# Stale ignored source-checkout output\n"):
+            with self.subTest(source_reference=source_reference):
+                reference = self.checkout / REFERENCE
+                if source_reference is not None:
+                    reference.write_text(source_reference)
+                result, events = self.run_runner("--workspace", REFERENCE_DOCS_ROOT=str(self.checkout))
+                self.assertEqual(reference.read_text() if reference.exists() else None,
+                                 source_reference, "generation must not modify the inherited source root")
+                self.assert_workspace_success(result, events)
+
+    def test_workspace_ignores_inherited_external_reference_root(self):
+        external = self.fixture / "external"
+        shutil.copytree(self.checkout / "docs", external / "docs")
+        for source_reference in (None, "# Stale ignored source-checkout output\n"):
+            for external_reference in (None, "# Preserve external-checkout output\n"):
+                with self.subTest(source_reference=source_reference, external_reference=external_reference):
+                    source = self.checkout / REFERENCE
+                    reference = external / REFERENCE
+                    if source_reference is not None:
+                        source.write_text(source_reference)
+                    if external_reference is None:
+                        reference.unlink(missing_ok=True)
+                    else:
+                        reference.write_text(external_reference)
+                    result, events = self.run_runner("--workspace", REFERENCE_DOCS_ROOT=str(external))
+                    self.assertEqual(reference.read_text() if reference.exists() else None,
+                                     external_reference, "generation must not modify the inherited external root")
+                    self.assertEqual(source.read_text() if source.exists() else None,
+                                     source_reference, "generation must not modify the source checkout")
+                    self.assert_workspace_success(result, events)
 
     def test_generator_build_failure_propagates_without_workspace_compilation(self):
         for status in (1, 42, 75):
             with self.subTest(status=status):
-                result, events = self.run_runner("--workspace", FACTS_RUNNER_BUILD_STATUS=str(status))
+                result, events = self.run_runner(
+                    "--workspace", FACTS_RUNNER_BUILD_STATUS=str(status),
+                    REFERENCE_DOCS_ROOT=str(self.checkout))
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assert_snapshot_events(events, ["build"])
                 self.assertFalse((self.checkout / REFERENCE).exists())
@@ -157,10 +210,15 @@ class CommunityFactsRunnerPrerequisites(unittest.TestCase):
                 self.assertFalse((self.checkout / REFERENCE).exists())
 
     def test_workspace_compilation_exit_status_is_preserved(self):
-        result, events = self.run_runner("--workspace", FACTS_RUNNER_COMPILE_STATUS="42")
-        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
-        self.assert_snapshot_events(events, ["build", "generate", "compile"])
-        self.assertEqual(events[-1]["reference"], GENERATED)
+        for status in (1, 42, 75):
+            with self.subTest(status=status):
+                result, events = self.run_runner(
+                    "--workspace", FACTS_RUNNER_COMPILE_STATUS=str(status),
+                    REFERENCE_DOCS_ROOT=str(self.checkout))
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assert_snapshot_events(events, ["build", "generate", "compile"])
+                self.assertEqual(events[-1]["reference"], GENERATED)
+                self.assertFalse((self.checkout / REFERENCE).exists())
 
     def test_discord_only_modes_do_not_generate_bot_reference(self):
         for args, command in (((), "test"), (("--controls",), "test"), (("--clippy",), "clippy")):
