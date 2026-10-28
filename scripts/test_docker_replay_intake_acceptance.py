@@ -199,6 +199,154 @@ class DockerReplayConfinementAcceptanceTests(unittest.TestCase):
                     self.assertEqual(len(fetched), 1)
                     self.assertTrue(writes, "write observer must detect a real replay")
 
+    def test_grouped_mkdir_operators_refuse_before_replay(self):
+        for operator in ("||", "&&&", ">>"):
+            with self.subTest(operator=operator):
+                self.check_refusal(
+                    f"RUN mkdir -p src {operator} && cargo fetch --locked")
+
+    def test_confined_mkdir_fetch_layer_remains_supported(self):
+        for name in DOCKERFILES:
+            with self.subTest(dockerfile=name):
+                with tempfile.TemporaryDirectory(prefix="docker-mkdir-control-") as tmp:
+                    fixture = Path(tmp)
+                    root = make_fixture(fixture)
+                    scratch = fixture / "scratch"
+                    scratch.mkdir()
+                    docker = (root / name).read_text()
+                    self.assertIn("COPY . .", docker)
+                    mutated = docker.replace(
+                        "COPY . .", "RUN mkdir -p src && cargo fetch --locked\nCOPY . .", 1)
+                    fetched = []
+
+                    def witness(dest):
+                        self.assertTrue((dest / "src/lib.rs").is_file())
+                        self.assertTrue((dest / "Cargo.toml").is_file())
+                        self.assertTrue(dest.resolve().is_relative_to(scratch.resolve()))
+                        fetched.append(dest)
+
+                    with mock.patch.object(
+                            subprocess, "run",
+                            side_effect=AssertionError("gate must not launch processes")):
+                        manifests.check_tree(
+                            mutated, root, scratch_dir=str(scratch), fetch=witness)
+                    self.assertEqual(len(fetched), 1)
+
+    def test_unquoted_echo_comment_refuses_before_replay(self):
+        for name in DOCKERFILES:
+            with self.subTest(dockerfile=name):
+                with tempfile.TemporaryDirectory(prefix="docker-comment-refusal-") as tmp:
+                    fixture = Path(tmp)
+                    root = make_fixture(fixture)
+                    scratch = fixture / "scratch"
+                    scratch.mkdir()
+                    docker = (root / name).read_text()
+                    self.assertIn("echo '' >", docker)
+                    mutated = docker.replace("echo '' >", "echo # >", 1)
+                    fetched = []
+                    with watch_writes(fixture, scratch) as writes:
+                        with mock.patch.object(
+                                subprocess, "run",
+                                side_effect=AssertionError("gate must not launch processes")):
+                            with self.assertRaises(manifests.Refusal):
+                                manifests.check_tree(
+                                    mutated, root, scratch_dir=str(scratch),
+                                    fetch=lambda dest: fetched.append(dest))
+                    self.assertEqual(writes, [], "comment syntax must refuse before replay")
+                    self.assertEqual(fetched, [], "comment syntax must refuse before fetch")
+
+    def test_quoted_echo_comment_remains_literal(self):
+        for name in DOCKERFILES:
+            with self.subTest(dockerfile=name):
+                with tempfile.TemporaryDirectory(prefix="docker-comment-control-") as tmp:
+                    fixture = Path(tmp)
+                    root = make_fixture(fixture)
+                    scratch = fixture / "scratch"
+                    scratch.mkdir()
+                    docker = (root / name).read_text()
+                    self.assertIn("echo '' > src/lib.rs", docker)
+                    mutated = docker.replace("echo '' >", "echo '#' >", 1)
+                    fetched = []
+
+                    def witness(dest):
+                        self.assertEqual((dest / "src/lib.rs").read_text().splitlines(), ["#"])
+                        self.assertTrue(dest.resolve().is_relative_to(scratch.resolve()))
+                        fetched.append(dest)
+
+                    with mock.patch.object(
+                            subprocess, "run",
+                            side_effect=AssertionError("gate must not launch processes")):
+                        manifests.check_tree(
+                            mutated, root, scratch_dir=str(scratch), fetch=witness)
+                    self.assertEqual(len(fetched), 1)
+
+    def test_copy_destination_file_symlink_refuses_before_writes(self):
+        with tempfile.TemporaryDirectory(prefix="docker-copy-destination-link-") as tmp:
+            fixture = Path(tmp)
+            root = fixture / "root"
+            stage = fixture / "stage"
+            outside = fixture / "outside"
+            for directory in (root, stage, outside):
+                directory.mkdir()
+            (root / "Cargo.toml").write_bytes(b"[workspace]\nmembers = []\n")
+            sentinel = outside / "sentinel.toml"
+            sentinel.write_bytes(b"outside destination sentinel\n")
+            destination = stage / "Cargo.toml"
+            destination.symlink_to(sentinel)
+            before = snapshot(fixture)
+            with watch_writes(fixture, fixture) as writes:
+                with self.assertRaises(manifests.Refusal):
+                    manifests.reconstruct(
+                        "FROM fixture AS builder\nWORKDIR /app\nCOPY Cargo.toml ./\nCOPY . .\n",
+                        root, stage)
+            self.assertEqual(writes, [], "COPY must refuse before writing through the link")
+            self.assertEqual(snapshot(fixture), before, "no sentinel or partial-copy changes")
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(destination.readlink(), sentinel)
+
+    def test_copy_source_file_symlink_refuses_before_writes(self):
+        with tempfile.TemporaryDirectory(prefix="docker-copy-source-link-") as tmp:
+            fixture = Path(tmp)
+            root = fixture / "root"
+            stage = fixture / "stage"
+            outside = fixture / "outside"
+            for directory in (root, stage, outside):
+                directory.mkdir()
+            sentinel = outside / "sentinel.toml"
+            sentinel.write_bytes(b"[workspace]\nmembers = []\n")
+            source = root / "Cargo.toml"
+            source.symlink_to(sentinel)
+            before = snapshot(fixture)
+            with watch_writes(fixture, fixture) as writes:
+                with self.assertRaises(manifests.Refusal):
+                    manifests.reconstruct(
+                        "FROM fixture AS builder\nWORKDIR /app\nCOPY Cargo.toml ./\nCOPY . .\n",
+                        root, stage)
+            self.assertEqual(writes, [], "COPY must refuse before copying outside source bytes")
+            self.assertEqual(snapshot(fixture), before, "no sentinel or partial-copy changes")
+            self.assertEqual(list(stage.iterdir()), [])
+            self.assertTrue(source.is_symlink())
+            self.assertEqual(source.readlink(), sentinel)
+
+    def test_copy_confined_regular_file_still_copies_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="docker-copy-file-control-") as tmp:
+            fixture = Path(tmp)
+            root = fixture / "root"
+            stage = fixture / "stage"
+            root.mkdir()
+            stage.mkdir()
+            content = b"[workspace]\nmembers = []\n"
+            source = root / "Cargo.toml"
+            source.write_bytes(content)
+            manifests.reconstruct(
+                "FROM fixture AS builder\nWORKDIR /app\nCOPY Cargo.toml ./\nCOPY . .\n",
+                root, stage)
+            destination = stage / "Cargo.toml"
+            self.assertEqual(destination.read_bytes(), content)
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(list(stage.iterdir()), [destination])
+            self.assertEqual(source.read_bytes(), content)
+
 
 def run_verifier(root):
     scratch = root / "scratch"
