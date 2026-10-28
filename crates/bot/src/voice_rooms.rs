@@ -8118,6 +8118,77 @@ mod voice_actor_inbox_backpressure_tests {
     }
 
     #[test]
+    fn release_retries_after_a_producer_acquires_the_observed_slot() {
+        let (actor, mut rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP - 1 {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert_eq!(actor.inbox_depth(), 255);
+        let command = rx.try_recv().expect("queued command holds a permit");
+        let mut before_cas_calls = 0;
+        actor
+            .backpressure
+            .release_for_with_before_cas(&command, || {
+                before_cas_calls += 1;
+                // The receiver loaded 255 before this producer fills slot 256.
+                // Its first CAS must fail, then retry against the new depth.
+                assert_eq!(actor.inbox_depth(), 255);
+                assert!(actor.try_send_command(ActorCommand::Reconcile));
+                assert_eq!(actor.inbox_depth(), 256);
+            });
+        assert_eq!(before_cas_calls, 1);
+        assert_eq!(actor.inbox_depth(), 255);
+        assert_eq!(actor.inbox_overflow_dropped(), 0);
+        assert!(actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 256);
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), 256);
+        assert_eq!(actor.inbox_overflow_dropped(), 1);
+        assert_eq!(rx.len(), 256);
+    }
+
+    #[test]
+    fn release_at_zero_does_not_underflow_or_consume_capacity() {
+        let (actor, rx) = actor();
+        actor.backpressure.release_for(&ActorCommand::Reconcile);
+        assert_eq!(actor.inbox_depth(), 0);
+        let mut before_cas_calls = 0;
+        actor
+            .backpressure
+            .release_for_with_before_cas(&ActorCommand::Reconcile, || before_cas_calls += 1);
+        assert_eq!(before_cas_calls, 1);
+        assert_eq!(actor.inbox_depth(), 0);
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP);
+        assert_eq!(actor.inbox_overflow_dropped(), 1);
+    }
+
+    #[test]
+    fn reply_bearing_release_skips_the_ledger_and_before_cas_hook() {
+        let (actor, _rx) = actor();
+        for _ in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Reconcile));
+        }
+        let (reply, _inbox) = oneshot::channel();
+        let command = ActorCommand::Status(reply);
+        let mut before_cas_calls = 0;
+        actor
+            .backpressure
+            .release_for_with_before_cas(&command, || before_cas_calls += 1);
+        assert_eq!(before_cas_calls, 0);
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        actor.backpressure.release_for(&command);
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert_eq!(actor.inbox_overflow_dropped(), 1);
+    }
+
+    #[test]
     fn lossless_sends_hold_a_slot_until_received() {
         // Ledger pairing for the control-plane bypass: a lossless send
         // claims an uncounted slot and its receive releases exactly that

@@ -3933,9 +3933,104 @@ def workflow_policy_errors(workflows):
     return errors
 
 
+# Explicit inventory prevents deleting or retagging a container from shrinking
+# the policy's scope. The deployment schema gate has a separate trixie pin.
+BOOKWORM_JOBS = {
+    "check.yml": ("check", "rust-tests", "coverage-shard", "ignored-db-stores",
+                  "ignored-db-runtime", "moderation-db", "self-role-store",
+                  "community-db", "feeds-db", "tickets-postgres", "fuzz-compile"),
+    "reusable-rust-nextest.yml": ("nextest",),
+    "pipeline-benchmark.yml": ("benchmark",),
+}
+BOOKWORM_IMAGE = ("rust:1.99-bookworm@sha256:"
+                  "e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c")
+CACHE_JOBS = {"nightly.yml": ("sweep", "nightly-cargo"),
+              "pipeline-benchmark.yml": ("benchmark", "pipeline-bench")}
+CACHE_PATHS = "~/.cargo/registry\n~/.cargo/git\ntarget\n"
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflows = load_workflows()
+
+    def assert_bookworm_image(self, workflows, workflow, job):
+        actual = workflows[workflow]["jobs"].get(job, {}).get("container", {})
+        self.assertIsInstance(actual, dict, f"{workflow}:{job} requires a container")
+        self.assertEqual(actual.get("image"), BOOKWORM_IMAGE, f"{workflow}:{job}")
+
+    def assert_compiler_cache(self, workflows, workflow, job, prefix):
+        steps = workflows[workflow]["jobs"][job]["steps"]
+        caches = [step for step in steps
+                  if str(step.get("uses", "")).startswith("actions/cache@")]
+        self.assertEqual(len(caches), 1, f"{workflow}:{job} needs one primary cache")
+        options = caches[0]["with"]
+        self.assertEqual(options.get("key"),
+                         "${{ runner.os }}-" + prefix +
+                         "-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}")
+        self.assertEqual(options.get("path"), CACHE_PATHS)
+        self.assertEqual(options.get("restore-keys"),
+                         "${{ runner.os }}-nightly-cargo-\n" if workflow == "nightly.yml" else None)
+
+    def test_rust_bookworm_job_container_images_are_pinned(self):
+        for workflow, jobs in BOOKWORM_JOBS.items():
+            for job in jobs:
+                with self.subTest(workflow=workflow, job=job):
+                    self.assert_bookworm_image(self.workflows, workflow, job)
+
+    def test_primary_cargo_caches_include_compiler_input(self):
+        for workflow, (job, prefix) in CACHE_JOBS.items():
+            with self.subTest(workflow=workflow, job=job):
+                self.assert_compiler_cache(self.workflows, workflow, job, prefix)
+
+    def test_bookworm_image_and_compiler_cache_policy_mutations(self):
+        # Exercise the policy independently of the still-unmigrated workflows.
+        fixed = deepcopy(self.workflows)
+        for workflow, jobs in BOOKWORM_JOBS.items():
+            for job in jobs:
+                fixed[workflow]["jobs"][job]["container"]["image"] = BOOKWORM_IMAGE
+                self.assert_bookworm_image(fixed, workflow, job)
+        for workflow, (job, prefix) in CACHE_JOBS.items():
+            step = next(step for step in fixed[workflow]["jobs"][job]["steps"]
+                        if str(step.get("uses", "")).startswith("actions/cache@"))
+            step["with"]["key"] = ("${{ runner.os }}-" + prefix +
+                                   "-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}")
+            self.assert_compiler_cache(fixed, workflow, job, prefix)
+
+        stale = ("rust:bookworm@sha256:"
+                 "93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e")
+        for workflow, jobs in BOOKWORM_JOBS.items():
+            for job in jobs:
+                for image in (stale, "rust:1.99-bookworm@sha256:" + "0" * 64):
+                    with self.subTest(workflow=workflow, job=job, image=image):
+                        mutated = deepcopy(fixed)
+                        mutated[workflow]["jobs"][job]["container"]["image"] = image
+                        with self.assertRaises(AssertionError):
+                            self.assert_bookworm_image(mutated, workflow, job)
+                with self.subTest(workflow=workflow, job=job, missing=True):
+                    mutated = deepcopy(fixed)
+                    del mutated[workflow]["jobs"][job]["container"]
+                    with self.assertRaises(AssertionError):
+                        self.assert_bookworm_image(mutated, workflow, job)
+        for workflow, (job, prefix) in CACHE_JOBS.items():
+            for missing in ("Cargo.lock", "rust-toolchain.toml"):
+                with self.subTest(workflow=workflow, missing=missing):
+                    mutated = deepcopy(fixed)
+                    step = next(step for step in mutated[workflow]["jobs"][job]["steps"]
+                                if str(step.get("uses", "")).startswith("actions/cache@"))
+                    remaining = "rust-toolchain.toml" if missing == "Cargo.lock" else "Cargo.lock"
+                    step["with"]["key"] = ("${{ runner.os }}-" + prefix +
+                                           "-${{ hashFiles('" + remaining + "') }}")
+                    with self.assertRaises(AssertionError):
+                        self.assert_compiler_cache(mutated, workflow, job, prefix)
+            for field, value in (("path", "target\n"),
+                                 ("restore-keys", "wrong-prefix\n")):
+                with self.subTest(workflow=workflow, field=field):
+                    mutated = deepcopy(fixed)
+                    step = next(step for step in mutated[workflow]["jobs"][job]["steps"]
+                                if str(step.get("uses", "")).startswith("actions/cache@"))
+                    step["with"][field] = value
+                    with self.assertRaises(AssertionError):
+                        self.assert_compiler_cache(mutated, workflow, job, prefix)
 
     def test_merge_queue_reports_required_checks_without_pr_metadata(self):
         for name in ("check.yml", "supply-chain.yml"):
