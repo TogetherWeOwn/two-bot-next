@@ -114,7 +114,7 @@ fn documented_legacy_rows_equal_parity_section1() {
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        47
+        48
     );
     assert_eq!(
         COMMAND_PERMISSIONS
