@@ -134,6 +134,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Feed domain](feeds-port.md)
 - [Private sample](feed-preview-spec.md)
 - [Title filter](feed-title-filter-spec.md)
+- [Feeds](dashboard-feed-config-spec.md)
 - [Relay move](feed-move-spec.md)
 - [EventSub ops](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
