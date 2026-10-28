@@ -14,9 +14,9 @@ use two_bot_core::{
     compensate_rsvp_write, list_rsvps, live_gate_announcements_slash, normalize_event_link,
     now_iso, parse_attendance_occurrence, partition_rsvps, put_rsvp_with_audit,
     record_checkin_with_audit, require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text,
-    rsvp_saved_text, rsvp_saved_text_with_event, validate_event_id, validate_occurrence_id,
-    AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
-    RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
+    rsvp_saved_text_for_transition, rsvp_saved_text_for_transition_with_event, validate_event_id,
+    validate_occurrence_id, AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput,
+    HandlerId, InteractionRouter, RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
 };
 
 use crate::{
@@ -457,12 +457,14 @@ async fn execute(
                 }
                 return Err(refusal);
             }
-            // Pasted links confirm with the stable numeric identity they
-            // normalized to; raw ids keep the legacy sentence byte-identical.
+            // The copy comes from the committed transition alone (first,
+            // changed or saved again). Pasted links confirm with the stable
+            // numeric identity they normalized to; a first response with a raw
+            // id keeps the legacy sentence byte-identical.
             Ok(if pasted_link {
-                rsvp_saved_text_with_event(status, &record.event_id)
+                rsvp_saved_text_for_transition_with_event(&transition, &record.event_id)
             } else {
-                rsvp_saved_text(status)
+                rsvp_saved_text_for_transition(&transition)
             })
         }
         HandlerId::ScorecardAttendance => {
