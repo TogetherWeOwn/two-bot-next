@@ -9,9 +9,9 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 44 built-in slash commands (core + scorecard + automation +
+Scope: 45 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 65). No guild was
+the voice set; with the voice gates on it renders 66). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -52,7 +52,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 20 | `/sticky` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `debounce` 1–300 |
 | 21 | `/sticky-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired` |
 | 37 | `/giveaway` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row; one-click member entry; timed draw + announce with reroll | `AutomationsDisabled`, `ManageServerRequired`, `prize` 1–200 chars, `duration` 1–43200 min, `winners` 1–100 |
-| 24 | `/rsvp` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral `RSVP saved: <status>.` (pasted links append the event id) | `AnnouncementsDisabled`, `event-id` required (id or pasted link), `status` going/interested/declined |
+| 24 | `/rsvp` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral `RSVP saved: <status>.`; a changed or repeated choice adds `(changed from <previous>)` or `(saved again; time updated)` (pasted links append the event id) | `AnnouncementsDisabled`, `event-id` required (id or pasted link), `status` going/interested/declined |
 | 25 | `/rsvp-attendance` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral RSVP totals | `AnnouncementsDisabled`, `event-id` required (id or pasted link) |
 | 26 | `/lfg` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral signup post + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `title`/`starts-at`/`roles` required |
 | 27 | `/lfg-close` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `id` required |
@@ -76,17 +76,18 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 11 | `/unlock` | `TWO_MODERATION` | ManageChannels | Ephemeral outcome + send restore | `GuildRestricted`, `ModerationDisabled`, `ModerationPermission(Unlock)`, `reason` required ≤512 |
 | 35 | `/purge-preview` | `TWO_MODERATION` | ManageMessages (8192) | Deferred ephemeral sampled counts, candidate time span and exclusions; no delete, audit, claim or lane writes; explicitly sampling, not a guarantee | `GuildRestricted`, `ModerationDisabled`, `PurgePreviewPermission`, only required `count` 1–100; no reason |
 | 36 | `/channel-inspect` | `TWO_MODERATION` | ManageChannels (16) | Deferred ephemeral saved lockdown and live slowmode; absent lockdown is none, unavailable metadata is unknown; no config, audit, claim or lane writes | `GuildRestricted`, `ModerationDisabled`, `ChannelInspectPermission`, no options |
+| 47 | `/moderation-recent` | `TWO_MODERATION` | ModerateMembers (1099511627776) | Deferred ephemeral newest-first page of saved moderation ledger rows labelled not live-verified; actor's Moderate Members standing rechecked live; applied, denied and uncertain outcomes stay distinct; no claim, audit, retry or Discord mutation | `GuildRestricted`, `ModerationDisabled`, `ModerationRecentPermission`, optional `page` 1–20 only; duplicate, unknown or wrong-typed options refuse before any read; empty, past-end and store-failure replies are finite and private |
 
 Member-moderation policy order (ban, tempban, kick, timeout, warn):
 permission → target present → self-target → owner/Owen/bot/staff protection →
 bot hierarchy → actor hierarchy. Audit `reason` is trimmed, non-empty, ≤512
-UTF-16 units on every mutating moderation row. The three private reads take no
+UTF-16 units on every mutating moderation row. The four private reads take no
 reason and write no audit record. Failed reads stay private with retry guidance;
 unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 44-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 45-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

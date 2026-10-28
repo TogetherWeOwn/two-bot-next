@@ -344,6 +344,49 @@ separate `:in_progress` row with `stage: claim`, preserving both the original
 uncertain dispatch row and its key. Further redelivery deduplicates that row;
 completed channel replays still write none. Successful rows are unchanged.
 
+## Recent actions (`/moderation-recent`)
+
+`/moderation-recent [page]` gives staff on shift a private, read-only page of the
+newest saved moderation ledger rows. It sits in the moderation command family
+behind the same `TWO_MODERATION` gate, configured-guild fence and the Moderate
+Members permission as `/warn`, and it needs the member consumer to exist (the
+five member verbs share that presence). The router checks the interaction's
+permission bits; the handler then rechecks the actor live over REST (guild roles
+plus the actor's member) and refuses with a finite corrective when the actor is
+missing, cold, unreadable or lacks Moderate Members. Interaction-time bits
+never authorize the read, and no member or self authority exists. The reply is
+ephemeral with every mention parse disabled.
+
+- **Source.** One guild-scoped, `LIMIT`-bounded read of the newest 100
+  `moderation_audit` rows plus `moderation_warnings` rows that no audit row
+  shares a `request_id` with, ordered `created_at DESC, request_id ASC`. Claim
+  tokens, idempotency keys and metadata are never selected. It is paginated in
+  memory; older rows are not listed.
+- **Rows.** One line each: complete request id, action, outcome, target (or
+  channel), acting staff member, UTC time and a reason of at most 80 UTF-16
+  units rendered inside a code span so mentions, markdown and links stay
+  inert. The header states these are saved ledger rows, not live-verified
+  Discord state.
+- **Outcomes are never relabelled.** `banned`, `temporarily_banned`, `kicked`,
+  `timed_out`, `warned`, `unbanned`, `purged`, `slowmode_updated`,
+  `locked_down` and `unlocked` render `applied`; `denied` and `refused` render
+  `denied`; everything else (`failed`, `in_progress`, `unban_failed`, unknown)
+  renders `uncertain`. The saved word follows in parentheses.
+- **Pages.** Whole rows pack into the 2000 UTF-16 unit budget (a ledger that
+  fits stays on one page) with a `Page N of M` footer and, when more pages
+  exist, `Next: /moderation-recent page:N+1`. `page` is an optional integer
+  1–20; a page outside the packed range (or below 1) answers `Invalid page. Run
+  /moderation-recent page:1, then use the next-page hint.` An empty ledger
+  answers `No recent moderation actions in this server.`
+- **Strict decode first.** Duplicate, unknown and wrong-typed options refuse
+  with `Cannot run /moderation-recent: ... Try: /moderation-recent page:1`
+  before any Discord or store read, never echoing option values.
+- **Failure.** A ledger read failure answers a private `try again` corrective
+  with no raw error, and logs the sanitized class only.
+- **Pure read.** No claim, sweep, retry, repair, delete, unban, warn, retention
+  change, applied-mutation audit, idempotency row or Discord mutation, on every
+  path including refusals.
+
 ## Verification
 
 On the persistent controller, use the bounded cache wrapper from this isolated
