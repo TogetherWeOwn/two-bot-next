@@ -12,9 +12,12 @@ always exits 0 on planning inputs; only output write failures exit 1.
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+from cargo_feature_selection import workspace_feature_args
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -28,8 +31,9 @@ ALL_CRATES = [
     "two-bot-next",
 ]
 
-# Match .github/workflows/check.yml's coverage-shard commands, including
-# sweep skip lists: 2 workspace sweeps + 15 dedicated cov legs.
+# Command templates retain the baseline skip lists. Resolve sweep templates
+# with resolve_sweep_leg(leg, metadata) before comparing or copying commands:
+# effective feature flags depend on the selected workspace dependency graph.
 FULL_LEGS = [
     {
         "id": "sweep-nonignored",
@@ -427,19 +431,22 @@ def reverse_deps_from_metadata(metadata):
 
 
 def sweep_feature_flags(key, metadata):
-    """Apply core/db only when it belongs to a selected package's graph."""
-    if key != "other":
-        return ["--features", "two-bot-core/db"]
+    """Resolve the full-workspace feature closure for a sweep's package set."""
     reverse = reverse_deps_from_metadata(metadata)
-    affected = {"two-bot-core"}
-    pending = list(affected)
-    while pending:
-        for dependent in reverse.get(pending.pop(), ()):
-            if dependent not in affected:
-                affected.add(dependent)
-                pending.append(dependent)
-    remainder = set(reverse) - set(SWEEP_PACKAGES.values())
-    return ["--features", "two-bot-core/db"] if remainder & affected else []
+    package = SWEEP_PACKAGES[key]
+    selected = [package] if package else sorted(set(reverse) - set(SWEEP_PACKAGES.values()))
+    return workspace_feature_args(metadata, selected)
+
+
+def resolve_sweep_leg(leg, metadata):
+    """Turn a sweep template into the command actually run for this graph."""
+    if not leg["id"].startswith(("sweep-nonignored-", "sweep-ignored-")):
+        return dict(leg)
+    key = leg["id"].rsplit("-", 1)[1]
+    tokens = shlex.split(leg["command"])
+    at = tokens.index("--features")
+    tokens[at:at + 2] = sweep_feature_flags(key, metadata)
+    return dict(leg, command=shlex.join(tokens))
 
 
 def _full_plan(shard_count, reason):
@@ -580,7 +587,7 @@ def _changed_from_diff(base_ref, head_ref):
 def _metadata_from_cargo():
     try:
         proc = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1"],
+            ["cargo", "metadata", "--format-version", "1", "--locked", "--features", "two-bot-core/db"],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
@@ -605,7 +612,17 @@ def main(argv=None):
     parser.add_argument("--ref", default="refs/pull/1/merge")
     parser.add_argument("--output")
     parser.add_argument("--sweep-features", choices=SWEEP_PACKAGES)
+    parser.add_argument("--describe-sweeps", action="store_true")
     args = parser.parse_args(argv)
+    if args.describe_sweeps:
+        metadata = _metadata_from_cargo()
+        try:
+            legs = [resolve_sweep_leg(leg, metadata) for leg in FULL_LEGS]
+        except (ValueError, TypeError, KeyError):
+            print("::error::could not resolve coverage command descriptors", file=sys.stderr)
+            return 1
+        print(json.dumps(legs, indent=2))
+        return 0
     if args.sweep_features:
         try:
             flags = sweep_feature_flags(args.sweep_features, _metadata_from_cargo())

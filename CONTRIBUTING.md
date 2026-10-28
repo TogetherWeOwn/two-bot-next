@@ -80,11 +80,18 @@ one timing-only worker would reintroduce the critical path.
 Coverage splits both ignored and nonignored sweeps by package before assigning
 legs to eight runners. A remainder partition includes root/testsupport and future
 workspace packages; each package still discovers all of its targets. The
-`two-bot-core/db` feature is applied only where the selected dependency graph can
-accept it; unrelated packages cannot accept that dependency feature flag.
-Changed-crate/reverse-dependency selection, conservative widening, guarded replay
-ownership and the HARD added-line coverage bar remain mandatory. Synthetic
-ownership tests are not real LLVM coverage parity or latency evidence.
+workspace-package features are resolved from the full workspace before selecting
+packages: enabling only `two-bot-core/db` would lose the consumer's own `db`
+feature. Unrelated packages cannot accept that dependency feature flag. The
+shared `cargo_feature_selection.py` helper preserves workspace-member feature
+unification without copying external platform/build feature unions. Inspect
+resolved sweep descriptors with `python3 scripts/ci/plan-coverage-shards.py
+--describe-sweeps`; `FULL_LEGS` contains templates, not graph-independent final
+commands. Changed-crate/reverse-dependency selection, conservative widening,
+guarded replay ownership and the HARD added-line coverage bar remain mandatory.
+Synthetic ownership checks and workspace-feature qualification are not real LLVM
+parity or latency evidence; external dependency feature differences still need
+real Cargo/LLVM qualification.
 
 A normal reviewed revert of a partitioning follow-up restores its prior sharded
 configuration. Restoring the historical single coverage job requires reverting

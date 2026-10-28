@@ -561,7 +561,7 @@ jobs:
       contents: read
     needs: [job-inputs]
     if: needs.job-inputs.outputs.rust != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'test-partition-plan') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     outputs:
       rust-tests: ${{ steps.plan.outputs.rust-tests }}
@@ -591,7 +591,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.test-partition-plan.outputs.rust-tests) }}
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests-partition') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # Suite-only since the HARD patch-coverage measurement split out of this
     # lane: the combined job outgrew 60 minutes (59m54s on main, one 60m07s
     # mid-measurement kill), while the replay alone measured ~30 min of a
@@ -913,7 +913,7 @@ jobs:
       contents: read
     needs: [job-inputs, rust-tests-partition]
     if: always() && needs.job-inputs.outputs.rust != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1456,20 +1456,17 @@ jobs:
             esac
           done
           sweep_selector() {
-            sweep_features=(--features two-bot-core/db)
             case "$1" in
               core) sweep_args=(-p two-bot-core) ;;
               discord) sweep_args=(-p two-bot-discord) ;;
               bot) sweep_args=(-p two-bot) ;;
               cutover) sweep_args=(-p two-bot-cutover) ;;
               store) sweep_args=(-p two-bot-store) ;;
-              other)
-                sweep_args=(--workspace --exclude two-bot-core --exclude two-bot-discord --exclude two-bot --exclude two-bot-cutover --exclude two-bot-store)
-                feature_flags=$(python3 scripts/ci/plan-coverage-shards.py --sweep-features other) || exit 1
-                read -r -a sweep_features <<< "$feature_flags"
-                ;;
+              other) sweep_args=(--workspace --exclude two-bot-core --exclude two-bot-discord --exclude two-bot --exclude two-bot-cutover --exclude two-bot-store) ;;
               *) echo "::error::unknown sweep package" >&2; exit 1 ;;
             esac
+            feature_flags=$(python3 scripts/ci/plan-coverage-shards.py --sweep-features "$1") || exit 1
+            read -r -a sweep_features <<< "$feature_flags"
           }
           # The member-moderation suite's guard panics without MEMBER_TESTDB. It
           # used to be exported just before the ignored sweep; every shard
@@ -2300,7 +2297,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.test-partition-plan.outputs.ignored-db-runtime) }}
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-runtime') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-runtime-partition') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -2593,7 +2590,7 @@ jobs:
       contents: read
     needs: [job-inputs, ignored-db-runtime-partition]
     if: always() && needs.job-inputs.outputs.rust != 'false'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-runtime') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

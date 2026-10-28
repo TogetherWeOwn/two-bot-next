@@ -16,6 +16,8 @@ import subprocess
 import sys
 import time
 
+from cargo_feature_selection import workspace_feature_args
+
 BOOTSTRAP = "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
 EMPTY_PASSWORD = "postgres://agent_test:@agent-testdb:5432/agent_test"
 EXACT = "postgres://agent_test@agent-testdb:5432/agent_test"
@@ -119,33 +121,8 @@ def integration_commands(index):
             if owner == index:
                 by_package.setdefault(package["name"], []).append(target["name"])
     result = []
-    package_map = {p["name"]: p for p in packages}
     for name, targets in sorted(by_package.items()):
-        package = package_map[name]
-        direct = [dep.get("rename") or dep["name"] for dep in package["dependencies"]
-                  if dep["name"] == "two-bot-core"]
-        if name == "two-bot-core":
-            feature_args = ["--features", "two-bot-core/db"]
-        elif direct:
-            if len(set(direct)) != 1:
-                raise ValueError(f"ambiguous core dependency aliases in {name}")
-            feature_args = ["--features", direct[0] + "/db"]
-        else:
-            # A transitive-only core dependency needs an explicit feature path;
-            # omitting core/db here would silently change the workspace sweep.
-            pending = [package["id"]]
-            visited = set()
-            while pending:
-                current = pending.pop()
-                if current in visited:
-                    continue
-                visited.add(current)
-                if current == core["id"]:
-                    raise ValueError(f"{name} reaches two-bot-core only transitively; configure its db feature path")
-                if current not in nodes:
-                    raise ValueError("Cargo metadata has an incomplete dependency graph")
-                pending.extend(dep["pkg"] for dep in nodes[current]["deps"])
-            feature_args = []
+        feature_args = workspace_feature_args(graph, [name])
         selectors = [word for target in sorted(targets) for word in ("--test", target)]
         skips = [word for skip in INTEGRATION_SKIPS for word in ("--skip", skip)]
         base = ["test", "-p", name] + selectors + feature_args + ["--locked"]
