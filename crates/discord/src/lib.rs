@@ -64,6 +64,7 @@ mod test_clock;
 #[path = "../tests/common/mod.rs"]
 pub mod test_wire;
 pub mod voice_rooms;
+pub mod voice_rooms_board;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{
