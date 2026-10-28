@@ -116,9 +116,17 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   let listenerPort = 8080;
   let probeStatus = 503;
   let probeResponse: ((status: number) => Response) | undefined;
+  let metricsResponse: (() => Response) | undefined;
+  const signals: { signal: number; at: number }[] = [];
+  let stopped: (() => void) | undefined;
   const runtime = {
     running: flags.running ?? false,
     destroys: 0,
+    signal(signal: number) {
+      signals.push({ signal, at: Date.now() });
+      this.running = false;
+      stopped?.();
+    },
     async destroy() {
       this.destroys++;
       if (flags.stopError) throw new Error("synthetic shutdown failure");
@@ -132,13 +140,19 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
       listenerPort = Number(options.env?.LISTEN_ADDR?.split(":").at(-1) ?? 8080);
       this.running = true;
     },
-    // A running container's monitor stays pending until it stops.
-    monitor: () => new Promise<void>(() => {}),
+    // Native SIGTERM ends the process. The double has no idle timer:
+    // expiry must come from the installed SDK's alarm.
+    monitor: () => new Promise<void>((resolve) => { stopped = resolve; }),
     getTcpPort: (port: number) => ({
       async fetch(input: string | Request) {
         const pathname = new URL(typeof input === "string" ? input : input.url).pathname;
         requests.push({ pathname, port });
         if (port !== listenerPort) throw new Error("connection refused: wrong container port");
+        if (pathname === "/metrics" && metricsResponse) {
+          const response = metricsResponse();
+          Object.defineProperty(response, "webSocket", { value: null });
+          return response;
+        }
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
         const status = pathname === "/readyz" ? probeStatus : 200;
@@ -192,9 +206,10 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   );
   await Promise.all(gates);
   return {
-    bot, runtime, starts, requests, logs, values, ctx, database,
+    bot, runtime, starts, requests, logs, values, ctx, database, signals,
     setProbeStatus: (status: number) => { probeStatus = status; },
     setProbeResponse: (factory: (status: number) => Response) => { probeResponse = factory; },
+    setMetricsResponse: (factory: () => Response) => { metricsResponse = factory; },
     pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all(),
   };
 }
@@ -2860,3 +2875,307 @@ for (const value of ["5m", "10m", "20m", "60m"]) {
     assert.equal(h.bot.sleepAfter, value);
   });
 }
+
+// This driver only delivers a native alarm and advances Node's clock until
+// the SDK's own bounded alarm wait completes. It never computes idle expiry,
+// calls onActivityExpired itself, or stops the process in the runtime double.
+async function settleIdleSdkAlarm(t: TestContext, bot: TwoBotContainer) {
+  let settled = false;
+  const firing = bot.alarm().finally(() => { settled = true; });
+  await setImmediate();
+  for (let elapsed = 0; !settled && elapsed < 180_000; elapsed += 1000) {
+    t.mock.timers.tick(1000);
+    await setImmediate();
+  }
+  assert.equal(settled, true, "the SDK alarm must finish within its three-minute fallback");
+  await firing;
+}
+
+async function assertIdleLifecycle(t: TestContext, mutant?: "expiry-noop" | "renewal-noop") {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("offline acceptance forbids external fetch"); });
+  const h = await harness(t, STAGING_IDLE_ENV);
+  h.setProbeStatus(200);
+  const initial = Date.now();
+  await (await h.bot.fetch(probeRequest("https://worker.invalid/readyz"))).arrayBuffer();
+  await setImmediate();
+  assert.equal(h.starts.length, 1);
+  assert.equal(h.runtime.running, true);
+  assert.deepEqual(h.signals, []);
+
+  // Install mutation controls after startup, so a disabled renewal leaves a
+  // valid original deadline rather than merely breaking construction.
+  if (mutant === "expiry-noop") t.mock.method(h.bot, "onActivityExpired", async () => {});
+  if (mutant === "renewal-noop") t.mock.method(h.bot, "renewActivityTimeout", () => {});
+  t.mock.timers.tick(10 * 60_000);
+  await (await h.bot.fetch(probeRequest("https://worker.invalid/health"))).arrayBuffer();
+  await setImmediate();
+  assert.equal(h.starts.length, 1, "owned traffic renews the same process, not a replacement");
+
+  t.mock.timers.tick(5 * 60_000);
+  await settleIdleSdkAlarm(t, h.bot);
+  assert.equal(h.runtime.running, true, "owned activity must survive the original idle deadline");
+  assert.deepEqual(h.signals, [], "the original deadline is no longer a stop boundary");
+
+  const renewedDeadline = initial + 25 * 60_000;
+  t.mock.timers.tick(renewedDeadline - 1 - Date.now());
+  const justBeforeExpiry = h.bot.alarm();
+  await setImmediate();
+  assert.equal(h.runtime.running, true, "no premature stop one millisecond before the renewed deadline");
+  assert.deepEqual(h.signals, []);
+  t.mock.timers.tick(1);
+  await justBeforeExpiry;
+  await h.bot.alarm();
+  await setImmediate();
+  assert.deepEqual(h.signals, [{ signal: 15, at: renewedDeadline }],
+    "idle expiry must deliver exactly one native SIGTERM at the renewed deadline");
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.runtime.destroys, 0, "idle expiry is graceful, not a forced destroy");
+  assert.ok(h.logs.includes("two-bot container stopped"), "the SDK stop hook must run");
+
+  t.mock.timers.tick(1);
+  const replacement = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
+  assert.equal(replacement.status, 200);
+  await replacement.arrayBuffer();
+  await setImmediate();
+  assert.equal(h.starts.length, 2, "the next owned request starts a replacement");
+  assert.deepEqual(h.starts[1]?.env, EXPECTED_ENV);
+  assert.equal(h.runtime.running, true);
+  assert.equal(h.pending().length, 0, "a replacement must not resurrect the keepalive chain");
+}
+
+test("SDK idle lifecycle: real expiry, owned renewal, SIGTERM and on-demand replacement", async (t) => {
+  await assertIdleLifecycle(t);
+});
+
+for (const mutant of ["expiry-noop", "renewal-noop"] as const) {
+  test(`SDK idle lifecycle oracle rejects ${mutant}`, async (t) => {
+    await assert.rejects(assertIdleLifecycle(t, mutant), (error: unknown) => {
+      assert.ok(error instanceof assert.AssertionError);
+      assert.match(error.message, mutant === "expiry-noop"
+        ? /^idle expiry must deliver exactly one native SIGTERM at the renewed deadline/
+        : /^owned activity must survive the original idle deadline/);
+      return true;
+    });
+  });
+}
+
+for (const warm of [false, true]) {
+  for (const path of ["/health", "/readyz"]) {
+    for (const status of path === "/health" ? [200] : [200, 503]) {
+      test(`idle cleanup: ${warm ? "warm" : "cold"} ${path} (${status}) survives transient DELETE failure and retries`, async (t) => {
+        const h = await harness(t, STAGING_IDLE_ENV);
+        h.setProbeStatus(status);
+        if (warm) await (await h.bot.fetch(probeRequest("https://worker.invalid/health"))).arrayBuffer();
+        await h.bot.schedule(60, "keepalive", KEEPALIVE);
+        await h.bot.schedule(3600, "onStop", {});
+        const exec = h.ctx.storage.sql.exec;
+        let failing = true;
+        let attempts = 0;
+        t.mock.method(h.ctx.storage.sql, "exec", (query: string, ...bindings: (string | number | null)[]) => {
+          if (/DELETE FROM container_schedules WHERE callback =/.test(query) && bindings[0] === "keepalive") {
+            attempts++;
+            if (failing) throw new Error(`synthetic cleanup provider error ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.OPS_ALERT_WEBHOOK_URL}`);
+          }
+          return exec(query, ...bindings);
+        });
+        const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+        assert.equal(response.status, status, "disabled-chain cleanup must not replace the owned Container response");
+        assert.deepEqual(await response.json(), { ready: status === 200, gateway_connected: status === 200 });
+        assert.ok(attempts > 0, "the fault must reach actual SDK DELETE SQL");
+        assert.equal(h.starts.length, 1);
+        assert.equal(h.runtime.running, true, "monitoring cleanup must not destroy the healthy process");
+        assert.equal(h.runtime.destroys, 0);
+        assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)
+          && !line.includes(WORKER_ENV.OPS_ALERT_WEBHOOK_URL)
+          && !line.includes("synthetic cleanup provider error")));
+        const failedAttempts = attempts;
+        failing = false;
+        const retry = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+        assert.equal(retry.status, status);
+        await retry.arrayBuffer();
+        await h.bot.onStart();
+        assert.ok(attempts > failedAttempts, "a later owned request/startup must retry cleanup");
+        assert.equal(h.pending().length, 0);
+        assert.equal((await h.bot.listSchedules("onStop")).length, 1, "cleanup preserves unrelated SDK schedules");
+        assert.equal(h.starts.length, 1);
+      });
+    }
+  }
+}
+
+for (const entry of ["native start", "onStart hook"] as const) {
+  test(`idle cleanup: ${entry} tolerates transient DELETE failure without raw error leakage`, async (t) => {
+    const h = await harness(t, STAGING_IDLE_ENV, { running: entry === "onStart hook" });
+    await h.bot.schedule(60, "keepalive", KEEPALIVE);
+    const exec = h.ctx.storage.sql.exec;
+    let failing = true;
+    t.mock.method(h.ctx.storage.sql, "exec", (query: string, ...bindings: (string | number | null)[]) => {
+      if (failing && /DELETE FROM container_schedules WHERE callback =/.test(query) && bindings[0] === "keepalive") {
+        throw new Error(`synthetic cleanup provider error ${WORKER_ENV.DISCORD_TOKEN}`);
+      }
+      return exec(query, ...bindings);
+    });
+    await assert.doesNotReject(entry === "native start" ? h.bot.start() : h.bot.onStart(),
+      "schedule cleanup is fail-open monitoring, not failed ownership");
+    assert.equal(h.runtime.running, true);
+    assert.equal(h.runtime.destroys, 0);
+    assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)
+      && !line.includes("synthetic cleanup provider error")));
+    failing = false;
+    await h.bot.onStart();
+    assert.equal(h.pending().length, 0);
+  });
+}
+
+for (const running of [false, true]) {
+  test(`idle cleanup: ${running ? "warm" : "cold"} ownership refusal still fails closed before monitoring`, async (t) => {
+    const h = await harness(t, STAGING_IDLE_ENV, { running, owner: null });
+    let deletes = 0;
+    const exec = h.ctx.storage.sql.exec;
+    t.mock.method(h.ctx.storage.sql, "exec", (query: string, ...bindings: (string | number | null)[]) => {
+      if (/DELETE FROM container_schedules WHERE callback =/.test(query)) deletes++;
+      return exec(query, ...bindings);
+    });
+    const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    assert.equal(response.status, 503);
+    assert.equal(h.starts.length, 0);
+    assert.equal(h.requests.length, 0);
+    assert.equal(deletes, 0, "fail-open monitoring must never suppress the ownership fence");
+  });
+}
+
+const IDLE_RELEASE = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+function healthyIdleProbe() {
+  return Response.json({ components: [["process", "ready"], ["gateway", "ready"]],
+    build_revision: IDLE_RELEASE, build_id: "123-1" });
+}
+
+for (const fault of ["halted voice worker", "stale creator map"] as const) {
+  test(`awake idle monitoring: healthy readyz cannot hide a ${fault} or renew the idle lifetime`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+    const outbound = t.mock.method(globalThis, "fetch", async () => { throw new Error("offline acceptance forbids external fetch"); });
+    const h = await harness(t, { ...STAGING_IDLE_ENV, TWO_DEPLOY_ENV: "staging", OPS_ALERT_FORWARDING: "off" });
+    h.setProbeStatus(200);
+    h.setProbeResponse(healthyIdleProbe);
+    h.setMetricsResponse(() => new Response(fault === "halted voice worker"
+      ? liveMetricsBody().replace("two_bot_voice_worker_halted 0", "two_bot_voice_worker_halted 1")
+      : liveMetricsBody().replace("two_bot_voice_creator_map_generation 0", "two_bot_voice_creator_map_generation 1")
+        .replace("two_bot_voice_creator_map_age_seconds 0", "two_bot_voice_creator_map_age_seconds 660")));
+    const startedAt = Date.now();
+    const ready = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
+    assert.equal(ready.status, 200);
+    await ready.arrayBuffer();
+    await setImmediate();
+    t.mock.timers.tick(60_000);
+    await settleIdleSdkAlarm(t, h.bot);
+    const state = h.values.get("two-bot:metrics-alerts") as MetricsAlertState | undefined;
+    const rule = fault === "halted voice worker" ? "voice_worker_halted" : "voice_creator_map_stale";
+    assert.ok(state?.firing.includes(rule), "an awake idle bot must still evaluate its metrics, independently of readyz");
+    assert.ok(h.requests.some((request) => request.pathname === "/metrics"), "observe the actual Container boundary");
+    assert.ok(h.logs.some((line) => line.includes('"event":"metrics_alert"') && line.includes(rule)));
+    if (fault === "stale creator map") {
+      assert.equal((h.values.get("two-bot:remediation") as { scopes: Record<string, { phase: string }> }).scopes["voice-stall"]?.phase,
+        "reload-recommended", "idle monitoring still advances the recommendation guard");
+      assert.ok(h.logs.some((line) => line.includes('"event":"remediation_guard_receipt"') && line.includes('"ok":true')));
+    }
+    // An observer may have its own non-renewing schedule. It must not depend
+    // on or silently resurrect the disabled self-renewing keepalive chain.
+    assert.equal(h.pending().length, 0);
+    for (let turn = 0; h.runtime.running && Date.now() <= startedAt + 15 * 60_000 && turn < 1000; turn++) {
+      await settleIdleSdkAlarm(t, h.bot);
+    }
+    assert.deepEqual(h.signals, [{ signal: 15, at: startedAt + 15 * 60_000 }],
+      "monitoring an awake container must not prolong its idle lifetime");
+    const requestsAtSleep = h.requests.length;
+    for (let turn = 0; turn < 2; turn++) {
+      t.mock.timers.tick(180_000);
+      await settleIdleSdkAlarm(t, h.bot);
+    }
+    assert.equal(h.starts.length, 1, "an observer must not wake a sleeping bot");
+    assert.equal(h.requests.length, requestsAtSleep, "sleep is not a synthetic health/scrape failure");
+    assert.equal(h.runtime.destroys, 0, "recommendations never execute remediation");
+    assert.equal(outbound.mock.callCount(), 0, "observations cannot perform external remediation");
+  });
+}
+
+test("idle drill: suppressed STOP survives deployment, monitored unarmed clear resets it before rearm", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const outbound = t.mock.method(globalThis, "fetch", async () => { throw new Error("offline acceptance forbids external fetch"); });
+  const armedEnv = { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", OPS_ALERT_FORWARDING: "off",
+    KEEPALIVE_ENABLED: "1", TWO_VOICE_STALL_FAULT_INJECTION: "1" };
+  const armed = await harness(t, armedEnv);
+  armed.setProbeStatus(200);
+  armed.setProbeResponse(healthyIdleProbe);
+  armed.setMetricsResponse(() => new Response(liveMetricsBody()));
+  await tickKeepalive(armed.bot);
+  assert.equal((armed.values.get("two-bot:remediation") as { scopes: Record<string, { phase: string }> }).scopes["voice-stall"]?.phase,
+    "reload-recommended");
+  t.mock.timers.tick(30 * 60_000);
+  await tickKeepalive(armed.bot);
+  t.mock.timers.tick(30 * 60_000);
+  await tickKeepalive(armed.bot);
+  const stopped = structuredClone(armed.values.get("two-bot:remediation")) as {
+    scopes: Record<string, { phase: string; suppressed: boolean; consecutiveFailures: number; clearSinceSeconds: number }>;
+  };
+  assert.equal(stopped.scopes["voice-stall"]?.suppressed, true);
+  assert.equal(stopped.scopes["voice-stall"]?.consecutiveFailures, 2);
+  assert.ok(armed.logs.some((line) => line.includes("REMEDIATION STOPPED voice-stall")));
+  assert.equal(armed.runtime.destroys, 0);
+
+  // Explicit clear observation keeps an owned caller active while a separate
+  // observer advances the guard. No fault is armed or self-renewing keepalive
+  // required. Only persisted KV and SQLite cross this deployment boundary;
+  // there is no state reset seam.
+  const clearId = "deployment-clear";
+  armed.values.set(OWNER_KEY, { ...ACTIVE_OWNER, deploymentId: clearId, epoch: 2 });
+  const clear = await harness(t, { ...STAGING_IDLE_ENV, TWO_DEPLOY_ENV: "staging",
+    OPS_ALERT_FORWARDING: "off", CF_VERSION_METADATA: { id: clearId } }, armed.values, armed.database);
+  clear.setProbeStatus(200);
+  clear.setProbeResponse(healthyIdleProbe);
+  clear.setMetricsResponse(() => new Response(liveMetricsBody()));
+  assert.deepEqual(clear.values.get("two-bot:remediation"), stopped, "deployment cannot forget STOP");
+  const request = new Request("https://worker.invalid/readyz", { headers: { [DEPLOYMENT_HEADER]: clearId } });
+  await (await clear.bot.fetch(request)).arrayBuffer();
+  await setImmediate();
+  t.mock.timers.tick(60_000);
+  await settleIdleSdkAlarm(t, clear.bot);
+  const holding = clear.values.get("two-bot:remediation") as typeof stopped;
+  assert.ok(holding.scopes["voice-stall"]!.clearSinceSeconds > 0,
+    "unarmed clear must retain monitored healthy observations across deployment");
+  assert.equal(holding.scopes["voice-stall"]!.suppressed, true, "one clear sample cannot reset STOP");
+  const resetAfter = holding.scopes["voice-stall"]!.clearSinceSeconds * 1000 + 30 * 60_000;
+  let callerLastActive = Date.now();
+  for (let turn = 0; Date.now() <= resetAfter && turn < 1000; turn++) {
+    if (Date.now() - callerLastActive >= 5 * 60_000) {
+      const response = await clear.bot.fetch(new Request(request));
+      assert.equal(response.status, 200);
+      await response.arrayBuffer();
+      await setImmediate();
+      callerLastActive = Date.now();
+    }
+    await settleIdleSdkAlarm(t, clear.bot);
+  }
+  assert.deepEqual((clear.values.get("two-bot:remediation") as typeof stopped).scopes["voice-stall"], {
+    phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0,
+  }, "a full monitored healthy half-hour resets the persisted guard");
+  assert.ok(clear.logs.some((line) => line.includes('"event":"remediation_guard_receipt"')
+    && line.includes('"ok":true') && line.includes('"decision":"idle"')),
+    "verify reset by a successful persisted-state receipt, not a fresh in-memory guard");
+  assert.equal(clear.pending().length, 0);
+  assert.equal(clear.runtime.destroys, 0);
+
+  const rearmId = "deployment-rearm";
+  clear.values.set(OWNER_KEY, { ...ACTIVE_OWNER, deploymentId: rearmId, epoch: 3 });
+  const rearmed = await harness(t, { ...armedEnv, CF_VERSION_METADATA: { id: rearmId } }, clear.values, clear.database);
+  rearmed.setProbeStatus(200);
+  rearmed.setProbeResponse(healthyIdleProbe);
+  rearmed.setMetricsResponse(() => new Response(liveMetricsBody()));
+  await tickKeepalive(rearmed.bot);
+  const guard = (rearmed.values.get("two-bot:remediation") as typeof stopped).scopes["voice-stall"]!;
+  assert.equal(guard.phase, "reload-recommended", "rearm begins at R1 only after verified reset");
+  assert.equal(guard.suppressed, false);
+  assert.equal(guard.consecutiveFailures, 0);
+  assert.equal(rearmed.runtime.destroys, 0);
+  assert.equal(outbound.mock.callCount(), 0, "the drill recommends actions but executes none");
+});

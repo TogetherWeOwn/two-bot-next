@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location(
@@ -83,8 +84,47 @@ class AlertBindingTests(unittest.TestCase):
                 self.assertTrue(any("positive safe-integer string" in e for e in self.check_config(config)))
 
     def test_optional_handling_does_not_weaken_required_bindings(self):
-        config = BASE.replace('KEEPALIVE_SECONDS = "60"\nTWO_GUILD_NAME', "TWO_GUILD_NAME", 1)
-        self.assertTrue(any("missing vars ['KEEPALIVE_SECONDS']" in e for e in self.check_config(config)))
+        # Removal is scoped to [env.staging.vars] only: the old first-adjacency
+        # replace now hits production (staging has idle-sleep lines between
+        # KEEPALIVE_SECONDS and TWO_GUILD_NAME). Staging must report the
+        # literal missing key with a staging prefix while production and the
+        # top level retain it.
+        self.assertEqual(self.check_config(BASE), [])
+        prefix, rest = BASE.split("[env.staging.vars]", 1)
+        staging_body, suffix = rest.split("\n[", 1)
+        suffix = "\n[" + suffix
+        self.assertIn('KEEPALIVE_SECONDS = "60"', staging_body)
+        staging_body = staging_body.replace('KEEPALIVE_SECONDS = "60"\n', "", 1)
+        self.assertNotIn("KEEPALIVE_SECONDS", staging_body)
+        config = prefix + "[env.staging.vars]" + staging_body + suffix
+        prod_body = config.split("[env.production.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('KEEPALIVE_SECONDS = "60"', prod_body)
+        self.assertIn('KEEPALIVE_SECONDS = "60"', prefix)
+        errors = self.check_config(config)
+        staging_missing = [
+            e for e in errors
+            if "[env.staging]" in e and "missing vars ['KEEPALIVE_SECONDS']" in e
+        ]
+        self.assertEqual(len(staging_missing), 1, errors)
+        prod_missing = [e for e in errors if "[env.production]" in e and "missing vars" in e]
+        self.assertEqual(prod_missing, [], errors)
+
+    def test_staging_missing_vars_suppression_is_detected(self):
+        # Control for the staging-scoped required-bindings test: patch the
+        # checker to suppress only staging missing-vars diagnostics, run the
+        # existing oracle, and assert it raises. Mutant is in-memory only via
+        # patch; no source writes. Proves the oracle itself detects suppression,
+        # not just that filtering changes an array.
+        real_check = checker.check
+
+        def suppress_staging_missing(path):
+            errors = real_check(path)
+            return [e for e in errors if not ("[env.staging]" in e and "missing vars" in e)]
+
+        with patch.object(checker, "check", side_effect=suppress_staging_missing):
+            with self.assertRaises(AssertionError):
+                self.test_optional_handling_does_not_weaken_required_bindings()
+        self.test_optional_handling_does_not_weaken_required_bindings()
 
     def test_ingress_is_staging_only_and_deployed_dark(self):
         staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
