@@ -1098,9 +1098,17 @@ fn comment_open_after(line: &str, mut in_comment: bool) -> bool {
 fn rendered_link_lines(text: &str) -> Vec<&str> {
     use pulldown_cmark::{Event, Parser, Tag};
 
+    // pulldown-cmark 0.13.5's closing-fence scanner accepts spaces but not
+    // CommonMark's trailing tabs. Normalize only line-end ASCII whitespace;
+    // replacing each tab with one space preserves byte offsets into the original
+    // source, whose manifest rows must still match exactly (including whitespace).
+    let trailing_space =
+        regex::Regex::new(r"(?m)[ \t]+\r?$").expect("line-end ASCII whitespace pattern");
+    let parser_text =
+        trailing_space.replace_all(text, |row: &regex::Captures<'_>| row[0].replace('\t', " "));
     let mut in_comment = false;
     let mut rendered = Vec::new();
-    for (event, range) in Parser::new(text).into_offset_iter() {
+    for (event, range) in Parser::new(&parser_text).into_offset_iter() {
         match event {
             Event::Html(html) | Event::InlineHtml(html) => {
                 in_comment = comment_open_after(&html, in_comment);
@@ -1403,6 +1411,60 @@ fn control_docs_index_rejects_rows_hidden_by_raw_html_and_odd_markup() {
     // tags alone are, even when their names are not in the block-tag list.
     shown(format!("<span>x</span>\n{guide}\n"));
     hidden(format!("<divider>\n{guide}\n"));
+}
+
+#[test]
+fn control_docs_index_accepts_tab_terminated_fences_without_normalizing_rows() {
+    let guide = "- [Community jobs](community-jobs.md)";
+    let fragment = "- [Community](index-community.md)";
+    for (open, close) in [
+        ("```", "```"),
+        ("~~~", "~~~"),
+        ("```", "````"),
+        ("~~~", "~~~~"),
+    ] {
+        for suffix in ["\t", " \t ", "\t \t"] {
+            for eol in ["\n", "\r\n"] {
+                let markup = format!("{open}{eol}example{eol}{close}{suffix}{eol}");
+                let guide_markup = format!("{markup}{guide}{eol}");
+                let fragment_markup = format!("{markup}{fragment}{eol}");
+                for (layout, readme, contents) in [
+                    ("direct", guide_markup.as_str(), guide),
+                    ("linked row", fragment_markup.as_str(), guide),
+                    ("linked guide", fragment, guide_markup.as_str()),
+                ] {
+                    assert!(
+                        community_jobs_fixture_is_indexed(&[
+                            ("docs/README.md", readme),
+                            ("docs/index-community.md", contents),
+                            ("docs/community-jobs.md", "# Community jobs\n"),
+                        ]),
+                        "{layout}: tab-terminated fence must close: {markup:?}"
+                    );
+                }
+            }
+        }
+    }
+    // Source rows are not normalized: line-end spaces/tabs and leading tabs
+    // cannot turn malformed manifest rows or indented code into valid links.
+    for (prefix, suffix) in [("", "\t"), ("", " \t "), ("\t", "")] {
+        let guide_markup = format!("{prefix}{guide}{suffix}\n");
+        let fragment_markup = format!("{prefix}{fragment}{suffix}\n");
+        for (layout, readme, contents) in [
+            ("direct", guide_markup.as_str(), guide),
+            ("linked row", fragment_markup.as_str(), guide),
+            ("linked guide", fragment, guide_markup.as_str()),
+        ] {
+            assert!(
+                !community_jobs_fixture_is_indexed(&[
+                    ("docs/README.md", readme),
+                    ("docs/index-community.md", contents),
+                    ("docs/community-jobs.md", "# Community jobs\n"),
+                ]),
+                "{layout}: source row must remain exact: {prefix:?}, {suffix:?}"
+            );
+        }
+    }
 }
 
 #[test]
