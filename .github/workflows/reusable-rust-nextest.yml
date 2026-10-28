@@ -348,6 +348,10 @@ jobs:
       # and copy to the workspace root so the parse/upload steps below see one
       # stable path. The nextest exit status is preserved: a failing test run
       # still fails this step, but its JUnit evidence is retained for upload.
+      - name: Generate command reference before nextest compilation
+        shell: bash
+        run: python3 scripts/generate_command_reference.py
+
       - name: cargo nextest (unit and binary, retries=1, JUnit)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci

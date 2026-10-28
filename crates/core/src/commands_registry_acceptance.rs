@@ -22,12 +22,24 @@ fn core_commands_match_legacy_names() {
     assert_eq!(core[0].options[0].kind, 6);
     assert!(core[0].options[0].required.is_none());
     assert!(core[1].options.is_empty());
-    assert_eq!(core[2].options.len(), 1);
+    assert_eq!(core[2].options.len(), 2);
     assert_eq!(core[2].options[0].name, "command");
     assert_eq!(core[2].options[0].kind, 3);
     assert!(core[2].options[0].required.is_none());
     assert_eq!(core[2].options[0].max_length, Some(32));
     assert!(core[2].options[0].choices.is_empty());
+    // Optional focused subcommand-path selector: space-separated exact
+    // segments within the selected root. 96 wire chars carry the deepest
+    // Discord path (two 32-char segments plus separators) with headroom.
+    assert_eq!(core[2].options[1].name, "subcommand");
+    assert_eq!(
+        core[2].options[1].description,
+        "Subcommand path, space-separated (requires command)"
+    );
+    assert_eq!(core[2].options[1].kind, 3);
+    assert!(core[2].options[1].required.is_none());
+    assert_eq!(core[2].options[1].max_length, Some(96));
+    assert!(core[2].options[1].choices.is_empty());
     assert_eq!(core[2].description, HELP_DESCRIPTION);
     assert!(core[2].default_member_permissions.is_none());
     // The Next-only `privacy` self-serve carries analytics and deletion
