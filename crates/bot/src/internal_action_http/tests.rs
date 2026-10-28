@@ -4679,10 +4679,19 @@ async fn scoped_receiver_challenges_registry_refusals_but_not_service_faults() {
         "scoped refusals must precede execution intents"
     );
 
-    // Prove the payload and counting seam can reach the event executor when
-    // authenticated with the existing unscoped scheme, not merely fail input
-    // validation before it. This is a disposable database and offline effect.
-    let (status, _, body) = answer(app, signed(&raw, "old", "intent-scoped-refusal")).await;
+    // Bearer-bearing input cannot fall back to legacy authority either.
+    let (status, _, body) = answer(app.clone(), signed(&raw, "old", "intent-scoped-refusal")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(mutates.calls.load(Ordering::SeqCst), 0);
+
+    // Prove the event fields and counting seam reach the legacy executor,
+    // rather than failing validation before it. Remove only the bearer:
+    // legacy deliberately refuses bearer-bearing input before dispatch.
+    // This is a disposable database and offline effect.
+    payload.as_object_mut().unwrap().remove("admin_bearer");
+    let legacy_raw = payload.to_string();
+    let (status, _, body) = answer(app, signed(&legacy_raw, "old", "intent-scoped-refusal")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["event_id"], CREATE_EVENT_ID);
     assert_eq!(mutates.calls.load(Ordering::SeqCst), 1);
