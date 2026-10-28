@@ -7,6 +7,8 @@ An explicit --mutant injects exactly one regression ONLY into that scratch copy;
 exit 75 is cache refusal, not an observed assertion failure.
 Builder must keep the same cfg(test) binding/registration so ordinary library CI
 runs these protected tests. Non-test builds keep the real store import.
+--workspace generates the ignored command reference inside the scratch snapshot
+before compiling bot tests; Discord-only modes do not need that prerequisite.
 
 Commands (controller Cargo builds always use the bounded cache wrapper):
   python3 crates/discord/tests/run_community_facts_requeue.py
@@ -153,8 +155,14 @@ def main():
             print("Mutant runtime SHA-256:", hashlib.sha256(instrumented).hexdigest(), flush=True)
         else:
             print("Scratch changes: external store import + cfg(test) registration only", flush=True)
-        print("Command:", " ".join(command), flush=True)
         try:
+            if args.workspace:
+                prerequisite = ["python3", "scripts/generate_command_reference.py", "--controller"]
+                print("Prerequisite:", " ".join(prerequisite), flush=True)
+                generated = subprocess.run(prerequisite, cwd=workspace, check=False)
+                if generated.returncode:
+                    return generated.returncode
+            print("Command:", " ".join(command), flush=True)
             result = subprocess.run(command, cwd=workspace, check=False)
         finally:
             if (ROOT / SOURCE).read_bytes() != original:
