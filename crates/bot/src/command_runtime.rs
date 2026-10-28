@@ -1606,6 +1606,9 @@ impl CommandRuntime {
                 Some(HandlerId::Moderation(ModerationAction::Timeout))
             }
             "warn" if self.member.is_some() => Some(HandlerId::Moderation(ModerationAction::Warn)),
+            // The staff ledger read shares the member consumer's presence:
+            // without it the immediate unavailable reply is kept.
+            "moderation-recent" if self.member.is_some() => Some(HandlerId::ModerationRecent),
             _ => None,
         };
         if owner != Some(handler) {
@@ -1747,6 +1750,15 @@ impl CommandRuntime {
             "warn" => {
                 self.member_command(interaction, ModerationAction::Warn)
                     .await;
+            }
+            "moderation-recent" => {
+                crate::moderation_recent_command::handle_command(
+                    &self.pool,
+                    self.guild_id,
+                    &self.executor,
+                    interaction,
+                )
+                .await;
             }
             _ => {}
         }
@@ -3227,6 +3239,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
     if gates.moderation {
         register_channel_handlers(&mut router);
+        // The staff ledger read executes in this runtime (member consumer
+        // present); registration documents the ownership the router names.
+        router.register(Box::new(SliceHandler(HandlerId::ModerationRecent)));
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));

@@ -55,6 +55,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("moderation-recent", "docs/parity.md §1 moderation-recent"),
     ("lfg-list", "docs/parity.md §1 lfg-list"),
     ("rsvp", "docs/parity.md §1 #24 caps"),
     ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
@@ -632,6 +633,18 @@ pub fn expected_registry() -> Value {
             "options": [],
             "dm_permission": false,
             "default_member_permissions": "16"
+        }),
+    );
+    commands.insert(
+        after_unlock + 2,
+        json!({
+            "name": "moderation-recent",
+            "description": "Privately list recent saved moderation actions",
+            "dm_permission": false,
+            "default_member_permissions": "1099511627776",
+            "options": [{"name": "page",
+                "description": "Page of saved moderation actions (1 is newest)",
+                "type": 4, "min_value": 1, "max_value": 20}]
         }),
     );
     // Picker-copy exceptions (registry golden exceptions table): command and
