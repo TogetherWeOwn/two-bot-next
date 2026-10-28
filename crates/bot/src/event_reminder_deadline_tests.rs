@@ -4,6 +4,9 @@
 
 #![cfg(test)]
 
+#[path = "event_reminder_deadline_review_tests.rs"]
+mod review_gaps;
+
 use std::{process::Command, sync::Arc, time::Duration};
 
 use serde_json::json;
@@ -93,8 +96,12 @@ async fn urgent_tail() {
         "1546451670500643001",
         "1546451670500643002",
     ];
+    // Map the event's wall-clock start to the mock's monotonic arrival clock.
+    // The audit timestamp is a pre-wire fence, not evidence of timely delivery.
+    let wire_epoch = tokio::time::Instant::now();
     let now = now_ms();
     let starts = now + 10_000;
+    let wire_deadline = wire_epoch + Duration::from_millis(starts - now);
     let mut events: Vec<_> = ids
         .map(|id| ScheduledEvent {
             id: id.to_owned(),
@@ -188,16 +195,16 @@ async fn urgent_tail() {
         attempts.iter().all(|(id, _)| ids.contains(&id.as_str())),
         "the extra pass must leave a nonurgent fourth event for the ordinary tick"
     );
+    let fences_before_restart = reminder_fences(db.pool()).await;
     if delivered.is_ok() {
-        // Retain all fences but reschedule the three reminders into the future
-        // and remove the nonurgent control. Expiry cannot explain the silence:
-        // a fresh pool/executor must refuse replay, including the extra pass.
+        // All three remain future AND urgent after restart. Neither expiration
+        // nor the follow-up's urgency filter can explain replay refusal.
         let restart_now = now_ms();
         let rescheduled: Vec<_> = events[..3]
             .iter()
             .cloned()
             .map(|mut event| {
-                event.starts_at = format_iso_ms(restart_now + 60_000);
+                event.starts_at = format_iso_ms(restart_now + 10_000);
                 event
             })
             .collect();
@@ -216,11 +223,16 @@ async fn urgent_tail() {
             guild.to_owned(),
         ));
         let replay = register(restarted, &fixtures::staging()).expect("new job after restart");
+        assert!(
+            now_ms() < restart_now + 10_000,
+            "restart control must still be future and within the urgent window"
+        );
         (replay.action)()
             .await
             .expect("retained fences refuse replay");
         peer.close().await;
     }
+    let fences_after_restart = reminder_fences(db.pool()).await;
     let requests = mock.requests();
     let successful = status.read().await[NAMES[0]].last_success.is_some();
     mock.shutdown().await;
@@ -231,6 +243,11 @@ async fn urgent_tail() {
     );
     assert_eq!(attempts.len(), 3, "one immutable attempt per event");
     assert!(attempts.iter().all(|(_, at)| *at < starts as i64));
+    assert_eq!(fences_before_restart.len(), 3);
+    assert_eq!(
+        fences_after_restart, fences_before_restart,
+        "restart must retain each complete immutable fence, including its identity"
+    );
     assert_eq!(
         requests
             .iter()
@@ -238,7 +255,32 @@ async fn urgent_tail() {
             .count(),
         3
     );
+    for id in ids {
+        let link = format!("https://discord.com/events/{guild}/{id}");
+        let arrivals: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.method == "POST" && String::from_utf8_lossy(&request.body).contains(&link)
+            })
+            .collect();
+        assert_eq!(arrivals.len(), 1, "one actual reminder arrival for {id}");
+        assert!(
+            arrivals[0].received_at < wire_deadline,
+            "reminder for {id} must reach Discord before that event's start"
+        );
+    }
     assert!(successful, "follow-up remains a supervised healthy attempt");
+}
+
+async fn reminder_fences(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT to_jsonb(a)::text FROM automation_audit_log a
+         WHERE guild_id = $1 AND action = 'rsvp.reminder_attempt' ORDER BY id",
+    )
+    .bind(GUILD)
+    .fetch_all(pool)
+    .await
+    .expect("read complete immutable reminder fences")
 }
 
 const GUILD: &str = "3333";
