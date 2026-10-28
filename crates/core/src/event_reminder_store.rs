@@ -40,6 +40,17 @@ pub async fn due_event_reminders(
     guild: &str,
     now: u64,
 ) -> Result<Vec<EventReminder>, sqlx::Error> {
+    due_event_reminders_before(pool, guild, now, now.saturating_add(EVENT_REMINDER_LEAD_MS)).await
+}
+
+/// Apply an earlier start cutoff before reading any candidate's attendee roster.
+/// The cutoff cannot widen the ordinary lead window or the two-event batch.
+pub async fn due_event_reminders_before(
+    pool: &PgPool,
+    guild: &str,
+    now: u64,
+    latest_start: u64,
+) -> Result<Vec<EventReminder>, sqlx::Error> {
     sqlx::query_as(
         "SELECT e.event_id, e.name, e.starts_at, e.channel_id,
                 ARRAY(SELECT r.user_id FROM event_rsvps r
@@ -61,7 +72,9 @@ pub async fn due_event_reminders(
     )
     .bind(guild)
     .bind(format_iso_ms(now))
-    .bind(format_iso_ms(now.saturating_add(EVENT_REMINDER_LEAD_MS)))
+    .bind(format_iso_ms(
+        latest_start.min(now.saturating_add(EVENT_REMINDER_LEAD_MS)),
+    ))
     .bind(EVENT_REMINDER_BATCH_LIMIT)
     .bind(MAX_RSVPS_PER_EVENT + 1)
     .fetch_all(pool)
@@ -73,17 +86,32 @@ pub async fn due_event_reminders(
 /// new claim authorizes POST; an unknown commit result authorizes nothing.
 /// Serializing guild admission also makes the retained-fence cap race-safe.
 /// NULL actor and event-only target contain no member data to erase.
+/// This variant uses a supplied reference time; live dispatch must use
+/// [`begin_event_reminder_delivery_with_clock`] to account for admission waits.
 pub async fn begin_event_reminder_delivery(
     pool: &PgPool,
     guild: &str,
     event: &EventReminder,
     now: u64,
 ) -> Result<bool, sqlx::Error> {
+    begin_event_reminder_delivery_with_clock(pool, guild, event, &|| now).await
+}
+
+/// Live dispatch samples its clock only after acquiring the connection and
+/// guild lock. A timestamp captured before either wait cannot admit a send.
+/// Callers must also recheck after commit, which can itself outlast the start.
+pub async fn begin_event_reminder_delivery_with_clock(
+    pool: &PgPool,
+    guild: &str,
+    event: &EventReminder,
+    clock: &impl Fn() -> u64,
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('event_reminders:' || $1, 0))")
         .bind(guild)
         .execute(&mut *tx)
         .await?;
+    let now = clock();
     let inserted = sqlx::query(
         "INSERT INTO automation_audit_log
            (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)

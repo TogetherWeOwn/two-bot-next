@@ -253,45 +253,56 @@ async fn remind_event_attendees(
     clock: &impl Fn() -> u64,
     latest_start: Option<u64>,
 ) -> Result<(), ErrorClass> {
-    use two_bot_core::event_reminder_store::{begin_event_reminder_delivery, due_event_reminders};
+    use two_bot_core::{
+        event_reminder_store::{
+            begin_event_reminder_delivery_with_clock, due_event_reminders_before,
+            EVENT_REMINDER_LEAD_MS,
+        },
+        scheduled::parse_iso_ms,
+    };
 
-    let latest_start = latest_start.map(format_iso_ms);
-    for event in due_event_reminders(pool, guild, clock())
+    let now = clock();
+    let latest_start = latest_start.unwrap_or_else(|| now.saturating_add(EVENT_REMINDER_LEAD_MS));
+    for event in due_event_reminders_before(pool, guild, now, latest_start)
         .await
         .map_err(reminder_database)?
     {
-        // The store orders by start time. Nonurgent tails retain the ordinary
-        // two-per-tick budget; no audit fence is armed merely by selection.
-        if latest_start
-            .as_ref()
-            .is_some_and(|latest| event.starts_at.as_str() > latest.as_str())
-        {
-            break;
-        }
-        let now = clock();
-        if !begin_event_reminder_delivery(pool, guild, &event, now)
+        if !begin_event_reminder_delivery_with_clock(pool, guild, &event, clock)
             .await
             .map_err(reminder_database)?
         {
             continue;
         }
-        let (outcome, reason) = if let Some(content) = event_reminder_content(guild, &event) {
-            match rest
-                .post_message_confirmed(&event.channel_id, &content, &random_nonce())
+        let content = event_reminder_content(guild, &event);
+        // The INSERT and commit may also wait. Keep every committed fence, but
+        // refuse an expired send and bound any transport admission by the start.
+        let now = clock();
+        let remaining = parse_iso_ms(&event.starts_at)
+            .and_then(|starts| starts.checked_sub(now))
+            .filter(|remaining| *remaining > 0);
+        let (outcome, reason) = match (content, remaining) {
+            (_, None) => ("failed", Some("invalid_or_elapsed_event_start")),
+            (None, Some(_)) => ("failed", Some("invalid_or_oversized_reminder")),
+            (Some(content), Some(remaining)) => {
+                let nonce = random_nonce();
+                let result = tokio::time::timeout(
+                    Duration::from_millis(remaining),
+                    rest.post_message_confirmed(&event.channel_id, &content, &nonce),
+                )
                 .await
-            {
-                Ok(_) => ("posted", None),
-                Err(error) => (
-                    if error.proves_no_effect() || error.is_admission_blocked() {
-                        "failed"
-                    } else {
-                        "delivery_uncertain"
-                    },
-                    Some(discord_error_name(&error)),
-                ),
+                .unwrap_or(Err(DiscordError::Timeout));
+                match result {
+                    Ok(_) => ("posted", None),
+                    Err(error) => (
+                        if error.proves_no_effect() || error.is_admission_blocked() {
+                            "failed"
+                        } else {
+                            "delivery_uncertain"
+                        },
+                        Some(discord_error_name(&error)),
+                    ),
+                }
             }
-        } else {
-            ("failed", Some("invalid_or_oversized_reminder"))
         };
         // Only the result is appended; the attempt fact remains immutable.
         // No attendee ids, names or rendered content enter diagnostics/audits.

@@ -30,7 +30,12 @@ follow-up shares the same activation fence, supervisor ownership, cancellation
 and overall deadline; it never reruns ordinary scheduled messages, resets the
 timeout or admits an event after its start. There is no unbounded drain: at
 most four reminder attempts run in one supervised invocation. Larger urgent
-bursts, slow delivery or exhausted deadlines remain best effort.
+bursts, slow delivery or exhausted deadlines remain best effort. The urgent
+cutoff is applied in the store query before attendee rosters are materialized.
+Admission checks the clock after connection and guild-lock waits, and dispatch
+checks again after commit. An event-start timeout also bounds transport
+admission and the POST; a timeout retains the immutable fence and is uncertain,
+not permission to retry.
 Ordinary scheduled messages run first as a separate phase: a completed
 schedule-store failure that stops their batch still permits the bounded
 reminder attempt on the same tick when activation and supervisor ownership
