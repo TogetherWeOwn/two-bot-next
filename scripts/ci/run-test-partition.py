@@ -184,6 +184,8 @@ def has_tests(commands):
 
 
 def execute(commands):
+    if any(item[2] for item in commands):
+        Path(environment(None, True)["PAPERCLIP_RUN_SCRATCH_DIR"]).mkdir(parents=True, exist_ok=True)
     if not has_tests(commands):
         raise ValueError("partition selected no tests")
     property_seconds = 0.0
