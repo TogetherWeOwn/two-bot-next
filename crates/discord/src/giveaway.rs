@@ -17,7 +17,11 @@
 //! winners post carries `<@id>` text, the draw seed and the revealed nonce so
 //! any member can replay the draw.
 
-use std::{collections::HashMap, sync::Mutex, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -117,13 +121,20 @@ enum DrawError {
 // always-on container.
 static EFFECTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[derive(Debug)]
 pub struct GiveawayRuntime {
     pool: PgPool,
     executor: ActionExecutor,
+    create_clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    create_nonce: Arc<dyn Fn() -> String + Send + Sync>,
     // Serialize count edits with entry/cancel, including the refresh supervisor.
     // No spawned waiters: the existing command admission lane bounds callers.
     budgets: Mutex<HashMap<String, (Instant, u32)>>,
+}
+
+impl std::fmt::Debug for GiveawayRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GiveawayRuntime").finish_non_exhaustive()
+    }
 }
 
 impl GiveawayRuntime {
@@ -131,42 +142,74 @@ impl GiveawayRuntime {
         Self {
             pool,
             executor,
+            create_clock: Arc::new(OffsetDateTime::now_utc),
+            create_nonce: Arc::new(giveaway::mint_draw_nonce),
             budgets: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Called only after the shared router authorized and deferred the command.
-    pub async fn command(&self, interaction: &Interaction) {
-        let _effects = EFFECTS.lock().await;
-        let result = self.command_inner(interaction).await;
-        self.finish(interaction, result.unwrap_or_else(|_| FAILURE.to_owned()))
-            .await;
+    /// Deterministic create sources for behavioral verification. Production
+    /// construction retains the UTC clock and secure draw randomness.
+    pub fn with_create_sources(
+        mut self,
+        clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+        nonce: Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Self {
+        self.create_clock = clock;
+        self.create_nonce = nonce;
+        self
     }
 
-    async fn command_inner(&self, interaction: &Interaction) -> Result<String, sqlx::Error> {
+    /// Called only after the shared router authorized and deferred the command.
+    pub async fn command(&self, interaction: &Interaction) {
+        let text = match self.decode_command(interaction) {
+            Err(text) => text,
+            Ok((guild, Management::Create(create))) if create.preview => {
+                // Preview is pure: neither rendering nor completion waits on
+                // mutations, and its webhook cannot hold up entries or draws.
+                self.create(interaction, &guild, &create)
+                    .await
+                    .unwrap_or_else(|_| FAILURE.to_owned())
+            }
+            Ok((guild, command)) => {
+                let _effects = EFFECTS.lock().await;
+                self.command_inner(interaction, &guild, command)
+                    .await
+                    .unwrap_or_else(|_| FAILURE.to_owned())
+            }
+        };
+        self.finish(interaction, text).await;
+    }
+
+    fn decode_command(&self, interaction: &Interaction) -> Result<(String, Management), String> {
         let Some(guild) = interaction.guild_id else {
-            return Ok(INVALID.into());
+            return Err(INVALID.into());
         };
-        let guild = guild.get().to_string();
         let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
-            return Ok(INVALID.into());
+            return Err(INVALID.into());
         };
-        // One strict decode before any store read, budget, audit, draw or
-        // Discord work; a refusal is a private reply with no other effect.
-        let command = match options::decode(&data.options) {
-            Ok(command) => command,
-            Err(refusal) => return Ok(refusal.text()),
-        };
+        // One strict, pure decode, including preview and the existing safe
+        // diagnostics, before locking or any store/provider operation.
+        let command = options::decode(&data.options).map_err(|refusal| refusal.text())?;
+        Ok((guild.get().to_string(), command))
+    }
+
+    async fn command_inner(
+        &self,
+        interaction: &Interaction,
+        guild: &str,
+        command: Management,
+    ) -> Result<String, sqlx::Error> {
         match command {
-            Management::Create(create) => self.create(interaction, &guild, &create).await,
-            Management::Inspect { id } => self.inspect(interaction, &guild, &id).await,
+            Management::Create(create) => self.create(interaction, guild, &create).await,
+            Management::Inspect { id } => self.inspect(interaction, guild, &id).await,
             Management::List => {
-                let rows = store::list_active(&self.pool, &guild).await?;
+                let rows = store::list_active(&self.pool, guild).await?;
                 Ok(list::render_active_list(&rows))
             }
             Management::Cancel { id } => {
                 let Some(row) =
-                    store::cancel_audited(&self.pool, &guild, &id, &actor_id(interaction)).await?
+                    store::cancel_audited(&self.pool, guild, &id, &actor_id(interaction)).await?
                 else {
                     return Ok("Giveaway is unknown or already closed.".into());
                 };
@@ -175,11 +218,11 @@ impl GiveawayRuntime {
                 }
                 Ok("Giveaway cancelled.".into())
             }
-            Management::End { id } => self.end(&guild, &id, &actor_id(interaction)).await,
+            Management::End { id } => self.end(guild, &id, &actor_id(interaction)).await,
             Management::Pause { id } => {
                 if !store::pause_audited(
                     &self.pool,
-                    &guild,
+                    guild,
                     &id,
                     Some(&actor_id(interaction)),
                     OffsetDateTime::now_utc(),
@@ -188,7 +231,7 @@ impl GiveawayRuntime {
                 {
                     return Ok("Giveaway is unknown, already closed, or mid-draw.".into());
                 }
-                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, &id).await {
+                if let Ok(Some(row)) = store::get_giveaway(&self.pool, guild, &id).await {
                     if self.update(&row).await.is_err() {
                         return Ok("Giveaway paused; its message could not be refreshed.".into());
                     }
@@ -198,7 +241,7 @@ impl GiveawayRuntime {
             Management::Resume { id } => {
                 if store::resume_audited(
                     &self.pool,
-                    &guild,
+                    guild,
                     &id,
                     Some(&actor_id(interaction)),
                     OffsetDateTime::now_utc(),
@@ -208,7 +251,7 @@ impl GiveawayRuntime {
                 {
                     return Ok("Giveaway is unknown or not paused.".into());
                 }
-                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, &id).await {
+                if let Ok(Some(row)) = store::get_giveaway(&self.pool, guild, &id).await {
                     if self.update(&row).await.is_err() {
                         return Ok("Giveaway resumed; its message could not be refreshed.".into());
                     }
@@ -218,7 +261,7 @@ impl GiveawayRuntime {
             Management::Extend { id, seconds } => {
                 if store::extend_audited(
                     &self.pool,
-                    &guild,
+                    guild,
                     &id,
                     seconds,
                     Some(&actor_id(interaction)),
@@ -229,7 +272,7 @@ impl GiveawayRuntime {
                 {
                     return Ok("Giveaway is unknown or already closed.".into());
                 }
-                if let Ok(Some(row)) = store::get_giveaway(&self.pool, &guild, &id).await {
+                if let Ok(Some(row)) = store::get_giveaway(&self.pool, guild, &id).await {
                     if self.update(&row).await.is_err() {
                         return Ok("Giveaway extended; its message could not be refreshed.".into());
                     }
@@ -237,7 +280,7 @@ impl GiveawayRuntime {
                 Ok("Giveaway extended.".into())
             }
             Management::Reroll { id, target } => {
-                self.reroll(&guild, &id, target, &actor_id(interaction))
+                self.reroll(guild, &id, target, &actor_id(interaction))
                     .await
             }
         }
@@ -278,7 +321,24 @@ impl GiveawayRuntime {
         if actor.is_empty() {
             return Ok(INVALID.into());
         }
-        let now = OffsetDateTime::now_utc();
+        let now = (self.create_clock)();
+        let Some(ends_at) = now.checked_add(time::Duration::seconds(create.seconds)) else {
+            return Ok(INVALID.into());
+        };
+        let requirements_json = serde_json::json!({"roles": create.roles, "min_account_age_days": create.account_days, "min_guild_age_days": create.server_days});
+        let presentation = GiveawayPresentation {
+            prize: &create.prize,
+            winners_count: create.winners as i32,
+            ends_at,
+            requirements_json: &requirements_json,
+            id: None,
+        };
+        if create.preview {
+            return Ok(format!(
+                "Preview — not created\nProposed message in <#{channel}>:\n{}\n\nCapacity is not reserved; eligibility has not been checked. Later creation is not guaranteed. Run /giveaway create with the same options without preview (or preview:false) to create it; its closing time is recalculated then.",
+                presentation.render(0, "open", now)
+            ));
+        }
         // The interaction id is an opaque correlation id, not an authorization
         // capability. It makes a retried create fail closed before Discord I/O.
         let id = interaction.id.get().to_string();
@@ -290,17 +350,17 @@ impl GiveawayRuntime {
             message_id: "pending".into(),
             created_by: actor,
             winners_count: create.winners as i32,
-            ends_at: now + time::Duration::seconds(create.seconds),
-            requirements_json: serde_json::json!({"roles": create.roles, "min_account_age_days": create.account_days, "min_guild_age_days": create.server_days}),
+            ends_at,
+            requirements_json,
             max_entries: store::MAX_GIVEAWAY_ENTRIES,
-            draw_nonce: giveaway::mint_draw_nonce(),
+            draw_nonce: (self.create_nonce)(),
             created_at: now,
         };
         let Some(row) = store::create_admitted(&self.pool, &input).await? else {
             return Ok("Giveaway already recorded or the server has 10 active giveaways.".into());
         };
         let nonce = format!("gw{id}");
-        match self.executor.post_message_with_components(&row.channel_id, &render(&row, 0), &components(&row), &nonce).await {
+        match self.executor.post_message_with_components(&row.channel_id, &render_at(&row, 0, now), &components(&row), &nonce).await {
             Ok(message) => {
                 if matches!(store::attach_message(&self.pool, guild, &id, &message).await, Ok(true)) {
                     return Ok(format!("Giveaway `{id}` created."));
@@ -1134,25 +1194,59 @@ fn winners_posts(
     posts
 }
 
+/// The same pure message source for validated proposals and persisted creates.
+/// It has no draw identity, nonce, executor or store capability; the persisted
+/// id line renders only when the caller supplies one (preview never does).
+struct GiveawayPresentation<'a> {
+    prize: &'a str,
+    winners_count: i32,
+    ends_at: OffsetDateTime,
+    requirements_json: &'a serde_json::Value,
+    id: Option<&'a str>,
+}
+
+impl GiveawayPresentation<'_> {
+    fn render(&self, count: i64, status: &str, now: OffsetDateTime) -> String {
+        let ending =
+            if status == "open" && self.ends_at.unix_timestamp() - now.unix_timestamp() <= 30 {
+                " — ending soon!"
+            } else {
+                ""
+            };
+        // Entry posts and saved detail share one static summary: preview and
+        // create render the same bytes through the same gate and helpers.
+        // The absolute closing instant stays alongside the relative one so a
+        // private proposal shows exactly when it would close.
+        let summary = match display_requirements_json(self.requirements_json) {
+            Some(requirements) => requirements_text(&requirements),
+            None => "unavailable (saved rules unreadable; ask staff)".to_owned(),
+        };
+        let deadline = self.ends_at.unix_timestamp();
+        let id_line = match self.id {
+            Some(id) => format!("\nID: `{id}`"),
+            None => String::new(),
+        };
+        format!(
+            "Giveaway: {}\n{count} entrants · {} winners\nEnds <t:{deadline}:F> (<t:{deadline}:R>) · {status}{ending}{id_line}\nRequirements: {summary}",
+            inline_prize(self.prize, giveaway::PRIZE_MAX_CHARS),
+            self.winners_count
+        )
+    }
+}
+
 fn render(row: &GiveawayRow, count: i64) -> String {
-    let ending = if row.status == "open"
-        && row.ends_at.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp() <= 30
-    {
-        " — ending soon!"
-    } else {
-        ""
+    render_at(row, count, OffsetDateTime::now_utc())
+}
+
+fn render_at(row: &GiveawayRow, count: i64, now: OffsetDateTime) -> String {
+    let presentation = GiveawayPresentation {
+        prize: &row.prize,
+        winners_count: row.winners_count,
+        ends_at: row.ends_at,
+        requirements_json: &row.requirements_json,
+        id: Some(&row.id),
     };
-    format!(
-        "Giveaway: {}\n{} entrants · {} winners\nEnds <t:{}:R> · {}{}\nID: `{}`\n{}",
-        inline_prize(&row.prize, giveaway::PRIZE_MAX_CHARS),
-        count,
-        row.winners_count,
-        row.ends_at.unix_timestamp(),
-        row.status,
-        ending,
-        row.id,
-        requirements_line(row)
-    )
+    presentation.render(count, &row.status, now)
 }
 
 /// Private saved-state detail for staff inspection. Saved records only, never
@@ -1229,8 +1323,14 @@ fn requirements_line(row: &GiveawayRow) -> String {
 /// JSON, age gates past ten years, a role id that is not a nonzero number)
 /// parse to `None` here too, never to a guessed "Everyone".
 fn display_requirements(row: &GiveawayRow) -> Option<giveaway::GiveawayRequirements> {
-    let requirements: giveaway::GiveawayRequirements =
-        serde_json::from_value(row.requirements_json.clone()).ok()?;
+    display_requirements_json(&row.requirements_json)
+}
+
+/// Row-independent half of `display_requirements`: previews validate the same
+/// rules without a stored row, so they share this gate and the summary below
+/// instead of growing a second renderer.
+fn display_requirements_json(json: &serde_json::Value) -> Option<giveaway::GiveawayRequirements> {
+    let requirements: giveaway::GiveawayRequirements = serde_json::from_value(json.clone()).ok()?;
     if requirements.min_account_age_days > giveaway::REQUIREMENT_MAX_AGE_DAYS
         || requirements.min_guild_age_days > giveaway::REQUIREMENT_MAX_AGE_DAYS
         || requirements
@@ -1247,6 +1347,12 @@ fn requirements_summary(row: &GiveawayRow) -> String {
     let Some(requirements) = display_requirements(row) else {
         return "unavailable (saved rules unreadable; ask staff)".to_owned();
     };
+    requirements_text(&requirements)
+}
+
+/// Static rules text shared by entry posts, saved detail and private
+/// previews: role identifiers, age gates, or `Everyone` when unrestricted.
+fn requirements_text(requirements: &giveaway::GiveawayRequirements) -> String {
     let mut parts = Vec::new();
     if !requirements.roles.is_empty() {
         // Role ids shown before the bounded overflow marker.

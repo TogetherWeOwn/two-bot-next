@@ -73,6 +73,25 @@ fn fixture() -> Value {
         "expected_response": null,
         "deferral_reason": "Compiled-only metadata companion; live publication and smoke remain unapproved."
     }));
+    // Preview is compiled-only; preserve the saved publication and smoke evidence.
+    let giveaway = rows
+        .iter_mut()
+        .find(|row| row["name"] == "giveaway")
+        .expect("saved giveaway command");
+    let create = giveaway["options"]
+        .as_array_mut()
+        .expect("subcommands")
+        .iter_mut()
+        .find(|option| option["name"] == "create")
+        .expect("create command");
+    create["options"]
+        .as_array_mut()
+        .expect("create options")
+        .push(serde_json::json!({
+            "name": "preview",
+            "description": "Privately preview without creating or reserving capacity",
+            "type": "boolean", "required": false, "choices": []
+        }));
     fixture["count"] = serde_json::json!(45);
     fixture
 }

@@ -49,6 +49,7 @@ pub(super) struct Create {
     pub(super) roles: Vec<String>,
     pub(super) account_days: i64,
     pub(super) server_days: i64,
+    pub(super) preview: bool,
 }
 
 /// Why a payload was refused. Rendered by [`Refusal::text`].
@@ -164,6 +165,7 @@ fn create(children: &[CommandDataOption]) -> Result<Create, Refusal> {
             "min-account-age-days",
             "min-server-age-days",
             "channel",
+            "preview",
         ],
     )?;
     let prize = match find(&found, "prize") {
@@ -192,6 +194,11 @@ fn create(children: &[CommandDataOption]) -> Result<Create, Refusal> {
     ) {
         return Err(Refusal::new("channel", Problem::Type("a channel")));
     }
+    let preview = match find(&found, "preview") {
+        None => false,
+        Some(CommandOptionValue::Boolean(value)) => *value,
+        Some(_) => return Err(Refusal::new("preview", Problem::Type("a boolean"))),
+    };
     Ok(Create {
         prize,
         winners,
@@ -199,6 +206,7 @@ fn create(children: &[CommandDataOption]) -> Result<Create, Refusal> {
         roles,
         account_days,
         server_days,
+        preview,
     })
 }
 
@@ -231,7 +239,7 @@ fn collect<'a>(
 
 fn accepted_list(sub: &str) -> &'static str {
     match sub {
-        "create" => "it takes `prize`, `duration` (or `duration-minutes`), `winners`, `required-role`, `min-account-age-days` and `min-server-age-days`",
+        "create" => "it takes `prize`, `duration` (or `duration-minutes`), `winners`, `required-role`, `min-account-age-days`, `min-server-age-days` and `preview`",
         "extend" => "it takes `id` and `duration` (or `duration-minutes`)",
         "reroll" => "it takes `id` and `user`",
         "list" => "it takes no options",

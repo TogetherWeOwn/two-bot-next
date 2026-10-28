@@ -3665,10 +3665,21 @@ restarts. Duplicates collapse to one row. `gw:<id>` carries only the opaque
 id; the server resolves guild, message, deadline, status, requirements and
 capacity.
 
-The giveaway row is recorded before its message posts. If sending or the
-message-id attachment fails, never blindly re-post: inspect the channel for
-a delivered message and cancel the recorded id if needed. An unconfirmed
-definition holds an active slot and takes no entries.
+Use `/giveaway create prize:Friday prize duration:60 winners:2 preview:true`
+for a private **Preview — not created**. It shows the proposed invocation-channel
+message, absolute closing instant, winner count and role/age requirements, with
+mentions suppressed and no live enter button. Validation is the same as real
+creation, but preview does not access the database, generate draw randomness,
+consume giveaway admission/cap/cooldown, insert audits, publish components or
+schedule a draw. It does not reserve capacity, establish eligibility or guarantee
+later creation. Run the same command without `preview` (or with `preview:false`)
+to create; the closing instant is recalculated then. Wrong-typed, duplicate or
+unknown create options refuse privately rather than falling through to creation.
+
+For real creation (preview omitted or false), the giveaway row is recorded before
+its message posts. If sending or the message-id attachment fails, never blindly
+re-post: inspect the channel for a delivered message and cancel the recorded id
+if needed. An unconfirmed definition holds an active slot and takes no entries.
 
 `giveaway_countdown` ticks every 15 seconds; durable claims permit at most
 one cosmetic refresh at each 1h, 10min, 1min and ending-soon threshold

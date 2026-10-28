@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected tests-only private giveaway creation preview; the implementation owner ships the combined green PR.",
+  "baselineSha": "0b8f8c6427859a606c4be710224dc68649fabe00",
+  "branch": "test/giveaway-preview-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/discord/tests/giveaway_preview_acceptance.rs",
+      "sha256": "fc3309bfb6c23ea4aac17d8dc8a1a456864699cb0fbea1826a4aa1ee35967233",
+      "tests": 16
+    }
+  ],
+  "registration": "Cargo automatically discovers the new integration target; --features db is required. No shared source file is frozen or changed.",
+  "commands": {
+    "focused": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_preview_acceptance -- --nocapture --test-threads=1",
+    "offlineControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_preview_acceptance control -- --nocapture --test-threads=1",
+    "existingDrawRecoveryControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test giveaway_timed_draw_acceptance -- --nocapture --test-threads=1",
+    "existingDomainStoreControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test giveaway_domain_store_acceptance -- --nocapture --test-threads=1",
+    "format": "cargo fmt --all -- --check",
+    "testInventory": "python3 scripts/ci/check-test-inventory.py"
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "guard": "two_bot_testsupport::TestDatabase",
+    "missingEnvironment": "Three database cases print SKIP and return; that is not execution evidence. Thirteen cases require no database.",
+    "scope": "Only an authorized disposable test database. Never production/staging. Loopback SQL tripwires accept no protocol or credentials.",
+    "ci": "The existing workspace integration lane discovers this non-ignored target and supplies the guarded test database. Nextest lib/bin execution alone does not run this target."
+  },
+  "deterministicSources": {
+    "target": "two_bot_discord::giveaway::GiveawayRuntime",
+    "requiredInherentMethod": "with_create_sources(self, clock: Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>, nonce: Arc<dyn Fn() -> String + Send + Sync>) -> Self",
+    "baseline": "A test-local extension trait returns the existing runtime, so missing behavior fails assertions rather than compilation. An explicit baseline-adapter control keeps the trait live after the inherent method exists.",
+    "fixedNowUnixSeconds": 1800000000,
+    "fixedOneHourDeadlineUnixSeconds": 1800003600,
+    "nonceWitness": "The injected counter must stay zero for valid/invalid previews and must supply the nonce actually stored by real create. Default production sources remain secure randomness and wall clock."
+  },
+  "contract": {
+    "surface": "Optional boolean preview on existing giveaway create; no new command. Registry help and generated command reference expose it.",
+    "preview": "One ephemeral response, label Preview — not created, proposed invocation-channel message, absolute localized deadline, requirements, explicit create without preview next action, no components or draw secrets.",
+    "presentation": "Shared validated pure presentation produces matching Giveaway:, entrant/winner, Ends and Requirements: lines for preview and create. Preview-only disclosures and stored identity are excluded from parity comparison.",
+    "safety": "Independent bound-socket SQL tripwire plus closed-pool test; REST allowlist; injected nonce counter; primed real-pool acquisition observer; durable row/audit counts; deterministic concurrent preview completion; same-id later real create.",
+    "validation": "Prize scalar-count/trim boundaries, duration and multiplication overflow, winner bounds, role type, account/server-age bounds, missing required fields, optional defaults, legacy duration alias, malformed/duplicate/unknown options and existing authority/guild/activation fences.",
+    "disclosures": "Preview does not reserve capacity, establish eligibility or guarantee a subsequent create. Existing foreign-guild/DM routing remains silent.",
+    "compatibility": "Missing or false preview creates normally; replay publishes/audits once. Existing create, timed-draw, replay and recovery suites remain unchanged."
+  },
+  "observedBeforePublication": {
+    "runtime": "Initial local run refused admission three times. Original head 9f68a91e64b22640e2d8f4653dc91a9eea4e8c87 CI run 40204641962 exposed test-owned E0599 at RouterGates::default(), not behavioral RED. Corrected by an explicit gate fixture; renewed bounded Cargo attempt refused exit 75. New-head compilation and behavior-specific RED remain pending.",
+    "originalHeadControls": "Original CI rust-tests job 121202913222 logged 37 passing giveaway-related lib/bin tests before integration compilation failed. This is not a completed integration/recovery-control run.",
+    "format": "PASS",
+    "floorGuard": "PASS",
+    "testInventory": "PASS",
+    "secretDebugGuard": "PASS including 23 self-tests",
+    "docsIndex": "PASS"
+  },
+  "handoff": {
+    "nextAction": "Run the focused and unchanged-control commands with the authorized test fixture; publish actual behavior-specific RED on an exact pushed SHA before completing the test-author handoff.",
+    "implementation": "Incorporate the exact acceptance commit in an isolated implementation branch. Do not edit the protected file. Return test corrections to the test author. Bundle runtime, shared pure presentation, command registration/help and generated reference in the implementation PR.",
+    "merge": "Never merge this deliberately red tests-only handoff; only the combined implementation PR may merge after all existing gates pass."
+  }
+}
