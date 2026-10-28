@@ -134,12 +134,14 @@ remaining gateway/accepted-prefix work:
    It reports a missing trigger, a paused definition, the text-command gate
    being off and a builtin-reserved trigger, each with a next action that uses
    existing commands (`/command ... text-trigger:`, `/command-enable`, or an
-   operator configuration review). A paused row whose name is reserved (a
-   grandfathered voice/assistant name) cannot be resumed, so its next action
-   points at recreating it under a different name or deleting it instead of
-   `/command-enable`. If the gate is not available to the view it says
-   unknown. "Eligible" stays subject to normal per-message permission
-   checks and automod and is neither a delivery promise nor evidence that the
+   operator configuration review). A row whose name is reserved (a
+   grandfathered voice/assistant name) cannot be replaced or resumed under that
+   name, so trigger-repair and pause remedies point at recreating it under a
+   different name or deleting it. Resume is offered only when the complete
+   stored definition passes the same validation as `/command-enable`; an
+   invalid saved template, description or trigger must be repaired with
+   `/command` first. If the gate is not available to the view it says unknown.
+   "Eligible" stays subject to normal per-message permission checks and automod and is neither a delivery promise nor evidence that the
    slash-command registry is synchronized;
    `view:template` shows the saved template as stored; `view:preview` renders
    it with the invoking member/channel and explicit bounded sample arguments
