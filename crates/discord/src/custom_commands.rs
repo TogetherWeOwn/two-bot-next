@@ -1279,8 +1279,9 @@ mod inspect_regressions {
             "Summary /setup\nDescription: Saved response\nSaved definition \u{2014} Status: Enabled\nText trigger: !setup\nText-trigger eligibility: Unknown ("
         ));
         assert!(summary.ends_with(
-            "\nSaved template: /command-inspect name:setup view:template\nPrivate preview: /command-inspect name:setup view:preview\nReplace the definition: /command name:setup template:..."
+            "\nSaved template: /command-inspect name:setup view:template\nPrivate preview: /command-inspect name:setup view:preview\nRecreate under a different name: /command name:another-name template:..."
         ));
+        assert!(!summary.contains("Replace the definition: /command name:setup"));
         assert_eq!(
             fixture
                 .reply(&inspect(6002, "setup", "template"), Some("TWO"))
