@@ -553,7 +553,9 @@ def main(argv=None, env=None):
             ring_path = Path(scratch) / "prev.json"
             ring_path.write_text(json.dumps(ring) + "\n", encoding="utf-8")
             verdict = run_driver(args.node, args.driver, exposition_path, ring_path, now)
-    except TrackError as error:
+    except (TrackError, OSError) as error:
+        if isinstance(error, OSError):
+            error = TrackError("burn evaluation failed: ring scratch I/O failed")
         print(f"::error::{error}")
         Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
                                            encoding="utf-8")

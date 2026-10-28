@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Reconstruct Docker's dependency layer and validate it without a Docker daemon."""
+import importlib.util
 import os
 from pathlib import Path
-import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,25 +10,15 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
-class Refusal(Exception):
-    """Fixed-vocabulary refusal for Docker dependency-layer validation.
-
-    Every validation path raises this (never ``assert``/``AssertionError``)
-    so the gate fails closed under ``python -O``, where asserts are stripped.
-    The message keeps its diagnostic vocabulary so any refusal maps to its
-    next action: fix the named Dockerfile line, restore the named pinned
-    input, or set the named scratch env var.
-    """
-
-
-def require(condition, message):
-    """Raise :class:`Refusal` when condition is false, else return None.
-
-    A function call survives ``python -O``; a bare ``assert`` does not.
-    """
-    if not condition:
-        raise Refusal(message)
-    return None
+# The standalone verifier also runs from exported single-script fixtures.
+# Keep the shared parser there; importing it must not execute its CLI.
+_DEPS_SPEC = importlib.util.spec_from_file_location(
+    "docker_dependency_layer", Path(__file__).with_name("test-docker-deps.py"))
+_deps = importlib.util.module_from_spec(_DEPS_SPEC)
+_DEPS_SPEC.loader.exec_module(_deps)
+Refusal = _deps.Refusal
+require = _deps.require
+_copy_parts = _deps._copy_parts
 
 
 # Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
@@ -116,29 +105,6 @@ def _layer_instructions(docker_text):
     return instructions
 
 
-def _command_words(command):
-    """Keep COPY and RUN quoting failures on the same typed refusal path."""
-    try:
-        return shlex.split(command)
-    except ValueError as error:
-        raise Refusal(
-            "unsupported dependency-layer command: malformed quoting") from error
-
-
-def _copy_parts(stripped):
-    """Split a COPY line into (sources, destination), refusing arity drift.
-
-    A bare star-unpack silently accepts `COPY foo` (sources=[]) — an
-    invalid Dockerfile that must refuse with typed vocabulary instead.
-    """
-    parts = _command_words(stripped)[1:]
-    require(len(parts) >= 2,
-            "unsupported dependency-layer command: "
-            "COPY needs sources and destination")
-    *sources, destination = parts
-    return sources, destination
-
-
 def dependency_sources(docker_text):
     """COPY sources of the dependency layer (everything before `COPY . .`).
 
@@ -172,31 +138,7 @@ def reconstruct(docker_text, root, dest):
     instruction this validator does not understand, so new Dockerfile verbs
     fail closed instead of passing unchecked.
     """
-    fetch_seen = False
-    for kind, stripped in _layer_instructions(docker_text):
-        if kind == "preamble":
-            continue
-        if kind == "copy":
-            sources, destination = _copy_parts(stripped)
-            target = dest / destination
-            target.mkdir(parents=True, exist_ok=True)
-            for source in sources:
-                shutil.copyfile(root / source, target / Path(source).name)
-        elif kind == "run":
-            for command in stripped[4:].split("&&"):
-                words = _command_words(command)
-                require(words, "unsupported dependency-layer command: empty segment")
-                if len(words) >= 3 and words[:2] == ["mkdir", "-p"]:
-                    for path in words[2:]:
-                        (dest / path).mkdir(parents=True, exist_ok=True)
-                elif len(words) == 4 and words[0] == "echo" and words[2] == ">":
-                    (dest / words[3]).write_text(words[1] + "\n")
-                elif words == ["cargo", "fetch", "--locked"]:
-                    fetch_seen = True
-                else:
-                    raise Refusal(
-                        f"unsupported dependency-layer command: {words[0]}")
-    return fetch_seen
+    return _deps.replay_layer(_layer_instructions(docker_text), root, dest)
 
 
 def validate_layer(dest):
