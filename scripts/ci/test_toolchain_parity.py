@@ -236,6 +236,25 @@ def make_fixture_root(parent, channel="1.99.1", workflow_toolchain="1.99.1", doc
     return root
 
 
+def continued_from_fixtures(reference):
+    # Valid Docker logical instructions only. Comments/blank physical lines
+    # do not end a continuation; the escape directive precedes every stage.
+    backslash = chr(92)
+    return (
+        ("plain", "", f"FROM {backslash}\n rust:{reference} AS extra\n"),
+        ("mixed-case-platform", "",
+         f"  FrOm --platform=$BUILDPLATFORM {backslash}\n rust:{reference} AS extra\n"),
+        ("continued-platform", "",
+         f"FROM {backslash}\n --platform=linux/amd64 {backslash}\n rust:{reference} AS extra\n"),
+        ("crlf", "", f"FROM {backslash}\r\n rust:{reference} AS extra\r\n"),
+        ("comment-and-blank", "",
+         f"FROM {backslash}\n # continuation comment\n\n rust:{reference} AS extra\n"),
+        ("explicit-backslash", f"# escape={backslash}\n",
+         f"FROM {backslash}\n rust:{reference} AS extra\n"),
+        ("backtick", "# escape=`\n", f"FROM `\n rust:{reference} AS extra\n"),
+    )
+
+
 class ToolchainParityTests(unittest.TestCase):
     def test_pinned_tree_passes(self):
         self.assertEqual(toolchain_parity_errors(ROOT), [])
@@ -479,6 +498,54 @@ class ToolchainParityTests(unittest.TestCase):
                 "builder digests disagree: Dockerfile@sha256:aaaaaaaaaaaa, "
                 "crates/voice-probe/Dockerfile@sha256:bbbbbbbbbbbb"
             ])
+
+    def assert_continuation_diagnostics(self, errors, name, expected=()):
+        self.assertIsInstance(errors, list)
+        if expected:
+            self.assertTrue(errors, f"{name}: continued Rust stage must not disappear")
+        for error in errors:
+            self.assertIsInstance(error, str)
+            self.assertTrue(error.startswith(f"{name}: "), errors)
+        # A deliberately unsupported form may fail closed, even when pinned.
+        # A missing-stage/digest error is NOT a valid pinned-form rejection.
+        def unsupported(error):
+            return (("unsupported" in error.lower() or "not supported" in error.lower())
+                    and ("continuation" in error.lower() or "escape" in error.lower()))
+        self.assertTrue(all(unsupported(error) or
+                            (bool(expected) and all(term in error for term in expected))
+                            for error in errors), errors)
+
+    def assert_continued_stage_policy(self, reference, expected=()):
+        # Independent scope: dropping a covered Dockerfile must not also drop
+        # these fixtures. Each keeps a pinned first stage so omission is visible.
+        for name in ("Dockerfile", "crates/voice-probe/Dockerfile"):
+            for form, directive, later in continued_from_fixtures(reference):
+                with self.subTest(dockerfile=name, form=form):
+                    with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                        root = make_fixture_root(scratch)
+                        self.assertEqual(toolchain_parity_errors(root), [])
+                        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+                        # write_bytes preserves the CRLF case instead of text
+                        # IO normalizing it before the production reader runs.
+                        (root / name).write_bytes((directive + first + later).encode())
+                        self.assert_continuation_diagnostics(
+                            toolchain_parity_errors(root), name, expected)
+
+    def test_correctly_pinned_continued_stage_passes_or_explicitly_refuses(self):
+        self.assert_continued_stage_policy(f"1.99-trixie@sha256:{PINNED_DIGEST}")
+
+    def test_continued_later_unpinned_stage_fails_through_aggregate(self):
+        self.assert_continued_stage_policy("1.99-trixie", ("stage 1", "digest"))
+
+    def test_continued_later_wrong_tag_fails_through_aggregate(self):
+        self.assert_continued_stage_policy(
+            f"1.98-trixie@sha256:{PINNED_DIGEST}",
+            ("stage 1", "expected rust:1.99-trixie", "got rust:1.98-trixie"))
+
+    def test_continued_later_digest_disagreement_fails_through_aggregate(self):
+        self.assert_continued_stage_policy(
+            "1.99-trixie@sha256:" + "b" * 64,
+            ("disagree", "sha256:aaaaaaaaaaaa", "sha256:bbbbbbbbbbbb"))
 
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:

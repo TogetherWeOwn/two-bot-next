@@ -3971,6 +3971,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(options.get("restore-keys"),
                          "${{ runner.os }}-nightly-cargo-\n" if workflow == "nightly.yml" else None)
 
+    def test_bookworm_image_policy_inventory_is_complete(self):
+        # Deliberately independent of the inventory used by both the real-tree
+        # check and its mutants: deleting scope must not delete its oracle.
+        self.assertEqual(BOOKWORM_JOBS, {
+            "check.yml": ("check", "rust-tests", "coverage-shard", "ignored-db-stores",
+                          "ignored-db-runtime", "moderation-db", "self-role-store",
+                          "community-db", "feeds-db", "tickets-postgres", "fuzz-compile"),
+            "reusable-rust-nextest.yml": ("nextest",),
+            "pipeline-benchmark.yml": ("benchmark",),
+        })
+
+    def test_compiler_cache_policy_inventory_is_complete(self):
+        self.assertEqual(CACHE_JOBS, {
+            "nightly.yml": ("sweep", "nightly-cargo"),
+            "pipeline-benchmark.yml": ("benchmark", "pipeline-bench"),
+        })
+
     def test_rust_bookworm_job_container_images_are_pinned(self):
         for workflow, jobs in BOOKWORM_JOBS.items():
             for job in jobs:
