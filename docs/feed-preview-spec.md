@@ -312,7 +312,8 @@ prove quotas, cancellation, peak heap, safe rendering or zero effects.
 >>> protected = ["crates/core/src/feeds_http.rs", "crates/core/src/feeds_connector.rs", "crates/core/src/feeds.rs", "crates/bot/src/feed_jobs.rs", "crates/bot/src/command_runtime.rs", "crates/core/src/feeds_store.rs"]
 >>> hashes = {f: hashlib.sha256(pathlib.Path(f).read_bytes()).hexdigest() for f in protected}
 >>> assert all(len(value) == 64 for value in hashes.values())
->>> assert "(feed-preview-spec.md)" in pathlib.Path("docs/README.md").read_text()
+>>> from scripts.check_docs_index import check
+>>> assert "docs/feed-preview-spec.md" not in check(pathlib.Path.cwd())["missing"]
 >>> handoff = {"schema": "feeds.preview.design-check.v1", "spec_sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "protected_file_hashes": hashes, "outcome": "checked", "reason": "document_only", "next_action": "request_exact_spec_intent_alignment"}
 >>> assert len(json.dumps(handoff).encode()) < 4096 and json.loads(json.dumps(handoff)) == handoff
 >>> print(json.dumps({"cases": len(ids), "outcome": handoff["outcome"], "reason": handoff["reason"]}, sort_keys=True))

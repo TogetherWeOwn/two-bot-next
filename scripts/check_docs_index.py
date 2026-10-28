@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Check docs/README.md discovery and byte budgets, without network.
+"""Check the README-linked docs index and byte budgets, without network.
 
 Run with --json for {missing,stale,oversize}: sorted arrays of repo-relative
-paths. Invalid/duplicate index rows appear in stale as docs/README.md:<line>.
-An undecodable index is stale as docs/README.md so --json keeps its shape.
+paths. Invalid/duplicate rows appear in stale as <index path>:<line>.
+An undecodable index is stale as its path so --json keeps its shape.
 Uppercase .MD files are missing until renamed to lowercase .md targets.
 Exit 0 means all arrays are empty; exit 1 means repair the named index rows or
 split the oversized doc. --root selects a scratch checkout for mutation tests.
 Purposes live only in the index's link labels, never in a second manifest.
 
-The index merges with the union driver (.gitattributes), so parallel row
-insertions combine instead of conflicting. --dedupe is the only write mode:
-it removes the exact-duplicate lines union can leave behind, then reports
-exactly like a check run. It never reorders lines and never picks between
-rows that share a target with different labels; those stay stale here.
+Only strict README links to docs-root index-*.md sections are assembled, at
+that link's position. Section links are not recursive. All row destinations
+are relative to docs/ (README and sections are siblings).
+The indexes merge with the union driver (.gitattributes). --dedupe is the
+only write mode: it removes exact-duplicate lines in each linked index, then
+reports exactly like a check run. It never reorders lines or picks between
+rows sharing a target with different labels, or across files.
 """
 
 import argparse
@@ -35,6 +37,24 @@ LARGE_DOCS = {
     "docs/soak-checklist.md": "Generated coverage ledger; use the start-here section map.",
 }
 ROW = re.compile(r"- \[([^\]\n]+)\]\(([A-Za-z0-9_./-]+\.md)\)")
+FRAGMENT = re.compile(r"index-[^/]+\.md")
+ENTRYPOINT = "docs/README.md"
+
+
+def index_rows(text, source, stale):
+    """Yield validated (line, target) pairs; retain the strict line-based rule."""
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.startswith("- "):
+            continue
+        match = ROW.fullmatch(line)
+        if match:
+            purpose, target = match.groups()
+            path = PurePosixPath(target)
+            if (purpose.strip() and not path.is_absolute() and ".." not in path.parts
+                    and path.as_posix() == target):
+                yield number, target
+                continue
+        stale.add(f"{source}:{number}")
 
 
 def check(root=ROOT, large_docs=LARGE_DOCS):
@@ -46,38 +66,41 @@ def check(root=ROOT, large_docs=LARGE_DOCS):
         for p in docs.rglob("*")
         if p.is_file() and p.suffix.lower() == ".md"
     }
-    index = docs / "README.md"
     indexed = set()
+    indexes = {ENTRYPOINT}
     stale = set()
-    if index.is_file():
+
+    def visit(source):
+        if source not in files:
+            return
         try:
-            text = index.read_text(encoding="utf-8")
+            text = files[source].read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            stale.add("docs/README.md")
-            text = ""
-        for number, line in enumerate(text.splitlines(), 1):
-            if not line.startswith("- "):
-                continue
-            match = ROW.fullmatch(line)
-            if not match:
-                stale.add(f"docs/README.md:{number}")
-                continue
-            purpose, target = match.groups()
-            path = PurePosixPath(target)
+            stale.add(source)
+            return
+        for number, target in index_rows(text, source, stale):
             name = f"docs/{target}"
-            if (not purpose.strip() or path.is_absolute() or ".." in path.parts
-                    or path.as_posix() != target or name in indexed):
-                stale.add(f"docs/README.md:{number}")
+            if name in indexed:
+                stale.add(f"{source}:{number}")
                 continue
             indexed.add(name)
             if name not in files and name not in GENERATED_DOCS:
                 stale.add(name)
+            if source == ENTRYPOINT and FRAGMENT.fullmatch(target):
+                indexes.add(name)
+                visit(name)
+
+    visit(ENTRYPOINT)
     missing = set(files) - indexed - GENERATED_DOCS
-    if not index.is_file():
-        missing.add("docs/README.md")
+    # A section is discoverable only through a direct README link, never a
+    # row in another section. Unlinked sections and their rows stay orphans.
+    missing.update(name for name in files
+                   if FRAGMENT.fullmatch(name.removeprefix("docs/")) and name not in indexes)
+    if ENTRYPOINT not in files:
+        missing.add(ENTRYPOINT)
     oversize = {
         name for name, path in files.items()
-        if (name == "docs/README.md" and path.stat().st_size >= INDEX_LIMIT)
+        if (name in indexes and path.stat().st_size >= INDEX_LIMIT)
         or (path.stat().st_size > DOC_LIMIT and name not in large_docs)
     }
     return {"missing": sorted(missing), "stale": sorted(stale), "oversize": sorted(oversize)}
@@ -107,21 +130,32 @@ def dedupe_text(text):
 
 
 def dedupe(root=ROOT):
-    """Rewrite docs/README.md under root deduped; return True if it changed.
+    """Dedupe README and its linked sections independently; return any change.
 
-    A missing (or non-file) index is a no-op, and UnicodeDecodeError
-    propagates without any write, so the caller falls through to the normal
-    fail-closed check report in both cases.
+    Missing/non-file indexes are no-ops. An undecodable index is left untouched
+    for the normal fail-closed report, without preventing other section repairs.
+    Orphans are never read or rewritten.
     """
-    index = root / "docs" / "README.md"
-    if not index.is_file():
-        return False
-    text = index.read_text(encoding="utf-8")
-    cleaned = dedupe_text(text)
-    if cleaned == text:
-        return False
-    index.write_text(cleaned, encoding="utf-8")
-    return True
+    sources = [ENTRYPOINT]
+    changed = False
+    for source in sources:
+        index = root / source
+        if not index.is_file():
+            continue
+        try:
+            text = index.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if source == ENTRYPOINT:
+            sources.extend(dict.fromkeys(
+                f"docs/{target}" for _, target in index_rows(text, source, set())
+                if FRAGMENT.fullmatch(target)
+            ))
+        cleaned = dedupe_text(text)
+        if cleaned != text:
+            index.write_text(cleaned, encoding="utf-8")
+            changed = True
+    return changed
 
 
 def main(argv=None):
@@ -139,7 +173,7 @@ def main(argv=None):
             changed = False
     report = check(args.root)
     if changed and not args.json:
-        print("deduped: docs/README.md")
+        print("deduped: linked docs indexes")
     if args.json:
         print(json.dumps(report, sort_keys=True))
     elif any(report.values()):

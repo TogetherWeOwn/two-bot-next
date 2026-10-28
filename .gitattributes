@@ -1,7 +1,8 @@
-# The docs index is a manifest of one-line rows, and parallel doc changes
+# The docs indexes are manifests of one-line rows, and parallel doc changes
 # insert different rows at the same section tails. Union keeps both sides'
 # rows instead of raising conflict markers over insert position alone.
 # scripts/check_docs_index.py --dedupe removes any exact duplicates union
 # leaves behind, and the checker still fails closed on every outcome union
 # cannot settle: duplicate targets, deleted targets and malformed rows.
 docs/README.md merge=union
+docs/index-*.md merge=union

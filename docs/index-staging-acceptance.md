@@ -1,0 +1,26 @@
+# Staging acceptance
+
+[Docs map](README.md). Guide destinations are relative to `docs/`.
+
+- [Soak lifecycle](staging-soak.md)
+- [Soak coverage plan](soak-checklist.md)
+- [Soak entry gates](soak-entry-gates.md)
+- [Evidence route](evidence-route.md)
+- [Expected-join tests](expected-joins-acceptance.md)
+- [E2E matrix](staging-e2e-command-matrix.md)
+- [E2E record](staging-e2e-run-record.md)
+- [Fixture census](staging-fixture-census.md)
+- [Health probe](staging-health-contract-probe.md)
+- [Migration claim](staging-migrate-claim.md)
+- [Rollout gate](staging-rollout-gate.md)
+- [Slash smoke](staging-slash-smoke.md)
+- [Voice checks](staging-voice-event-verification.md)
+- [Smoke replies](smoke-expected-responses.md)
+- [Smoke record](smoke-run-record.md)
+- [Smoke inventory](smoke-surface-inventory.md)
+- [T0 smoke](t0-acceptance-smoke-contract.md)
+- [User-flow synthetic](synthetic-user-flow.md)
+- [Binary lifecycle](alive-acceptance.md)
+- [Presence probe](presence-probe-acceptance.md)
+- [REST pacing](pacing-backoff-acceptance.md)
+- [Retention runtime](testing/retention-runtime.md)
