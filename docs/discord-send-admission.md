@@ -134,6 +134,18 @@ statement either installs the hold and clears occupancy together, or the old
 occupied row remains. A lost completion acknowledgement does not justify
 replaying the effect. Unknown or old generations are not execution leases.
 
+ActionExecutor's governed GET transport is the read-only exception to caller
+cancellation: one task owns admission, headers, bounded body collection and
+completion independently of the awaiting fetch. It keeps the original absolute
+wire deadline (five seconds if a direct governed caller supplies none), with at
+most one additional second for storage settlement. It never retries, publishes a
+snapshot, or runs the cancelled caller's continuation. A 429 body is still
+collected within the original deadline, and its longer cooldown is committed
+before occupancy is released. A stalled admission/completion loses its task at
+the bound and leaves any unconfirmed durable outcome occupied; process loss
+still uses the lease below. Mutations, generic permit Drop, shutdown publication
+rules and the lease duration are unchanged.
+
 A held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
 0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims
 the lane with a fresh generation, so the dead holder's late completion lands

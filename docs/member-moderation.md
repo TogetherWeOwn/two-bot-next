@@ -147,6 +147,41 @@ authoritative exact-intent evidence. Mutations are dry-run by default
 (`--execute` writes), staging-guild only, and claim tokens never print.
 `TWO_MODERATION` stays default-off and staging-only until soak.
 
+## Private saved-expiry inventory
+
+`/tempban-list [page:1..10000]` privately lists saved temporary-ban expiry work,
+not observed Discord bans. It shares the configured-guild, moderation and
+staging-only member-runtime gates. Both routing and a fresh server-side actor
+membership/role check require Ban Members-class authority. No self/member lookup
+permission is introduced. This is not live activation or production clearance.
+
+Page one is the default. Pages contain ten complete rows (except the final
+page), ordered by exact saved `execute_at`, then work/request ID in PostgreSQL
+`C` collation. SQL reads at most eleven rows including lookahead, with a bounded
+offset; the next-page invocation is shown when available. Separate invocations
+are not a snapshot: concurrent expiry work can shift page boundaries. Page 10000
+is the browse ceiling; further inspection belongs to the operator.
+
+Rows show full work and member IDs, a Discord-localized saved timestamp, due or
+future timing, and the actual state: `pending`, `staged/prepared`, `running` or
+`quarantined`, plus `dispatch uncertain` when saved. Done, cancelled and
+superseded history is excluded. A prepared permanent-ban intent without a saved
+expiry is not included. **Saved/due does not confirm a Discord unban; running is
+not completion.** Neither elapsed time nor this inventory resolves uncertainty.
+
+The reply is ephemeral with mentions suppressed and at most 2000 UTF-16 units.
+Unsafe identity characters are percent-encoded as UTF-8 bytes (including `%`),
+not clipped; decode those bytes to recover the exact identity. A page whose
+complete safe IDs cannot fit fails closed with an operator next action, rather
+than dropping rows. Empty inventory, an empty higher page and unavailable reads
+have distinct corrective replies. Invalid, duplicated, unknown or wrong-typed
+selectors refuse before any expiry read; use `/tempban-list page:1` to restart.
+
+This path performs only SELECTs and authority GETs. It never claims, sweeps,
+retries, repairs, deletes, unbans or writes an applied-mutation audit, and never
+looks up Discord bans. Reasons, attribution and claim capabilities are not
+selected or displayed. Existing reconciliation remains separately authorized.
+
 ## Durability
 
 Migrations 0110–0114 stay in `crates/cutover/migrations`, the directory embedded
@@ -308,6 +343,49 @@ inferred and no claim or Discord write occurs. Held channel claims write a
 separate `:in_progress` row with `stage: claim`, preserving both the original
 uncertain dispatch row and its key. Further redelivery deduplicates that row;
 completed channel replays still write none. Successful rows are unchanged.
+
+## Recent actions (`/moderation-recent`)
+
+`/moderation-recent [page]` gives staff on shift a private, read-only page of the
+newest saved moderation ledger rows. It sits in the moderation command family
+behind the same `TWO_MODERATION` gate, configured-guild fence and the Moderate
+Members permission as `/warn`, and it needs the member consumer to exist (the
+five member verbs share that presence). The router checks the interaction's
+permission bits; the handler then rechecks the actor live over REST (guild roles
+plus the actor's member) and refuses with a finite corrective when the actor is
+missing, cold, unreadable or lacks Moderate Members. Interaction-time bits
+never authorize the read, and no member or self authority exists. The reply is
+ephemeral with every mention parse disabled.
+
+- **Source.** One guild-scoped, `LIMIT`-bounded read of the newest 100
+  `moderation_audit` rows plus `moderation_warnings` rows that no audit row
+  shares a `request_id` with, ordered `created_at DESC, request_id ASC`. Claim
+  tokens, idempotency keys and metadata are never selected. It is paginated in
+  memory; older rows are not listed.
+- **Rows.** One line each: complete request id, action, outcome, target (or
+  channel), acting staff member, UTC time and a reason of at most 80 UTF-16
+  units rendered inside a code span so mentions, markdown and links stay
+  inert. The header states these are saved ledger rows, not live-verified
+  Discord state.
+- **Outcomes are never relabelled.** `banned`, `temporarily_banned`, `kicked`,
+  `timed_out`, `warned`, `unbanned`, `purged`, `slowmode_updated`,
+  `locked_down` and `unlocked` render `applied`; `denied` and `refused` render
+  `denied`; everything else (`failed`, `in_progress`, `unban_failed`, unknown)
+  renders `uncertain`. The saved word follows in parentheses.
+- **Pages.** Whole rows pack into the 2000 UTF-16 unit budget (a ledger that
+  fits stays on one page) with a `Page N of M` footer and, when more pages
+  exist, `Next: /moderation-recent page:N+1`. `page` is an optional integer
+  1–20; a page outside the packed range (or below 1) answers `Invalid page. Run
+  /moderation-recent page:1, then use the next-page hint.` An empty ledger
+  answers `No recent moderation actions in this server.`
+- **Strict decode first.** Duplicate, unknown and wrong-typed options refuse
+  with `Cannot run /moderation-recent: ... Try: /moderation-recent page:1`
+  before any Discord or store read, never echoing option values.
+- **Failure.** A ledger read failure answers a private `try again` corrective
+  with no raw error, and logs the sanitized class only.
+- **Pure read.** No claim, sweep, retry, repair, delete, unban, warn, retention
+  change, applied-mutation audit, idempotency row or Discord mutation, on every
+  path including refusals.
 
 ## Verification
 

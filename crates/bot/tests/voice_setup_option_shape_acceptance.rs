@@ -888,9 +888,9 @@ async fn omitted_optional_fields_preserve_existing_receipts_and_state() {
         ("defaultlimit", vec![option("channel", channel_value(CREATOR))], "New rooms from <#200> inherit the creator channel's limit. Applies to rooms created from now on; open rooms keep theirs.", { let mut c = seeded_creator(); c.default_limit = None; Some(c) }),
         ("inheritpermissions", vec![option("channel", channel_value(CREATOR)), option("source", string("creator"))], "New rooms from <#200> copy overrides from the creator channel. Applies to rooms created from now on; open rooms keep theirs.", { let mut c = seeded_creator(); c.permission_source = PermissionSource::Creator; c.permission_channel_id = None; Some(c) }),
         ("create", vec![], "Give the new creator channel a name, then try again.", None),
-        ("position", vec![option("channel", channel_value(CREATOR))], "Choose a position (above or below) or a first room number, then try again.", None),
+        ("position", vec![option("channel", channel_value(CREATOR))], "New rooms from <#200> go above, numbering from 9. Applies to rooms created from now on; open rooms stay where they are.", None),
         ("inheritpermissions", vec![option("channel", channel_value(CREATOR)), option("source", string("category"))], "New rooms from <#200> copy overrides from the category. Applies to rooms created from now on; open rooms keep theirs.", { let mut c = seeded_creator(); c.permission_source = PermissionSource::Category; c.permission_channel_id = None; Some(c) }),
-        ("group", vec![option("channel", channel_value(CREATOR))], "Choose whether to group rooms by category, then try again.", None),
+        ("group", vec![option("channel", channel_value(CREATOR))], "Shared category numbering is on for <#200>: new rooms join the category's room block. Applies to rooms created from now on.", None),
         ("alwaysprivate", vec![option("channel", channel_value(CREATOR))], "Choose whether new rooms start private, then try again.", None),
     ] {
         let fixture = Fixture::new().await;

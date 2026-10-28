@@ -134,6 +134,19 @@ a boot-parked community job needs a restart to start ticking, like the parked
 audit runtime. Every other
 storable row's stored value is unwired.
 
+The five existing onboarding destination keys validate before settings writes:
+`DISCORD_ANCHOR_WELCOME_CHANNEL_ID`, `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID`
+and `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` accept optional nonzero u64 IDs;
+`DISCORD_LANDING_CHANNEL_IDS` and `DISCORD_GOODBYE_CHANNEL_IDS` accept CSV IDs,
+trimming whitespace and omitting empty segments. Validation shares the runtime
+parsers and existing JSON-to-env rendering (including booleans, integral numbers
+and flat arrays). Stored JSON null is refused; explicit row deletion restores
+boot fallback. Repair invalid values or delete the override. Empty syntax does
+not satisfy mode-required destinations. Syntax proves no channel existence or
+permission and does not change hot wiring or dry-run behavior. See
+[settings actions](internal-action-settings.md#onboarding-destinations) for
+rendering, typed refusal and no-effect guarantees.
+
 Gateway boot reads process environment only, through a fixed set of loaders:
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),
 `FeatureGates::from_env` (`TWO_AUTOMATIONS`, `TWO_ANNOUNCEMENTS`,
