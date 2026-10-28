@@ -99,8 +99,20 @@ def _rust_stages(text):
     for escape in re.findall(r"(?im)^[ \t]*#[ \t]*escape[ \t]*=([^\r\n]*)", text):
         if escape.strip() != "\\":
             raise ValueError("unsupported Docker escape directive; use the default backslash escape")
-    if re.search(r"(?im)^[ \t]*FROM\b[^\r\n]*[\\`][ \t]*\r?$", text):
-        raise ValueError("unsupported Docker FROM continuation; keep each FROM on one physical line")
+    instruction = ""
+    continued = False
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        instruction += line
+        if line.rstrip().endswith("\\"):
+            instruction = instruction.rstrip()[:-1]
+            continued = True
+            continue
+        if continued and re.match(r"(?i)^[ \t]*FROM\b", instruction):
+            raise ValueError("unsupported Docker FROM continuation; keep each FROM on one physical line")
+        instruction = ""
+        continued = False
     stages = []
     for reference in re.findall(r"(?im)^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(rust:\S+)", text):
         tag, _, digest = reference.removeprefix("rust:").partition("@")
