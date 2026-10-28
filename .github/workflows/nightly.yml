@@ -153,7 +153,7 @@ jobs:
             ~/.cargo/git
             target
           # Keep lean nightly artifacts separate from the required check job.
-          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-nightly-cargo-
       - name: Prepare isolated test databases

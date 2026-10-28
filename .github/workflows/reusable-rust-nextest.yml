@@ -54,7 +54,7 @@ jobs:
     # A job container gets its own network namespace, so no published host
     # port collides on the shared self-hosted Docker host.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     # NOTE: job-container steps default to sh (no pipefail), so every run
     # step below declares bash explicitly.
     env:

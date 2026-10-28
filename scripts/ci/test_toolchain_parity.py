@@ -94,7 +94,12 @@ def _rust_stages(text):
     such as `--platform=$BUILDPLATFORM` are skipped so flagged rust stages
     stay covered instead of silently invisible to the tag and digest checks.
     """
-    return re.findall(r"(?m)^FROM\s+(?:--\S+\s+)*rust:([^\s@]+)(?:@sha256:([0-9a-f]{64}))?", text)
+    stages = []
+    for reference in re.findall(r"(?im)^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(rust:\S+)", text):
+        tag, _, digest = reference.removeprefix("rust:").partition("@")
+        pinned = re.fullmatch(r"sha256:([0-9a-f]{64})", digest)
+        stages.append((tag, pinned.group(1) if pinned else None))
+    return stages
 
 
 def dockerfile_parity_errors(root):
@@ -144,6 +149,9 @@ def container_image_errors(root):
         if not stages or not stages[0][1]:
             errors.append(f"{name}: no pinned rust builder digest found")
             continue
+        for index, (_tag, digest) in enumerate(stages[1:], start=1):
+            if digest is None:
+                errors.append(f"{name}: stage {index} has no pinned rust builder digest")
         stage_digests = {digest for _, digest in stages if digest}
         if len(stage_digests) > 1:
             detail = ", ".join(sorted(f"sha256:{d[:12]}" for d in stage_digests))
