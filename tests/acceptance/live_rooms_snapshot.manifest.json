@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Spec-first live-rooms snapshot adapter acceptance over synthetic LiveState; no gateway, HTTP, database, new persistence, environment mutation or command publication.",
+  "baseCommit": "6c908224b0df1f53f48b84ac1c21414f3ecdc3dc",
+  "executionBase": "ce5f3dc49658ee1f5df453506343ce59ede8dcc7",
+  "baselineTree": "executionBase has exactly the baseCommit tree, including the merged pure board core.",
+  "branch": "feat/live-rooms-board-snapshot",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/voice_live_rooms_snapshot_acceptance_tests.rs",
+      "sha256": "3593d73697a45590d2cda81cad7b8f79b0160b2184f5d1a36a2817199ecd6ed0",
+      "tests": 23,
+      "controls": 2
+    }
+  ],
+  "editableBridge": {
+    "path": "crates/bot/src/voice_live_rooms_snapshot_adapter.rs",
+    "contract": "Builder replaces the explicit MissingFeature result with a call to the real production snapshot reader and type conversions only. No locking, readiness decisions, ledger selection, bot classification, role lookup, presence policy, permission resolution or fixture-specific answers in this bridge. Keep MissingFeature distinguishable from legitimate catching-up refusals. Protected observation vocabulary is not a required production API."
+  },
+  "registration": {
+    "path": "crates/bot/src/voice_rooms_tests.rs",
+    "module": "live_rooms_snapshot_acceptance",
+    "contract": "Preserve the two-line path/module registration in the existing cfg(test) subtree. The rest of this shared test file is not frozen. No production visibility change or Cargo.toml/workflow change is needed. Existing workspace lib/bins tests and nextest discover these tests."
+  },
+  "commands": {
+    "acceptance": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::live_rooms_snapshot_acceptance -- --nocapture",
+    "controls": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::live_rooms_snapshot_acceptance::control_existing_ -- --nocapture",
+    "format": "cargo fmt --all -- --check",
+    "inventory": "python3 scripts/ci/check-test-inventory.py",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref 6c908224b0df1f53f48b84ac1c21414f3ecdc3dc --head-ref HEAD",
+    "verifyHashes": "python3 -c 'import hashlib,json,pathlib; m=json.loads(pathlib.Path(\"tests/acceptance/live_rooms_snapshot.manifest.json\").read_text()); checks={f[\"path\"]: hashlib.sha256(pathlib.Path(f[\"path\"]).read_bytes()).hexdigest()==f[\"sha256\"] for f in m[\"protectedFiles\"]}; print(checks); assert all(checks.values())'"
+  },
+  "contract": {
+    "readyMapping": "Preserve supplied timestamp and live generation, guild and owner identity, viewer-specific roles (not the bot's Administrator roles), the mirrored guild role table, channel limit, enforced channel overwrites, ledger ownership and human occupant presence inputs. Pass raw presence to the shipped core, which performs alias/majority/seat/render policy.",
+    "readiness": "Pre-authoritative and disconnected snapshots refuse with zero room facts. Missing viewer-role entry also refuses, including a guild-owner viewer. Present empty role list is known, not missing. Missing guild-role table refuses; missing assigned/everyone roles cannot disclose any partial board or overflow.",
+    "ledger": "Only the intersection of this guild's tracked ledger rows and live channels can appear. Untracked channels, vanished channels, foreign-guild ledger rows, empty rooms and bot-only rooms produce no room facts.",
+    "occupancy": "Known bots do not consume seats or dominate games; unknown bot identity remains human under the existing rule. Configured synthetic bot counts as human in a synthetic guild. Live-guild fixture installs the existing synthetic_humans_for fence, which removes overrides, so bots remain bots there.",
+    "presence": "Use only supplied in-memory facts. Off-room and disconnected members never contribute. Disabled presence shows neither cached games nor playing counts; absent facts never invent General. Current ledger owner, not original creator, supplies the force-single tie-break.",
+    "permissions": "Forward the enforced channel overwrite list, not a second application of category overwrites or bot authority. A Connect deny excludes the viewer despite visibility/bot Administrator/category allow. Direct member access grant and final member Connect deny stay viewer-specific.",
+    "generations": "Owned captured facts survive later state replacement unchanged; an ordinary read does not mutate live state or the input ledger. A concurrent writer replaces all roles/occupants/limits/presences atomically once in each of 256 capture windows; every observation must be wholly generation 41 or wholly generation 42. No sleep, wall-clock timing oracle or production test hook.",
+    "fixtureControls": "Two tests independently exercise the existing real LiveState occupancy and guild-member permission resolver with literal expected results; they do not call the missing-feature bridge."
+  },
+  "redProtocol": {
+    "expected": "21 adapter tests fail at assertions because the explicit MissingFeature bridge has no production reader; 2 existing-behavior controls pass. MissingFeature is not a valid empty-board or catching-up result.",
+    "requiredEvidence": "An admitted compiled run must show expected assertion-level RED plus passing controls before final acceptance handoff. Admission refusal, compile errors and zero selected tests do not prove behavioral RED.",
+    "observedLocal": "Both the post-core control target and the new adapter acceptance target were refused before Cargo with exit 75: no idle, below-budget slot; no per-worktree fallback. No Rust compilation or test execution occurred; no RED/GREEN claim.",
+    "greenRequirement": "Builder preserves the protected file byte-for-byte and the test registration, wires only the editable bridge to real production adapter code, and makes all 23 tests pass in the single feature PR with same-head CI/review. Never open or merge a standalone test-only PR.",
+    "roleProofLimit": "Synthetic cases encode missing member entries, missing assigned roles and missing everyone role, but their execution and production guild-cache completeness remain unverified until admitted verification. No permission-proof or kill-rule clearance is claimed by this manifest."
+  },
+  "handoff": "Immutable pushed SHA and this manifest's own SHA-256 are recorded externally on the acceptance task to avoid a self-referential hash. Only the Test Author changes protected tests. Retain the normal feature branch and independent review/CI/auto-merge gates."
+}
