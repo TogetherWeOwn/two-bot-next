@@ -168,6 +168,7 @@ RUST_DOCS = frozenset({
     "docs/smoke-expected-responses.md",
     "docs/smoke-run-record.md",
     "docs/smoke-surface-inventory.md",
+    "docs/t0-acceptance-smoke-contract.json",
     "docs/privacy.md",
     "docs/database-roles.md",
     "docs/rollback-delta.md",

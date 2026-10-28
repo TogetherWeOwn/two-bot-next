@@ -216,7 +216,7 @@ class SelectionTests(unittest.TestCase):
                      "docs/soak-checklist.json", "docs/soak-checklist.md",
                      "docs/privacy.md", "docs/database-roles.md",
                      "docs/rollback-delta.md", "docs/backup.md",
-                     "docs/tickets.md"]
+                     "docs/tickets.md", "docs/t0-acceptance-smoke-contract.json"]
         for path in rust_docs:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
