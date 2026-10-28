@@ -73,6 +73,8 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(agg["name"], "ci-ok")
         self.assertIn("always()", agg["if"])
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
+                    "test-partition-plan", "rust-tests-partition",
+                    "ignored-db-runtime-partition",
                     "coverage-plan", "coverage-shard", "patch-coverage",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
@@ -88,6 +90,8 @@ class RequiredChecksReportTests(unittest.TestCase):
                        "SELF_ROLE_RESULT", "COMMUNITY_DB_RESULT",
                        "FEEDS_DB_RESULT", "TICKETS_RESULT",
                        "MODERATION_DB_RESULT", "RUST_TESTS_RESULT",
+                       "TEST_PARTITION_PLAN_RESULT", "RUST_TEST_PARTITION_RESULT",
+                       "RUNTIME_PARTITION_RESULT",
                        "COVERAGE_PLAN_RESULT", "COVERAGE_SHARD_RESULT",
                        "PATCH_COVERAGE_RESULT",
                        "IGNORED_DB_STORES_RESULT", "IGNORED_DB_RUNTIME_RESULT",
@@ -157,27 +161,57 @@ class RequiredChecksReportTests(unittest.TestCase):
     def test_ignored_db_runtime_routes_claimed_ignored_tests(self):
         # These two filters are the only required-lane coverage for eleven
         # ignored tests. Cargo exits 0 when a filter matches nothing, so pin
-        # step presence, the exact run lines (a one-character typo would
-        # silently unroute the tests) and the frontier's guarded URL.
-        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
-        evidence = [step for step in job.get("steps", [])
-                    if step.get("name") == "containment evidence acceptance (mock Discord and CI service only)"]
+        # partition presence, the exact argv (a one-character typo would
+        # silently unroute the tests) and the frontier's guarded URL. The
+        # lane runs partitioned: the "runtime" partition of
+        # run-test-partition.py carries these filters, the
+        # ignored-db-runtime-partition workers execute them, and the
+        # ignored-db-runtime aggregate verifies every partition receipt.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "run_test_partition", ROOT / "scripts/ci/run-test-partition.py")
+        partitions = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(partitions)
+        self.assertIn("runtime", partitions.PARTITIONS["ignored-db-runtime"])
+        commands = partitions.runtime_commands("runtime")
+        evidence = [entry for entry in commands
+                    if "containment_runtime_evidence_" in entry[0]]
         self.assertEqual(len(evidence), 1)
         self.assertEqual(
-            evidence[0].get("run"),
-            "cargo test -p two-bot --locked --lib --bins containment_runtime_evidence_ -- --include-ignored",
+            ["cargo"] + evidence[0][0],
+            ["cargo", "test", "-p", "two-bot", "--locked", "--lib", "--bins",
+             "containment_runtime_evidence_", "--", "--include-ignored"],
         )
-        frontier = [step for step in job.get("steps", [])
-                    if step.get("name") == "ops backfill frontier acceptance (CI service only)"]
+        frontier = [entry for entry in commands
+                    if "configured_database_reports_seeded_family_frontier" in entry[0]]
         self.assertEqual(len(frontier), 1)
         self.assertEqual(
-            frontier[0].get("env", {}).get("TWO_TEST_DATABASE_URL"),
+            frontier[0][1],
             "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
         )
         self.assertEqual(
-            frontier[0].get("run"),
-            "cargo test -p two-bot --locked --lib --bins configured_database_reports_seeded_family_frontier -- --include-ignored",
+            ["cargo"] + frontier[0][0],
+            ["cargo", "test", "-p", "two-bot", "--locked", "--lib", "--bins",
+             "configured_database_reports_seeded_family_frontier",
+             "--", "--include-ignored"],
         )
+        # The partition worker executes the script for this lane, and the
+        # aggregate verifies the receipts; a filter the worker never runs
+        # is unrouted even when the script still lists it.
+        worker = self.workflows["check.yml"]["jobs"]["ignored-db-runtime-partition"]
+        run_steps = [step for step in worker.get("steps", [])
+                     if "run-test-partition.py" in str(step.get("run", ""))
+                     and '--lane "$CI_TEST_LANE"' in str(step.get("run", ""))]
+        self.assertEqual(len(run_steps), 1)
+        self.assertEqual(
+            run_steps[0].get("env", {}).get("CI_TEST_LANE"), "ignored-db-runtime")
+        aggregate = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        self.assertIn("ignored-db-runtime-partition", aggregate.get("needs", []))
+        verify = [step for step in aggregate.get("steps", [])
+                  if "--verify-receipts" in str(step.get("run", ""))]
+        self.assertEqual(len(verify), 1)
+        self.assertEqual(
+            verify[0].get("env", {}).get("CI_TEST_LANE"), "ignored-db-runtime")
 
         # Each filter substring must still match its ignored test fns in the
         # source tree: a renamed test would otherwise keep every gate green
@@ -262,7 +296,9 @@ class RequiredChecksReportTests(unittest.TestCase):
     def test_aggregators_accept_a_skip_only_when_the_selector_deselected_the_job(self):
         # Docs-only PRs: selector-gated jobs skip, always-run selectors and
         # lint still pass. Docs changes continue to select the worker lane.
-        gated = {"rust-tests", "coverage-plan", "coverage-shard", "patch-coverage",
+        gated = {"rust-tests", "test-partition-plan", "rust-tests-partition",
+                 "ignored-db-runtime-partition",
+                 "coverage-plan", "coverage-shard", "patch-coverage",
                  "ignored-db-stores", "ignored-db-runtime", "self-role-store",
                  "community-db", "feeds-db", "tickets-postgres", "moderation-db",
                  "parity-docs", "supply-chain", "fuzz-compile", "nextest"}

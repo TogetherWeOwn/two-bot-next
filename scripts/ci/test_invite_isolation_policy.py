@@ -32,11 +32,19 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         jobs=("rust-tests",),
     ):
         result = self.policy_result(name)
-        self.assertEqual(len(result.failures), len(jobs), result.failures)
+        # A mutation may trip several assertions in one lane (tuple plus
+        # per-command pins); every failure must land in a mutated lane and
+        # every mutated lane must fail, with no spillover elsewhere.
+        self.assertGreaterEqual(len(result.failures), len(jobs), result.failures)
         for job in jobs:
             self.assertTrue(
                 any(f"job='{job}'" in case.id() for case, _ in result.failures),
                 f"{name} accepted an unsafe schedule in {job}",
+            )
+        for case, _ in result.failures:
+            self.assertTrue(
+                any(f"job='{job}'" in case.id() for job in jobs),
+                f"{name} failed outside the mutated lanes: {case.id()}",
             )
         return result
 
@@ -174,23 +182,72 @@ class InviteIsolationPolicyTests(unittest.TestCase):
             ["ordinary"],
         )
 
+    def mutated_runner(self, mutate):
+        """Partition runner with its executed commands mutated.
+
+        The rust-tests lane executes via run-test-partition.py, not YAML
+        run strings: mutations patch the runner module the policy pins,
+        so the policy protects the executed argv, databases and skip sets
+        rather than moved string pins.
+        """
+        module = policy.load_partition_module()
+        mutate(module)
+        return module
+
+    def assert_runner_rejected(self, mutate):
+        module = self.mutated_runner(mutate)
+        with patch.object(policy, "load_partition_module", return_value=module):
+            return self.assert_isolation_rejected()
+
     def test_signal_lane_rejects_parallel_invite_replay(self):
-        steps = self.case.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-        replay = next(step for step in steps if "--test invite_uses_saturation_acceptance" in step.get("run", ""))
-        replay["run"] = replay["run"].replace(" --test-threads=1", "")
-        self.assert_isolation_rejected()
+        def drop_serial(module):
+            real = module.rust_commands
+            suite = "invite_uses_saturation_acceptance"
+
+            def patched(partition):
+                entries = real(partition)
+                if partition != "replays":
+                    return entries
+                mutated = []
+                for argv, database, integration, timeout, budget in entries:
+                    if suite in argv:
+                        argv = [token for token in argv if token != "--test-threads=1"]
+                    mutated.append((argv, database, integration, timeout, budget))
+                return mutated
+
+            module.rust_commands = patched
+
+        self.assert_runner_rejected(drop_serial)
 
     def test_signal_lane_rejects_a_narrowed_replay(self):
-        steps = self.case.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-        replay = next(step for step in steps if "--test invite_uses_saturation_acceptance" in step.get("run", ""))
-        replay["run"] = replay["run"].replace(" --locked -- ", " --locked normal_uses_round_trip_byte_identical -- ")
-        self.assert_isolation_rejected()
+        def narrow(module):
+            real = module.rust_commands
+            suite = "invite_uses_saturation_acceptance"
+
+            def patched(partition):
+                entries = real(partition)
+                if partition != "replays":
+                    return entries
+                mutated = []
+                for argv, database, integration, timeout, budget in entries:
+                    if suite in argv:
+                        at = argv.index("--")
+                        argv = argv[:at] + ["normal_uses_round_trip_byte_identical"] + argv[at:]
+                    mutated.append((argv, database, integration, timeout, budget))
+                return mutated
+
+            module.rust_commands = patched
+
+        self.assert_runner_rejected(narrow)
 
     def test_signal_lane_rejects_missing_fixture_skip(self):
-        steps = self.case.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-        sweep = next(step for step in steps if "--workspace --test '*'" in step.get("run", ""))
-        sweep["run"] = sweep["run"].replace("--skip uses_u64_max_saturates_at_i32_max", "")
-        self.assert_isolation_rejected()
+        def drop_skip(module):
+            module.INTEGRATION_SKIPS = tuple(
+                skip for skip in module.INTEGRATION_SKIPS
+                if skip != "uses_u64_max_saturates_at_i32_max"
+            )
+
+        self.assert_runner_rejected(drop_skip)
 
     def test_coverage_lane_rejects_missing_fixture_skip(self):
         steps = self.case.workflows["check.yml"]["jobs"]["coverage-shard"]["steps"]

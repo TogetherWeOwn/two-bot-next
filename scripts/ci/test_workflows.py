@@ -39,7 +39,12 @@ JOB_INVENTORY = {
                   # selects the legs, the shard matrix runs them, and
                   # `patch-coverage` merges and gates, so the unit-test signal
                   # and the coverage verdict fail independently.
-                  "rust-tests", "coverage-plan", "coverage-shard",
+                  # rust-tests and ignored-db-runtime are partitioned: the
+                  # planner emits the matrices, the *-partition workers run
+                  # them, and the stable final aggregates verify receipts.
+                  "rust-tests", "test-partition-plan", "rust-tests-partition",
+                  "ignored-db-runtime-partition",
+                  "coverage-plan", "coverage-shard",
                   "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile",
@@ -167,9 +172,40 @@ class UniqueKeyLoader(yaml.BaseLoader):
         return mapping
 
 
+EXPECTED_COVERAGE_SWEEPS = {
+    f"{family}-{package}"
+    for family in ("sweep-nonignored", "sweep-ignored")
+    for package in ("core", "discord", "bot", "cutover", "store", "other")
+}
+EXPECTED_COVERAGE_REPLAYS = {
+    "core-stream_live_store", "discord-mutation_429_proves_no_effect_channel",
+    "core-channel_moderation", "discord-channel_moderation_runtime",
+    "discord-internal_channel_moderation", "core-feeds_store",
+    "cutover-legacy_verify_db", "cutover-legacy_tls_fence", "cutover-staging_migrate_db",
+    "discord-internal_events", "cutover-raid_list_db", "cutover-reengagement_list_db",
+    "cutover-game_activity_report_db", "core-member_moderation_db",
+    "store-invite_uses_saturation_acceptance",
+}
+
+
 def load_workflows():
     return {path.name: yaml.load(path.read_text(), Loader=UniqueKeyLoader)
             for path in (ROOT / ".github/workflows").glob("*.y*ml")}
+
+
+def load_partition_module(name="run_test_partition"):
+    """Load the partitioned test-lane runner for offline command pins.
+
+    The rust-tests and ignored-db-runtime lanes execute via
+    scripts/ci/run-test-partition.py; lane tests pin its argv, databases
+    and skip sets. Loaded fresh (no cache) so mutation probes in
+    test_invite_isolation_policy.py can substitute mutated runners.
+    """
+    spec = importlib.util.spec_from_file_location(
+        name, ROOT / "scripts/ci/run-test-partition.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def runner_allowed(job_id, runs_on):
@@ -3981,13 +4017,20 @@ class WorkflowTests(unittest.TestCase):
         # 60m07s mid-measurement kill), while the replay alone measured ~30
         # min of a 42m16s job. 45 minutes keeps comfortable headroom for a
         # cache-cold or slow runner without letting a hung suite burn an hour.
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        # The lane is partitioned: workers carry the suite timeout, the
+        # stable final aggregate only downloads and verifies receipts.
+        jobs = self.workflows["check.yml"]["jobs"]
+        worker = jobs["rust-tests-partition"]
         # BaseLoader keeps scalars as strings; "45" is the 45-minute limit.
-        self.assertEqual(job["timeout-minutes"], "45")
+        self.assertEqual(worker["timeout-minutes"], "45")
         # The measurement lives in the sharded coverage jobs now: no step here
         # may re-merge it into this lane.
-        names = [step.get("name") for step in job["steps"]]
+        names = [step.get("name") for step in worker["steps"]]
         self.assertNotIn("Patch coverage (HARD, 80% of added lines)", names)
+        aggregate = jobs["rust-tests"]
+        self.assertEqual(aggregate["timeout-minutes"], "5")
+        self.assertIn("rust-tests-partition", aggregate.get("needs", []))
+        self.assertIn("job-inputs", aggregate.get("needs", []))
 
     def test_coverage_shard_and_merge_timeouts_cover_their_work(self):
         # The old single coverage job needed a 60-minute ceiling: the llvm-cov
@@ -4002,23 +4045,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(jobs["patch-coverage"]["timeout-minutes"], "15")
 
     def test_rust_lane_cargo_cache_entries_are_pinned(self):
-        # The `check` entry is written by `rust-tests` and restored by the two
-        # ignored-db lanes, which rebuild the same non-instrumented graph. The
+        # The partitioned lanes own per-partition entries: each
+        # rust-tests worker writes its own `rust-tests-<partition>`
+        # entry on pushes to main, and each runtime worker restores its
+        # own `ignored-db-runtime-<partition>` entry without saving. The
         # coverage shards build a unique instrumented graph under
         # `target/llvm-cov-target` that no other lane produces, so each shard
         # owns a separate writable `coverage-shard-N` entry: restore-only
         # would cold-build the instrumented dependencies on every run after a
-        # cache rotation. Two writers must never share one entry (no
-        # concurrent save race on `check`).
+        # cache rotation. The stores lane stays restore-only on the shared
+        # `check` entry. Two writers must never share one entry (no
+        # concurrent save race).
         jobs = self.workflows["check.yml"]["jobs"]
         # (shared-key, save-if); BaseLoader keeps scalars as strings.
         expected = {
             "check": ("lint", "${{ github.event_name == 'push' }}"),
-            "rust-tests": ("check", "${{ github.event_name == 'push' }}"),
+            "rust-tests-partition": ("rust-tests-${{ matrix.partition }}",
+                                     "${{ github.event_name == 'push' }}"),
             "coverage-shard": ("coverage-shard-${{ matrix.shard_index }}",
                                "${{ github.event_name == 'push' }}"),
             "ignored-db-stores": ("check", "false"),
-            "ignored-db-runtime": ("check", "false"),
+            "ignored-db-runtime-partition": ("ignored-db-runtime-${{ matrix.partition }}",
+                                              "false"),
         }
         writers = []
         for job_id, (shared_key, save_if) in expected.items():
@@ -4039,9 +4087,100 @@ class WorkflowTests(unittest.TestCase):
                 shared_key, seen,
                 f"{job_id} races another writer on shared-key {shared_key}")
             seen.add(shared_key)
+        # The stable final aggregates are host-only receipt verifiers: they
+        # build nothing and must not restore a cargo cache.
+        for aggregate in ("rust-tests", "ignored-db-runtime"):
+            with self.subTest(job=aggregate):
+                names = [step.get("name")
+                         for step in jobs[aggregate]["steps"]]
+                self.assertNotIn("Restore cargo cache", names)
+
+    def test_partition_workers_and_aggregates_are_strict(self):
+        # The lanes run partitioned: the planner emits per-lane matrices,
+        # the *-partition workers execute them and upload receipts, and the
+        # stable final aggregates fail closed unless every worker succeeded
+        # and every receipt verifies. A missing worker, a skipped matrix
+        # entry or an unverified receipt must never read as green.
+        partitions = load_partition_module()
+        self.assertEqual(
+            partitions.PARTITIONS["rust-tests"],
+            ("unit-bin", "integration-0", "integration-1", "integration-2", "replays"))
+        self.assertEqual(
+            partitions.PARTITIONS["ignored-db-runtime"],
+            ("onboarding", "gateway", "runtime", "cutover", "other"))
+        jobs = self.workflows["check.yml"]["jobs"]
+        plan = jobs["test-partition-plan"]
+        self.assertEqual(plan.get("permissions"), {"contents": "read"})
+        self.assertEqual(plan.get("needs"), ["job-inputs"])
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", plan.get("if", ""))
+        outputs = plan.get("outputs", {})
+        self.assertIn("steps.plan.outputs.rust-tests", outputs.get("rust-tests", ""))
+        self.assertIn("steps.plan.outputs.ignored-db-runtime",
+                      outputs.get("ignored-db-runtime", ""))
+        plan_step = next(step for step in plan["steps"] if step.get("id") == "plan")
+        self.assertIn("run-test-partition.py", plan_step["run"])
+        self.assertIn('--lane "$lane" --list', plan_step["run"])
+        for lane, worker_id, aggregate_id in (
+                ("rust-tests", "rust-tests-partition", "rust-tests"),
+                ("ignored-db-runtime", "ignored-db-runtime-partition", "ignored-db-runtime")):
+            with self.subTest(lane=lane):
+                worker = jobs[worker_id]
+                self.assertEqual(worker.get("permissions"), {"contents": "read"})
+                self.assertIn("job-inputs", worker.get("needs", []))
+                self.assertIn("test-partition-plan", worker.get("needs", []))
+                self.assertIn("needs.job-inputs.outputs.rust != 'false'",
+                              worker.get("if", ""))
+                strategy = worker.get("strategy", {})
+                self.assertEqual(strategy.get("fail-fast"), "false")
+                self.assertIn(f"needs.test-partition-plan.outputs.{lane}",
+                              strategy.get("matrix", ""))
+                run_step = next(
+                    step for step in worker["steps"]
+                    if step.get("name") == "Run selected test partition")
+                self.assertEqual(run_step.get("env", {}).get("CI_TEST_LANE"), lane)
+                self.assertIn("${{ matrix.partition }}",
+                              run_step.get("env", {}).get("CI_TEST_PARTITION", ""))
+                self.assertIn("run-test-partition.py", run_step["run"])
+                self.assertIn('--lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"',
+                              run_step["run"])
+                upload = next(
+                    step for step in worker["steps"]
+                    if step.get("name") == "Upload successful test partition receipt")
+                self.assertIn("actions/upload-artifact@", upload.get("uses", ""))
+                self.assertEqual(upload["with"]["name"],
+                                 f"test-partition-{lane}-"
+                                 "${{ matrix.partition }}")
+                self.assertEqual(upload["with"]["if-no-files-found"], "error")
+                aggregate = jobs[aggregate_id]
+                self.assertEqual(aggregate.get("permissions"), {"contents": "read"})
+                self.assertIn("job-inputs", aggregate.get("needs", []))
+                self.assertIn(worker_id, aggregate.get("needs", []))
+                self.assertIn("always()", aggregate.get("if", ""))
+                self.assertIn("needs.job-inputs.outputs.rust != 'false'",
+                              aggregate.get("if", ""))
+                download = next(
+                    step for step in aggregate["steps"]
+                    if step.get("name") == "Download successful partition receipts")
+                self.assertIn("actions/download-artifact@", download.get("uses", ""))
+                self.assertEqual(download["with"]["pattern"],
+                                 f"test-partition-{lane}-*")
+                gate = next(
+                    step for step in aggregate["steps"]
+                    if step.get("name") == "Require every test partition")
+                self.assertIn("PARTITION_RESULTS", str(gate.get("env", "")))
+                self.assertIn("toJSON(needs)", str(gate.get("env", {}).get(
+                    "PARTITION_RESULTS", "")))
+                self.assertIn("result') != 'success'", gate["run"])
+                self.assertIn("sys.exit(1)", gate["run"])
+                verify = next(
+                    step for step in aggregate["steps"]
+                    if step.get("name") == "Verify exact successful partition receipts and property budget")
+                self.assertEqual(verify.get("env", {}).get("CI_TEST_LANE"), lane)
+                self.assertIn("run-test-partition.py", verify["run"])
+                self.assertIn('--lane "$CI_TEST_LANE" --verify-receipts', verify["run"])
 
     def test_rust_test_container_pins_disposable_database_service_address(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        job = self.workflows["check.yml"]["jobs"]["rust-tests-partition"]
         prerequisites = next(
             step for step in job["steps"]
             if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
@@ -4050,13 +4189,14 @@ class WorkflowTests(unittest.TestCase):
         self.assert_loopback_forward_is_pinned(prerequisites["run"])
 
     def test_coverage_shard_container_pins_disposable_database_service_address(self):
-        # Same hardening as rust-tests: the coverage legs run long database
-        # suites, and a main run lost service-alias DNS mid-suite. The block
-        # stays byte-identical to the rust-tests copy: shared setup, not a
-        # forked copy that can drift.
+        # Same hardening as the rust-tests workers: the coverage legs run
+        # long database suites, and a main run lost service-alias DNS
+        # mid-suite. The block stays byte-identical to the worker copy:
+        # shared setup, not a forked copy that can drift.
         jobs = self.workflows["check.yml"]["jobs"]
         runs = {}
-        for job_id in ("rust-tests", "coverage-shard"):
+        for job_id in ("rust-tests-partition", "coverage-shard",
+                       "ignored-db-runtime-partition"):
             prerequisites = next(
                 step for step in jobs[job_id]["steps"]
                 if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
@@ -4064,7 +4204,9 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(prerequisites.get("shell"), "bash")
             runs[job_id] = prerequisites["run"]
         self.assert_loopback_forward_is_pinned(runs["coverage-shard"])
-        self.assertEqual(runs["rust-tests"], runs["coverage-shard"],
+        self.assertEqual(runs["rust-tests-partition"], runs["coverage-shard"],
+                         "the lanes' loopback-forward blocks drifted apart")
+        self.assertEqual(runs["ignored-db-runtime-partition"], runs["coverage-shard"],
                          "the lanes' loopback-forward blocks drifted apart")
 
     def assert_loopback_forward_is_pinned(self, run):
@@ -4124,7 +4266,7 @@ class WorkflowTests(unittest.TestCase):
         )
 
     def test_rust_test_postgres_wal_budget_is_bounded(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        job = self.workflows["check.yml"]["jobs"]["rust-tests-partition"]
         prepare = next(
             step for step in job["steps"]
             if step.get("name") == "Prepare isolated test databases"
@@ -4144,19 +4286,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'min_wal_size': '32MB'", verify["run"])
 
     def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
-        # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
-        # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
-        # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
-        # the bounded service must carry its own budget and verify it.
-        # rust-tests and coverage-shard are tighter because the coverage replay
-        # exhausted 1 GiB at 512 MB (run 39360867142); rust-tests keeps the
-        # budget the replay needed when it ran there. The other lanes stay at
-        # 512/64 MB.
+        # Run 39209332791: only the rust-tests workers bounded WAL while the
+        # ignored lanes ran the PG18 default (max_wal_size 1GB) on the same
+        # 1 GiB tmpfs, and the stores lane PANICed with ENOSPC mid-suite.
+        # Every lane that mounts the bounded service must carry its own
+        # budget and verify it. The rust-tests workers and coverage-shard
+        # are tighter because the coverage replay exhausted 1 GiB at 512 MB
+        # (run 39360867142); the workers keep the budget the replay needed
+        # when it ran there. The other lanes stay at 512/64 MB.
         budgets = {
-            "rust-tests": ("128MB", "32MB"),
+            "rust-tests-partition": ("128MB", "32MB"),
             "coverage-shard": ("128MB", "32MB"),
             "ignored-db-stores": ("512MB", "64MB"),
-            "ignored-db-runtime": ("512MB", "64MB"),
+            "ignored-db-runtime-partition": ("512MB", "64MB"),
         }
         for job_id, (max_wal, min_wal) in budgets.items():
             with self.subTest(job=job_id):
@@ -4275,10 +4417,10 @@ class WorkflowTests(unittest.TestCase):
             (workflow, job_id)
             for workflow, job_id in (
                 ("check.yml", "check"),
-                ("check.yml", "rust-tests"),
+                ("check.yml", "rust-tests-partition"),
                 ("check.yml", "coverage-shard"),
                 ("check.yml", "ignored-db-stores"),
-                ("check.yml", "ignored-db-runtime"),
+                ("check.yml", "ignored-db-runtime-partition"),
                 ("reusable-rust-nextest.yml", "nextest"),
             )
         ]
@@ -4369,7 +4511,8 @@ class WorkflowTests(unittest.TestCase):
         # max_wal_size is a soft checkpoint target, not a hard ceiling: the
         # pre-suite report cannot show peak WAL. Every Postgres lane brackets
         # its run with an always-runs post-suite report for ENOSPC triage.
-        for job_id in ("rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime"):
+        for job_id in ("rust-tests-partition", "coverage-shard",
+                       "ignored-db-stores", "ignored-db-runtime-partition"):
             with self.subTest(job=job_id):
                 job = self.workflows["check.yml"]["jobs"][job_id]
                 steps = job["steps"]
@@ -4381,11 +4524,14 @@ class WorkflowTests(unittest.TestCase):
                 )
                 self.assertEqual(post.get("if"), "always()")
                 # coverage-shard runs no plain `cargo test` step: its suite is
-                # the llvm-cov legs inside the Patch coverage legs step.
+                # the llvm-cov legs inside the Patch coverage legs step. The
+                # partitioned workers run their suite via the partition
+                # runner, not a literal `cargo test` line.
                 test_steps = [
                     index for index, candidate in enumerate(steps)
                     if "cargo test" in str(candidate.get("run", ""))
                     or "Patch coverage" in str(candidate.get("name", ""))
+                    or "Run selected test partition" in str(candidate.get("name", ""))
                 ]
                 self.assertTrue(test_steps)
                 self.assertGreater(steps.index(post), max(test_steps))
@@ -4459,13 +4605,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_runtime_container_pins_disposable_database_service_address(self):
-        # Same hardening as rust-tests and the stores lane: the runtime lane
-        # runs 26 sequential database suites, and a long run must not depend
-        # on service-alias DNS staying up (EAI_AGAIN on agent-testdb hit a
-        # stores run while Postgres PANIC-recovered on ENOSPC).
+        # Same hardening as the rust-tests workers and the stores lane: each
+        # runtime worker runs its partition's database suites, and a long run
+        # must not depend on service-alias DNS staying up (EAI_AGAIN on
+        # agent-testdb hit a stores run while Postgres PANIC-recovered on
+        # ENOSPC).
         # The runtime WAL cap lives in this lane too (see
         # test_runtime_postgres_wal_budget_is_bounded below).
-        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime-partition"]
         prerequisites = next(
             step for step in job["steps"]
             if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
@@ -4553,7 +4700,7 @@ class WorkflowTests(unittest.TestCase):
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Keep the broader runtime-lane budget from main; the smaller target is
         # specific to the longer rust-tests coverage replay.
-        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime-partition"]
         prepare = next(
             step for step in job["steps"]
             if step.get("name") == "Prepare isolated test databases"
@@ -4571,8 +4718,41 @@ class WorkflowTests(unittest.TestCase):
 
     def test_ops_acceptance_env_is_isolated_from_parallel_sweeps(self):
         suite = "settings_jobs::tests::ops_overrides_acceptance_tests::"
+        bootstrap = "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
         for job_name in ("rust-tests", "coverage-shard"):
             with self.subTest(job=job_name):
+                if job_name == "rust-tests":
+                    # Partitioned lane: the unit-bin partition carries the
+                    # broad sweep (skipping the env-mutating suite) and the
+                    # replays partition runs it alone and serially.
+                    partitions = load_partition_module()
+                    unit = partitions.rust_commands("unit-bin")
+                    broad = [entry for entry in unit
+                             if "--workspace" in entry[0]
+                             and "--lib" in entry[0] and "--bins" in entry[0]
+                             and "--ignored" not in " ".join(entry[0])
+                             and not any("property_" in token for token in entry[0])]
+                    self.assertEqual(len(broad), 1)
+                    self.assertIn(f"--skip {suite}", " ".join(broad[0][0]))
+                    self.assertEqual(broad[0][1], bootstrap)
+                    replays = partitions.rust_commands("replays")
+                    isolated = [entry for entry in replays
+                                if suite in " ".join(entry[0])
+                                and f"--skip {suite}" not in " ".join(entry[0])]
+                    self.assertEqual(len(isolated), 1)
+                    argv, database, _, _, _ = isolated[0]
+                    self.assertIn("-p", argv)
+                    self.assertIn("two-bot", argv)
+                    self.assertIn("--bin", argv)
+                    self.assertIn("two-bot", argv)
+                    self.assertIn("--features", argv)
+                    self.assertIn("two-bot-core/db", argv)
+                    self.assertIn("--locked", argv)
+                    self.assertIn("--test-threads=1", argv)
+                    self.assertNotIn("--ignore-run-fail", argv)
+                    self.assertNotIn("--ignored", argv)
+                    self.assertEqual(database, bootstrap)
+                    continue
                 steps = self.workflows["check.yml"]["jobs"][job_name]["steps"]
                 runs = [
                     (step, line)
@@ -4581,8 +4761,8 @@ class WorkflowTests(unittest.TestCase):
                 ]
                 broad = [
                     line for _, line in runs
-                    if "--workspace --lib --bins" in line
-                    and "--ignored" not in line and "property_" not in line
+                    if '"${sweep_args[@]}"' in line and "--lib --bins --tests" in line
+                    and "-- --ignored" not in line
                 ]
                 self.assertEqual(len(broad), 1)
                 self.assertIn(f"--skip {suite}", broad[0])
@@ -4600,29 +4780,29 @@ class WorkflowTests(unittest.TestCase):
                 self.assertNotIn("--ignored", command)
                 self.assertEqual(
                     step["env"]["TWO_TEST_DATABASE_URL"],
-                    "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+                    bootstrap,
                 )
-                if job_name == "coverage-shard":
-                    self.assertIn("--no-report", command)
-                    self.assertEqual(
-                        shlex.split(command),
-                        shlex.split(
-                            'cov_run "$COV" llvm-cov --no-report -p two-bot --bin two-bot '
-                            '--features two-bot-core/db --locked -- '
-                            f'{suite} --test-threads=1 --skip regenerate_reference_docs'
-                        ),
-                    )
-                    [block] = re.findall(
-                        r"if selected sweep-nonignored; then\n(.*?)\nfi",
-                        step["run"], re.DOTALL,
-                    )
-                    block_runs = [line for line in shell_logical_lines(block)
-                                  if line.startswith("cov_run ")]
-                    self.assertEqual(block_runs, [broad[0], command])
-                    self.assertLess(
-                        step["run"].index(command),
-                        step["run"].index("export TWO_TEST_DATABASE_URL="),
-                    )
+                self.assertIn("--no-report", command)
+                self.assertEqual(
+                    shlex.split(command),
+                    shlex.split(
+                        'cov_run "$COV" llvm-cov --no-report -p two-bot --bin two-bot '
+                        '--features two-bot-core/db --locked -- '
+                        f'{suite} --test-threads=1 --skip regenerate_reference_docs'
+                    ),
+                )
+                [block] = re.findall(
+                    r'if selected "sweep-nonignored-\$package"; then\n(.*?)\nfi\nfi',
+                    step["run"], re.DOTALL,
+                )
+                self.assertIn('if [ "$package" = bot ]; then', block)
+                block_runs = [line for line in shell_logical_lines(block)
+                              if line.startswith("cov_run ")]
+                self.assertEqual(block_runs, [broad[0], command])
+                self.assertLess(
+                    step["run"].index(command),
+                    step["run"].index("export TWO_TEST_DATABASE_URL="),
+                )
 
     def test_coverage_ops_replay_is_selected_serial_and_fails_closed(self):
         step = next(
@@ -4632,18 +4812,25 @@ class WorkflowTests(unittest.TestCase):
         suite = "settings_jobs::tests::ops_overrides_acceptance_tests::"
         run = step["run"]
         wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
-        sweeps = run[run.index("if selected sweep-nonignored; then"):
+        sweeps = run[run.index("for package in core discord bot cutover store other; do"):
                      run.index("if selected_any core-stream_live_store")]
         bootstrap = "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
+        # Per-package legs: the env-mutating ops replay runs only for the
+        # bot's nonignored sweep, never for other packages. Cases avoid the
+        # "other" remainder so the behavioral probe never shells out to
+        # cargo metadata via --sweep-features; static pins cover it.
         cases = (
             ("", False, 0),
-            ("sweep-ignored", False, 1),
+            ("sweep-ignored-core", False, 1),
             ("core-stream_live_store", False, 0),
-            ("sweep-nonignored", False, 2),
-            ("sweep-nonignored sweep-ignored", False, 3),
-            ("sweep-nonignored", True, 2),
-            ("sweep-nonignored sweep-ignored", True, 2),
-            ("sweep-ignored", True, 1),
+            ("sweep-nonignored-core", False, 1),
+            ("sweep-nonignored-bot", False, 2),
+            ("sweep-nonignored-bot sweep-ignored-core", False, 3),
+            ("sweep-nonignored-core sweep-ignored-core", False, 2),
+            ("sweep-nonignored-bot", True, 2),
+            ("sweep-nonignored-bot sweep-ignored-core", True, 2),
+            ("sweep-ignored-core", True, 1),
+            ("sweep-nonignored-core", True, 1),
         )
         with tempfile.TemporaryDirectory() as directory:
             stub = Path(directory) / "cargo-llvm-cov"
@@ -4662,8 +4849,14 @@ class WorkflowTests(unittest.TestCase):
                                  FAIL_OPS="1" if fail_ops else "0"),
                         capture_output=True, text=True, check=False, timeout=15,
                     )
-                    selected = "sweep-nonignored" in legs.split()
-                    must_fail = selected and fail_ops
+                    if not legs.strip():
+                        # An empty selection fails closed before any sweep.
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn("empty coverage leg selection", result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        continue
+                    selected_bot = "sweep-nonignored-bot" in legs.split()
+                    must_fail = selected_bot and fail_ops
                     self.assertEqual(result.returncode, 1 if must_fail else 0, result.stderr)
                     if must_fail:
                         self.assertIn("patch coverage measurement failed", result.stderr)
@@ -4678,9 +4871,10 @@ class WorkflowTests(unittest.TestCase):
                         commands.append(command)
                     isolated = [command for command in commands
                                 if suite in command and f"--skip {suite}" not in command]
-                    self.assertEqual(len(isolated), int(selected))
-                    if selected:
-                        self.assertIn("--workspace --lib --bins --tests", commands[0])
+                    self.assertEqual(len(isolated), int(selected_bot))
+                    if selected_bot:
+                        self.assertIn("-p two-bot", commands[0])
+                        self.assertIn("--lib --bins --tests", commands[0])
                         self.assertIn(f"--skip {suite}", commands[0])
                         self.assertEqual(commands[1], isolated[0])
                         self.assertEqual(shlex.split(isolated[0]), shlex.split(
@@ -4688,16 +4882,64 @@ class WorkflowTests(unittest.TestCase):
                             "--features two-bot-core/db --locked -- "
                             f"{suite} --test-threads=1 --skip regenerate_reference_docs"
                         ))
+                    if "sweep-nonignored-core" in legs.split():
+                        core_sweeps = [command for command in commands
+                                       if "-p two-bot-core" in command
+                                       and "-- --ignored" not in command]
+                        self.assertEqual(len(core_sweeps), 1)
+                        self.assertIn(f"--skip {suite}", core_sweeps[0])
                     ignored = [command for command in commands if "-- --ignored" in command]
-                    self.assertEqual(len(ignored), int("sweep-ignored" in legs.split()
-                                                      and not must_fail))
+                    want_ignored = (any(leg.startswith("sweep-ignored-") for leg in legs.split())
+                                    and not must_fail)
+                    self.assertEqual(len(ignored), int(want_ignored))
 
     def test_invite_saturation_isolation_in_both_lanes(self):
         suite = "invite_uses_saturation_acceptance"
         source = (ROOT / f"crates/store/tests/{suite}.rs").read_text(encoding="utf-8")
         names = set(tokio_test_names(source))
+        bootstrap = "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
         for job_name in ("rust-tests", "coverage-shard"):
             with self.subTest(job=job_name):
+                if job_name == "rust-tests":
+                    # Partitioned lane: every integration partition skips
+                    # the racy fixtures, and the replays partition runs the
+                    # complete suite alone and serially.
+                    partitions = load_partition_module()
+                    for name in sorted(names):
+                        with self.subTest(fixture=name):
+                            self.assertIn(name, partitions.INTEGRATION_SKIPS)
+                    integration = []
+                    for index in (0, 1, 2):
+                        integration.extend(partitions.integration_commands(index))
+                    swept = [entry for entry in integration if entry[2]]
+                    self.assertTrue(swept, "integration partitions must sweep targets")
+                    for argv, database, _, _, _ in swept:
+                        text = " ".join(argv)
+                        self.assertNotIn("--ignored", text)
+                        for name in sorted(names):
+                            with self.subTest(fixture=name):
+                                self.assertIn(f"--skip {name}", text)
+                    replays = partitions.rust_commands("replays")
+                    matches = [entry for entry in replays
+                               if f"--test" in entry[0] and suite in entry[0]]
+                    self.assertEqual(len(matches), 1)
+                    argv, database, _, _, _ = matches[0]
+                    replay = "cargo " + shlex.join(argv)
+                    self.assertIn("-p two-bot-store", replay)
+                    self.assertIn("--locked", replay)
+                    self.assertIn("--test-threads=1", replay)
+                    self.assertNotIn("--ignore-run-fail", replay)
+                    self.assertNotIn("--ignored", replay)
+                    self.assertEqual(
+                        replay.split(" -- ", 1)[0],
+                        f"cargo test -p two-bot-store --test {suite} --features two-bot-core/db --locked",
+                    )
+                    self.assertEqual(
+                        replay.split(" -- ", 1)[1].split(),
+                        ["--test-threads=1"],
+                    )
+                    self.assertEqual(database, bootstrap)
+                    continue
                 steps = self.workflows["check.yml"]["jobs"][job_name]["steps"]
                 runs = [
                     (step, line)
@@ -4706,8 +4948,8 @@ class WorkflowTests(unittest.TestCase):
                 ]
                 sweeps = [
                     line for _, line in runs
-                    if "--workspace" in line and ("--tests" in line or "--test '*'" in line)
-                    and "--ignored" not in line and "property_" not in line
+                    if '"${sweep_args[@]}"' in line and "--lib --bins --tests" in line
+                    and "-- --ignored" not in line
                 ]
                 self.assertEqual(len(sweeps), 1)
                 skips = set(re.findall(r"--skip (\S+)", sweeps[0]))
@@ -4726,29 +4968,25 @@ class WorkflowTests(unittest.TestCase):
                 # may silently narrow the complete serial replay.
                 self.assertEqual(
                     replay.split(" -- ", 1)[0],
-                    f'cov_run "$COV" llvm-cov --no-report -p two-bot-store --features two-bot-core/db --locked --test {suite}'
-                    if job_name == "coverage-shard" else
-                    f"cargo test -p two-bot-store --test {suite} --features two-bot-core/db --locked",
+                    f'cov_run "$COV" llvm-cov --no-report -p two-bot-store --features two-bot-core/db --locked --test {suite}',
                 )
                 self.assertEqual(
                     replay.split(" -- ", 1)[1].split(),
-                    ["--test-threads=1", "--skip", "regenerate_reference_docs"]
-                    if job_name == "coverage-shard" else ["--test-threads=1"],
+                    ["--test-threads=1", "--skip", "regenerate_reference_docs"],
                 )
-                if job_name == "coverage-shard":
-                    self.assertIn("--no-report", replay)
-                    exports = [
-                        line for line in shell_logical_lines(step["run"].split(replay, 1)[0])
-                        if line.startswith("export TWO_TEST_DATABASE_URL=")
-                    ]
-                    self.assertTrue(exports)
-                    self.assertEqual(
-                        exports[-1],
-                        "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
-                    )
+                self.assertIn("--no-report", replay)
+                exports = [
+                    line for line in shell_logical_lines(step["run"].split(replay, 1)[0])
+                    if line.startswith("export TWO_TEST_DATABASE_URL=")
+                ]
+                self.assertTrue(exports)
+                self.assertEqual(
+                    exports[-1],
+                    "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
+                )
                 self.assertEqual(
                     step["env"]["TWO_TEST_DATABASE_URL"],
-                    "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+                    bootstrap,
                 )
 
     def test_coverage_shard_runs_with_db_and_includes_ignored_tests(self):
@@ -4840,14 +5078,19 @@ class WorkflowTests(unittest.TestCase):
             'echo "::error::patch coverage measurement failed to build or report" >&2',
             step["run"],
         )
-        sweeps = [run for run in cov_runs if "--workspace --lib --bins --tests" in run]
+        # Package-partitioned sweeps run via per-family loops with
+        # shell-variable selectors; the leg-selection test pins the
+        # selector values, and here each template carries the full flags
+        # and skip sets.
+        sweeps = [run for run in cov_runs
+                  if '"${sweep_args[@]}"' in run and "--lib --bins --tests" in run]
         self.assertEqual(len(sweeps), 2)
         for sweep in sweeps:
             with self.subTest(sweep=sweep):
                 # A failing test must never suppress coverage collection.
                 self.assertIn("--ignore-run-fail", sweep)
                 self.assertIn("--no-report", sweep)
-                self.assertIn("--features two-bot-core/db", sweep)
+                self.assertIn('"${sweep_features[@]}"', sweep)
                 self.assertIn("--locked", sweep)
         ignored_sweeps = [run for run in sweeps if "-- --ignored" in run]
         self.assertEqual(len(ignored_sweeps), 1)
@@ -4927,7 +5170,7 @@ class WorkflowTests(unittest.TestCase):
         ignored_sweep_index = next(
             index for index, line in enumerate(logical_lines)
             if line.startswith("cov_run ")
-            and "--workspace --lib --bins --tests" in line
+            and '"${sweep_args[@]}"' in line
             and "-- --ignored" in line
         )
         member_rerun_index = next(
@@ -5166,7 +5409,7 @@ class WorkflowTests(unittest.TestCase):
         )
         [sweep] = [
             line for line in shell_logical_lines(step["run"])
-            if line.startswith("cov_run ") and "--workspace --lib --bins --tests" in line
+            if line.startswith("cov_run ") and '"${sweep_args[@]}"' in line
             and "-- --ignored" in line
         ]
         sweep_skips = re.findall(r"--skip (\S+)", sweep)
@@ -5312,7 +5555,7 @@ class WorkflowTests(unittest.TestCase):
         )
         [coverage_sweep] = [
             line for line in shell_logical_lines(coverage_step["run"])
-            if line.startswith("cov_run ") and "--workspace --lib --bins --tests" in line
+            if line.startswith("cov_run ") and '"${sweep_args[@]}"' in line
             and "-- --ignored" in line
         ]
         coverage_skips = set(re.findall(r"--skip (\S+)", coverage_sweep))
@@ -5555,7 +5798,7 @@ class WorkflowTests(unittest.TestCase):
         step = next(step for step in job["steps"] if step.get("id") == "plan")
         self.assertEqual(step.get("name"), "Plan coverage shards")
         self.assertIn("scripts/ci/plan-coverage-shards.py", step["run"])
-        self.assertIn("--shards 4", step["run"])
+        self.assertIn("--shards 8", step["run"])
         self.assertIn("--output plan.json", step["run"])
         self.assertIn('"shard_index"', step["run"])
         self.assertIn('"legs"', step["run"])
@@ -5588,17 +5831,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(upload["with"].get("overwrite"), "true")
 
     def test_coverage_shard_leg_selection_matches_the_planner(self):
-        # Every planner leg id guards exactly one legs block, and the
+        # Every planner leg id is executable by exactly one guard, and the
         # unknown-id validation list matches the planner's FULL_LEGS: a leg
         # the planner can emit but no guard runs would silently
         # under-measure its crates, and an id the guards accept but the
-        # planner never emits is dead code.
+        # planner never emits is dead code. Dedicated legs guard individual
+        # blocks; package-partitioned sweeps run via per-family loops over
+        # the six sweep packages with a shared selector.
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "shard_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
         planner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(planner)
         expected = [leg["id"] for leg in planner.FULL_LEGS]
+        self.assertCountEqual(expected, EXPECTED_COVERAGE_SWEEPS | EXPECTED_COVERAGE_REPLAYS)
+        sweep_ids = [leg_id for leg_id in expected
+                     if leg_id.startswith("sweep-nonignored-")
+                     or leg_id.startswith("sweep-ignored-")]
+        dedicated_ids = [leg_id for leg_id in expected
+                         if leg_id not in sweep_ids]
+        self.assertCountEqual(sweep_ids, EXPECTED_COVERAGE_SWEEPS)
+        self.assertCountEqual(dedicated_ids, EXPECTED_COVERAGE_REPLAYS)
         job = self.workflows["check.yml"]["jobs"]["coverage-shard"]
         step = next(
             step for step in job["steps"]
@@ -5608,13 +5861,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("selected() {", run)
         self.assertIn("selected_any() {", run)
         self.assertIn("::error::unknown coverage leg", run)
-        for leg_id in expected:
+        for leg_id in dedicated_ids:
             with self.subTest(leg=leg_id):
                 self.assertEqual(
                     run.count(f"if selected {leg_id}; then"), 1,
                     f"leg {leg_id} must guard exactly one block")
         guards = set(re.findall(r"if selected ([a-z0-9_-]+); then", run))
-        self.assertEqual(guards, set(expected))
+        self.assertEqual(guards, set(dedicated_ids))
+        # The sweep loops iterate every package and select per-leg ids via
+        # the shared selector; a package missing from either loop would
+        # silently under-measure its crates.
+        self.assertEqual(
+            run.count("for package in core discord bot cutover store other; do"), 2)
+        for family in ("sweep-nonignored", "sweep-ignored"):
+            with self.subTest(family=family):
+                self.assertEqual(
+                    run.count(f'if selected "{family}-$package"; then'), 1)
+        self.assertIn("sweep_selector() {", run)
+        self.assertEqual(run.count('sweep_selector "$package"'), 2)
+        selectors = {
+            "core": "sweep_args=(-p two-bot-core)",
+            "discord": "sweep_args=(-p two-bot-discord)",
+            "bot": "sweep_args=(-p two-bot)",
+            "cutover": "sweep_args=(-p two-bot-cutover)",
+            "store": "sweep_args=(-p two-bot-store)",
+        }
+        for package, selector in selectors.items():
+            with self.subTest(package=package):
+                self.assertIn(f"{package}) {selector}", run)
+        # The remainder spans two lines (workspace selector plus a runtime
+        # feature query), so pin its branch, selector and feature probe.
+        with self.subTest(package="other"):
+            self.assertIn("other)", run)
+            self.assertIn("sweep_args=(--workspace", run)
+            self.assertIn("--sweep-features other", run)
         validated = re.search(r'case " ([a-z0-9_ -]+) " in', run)[1].split()
         self.assertEqual(validated, expected)
 
@@ -5627,27 +5907,80 @@ class WorkflowTests(unittest.TestCase):
             step for step in self.workflows["check.yml"]["jobs"]["coverage-shard"]["steps"]
             if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
         )
+        self.assertCountEqual([leg["id"] for leg in planner.FULL_LEGS],
+                              EXPECTED_COVERAGE_SWEEPS | EXPECTED_COVERAGE_REPLAYS)
         sweeps = [leg for leg in planner.FULL_LEGS
-                  if leg["id"] in ("sweep-nonignored", "sweep-ignored")]
-        self.assertEqual([leg["id"] for leg in sweeps], ["sweep-nonignored", "sweep-ignored"])
+                  if leg["id"].startswith("sweep-nonignored-")
+                  or leg["id"].startswith("sweep-ignored-")]
+        self.assertCountEqual([leg["id"] for leg in sweeps], EXPECTED_COVERAGE_SWEEPS)
+        # The workflow runs sweeps via per-family loops with shell-variable
+        # selectors; resolve them to effective commands for comparison. The
+        # "other" remainder resolves its features from the real feature
+        # graph at runtime (true effective behavior, not the template).
+        metadata = planner._metadata_from_cargo()
+        self.assertIsNotNone(metadata, "coverage feature graph must resolve offline")
+        other_features = planner.sweep_feature_flags("other", metadata)
+        logical = shell_logical_lines(step["run"])
+        sweep_runs = [line for line in logical
+                      if line.startswith("cov_run ")
+                      and '"${sweep_args[@]}"' in line]
+        self.assertEqual(len(sweep_runs), 2)
+        by_family = {}
+        for line in sweep_runs:
+            if "-- --ignored" in line:
+                by_family["sweep-ignored"] = line
+            else:
+                by_family["sweep-nonignored"] = line
+        self.assertEqual(set(by_family), {"sweep-nonignored", "sweep-ignored"})
+        ops_suite = "settings_jobs::tests::ops_overrides_acceptance_tests::"
+        ops_replays = [line for line in logical
+                       if line.startswith("cov_run ")
+                       and ops_suite in line
+                       and f"--skip {ops_suite}" not in line]
+        self.assertEqual(len(ops_replays), 1)
+        packages = {
+            "core": ["-p", "two-bot-core"],
+            "discord": ["-p", "two-bot-discord"],
+            "bot": ["-p", "two-bot"],
+            "cutover": ["-p", "two-bot-cutover"],
+            "store": ["-p", "two-bot-store"],
+            "other": ["--workspace", "--exclude", "two-bot-core",
+                      "--exclude", "two-bot-discord", "--exclude", "two-bot",
+                      "--exclude", "two-bot-cutover", "--exclude", "two-bot-store"],
+        }
         for leg in sweeps:
             with self.subTest(leg=leg["id"]):
-                [block] = re.findall(
-                    rf"if selected {re.escape(leg['id'])}; then\n(.*?)\nfi",
-                    step["run"], re.DOTALL,
-                )
-                commands = [line for line in shell_logical_lines(block)
-                            if line.startswith("cov_run ")]
-                executed = [
-                    ["cargo" if token == "$COV" else token
-                     for token in shlex.split(command)[1:]]
-                    for command in commands
-                ]
+                parts = leg["id"].split("-")
+                family = f"{parts[0]}-{parts[1]}"
+                package = parts[2]
+                template = by_family[family]
+                tokens = shlex.split(template)[1:]
+                resolved = []
+                for token in tokens:
+                    if token == "${sweep_args[@]}":
+                        resolved.extend(packages[package])
+                    elif token == "${sweep_features[@]}":
+                        if package == "other":
+                            resolved.extend(other_features)
+                        else:
+                            resolved.extend(["--features", "two-bot-core/db"])
+                    elif token == "$COV":
+                        resolved.append("cargo")
+                    else:
+                        resolved.append(token)
+                # The bot's nonignored sweep runs the env-mutating ops
+                # replay alone right after; every other sweep stands alone.
+                if leg["id"] == "sweep-nonignored-bot":
+                    ops_tokens = ["cargo" if token == "$COV" else token
+                                  for token in shlex.split(ops_replays[0])[1:]]
+                    executed = [resolved, ops_tokens]
+                else:
+                    executed = [resolved]
                 described = [leg["command"], *leg.get("supplemental_commands", [])]
                 self.assertEqual([shlex.split(command) for command in described], executed,
                                  f"{leg['id']} must describe every actual command, including all skips")
                 supplemental = leg.get("supplemental_commands", [])
-                if leg["id"] == "sweep-nonignored":
+                if leg["id"] == "sweep-nonignored-bot":
                     self.assertEqual(supplemental, [
                         "cargo llvm-cov --no-report -p two-bot --bin two-bot "
                         "--features two-bot-core/db --locked -- "
@@ -5656,10 +5989,10 @@ class WorkflowTests(unittest.TestCase):
                     ])
                 else:
                     self.assertEqual(supplemental, [])
-        self.assertEqual(len(planner.FULL_LEGS), 17)
         # The serial invite-saturation replay is its own store leg; its
         # guarded block must run exactly the command the planner describes.
-        invite = planner.FULL_LEGS[16]
+        invite = next(leg for leg in planner.FULL_LEGS
+                      if leg["id"] == "store-invite_uses_saturation_acceptance")
         self.assertEqual(invite["id"], "store-invite_uses_saturation_acceptance")
         self.assertEqual(invite["crates"], ["two-bot-store"])
         self.assertEqual(
@@ -8030,11 +8363,17 @@ class WorkflowTests(unittest.TestCase):
         }
         installers = {job: steps for job, steps in installers.items() if steps}
         self.assertEqual(set(installers), {
-            "check", "rust-tests", "coverage-plan", "coverage-shard",
-            "ignored-db-stores", "ignored-db-runtime",
+            "check", "rust-tests-partition", "coverage-plan", "coverage-shard",
+            "ignored-db-stores", "ignored-db-runtime-partition",
             "moderation-db", "self-role-store", "community-db", "tickets-postgres", "feeds-db",
             "fuzz-compile",
         })
+        # The partition planner and the stable final aggregates are
+        # host-only: they install no toolchain.
+        for host_only in ("test-partition-plan", "rust-tests",
+                          "ignored-db-runtime"):
+            with self.subTest(job=host_only):
+                self.assertNotIn(host_only, installers)
         for job_id, steps in installers.items():
             with self.subTest(job=job_id):
                 self.assertEqual(len(steps), 1)
@@ -8064,9 +8403,16 @@ class WorkflowTests(unittest.TestCase):
                     lanes.append((workflow_name, job_id))
         # Sentinels: an enumeration that silently found nothing would pass
         # every subtest vacuously.
-        for lane in (("check.yml", "ignored-db-runtime"), ("reusable-rust-nextest.yml", "nextest")):
+        for lane in (("check.yml", "rust-tests-partition"),
+                     ("check.yml", "ignored-db-runtime-partition"),
+                     ("reusable-rust-nextest.yml", "nextest")):
             self.assertIn(lane, lanes)
         self.assertNotIn(("check.yml", "fuzz-compile"), lanes)
+        # The partition planner and the stable final aggregates install
+        # no toolchain, so they carry no retry guard.
+        for host_only in ("test-partition-plan", "rust-tests",
+                          "ignored-db-runtime"):
+            self.assertNotIn(("check.yml", host_only), lanes)
         return lanes
 
     def test_rust_toolchain_installs_are_retry_guarded(self):

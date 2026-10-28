@@ -69,10 +69,11 @@ ABSENT = (
     "yet. This failure is the expected pre-build state, not a regression."
 )
 
-# The full leg list in .github/workflows/check.yml at 817707990 (the
-# pre-shard patch-coverage job), plus the serial invite-saturation store
-# leg added since: two workspace sweeps plus every dedicated cov leg, as
-# (package, target, selected-via---test-flag).
+# The full leg list in .github/workflows/check.yml: package partitions of
+# the two workspace sweeps (six packages per family: core, discord, bot,
+# cutover, store, other) plus every dedicated cov leg, as
+# (package, target, selected-via---test-flag). The serial
+# invite-saturation store leg is included in the dedicated set.
 EXPECTED_DEDICATED_LEGS = [
     ("two-bot-core", "stream_live_store", True),
     ("two-bot-discord", "mutation_429_proves_no_effect_channel", True),
@@ -90,8 +91,12 @@ EXPECTED_DEDICATED_LEGS = [
     ("two-bot-core", "member_moderation_db", True),
     ("two-bot-store", "invite_uses_saturation_acceptance", True),
 ]
-EXPECTED_WORKSPACE_SWEEPS = 2
-EXPECTED_TOTAL_LEGS = len(EXPECTED_DEDICATED_LEGS) + EXPECTED_WORKSPACE_SWEEPS
+# Six sweep packages per family (nonignored + ignored): the remainder
+# ("other") owns root/testsupport and any future workspace member.
+EXPECTED_SWEEP_PACKAGES = ("core", "discord", "bot", "cutover", "store", "other")
+EXPECTED_SWEEP_FAMILIES = ("sweep-nonignored", "sweep-ignored")
+EXPECTED_SWEEP_LEGS = len(EXPECTED_SWEEP_PACKAGES) * len(EXPECTED_SWEEP_FAMILIES)
+EXPECTED_TOTAL_LEGS = len(EXPECTED_DEDICATED_LEGS) + EXPECTED_SWEEP_LEGS
 
 KNOWN_PACKAGES = {
     "two-bot-core",
@@ -165,6 +170,13 @@ def matches_dedicated(cmd, pkg, target, via_test_flag):
     return re.search(r"(?:^|\s)--\s+channel_moderation(?:\s|$)", cmd) is not None
 
 
+def is_sweep_leg(leg):
+    leg_id = leg.get("id", "")
+    return any(leg_id == f"{family}-{package}"
+               for family in EXPECTED_SWEEP_FAMILIES
+               for package in EXPECTED_SWEEP_PACKAGES)
+
+
 def is_workspace_sweep(leg):
     return "--workspace" in command_text(leg)
 
@@ -214,7 +226,7 @@ def full_leg_ids(planner):
 
 def dedicated_commands(planner):
     return {leg["id"]: command_text(leg) for leg in planner.FULL_LEGS
-            if not is_workspace_sweep(leg)}
+            if not is_sweep_leg(leg)}
 
 
 def lcov_text(entries):
@@ -290,6 +302,10 @@ class FullLegListTests(unittest.TestCase):
         self.assertEqual(len(planner.FULL_LEGS), EXPECTED_TOTAL_LEGS)
         ids = full_leg_ids(planner)
         self.assertEqual(len(set(ids)), len(ids), "leg ids must be unique")
+        sweeps = [leg for leg in planner.FULL_LEGS if is_sweep_leg(leg)]
+        dedicated = [leg for leg in planner.FULL_LEGS if not is_sweep_leg(leg)]
+        self.assertEqual(len(sweeps), EXPECTED_SWEEP_LEGS)
+        self.assertEqual(len(dedicated), len(EXPECTED_DEDICATED_LEGS))
 
     def test_every_leg_has_an_id_a_command_and_known_crates(self):
         planner = load_planner(self)
@@ -306,8 +322,34 @@ class FullLegListTests(unittest.TestCase):
 
     def test_workspace_sweeps_are_present(self):
         planner = load_planner(self)
-        sweeps = [leg for leg in planner.FULL_LEGS if is_workspace_sweep(leg)]
-        self.assertEqual(len(sweeps), EXPECTED_WORKSPACE_SWEEPS)
+        sweeps = [leg for leg in planner.FULL_LEGS if is_sweep_leg(leg)]
+        self.assertEqual(len(sweeps), EXPECTED_SWEEP_LEGS)
+        by_id = {leg["id"]: leg for leg in sweeps}
+        for family in EXPECTED_SWEEP_FAMILIES:
+            for package in EXPECTED_SWEEP_PACKAGES:
+                leg_id = f"{family}-{package}"
+                with self.subTest(leg=leg_id):
+                    self.assertIn(leg_id, by_id)
+                    cmd = command_text(by_id[leg_id])
+                    # Automatic target discovery: sweeps never name an
+                    # integration target, so a new target is covered without
+                    # a planner change.
+                    self.assertNotIn("--test ", cmd)
+                    self.assertIn("--lib --bins --tests", cmd)
+                    if package == "other":
+                        self.assertIn("--workspace", cmd)
+                        for excluded in ("two-bot-core", "two-bot-discord",
+                                         "two-bot", "two-bot-cutover",
+                                         "two-bot-store"):
+                            self.assertIn(f"--exclude {excluded}", cmd)
+                    else:
+                        self.assertNotIn("--workspace", cmd)
+        # Only the two "other" remainders still carry --workspace.
+        workspace = [leg for leg in planner.FULL_LEGS if is_workspace_sweep(leg)]
+        self.assertEqual(
+            sorted(leg["id"] for leg in workspace),
+            ["sweep-ignored-other", "sweep-nonignored-other"],
+        )
 
     def test_every_dedicated_leg_matches_exactly_one_expected_leg(self):
         planner = load_planner(self)
@@ -326,17 +368,26 @@ class FullLegListTests(unittest.TestCase):
         self.assertTrue(always)
         self.assertLess(set(always), full)
         by_id = {leg["id"]: leg for leg in planner.FULL_LEGS}
-        self.assertTrue(any(is_workspace_sweep(by_id[lid]) for lid in always))
+        self.assertTrue(any(is_sweep_leg(by_id[lid]) for lid in always))
+        # The always-on set is the nonignored remainder only: docs-only
+        # changes measure the root/testsupport packages without running
+        # every dedicated replay.
+        self.assertEqual(always, ["sweep-nonignored-other"])
 
 
 class PartitionTests(unittest.TestCase):
     def test_shards_cover_every_leg_exactly_once(self):
         planner = load_planner(self)
         full = set(full_leg_ids(planner))
+        # A workspace-wide change widens to the full 27-leg set; a core
+        # change is scoped to its affected packages (see
+        # test_core_change_selects_affected_packages_without_widening).
         for count in (1, 2, 4, 6):
             with self.subTest(shards=count):
-                result = make_plan(planner, ["crates/core/src/a.rs"],
+                result = make_plan(planner, ["Cargo.lock"],
                                    shards=count)
+                self.assertTrue(result["widened"])
+                self.assertEqual(set(result["legs"]), full)
                 union = [lid for shard in result["shards"] for lid in shard]
                 self.assertEqual(len(result["shards"]), count)
                 self.assertEqual(len(union), len(set(union)))
@@ -453,11 +504,21 @@ class ChangedCrateSelectionTests(unittest.TestCase):
         self.assert_pkg_legs(planner, selected, "two-bot-core", False)
         self.assert_pkg_legs(planner, selected, "two-bot-store", False)
 
-    def test_core_change_selects_everything_without_widening(self):
+    def test_core_change_selects_affected_packages_without_widening(self):
+        # Core sits below every package with dedicated legs, so a core
+        # change selects all 15 dedicated replays plus the affected
+        # package sweeps, without widening. The only leg left out is the
+        # ignored remainder: root/testsupport do not depend on core, and
+        # the always-on set covers only the nonignored remainder.
         planner = load_planner(self)
         result = make_plan(planner, ["crates/core/src/a.rs"], shards=4)
-        self.assertEqual(set(result["legs"]), set(full_leg_ids(planner)))
         self.assertFalse(result["widened"])
+        selected = set(result["legs"])
+        self.assertEqual(selected, set(full_leg_ids(planner)) - {"sweep-ignored-other"})
+        for pkg in ("two-bot-core", "two-bot-discord", "two-bot-cutover",
+                    "two-bot-store"):
+            self.assert_pkg_legs(planner, selected, pkg, True)
+        self.assertLess(set(planner.ALWAYS_ON_LEGS), selected)
 
     def test_leaf_crate_change_selects_no_dedicated_legs(self):
         planner = load_planner(self)

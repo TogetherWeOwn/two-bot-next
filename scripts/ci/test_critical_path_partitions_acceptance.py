@@ -50,6 +50,11 @@ def evolving_inventory():
              for package in ("two-bot-core", "two-bot")
              for name, ignored in (("onboarding_late_contract", False),
                                    ("onboarding_late_contract_ignored", True))]
+    # The remainder must discover future workspace members too, not just
+    # targets in the original hard-coded package families.
+    extra += [dict(package="two-bot-future", kind="test", target="new_member_contract",
+                   name=name, ignored=ignored)
+              for name, ignored in (("property_smoke", False), ("ordinary_ignored", True))]
     return ROWS + extra
 
 
@@ -130,6 +135,46 @@ def check_disposable_guards(case, sandbox, job, lane):
 
 
 class RecorderControls(unittest.TestCase):
+    def test_unrelated_packages_do_not_inherit_a_literal_dependency_feature(self):
+        units = selections(["test", "--workspace", "--features", "two-bot-core/db"], ROWS)
+        unrelated = [unit for unit in units if unit[0] in ("two-bot-next", "two-bot-testsupport")]
+        self.assertTrue(unrelated)
+        self.assertTrue(all(unit[4] == () for unit in unrelated),
+                        "a package without a core dependency cannot observe core/db")
+
+    def test_a_dependency_feature_is_not_the_consumers_own_feature(self):
+        units = selections(["test", "-p", "two-bot-discord", "--features", "two-bot-core/db"], ROWS)
+        self.assertTrue(units)
+        self.assertEqual(units[0][4], ("two-bot-core/db", "two-bot-core/default",
+                                     "two-bot-discord/default", "two-bot-discord/test-support"))
+        own = selections(["test", "-p", "two-bot-discord", "--features", "db"], ROWS)
+        self.assertIn("two-bot-discord/db", own[0][4])
+        self.assertIn("two-bot-core/db", own[0][4])
+
+    def test_selected_workspace_features_unify_before_projection_to_each_test(self):
+        broad = selections(["test", "--workspace", "--features", "two-bot-core/db"], ROWS)
+        narrow = selections(["test", "-p", "two-bot-discord", "--features", "two-bot-core/db"], ROWS)
+        discord = next(unit for unit in broad if unit[0] == "two-bot-discord")
+        self.assertIn("two-bot-discord/db", discord[4], "bot enables its dependency's db feature")
+        self.assertNotIn("two-bot-discord/db", narrow[0][4])
+        self.assertNotEqual(discord[4], narrow[0][4], "raw CLI flags hide lost feature unification")
+
+    def test_dependency_feature_requires_a_selected_owner_or_direct_dependency(self):
+        for args in (["-p", "two-bot-testsupport"],
+                     ["--workspace", "--exclude", "two-bot-core", "--exclude", "two-bot",
+                      "--exclude", "two-bot-discord", "--exclude", "two-bot-cutover",
+                      "--exclude", "two-bot-store"]):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                selections(["test", *args, "--features", "two-bot-core/db"], ROWS)
+
+    def test_feature_disabled_targets_are_not_implicit_test_selections(self):
+        row = dict(package="two-bot-core", kind="test", target="requires_db",
+                   name="feature_gated", ignored=False, required_features=["db"])
+        self.assertEqual(selections(["test", "-p", "two-bot-core"], [row]), [])
+        enabled = selections(["test", "-p", "two-bot-core", "--features", "db"], [row])
+        self.assertEqual([unit[:4] for unit in enabled],
+                         [("two-bot-core", "test", "requires_db", "feature_gated")])
+
     def test_package_target_and_ignored_filters_are_independent(self):
         rows = [dict(package=p, kind="test", target="same_name", name=n, ignored=i)
                 for p in ("two-bot-core", "two-bot-discord")
@@ -152,7 +197,7 @@ class RecorderControls(unittest.TestCase):
         rust = ledger(BASELINE["lanes"]["rust-tests"], ROWS)
         self.assertTrue(any(key[2] == "future_unlisted_contract" for key in rust))
         ordinary = ("two-bot-core", "lib", "two_bot_core", "property_smoke",
-                    ("two-bot-core/db",), None, False)
+                    ("two-bot-core/db", "two-bot-core/default"), None, False)
         self.assertEqual(rust[ordinary], 2, "ordinary and property-budget replay must both count")
         self.assertGreater(sum(ledger(BASELINE["lanes"]["coverage"], ROWS).values()), 100)
 
