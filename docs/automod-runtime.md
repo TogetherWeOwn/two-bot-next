@@ -223,7 +223,8 @@ otherwise the loop is unchanged.
   (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:343-347`,
   `crates/bot/src/gateway.rs:52-72`). The hook carries
   the trigger verdict into the trigger handler, where a missing verdict fails
-  closed (`crates/bot/src/command_runtime.rs:983-1006`, `acceptance_for_verdict`
+  closed (`CommandRuntime::dispatch_with_verdict` in
+  `crates/bot/src/command_runtime.rs`, `acceptance_for_verdict`
   at `crates/bot/src/gateway_commands.rs:100-116`). Per outcome class
   (`ActivationOutcome` in `crates/discord/src/automod_activation.rs:74-86`):
 
