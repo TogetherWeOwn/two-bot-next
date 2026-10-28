@@ -337,7 +337,8 @@ nonzero, without inventing today's HTTP statuses:
 | `REFUSED / REGISTRATION_CLOSED` | false / `keep_response_or_decline` |
 | `REFUSED / NOT_AVAILABLE` | false / `check_authorized_context` |
 | `REFUSED / INVALID_INPUT`, `UNSUPPORTED_OCCURRENCE` | false / `fix_input_or_keep_baseline` |
-| `REFUSED / CONFLICT`, `ACTION_CONFLICT`, `INTENT_EXPIRED` | false / `reread_then_new_preview` |
+| `REFUSED / CONFLICT`, `INTENT_EXPIRED` | false / `reread_then_new_preview` |
+| `REFUSED / ACTION_CONFLICT` (member RSVP interaction) | false / `retry_new_explicit_interaction` |
 | `REFUSED / RATE_LIMITED`, `SAFETY_LIMIT` | true / `retry_new_action_after_server_delay` |
 | `UNAVAILABLE / POLICY_UNKNOWN`, `AUTHORITY_UNKNOWN`, `EVENT_UNKNOWN`, `CLOCK_UNKNOWN`, `STORE_UNKNOWN` | true / `retry_fresh_preview_when_available` |
 | `UNKNOWN / COMMIT_UNKNOWN` | false / `inspect_same_operation_no_new_save` |
