@@ -200,6 +200,19 @@ class CoveragePartitionAcceptance(unittest.TestCase):
         self.assertEqual(ledger(got, self.rows, environments=True),
                          ledger(BASELINE["lanes"]["coverage"], self.rows, environments=True))
 
+    def test_ops_and_starboard_replays_have_one_appropriate_sweep_partition_owner(self):
+        executions = self.executions()
+        for needle, ignored in (("settings_jobs::tests::ops_overrides_acceptance_tests::", False),
+                                ("starboard_store", True)):
+            with self.subTest(replay=needle):
+                owners = {leg: records for leg, records in executions.items()
+                          if any(needle in r["argv"] and "--ignore-run-fail" not in r["argv"] for r in records)}
+                self.assertEqual(len(owners), 1, "isolated replay must run once, not on every shard")
+                records = next(iter(owners.values()))
+                self.assertTrue(any("--ignore-run-fail" in r["argv"]
+                                    and ("--ignored" in r["argv"]) == ignored for r in records),
+                                "isolated replay lost its sweep-family owner")
+
     def test_scoped_expanded_plans_keep_reverse_dependents_and_widen_when_metadata_is_incomplete(self):
         executions = self.executions()
         graph = metadata(self.rows)
@@ -340,6 +353,19 @@ class TestLanePartitionAcceptance(unittest.TestCase):
                     self.assertEqual(self.sandbox.records(), [])
         proc = self.sandbox.run(shlex.join([sys.executable, str(RUNNER), "--lane", "unknown", "--list"]))
         self.assertNotEqual(proc.returncode, 0)
+
+    def test_empty_selected_inventory_cannot_succeed_as_a_measured_partition(self):
+        require_runner(self)
+        empty = Sandbox([])
+        self.addCleanup(empty.close)
+        for lane in ("rust-tests", "ignored-db-runtime"):
+            entries = list_partitions(self, self.sandbox, lane)
+            for row in entries:
+                with self.subTest(lane=lane, partition=row["partition"]):
+                    empty.clear()
+                    proc = empty.run(shlex.join([
+                        sys.executable, str(RUNNER), "--lane", lane, "--partition", row["partition"]]))
+                    self.assertNotEqual(proc.returncode, 0, "zero selected tests were reported as a completed partition")
 
     def test_each_test_partition_propagates_cargo_failure(self):
         for lane in ("rust-tests", "ignored-db-runtime"):
