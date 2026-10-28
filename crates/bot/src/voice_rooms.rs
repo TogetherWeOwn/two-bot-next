@@ -110,7 +110,7 @@ use two_bot_core::{
         OverwriteTarget as TextOverwriteTarget, TextChannelPlan, VoiceRoomFacts,
         DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
     },
-    voice_utilities::{invite_render, is_valid_invite_code, ping_render},
+    voice_utilities::{invite_render, is_valid_invite_code, myroom_render, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
@@ -3937,6 +3937,39 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         rooms
     }
 
+    /// `owned_rooms` for the `/myroom` read: `None` unless live evidence is
+    /// authoritative (gateway connected, snapshot ready, worker not halted),
+    /// matching `kick_room_of`. A disconnected or just-loaded worker may track
+    /// rooms Discord no longer has, so it must not call them live.
+    pub fn live_owned_rooms(&self, member: Snowflake) -> Option<Vec<(Snowflake, bool)>> {
+        if !self.live.read_state().ready || self.halted {
+            return None;
+        }
+        Some(self.owned_rooms(member))
+    }
+
+    /// The member's currently owned live rooms as `(room channel, runtime
+    /// private)` pairs in channel order. Ownership is the current
+    /// `owner_id`, never the original creator. Privacy is the effective
+    /// closed state: the live worker flag, or Connect denied to @everyone
+    /// on Discord (an `/alwaysprivate` creator closes rooms the flag still
+    /// reads as public). Pure in-memory read: no store, queue or Discord
+    /// touch.
+    pub fn owned_rooms(&self, member: Snowflake) -> Vec<(Snowflake, bool)> {
+        let mut rooms: Vec<(Snowflake, bool)> = self
+            .rooms
+            .iter()
+            .filter(|(_, room)| room.owner_id == member)
+            .map(|(channel, _)| {
+                let private = self.privacy.get(channel).is_some_and(|room| room.private)
+                    || self.live_everyone_denies_connect(*channel);
+                (*channel, private)
+            })
+            .collect();
+        rooms.sort_unstable();
+        rooms
+    }
+
     /// Replace the caps and cooldown used by the durable create admission
     /// (legacy defaults: 1 room per member, 40 per guild, 30 s cooldown).
     pub fn set_admission_config(&mut self, config: CreateAdmissionConfig) {
@@ -5915,10 +5948,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             }
                             Ok(CreateClaim::Refused(reason)) => {
                                 observe_voice_operation("create", "refused");
+                                // The recorded refusal stays context-free: it is an
+                                // operator diagnostic (`/setup`, logging notices) with
+                                // no per-member reply, so member room ids do not
+                                // belong in it or in its dedup key. Members find their
+                                // rooms with `/myroom`.
+                                let message = reason.user_message(&self.admission);
                                 self.record(LifecycleFailure::CreateRefused {
                                     creator_id: creator_channel_id,
                                     reason,
-                                    message: reason.user_message(&self.admission),
+                                    message,
                                 });
                                 creation.timing.finish("refused");
                                 self.creations.remove(&action.id);
@@ -7893,6 +7932,13 @@ enum ActorCommand {
         decision: JoinDecisionCommand,
         reply: oneshot::Sender<JoinReply>,
     },
+    /// Read-only `/myroom`: the member's currently owned live rooms as
+    /// `(room channel, runtime private)` pairs in channel order. Answered
+    /// from live worker state only; never touches the store.
+    MyRooms {
+        member: Snowflake,
+        reply: oneshot::Sender<Option<Vec<(Snowflake, bool)>>>,
+    },
 }
 
 #[derive(PartialEq, Eq)]
@@ -8898,6 +8944,28 @@ where
             .await
             .ok()?
             .ok()
+    }
+
+    /// Read one member's currently owned live rooms (`/myroom`) from the
+    /// live worker as `(room channel, runtime private)` pairs. `None` when
+    /// the guild has no live actor, when its inbox already drained, when no
+    /// answer arrived within `WORKER_ACK_WAIT`, or when the worker's live
+    /// evidence is not ready.
+    pub async fn run_myrooms(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Option<Vec<(Snowflake, bool)>> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::MyRooms { member, reply })
+            .ok()?;
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()?
     }
 
     /// Invalidate first: even an in-flight task cannot write after GuildDelete.
@@ -10435,6 +10503,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::JoinDecision { decision, reply } => {
             let _ = reply.send(worker.apply_join_decision(decision));
+        }
+        ActorCommand::MyRooms { member, reply } => {
+            let _ = reply.send(worker.live_owned_rooms(member));
         }
     }
     accepted_join
@@ -12033,6 +12104,10 @@ pub enum VoiceCommand {
     },
     Ping,
     Invite,
+    /// Read-only `/myroom`: list the invoker's currently owned live rooms
+    /// with their runtime privacy. Answered from live worker state only; the
+    /// invoker never has to be in voice.
+    MyRoom,
     TextChannels {
         channel_id: Snowflake,
         request: TextChannelsRequest,
@@ -12362,6 +12437,7 @@ fn parse_voice_command_with_registry(
         }),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
+        "myroom" => Some(VoiceCommand::MyRoom),
         "textchannels" => {
             if let Some(field) = setup_shape_refusal("textchannels", &command.options) {
                 return Some(VoiceCommand::SetupShapeInvalid {
@@ -13008,6 +13084,7 @@ impl VoiceCommand {
             Self::Setup { .. } => "setup",
             Self::Ping => "ping",
             Self::Invite => "invite",
+            Self::MyRoom => "myroom",
             Self::TextChannels { .. } => "textchannels",
             Self::Position { .. } => "position",
             Self::Group { .. } => "group",
@@ -14007,6 +14084,30 @@ where
         }
         VoiceCommand::Invite => {
             reply(ephemeral_response(&invite_render(invite_code))).await;
+            true
+        }
+        VoiceCommand::MyRoom => {
+            let Some(actor_id) = invoker_member_id(interaction) else {
+                reply(ephemeral_response(
+                    "I couldn't tell who invoked /myroom — try again.",
+                ))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_myrooms(guild_id, actor_id)
+                .await
+                .map(|rooms| myroom_render(&rooms))
+                .unwrap_or_else(|| {
+                    // A known worker that never answered is a transient
+                    // failure, not a cold cache.
+                    if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY.to_owned()
+                    } else {
+                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    }
+                });
+            reply(ephemeral_response(&text)).await;
             true
         }
         VoiceCommand::Access(action) => {

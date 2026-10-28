@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only handoff for private discovery of a member's own live voice rooms through /myroom, with the recorded per-user-cap refusal kept context-free",
+  "baseCommit": "1a87869f898cbe4e3c9171a4fcf9885119202ade",
+  "branch": "test/voice-myroom-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/voice_myroom_acceptance_tests.rs",
+      "sha256": "55655980d0987442fee212c81f208a8b80f1e801cb7e0590f20fa8b44df8e126",
+      "tests": 9
+    },
+    {
+      "path": "crates/core/tests/voice_myroom_acceptance.rs",
+      "sha256": "073154c4eb1897c172a63fcbdc39e8dc3285548231c72fb5b6dccaf08193031b",
+      "tests": 4
+    },
+    {
+      "path": "crates/bot/src/voice_rooms_tests.rs",
+      "sha256": "dbc29c618f272104b689e667341bbbbeb4c32de0d9a8d546372a8bfadb21a3b4",
+      "change": "Only the myroom_acceptance child-module registration and \"myroom\" in the voice_command_set_is_gated_on_two_voice expected command list were added; other tests unchanged"
+    }
+  ],
+  "commands": {
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib --locked voice_rooms::tests::myroom_acceptance:: -- --nocapture --test-threads=1",
+    "discovery": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_myroom_acceptance --locked -- --nocapture",
+    "compatibility": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest --test smoke_surface_inventory --test registry_golden --test reference_docs --locked",
+    "format": "cargo fmt --all -- --check"
+  },
+  "expectedBaseline": {
+    "runtime": {
+      "tests": 9,
+      "missingBehaviorFailures": 4,
+      "controls": 5
+    },
+    "discovery": {
+      "tests": 4,
+      "missingBehaviorFailures": 3,
+      "controls": 1
+    },
+    "note": "Expected counts are a contract, not a claim that a Rust run was observed. Consult the task handoff for actual execution evidence."
+  },
+  "boundaries": {
+    "externalServices": "No database, Discord, staging or production access; only stateful persistence and Discord doubles",
+    "runtime": "Real parser, authority/access gates, runtime actor channel, production apply_command and response rendering; the command-only actor driver excludes unrelated timer maintenance",
+    "liveState": "The loaded worker owns two caller rooms and one other-owner room; stored room rows and privacy are deliberately changed after load, and a room-store read is scripted to fail",
+    "readOnly": "Before-read snapshots pin persisted and runtime room/privacy state, the pending mutation queue, create claims, overwrite writes and effect trace"
+  },
+  "contract": {
+    "cap": "The recorded UserCap refusal stays the context-free \"You already have a temporary voice channel.\" with or without known owned rooms, and all four non-cap messages remain byte-identical; the recorded failure is an operator diagnostic, so no member room id enters it",
+    "admission": "Pure reason codes/messages remain context-free; a refusal claims once, precedes every Discord write, binds/settles nothing and never retries",
+    "memberRead": "One ephemeral /myroom reply lists only authenticated current-owner live tracked rooms, including channel links and associated public/private state; being outside voice is allowed",
+    "empty": "No owned live room is stated truthfully, with joining a creator lobby as the next action",
+    "discovery": "Exactly one guild-only no-option ordinary-member command with voice on; voice sink owns dispatch before custom rows; help lists it with the member voice commands",
+    "compatibility": "Builder owns staging voice publish manifest, help/count pins and rendered docs/commands.md. Existing voice-off smoke/legacy registry fixtures must remain truthful; do not increase voice-off counts for a voice-only surface."
+  },
+  "handoff": [
+    "Do not merge this deliberately failing test-only branch by itself.",
+    "Consume the immutable handoff SHA, preserve every protected file byte-for-byte and return test corrections to the test author.",
+    "The Builder owns the implementation and compatibility pins/docs, exact-head green required checks, independent review and squash auto-merge.",
+    "The acceptance task remains open until the intended assertion failures and passing controls have been observed; a cache admission refusal is not RED evidence."
+  ],
+  "revision": {
+    "version": 2,
+    "supersedes": "23b3a9f950720b2956a7f006fc48cbd0aacb2532",
+    "reason": "Corrects one oracle. Revision 1 pinned owned-room mentions inside the recorded UserCap refusal (LifecycleFailure::CreateRefused.message). That record is an operator diagnostic rendered only by the admin /setup failure line and logging notices; a gateway voice join has no per-member reply, so the guidance never reached the member, and member room ids would enter operator notices and split the failure dedup key. The replacement control pins the recorded UserCap message byte-identical to the context-free text even when the member owns rooms; members discover their rooms with /myroom. The voice_rooms_tests.rs pin now also covers the voice command-set expectation gaining \"myroom\", and this revision merges current main so every pin matches a main-based tree.",
+    "baseCommit": "1a87869f898cbe4e3c9171a4fcf9885119202ade",
+    "passed": [
+      "cargo fmt --all -- --check"
+    ],
+    "not_executed": [
+      "focused Rust runtime and discovery acceptance targets (cargo pool refused exit 75: pool contents do not match immutable policy; refusal is neither RED nor GREEN)",
+      "compatibility targets",
+      "workspace clippy and tests"
+    ]
+  }
+}

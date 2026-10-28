@@ -129,7 +129,8 @@
       { "name": "private", "default_member_permissions": null },
       { "name": "public", "default_member_permissions": null },
       { "name": "limit", "default_member_permissions": null },
-      { "name": "unlimit", "default_member_permissions": null }
+      { "name": "unlimit", "default_member_permissions": null },
+      { "name": "myroom", "default_member_permissions": null }
     ],
     "shadowed_by_first_wins": [
       "kick"
