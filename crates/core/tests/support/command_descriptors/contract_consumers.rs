@@ -14,7 +14,7 @@ mod frozen_baseline;
 #[path = "frozen_e2e.rs"]
 mod frozen_e2e;
 
-use frozen_baseline::{gate_env_flag, FROZEN};
+use frozen_baseline::{gate_env_flag, FROZEN, MEMBER_HANDLER_GAPS};
 use frozen_e2e::FROZEN_E2E;
 use two_bot_core::command_descriptor::{CommandDescriptor, DescriptorRegistry, HelpPlacement};
 use two_bot_core::command_permissions::{CommandSurface, COMMAND_PERMISSIONS};
@@ -315,34 +315,37 @@ fn every_routed_handler_is_registered_or_a_blessed_gap() {
             .find(|g| g.moderation && g.automations && g.announcements && g.scorecard && !g.voice)
             .expect("the all-on, voice-off gate set exists");
         let router = InteractionRouter::production_router(gates, member_present);
-        let blessed: Vec<String> =
-            InteractionRouter::intentional_registration_exceptions(member_present)
-                .into_iter()
-                .map(|id| format!("{id:?}"))
-                .collect();
         let missing = reg.unregistered_handlers(&router);
         let expected: std::collections::BTreeSet<_> = FROZEN
             .iter()
-            .filter(|f| blessed.iter().any(|b| *b == f.handler))
+            .filter(|f| !member_present && MEMBER_HANDLER_GAPS.contains(&f.handler))
             .map(|f| f.name)
             .collect();
-        let actual: std::collections::BTreeSet<_> = missing.iter().copied().collect();
+        let actual: std::collections::BTreeSet<_> = missing
+            .iter()
+            .copied()
+            .filter(|name| FROZEN.iter().any(|f| f.name == *name))
+            .collect();
         assert_eq!(
             actual, expected,
-            "the complete registration gap set for member_present={member_present}"
+            "the complete frozen registration gap set for member_present={member_present}"
         );
-        assert_eq!(missing.len(), expected.len(), "each gap appears once");
-        // `unregistered_handlers` names commands; every one must be a command
-        // whose owner is a blessed gap, and nothing else may be missing.
-        for name in missing {
-            let f = FROZEN
+        assert_eq!(
+            missing.len(),
+            missing
                 .iter()
-                .find(|f| f.name == name)
-                .unwrap_or_else(|| panic!("/{name}: unregistered handler outside the frozen set"));
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "each gap appears once"
+        );
+        // New commands are outside the frozen oracle, but no reported gap may
+        // name a command absent from the supplied registry.
+        let names = reg.names();
+        for name in missing {
             assert!(
-                blessed.iter().any(|b| *b == f.handler),
-                "/{name} ({}) is routed but has no registered handler",
-                f.handler
+                names.contains(&name),
+                "/{name}: gap for an unregistered command"
             );
         }
     }

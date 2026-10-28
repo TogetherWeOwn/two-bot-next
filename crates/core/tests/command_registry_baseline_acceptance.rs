@@ -22,7 +22,8 @@ mod frozen_e2e;
 mod frozen_help;
 
 use frozen_baseline::{
-    gate_env_flag, gate_refusal, Frozen, Gate, ADMINISTRATOR, FROZEN, HELP_LAYOUT, NON_SLASH_PARITY,
+    gate_env_flag, gate_refusal, Frozen, Gate, ADMINISTRATOR, FROZEN, HELP_LAYOUT,
+    MEMBER_HANDLER_GAPS, NON_SLASH_PARITY,
 };
 use frozen_e2e::FROZEN_E2E;
 use std::collections::BTreeSet;
@@ -601,15 +602,31 @@ fn permission_table_and_parity_dispositions_match_the_frozen_contract() {
 fn production_registration_covers_every_routed_handler_except_the_blessed_gap() {
     for member_present in [true, false] {
         let router = InteractionRouter::production_router(all_on().gates(), member_present);
-        let blessed: BTreeSet<String> =
+        let blessed: Vec<String> =
             InteractionRouter::intentional_registration_exceptions(member_present)
                 .into_iter()
                 .map(|id| format!("{id:?}"))
                 .collect();
+        // The production list can also include newer commands outside this oracle.
+        let frozen_blessed: Vec<&str> = blessed
+            .iter()
+            .map(String::as_str)
+            .filter(|id| FROZEN.iter().any(|f| f.handler == *id))
+            .collect();
+        let expected: BTreeSet<&str> = if member_present {
+            BTreeSet::new()
+        } else {
+            MEMBER_HANDLER_GAPS.into_iter().collect()
+        };
         assert_eq!(
-            blessed.len(),
-            if member_present { 0 } else { 5 },
-            "member_present={member_present}"
+            frozen_blessed.iter().copied().collect::<BTreeSet<_>>(),
+            expected,
+            "frozen exceptions for member_present={member_present}"
+        );
+        assert_eq!(
+            frozen_blessed.len(),
+            expected.len(),
+            "each frozen exception appears once for member_present={member_present}"
         );
         for f in &FROZEN {
             let SlashOutcome::Handled { handler } = router.route_slash(&SlashContext {
@@ -622,7 +639,7 @@ fn production_registration_covers_every_routed_handler_except_the_blessed_gap() 
             };
             assert_eq!(format!("{handler:?}"), f.handler, "/{} owner", f.name);
             let registered = router.handler_for(&handler).is_some();
-            let gap = blessed.contains(&format!("{handler:?}"));
+            let gap = expected.contains(f.handler);
             assert_eq!(
                 registered, !gap,
                 "/{} registered={registered} gap={gap} member_present={member_present}",

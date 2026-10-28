@@ -100,6 +100,7 @@ Semantics the tests pin beyond the signatures:
 - `E2eMatrixRow.permission_name` is the Discord permission constant name for a single known bit (`ManageGuild`), `Everyone` for 0; `handler` is the `Debug` spelling of the `HandlerId`.
 - Gate off keeps the name routed and refused (`Refuse`), never `Unknown`; guild fence first, gate second, permission third.
 - Registered metadata is not an executing handler: `unregistered_handlers` reports it.
+- Shipping registration comparisons cover the 43 frozen commands. Their exact five member-handler gaps are independent literals, not expectations derived from the production exception helper. A later command's exception does not enlarge that frozen set or fail its cardinality check. Every reported registry gap still names a registered descriptor and appears only once.
 
 ## Help scope and unchanged member-visible output
 

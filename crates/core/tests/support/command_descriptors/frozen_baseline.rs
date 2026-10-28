@@ -52,6 +52,16 @@ pub const MANAGE_MESSAGES: u64 = 1 << 13;
 pub const MANAGE_CHANNELS: u64 = 1 << 4;
 pub const ADMINISTRATOR: u64 = 1 << 3;
 
+/// These frozen handlers are unavailable only while the member consumer is absent.
+/// Additional commands do not enlarge the frozen registration-gap contract.
+pub const MEMBER_HANDLER_GAPS: [&str; 5] = [
+    "Moderation(Ban)",
+    "Moderation(TempBan)",
+    "Moderation(Kick)",
+    "Moderation(Timeout)",
+    "Moderation(Warn)",
+];
+
 const fn r(
     name: &'static str,
     parity_row: u8,
