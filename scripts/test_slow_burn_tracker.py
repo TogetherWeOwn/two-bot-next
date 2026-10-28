@@ -917,6 +917,7 @@ class TrackerCacheDuplicateKeyTests(unittest.TestCase):
 
 # Keep protected intake acceptance tests in the existing CI entrypoint.
 from test_slow_burn_tracker_intake_acceptance import TrackerIntakeAcceptanceTests
+from test_slow_burn_tracker_scratch_acceptance import TrackerScratchAcceptanceTests
 
 
 if __name__ == "__main__":

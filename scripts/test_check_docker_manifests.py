@@ -275,5 +275,9 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("test_check_docker_manifests.py", CHECK_YML.read_text())
 
 
+# Keep the protected replay acceptance battery on the existing CI entrypoint.
+from test_docker_replay_intake_acceptance import DockerReplayConfinementAcceptanceTests
+
+
 if __name__ == "__main__":
     unittest.main()
