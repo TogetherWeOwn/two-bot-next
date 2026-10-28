@@ -101,27 +101,28 @@ fn documented_legacy_rows_equal_parity_section1() {
     // (row 39), plus `/lfg-edit` sharing row 26, and pause/resume
     // `/command-disable` and `/command-enable` (rows 40 and 41),
     // `/welcome-preview` (42), `/game-mix` (43), feed pause/resume (44/45),
-    // and one-off timing correction `/schedule-retime` (row 46).
+    // `/tempban-list` saved expiry inspection (46), and the staff ledger
+    // read `/moderation-recent` (47), plus `/schedule-retime` (48).
     // No Next-only row appears in the legacy §1 table above;
     // the registry-equality test below covers every published builtin instead.
-    // 47 entries: 46 contiguous parity rows plus the `/lfg-edit` companion
+    // 49 entries: 48 contiguous parity rows plus the `/lfg-edit` companion
     // sharing LFG row 26.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 47);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 49);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        47
+        49
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=46).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=46"
+        (1..=48).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=48"
     );
     for (name, parity_row, required_permissions) in
         [("command-inspect", 33, 1 << 5), ("lfg-list", 38, 1 << 33)]
@@ -172,7 +173,7 @@ fn documented_legacy_rows_equal_parity_section1() {
     assert_eq!(resume.policy_hook, None);
     let retime =
         command_permission("schedule-retime").expect("schedule-retime has a permission row");
-    assert_eq!(retime.parity_row, 46);
+    assert_eq!(retime.parity_row, 48);
     assert_eq!(retime.required_permissions, 32, "ManageGuild bit");
     assert_eq!(retime.surface, CommandSurface::BuiltinSlash);
     assert_eq!(retime.policy_hook, None);
@@ -224,7 +225,12 @@ fn lfg_edit_is_the_only_companion_of_the_canonical_lfg_parity_row() {
 
 #[test]
 fn next_only_read_permission_rows_do_not_become_mutation_policy_hooks() {
-    for (name, number, bits) in [("purge-preview", 35, 8192), ("channel-inspect", 36, 16)] {
+    for (name, number, bits) in [
+        ("purge-preview", 35, 8192),
+        ("channel-inspect", 36, 16),
+        ("tempban-list", 46, 4),
+        ("moderation-recent", 47, 1_099_511_627_776),
+    ] {
         let row = command_permission(name).expect("read has a permission row");
         assert_eq!(row.parity_row, number);
         assert_eq!(row.required_permissions, bits);
@@ -249,7 +255,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 44);
+    assert_eq!(builtins.len(), 46);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -383,7 +389,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 44, "every retained builtin routes");
+    assert_eq!(routed, 46, "every retained builtin routes");
 }
 
 #[test]

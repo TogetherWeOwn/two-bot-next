@@ -252,6 +252,39 @@ pub fn rsvp_saved_text_with_event(status: RsvpStatus, event_id: &str) -> String 
     format!("{} Event `{event_id}`.", rsvp_saved_text(status))
 }
 
+/// `/rsvp` reply chosen from the committed [`RsvpTransition`] the writer
+/// already returned: no extra read decides the copy. A first response keeps the
+/// legacy sentence byte-identical; a changed one names both choices; the same
+/// choice saved again says so and that the saved time was updated (the writer
+/// rewrites `responded_at` and audits every response).
+#[must_use]
+pub fn rsvp_saved_text_for_transition(transition: &RsvpTransition) -> String {
+    let current = transition.current.as_str();
+    match transition.previous {
+        None => rsvp_saved_text(transition.current),
+        Some(previous) if previous != transition.current => {
+            format!(
+                "RSVP saved: {current} (changed from {}).",
+                previous.as_str()
+            )
+        }
+        Some(_) => format!("RSVP saved: {current} (saved again; time updated)."),
+    }
+}
+
+/// [`rsvp_saved_text_for_transition`] for a pasted event link: the same
+/// sentence plus the stable numeric identity the link normalized to.
+#[must_use]
+pub fn rsvp_saved_text_for_transition_with_event(
+    transition: &RsvpTransition,
+    event_id: &str,
+) -> String {
+    format!(
+        "{} Event `{event_id}`.",
+        rsvp_saved_text_for_transition(transition)
+    )
+}
+
 /// `/rsvp-attendance` totals reply (legacy `` `Going: ${g}\nInterested:
 /// ${i}\nDeclined: ${d}` ``, ephemeral).
 #[must_use]
@@ -776,6 +809,51 @@ mod tests {
     }
 
     #[test]
+    fn saved_copy_distinguishes_first_changed_and_repeated_for_every_status() {
+        let all = [
+            RsvpStatus::Going,
+            RsvpStatus::Interested,
+            RsvpStatus::Declined,
+        ];
+        for current in all {
+            let first = RsvpTransition {
+                previous: None,
+                previous_responded_at: None,
+                current,
+            };
+            assert_eq!(
+                rsvp_saved_text_for_transition(&first),
+                rsvp_saved_text(current),
+                "first response keeps the legacy sentence"
+            );
+            for previous in all {
+                let transition = RsvpTransition {
+                    previous: Some(previous),
+                    previous_responded_at: Some("2026-09-10T10:00:00.000Z".to_owned()),
+                    current,
+                };
+                let expected = if previous == current {
+                    format!(
+                        "RSVP saved: {} (saved again; time updated).",
+                        current.as_str()
+                    )
+                } else {
+                    format!(
+                        "RSVP saved: {} (changed from {}).",
+                        current.as_str(),
+                        previous.as_str()
+                    )
+                };
+                assert_eq!(rsvp_saved_text_for_transition(&transition), expected);
+                assert_eq!(
+                    rsvp_saved_text_for_transition_with_event(&transition, EVENT),
+                    format!("{expected} Event `{EVENT}`.")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn transitions_distinguish_new_change_and_repeat() {
         let fresh = RsvpTransition {
             previous: None,
@@ -1123,9 +1201,9 @@ mod tests {
         // `rsvp-attendance`. First-wins merge must publish each exactly once.
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices merge cleanly");
-        // 7 core + 26 feature commands, including pause/resume, lfg-edit and feed-inspect,
-        // plus schedule-retime, + 9 mutations + 2 reads: nothing deduped away.
-        assert_eq!(merged.len(), 44);
+        // 7 core + 26 feature commands, including pause/resume, lfg-edit and feed-inspect and schedule-retime,
+        // + 9 mutations + 4 reads: nothing deduped away.
+        assert_eq!(merged.len(), 46);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         for name in [
             "attendance",
@@ -1134,6 +1212,8 @@ mod tests {
             "lfg-edit",
             "lfg-list",
             "feed-inspect",
+            "tempban-list",
+            "moderation-recent",
         ] {
             assert_eq!(
                 names.iter().filter(|n| **n == name).count(),

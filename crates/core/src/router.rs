@@ -63,7 +63,7 @@ use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
 };
 use super::moderation::{ModerationAction, ModerationGates};
-use super::onboarding::{GAME_SELECT_ID, SESSION_SELECT_ID};
+use super::onboarding::{GAME_PREVIEW_SELECT_ID, GAME_SELECT_ID, SESSION_SELECT_ID};
 use super::voice_rooms::voice_commands;
 
 /// Names of the voice command set, computed once: the router consults them on
@@ -143,6 +143,8 @@ pub enum HandlerId {
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
+    TempbanList,
+    ModerationRecent,
 }
 
 /// Which feature slice owns a routed component / modal submit (parity §2).
@@ -282,6 +284,8 @@ pub enum RouterRefusal {
     ModerationPermission(ModerationAction),
     PurgePreviewPermission,
     ChannelInspectPermission,
+    TempbanListPermission,
+    ModerationRecentPermission,
 }
 
 impl RouterRefusal {
@@ -299,6 +303,8 @@ impl RouterRefusal {
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::ModerationRecentPermission => "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
             // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
@@ -408,6 +414,7 @@ impl InteractionRouter {
             }
             register(HandlerId::PurgePreview);
             register(HandlerId::ChannelInspect);
+            register(HandlerId::ModerationRecent);
         }
         if gates.automations {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
@@ -444,6 +451,7 @@ impl InteractionRouter {
             register(id);
         }
         if member_present {
+            register(HandlerId::TempbanList);
             // Member verbs (`CommandRuntime::build`, while the consumer exists).
             for action in [
                 ModerationAction::Ban,
@@ -473,6 +481,7 @@ impl InteractionRouter {
             Vec::new()
         } else {
             vec![
+                HandlerId::TempbanList,
                 HandlerId::Moderation(ModerationAction::Ban),
                 HandlerId::Moderation(ModerationAction::TempBan),
                 HandlerId::Moderation(ModerationAction::Kick),
@@ -577,6 +586,7 @@ impl InteractionRouter {
     ) -> Option<SlashOutcome> {
         // Moderation carries its own guild fence (refusal, not silence).
         let moderation = match name {
+            "tempban-list" => Some((HandlerId::TempbanList, RouterRefusal::TempbanListPermission)),
             "purge-preview" => Some((
                 HandlerId::PurgePreview,
                 RouterRefusal::PurgePreviewPermission,
@@ -584,6 +594,10 @@ impl InteractionRouter {
             "channel-inspect" => Some((
                 HandlerId::ChannelInspect,
                 RouterRefusal::ChannelInspectPermission,
+            )),
+            "moderation-recent" => Some((
+                HandlerId::ModerationRecent,
+                RouterRefusal::ModerationRecentPermission,
             )),
             _ => ModerationAction::ALL
                 .iter()
@@ -823,7 +837,7 @@ impl InteractionRouter {
     /// Route one message component by `custom_id` (exact ids, then prefixes).
     #[must_use]
     pub fn route_component(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
-        let handler = if custom_id == GAME_SELECT_ID {
+        let handler = if custom_id == GAME_SELECT_ID || custom_id == GAME_PREVIEW_SELECT_ID {
             if !self.gates.onboarding_picker || !self.guild_ok(guild_id) {
                 return ComponentOutcome::Ignore;
             }
@@ -1022,6 +1036,7 @@ mod tests {
             ("game-mix", HandlerId::GameMix),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
+            ("tempban-list", HandlerId::TempbanList),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
             ("timeout", HandlerId::Moderation(ModerationAction::Timeout)),
             ("warn", HandlerId::Moderation(ModerationAction::Warn)),
@@ -1037,6 +1052,7 @@ mod tests {
             ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
             ("purge-preview", HandlerId::PurgePreview),
             ("channel-inspect", HandlerId::ChannelInspect),
+            ("moderation-recent", HandlerId::ModerationRecent),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
             ("command-remove", HandlerId::AutomationAdmin),
@@ -1064,7 +1080,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 44, "all 44 handler-owned builtins covered");
+        assert_eq!(cases.len(), 46, "all 46 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1158,9 +1174,11 @@ mod tests {
             ("lfg-edit", RouterRefusal::AnnouncementsDisabled),
             ("feed-list", RouterRefusal::AnnouncementsDisabled),
             ("ban", RouterRefusal::ModerationDisabled),
+            ("tempban-list", RouterRefusal::ModerationDisabled),
             ("purge", RouterRefusal::ModerationDisabled),
             ("purge-preview", RouterRefusal::ModerationDisabled),
             ("channel-inspect", RouterRefusal::ModerationDisabled),
+            ("moderation-recent", RouterRefusal::ModerationDisabled),
         ] {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1293,10 +1311,14 @@ mod tests {
     fn private_read_permissions_name_the_invoked_command_and_never_fall_through() {
         let r = router();
         for (name, required, handler, refusal, expected) in [
+            ("tempban-list", 4, HandlerId::TempbanList, RouterRefusal::TempbanListPermission,
+             "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it."),
             ("purge-preview", 8192, HandlerId::PurgePreview, RouterRefusal::PurgePreviewPermission,
              "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
             ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
              "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
+            ("moderation-recent", 1_099_511_627_776, HandlerId::ModerationRecent, RouterRefusal::ModerationRecentPermission,
+             "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it."),
         ] {
             assert_eq!(refusal.message(), expected);
             for permissions in [None, Some(0), Some(8), Some(!required)] {
@@ -1619,6 +1641,12 @@ mod tests {
             }
         );
         assert_eq!(
+            r.route_component(GAME_PREVIEW_SELECT_ID, Some(GUILD)),
+            ComponentOutcome::Handled {
+                handler: ComponentHandler::GamePicker
+            }
+        );
+        assert_eq!(
             r.route_component(SESSION_SELECT_ID, Some(GUILD)),
             ComponentOutcome::Handled {
                 handler: ComponentHandler::SessionPicker
@@ -1723,8 +1751,8 @@ mod tests {
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
         // 7 core + 1 scorecard + 13 automation + 12 announcements + 9 moderation
-        // + 2 reads + 1 custom = 45, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 45);
+        // + 4 reads + 1 custom = 47, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 47);
         assert_eq!(
             &names[..8],
             [
@@ -1760,14 +1788,25 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[33..42],
+            &names[33..43],
             [
-                "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
+                "ban",
+                "tempban",
+                "tempban-list",
+                "kick",
+                "timeout",
+                "warn",
+                "purge",
+                "slowmode",
+                "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[42..44], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[44], "faq");
+        assert_eq!(
+            &names[43..46],
+            ["purge-preview", "channel-inspect", "moderation-recent"]
+        );
+        assert_eq!(names[46], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1807,6 +1846,7 @@ mod tests {
         let moderation = [
             "ban",
             "tempban",
+            "tempban-list",
             "kick",
             "timeout",
             "warn",
@@ -1816,6 +1856,7 @@ mod tests {
             "unlock",
             "purge-preview",
             "channel-inspect",
+            "moderation-recent",
         ];
         for mask in 0_u8..64 {
             let gates = RouterGates {
@@ -2085,7 +2126,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 44);
+        assert_eq!(off.len(), 46);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -2095,16 +2136,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 44 builtins keep their order; the 21 voice names that survive
+        // 46 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 65);
-        assert_eq!(on_names[..44], off_names[..]);
+        assert_eq!(on.len(), 67);
+        assert_eq!(on_names[..46], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[44..], expected[..]);
+        assert_eq!(on_names[46..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -2165,13 +2206,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 44
+        // Both gates on is the full voice set without the assistant: 46
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 65);
+        assert_eq!(both.len(), 67);
     }
 
     #[test]

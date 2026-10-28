@@ -5,7 +5,7 @@
 //! `fixtures/smoke_surface_inventory.json` exactly, in publish order. The
 //! fixture additionally marks the five smoke-covered commands (one per
 //! routing family, matching `crates/discord/tests/top5_reply_fixtures.rs`)
-//! versus the 37 saved deferrals (38 with the compiled-only LFG edit).
+//! versus 39 saved deferrals (41 with compiled-only LFG edit and retime).
 //!
 //! Offline only: no staging guild, no live Discord, no network, no database.
 
@@ -34,17 +34,18 @@ fn fixture() -> Value {
     let mut fixture: Value =
         serde_json::from_str(include_str!("fixtures/smoke_surface_inventory.json"))
             .expect("smoke surface inventory fixture parses");
-    // Preserve the saved publication inventory (42 rows including
-    // welcome-preview and feed pause/resume); extend only the compiled registry oracle with the
+    // Preserve the saved publication inventory (44 rows including
+    // welcome-preview, feed pause/resume, tempban-list and moderation-recent);
+    // extend only the compiled registry oracle with the
     // lfg-edit companion. No smoke coverage or deployment is claimed for edit.
     assert_eq!(
-        fixture["count"], 42,
-        "saved inventory retains the feed pair"
+        fixture["count"], 44,
+        "saved inventory retains the feed pair and both staff reads"
     );
     let rows = fixture["commands"]
         .as_array_mut()
         .expect("saved command rows");
-    assert_eq!(rows.len(), 42);
+    assert_eq!(rows.len(), 44);
     assert!(rows.iter().all(|row| row["name"] != "lfg-edit"));
     let after_close = rows
         .iter()
@@ -96,7 +97,7 @@ fn fixture() -> Value {
         "expected_response": null,
         "deferral_reason": "Mutates a saved one-off deadline (DB write) with no live invocation; covered by disposable-database acceptance rather than the live smoke five."
     }));
-    fixture["count"] = serde_json::json!(44);
+    fixture["count"] = serde_json::json!(46);
     fixture
 }
 
@@ -116,14 +117,14 @@ fn option_type_name(kind: u8) -> &'static str {
 fn inventory_matches_registry_output_in_publish_order() {
     let published = all_on_router().publish_set(&[]).expect("publish set");
     let fixture = fixture();
-    assert_eq!(fixture["count"], 44, "44 built-ins");
+    assert_eq!(fixture["count"], 46, "46 built-ins");
     assert_eq!(
         fixture["dm_permission_all_false"], true,
         "fixture claims guild-only"
     );
     let rows = fixture["commands"].as_array().expect("command rows");
     assert_eq!(published.len(), rows.len(), "registry row count matches");
-    assert_eq!(published.len(), 44, "44 built-ins in the registry");
+    assert_eq!(published.len(), 46, "46 built-ins in the registry");
 
     for (definition, row) in published.iter().zip(rows.iter()) {
         let name = row["name"].as_str().expect("row name");
@@ -269,8 +270,8 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
     assert_eq!(covered.len(), 5, "exactly the top five");
-    assert_eq!(deferred.len(), 39, "every non-smoke row deferred");
-    assert_eq!(covered.len() + deferred.len(), 44, "every row marked");
+    assert_eq!(deferred.len(), 41, "every non-smoke row deferred");
+    assert_eq!(covered.len() + deferred.len(), 46, "every row marked");
 
     let mut covered_names: Vec<&str> = covered
         .iter()
@@ -336,4 +337,37 @@ fn covered_five_route_to_their_handlers() {
             "/{name} routes to its handler"
         );
     }
+}
+
+#[test]
+fn machine_readable_t0_contract_matches_the_compiled_surface() {
+    let contract: Value = serde_json::from_str(include_str!(
+        "../../../docs/t0-acceptance-smoke-contract.json"
+    ))
+    .expect("T0 smoke contract parses");
+    let surface = &contract["command_surface"];
+    let published = all_on_router().publish_set(&[]).expect("publish set");
+    let names: Vec<&str> = published.iter().map(|def| def.name.as_str()).collect();
+    assert_eq!(surface["all_gates_on_count"], 46, "all built-ins counted");
+    let order: Vec<&str> = surface["publish_order"]
+        .as_array()
+        .expect("publish order")
+        .iter()
+        .map(|name| name.as_str().expect("command name"))
+        .collect();
+    assert_eq!(
+        order, names,
+        "machine-readable contract preserves publish order"
+    );
+    let mut grouped: Vec<&str> = surface["ents"]
+        .as_object()
+        .expect("command groups")
+        .values()
+        .flat_map(|group| group.as_array().expect("group commands"))
+        .map(|name| name.as_str().expect("grouped command name"))
+        .collect();
+    grouped.sort_unstable();
+    let mut expected = names;
+    expected.sort_unstable();
+    assert_eq!(grouped, expected, "groups cover every command exactly once");
 }

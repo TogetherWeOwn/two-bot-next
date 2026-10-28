@@ -2,6 +2,7 @@
 //! Side effects belong to the shared router/REST executor, not this module.
 
 use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES, MAX_FEED_SOURCE_BYTES};
+use crate::help::inert;
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -958,33 +959,55 @@ pub fn feed_pending_evidence_refusal_text(
         FeedPendingEvidenceOperation::Remove => "was not removed and remains saved",
     };
     format!(
-        "Feed relay `{id}` {unchanged}: snapshot of {pending} unresolved delivery evidence. \
+        "Feed relay `{}` {unchanged}: snapshot of {pending} unresolved delivery evidence. \
          Wait for reconciliation and recovery to settle, then inspect via /feed-inspect. \
-         Retry after recovery settles."
+         Retry after recovery settles.",
+        inert(id)
+    )
+}
+
+/// Private duplicate-add receipt. Only a command-safe saved id and the observed
+/// lifecycle state leave the store; no source or delivery capability is echoed.
+/// A malformed restored id is not truncated into a different command target.
+#[must_use]
+pub fn feed_existing_text(id: &str, enabled: bool) -> String {
+    let state = if enabled { "enabled" } else { "paused" };
+    if validate_id(id).is_err() {
+        return format!(
+            "A feed relay is already saved and {state}. No relay was created or changed. \
+             Use /feed-list to inspect saved relays."
+        );
+    }
+    let command = if enabled { "feed-pause" } else { "feed-resume" };
+    format!(
+        "Feed relay already saved: `{id}` is {state}. No relay was created or changed. \
+         Inspect with `/feed-inspect id:{id}` or use `/{command} id:{id}`."
     )
 }
 
 /// Pause/resume confirmations. The relay id is interpolated by the caller so
 /// the member can copy the stable id back into `/feed-resume`, `/feed-remove`
-/// or `/feed-list page:<n>`.
+/// or `/feed-list page:<n>`. The supplied id renders through `inert` inside
+/// the trusted backticks: stable ids pass through byte-identical, but a
+/// crafted id cannot close the code span or forge markup.
 #[must_use]
 pub fn feed_paused_text(id: &str) -> String {
-    format!("Feed relay paused: `{id}`.")
+    format!("Feed relay paused: `{}`.", inert(id))
 }
 
 #[must_use]
 pub fn feed_already_paused_text(id: &str) -> String {
-    format!("Feed relay is already paused: `{id}`.")
+    format!("Feed relay is already paused: `{}`.", inert(id))
 }
 
 #[must_use]
 pub fn feed_resumed_text(id: &str) -> String {
-    format!("Feed relay resumed: `{id}`.")
+    format!("Feed relay resumed: `{}`.", inert(id))
 }
 
 #[must_use]
 pub fn feed_already_resumed_text(id: &str) -> String {
-    format!("Feed relay is already enabled: `{id}`.")
+    format!("Feed relay is already enabled: `{}`.", inert(id))
 }
 
 const MAX_XML_DEPTH: usize = 64;

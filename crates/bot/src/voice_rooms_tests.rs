@@ -5,6 +5,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_access_strict_shapes_acceptance_tests.rs"]
+mod access_strict_shapes_acceptance;
 #[path = "voice_actor_inbox_backpressure_acceptance_tests.rs"]
 mod actor_inbox_backpressure_acceptance;
 #[path = "voice_admission_config_acceptance_tests.rs"]
@@ -19,6 +21,8 @@ mod cold_authority;
 mod control_plane_overflow_acceptance;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
+#[path = "voice_creator_settings_read_acceptance_tests.rs"]
+mod creator_settings_read_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_disconnect_loud_acceptance_tests.rs"]
@@ -35,6 +39,8 @@ mod event_voice_channels_acceptance;
 mod event_voice_channels_regression;
 #[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
 mod fair_scheduling_acceptance;
+#[path = "voice_config_full_diff_acceptance_tests.rs"]
+mod full_diff_acceptance;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
 #[path = "voice_invite_responder_wiring_tests.rs"]
@@ -63,6 +69,8 @@ mod ownership_receipt_acceptance;
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
 mod responder_admission_acceptance;
+#[path = "voice_import_review_regressions_tests.rs"]
+mod review_regressions;
 #[path = "voice_setup_access_paging_acceptance_tests.rs"]
 mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
@@ -5766,8 +5774,16 @@ async fn channel_manage_channels_never_bypasses_voice_restrictions_or_configurat
         "defaultlimit",
         "alwaysprivate",
     ] {
+        // `/textchannels` strictly decodes its options before the
+        // permission check, so it needs its required `channel` option to
+        // reach the authority refusal under test.
+        let options = if name == "textchannels" {
+            vec![channel_option("channel", CREATOR)]
+        } else {
+            vec![]
+        };
         let mut interaction = voice_interaction(
-            Some(command_data(name, vec![])),
+            Some(command_data(name, options)),
             Some(Permissions::MANAGE_CHANNELS),
             true,
         );
@@ -7792,6 +7808,78 @@ fn parse_textchannels_leaves_unset_options_unset() {
             },
         })
     );
+}
+
+#[test]
+fn parse_textchannels_strict_shape_names_the_offending_field() {
+    let valid_options = || {
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(true)),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ]
+    };
+    let mut cases: Vec<(&'static str, Vec<CommandDataOption>)> = Vec::new();
+    for (field, wrong) in [
+        ("channel", CommandOptionValue::String("bad".to_owned())),
+        ("enabled", CommandOptionValue::String("bad".to_owned())),
+        ("name", CommandOptionValue::Boolean(true)),
+        ("viewer-role", CommandOptionValue::String("bad".to_owned())),
+    ] {
+        let mut options = valid_options();
+        options
+            .iter_mut()
+            .find(|option| option.name == field)
+            .expect("known field")
+            .value = wrong;
+        cases.push((field, options));
+    }
+    for (field, good) in [
+        ("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+        ("enabled", CommandOptionValue::Boolean(true)),
+        ("name", CommandOptionValue::String("lounge".to_owned())),
+        ("viewer-role", CommandOptionValue::Role(Id::new(42))),
+    ] {
+        let mut options = valid_options();
+        options.push(typed_option(field, good));
+        cases.push((field, options));
+    }
+    cases.push((
+        "channel",
+        valid_options()
+            .into_iter()
+            .filter(|option| option.name != "channel")
+            .collect(),
+    ));
+
+    for (expected, options) in cases {
+        let interaction = textchannels_interaction(options, Some(Permissions::MANAGE_CHANNELS));
+        assert_eq!(
+            parse_voice_command(&interaction),
+            Some(VoiceCommand::SetupShapeInvalid {
+                command: "textchannels",
+                field: expected,
+            }),
+            "malformed {expected} must be reported as {expected}"
+        );
+    }
+}
+
+#[test]
+fn textchannels_shape_correction_names_the_field_before_the_usage_example() {
+    for field in ["channel", "enabled", "name", "viewer-role"] {
+        let text = setup_shape_correction("textchannels", field);
+        // The usage example names every option, so only the diagnostic
+        // before it can prove which field the correction blames.
+        let (diagnostic, usage) = text.split_once("Try:").expect("copyable invocation");
+        assert!(diagnostic.contains(&format!("`{field}`")), "{text}");
+        if field != "channel" {
+            assert!(!diagnostic.contains("`channel`"), "{text}");
+        }
+        assert!(usage.contains("/textchannels channel:"), "{text}");
+        assert!(!text.contains("ambiguous"), "{text}");
+    }
 }
 
 fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
@@ -12899,6 +12987,55 @@ async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
     assert!(content.contains("<@303>"), "{content}");
     assert!(content.contains("too loud"), "{content}");
     assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
+}
+
+// The gateway bypasses `handle_voice_interaction` for `/kick`, so this sink is
+// the only production route to the malformed-reason correction. Reverting its
+// `KickReasonInvalid` claim hands the member the router's moderation refusal.
+#[tokio::test]
+async fn kick_vote_sink_answers_a_malformed_reason_with_one_private_correction() {
+    let malformed = [
+        (
+            "duplicated reason",
+            vec![
+                user_option("member", KICK_TARGET),
+                command_option("reason", "too loud"),
+                command_option("reason", "again"),
+            ],
+        ),
+        (
+            "non-text reason",
+            vec![
+                user_option("member", KICK_TARGET),
+                typed_option("reason", CommandOptionValue::Integer(7)),
+            ],
+        ),
+    ];
+    for (case, options) in malformed {
+        let trace = Trace::default();
+        let runtime = kick_room_runtime(
+            &trace,
+            true,
+            vec![
+                voice_member_in(KICK_VOTER, KICK_ROOM),
+                voice_member_in(KICK_TARGET, KICK_ROOM),
+            ],
+        );
+        let replies = Replies::new(trace.clone());
+        let interaction = with_user(
+            voice_interaction(Some(command_data("kick", options)), None, true),
+            KICK_VOTER,
+        );
+        let answered = VoiceResponder::start_kick_vote(&runtime, &replies, &interaction).await;
+        assert!(answered, "{case}: voice owns the callback");
+        let completed = replies.completed.lock().unwrap();
+        assert_eq!(completed.len(), 1, "{case}: exactly one reply");
+        let data = completed[0].data.as_ref().expect("correction body");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL), "{case}");
+        assert!(data.components.is_none(), "{case}: no public ballot");
+        let content = data.content.as_deref().unwrap_or_default();
+        assert!(content.contains("reason:"), "{case}: {content}");
+    }
 }
 
 // Every decline sends no callback at all: the router answers instead, so a

@@ -37,7 +37,8 @@ The shared S4 interaction router and REST executor are now present on `main`.
 consumes their routing decisions and executes management/dynamic-slash handlers.
 It defers responses before transactional work, edits through the shared executor,
 suppresses mentions, audits writes/runs, and serializes mutation plus full-set
-publication. A publication failure reports a saved-but-not-synchronized result.
+publication. A publication failure reports a saved-but-pending result and
+persists a resync marker (see [Pending registry resync](#pending-registry-resync)).
 
 **Gateway composition is implemented and runtime-verified in hosted CI; it is
 not deployed.**
@@ -94,7 +95,9 @@ remaining gateway/accepted-prefix work:
 3. After a committed add/update or successful remove, consume
    `resync_registry` through the shared publisher. Rebuild from current DB
    rows plus **all** builtin definitions. An absent remove does not republish.
-   A publication failure must not be reported as a fully synchronized write.
+   A publication failure must not be reported as a fully synchronized write:
+   it reports the saved-but-pending state and records the durable resync
+   marker described under [Pending registry resync](#pending-registry-resync).
 4. `/command-list` lists complete rows in name order, including disabled commands
    and optional text triggers. It defaults to page 1; `/command-list page:2`
    retrieves page 2. Each nonempty ephemeral reply identifies `Page N of M` and,
@@ -136,6 +139,26 @@ remaining gateway/accepted-prefix work:
    inspectable. Unknown, other-guild-only and deleted names share one truthful
    miss pointing at `/command-list`; lookup outages reuse the fixed
    availability reply below.
+
+   To check proposed text before saving or replacing a response, use
+   `/command-inspect draft:Hello {username}` instead of a saved `name`.
+   Pass exactly one of `name` or `draft`; missing input, both inputs, duplicate
+   options, unknown options and non-text values refuse before any lookup.
+   Drafts default to preview; explicit `view:preview` is equivalent, while
+   `view:summary` and `view:template` require saved-name mode. The proposed
+   template must be 1–2000 UTF-16 units and uses only `{user}`, `{username}`,
+   `{server}` and `{channel}` with the same single-pass invocation context as
+   saved previews. Optional `arguments` remain ignored — no `{args}` or
+   second interpolation pass. The private response starts **Draft preview —
+   not saved or published**. Markdown escaping and empty allowed mentions keep
+   hostile text inert; framing-only truncation is explicit, but invalid
+   placeholders and expanded output over 2000 units refuse with a correction.
+   Missing context is reported separately. Draft mode works without storage
+   and never reads/writes saved commands, republishes registration, sends to a
+   channel, records audit facts, matches triggers or consumes cooldowns/claims.
+   It cannot overwrite or enable anything. Saving later is a distinct
+   `/command name:<name> template:<text>` invocation with fresh checks; a
+   preview is not permission or a guarantee that the later save will succeed.
 9. `/command-disable name:<name>` pauses one saved definition and
    `/command-enable name:<name>` resumes it, without deleting anything.
    Both take exactly one text `name` (a forged type, a duplicate or any
@@ -149,8 +172,38 @@ remaining gateway/accepted-prefix work:
    definition refuses without reactivating); pausing needs no content
    check. The flip commits before the one full-set publication, so a
    prefix or slash invocation racing a stale picker reads the saved
-   state. A failed publication reports saved-but-not-synchronized with a
-   safe next action; a repeated state never claims the picker repaired.
+   state. A failed publication reports the saved-but-pending state and
+   records the same resync marker as a define; a repeated state never
+   claims the picker repaired, and no reply advises a restart, a delete
+   or repeating the toggle.
+
+## Pending registry resync
+
+A define, remove or toggle commits its saved definition (and its one audit
+fact) before the full registry is republished. If that publication fails —
+for example Discord refuses the replace-all PUT during an outage — the
+picker would otherwise stay stale until a restart. Instead, the failed
+publication records one durable marker row per guild in
+`automation_command_registry_resync` (migration `0468`, cutover chain):
+the guild id and the first failure time, nothing else. Recording is
+idempotent, so repeated failures keep exactly one pending row.
+
+The private confirmation names both halves of the outcome truthfully — the
+definition is saved, synchronization is pending and will resync
+automatically on the next publication — and never advises restarting the
+bot, deleting the definition or repeating the mutation (a repeated toggle
+is a no-op that does not republish). The last confirmed discovery snapshot
+does not advance.
+
+Recovery needs no new scheduler or retry API, and never replays the
+committed mutation: the next successful full-set publication — a later
+management publish, the READY/RESUMED registry sync, or the boot resync —
+rebuilds the complete set from the saved rows, advances the confirmed
+snapshot and deletes that guild's marker. One guild's recovery never
+clears another guild's pending row. The marker is best-effort recovery
+state around the publication outcome (recording or clearing it never masks
+that outcome), holds no member data, and is excluded from backups: a
+recovered process republishes the full set on boot anyway.
 
 ## Slash-run audit replay
 
@@ -197,6 +250,15 @@ interaction records only its own outcome. A successful completion delivers
 the rendered template and records `(ok, None)`; audit rows carry no template
 or rendered content. A render or context failure is definitive and local, so it still
 audits even when the fallback completion is uncertain.
+
+A saved template that no longer passes the definition-time rules (unknown
+placeholder, empty, or over the 2000 UTF-16-unit limit — for example after an
+import) is refused at both execution boundaries: slash completes with the
+fixed context-or-template unavailable text, prefix sends nothing, and the run
+audits `render_failed` without the template text. The definition is never
+disabled, deleted, or repaired automatically. To fix it, run
+`/command-inspect name:<name> view:preview` for the private refusal detail,
+then replace the template with `/command name:<name> template:<text>`.
 
 ## Explicit prefix acceptance and replay safety
 

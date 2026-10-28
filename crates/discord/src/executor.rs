@@ -93,6 +93,10 @@ pub const BOOT_BLOCKED_RETRY_SLEEP_MS: u64 = 250;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
+/// Extra time for a governed read to settle storage after its wire deadline.
+/// This never extends the wire attempt or authorizes another request. If
+/// completion cannot be confirmed within the bound, admission stays occupied.
+const READ_SETTLEMENT_GRACE_MS: u64 = 1_000;
 /// Wire marker for a stalled response body: headers arrived but the body never
 /// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
 /// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
@@ -220,6 +224,16 @@ impl DiscordError {
     pub fn proves_no_effect(&self) -> bool {
         self.is_safe_pre_mutation() || matches!(self, Self::RateLimited)
     }
+}
+
+/// Outcome of [`ActionExecutor::edit_message_for_close_refresh`]: a confirmed
+/// edit, a definitively deleted message, or a retryable failure whose
+/// [`DiscordError::cause`] stays in fixed vocabulary for content-free logs.
+#[derive(Debug)]
+pub enum CloseRefreshEdit {
+    Edited,
+    UnknownMessage,
+    Retryable(DiscordError),
 }
 
 /// One moderation mutation the executor carries out (legacy
@@ -718,8 +732,48 @@ impl HyperTransport {
     /// `deadline` is the caller's absolute attempt instant: admission,
     /// headers and body together stay inside it. The unadmitted loopback path
     /// passes `None` (headers unbounded, body at the fixed
-    /// [`RESPONSE_BODY_TIMEOUT_MS`]).
+    /// [`RESPONSE_BODY_TIMEOUT_MS`]). Governed GETs own their bounded attempt
+    /// independently of the caller: cancelling a fetch must not abandon its
+    /// admission or 429 body accounting. No caller continuation or retry lives
+    /// in that owner. Mutations retain their cancellation/uncertainty fences.
     pub async fn send_request(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(RawResponse, bool), String> {
+        if self.admission.is_some() && request.method() == Method::Get {
+            let transport = self.clone();
+            let request = request.clone();
+            let deadline = deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS)
+            });
+            // The inner phase timers retain the original wire deadline. The
+            // later watchdog leaves time for their storage cleanup, but also
+            // bounds a stuck completion. Dropping the join handle detaches
+            // only this one read, never a retry loop or a mutation.
+            let owner = tokio::spawn(async move {
+                let settled_by = deadline + Duration::from_millis(READ_SETTLEMENT_GRACE_MS);
+                match tokio::time::timeout_at(
+                    settled_by,
+                    transport.send_request_inner(&request, Some(deadline)),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!("Discord read settlement timed out; lane held");
+                        Err("Discord read settlement timed out".to_owned())
+                    }
+                }
+            });
+            return owner
+                .await
+                .map_err(|_| "Discord read owner unavailable".to_owned())?;
+        }
+        self.send_request_inner(request, deadline).await
+    }
+
+    async fn send_request_inner(
         &self,
         request: &Request,
         deadline: Option<tokio::time::Instant>,
@@ -2933,6 +2987,19 @@ impl ActionExecutor {
         content: &str,
         components: &[serde_json::Value],
     ) -> Result<(), DiscordError> {
+        let req = Self::update_message_request(channel_id, message_id, content, components)?;
+        self.call_once_raw_paced(req, &[200]).await?;
+        Ok(())
+    }
+
+    /// Shared PATCH builder for message edits: the same ceiling, snowflake,
+    /// body and route validation for refreshes and close-repair retries.
+    fn update_message_request(
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> Result<Request, DiscordError> {
         if utf16_len(content) > MAX_MESSAGE_CHARS {
             return Err(DiscordError::Rejected(
                 "message exceeds Discord's ceiling".into(),
@@ -2944,15 +3011,51 @@ impl ActionExecutor {
             "content": content, "components": components, "allowed_mentions": {"parse": []}
         }))
         .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
-        let req = Request::builder(&Route::UpdateMessage {
+        Request::builder(&Route::UpdateMessage {
             channel_id: channel.get(),
             message_id: message.get(),
         })
         .body(body)
         .build()
-        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
-        self.call_once_raw_paced(req, &[200]).await?;
-        Ok(())
+        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))
+    }
+
+    /// Retry one already-authorized close edit, distinguishing a definitively
+    /// deleted message from a retryable refusal. Unlike
+    /// [`Self::edit_message_with_components`], a 404 is accepted so its body
+    /// can prove (Discord code 10008) or refuse to prove that the message is
+    /// gone; the remote body never surfaces in the outcome.
+    pub async fn edit_message_for_close_refresh(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> CloseRefreshEdit {
+        let req = match Self::update_message_request(channel_id, message_id, content, components) {
+            Ok(req) => req,
+            Err(error) => return CloseRefreshEdit::Retryable(error),
+        };
+        match self.call_once_raw_paced(req, &[200, 404]).await {
+            Ok(mut res) if res.status == 200 => {
+                // Definite effect on an idempotent edit: the 200 is the full
+                // receipt, so release the lane for the next repair row.
+                res.complete().await;
+                CloseRefreshEdit::Edited
+            }
+            Ok(mut res) => {
+                let unknown = is_unknown_message_response(&res);
+                // A 404 already released on receipt; explicit for symmetry
+                // with reads that validate the body before completing.
+                res.complete().await;
+                if unknown {
+                    CloseRefreshEdit::UnknownMessage
+                } else {
+                    CloseRefreshEdit::Retryable(throw_for_status(&res))
+                }
+            }
+            Err(error) => CloseRefreshEdit::Retryable(error),
+        }
     }
 
     /// Bounded nonce reconciliation. An unreadable/denied history is NOT an empty history.
@@ -4221,6 +4324,21 @@ pub fn is_definitive_rejection(status: u16) -> bool {
     matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422)
 }
 
+/// Discord JSON error code for a deleted message. Only this code — never a
+/// bare 404 — proves the message is gone and settles a close-repair retry.
+const DISCORD_CODE_UNKNOWN_MESSAGE: i64 = 10008;
+
+/// True only for a 404 whose JSON body carries [`DISCORD_CODE_UNKNOWN_MESSAGE`].
+/// Any other code, a non-numeric code or an unreadable body is not proof of
+/// absence, so the repair stays retryable. Never copies the remote body.
+fn is_unknown_message_response(res: &RawResponse) -> bool {
+    res.status == 404
+        && serde_json::from_slice::<serde_json::Value>(&res.body)
+            .ok()
+            .and_then(|body| body.get("code").and_then(serde_json::Value::as_i64))
+            == Some(DISCORD_CODE_UNKNOWN_MESSAGE)
+}
+
 /// Only documented no-effect rejections are retry-safe. An unexpected success,
 /// redirect, timeout status or other ambiguous response may follow a mutation.
 #[must_use]
@@ -4597,6 +4715,7 @@ mod tests {
             key: TokenKey,
             entered: Arc<AtomicUsize>,
             dropped: Arc<AtomicUsize>,
+            started: Arc<tokio::sync::Notify>,
         }
         impl SendAdmission for PendingAdmission {
             fn token_key(&self) -> &TokenKey {
@@ -4607,6 +4726,7 @@ mod tests {
                 Box::pin(async move {
                     let _drop = AdmissionDrop(self.dropped.clone());
                     self.entered.fetch_add(1, Ordering::SeqCst);
+                    self.started.notify_one();
                     std::future::pending().await
                 })
             }
@@ -4615,6 +4735,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let entered = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
         let token = "fixture-lazy-send-token";
         let executor = ActionExecutor::with_admission(
             token.to_owned(),
@@ -4623,6 +4744,7 @@ mod tests {
                 key: TokenKey::for_bot_token(token).expect("fixture token key"),
                 entered: entered.clone(),
                 dropped: dropped.clone(),
+                started: started.clone(),
             }),
         )
         .expect("fixture executor");
@@ -4637,16 +4759,41 @@ mod tests {
         let mut pending = Box::pin(executor.send_admitted_for(&request, budget));
         // Construction must not start the deadline or durable admission.
         tokio::time::advance(budget * 2).await;
+        assert_eq!(executor.requests(), 0);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
         std::future::poll_fn(|cx| {
             assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
             Poll::Ready(())
         })
         .await;
         assert_eq!(executor.requests(), 1);
+        // A governed GET owns admission independently of its awaiting caller.
+        // Wait for the owner rather than requiring admission in the first poll.
+        tokio::time::timeout(budget, started.notified())
+            .await
+            .expect("governed read owner entered admission");
         assert_eq!(entered.load(Ordering::SeqCst), 1);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(pending);
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "caller cancellation must not abandon the admission before its deadline"
+        );
+        // The original attempt gets at most one extra second for settlement.
+        tokio::time::advance(Duration::from_millis(1) + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "pending admission must be dropped by the read settlement bound"
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "no detached retry");
+        assert_eq!(executor.requests(), 1);
     }
 
     fn boot_executor() -> ActionExecutor {
@@ -5084,5 +5231,43 @@ mod tests {
         // Reason validation happens before any I/O: an empty reason is a
         // terminal Failed value with zero attempts, not a panic.
         assert!(audit_reason("").is_err());
+    }
+
+    #[test]
+    fn unknown_message_needs_404_with_code_10008() {
+        let coded = RawResponse {
+            status: 404,
+            retry_after_header: None,
+            body: br#"{"code": 10008, "message": "Unknown Message"}"#.to_vec(),
+            completion: None,
+        };
+        assert!(is_unknown_message_response(&coded));
+        let bodies: [&[u8]; 5] = [
+            br#"{"message": "REMOTE_BODY_SENTINEL"}"#,
+            br#"{"code": 50001, "message": "Missing Access"}"#,
+            br#"{"code": "10008"}"#,
+            b"not json",
+            b"",
+        ];
+        for body in bodies {
+            let unclassified = RawResponse {
+                status: 404,
+                retry_after_header: None,
+                body: body.to_vec(),
+                completion: None,
+            };
+            assert!(
+                !is_unknown_message_response(&unclassified),
+                "unclassified 404 stays retryable: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let wrong_status = RawResponse {
+            status: 403,
+            retry_after_header: None,
+            body: br#"{"code": 10008}"#.to_vec(),
+            completion: None,
+        };
+        assert!(!is_unknown_message_response(&wrong_status));
     }
 }

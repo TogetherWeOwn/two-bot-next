@@ -16,6 +16,8 @@ pub mod channel_access;
 pub mod channel_moderation;
 pub mod command_identity;
 pub mod command_registry;
+#[cfg(any(test, feature = "db"))]
+mod custom_command_prefix_render;
 #[cfg(feature = "db")]
 pub mod custom_commands;
 #[cfg(test)]
@@ -62,6 +64,7 @@ mod test_clock;
 #[path = "../tests/common/mod.rs"]
 pub mod test_wire;
 pub mod voice_rooms;
+pub mod voice_rooms_board;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{
@@ -72,9 +75,10 @@ pub use leveling_runtime::{
 pub use adapter::event_to_core;
 pub use executor::{
     is_definitive_rejection, lockdown_masks, pace_delay_ms, paced_step, throw_for_status,
-    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall,
-    DiscordError, EveryoneOverwrite, PacedStep, RawResponse, RewardRoleReport, KICK_INTERVAL_MS,
-    MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS, MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
+    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome,
+    CloseRefreshEdit, DiscordCall, DiscordError, EveryoneOverwrite, PacedStep, RawResponse,
+    RewardRoleReport, KICK_INTERVAL_MS, MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS,
+    MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{

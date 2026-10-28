@@ -64,9 +64,11 @@ Two 503s that are truthful, never acceptance:
 ## 3. Top command-surface presence
 
 The publish set (`InteractionRouter::publish_set`) with all gates on is
-**44 built-ins**, guild-only (`dm_permission` false throughout), in legacy
-publish order (pinned by `publish_set_is_the_complete_merged_view` in
-`crates/core/src/router.rs`):
+**46 built-ins**, guild-only (`dm_permission` false throughout), in legacy
+publish order (also pinned in the machine-readable companion by
+`machine_readable_t0_contract_matches_the_compiled_surface`; no live
+publication is claimed). The registry order is pinned by `publish_set_is_the_complete_merged_view` in
+`crates/core/src/router.rs`:
 
 `rank`, `leaderboard`, `help`, `privacy`, `reopen`, `welcome-preview`,
 `game-mix` (core), `attendance` (scorecard), `command`, `command-remove`,
@@ -74,9 +76,9 @@ publish order (pinned by `publish_set_is_the_complete_merged_view` in
 `schedule`, `schedule-remove`, `schedule-retime`, `schedule-list`, `sticky`,
 `sticky-remove`, `giveaway` (automation), `rsvp`, `rsvp-attendance`, `lfg`,
 `lfg-close`, `lfg-edit`, `lfg-list`, `feed-add`, `feed-remove`, `feed-pause`,
-`feed-resume`, `feed-list`, `feed-inspect` (announcements), `ban`, `tempban`,
+`feed-resume`, `feed-list`, `feed-inspect` (announcements), `ban`, `tempban`, `tempban-list`,
 `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown`, `unlock`
-(moderation), `purge-preview`, `channel-inspect` (reads).
+(moderation), `purge-preview`, `channel-inspect`, `moderation-recent` (reads).
 
 First definition wins, built-in names are reserved, Discord's 100-command
 ceiling applies; DB-backed custom commands are dynamic and not listed.
@@ -155,7 +157,7 @@ with the observed value. Any NO-GO row aborts to the rollback path in
 - [ ] Gateway component `ready` (Connected); 503 parked is truthful, never
   acceptance (§2).
 - [ ] No `token_invalid: down`; no `gateway_failure` class present (§2).
-- [ ] All 44 built-in commands present in publish order, guild-only (§3).
+- [ ] All 46 built-in commands present in publish order, guild-only (§3).
 - [ ] Top five route: `rank`/`leaderboard`/`rsvp` open, `lfg` needs Manage
   Events, `ban` needs Ban Members (§3).
 - [ ] Unknown name → re-pick copy; stale control → expired-control copy (§4).
