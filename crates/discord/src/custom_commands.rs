@@ -1037,6 +1037,7 @@ impl CustomCommandRuntime {
             .author_id()
             .ok_or(CustomCommandError::Context)?
             .to_string();
+        let shown = shown_command_name(&name);
         let audit_id = format!("custom:manage:{}", interaction.id);
         let at = two_bot_core::now_iso();
         let _guard = self.registry.lock().await;
@@ -1056,12 +1057,12 @@ impl CustomCommandRuntime {
         let (reply, resync) = match decision {
             Ok(decision) => {
                 let reply = match decision.outcome {
-                    EditOutcome::Missing => format!("No command /{name} found."),
+                    EditOutcome::Missing => format!("No command /{shown} found."),
                     EditOutcome::Unchanged => format!(
-                        "/{name} is unchanged: the supplied values already match the saved definition."
+                        "/{shown} is unchanged: the supplied values already match the saved definition."
                     ),
                     EditOutcome::Changed => {
-                        format!("Saved /{name}: updated {}.", decision.changed.join(", "))
+                        format!("Saved /{shown}: updated {}.", decision.changed.join(", "))
                     }
                 };
                 (reply, decision.resync_registry)
