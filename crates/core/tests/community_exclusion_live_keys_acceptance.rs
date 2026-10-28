@@ -1079,13 +1079,117 @@ fn community_jobs_doc_documents_this_offline_verification() {
     );
 }
 
+// Match check_docs_index.py's full-line rule, not rendered Markdown. In
+// particular, a strict row inside a fence or comment still counts there.
+fn strict_index_rows(text: &str) -> Vec<(String, String)> {
+    let row = regex::Regex::new(r"\A- \[([^\]\n]+)\]\(([A-Za-z0-9_./-]+\.md)\)\z")
+        .expect("strict docs index row pattern");
+    text.lines()
+        .filter_map(|line| row.captures(line))
+        .filter(|parts| {
+            !parts[1].trim().is_empty()
+                && !parts[2]
+                    .split('/')
+                    .any(|part| matches!(part, "" | "." | ".."))
+        })
+        .map(|parts| (parts[1].to_owned(), parts[2].to_owned()))
+        .collect()
+}
+
+fn community_jobs_is_discoverable(
+    index: &str,
+    read_fragment: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let rows = strict_index_rows(index);
+    let is_community_jobs = |(purpose, target): &(String, String)| {
+        purpose == "Community jobs" && target == "community-jobs.md"
+    };
+    if rows.iter().any(is_community_jobs) {
+        return true;
+    }
+    let fragment =
+        regex::Regex::new(r"\Aindex-[^/]+\.md\z").expect("docs section filename pattern");
+    rows.iter()
+        .filter(|(_, target)| fragment.is_match(target))
+        .filter_map(|(_, target)| read_fragment(target))
+        .any(|text| strict_index_rows(&text).iter().any(is_community_jobs))
+}
+
 #[test]
 fn control_verification_doc_stays_discoverable_from_the_index() {
     let index = read_doc("docs/README.md");
     assert!(
-        index.contains("[Community jobs](community-jobs.md)"),
-        "the verification doc must stay indexed"
+        community_jobs_is_discoverable(&index, |target| Some(read_doc(&format!("docs/{target}")))),
+        "the verification doc must stay indexed directly or through a README-linked section"
     );
+}
+
+#[test]
+fn control_discoverability_follows_only_strict_readme_section_links() {
+    let guide = "- [Community jobs](community-jobs.md)\n";
+    let linked = "# Docs\n\n- [Community](index-community.md)\n";
+    let fragments = HashMap::from([
+        ("index-community.md", guide.to_owned()),
+        ("index-orphan.md", guide.to_owned()),
+        ("nested/index-community.md", guide.to_owned()),
+        ("guide-index-community.md", guide.to_owned()),
+    ]);
+    let discover = |index: &str| {
+        community_jobs_is_discoverable(index, |target| fragments.get(target).cloned())
+    };
+    assert!(discover(guide), "legacy direct rows stay valid");
+    assert!(discover(linked), "README-linked fragments are discoverable");
+    for index in [
+        "# Docs\n",
+        "See [Community](index-community.md).\n",
+        "  - [Community](index-community.md)\n",
+        "- [Community](index-community.md) trailing junk\n",
+        "- [   ](index-community.md)\n",
+        "- [Community](/index-community.md)\n",
+        "- [Community](../index-community.md)\n",
+        "- [Community](nested/index-community.md)\n",
+        "- [Community](guide-index-community.md)\n",
+        "- [Missing](index-missing.md)\n",
+    ] {
+        assert!(
+            !discover(index),
+            "non-section or absent link counted: {index}"
+        );
+    }
+    assert!(discover(&format!("```md\n{linked}```\n")));
+    assert!(discover(&format!("<!--\n{linked}-->\n")));
+}
+
+#[test]
+fn control_discoverability_counts_exactly_the_checkers_guide_rows() {
+    let linked = "- [Community](index-community.md)\n";
+    let guide = "- [Community jobs](community-jobs.md)\n";
+    for text in [
+        guide.to_owned(),
+        format!("```md\n{guide}```\n"),
+        format!("<!--\n{guide}-->\n"),
+    ] {
+        assert!(community_jobs_is_discoverable(linked, |_| Some(
+            text.clone()
+        )));
+    }
+    for text in [
+        "See [Community jobs](community-jobs.md).\n",
+        "  - [Community jobs](community-jobs.md)\n",
+        "* [Community jobs](community-jobs.md)\n",
+        "- [Community jobs](community-jobs.md) trailing junk\n",
+        "- [Community jobs](/community-jobs.md)\n",
+        "- [Community jobs](../community-jobs.md)\n",
+        "- [Community jobs](./community-jobs.md)\n",
+        "- [   ](community-jobs.md)\n",
+        "- [Leaf](index-leaf.md)\n",
+    ] {
+        assert!(
+            !community_jobs_is_discoverable(linked, |_| Some(text.to_owned())),
+            "non-row or recursive link counted: {text}"
+        );
+        assert!(!community_jobs_is_discoverable(text, |_| None));
+    }
 }
 
 #[test]
