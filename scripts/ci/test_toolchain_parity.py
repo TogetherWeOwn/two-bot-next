@@ -265,12 +265,34 @@ class ToolchainParityTests(unittest.TestCase):
             with self.subTest(workflow=drifted):
                 with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
                     root = make_fixture_root(scratch)
-                    (root / ".github/workflows" / drifted).write_text(
-                        PINNED_WORKFLOW.format(toolchain="1.100.0")
-                    )
+                    path = root / ".github/workflows" / drifted
+                    original = path.read_text()
+                    scalar = 'toolchain: "1.99.1"'
+                    self.assertEqual(original.count(scalar), 1)
+                    path.write_text(original.replace(scalar, 'toolchain: "1.100.0"', 1))
                     errors = workflow_toolchain_errors(root)
                     self.assertEqual(len(errors), 1, errors)
                     self.assertIn(drifted, errors[0])
+                    self.assertEqual(
+                        toolchain_parity_errors(root),
+                        [f"{drifted}#job: expected '1.99.1', got '1.100.0'"],
+                    )
+
+    def test_extra_workflow_installer_drift_fails_through_aggregate(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            path = root / ".github/workflows/pipeline-benchmark.yml"
+            original = path.read_text()
+            self.assertIn('toolchain: "1.99.1" # Match rust-toolchain.toml', original)
+            path.write_text(original + (
+                '      - uses: dtolnay/rust-toolchain@master\n'
+                '        with:\n'
+                '          toolchain: "1.98.0"\n'
+            ))
+            self.assertEqual(
+                toolchain_parity_errors(root),
+                ["pipeline-benchmark.yml#job: expected '1.99.1', got '1.98.0'"],
+            )
 
     def test_drifted_dockerfile_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
@@ -389,6 +411,66 @@ class ToolchainParityTests(unittest.TestCase):
             wired = toolchain_parity_errors(root)
             self.assertTrue(wired, "probe builder revert must fail through the CI entry point")
             self.assertTrue(any("voice-probe" in error for error in wired))
+
+    def test_probe_later_unpinned_stage_fails_through_aggregate(self):
+        for instruction in ("FROM", "from", "FrOm"):
+            for flags in ("", "--platform=$BUILDPLATFORM ", "--platform=linux/amd64 "):
+                with self.subTest(instruction=instruction, flags=flags):
+                    with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                        root = make_fixture_root(scratch)
+                        probe = root / "crates/voice-probe/Dockerfile"
+                        probe.write_text(probe.read_text() + f"{instruction} {flags}rust:1.99-trixie AS extra\n")
+                        errors = toolchain_parity_errors(root)
+                        self.assertTrue(
+                            any("crates/voice-probe/Dockerfile" in error and
+                                ("digest" in error or "pinned" in error) for error in errors),
+                            errors,
+                        )
+
+    def test_probe_lowercase_and_flagged_wrong_tag_fails_through_aggregate(self):
+        for instruction in ("from", "FrOm", "FROM"):
+            for flags in ("", "--platform=$BUILDPLATFORM ", "--platform=linux/amd64 "):
+                with self.subTest(instruction=instruction, flags=flags):
+                    with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                        root = make_fixture_root(scratch)
+                        probe = root / "crates/voice-probe/Dockerfile"
+                        probe.write_text(probe.read_text() +
+                            f"{instruction} {flags}rust:1.98-trixie@sha256:{PINNED_DIGEST} AS extra\n")
+                        self.assertIn(
+                            "crates/voice-probe/Dockerfile: stage 1 expected rust:1.99-trixie, got rust:1.98-trixie",
+                            toolchain_parity_errors(root),
+                        )
+
+    def test_probe_malformed_digests_fail_through_aggregate(self):
+        malformed = ("a" * 65, "a" * 63, "a" * 63 + "g", "a" * 64 + "suffix")
+        for digest in malformed:
+            for later in (False, True):
+                with self.subTest(digest=digest, later=later):
+                    with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                        root = make_fixture_root(scratch)
+                        probe = root / "crates/voice-probe/Dockerfile"
+                        valid = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+                        self.assertEqual(toolchain_parity_errors(root), [])
+                        bad = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=digest)
+                        probe.write_text((valid if later else "") + bad)
+                        errors = toolchain_parity_errors(root)
+                        self.assertTrue(
+                            any("crates/voice-probe/Dockerfile" in error and
+                                ("digest" in error or "pinned" in error) for error in errors),
+                            errors,
+                        )
+
+    def test_probe_only_builder_digest_disagreement_fails_through_aggregate(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            self.assertEqual(toolchain_parity_errors(root), [])
+            (root / "crates/voice-probe/Dockerfile").write_text(
+                PINNED_DOCKERFILE.format(tag="1.99-trixie", digest="b" * 64)
+            )
+            self.assertEqual(toolchain_parity_errors(root), [
+                "builder digests disagree: Dockerfile@sha256:aaaaaaaaaaaa, "
+                "crates/voice-probe/Dockerfile@sha256:bbbbbbbbbbbb"
+            ])
 
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:

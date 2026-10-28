@@ -3592,6 +3592,69 @@ mod tests {
         )));
     }
 
+    fn record_drop_poisons_concurrently(metrics: &Metrics, calls_per_worker: usize) {
+        const WORKERS: usize = 8;
+        let start = std::sync::Barrier::new(WORKERS);
+        std::thread::scope(|scope| {
+            let workers = (0..WORKERS)
+                .map(|_| {
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        for _ in 0..calls_per_worker {
+                            metrics.drop_poison("user_slot");
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker
+                    .join()
+                    .expect("bounded counter worker must not panic");
+            }
+        });
+    }
+
+    #[test]
+    fn drop_poison_concurrent_same_label_updates_have_an_exact_total() {
+        let metrics = Metrics::default();
+        let slot = bounded_index("user_slot", DROP_POISON_GUARDS);
+        let series_before = metrics
+            .render(None)
+            .lines()
+            .filter(|line| line.starts_with("two_bot_drop_poison_total{"))
+            .count();
+        record_drop_poisons_concurrently(&metrics, 8192);
+        assert_eq!(metrics.1[slot].load(Ordering::Relaxed), 65_536);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"user_slot\"} 65536\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 0\n"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_drop_poison_total{"))
+                .count(),
+            series_before
+        );
+    }
+
+    #[test]
+    fn drop_poison_concurrent_same_label_updates_saturate_near_u64_max() {
+        let metrics = Metrics::default();
+        let slot = bounded_index("user_slot", DROP_POISON_GUARDS);
+        metrics.1[slot].store(u64::MAX - 128, Ordering::Relaxed);
+        // 512 real updates cross the ceiling; extra calls must remain at MAX.
+        record_drop_poisons_concurrently(&metrics, 64);
+        assert_eq!(metrics.1[slot].load(Ordering::Relaxed), u64::MAX);
+        metrics.drop_poison("user_slot");
+        assert_eq!(metrics.1[slot].load(Ordering::Relaxed), u64::MAX);
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_drop_poison_total{{guard=\"user_slot\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 0\n"));
+    }
+
     #[test]
     fn drop_poison_hostile_labels_collapse_without_new_series() {
         let metrics = Metrics::default();
