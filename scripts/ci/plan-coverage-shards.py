@@ -446,7 +446,11 @@ def resolve_sweep_leg(leg, metadata):
     tokens = shlex.split(leg["command"])
     at = tokens.index("--features")
     tokens[at:at + 2] = sweep_feature_flags(key, metadata)
-    return dict(leg, command=shlex.join(tokens))
+    package = SWEEP_PACKAGES[key]
+    crates = [package] if package else sorted(
+        set(reverse_deps_from_metadata(metadata)) - set(SWEEP_PACKAGES.values())
+    )
+    return dict(leg, command=shlex.join(tokens), crates=crates)
 
 
 def _full_plan(shard_count, reason):
@@ -557,9 +561,14 @@ def _plan_inner(changed_files, shard_count, *, event_name, ref, metadata):
                 queue.append(dependent)
     selected = []
     for leg in FULL_LEGS:
+        crates = leg["crates"]
+        if leg["id"].startswith(("sweep-nonignored-", "sweep-ignored-")) and leg["id"].endswith("-other"):
+            # New workspace members live in the remainder, including their
+            # ignored tests when a changed dependency reaches them.
+            crates = set(reverse) - set(SWEEP_PACKAGES.values())
         if leg["id"] in ALWAYS_ON_LEGS:
             selected.append(leg["id"])
-        elif any(c in affected for c in leg["crates"]):
+        elif any(c in affected for c in crates):
             selected.append(leg["id"])
     return {
         "legs": selected,

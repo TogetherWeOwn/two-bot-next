@@ -1024,6 +1024,8 @@ jobs:
           legs = plan["legs"]
           shards = plan["shards"]
           import importlib.util
+          import sys
+          sys.path.insert(0, 'scripts/ci')
           spec = importlib.util.spec_from_file_location('coverage_planner', 'scripts/ci/plan-coverage-shards.py')
           planner = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(planner)
