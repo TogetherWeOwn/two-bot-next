@@ -550,7 +550,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("test_job_inputs.py", self.selector)
 
     def test_consumer_jobs_wait_on_selector(self):
-        for job in ("check", "rust-tests", "coverage-plan", "coverage-shard",
+        for job in ("check", "test-partition-plan", "rust-tests-partition",
+                    "ignored-db-runtime-partition", "rust-tests", "coverage-plan", "coverage-shard",
                     "patch-coverage", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
                     "tickets-postgres", "worker", "supply-chain", "ci-ok",
@@ -583,6 +584,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         head = self.text.split("\n  ci-ok:")[1].split("steps:", 1)[0]
         self.assertIn("always()", head)
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
+                    "test-partition-plan", "rust-tests-partition", "ignored-db-runtime-partition",
                     "coverage-plan", "coverage-shard", "patch-coverage",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
@@ -659,12 +661,12 @@ class WorkflowSurfaceTests(unittest.TestCase):
             yield (name.group(1).strip() if name else lines[0].strip(),
                    "\n".join(lines))
 
-    # The `check` lane always runs, so its Rust/DB steps carry the selector
-    # guard per step; the four Rust test lanes skip at the job level instead.
-    # The coverage planner skips at the job level too but is too small for
-    # the lane-shape pin below, and the merge uses a fail-closed `always()`
-    # form; both are pinned by test_coverage_plan_and_merge_skip_without_rust.
-    RUST_LANES = ("rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime")
+    # Heavy workers skip at the job level; `check` gates Rust/DB steps.
+    # Partitioned lanes have strict always-reporting stable finals rather
+    # than a second heavy worker. The small planners and finals have their
+    # own selector pins below; they must not inherit the heavy-lane shape.
+    RUST_LANES = ("rust-tests-partition", "coverage-shard", "ignored-db-stores",
+                  "ignored-db-runtime-partition")
     LANE_GUARD = "if: needs.job-inputs.outputs.rust != 'false'"
 
     # What a step must not do on a rust=false PR: that run never installs the
@@ -722,6 +724,30 @@ class WorkflowSurfaceTests(unittest.TestCase):
                         body, r"(?m)^\s+if:.*outputs\.rust",
                         f"{name!r}: the lane is already gated at the job level")
 
+    def test_partition_planner_and_stable_finals_keep_the_selector_and_strict_gates(self):
+        planner = self.job_text(self.text, "test-partition-plan").split("\n    steps:\n", 1)[0]
+        self.assertIn(f"\n    {self.LANE_GUARD}\n", planner)
+        self.assertRegex(planner, r"(?m)^    needs: \[job-inputs\]$")
+        for lane in ("rust-tests", "ignored-db-runtime"):
+            with self.subTest(lane=lane):
+                body = self.job_text(self.text, lane)
+                head = body.split("\n    steps:\n", 1)[0]
+                self.assertIn(f"\n    if: always() && {self.LANE_GUARD.removeprefix('if: ')}\n", head)
+                self.assertRegex(head, rf"(?m)^    needs: \[job-inputs, {lane}-partition\]$")
+                self.assertNotIn("    container:", head)
+                self.assertNotIn("    services:", head)
+                steps = dict(self.job_steps(self.text, lane))
+                require = steps["Require every test partition"]
+                self.assertIn("PARTITION_RESULTS: ${{ toJSON(needs) }}", require)
+                self.assertIn("not results or any(row.get('result') != 'success' for row in results.values())", require)
+                self.assertIn("sys.exit(1)", require)
+                verify = steps["Verify exact successful partition receipts and property budget"]
+                self.assertIn(f"CI_TEST_LANE: {lane}", verify)
+                self.assertIn('run-test-partition.py --lane "$CI_TEST_LANE" --verify-receipts test-partition-receipts', verify)
+                for name, step in steps.items():
+                    self.assertNotRegex(step, r"(?m)^\s+(?:if|continue-on-error):",
+                                        f"{name!r}: a selected stable final must fail closed")
+
     def test_coverage_plan_and_merge_skip_without_rust(self):
         # No Rust inputs (docs-only, worker-UI-only): the planner skips at
         # the job level like the test lanes, and the merge skips too — its
@@ -764,17 +790,16 @@ class WorkflowSurfaceTests(unittest.TestCase):
                          ["channel moderation store clippy"])
 
     def test_check_lanes_start_with_the_selector_not_behind_slow_jobs(self):
-        # The lint lane and the test lanes run in parallel: each waits
-        # on the selector only, never on the SBOM scan or the DB jobs (the old
-        # `check` started a median ~7.8 min after the run began because it
-        # waited on them). The aggregators carry those gates instead.
-        # Exception: coverage-shard also waits on coverage-plan, the fast
-        # (~2 min) matrix it cannot start without.
-        for job in ("check", *self.RUST_LANES):
+        # Heavy workers wait only on the selector and their small matrix
+        # planner, never on lint, SBOM or sibling DB/test work. Stable
+        # finals carry the worker gates instead of serializing that work.
+        for job in ("check", "test-partition-plan", *self.RUST_LANES):
             with self.subTest(job=job):
-                head = self.job_text(self.text, job)
+                head = self.job_text(self.text, job).split("\n    steps:\n", 1)[0]
                 if job == "coverage-shard":
                     self.assertRegex(head, r"(?m)^    needs: \[job-inputs, coverage-plan\]$")
+                elif job.endswith("-partition"):
+                    self.assertRegex(head, r"(?m)^    needs: \[job-inputs, test-partition-plan\]$")
                 else:
                     self.assertRegex(head, r"(?m)^    needs: \[job-inputs\]$")
 

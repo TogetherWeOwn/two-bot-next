@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -206,6 +207,51 @@ def load_partition_module(name="run_test_partition"):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def coverage_binding_graphs(workspace):
+    from test_critical_path_support import dependency, metadata
+
+    featureless = metadata([])
+    future = deepcopy(featureless)
+    name = "two-bot-future"
+    future["packages"].append(dict(
+        id=name, name=name, version="0.4.0",
+        manifest_path="/fixture/crates/future/Cargo.toml",
+        targets=[dict(name="future_contract", kind=["test"], crate_types=["bin"],
+                      test=True, doctest=False, edition="2021",
+                      src_path="/fixture/crates/future/tests/future_contract.rs",
+                      **{"required-features": ["db"]})],
+        dependencies=[dependency("two-bot-core")],
+        features={"default": ["db", "future-marker"],
+                  "db": ["two-bot-core/db"], "future-marker": []}))
+    future["workspace_members"].append(name)
+    future["workspace_default_members"].append(name)
+    future["resolve"]["nodes"].append(dict(
+        id=name, features=["db", "default", "future-marker"],
+        dependencies=["two-bot-core"], deps=[dict(
+            name="two_bot_core", pkg="two-bot-core",
+            dep_kinds=[dict(kind=None, target=None)])]))
+    return {"workspace": workspace, "featureless-remainder": featureless,
+            "future-remainder": future}
+
+
+def probe_coverage_sweeps(run, metadata, legs):
+    """Record shell argv, not feature semantics; the independent ledger owns those."""
+    from test_critical_path_support import BOOTSTRAP, Sandbox
+
+    sandbox = Sandbox(graph=metadata)
+    try:
+        cov = sandbox.executable(
+            "cargo-llvm-cov", "import json, sys\nprint(json.dumps(['cargo', *sys.argv[1:]]))\n",
+            directory=sandbox.root)
+        wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
+        sweeps = run[run.index("for package in core discord bot cutover store other; do"):
+                     run.index("if selected_any core-stream_live_store")]
+        return sandbox.run("set -u\n" + wrapper + sweeps, dict(
+            COV=str(cov), SHARD_LEGS=" ".join(legs), TWO_TEST_DATABASE_URL=BOOTSTRAP))
+    finally:
+        sandbox.close()
 
 
 def runner_allowed(job_id, runs_on):
@@ -5889,12 +5935,17 @@ class WorkflowTests(unittest.TestCase):
         for package, selector in selectors.items():
             with self.subTest(package=package):
                 self.assertIn(f"{package}) {selector}", run)
-        # The remainder spans two lines (workspace selector plus a runtime
-        # feature query), so pin its branch, selector and feature probe.
+        # Every selector resolves its features against the full supplied
+        # workspace graph; a fixed core/db flag loses consumer-own features.
+        self.assertIn(
+            'feature_flags=$(python3 scripts/ci/plan-coverage-shards.py --sweep-features "$1") || exit 1', run)
+        self.assertIn('read -r -a sweep_features <<< "$feature_flags"', run)
         with self.subTest(package="other"):
             self.assertIn("other)", run)
             self.assertIn("sweep_args=(--workspace", run)
-            self.assertIn("--sweep-features other", run)
+            self.assertIn(
+                "other) sweep_args=(--workspace --exclude two-bot-core --exclude two-bot-discord "
+                "--exclude two-bot --exclude two-bot-cutover --exclude two-bot-store)", run)
         validated = re.search(r'case " ([a-z0-9_ -]+) " in', run)[1].split()
         self.assertEqual(validated, expected)
 
@@ -5913,13 +5964,12 @@ class WorkflowTests(unittest.TestCase):
                   if leg["id"].startswith("sweep-nonignored-")
                   or leg["id"].startswith("sweep-ignored-")]
         self.assertCountEqual([leg["id"] for leg in sweeps], EXPECTED_COVERAGE_SWEEPS)
-        # The workflow runs sweeps via per-family loops with shell-variable
-        # selectors; resolve them to effective commands for comparison. The
-        # "other" remainder resolves its features from the real feature
-        # graph at runtime (true effective behavior, not the template).
-        metadata = planner._metadata_from_cargo()
-        self.assertIsNotNone(metadata, "coverage feature graph must resolve offline")
-        other_features = planner.sweep_feature_flags("other", metadata)
+        # FULL_LEGS contains templates. Bind resolved descriptors to real
+        # shell emissions for every package, not just the remainder. This
+        # is an argv binding; feature semantics still have their separate
+        # declaration/ledger oracle in the critical-path acceptance suite.
+        workspace = planner._metadata_from_cargo()
+        self.assertIsNotNone(workspace, "coverage feature graph must resolve offline")
         logical = shell_logical_lines(step["run"])
         sweep_runs = [line for line in logical
                       if line.startswith("cov_run ")
@@ -5948,47 +5998,61 @@ class WorkflowTests(unittest.TestCase):
                       "--exclude", "two-bot-discord", "--exclude", "two-bot",
                       "--exclude", "two-bot-cutover", "--exclude", "two-bot-store"],
         }
-        for leg in sweeps:
-            with self.subTest(leg=leg["id"]):
-                parts = leg["id"].split("-")
-                family = f"{parts[0]}-{parts[1]}"
-                package = parts[2]
-                template = by_family[family]
-                tokens = shlex.split(template)[1:]
-                resolved = []
-                for token in tokens:
-                    if token == "${sweep_args[@]}":
-                        resolved.extend(packages[package])
-                    elif token == "${sweep_features[@]}":
-                        if package == "other":
-                            resolved.extend(other_features)
-                        else:
-                            resolved.extend(["--features", "two-bot-core/db"])
-                    elif token == "$COV":
-                        resolved.append("cargo")
-                    else:
-                        resolved.append(token)
-                # The bot's nonignored sweep runs the env-mutating ops
-                # replay alone right after; every other sweep stands alone.
-                if leg["id"] == "sweep-nonignored-bot":
-                    ops_tokens = ["cargo" if token == "$COV" else token
-                                  for token in shlex.split(ops_replays[0])[1:]]
-                    executed = [resolved, ops_tokens]
-                else:
-                    executed = [resolved]
-                described = [leg["command"], *leg.get("supplemental_commands", [])]
-                self.assertEqual([shlex.split(command) for command in described], executed,
-                                 f"{leg['id']} must describe every actual command, including all skips")
-                supplemental = leg.get("supplemental_commands", [])
-                if leg["id"] == "sweep-nonignored-bot":
-                    self.assertEqual(supplemental, [
-                        "cargo llvm-cov --no-report -p two-bot --bin two-bot "
-                        "--features two-bot-core/db --locked -- "
-                        "settings_jobs::tests::ops_overrides_acceptance_tests:: "
-                        "--test-threads=1 --skip regenerate_reference_docs"
+        frozen_templates = deepcopy(planner.FULL_LEGS)
+        for graph_name, metadata in coverage_binding_graphs(workspace).items():
+            with self.subTest(graph=graph_name):
+                features = {key: planner.sweep_feature_flags(key, metadata) for key in packages}
+                if graph_name == "featureless-remainder":
+                    self.assertEqual(features["other"], [])
+                elif graph_name == "future-remainder":
+                    self.assertEqual(features["other"], [
+                        "--features", "two-bot-future/db",
+                        "--features", "two-bot-future/default",
+                        "--features", "two-bot-future/future-marker",
+                        "--features", "two-bot-core/db",
+                        "--features", "two-bot-core/default",
                     ])
-                else:
-                    self.assertEqual(supplemental, [])
+                proc = probe_coverage_sweeps(step["run"], metadata, [leg["id"] for leg in sweeps])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stderr, "")
+                commands = [json.loads(line) for line in proc.stdout.splitlines()]
+                cursor = 0
+                for template in sweeps:
+                    with self.subTest(leg=template["id"]):
+                        leg = planner.resolve_sweep_leg(template, metadata)
+                        package = leg["id"].rsplit("-", 1)[1]
+                        self.assertEqual(
+                            {k: v for k, v in leg.items() if k not in ("command", "crates")},
+                            {k: v for k, v in template.items() if k not in ("command", "crates")})
+                        # The bot's nonignored sweep runs the env-mutating
+                        # ops replay immediately after, and no other leg does.
+                        count = 2 if leg["id"] == "sweep-nonignored-bot" else 1
+                        executed = commands[cursor:cursor + count]
+                        self.assertEqual(len(executed), count)
+                        cursor += count
+                        described = [leg["command"], *leg.get("supplemental_commands", [])]
+                        self.assertEqual([shlex.split(command) for command in described], executed,
+                                         f"{leg['id']} must describe every actual command, including all skips")
+                        prefix = executed[0][:executed[0].index("--")]
+                        self.assertEqual(prefix[2:2 + len(packages[package])], packages[package])
+                        emitted_features = [word for index, token in enumerate(prefix)
+                                            if token == "--features" for word in prefix[index:index + 2]]
+                        self.assertEqual(emitted_features, features[package])
+                        supplemental = leg.get("supplemental_commands", [])
+                        if leg["id"] == "sweep-nonignored-bot":
+                            self.assertEqual(supplemental, [
+                                "cargo llvm-cov --no-report -p two-bot --bin two-bot "
+                                "--features two-bot-core/db --locked -- "
+                                "settings_jobs::tests::ops_overrides_acceptance_tests:: "
+                                "--test-threads=1 --skip regenerate_reference_docs"
+                            ])
+                        else:
+                            self.assertEqual(supplemental, [])
+                self.assertEqual(cursor, len(commands), "unexpected or duplicate sweep invocation")
+                for replay in planner.FULL_LEGS:
+                    if replay["id"] in EXPECTED_COVERAGE_REPLAYS:
+                        self.assertEqual(planner.resolve_sweep_leg(replay, metadata), replay)
+                self.assertEqual(planner.FULL_LEGS, frozen_templates, "resolution must not mutate templates")
         # The serial invite-saturation replay is its own store leg; its
         # guarded block must run exactly the command the planner describes.
         invite = next(leg for leg in planner.FULL_LEGS
@@ -6011,6 +6075,116 @@ class WorkflowTests(unittest.TestCase):
              for line in shell_logical_lines(invite_block) if line.startswith("cov_run ")],
             [shlex.split(invite["command"])],
         )
+
+    def test_coverage_resolved_sweep_owners_match_the_graph_members(self):
+        spec = importlib.util.spec_from_file_location(
+            "sweep_owners_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
+        planner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planner)
+        workspace = planner._metadata_from_cargo()
+        self.assertIsNotNone(workspace, "coverage feature graph must resolve offline")
+        packages = {"core": "two-bot-core", "discord": "two-bot-discord", "bot": "two-bot",
+                    "cutover": "two-bot-cutover", "store": "two-bot-store"}
+        for name, graph in coverage_binding_graphs(workspace).items():
+            members = {package["name"] for package in graph["packages"]
+                       if package["id"] in graph["workspace_members"]}
+            for template in planner.FULL_LEGS:
+                if template["id"] not in EXPECTED_COVERAGE_SWEEPS:
+                    continue
+                with self.subTest(graph=name, leg=template["id"]):
+                    key = template["id"].rsplit("-", 1)[1]
+                    expected = [packages[key]] if key in packages else members - set(packages.values())
+                    leg = planner.resolve_sweep_leg(template, graph)
+                    self.assertCountEqual(leg["crates"], expected,
+                                          "descriptor owners must match the graph-selected packages")
+
+    def test_coverage_core_change_keeps_the_ignored_future_remainder(self):
+        from test_critical_path_support import metadata
+
+        spec = importlib.util.spec_from_file_location(
+            "future_sweep_scope_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
+        planner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planner)
+        graph = coverage_binding_graphs(metadata([]))["future-remainder"]
+        plan = planner.plan(["crates/core/src/lib.rs"], 8,
+                            event_name="pull_request", ref="refs/pull/1/merge", metadata=graph)
+        # The future package has its own feature-gated target and a normal
+        # core dependency. A core edit must measure its ignored tests too,
+        # not only the always-on nonignored remainder.
+        self.assertIn("sweep-ignored-other", plan["legs"],
+                      "core reverse-dependent future member lost its ignored coverage owner")
+        self.assertEqual(sum(shard.count("sweep-ignored-other") for shard in plan["shards"]), 1)
+
+    def test_coverage_descriptor_cli_matches_the_supplied_graph(self):
+        from test_critical_path_support import Sandbox, metadata
+
+        spec = importlib.util.spec_from_file_location(
+            "cli_sweep_shard_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
+        planner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planner)
+        for name, graph in coverage_binding_graphs(metadata([])).items():
+            with self.subTest(graph=name):
+                sandbox = Sandbox(graph=graph)
+                try:
+                    proc = sandbox.run("python3 scripts/ci/plan-coverage-shards.py --describe-sweeps")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual(proc.stderr, "")
+                    described = json.loads(proc.stdout)
+                    self.assertEqual(described, [planner.resolve_sweep_leg(leg, graph)
+                                                 for leg in planner.FULL_LEGS])
+                    for key in ("core", "discord", "bot", "cutover", "store", "other"):
+                        with self.subTest(package=key):
+                            flags = sandbox.run(
+                                f"python3 scripts/ci/plan-coverage-shards.py --sweep-features {key}")
+                            self.assertEqual(flags.returncode, 0, flags.stdout + flags.stderr)
+                            self.assertEqual(flags.stderr, "")
+                            self.assertEqual(shlex.split(flags.stdout), planner.sweep_feature_flags(key, graph))
+                finally:
+                    sandbox.close()
+
+    def test_coverage_sweep_binding_rejects_incomplete_graphs_and_widens(self):
+        from test_critical_path_support import Sandbox, metadata
+
+        spec = importlib.util.spec_from_file_location(
+            "invalid_sweep_shard_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
+        planner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planner)
+        incomplete = metadata([])
+        incomplete["resolve"]["nodes"] = [node for node in incomplete["resolve"]["nodes"]
+                                            if node["id"] != "two-bot-discord"]
+        graphs = {"malformed": {}, "empty-resolve": metadata([]), "missing-member-node": incomplete}
+        graphs["empty-resolve"]["resolve"]["nodes"] = []
+        step = next(
+            step for step in self.workflows["check.yml"]["jobs"]["coverage-shard"]["steps"]
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)")
+        sweeps = [leg for leg in planner.FULL_LEGS if leg["id"] in EXPECTED_COVERAGE_SWEEPS]
+        for name, graph in graphs.items():
+            with self.subTest(graph=name):
+                for leg in sweeps:
+                    key = leg["id"].rsplit("-", 1)[1]
+                    with self.subTest(leg=leg["id"]):
+                        with self.assertRaises(ValueError):
+                            planner.sweep_feature_flags(key, graph)
+                        with self.assertRaises(ValueError):
+                            planner.resolve_sweep_leg(leg, graph)
+                        proc = probe_coverage_sweeps(step["run"], graph, [leg["id"]])
+                        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                        self.assertEqual(proc.stdout, "", "bad metadata must never invoke coverage")
+                        self.assertIn("could not resolve coverage feature graph", proc.stderr)
+                sandbox = Sandbox(graph=graph)
+                try:
+                    proc = sandbox.run("python3 scripts/ci/plan-coverage-shards.py --describe-sweeps")
+                    self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                    self.assertEqual(proc.stdout, "")
+                    self.assertIn("could not resolve coverage command descriptors", proc.stderr)
+                finally:
+                    sandbox.close()
+                plan = planner.plan(["crates/core/src/lib.rs"], 8,
+                                    event_name="pull_request", ref="refs/pull/1/merge", metadata=graph)
+                self.assertTrue(plan["widened"])
+                expected = [leg["id"] for leg in planner.FULL_LEGS]
+                self.assertCountEqual(plan["legs"], expected)
+                self.assertCountEqual([leg for shard in plan["shards"] for leg in shard], expected)
 
     def test_coverage_shard_caches_the_instrumented_build(self):
         # Each shard restores its own rust-cache entry and reports sccache

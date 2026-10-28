@@ -373,6 +373,27 @@ class MentionOnlyRunnerRejectedTests(unittest.TestCase):
                 errors = check_fixture(check_yml, NIGHTLY_YML, dict(BOT_ALIVE))
                 assert_orphaned(self, errors, "alive", True)
 
+    def test_unreachable_worker_or_verifier_after_exit_does_not_route(self):
+        # The supported worker/verifier interface is one direct command,
+        # not a general shell reachability proof. A valid argv after an
+        # unconditional successful exit must not satisfy that interface.
+        commands = {
+            "worker": 'python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"',
+            "verifier": 'python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --verify-receipts test-partition-receipts',
+        }
+        for role, command in commands.items():
+            self.assertEqual(VALID_CHECK_YML.count("run: " + command), 2)
+            unreachable = "run: |\n          exit 0\n          " + command
+            check_yml = with_direct_markers(
+                VALID_CHECK_YML.replace("run: " + command, unreachable))
+            for files, name, ignored in (
+                (MYCRATE_PLAIN, "plain", False),
+                (BOT_ALIVE, "alive", True),
+            ):
+                with self.subTest(role=role, target=name):
+                    errors = check_fixture(check_yml, NIGHTLY_YML, dict(files))
+                    assert_orphaned(self, errors, name, ignored)
+
     def test_non_run_mentions_do_not_route(self):
         worker_run = 'run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"'
         mention_steps = {
