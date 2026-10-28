@@ -96,6 +96,11 @@ async fn urgent_tail() {
         "1546451670500643001",
         "1546451670500643002",
     ];
+    let channels = [
+        "1546451670500642111",
+        "1546451670500642112",
+        "1546451670500642113",
+    ];
     // Map the event's wall-clock start to the mock's monotonic arrival clock.
     // The audit timestamp is a pre-wire fence, not evidence of timely delivery.
     let wire_epoch = tokio::time::Instant::now();
@@ -103,15 +108,17 @@ async fn urgent_tail() {
     let starts = now + 10_000;
     let wire_deadline = wire_epoch + Duration::from_millis(starts - now);
     let mut events: Vec<_> = ids
-        .map(|id| ScheduledEvent {
+        .into_iter()
+        .zip(channels)
+        .map(|(id, channel)| ScheduledEvent {
             id: id.to_owned(),
             name: "Late eligibility".to_owned(),
             starts_at: format_iso_ms(starts),
-            channel_id: Some("1546451670500642111".to_owned()),
+            channel_id: Some(channel.to_owned()),
             description: None,
             status: EventStatus::Scheduled,
         })
-        .into();
+        .collect();
     let later_id = "1546451670500643003";
     let mut later = events[0].clone();
     later.id = later_id.to_owned();
@@ -255,13 +262,13 @@ async fn urgent_tail() {
             .count(),
         3
     );
-    for id in ids {
-        let link = format!("https://discord.com/events/{guild}/{id}");
+    // Ordinary reminders need not contain event URLs. Distinct destinations
+    // identify each fixture event without depending on its rendered copy.
+    for (id, channel) in ids.into_iter().zip(channels) {
+        let path = format!("/api/v10/channels/{channel}/messages");
         let arrivals: Vec<_> = requests
             .iter()
-            .filter(|request| {
-                request.method == "POST" && String::from_utf8_lossy(&request.body).contains(&link)
-            })
+            .filter(|request| request.method == "POST" && request.path == path)
             .collect();
         assert_eq!(arrivals.len(), 1, "one actual reminder arrival for {id}");
         assert!(
