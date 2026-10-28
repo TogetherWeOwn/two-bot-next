@@ -254,7 +254,7 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .min_value(1)]),
         // Next-only queue inspection and body-only correction (parity rows
-        // 37–38): inspect the saved definition privately, or correct its
+        // 48–49): inspect the saved definition privately, or correct its
         // body without replacing the stable schedule. Published after
         // `schedule-list`; automation-gated and `ManageGuild`-gated like
         // the other admin commands. The edit surface is body-only: no

@@ -224,6 +224,17 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
             "Privately inspect saved lockdown and live slowmode",
         )
         .permissions(PERM_MANAGE_CHANNELS),
+        CommandDefinition::new(
+            "moderation-recent",
+            "Privately list recent saved moderation actions",
+        )
+        .permissions(PERM_MODERATE_MEMBERS)
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of saved moderation actions (1 is newest)",
+            CommandOptionType::Integer,
+        )
+        .int_range(1, crate::moderation_recent::RECENT_MAX_PAGE)]),
     ]
 }
 
@@ -627,13 +638,19 @@ mod tests {
                 "unlock",
                 "purge-preview",
                 "channel-inspect",
+                "moderation-recent",
             ]
         );
         assert_eq!(ModerationAction::ALL.len(), 9, "reads are not mutations");
         let mutation_names: Vec<_> = names
             .iter()
             .copied()
-            .filter(|name| !matches!(*name, "tempban-list" | "purge-preview" | "channel-inspect"))
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "tempban-list" | "purge-preview" | "channel-inspect" | "moderation-recent"
+                )
+            })
             .collect();
         assert_eq!(mutation_names.len(), 9);
         for (action, name) in ModerationAction::ALL.iter().zip(mutation_names) {
@@ -645,8 +662,8 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 7 core + 27 slice-2 + 9 moderation mutations + 3 private reads.
-        assert_eq!(merged.len(), 46);
+        // 7 core + 27 slice-2 + 9 moderation mutations + 4 private reads.
+        assert_eq!(merged.len(), 47);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             &names[..8],
@@ -690,7 +707,8 @@ mod tests {
                 "lockdown",
                 "unlock",
                 "purge-preview",
-                "channel-inspect"
+                "channel-inspect",
+                "moderation-recent"
             ]
         );
         assert!(merged.iter().all(|d| !d.dm_permission));
@@ -838,7 +856,23 @@ mod tests {
                 "default_member_permissions": "16"
             })
         );
-        assert_eq!(json.as_array().expect("array").len(), 12);
+        assert_eq!(
+            json[12],
+            serde_json::json!({
+                "name": "moderation-recent",
+                "description": "Privately list recent saved moderation actions",
+                "dm_permission": false,
+                "default_member_permissions": "1099511627776",
+                "options": [{
+                    "name": "page",
+                    "description": "Page of saved moderation actions (1 is newest)",
+                    "type": 4,
+                    "min_value": 1,
+                    "max_value": 20
+                }]
+            })
+        );
+        assert_eq!(json.as_array().expect("array").len(), 13);
     }
 
     #[test]

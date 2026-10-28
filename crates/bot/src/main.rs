@@ -101,6 +101,7 @@ mod member_cli;
 mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
+mod moderation_recent_command;
 mod moderation_release_cli;
 mod music_capture;
 #[cfg(test)]
