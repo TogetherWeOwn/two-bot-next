@@ -31,6 +31,15 @@ PACKAGES = {
     "two-bot-cutover": "cutover", "two-bot-store": "store",
     "two-bot-testsupport": "testsupport", "two-bot-next": "root",
 }
+# The remainder retains its public id; these are three package-wide libtest
+# selections, not three binary-only sweeps or a new partition framework.
+IGNORED_BOT_LEGS = (
+    "sweep-ignored-bot-gateway", "sweep-ignored-bot-self-role", "sweep-ignored-bot",
+)
+
+
+def sweep_package(leg_id):
+    return "bot" if leg_id in IGNORED_BOT_LEGS else leg_id.rsplit("-", 1)[1]
 
 
 def workflow():
@@ -268,7 +277,9 @@ def selections(argv, rows, graph=None):
     It covers the baseline command shapes, not arbitrary Cargo/nextest semantics.
     """
     args = list(argv)
-    if args and args[0] in ("test", "llvm-cov", "run"):
+    if args[:2] == ["llvm-cov", "test"]:
+        del args[:2]
+    elif args and args[0] in ("test", "llvm-cov", "run"):
         args.pop(0)
     if "--" in args:
         split = args.index("--")

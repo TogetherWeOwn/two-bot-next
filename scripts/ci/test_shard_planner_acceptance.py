@@ -54,6 +54,8 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+from test_critical_path_support import IGNORED_BOT_LEGS
+
 ROOT = Path(__file__).resolve().parents[2]
 PLANNER_PATH = Path(__file__).with_name("plan-coverage-shards.py")
 MERGE_PATH = Path(__file__).with_name("merge-coverage-shards.py")
@@ -91,11 +93,13 @@ EXPECTED_DEDICATED_LEGS = [
     ("two-bot-core", "member_moderation_db", True),
     ("two-bot-store", "invite_uses_saturation_acceptance", True),
 ]
-# Six sweep packages per family (nonignored + ignored): the remainder
-# ("other") owns root/testsupport and any future workspace member.
+# Six sweep packages per family, with the ignored bot owner split into three
+# package-wide selections. "other" still owns root/testsupport/future members.
 EXPECTED_SWEEP_PACKAGES = ("core", "discord", "bot", "cutover", "store", "other")
 EXPECTED_SWEEP_FAMILIES = ("sweep-nonignored", "sweep-ignored")
-EXPECTED_SWEEP_LEGS = len(EXPECTED_SWEEP_PACKAGES) * len(EXPECTED_SWEEP_FAMILIES)
+EXPECTED_SWEEP_IDS = {f"{family}-{package}" for family in EXPECTED_SWEEP_FAMILIES
+                      for package in EXPECTED_SWEEP_PACKAGES} | set(IGNORED_BOT_LEGS)
+EXPECTED_SWEEP_LEGS = len(EXPECTED_SWEEP_IDS)
 EXPECTED_TOTAL_LEGS = len(EXPECTED_DEDICATED_LEGS) + EXPECTED_SWEEP_LEGS
 
 KNOWN_PACKAGES = {
@@ -171,10 +175,7 @@ def matches_dedicated(cmd, pkg, target, via_test_flag):
 
 
 def is_sweep_leg(leg):
-    leg_id = leg.get("id", "")
-    return any(leg_id == f"{family}-{package}"
-               for family in EXPECTED_SWEEP_FAMILIES
-               for package in EXPECTED_SWEEP_PACKAGES)
+    return leg.get("id", "") in EXPECTED_SWEEP_IDS
 
 
 def is_workspace_sweep(leg):
@@ -379,10 +380,10 @@ class PartitionTests(unittest.TestCase):
     def test_shards_cover_every_leg_exactly_once(self):
         planner = load_planner(self)
         full = set(full_leg_ids(planner))
-        # A workspace-wide change widens to the full 27-leg set; a core
+        # A workspace-wide change widens to the full 29-leg set; a core
         # change is scoped to its affected packages (see
         # test_core_change_selects_affected_packages_without_widening).
-        for count in (1, 2, 4, 6):
+        for count in (1, 2, 4, 6, 8):
             with self.subTest(shards=count):
                 result = make_plan(planner, ["Cargo.lock"],
                                    shards=count)

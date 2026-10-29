@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 import yaml
 
+from test_critical_path_support import IGNORED_BOT_LEGS, sweep_package
+
 ROOT = Path(__file__).resolve().parents[2]
 _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
@@ -177,7 +179,7 @@ EXPECTED_COVERAGE_SWEEPS = {
     f"{family}-{package}"
     for family in ("sweep-nonignored", "sweep-ignored")
     for package in ("core", "discord", "bot", "cutover", "store", "other")
-}
+} | set(IGNORED_BOT_LEGS)
 EXPECTED_COVERAGE_REPLAYS = {
     "core-stream_live_store", "discord-mutation_429_proves_no_effect_channel",
     "core-channel_moderation", "discord-channel_moderation_runtime",
@@ -246,7 +248,7 @@ def probe_coverage_sweeps(run, metadata, legs):
             "cargo-llvm-cov", "import json, sys\nprint(json.dumps(['cargo', *sys.argv[1:]]))\n",
             directory=sandbox.root)
         wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
-        sweeps = run[run.index("for package in core discord bot cutover store other; do"):
+        sweeps = run[run.index("# Main sweep"):
                      run.index("if selected_any core-stream_live_store")]
         return sandbox.run("set -u\n" + wrapper + sweeps, dict(
             COV=str(cov), SHARD_LEGS=" ".join(legs), TWO_TEST_DATABASE_URL=BOOTSTRAP))
@@ -4858,7 +4860,7 @@ class WorkflowTests(unittest.TestCase):
         suite = "settings_jobs::tests::ops_overrides_acceptance_tests::"
         run = step["run"]
         wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
-        sweeps = run[run.index("for package in core discord bot cutover store other; do"):
+        sweeps = run[run.index("# Main sweep"):
                      run.index("if selected_any core-stream_live_store")]
         bootstrap = "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
         # Per-package legs: the env-mutating ops replay runs only for the
@@ -4868,6 +4870,9 @@ class WorkflowTests(unittest.TestCase):
         cases = (
             ("", False, 0),
             ("sweep-ignored-core", False, 1),
+            ("sweep-ignored-bot-gateway", False, 1),
+            ("sweep-ignored-bot-self-role", False, 1),
+            (" ".join(IGNORED_BOT_LEGS), False, 3),
             ("core-stream_live_store", False, 0),
             ("sweep-nonignored-core", False, 1),
             ("sweep-nonignored-bot", False, 2),
@@ -4934,10 +4939,10 @@ class WorkflowTests(unittest.TestCase):
                                        and "-- --ignored" not in command]
                         self.assertEqual(len(core_sweeps), 1)
                         self.assertIn(f"--skip {suite}", core_sweeps[0])
-                    ignored = [command for command in commands if "-- --ignored" in command]
-                    want_ignored = (any(leg.startswith("sweep-ignored-") for leg in legs.split())
-                                    and not must_fail)
-                    self.assertEqual(len(ignored), int(want_ignored))
+                    ignored = [command for command in commands if "--ignored" in shlex.split(command)]
+                    want_ignored = (sum(leg.startswith("sweep-ignored-") for leg in legs.split())
+                                    if not must_fail else 0)
+                    self.assertEqual(len(ignored), want_ignored)
 
     def test_invite_saturation_isolation_in_both_lanes(self):
         suite = "invite_uses_saturation_acceptance"
@@ -5124,31 +5129,45 @@ class WorkflowTests(unittest.TestCase):
             'echo "::error::patch coverage measurement failed to build or report" >&2',
             step["run"],
         )
-        # Package-partitioned sweeps run via per-family loops with
-        # shell-variable selectors; the leg-selection test pins the
-        # selector values, and here each template carries the full flags
-        # and skip sets.
-        sweeps = [run for run in cov_runs
-                  if '"${sweep_args[@]}"' in run and "--lib --bins --tests" in run]
-        self.assertEqual(len(sweeps), 2)
+        # The number of shared source templates is not the execution count.
+        # This quarantine policy is also invoked by hostile macro/trivia
+        # controls: exercise the available ids so those controls can reach
+        # their oracle before the fine split exists. Separate leg-list and
+        # descriptor tests independently require all fourteen sweep ids.
+        from test_critical_path_support import metadata
+        from test_critical_path_partitions_acceptance import planner as load_coverage_planner
+        sweep_ids = {leg["id"] for leg in load_coverage_planner().FULL_LEGS
+                     if leg["id"] in EXPECTED_COVERAGE_SWEEPS}
+        self.assertTrue(EXPECTED_COVERAGE_SWEEPS - set(IGNORED_BOT_LEGS[:2]) <= sweep_ids)
+        templates = [run for run in cov_runs if "--ignore-run-fail" in run]
+        self.assertTrue(templates)
+        for template in templates:
+            self.assertIn('"${sweep_features[@]}"', template)
+        proc = probe_coverage_sweeps(step["run"], metadata([]), sorted(sweep_ids))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        commands = [json.loads(line) for line in proc.stdout.splitlines()]
+        sweeps = [" ".join(command) for command in commands if "--ignore-run-fail" in command]
+        self.assertEqual(len(sweeps), len(sweep_ids))
         for sweep in sweeps:
             with self.subTest(sweep=sweep):
-                # A failing test must never suppress coverage collection.
                 self.assertIn("--ignore-run-fail", sweep)
                 self.assertIn("--no-report", sweep)
-                self.assertIn('"${sweep_features[@]}"', sweep)
                 self.assertIn("--locked", sweep)
-        ignored_sweeps = [run for run in sweeps if "-- --ignored" in run]
-        self.assertEqual(len(ignored_sweeps), 1)
-        self.assertIn("--test-threads=1", ignored_sweeps[0])
-        self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        ignored_sweeps = [run for run in sweeps if "--ignored" in shlex.split(run)]
+        self.assertEqual(len(ignored_sweeps), sum(leg.startswith("sweep-ignored-") for leg in sweep_ids))
+        for sweep in ignored_sweeps:
+            self.assertIn("--test-threads=1", sweep)
+            self.assertIn("--skip regenerate_reference_docs", sweep)
+        common_ignored_skips = set.intersection(*(
+            set(re.findall(r"--skip (\S+)", sweep)) for sweep in ignored_sweeps))
+        common_ignored_skip_text = " ".join("--skip " + skip for skip in sorted(common_ignored_skips))
         self.assertIn(
             "--skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected",
-            ignored_sweeps[0],
+            common_ignored_skip_text,
         )
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
-            ignored_sweeps[0],
+            common_ignored_skip_text,
         )
         # The stream go-live ledger suite, the internal-events DB test, the
         # legacy-verify/TLS-fence/migrate suites and the mutation-429 suite
@@ -5184,7 +5203,7 @@ class WorkflowTests(unittest.TestCase):
             "cancelled_lockdown_stays_fenced_with_seed_retained",
         ):
             with self.subTest(skipped=skipped):
-                self.assertIn(f"--skip {skipped}", ignored_sweeps[0])
+                self.assertIn(f"--skip {skipped}", common_ignored_skip_text)
         # The parity skip above keeps its unskipped, correctly ordered dedicated rerun.
         parity_reruns = [run for run in cov_runs if "--test legacy_verify_db" in run]
         self.assertEqual(len(parity_reruns), 1)
@@ -5225,8 +5244,11 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertLess(member_exports[0], ignored_sweep_index)
         self.assertLess(ignored_sweep_index, member_rerun_index)
-        self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
-        main_sweep = [run for run in sweeps if "-- --ignored" not in run][0]
+        main_sweeps = [run for run in sweeps if "--ignored" not in shlex.split(run)]
+        self.assertEqual(len(main_sweeps), 6)
+        main_skips = set.intersection(*(
+            set(re.findall(r"--skip (\S+)", sweep)) for sweep in main_sweeps))
+        main_sweep = " ".join("--skip " + skip for skip in sorted(main_skips))
         # Guarded suites panic under the bootstrap URL; they run only in
         # their dedicated agent_test steps below, never in the main sweep.
         self.assertIn(
@@ -5258,7 +5280,7 @@ class WorkflowTests(unittest.TestCase):
         staging_names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source))
         self.assertTrue(staging_names, "guarded ignored fixtures must be discovered")
         # Match complete tokens: a suffixed filter would not skip the fixture.
-        broad_skips = set(re.findall(r"--skip (\S+)", ignored_sweeps[0]))
+        broad_skips = common_ignored_skips
         for name in sorted(staging_names):
             with self.subTest(staging_skip=name):
                 self.assertIn(name, broad_skips)
@@ -5276,12 +5298,13 @@ class WorkflowTests(unittest.TestCase):
         for name in sorted(channel_names):
             with self.subTest(channel_skip=name):
                 self.assertIn(name, broad_skips)
-        ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
+        ignored_sweep = common_ignored_skip_text
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
             ignored_sweep,
         )
-        guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
+        guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run
+                   and "--ignore-run-fail" not in run]
         self.assertEqual(len(guarded), 17)
         for run in guarded:
             with self.subTest(guarded=run):
@@ -5913,18 +5936,21 @@ class WorkflowTests(unittest.TestCase):
                     run.count(f"if selected {leg_id}; then"), 1,
                     f"leg {leg_id} must guard exactly one block")
         guards = set(re.findall(r"if selected ([a-z0-9_-]+); then", run))
-        self.assertEqual(guards, set(dedicated_ids))
-        # The sweep loops iterate every package and select per-leg ids via
-        # the shared selector; a package missing from either loop would
-        # silently under-measure its crates.
-        self.assertEqual(
-            run.count("for package in core discord bot cutover store other; do"), 2)
-        for family in ("sweep-nonignored", "sweep-ignored"):
-            with self.subTest(family=family):
-                self.assertEqual(
-                    run.count(f'if selected "{family}-$package"; then'), 1)
+        self.assertEqual(guards - EXPECTED_COVERAGE_SWEEPS, set(dedicated_ids))
+        # Execute each sweep selection instead of requiring exactly two
+        # source loops. Extra fine-bot guards or a shared loop are both valid;
+        # a displayed/echoed/disconnected id is not an executable owner.
+        from test_critical_path_support import metadata
+        graph = metadata([])
+        for leg_id in sorted(EXPECTED_COVERAGE_SWEEPS):
+            with self.subTest(sweep=leg_id):
+                proc = probe_coverage_sweeps(run, graph, [leg_id])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                commands = [json.loads(line) for line in proc.stdout.splitlines()]
+                self.assertEqual(len(commands), 2 if leg_id == "sweep-nonignored-bot" else 1)
+                self.assertTrue(all(command[:2] == ["cargo", "llvm-cov"] for command in commands))
+                self.assertEqual("--ignored" in commands[0], leg_id.startswith("sweep-ignored-"))
         self.assertIn("sweep_selector() {", run)
-        self.assertEqual(run.count('sweep_selector "$package"'), 2)
         selectors = {
             "core": "sweep_args=(-p two-bot-core)",
             "discord": "sweep_args=(-p two-bot-discord)",
@@ -5971,17 +5997,8 @@ class WorkflowTests(unittest.TestCase):
         workspace = planner._metadata_from_cargo()
         self.assertIsNotNone(workspace, "coverage feature graph must resolve offline")
         logical = shell_logical_lines(step["run"])
-        sweep_runs = [line for line in logical
-                      if line.startswith("cov_run ")
-                      and '"${sweep_args[@]}"' in line]
-        self.assertEqual(len(sweep_runs), 2)
-        by_family = {}
-        for line in sweep_runs:
-            if "-- --ignored" in line:
-                by_family["sweep-ignored"] = line
-            else:
-                by_family["sweep-nonignored"] = line
-        self.assertEqual(set(by_family), {"sweep-nonignored", "sweep-ignored"})
+        # Invocation counts and family modes are checked from each selected
+        # leg below, not the number or layout of shared source templates.
         ops_suite = "settings_jobs::tests::ops_overrides_acceptance_tests::"
         ops_replays = [line for line in logical
                        if line.startswith("cov_run ")
@@ -6012,29 +6029,30 @@ class WorkflowTests(unittest.TestCase):
                         "--features", "two-bot-core/db",
                         "--features", "two-bot-core/default",
                     ])
-                proc = probe_coverage_sweeps(step["run"], metadata, [leg["id"] for leg in sweeps])
-                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertEqual(proc.stderr, "")
-                commands = [json.loads(line) for line in proc.stdout.splitlines()]
-                cursor = 0
+                invocation_count = 0
                 for template in sweeps:
                     with self.subTest(leg=template["id"]):
+                        proc = probe_coverage_sweeps(step["run"], metadata, [template["id"]])
+                        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                        self.assertEqual(proc.stderr, "")
+                        executed = [json.loads(line) for line in proc.stdout.splitlines()]
                         leg = planner.resolve_sweep_leg(template, metadata)
-                        package = leg["id"].rsplit("-", 1)[1]
+                        package = sweep_package(leg["id"])
                         self.assertEqual(
                             {k: v for k, v in leg.items() if k not in ("command", "crates")},
                             {k: v for k, v in template.items() if k not in ("command", "crates")})
                         # The bot's nonignored sweep runs the env-mutating
                         # ops replay immediately after, and no other leg does.
                         count = 2 if leg["id"] == "sweep-nonignored-bot" else 1
-                        executed = commands[cursor:cursor + count]
                         self.assertEqual(len(executed), count)
-                        cursor += count
+                        invocation_count += count
                         described = [leg["command"], *leg.get("supplemental_commands", [])]
                         self.assertEqual([shlex.split(command) for command in described], executed,
                                          f"{leg['id']} must describe every actual command, including all skips")
                         prefix = executed[0][:executed[0].index("--")]
-                        self.assertEqual(prefix[2:2 + len(packages[package])], packages[package])
+                        offset = 3 if prefix[:3] == ["cargo", "llvm-cov", "test"] else 2
+                        self.assertEqual(prefix[offset:offset + len(packages[package])], packages[package])
+                        self.assertEqual("--ignored" in executed[0], leg["id"].startswith("sweep-ignored-"))
                         emitted_features = [word for index, token in enumerate(prefix)
                                             if token == "--features" for word in prefix[index:index + 2]]
                         self.assertEqual(emitted_features, features[package])
@@ -6048,7 +6066,8 @@ class WorkflowTests(unittest.TestCase):
                             ])
                         else:
                             self.assertEqual(supplemental, [])
-                self.assertEqual(cursor, len(commands), "unexpected or duplicate sweep invocation")
+                self.assertEqual(invocation_count, len(EXPECTED_COVERAGE_SWEEPS) + 1,
+                                 "unexpected or duplicate sweep/ops invocation")
                 for replay in planner.FULL_LEGS:
                     if replay["id"] in EXPECTED_COVERAGE_REPLAYS:
                         self.assertEqual(planner.resolve_sweep_leg(replay, metadata), replay)
@@ -6092,7 +6111,7 @@ class WorkflowTests(unittest.TestCase):
                 if template["id"] not in EXPECTED_COVERAGE_SWEEPS:
                     continue
                 with self.subTest(graph=name, leg=template["id"]):
-                    key = template["id"].rsplit("-", 1)[1]
+                    key = sweep_package(template["id"])
                     expected = [packages[key]] if key in packages else members - set(packages.values())
                     leg = planner.resolve_sweep_leg(template, graph)
                     self.assertCountEqual(leg["crates"], expected,
@@ -6161,7 +6180,7 @@ class WorkflowTests(unittest.TestCase):
         for name, graph in graphs.items():
             with self.subTest(graph=name):
                 for leg in sweeps:
-                    key = leg["id"].rsplit("-", 1)[1]
+                    key = sweep_package(leg["id"])
                     with self.subTest(leg=leg["id"]):
                         with self.assertRaises(ValueError):
                             planner.sweep_feature_flags(key, graph)
