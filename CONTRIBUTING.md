@@ -78,8 +78,14 @@ property-test execution budget below 30 seconds; compiling all integrations in
 one timing-only worker would reintroduce the critical path.
 
 Coverage splits both ignored and nonignored sweeps by package before assigning
-legs to eight runners. A remainder partition includes root/testsupport and future
-workspace packages; each package still discovers all of its targets. The
+29 legs to eight runners: 14 sweep owners and 15 dedicated replays. The ignored
+bot sweep has three serial, package-wide libtest groups: `gateway_tests::`,
+`self_role_runtime::` excluding the gateway group, and a catch-all excluding both.
+All three discover every lib/bin/integration target, including future targets;
+the ordered exclusions give overlapping names exactly one owner. The default
+full plan places these groups on distinct runners, each with its own disposable
+database service. Every group retains the original global skip list. A separate
+workspace remainder owns root/testsupport and future workspace packages. The
 workspace-package features are resolved from the full workspace before selecting
 packages: enabling only `two-bot-core/db` would lose the consumer's own `db`
 feature. Unrelated packages cannot accept that dependency feature flag. The

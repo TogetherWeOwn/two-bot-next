@@ -1452,7 +1452,7 @@ jobs:
               *" $leg "*) echo "::error::duplicate coverage leg: $leg" >&2; exit 1 ;;
             esac
             seen_legs+="$leg "
-            case " sweep-nonignored-core sweep-nonignored-discord sweep-nonignored-bot sweep-nonignored-cutover sweep-nonignored-store sweep-nonignored-other sweep-ignored-core sweep-ignored-discord sweep-ignored-bot sweep-ignored-cutover sweep-ignored-store sweep-ignored-other core-stream_live_store discord-mutation_429_proves_no_effect_channel core-channel_moderation discord-channel_moderation_runtime discord-internal_channel_moderation core-feeds_store cutover-legacy_verify_db cutover-legacy_tls_fence cutover-staging_migrate_db discord-internal_events cutover-raid_list_db cutover-reengagement_list_db cutover-game_activity_report_db core-member_moderation_db store-invite_uses_saturation_acceptance " in
+            case " sweep-nonignored-core sweep-nonignored-discord sweep-nonignored-bot sweep-nonignored-cutover sweep-nonignored-store sweep-nonignored-other sweep-ignored-core sweep-ignored-discord sweep-ignored-bot-gateway sweep-ignored-bot-self-role sweep-ignored-bot sweep-ignored-cutover sweep-ignored-store sweep-ignored-other core-stream_live_store discord-mutation_429_proves_no_effect_channel core-channel_moderation discord-channel_moderation_runtime discord-internal_channel_moderation core-feeds_store cutover-legacy_verify_db cutover-legacy_tls_fence cutover-staging_migrate_db discord-internal_events cutover-raid_list_db cutover-reengagement_list_db cutover-game_activity_report_db core-member_moderation_db store-invite_uses_saturation_acceptance " in
               *" $leg "*) ;;
               *) echo "::error::unknown coverage leg: $leg" >&2; exit 1 ;;
             esac
@@ -1547,9 +1547,17 @@ jobs:
           # two_bot_test_ci URL on this step; they run in their dedicated sweep
           # below after TWO_TEST_DATABASE_URL is pinned to agent_test.
           # The parity acceptance has an exact-URL guard; its dedicated re-run below uses the accepted endpoint.
-          for package in core discord bot cutover store other; do
+          # Split the hot bot binary without narrowing future lib/bin/test targets.
+          # The catch-all and ordered skip preserve exactly one substring owner.
+          for package in core discord bot-gateway bot-self-role bot cutover store other; do
           if selected "sweep-ignored-$package"; then
-          sweep_selector "$package"
+          ignored_filters=()
+          case "$package" in
+            bot-gateway) sweep_selector bot; ignored_filters=(gateway_tests::) ;;
+            bot-self-role) sweep_selector bot; ignored_filters=(self_role_runtime:: --skip gateway_tests::) ;;
+            bot) sweep_selector bot; ignored_filters=(--skip gateway_tests:: --skip self_role_runtime::) ;;
+            *) sweep_selector "$package" ;;
+          esac
           cov_run "$COV" llvm-cov "${sweep_args[@]}" --lib --bins --tests \
             "${sweep_features[@]}" --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
@@ -1596,7 +1604,8 @@ jobs:
             --skip pins_list_through_rate_limit_client_persists_metadata_only \
             --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting \
             --skip persisted_rows_hold_ids_timestamps_enums_only \
-            --skip resume_continues_from_persisted_cursors_per_family
+            --skip resume_continues_from_persisted_cursors_per_family \
+            "${ignored_filters[@]}"
           fi
           done
           # Guarded channel suites accept the exact agent_test URL and the

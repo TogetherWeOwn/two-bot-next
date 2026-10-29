@@ -282,6 +282,17 @@ def _expand_sweeps(legs):
             part.pop("supplemental_commands", None)
             if package == "two-bot" and "supplemental_commands" in leg:
                 part["supplemental_commands"] = leg["supplemental_commands"]
+            if leg["id"] == "sweep-ignored" and package == "two-bot":
+                # Keep package-wide target discovery and substring skip semantics.
+                # Ordered exclusions make nested group names single-owner too.
+                for suffix, filters in (
+                    ("gateway", "gateway_tests::"),
+                    ("self-role", "self_role_runtime:: --skip gateway_tests::"),
+                ):
+                    expanded.append(dict(part, id=f"{part['id']}-{suffix}",
+                                         command=part["command"] + " " + filters,
+                                         sweep_package=key))
+                part["command"] += " --skip gateway_tests:: --skip self_role_runtime::"
             expanded.append(part)
     return expanded
 
@@ -442,7 +453,7 @@ def resolve_sweep_leg(leg, metadata):
     """Turn a sweep template into the command actually run for this graph."""
     if not leg["id"].startswith(("sweep-nonignored-", "sweep-ignored-")):
         return dict(leg)
-    key = leg["id"].rsplit("-", 1)[1]
+    key = leg.get("sweep_package", leg["id"].rsplit("-", 1)[1])
     tokens = shlex.split(leg["command"])
     at = tokens.index("--features")
     tokens[at:at + 2] = sweep_feature_flags(key, metadata)

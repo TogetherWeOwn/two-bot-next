@@ -33,8 +33,12 @@ lint-only `check` lane.
   independently, each legs step uses `always()` so a failure never suppresses
   coverage output, and the merge refuses anything but exactly N-of-N valid
   distinct shard reports (repeating a path, symlink or hard-link identity cannot
-  satisfy N-of-N). Both broad sweeps are package-partitioned; the remainder owns
-  root/testsupport and newly added workspace packages. Planning rejects missing,
+  satisfy N-of-N). Both broad sweeps are package-partitioned; the ignored bot
+  package has gateway, ordered self-role and catch-all substring groups on
+  distinct default workers. Each group keeps full target discovery, serial
+  execution and every existing exclusion; ordered skips prevent overlapping
+  names from executing twice. The workspace remainder owns root/testsupport and
+  newly added workspace packages. Planning rejects missing,
   duplicate, unknown or empty ownership before publishing a matrix. The merge
   converts absolute container `SF:` paths to
   repository-relative paths with `--source-root /__w/two-bot-next/two-bot-next`;
