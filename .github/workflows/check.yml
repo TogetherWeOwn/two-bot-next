@@ -454,7 +454,7 @@ jobs:
       # main's post-restore duplicates of them are dropped here — no coverage
       # change, same steps run once and earlier.
       - name: Verify check job disk hygiene
-        run: python3 scripts/test-check-disk-hygiene.py
+        run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-disk-hygiene.py
 
       # Compile optional stores and run their safety and scratch-DB tests too.
       # Onboarding/sticky live tests remain explicitly ignored by default.
