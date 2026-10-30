@@ -32,10 +32,8 @@ Severity is impact times confidence, after the disproof pass below:
   could not verify against this code or the pinned Twilight/Discord contract.
 - **Security exception:** never drop or downgrade a plausible security issue
   for lack of full verification; reserve Critical for a traced, verified path.
-  If the vulnerable code is new in this unmerged PR, post a security Warning
-  with the class, location and unverified step, but no exploit steps or
-  payloads. If it affects code already on `main` or deployed, do not describe
-  it publicly: post only a non-sensitive notice that a private report under
+  Do not describe a suspected vulnerability, exposed secret, or sensitive
+  data publicly: post only a non-sensitive notice that a private report under
   `SECURITY.md` is required.
 
 ## Disproof pass (before posting any finding)
@@ -129,7 +127,7 @@ the behavior/dependency change, not cosmetic diff noise.
 
 ## Finding format and coverage
 
-Except for deployed-code vulnerability details (see Security exception),
+Except for anything the Security exception says to report privately,
 use one concise inline finding per root cause, anchored to the smallest changed
 range: title, severity with its reason, triggering scenario, evidence
 (file/symbol), smallest corrective direction. State the commit you reviewed
