@@ -137,6 +137,48 @@ invariant; do not clear holds based solely on age. Naming, permissions, ownershi
 and room lifecycle are separate slices, and unit and database tests establish behaviour only, not
 staging readiness (staging proof stays on the voice acceptance card).
 
+## Private owned-room discovery and rollback
+
+`/myroom` replies once, ephemerally, with the invoker's current owned live
+rooms. Readiness, channel presence and the observed `@everyone` Connect ACL
+come from one live snapshot. An unavailable worker or unknown ACL returns an
+availability notice, not a guessed public room. A deleted channel is omitted.
+The persisted private flag may remain set after Connect opens if Join-channel
+cleanup fails; discovery reports the observed ACL without changing that retry
+state. Large lists stop at complete rows below the completion limit and state
+how many rooms were omitted. The read does not change rooms or permissions.
+
+Runtime `/access restrict command:myroom` is supported. Configuration import
+rejects `settings.command_roles` entries for `myroom`, including empty role
+lists: that import writes a different policy store and cannot enforce this
+command's restriction. Exporting or importing configuration is **not** proof
+that the runtime access-policy store is clear.
+
+**Before reverting to an image from before `/myroom`:** while the compatible
+new image is still running, an authorized guild administrator must perform the
+following in **every affected guild**:
+
+1. Run `/access show` and retain the current runtime policy read-back.
+2. If `myroom` is restricted, run `/access unrestrict command:myroom`.
+3. Run `/access show` again. Verify `myroom` is absent and every unrelated
+   restriction is preserved. Retain this read-back with the rollback evidence.
+4. Only after all affected guilds have verified cleanup, revert the image
+   through the existing governed rollout procedure and verify health.
+
+The preceding strict policy reader rejects the unknown `myroom` key; reverting
+first can make the entire runtime policy unreadable. If cleanup or read-back
+fails, stop that rollback: do not bypass the validator or clear the policy
+store. Restore the compatible image if necessary to complete authorized
+cleanup. There is no schema migration to reverse.
+
+Existing saved custom `myroom` definitions remain publishable and executable
+with voice off, and support same-name edits and pause/resume. Fresh custom
+writes still reserve the name. With voice on the voice slash handler takes
+precedence; the custom text trigger remains distinct. Custom catalog and
+import capacity count actual all-enabled publication slots: 67 builtins plus
+33 noncolliding customs fit the 100-command ceiling. The unpublished assistant
+reserves its name but does not consume another slot.
+
 ## Hermetic verification
 
 ```sh

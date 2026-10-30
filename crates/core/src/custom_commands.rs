@@ -321,6 +321,21 @@ pub fn builtin_command_names() -> HashSet<String> {
         .collect()
 }
 
+/// All-enabled publication slots occupied by builtins, independent of the
+/// current feature gates. Reserve names separately: the unpublished assistant
+/// owns its name but consumes no Discord command slot. Voice `/kick` overlaps
+/// moderation and therefore counts only once.
+#[must_use]
+pub fn published_builtin_count() -> usize {
+    let mut names = builtin_command_names();
+    names.extend(
+        super::voice_rooms::voice_commands()
+            .into_iter()
+            .map(|def| def.name),
+    );
+    names.len()
+}
+
 /// Names a custom command may not be *written* under: every builtin plus the
 /// voice-room and assistant sets. The voice sink dispatches by name, so a custom
 /// command named `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`

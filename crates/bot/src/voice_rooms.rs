@@ -3942,15 +3942,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// matching `kick_room_of`. A disconnected or just-loaded worker may track
     /// rooms Discord no longer has, so it must not call them live.
     pub fn live_owned_rooms(&self, member: Snowflake) -> Option<Vec<(Snowflake, bool)>> {
-        // Read privacy before taking this guard: owned_rooms reads live
-        // overwrites, and recursively taking the snapshot lock can deadlock.
-        let mut rooms = self.owned_rooms(member);
         let live = self.live.read_state();
         if !live.ready || self.halted {
             return None;
         }
-        // Gateway channel removal precedes reconciliation of tracked rows.
-        rooms.retain(|(channel, _)| live.channels.contains_key(channel));
+        let mut rooms = Vec::new();
+        for (id, room) in &self.rooms {
+            if room.owner_id != member {
+                continue;
+            }
+            // Gateway removal precedes reconciliation of tracked rows. Ready,
+            // presence and ACL evidence must all belong to this one snapshot.
+            let Some(channel) = live.channels.get(id) else {
+                continue;
+            };
+            let overwrites = channel.permission_overwrites.as_ref()?;
+            // The persisted private flag can outlive a successful Connect-open
+            // write when Join cleanup fails. It is retry state, not ACL proof.
+            let private = overwrites.iter().any(|overwrite| {
+                overwrite.kind == PermissionOverwriteType::Role
+                    && overwrite.id.get() == self.live.guild_id
+                    && overwrite.deny.contains(Permissions::CONNECT)
+            });
+            rooms.push((*id, private));
+        }
+        rooms.sort_unstable();
         Some(rooms)
     }
 

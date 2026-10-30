@@ -19,8 +19,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use super::custom_commands::reserved_command_names;
 use super::custom_commands::{
-    error_code, max_custom_commands, reserved_command_names, validate_put_input, CommandError,
+    error_code, max_custom_commands, published_builtin_count, validate_put_input, CommandError,
     PutCommandInput, StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
@@ -250,7 +252,7 @@ pub fn parse_import_document(
 /// command budget are refused before planning.
 #[must_use]
 pub fn max_import_entries() -> usize {
-    max_custom_commands(reserved_command_names().len())
+    max_custom_commands(published_builtin_count())
 }
 
 /// One dry-run rejection: the definition plus its stable reason code
@@ -299,7 +301,7 @@ pub fn diff_import(
             }),
         }
     }
-    let max = max_custom_commands(builtins.len());
+    let max = max_import_entries();
     let mut union: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
     for (_, entry) in &valid {
         union.insert(entry.name.as_str());

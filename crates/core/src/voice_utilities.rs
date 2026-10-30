@@ -101,9 +101,10 @@ pub const MYROOM_EMPTY: &str =
 ///
 /// `rooms` carries `(room channel, runtime private)` pairs in channel order
 /// from live worker state. Each owned room renders on its own line with its
-/// privacy word; an empty list renders [`MYROOM_EMPTY`]. The function cannot
-/// panic and performs no lookup of its own, so it can neither leak another
-/// member's rooms nor invent channels.
+/// privacy word; an empty list renders [`MYROOM_EMPTY`]. Long lists omit only
+/// whole rows and state the omitted count, staying below 2000 scalars before
+/// the completion adapter. The function performs no lookup of its own, so it
+/// can neither leak another member's rooms nor invent channels.
 #[must_use]
 pub fn myroom_render(rooms: &[(Snowflake, bool)]) -> String {
     if rooms.is_empty() {
@@ -114,9 +115,26 @@ pub fn myroom_render(rooms: &[(Snowflake, bool)]) -> String {
     } else {
         format!("You own {} live voice rooms:\n", rooms.len())
     };
+    // Reserve the largest possible omission footer before adding whole rows.
+    // The completion adapter's 2000-scalar clamp must never split a room label.
+    let footer_bound = format!("{} more rooms omitted.", rooms.len())
+        .chars()
+        .count();
+    let mut shown = 0;
+    let mut length = out.chars().count();
     for (channel, private) in rooms {
         let state = if *private { "private" } else { "public" };
-        out.push_str(&format!("<#{channel}> — {state}\n"));
+        let line = format!("<#{channel}> — {state}\n");
+        let line_length = line.chars().count();
+        if length + line_length + footer_bound > 2000 {
+            break;
+        }
+        out.push_str(&line);
+        length += line_length;
+        shown += 1;
+    }
+    if shown < rooms.len() {
+        out.push_str(&format!("{} more rooms omitted.", rooms.len() - shown));
     }
     out.trim_end_matches('\n').to_owned()
 }
