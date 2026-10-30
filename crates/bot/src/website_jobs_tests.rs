@@ -1380,23 +1380,11 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
     mock.shutdown().await;
 }
 
-// Keep every dependency target and level captured by the global subscriber,
-// but attribute events to this tick rather than its concurrent test siblings.
-fn rank_diagnostic_logs(capture: &tracing_capture::Capture, start: usize, case: &str) -> String {
-    let marker = format!(" capture_case={case}");
-    capture.text()[start..]
-        .lines()
-        .filter(|line| line.ends_with(&marker) || line.contains(&format!("{marker} ")))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[tokio::test]
 async fn rank_diagnostic_capture_reproduces_collision_and_detects_same_case_leaks() {
     use tracing::Instrument as _;
 
     let capture = tracing_capture::global();
-    let start = capture.text().len();
     let case = "rank-diagnostic-control";
     let sibling = "rank-diagnostic-control-sibling";
     let probe_id = u64::MAX.to_string();
@@ -1409,7 +1397,7 @@ async fn rank_diagnostic_capture_reproduces_collision_and_detects_same_case_leak
     }
     .instrument(tracing::info_span!("rank_diagnostic", capture_case = case));
     let poison = async {
-        tracing::warn!(role_id = %probe_id, role_name = probe_name, "Legend missing matches=0; sibling role sentinel");
+        tracing::warn!(role_id = %probe_id, role_name = probe_name, "Legend missing matches=0; sibling role sentinel capture_case={case}");
         tokio::task::yield_now().await;
     }
     .instrument(tracing::info_span!(
@@ -1419,7 +1407,7 @@ async fn rank_diagnostic_capture_reproduces_collision_and_detects_same_case_leak
     tokio::join!(mine, poison);
     tracing::warn!(role_name = probe_name, "unattributed role sentinel");
 
-    let logs = rank_diagnostic_logs(capture, start, case);
+    let logs = capture.text_for_case(Some(case));
     assert!(
         logs.contains("79999"),
         "the old numeric probe collides with timing alone"
@@ -1430,9 +1418,11 @@ async fn rank_diagnostic_capture_reproduces_collision_and_detects_same_case_leak
             !logs.contains(private),
             "sibling diagnostics must not contaminate this tick"
         );
-        assert!(rank_diagnostic_logs(capture, start, sibling).contains(private));
+        assert!(capture.text_for_case(Some(sibling)).contains(private));
     }
-    assert!(rank_diagnostic_logs(capture, start, "rank-diagnostic-absent").is_empty());
+    assert!(capture
+        .text_for_case(Some("rank-diagnostic-absent"))
+        .is_empty());
 
     // Positive privacy control: attribution must retain a leak from this tick,
     // including a dependency target, not just the expected application warning.
@@ -1442,11 +1432,27 @@ async fn rank_diagnostic_capture_reproduces_collision_and_detects_same_case_leak
     }
     .instrument(tracing::info_span!("rank_diagnostic", capture_case = case))
     .await;
-    let logs = rank_diagnostic_logs(capture, start, case);
+    let logs = capture.text_for_case(Some(case));
     for private in [probe_id.as_str(), probe_name] {
         assert!(
             logs.contains(private),
             "same-case leaks must remain detectable"
+        );
+    }
+
+    let multiline = "rank-diagnostic-multiline";
+    async {
+        tokio::task::yield_now().await;
+        tracing::debug!(target: "synthetic_dependency", "{} {}\ncontinued dependency diagnostic", probe_id, probe_name);
+    }
+    .instrument(tracing::info_span!("rank_diagnostic", capture_case = multiline))
+    .await;
+    let logs = capture.text_for_case(Some(multiline));
+    assert!(logs.contains("\ncontinued dependency diagnostic"));
+    for private in [probe_id.as_str(), probe_name] {
+        assert!(
+            logs.contains(private),
+            "multiline leaks must remain detectable"
         );
     }
 }
@@ -1501,12 +1507,11 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     )
     .await;
     let observation = Mutex::new(());
-    let start = capture.text().len();
     let case = "rank-tick-missing-rung";
     let outcome = tick(Kind::Rank, &pool, &executor(&mock), guild, &observation)
         .instrument(tracing::info_span!("rank_diagnostic", capture_case = case))
         .await;
-    let logs = rank_diagnostic_logs(capture, start, case);
+    let logs = capture.text_for_case(Some(case));
     assert_eq!(outcome, Err(ErrorClass::Configuration));
     for query in [
         "SELECT count(*) FROM rank_snapshots WHERE guild_id=$1",
