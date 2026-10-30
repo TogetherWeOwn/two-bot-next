@@ -27,6 +27,8 @@ Counters preserve intentional baseline replays, not just a union of test names.
 No real compiler, database, network request, timing or LCOV-parity claim occurs.
 """
 
+import argparse
+from copy import deepcopy
 import importlib.util
 import json
 import os
@@ -680,6 +682,278 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
         self.assertEqual(len(executions), 1,
                          "lane continued after the timed-out command")
         self.assertIn("alive", executions[0]["argv"])
+
+
+class RuntimeSmokePreparationAcceptance(unittest.TestCase):
+    """Cold-worker compile setup must not consume the alive execution deadline.
+
+    Execute the parsed generator/preparation/partition shells with the real
+    partition runner and synthetic Cargo. Only a successful compile-only call
+    warms the cold fixture. The narrow Actions model handles default success,
+    status functions and matrix equality; unknown expressions fail the fixture.
+    Artifact upload eligibility is modeled, not the native artifact action.
+    Host/container/DB setup before the generator is outside this harness.
+    """
+
+    GENERATOR = "Generate command reference before runtime test compilation"
+    UPLOAD = "Upload successful test partition receipt"
+
+    def step_runs(self, step, partition, success):
+        condition = str(step.get("if", "success()")).strip()
+        condition = condition.removeprefix("${{").removesuffix("}}").strip()
+        status = {"success()": success, "failure()": not success,
+                  "always()": True, "cancelled()": False, "!cancelled()": True}
+        terms = [term.strip() for term in condition.split("&&")]
+        allowed = success if not any(term in status for term in terms) else True
+        for term in terms:
+            matrix = re.fullmatch(r"matrix\.partition\s*(==|!=)\s*'([^']+)'", term)
+            if matrix:
+                match = partition == matrix[2]
+                allowed &= match if matrix[1] == "==" else not match
+            elif term in status:
+                allowed &= status[term]
+            elif term in ("true", "false", "True", "False"):
+                allowed &= term.lower() == "true"
+            else:
+                self.fail(f"unmodeled Actions condition: {condition}")
+        return allowed
+
+    def exercise(self, job, partition, *, prep_exit=0, generator_exit=0,
+                 prior_success=True):
+        sandbox = Sandbox(ROWS)
+        self.addCleanup(sandbox.close)
+        scripts = sandbox.root / "scripts/ci"
+        scripts.mkdir(parents=True)
+        for name in ("run-test-partition.py", "cargo_feature_selection.py"):
+            shutil.copyfile(ROOT / "scripts/ci" / name, scripts / name)
+        trace = sandbox.root / "smoke-events.jsonl"
+        generator = sandbox.root / "scripts/generate_command_reference.py"
+        generator.write_text(
+            "import json, os\n"
+            "with open(os.environ['SMOKE_TRACE'], 'a') as out:\n"
+            "    out.write(json.dumps({'kind': 'generator'}) + '\\n')\n"
+            "raise SystemExit(int(os.environ['GENERATOR_EXIT']))\n")
+        cargo = sandbox.bin / "cargo"
+        cargo.rename(sandbox.bin / "cargo-execution-fixture")
+        sandbox.executable("cargo", '''import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+cargo_args = args[:args.index('--')] if '--' in args else args
+compile_only = '--no-run' in cargo_args
+kind = 'prepare' if compile_only else 'cargo'
+profile = {k: v for k, v in os.environ.items()
+           if k.startswith('CARGO_') or k in ('RUSTFLAGS', 'RUSTDOCFLAGS', 'RUSTUP_TOOLCHAIN')}
+with open(os.environ['SMOKE_TRACE'], 'a') as out:
+    out.write(json.dumps({'kind': kind, 'argv': args, 'profile': profile,
+                          'step': int(os.environ['SMOKE_STEP'])}) + '\\n')
+prepared = Path(os.environ['RUNNER_TEMP']) / 'smoke-prepared'
+if compile_only:
+    code = int(os.environ['PREP_EXIT'])
+    if code == 0:
+        prepared.write_text('compiled, not executed\\n')
+    raise SystemExit(code)
+if '--test' in cargo_args and cargo_args[cargo_args.index('--test') + 1] == 'alive' and not prepared.exists():
+    raise SystemExit('cold alive artifact: compile-only preparation never succeeded')
+fixture = str(Path(__file__).with_name('cargo-execution-fixture'))
+os.execv(fixture, [fixture, *args])
+''')
+        steps = job["steps"]
+        first = next(i for i, step in enumerate(steps)
+                     if step.get("name") == self.GENERATOR)
+        run_index = next(i for i, step in enumerate(steps)
+                         if step.get("id") == "run_partition")
+        last = next(i for i, step in enumerate(steps)
+                    if step.get("name") == self.UPLOAD)
+        self.assertLess(first, run_index)
+        self.assertLess(run_index, last)
+        receipt = (sandbox.root / "test-partition-receipts"
+                   / f"ignored-db-runtime-{partition}.json")
+        attempts, uploads, output = [], [], []
+        success = prior_success
+        shared_env = dict(SMOKE_TRACE=str(trace), PREP_EXIT=str(prep_exit),
+                          GENERATOR_EXIT=str(generator_exit))
+        for index in range(first, last + 1):
+            step = steps[index]
+            if not self.step_runs(step, partition, success):
+                continue
+            if "uses" in step:
+                self.assertTrue(step["uses"].startswith("actions/upload-artifact@"))
+                uploads.append(index)
+                success &= receipt.is_file()
+                continue
+            attempts.append(index)
+            if index == run_index:
+                with trace.open("a") as out:
+                    out.write(json.dumps(dict(kind="partition", receipt_exists=receipt.exists())) + "\n")
+            shell = step.get("shell", "sh")
+            self.assertIn(shell, ("sh", "bash"), "unmodeled workflow shell")
+            argv = (["sh", "-e", "-c"] if shell == "sh" else
+                    ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c"])
+            env = (sandbox.env | shared_env
+                   | resolved_env(job, step, sandbox, {"partition": partition})
+                   | {"SMOKE_STEP": str(index)})
+            result = subprocess.run(
+                argv + [step["run"]], cwd=sandbox.root, env=env,
+                capture_output=True, text=True, timeout=30)
+            output.append(assertions_message(result))
+            if result.returncode and not step.get("continue-on-error", False):
+                success = False
+            github_env = sandbox.root / "github-env"
+            if github_env.exists():
+                shared_env.update(line.split("=", 1) for line in
+                                  github_env.read_text().splitlines())
+        events = ([json.loads(line) for line in trace.read_text().splitlines()]
+                  if trace.exists() else [])
+        return dict(sandbox=sandbox, events=events, attempts=attempts,
+                    uploads=uploads, success=success, receipt=receipt,
+                    run_index=run_index, output="\n".join(output))
+
+    def compile_identity(self, argv):
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("command")
+        for flags, dest in ((("-p", "--package"), "package"),
+                            (("--test",), "test"), (("--features", "-F"), "features")):
+            parser.add_argument(*flags, dest=dest, action="append", default=[])
+        for flag in ("--profile", "--target"):
+            parser.add_argument(flag)
+        for flag in ("--locked", "--no-run", "--release", "--all-features",
+                     "--no-default-features"):
+            parser.add_argument(flag, action="store_true")
+        value, extra = parser.parse_known_args(argv)
+        self.assertEqual(extra, [], "preparation added a test filter or unsupported build option")
+        return vars(value)
+
+    def assert_other_success(self, job):
+        observed = self.exercise(job, "other")
+        events = observed["events"]
+        preparations = [event for event in events if event["kind"] == "prepare"]
+        self.assertEqual(len(preparations), 1,
+                         "cold other worker needs one executed compile-only preparation")
+        prep = preparations[0]
+        step = job["steps"][prep["step"]]
+        self.assertFalse(step.get("continue-on-error", False))
+        bound = step.get("timeout-minutes")
+        self.assertIsNotNone(bound, "compile preparation has no finite step bound")
+        self.assertGreater(float(bound), 0)
+        self.assertLessEqual(float(bound), 10, "compile setup outgrew its small finite budget")
+        worker_bounds = [int(n) for n in re.findall(r"\b\d+\b", str(job["timeout-minutes"]))]
+        self.assertTrue(worker_bounds)
+        self.assertLess(float(bound), min(worker_bounds))
+        expected = dict(command="test", package=["two-bot"], test=["alive"],
+                        features=[], profile=None, target=None, locked=True,
+                        no_run=True, release=False, all_features=False,
+                        no_default_features=False)
+        self.assertEqual(self.compile_identity(prep["argv"]), expected,
+                         "compile setup changed alive's package/target/features/profile/lock identity")
+        probes = [event for event in events if event["kind"] == "cargo"
+                  and "alive" in event["argv"]]
+        self.assertEqual(len(probes), 2, "alive must still be inventoried and executed")
+        for event in probes:
+            live_args = event["argv"][:event["argv"].index("--")]
+            self.assertEqual(self.compile_identity(live_args), expected | {"no_run": False})
+            self.assertEqual(prep["profile"], event["profile"],
+                             "preparation and timed command compiled with different build environments")
+        kinds = [event["kind"] for event in events]
+        self.assertEqual(kinds[:3], ["generator", "prepare", "partition"])
+        partition = next(event for event in events if event["kind"] == "partition")
+        self.assertFalse(partition["receipt_exists"], "compile setup wrote an alternative receipt")
+        self.assertTrue(observed["success"], observed["output"])
+        self.assertEqual(len(observed["uploads"]), 1)
+        self.assertTrue(observed["receipt"].is_file())
+        return prep["step"], observed
+
+    def assert_prep_failure_is_fatal(self, job):
+        observed = self.exercise(job, "other", prep_exit=41)
+        self.assertEqual(sum(e["kind"] == "prepare" for e in observed["events"]), 1,
+                         "failure control never reached compile-only setup")
+        self.assertFalse(observed["success"], "compile error was tolerated")
+        self.assertNotIn(observed["run_index"], observed["attempts"],
+                         "partition ran after compile preparation failed")
+        self.assertEqual(observed["uploads"], [], "compile error made receipt upload eligible")
+        self.assertFalse(observed["receipt"].exists())
+        self.assertEqual(observed["sandbox"].records(), [],
+                         "compile preparation executed tests or continued the partition")
+
+    def assert_contract(self, job):
+        prep_index, observed = self.assert_other_success(job)
+        records = observed["sandbox"].records()
+        for partition in ("onboarding", "gateway", "runtime", "cutover"):
+            other = self.exercise(job, partition)
+            self.assertFalse(any(e["kind"] == "prepare" for e in other["events"]),
+                             f"compile setup leaked into {partition}")
+            self.assertTrue(other["success"], other["output"])
+            self.assertEqual(len(other["uploads"]), 1)
+            records += other["sandbox"].records()
+        self.assertEqual(ledger(records, ROWS, environments=True),
+                         ledger(BASELINE["lanes"]["ignored-db-runtime"], ROWS, environments=True),
+                         "compile setup changed original execution argv/env/replay multiplicities")
+        self.assert_prep_failure_is_fatal(job)
+        failed_generator = self.exercise(job, "other", generator_exit=42)
+        self.assertFalse(failed_generator["success"])
+        self.assertEqual([e["kind"] for e in failed_generator["events"]], ["generator"],
+                         "setup ran despite failed command-reference generation")
+        self.assertEqual(failed_generator["uploads"], [])
+        return prep_index
+
+    def test_cold_smoke_preparation_preserves_the_original_runtime_ledger(self):
+        self.assert_contract(workflow()["ignored-db-runtime-partition"])
+
+    def test_failed_compile_preparation_blocks_partition_and_receipt(self):
+        self.assert_prep_failure_is_fatal(workflow()["ignored-db-runtime-partition"])
+
+    def test_prior_setup_or_generator_failure_blocks_later_work(self):
+        job = workflow()["ignored-db-runtime-partition"]
+        for overrides in ({"prior_success": False}, {"generator_exit": 42}):
+            with self.subTest(overrides=overrides):
+                observed = self.exercise(job, "other", **overrides)
+                self.assertFalse(observed["success"])
+                self.assertNotIn(observed["run_index"], observed["attempts"])
+                self.assertFalse(any(e["kind"] == "prepare" for e in observed["events"]))
+                self.assertEqual(observed["uploads"], [])
+                self.assertFalse(observed["receipt"].exists())
+
+    def test_preparation_mutations_are_rejected_from_an_intact_workflow(self):
+        job = workflow()["ignored-db-runtime-partition"]
+        prep_index = self.assert_contract(job)
+
+        def move_preparation(changed, *, before_generator=False):
+            prep = changed["steps"].pop(prep_index)
+            anchor = next(i for i, step in enumerate(changed["steps"])
+                          if (step.get("name") == self.GENERATOR if before_generator
+                              else step.get("id") == "run_partition"))
+            changed["steps"].insert(anchor if before_generator else anchor + 1, prep)
+
+        mutations = {
+            "missing": lambda m: m["steps"].pop(prep_index),
+            "disabled": lambda m: m["steps"][prep_index].__setitem__("if", "false"),
+            "wrong owner": lambda m: m["steps"][prep_index].__setitem__("if", "matrix.partition == 'gateway'"),
+            "every owner": lambda m: m["steps"][prep_index].pop("if", None),
+            "nonfatal step": lambda m: m["steps"][prep_index].__setitem__("continue-on-error", True),
+            "swallowed compile error": lambda m: m["steps"][prep_index].__setitem__("run", m["steps"][prep_index]["run"] + " || true"),
+            "wrong target": lambda m: m["steps"][prep_index].__setitem__("run", "cargo test -p two-bot --locked --test restore_drill --no-run"),
+            "wrong package": lambda m: m["steps"][prep_index].__setitem__("run", "cargo test -p two-bot-discord --locked --test alive --no-run"),
+            "unlocked": lambda m: m["steps"][prep_index].__setitem__("run", "cargo test -p two-bot --test alive --no-run"),
+            "wrong features": lambda m: m["steps"][prep_index].__setitem__("run", "cargo test -p two-bot --locked --test alive --features two-bot-core/db --no-run"),
+            "wrong profile": lambda m: m["steps"][prep_index].__setitem__("run", "cargo test -p two-bot --locked --test alive --release --no-run"),
+            "profile env drift": lambda m: m["steps"][prep_index].__setitem__("env", {"CARGO_PROFILE_TEST_DEBUG": "0"}),
+            "unbounded": lambda m: m["steps"][prep_index].pop("timeout-minutes", None),
+            "worker-sized bound": lambda m: m["steps"][prep_index].__setitem__("timeout-minutes", 30),
+            "after execution": lambda m: move_preparation(m),
+            "before generator": lambda m: move_preparation(m, before_generator=True),
+            "runs tests instead of compiling only": lambda m: m["steps"][prep_index].__setitem__("run", "cargo test -p two-bot --locked --test alive -- --ignored --nocapture"),
+            "bypasses failed generator": lambda m: m["steps"][prep_index].__setitem__("if", "always() && matrix.partition == 'other'"),
+            "runner bypasses failed preparation": lambda m: next(s for s in m["steps"] if s.get("id") == "run_partition").__setitem__("if", "always()"),
+            "upload bypasses failed preparation": lambda m: next(s for s in m["steps"] if s.get("name") == self.UPLOAD).__setitem__("if", "always()"),
+            "preparation replaces execution": lambda m: next(s for s in m["steps"] if s.get("id") == "run_partition").__setitem__("run", "true"),
+            "preparation writes an alternate receipt": lambda m: m["steps"][prep_index].__setitem__(
+                "run", m["steps"][prep_index]["run"] + '\nmkdir -p "$RUNNER_TEMP/test-partition-receipts"\nprintf fixture > "$RUNNER_TEMP/test-partition-receipts/ignored-db-runtime-other.json"'),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(mutation=label):
+                changed = deepcopy(job)
+                mutate(changed)
+                with self.assertRaises(AssertionError, msg=label):
+                    self.assert_contract(changed)
 
 
 if __name__ == "__main__":

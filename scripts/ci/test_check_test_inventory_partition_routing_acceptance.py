@@ -720,5 +720,107 @@ class ConditionalEarlyExitRejectedTests(unittest.TestCase):
                 assert_orphaned(self, errors, "plain", False)
 
 
+class CompileOnlyIgnoredTargetRejectedTests(unittest.TestCase):
+    """Building alive is preparation, never ignored-test execution ownership."""
+
+    PREP = "cargo test -p two-bot --locked --test alive --no-run"
+    EXECUTE = "cargo test -p two-bot --locked --test alive -- --ignored --nocapture"
+    COMPILE_COMMANDS = (
+        PREP,
+        "cargo test --no-run -p two-bot --locked --test alive",
+        "cargo test -p two-bot --no-run --test alive --locked",
+        "cargo test --locked --test=alive -p two-bot --no-run",
+    )
+
+    def direct_workflow(self, command):
+        return with_direct_markers(
+            "jobs:\n  check:\n    steps:\n" + ALL_TARGETS_STEP + FUZZ_STEP
+            + "      - run: " + command + "\n")
+
+    def connected_workflow(self, worker_run=None):
+        before, worker = VALID_CHECK_YML.split(
+            "  ignored-db-runtime-partition:\n", 1)
+        worker, after = worker.split("  ignored-db-runtime:\n", 1)
+        prep = (
+            "      - name: Compile cold runtime smoke\n"
+            "        if: matrix.partition == 'other'\n"
+            "        timeout-minutes: 10\n"
+            "        run: " + self.PREP + "\n")
+        worker = worker.replace(
+            "      - name: Run selected test partition\n",
+            prep + "      - name: Run selected test partition\n", 1)
+        if worker_run is not None:
+            worker = worker.replace(
+                'run: python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"',
+                worker_run, 1)
+        return (before + "  ignored-db-runtime-partition:\n" + worker
+                + "  ignored-db-runtime:\n" + after)
+
+    def test_compile_only_alive_does_not_earn_direct_execution_credit(self):
+        for command in self.COMPILE_COMMANDS:
+            with self.subTest(command=command):
+                routed, _ = gate.routed_targets(self.direct_workflow(command))
+                self.assertNotIn(
+                    "alive", routed,
+                    "compile-only Cargo invocation earned execution credit")
+
+    def test_compile_only_alive_remains_an_orphaned_ignored_target(self):
+        for command in self.COMPILE_COMMANDS:
+            with self.subTest(command=command):
+                errors = check_fixture(
+                    self.direct_workflow(command), NIGHTLY_YML,
+                    dict(BOT_ALIVE), runner_text=None)
+                assert_orphaned(self, errors, "alive", True)
+
+    def test_real_alive_execution_still_routes_with_or_without_preparation(self):
+        commands = (
+            self.EXECUTE,
+            self.PREP + "\n      - run: " + self.EXECUTE,
+            self.PREP + " && " + self.EXECUTE,
+            self.EXECUTE + " --skip compile_only_--no-run_decoy",
+            self.EXECUTE + " # --no-run is only a comment",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                check_yml = self.direct_workflow(command)
+                routed, _ = gate.routed_targets(check_yml)
+                self.assertIn("alive", routed)
+                self.assertEqual(check_fixture(
+                    check_yml, NIGHTLY_YML, dict(BOT_ALIVE),
+                    runner_text=None), [])
+
+    def test_compile_preparation_preserves_intact_connected_runner_credit(self):
+        check_yml = self.connected_workflow()
+        assert_valid_dag(self, parse_jobs(check_yml))
+        self.assertEqual(check_fixture(
+            check_yml, NIGHTLY_YML, dict(BOT_ALIVE)), [])
+
+    def test_compile_preparation_cannot_rescue_an_unexecuted_partition(self):
+        connected = self.connected_workflow()
+        cases = {
+            "worker exits before runner": (
+                self.connected_workflow(
+                    'run: |\n          exit 0\n          python3 scripts/ci/run-test-partition.py --lane "$CI_TEST_LANE" --partition "$CI_TEST_PARTITION"'),
+                REAL_RUNNER_TEXT),
+            "planner disconnected": (
+                connected.replace(
+                    'matrix=$(python3 scripts/ci/run-test-partition.py --lane "$lane" --list)',
+                    'matrix=$(echo "$lane")'), REAL_RUNNER_TEXT),
+            "stable final disconnected": (
+                connected.replace(
+                    'run-test-partition.py --lane "$CI_TEST_LANE" --verify-receipts test-partition-receipts',
+                    'echo verify-receipts'), REAL_RUNNER_TEXT),
+            "runner exits before Cargo": (
+                connected, insert_at_function_start(
+                    REAL_RUNNER_TEXT, "execute", "    if True:\n        return 0.0\n")),
+        }
+        for kind, (check_yml, runner_text) in cases.items():
+            with self.subTest(kind=kind):
+                errors = check_fixture(
+                    with_direct_markers(check_yml), NIGHTLY_YML,
+                    dict(BOT_ALIVE), runner_text=runner_text)
+                assert_orphaned(self, errors, "alive", True)
+
+
 if __name__ == "__main__":
     unittest.main()
