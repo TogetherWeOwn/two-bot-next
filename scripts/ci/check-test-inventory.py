@@ -17,9 +17,9 @@ Coverage rules, in order:
    ``echo``/``printf`` line, or a ``--skip`` argument is a mention, not a
    route, and the target is orphaned.
 2. Integration targets without ``#[ignore]`` are covered by the workspace
-   ``--test '*'`` integration run or a connected partition runner whose
-   executable Cargo metadata discovery and dispatch are structurally verified.
-   Partitioned ignored targets require a verified package/target owner.
+   ``--test '*'`` integration run or a connected partition runner. Partitioned
+   ignored targets require a declared package/target owner. Execution-ledger
+   tests qualify the runner's discovery, dispatch and exact command coverage.
 3. Every fuzz target in ``fuzz/Cargo.toml`` must have a matching
    ``fuzz_targets/<name>.rs`` and the ``fuzz-compile`` job must build them.
 4. The workspace lib/bins unit run, the doc-test run and an ``--all-targets``
@@ -33,9 +33,9 @@ repository's workflows use today, including wrapper commands such as
 leading words. It does not expand shell variables (other than the explicit
 for-loop list in rule 1), follow arbitrary generated commands, or count a bare
 test-name filter without ``--test`` as routing an ignored target. The one
-recognized generated route is the checked-in partition runner, inspected as
-Python AST without executing or importing it; its planner, workers, strict
-finals and ci-ok dependencies must be connected. Other shapes need an explicit
+recognized generated route is the checked-in partition runner, treated as an
+opaque entrypoint; its planner, workers, strict finals and ci-ok dependencies
+must be connected. Other shapes need an explicit
 ``--test <name>`` command or a reasoned exemption.
 """
 
@@ -58,6 +58,22 @@ EXEMPT = {
     "reference_docs": "manual doc regen; rewrites committed files",
 }
 
+# Declared runtime routes, credited only behind the connected partition workflow.
+# The runner is opaque here; execution-ledger/argv tests qualify discovery and
+# these package-specific commands independently of completion receipts.
+PARTITION_RUNTIME_TARGETS = {
+    ("two-bot", "alive"),
+    ("two-bot", "containment_worker_soak"),
+    ("two-bot", "restore_drill"),
+    ("two-bot-discord", "community_facts_capture"),
+    *(("two-bot-cutover", name) for name in (
+        "invite_store", "legacy_copy_db", "legacy_tls_fence", "legacy_verify_db",
+        "member_list_catchup", "raid_list_db", "reengagement_list_db", "settings_db",
+        "staging_migrate_db", "voice_config_store", "voice_create_admission_store",
+        "voice_rooms_store",
+    )),
+}
+
 WORKSPACE_LIB_BINS = "cargo test --workspace --lib --bins"
 WORKSPACE_DOC = "cargo test --workspace --doc"
 FUZZ_BUILD = "cargo +nightly-2026-10-01 fuzz build"
@@ -68,7 +84,7 @@ _BLOCK_SCALAR_RE = re.compile(r"^[|>][+-]?[0-9]*$")
 # the opening quote leaves an unbalanced segment, which fails `shlex.split` and
 # would hide a genuine `--ignored` run behind the compile-only fail-closed path.
 _SKIP_RE = re.compile(
-    r"--skip(?:\s+|=)(?:\"[^\"]*\"|'[^']*'|[A-Za-z0-9_-]+)")
+    r"--skip(?:\s+|=)(?:\"(?:\\.|[^\"\\])*\"|'[^']*'|[A-Za-z0-9_-]+)")
 _TEST_ARG_RE = re.compile(r"--test(?:\s+|=)[\"']?([A-Za-z0-9_-]+)")
 _BLANKET_RE = re.compile(r"--test(?:\s+|=)[\"']?\*")
 _LOOP_RE = re.compile(
@@ -253,13 +269,12 @@ def executable_block_text(body):
     return "\n".join(kept)
 
 
-def _cargo_flags(segment):
+def _cargo_words(segment):
     """Cargo argument words for a segment, or ``None`` when it cannot be parsed.
 
-    Cargo flags end at the libtest separator ``--``; libtest filters after it
-    are not Cargo flags. Wrappers such as ``env --`` put their own ``--`` ahead
-    of the invocation, so the split starts at the ``cargo``/``llvm-cov`` token
-    instead of at the first ``--`` in the line.
+    Retain libtest arguments too: ``--list`` is not execution. Wrappers such as
+    ``env --`` put their own ``--`` ahead of the invocation, so start at the
+    ``cargo``/``llvm-cov`` token rather than the first word in the line.
     """
     try:
         words = shlex.split(segment)
@@ -271,13 +286,20 @@ def _cargo_flags(segment):
             break
     else:
         tail = words
-    return tail[:tail.index("--")] if "--" in tail else tail
+    return tail
 
 
-def _compile_only(segment):
-    # An unparseable command cannot prove execution either.
-    flags = _cargo_flags(segment)
-    return flags is None or "--no-run" in flags
+def _compile_only(words):
+    if not words:
+        return True
+    cargo = words[:words.index("--")] if "--" in words else words
+    if not cargo:
+        return True
+    subcommands = cargo
+    if cargo[0].rsplit("/", 1)[-1] == "cargo":
+        subcommands = [word for word in cargo[1:] if not word.startswith("+")]
+    return (not subcommands or subcommands[0] not in ("test", "llvm-cov") or
+            "--no-run" in cargo or "--list" in words)
 
 
 def routed_targets(*workflow_texts):
@@ -289,9 +311,8 @@ def routed_targets(*workflow_texts):
 def _scan_targets(*workflow_texts):
     """Return (executed targets, build-only targets, executable texts).
 
-    A ``--no-run`` build is ownership for an ordinary target but never
-    execution credit for an ``#[ignore]``d one, which only an executed
-    ``--test`` run can own.
+    Builds and libtest listings own ordinary targets but never earn execution
+    credit for an ``#[ignore]``d one; that needs an executed ``--test`` run.
     """
     executed = set()
     built = set()
@@ -301,10 +322,10 @@ def _scan_targets(*workflow_texts):
         executable_texts.append("\n".join(blocks))
         for block in blocks:
             for segment in block.splitlines():
-                flags = _cargo_flags(segment)
+                flags = _cargo_words(segment)
                 if flags is None:
                     continue
-                destination = built if "--no-run" in flags else executed
+                destination = built if _compile_only(flags) else executed
                 for arg in _TEST_ARG_RE.finditer(segment):
                     if _INVOCATION_RE.search(segment[:arg.start()]):
                         destination.add(arg.group(1))
@@ -312,14 +333,14 @@ def _scan_targets(*workflow_texts):
                 var = re.escape(loop.group("var"))
                 loop_targets = set()
                 for line in loop.group("body").splitlines():
-                    flags = _cargo_flags(line)
+                    flags = _cargo_words(line)
                     if flags is None:
                         continue
                     arg = re.search(
                         r"--test(?:\s+|=)[\"']?\$(?:\{%s\}|%s\b)" % (var, var),
                         line)
                     if arg and _INVOCATION_RE.search(line[:arg.start()]):
-                        loop_targets.add("--no-run" in flags)
+                        loop_targets.add(_compile_only(flags))
                 if True in loop_targets and False not in loop_targets:
                     built.update(token.strip("\"'")
                                  for token in loop.group("list").split())
@@ -568,221 +589,6 @@ def _contains_stmt(body, source):
     return any(_same_ast(node, expected) for node in body)
 
 
-def _is_process_exit(node):
-    """True for a call that ends the process instead of continuing dispatch.
-
-    ``sys.exit(0)``, ``exit(0)``, ``quit(0)`` and ``os._exit(0)`` all terminate
-    the runner as surely as ``return``/``raise``; a successful status is not
-    live routing. Recognition is by callee shape only, so the wrapped and
-    conditional spellings match the same node kinds.
-    """
-    if not isinstance(node, (ast.Call,)):
-        return False
-    func = node.func
-    if isinstance(func, ast.Attribute):
-        return (func.attr == "_exit" and
-                isinstance(func.value, ast.Name) and func.value.id == "os") or \
-               (func.attr == "exit" and
-                isinstance(func.value, ast.Name) and func.value.id == "sys")
-    return isinstance(func, ast.Name) and func.id in ("exit", "quit")
-
-
-def _is_exit_node(node):
-    return (isinstance(node, (ast.Return, ast.Raise)) or
-            (isinstance(node, ast.Expr) and _is_process_exit(node.value)))
-
-
-def _has_unrecognized_exit(body, allowed=()):
-    """Fail closed on exits nested in any unrecognized statement.
-
-    The few legitimate selection and validation branches are accepted only as
-    complete AST matches; merely nesting an exit inside a conditional, loop,
-    or try block cannot make it invisible to the routing proof.
-    """
-    allowed_nodes = [_stmt(source) for source in allowed]
-    return any(
-        any(_is_exit_node(child) for child in ast.walk(node))
-        for node in body
-        if not any(_same_ast(node, accepted) for accepted in allowed_nodes)
-    )
-
-
-def _runner_routes(root):
-    """Recognize the runner's narrow executable AST interface, without importing it.
-
-    The proof follows main -> lane dispatch -> command selection -> cargo
-    execution. Discovery and owners are read from live statements, never from
-    comments or free-standing string literals. Unknown rewrites fail closed.
-    """
-    try:
-        tree = ast.parse((root / "scripts/ci/run-test-partition.py").read_text())
-    except (OSError, SyntaxError, UnicodeError):
-        return False, False, False, set()
-    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    if any(sum(isinstance(n, ast.FunctionDef) and n.name == name for n in tree.body) != 1
-           for name in ("main", "execute", "rust_commands", "integration_commands", "runtime_commands", "command", "verify_receipts")):
-        return False, False, False, set()
-    main = functions["main"].body
-    execute = functions["execute"].body
-    rust = functions["rust_commands"].body
-    integration = functions["integration_commands"].body
-    runtime = functions["runtime_commands"].body
-    execution_loop = 'for index, (args, database, integration, timeout, budget) in enumerate(commands):\n    print("Running:", shlex.join(["cargo"] + args), flush=True)\n    start = time.monotonic()\n    subprocess.run(["cargo"] + args, env=environment(database, integration), check=True, timeout=remaining_timeout(index, args, timeout, deadlines))\n    if budget:\n        property_seconds += time.monotonic() - start'
-    # Only the known fatal wrapper proves failure propagation. A swallowing
-    # handler or a result-replacing else/finally must not earn runner credit.
-    entrypoint = _stmt('''if __name__ == "__main__":
-    try:
-        main()
-    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
-        print(f"partition failed: {exc}", file=sys.stderr)
-        sys.exit(1)
-''')
-    if not (tree.body and _same_ast(tree.body[-1], entrypoint) and
-            _contains_stmt(main, 'parser.add_argument("--lane", required=True, action="append", choices=PARTITIONS)') and
-            _contains_stmt(main, 'selection = parser.add_mutually_exclusive_group(required=True)') and
-            _contains_stmt(main, 'selection.add_argument("--list", action="append_const", const=True)') and
-            _contains_stmt(main, 'selection.add_argument("--partition", action="append")') and
-            _contains_stmt(main, 'selection.add_argument("--verify-receipts", action="append")') and
-            _contains_stmt(main, 'args = parser.parse_args()') and
-            _contains_stmt(main, 'lane = args.lane[0]') and
-            _contains_stmt(main, 'if args.list:\n    print(json.dumps({"include": [{"partition": p} for p in PARTITIONS[lane]]}, separators=(",", ":")))\n    return') and
-            _contains_stmt(main, 'if len(args.partition) != 1 or args.partition[0] not in PARTITIONS[lane]:\n    parser.error("partition must be specified once and belong to the selected lane")') and
-            _contains_stmt(main, 'partition = args.partition[0]') and
-            _contains_stmt(main, 'if args.verify_receipts is not None:\n    if len(args.verify_receipts) != 1 or not args.verify_receipts[0]:\n        parser.error("receipt directory must be specified exactly once")\n    verify_receipts(lane, args.verify_receipts[0])\n    return') and
-            _contains_stmt(main, 'commands = rust_commands(partition) if lane == "rust-tests" else runtime_commands(partition)') and
-            _contains_stmt(main, 'seconds = execute(commands)') and
-            _contains_stmt(main, 'write_receipt(lane, partition, seconds)') and
-            _contains_stmt(execute, execution_loop) and
-            _contains_stmt(functions["command"].body, 'return (args, database, integration, timeout, budget)')):
-        return False, False, False, set()
-    # The receipt check must validate exactly the expected partition files.
-    verify = functions['verify_receipts'].body
-    if not (_contains_stmt(verify, 'expected = {f"{lane}-{partition}.json": partition for partition in PARTITIONS[lane]}') and
-            _contains_stmt(verify, 'entries = list(directory.iterdir())') and
-            _contains_stmt(verify, 'if {p.name for p in entries} != set(expected) or any(not p.is_file() or p.is_symlink() for p in entries):\n    raise ValueError("receipt directory must contain exactly one file for each lane partition")')):
-        return False, False, False, set()
-    # Exits before dispatch or Cargo execution must be recognized validation or
-    # selection branches, even when nested under another control-flow statement.
-    main_end = next(i for i, n in enumerate(main) if _same_ast(n, _stmt('seconds = execute(commands)')))
-    execute_end = next(i for i, n in enumerate(execute) if _same_ast(n, _stmt(execution_loop)))
-    if (_has_unrecognized_exit(main[:main_end], (
-            'if args.list:\n    print(json.dumps({"include": [{"partition": p} for p in PARTITIONS[lane]]}, separators=(",", ":")))\n    return',
-            'if args.verify_receipts is not None:\n    if len(args.verify_receipts) != 1 or not args.verify_receipts[0]:\n        parser.error("receipt directory must be specified exactly once")\n    verify_receipts(lane, args.verify_receipts[0])\n    return')) or
-            _has_unrecognized_exit(execute[:execute_end], (
-                'if not has_tests(commands, deadlines):\n    raise ValueError("partition selected no tests")',))):
-        return False, False, False, set()
-    integration_dispatch = _contains_stmt(rust, 'if partition.startswith("integration-"):\n    return integration_commands(int(partition[-1]))')
-    discovery = (integration_dispatch and integration and
-        not _has_unrecognized_exit(integration[:-1], (
-            'if core is None or not members.issubset(nodes):\n    raise ValueError("Cargo metadata is missing workspace dependency resolution")',)) and
-        isinstance(integration[0], ast.Assign) and len(integration[0].targets) == 1 and
-        isinstance(integration[0].targets[0], ast.Name) and integration[0].targets[0].id == 'proc' and
-        isinstance(integration[0].value, ast.Call) and
-        _same_ast(integration[0].value.func, ast.parse('subprocess.run', mode='eval').body) and
-        isinstance(integration[0].value.args[0], ast.List) and
-        [getattr(x, 'value', None) for x in integration[0].value.args[0].elts[:2]] == ['cargo', 'metadata'] and
-        _contains_stmt(integration, 'graph = json.loads(proc.stdout)') and
-        _contains_stmt(integration, 'members = set(graph["workspace_members"])') and
-        _contains_stmt(integration, 'packages = [p for p in graph["packages"] if p["id"] in members]') and
-        _contains_stmt(integration, 'by_package = {}') and
-        _contains_stmt(integration, 'result = []') and
-        _same_ast(integration[-1], _stmt('return result')) and
-        _contains_stmt(integration, 'for package in packages:\n    for target in package["targets"]:\n        if "test" not in target["kind"] or not target.get("test", True):\n            continue\n        required = target.get("required-features", target.get("required_features", []))\n        if not set(required).issubset(nodes[package["id"]].get("features", [])):\n            continue\n        key = package["name"] + "/" + target["name"]\n        owner = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") % 3\n        if owner == index:\n            by_package.setdefault(package["name"], []).append(target["name"])'))
-    # Verify the selected targets become Cargo --test selectors and executed commands.
-    package_loop = next((n for n in integration if isinstance(n, ast.For) and
-                         ast.unparse(n.target) == '(name, targets)' and
-                         _same_ast(n.iter, ast.parse('sorted(by_package.items())', mode='eval').body)), None)
-    discovery = bool(discovery and package_loop and
-        _contains_stmt(package_loop.body, 'selectors = [word for target in sorted(targets) for word in ("--test", target)]') and
-        _contains_stmt(package_loop.body, 'base = ["test", "-p", name] + selectors + feature_args + ["--locked"]') and
-        _contains_stmt(package_loop.body, 'result.append(command(base + ["--"] + skips, BOOTSTRAP, integration=True))'))
-    def rust_branch(partition):
-        return next((n for n in rust if isinstance(n, ast.If) and
-                     _same_ast(n.test, ast.parse('partition == ' + repr(partition), mode='eval').body)), None)
-    def returned_calls(value):
-        # Only calls directly in returned lists (possibly concatenated) are
-        # executed. Do not count calls in lambdas, unused literals or filters.
-        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
-            return returned_calls(value.left) + returned_calls(value.right)
-        if isinstance(value, ast.List):
-            return [n for n in value.elts if isinstance(n, ast.Call) and
-                    isinstance(n.func, ast.Name) and n.func.id == 'command' and n.args]
-        return []
-
-    def has_command_list(branch, values):
-        if branch is None or not branch.body or not isinstance(branch.body[0], ast.Return):
-            return False
-        for call in returned_calls(branch.body[0].value):
-            node = call.args[0]
-            while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-                node = node.left
-            if isinstance(node, ast.List) and [getattr(e, 'value', None) for e in node.elts] == values:
-                return True
-        return False
-    unit = has_command_list(rust_branch('unit-bin'), ['test', '--workspace', '--lib', '--bins'])
-    doc = has_command_list(rust_branch('replays'), ['test', '--workspace', '--doc'])
-    owners = set()
-    partitions = next((n.value for n in tree.body if isinstance(n, ast.Assign) and
-                       len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and
-                       n.targets[0].id == 'PARTITIONS'), None)
-    try:
-        partition_map = ast.literal_eval(partitions)
-    except (ValueError, TypeError):
-        return False, False, False, set()
-    if (not isinstance(partition_map, dict) or
-            not {'unit-bin', 'integration-0', 'integration-1', 'integration-2', 'replays'}
-                .issubset(partition_map.get('rust-tests', ()))):
-        discovery = unit = doc = False
-
-    def literal_prefix(node):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            return literal_prefix(node.left) + literal_prefix(node.right)
-        if isinstance(node, ast.Name) and node.id == 'bot':
-            return ['test', '-p', 'two-bot', '--locked']
-        try:
-            value = ast.literal_eval(node)
-        except (ValueError, TypeError):
-            return []
-        return value if isinstance(value, list) else []
-
-    if _contains_stmt(runtime, 'bot = ["test", "-p", "two-bot", "--locked"]'):
-        for branch in runtime:
-            if (not isinstance(branch, ast.If) or not isinstance(branch.test, ast.Compare) or
-                    not isinstance(branch.test.left, ast.Name) or branch.test.left.id != 'partition' or
-                    len(branch.test.ops) != 1 or not isinstance(branch.test.ops[0], ast.Eq) or
-                    len(branch.test.comparators) != 1 or
-                    not isinstance(branch.test.comparators[0], ast.Constant) or
-                    branch.test.comparators[0].value not in partition_map.get('ignored-db-runtime', ())):
-                continue
-            if branch.body and isinstance(branch.body[0], ast.Return):
-                for node in returned_calls(branch.body[0].value):
-                    args = literal_prefix(node.args[0])
-                    if len(args) >= 3 and args[:2] == ['test', '-p'] and '--test' in args:
-                        i = args.index('--test')
-                        if i + 1 < len(args) and isinstance(args[i + 1], str):
-                            owners.add((args[2], args[i + 1]))
-            # This branch builds the cutover list from literal (target, DB,
-            # ignored) tuples and then returns both comprehensions.
-            if (branch.test.comparators[0].value == 'cutover' and
-                    _contains_stmt(branch.body, 'base = ["test", "-p", "two-bot-cutover"]') and
-                    _contains_stmt(branch.body, 'result = [command(base + ["--test", name, "--locked"] + (["--", "--ignored"] if ignored else []), db) for name, db, ignored in items]') and
-                    _contains_stmt(branch.body, 'result += [command(base + ["--locked", "--test", name, "--", "--ignored"]) for name in ("invite_store", "member_list_catchup")]') and
-                    _contains_stmt(branch.body, 'return result + [command(base + ["--locked", "--lib", "--", "--ignored"])]')):
-                items = next((n.value for n in branch.body if isinstance(n, ast.Assign) and
-                              len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and
-                              n.targets[0].id == 'items' and isinstance(n.value, ast.List)), None)
-                if items:
-                    for item in items.elts:
-                        if (isinstance(item, ast.Tuple) and len(item.elts) == 3 and
-                                isinstance(item.elts[0], ast.Constant) and
-                                isinstance(item.elts[0].value, str) and
-                                isinstance(item.elts[2], ast.Constant) and item.elts[2].value is True):
-                            owners.add(('two-bot-cutover', item.elts[0].value))
-                    owners.update({('two-bot-cutover', 'invite_store'),
-                                   ('two-bot-cutover', 'member_list_catchup')})
-    return discovery, unit, doc, owners
-
-
 def check(root=ROOT):
     errors = []
     try:
@@ -801,8 +607,10 @@ def check(root=ROOT):
     blanket_routed = bool(_BLANKET_RE.search(check_exec))
     discovery = unit = doc = False
     owners = set()
-    if _partition_workflow(check_yml):
-        discovery, unit, doc, owners = _runner_routes(root)
+    if ((root / "scripts/ci/run-test-partition.py").is_file() and
+            _partition_workflow(check_yml)):
+        discovery = unit = doc = True
+        owners = PARTITION_RUNTIME_TARGETS
 
     for path in sorted(root.glob("crates/*/tests/*.rs")):
         name = path.stem

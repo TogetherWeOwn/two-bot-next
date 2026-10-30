@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -179,6 +180,27 @@ def remaining_timeout(index, args, timeout, deadlines):
     return remaining
 
 
+def run_cargo(args, *, env, timeout=None, **kwargs):
+    argv = ["cargo"] + args
+    if timeout is None:
+        return subprocess.run(argv, env=env, check=True, **kwargs)
+    # Cargo/test binaries can spawn children. Isolate only this invocation so an
+    # expired inventory/execution deadline kills its whole tree, not our runner.
+    with subprocess.Popen(argv, env=env, start_new_session=True, **kwargs) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, argv, stdout, stderr)
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def has_tests(commands, deadlines):
     # Probe the selected commands, not the workspace as a whole. This also fails
     # closed on compile failures and never treats an empty partition as success.
@@ -187,9 +209,9 @@ def has_tests(commands, deadlines):
             continue
         probe = args + (["--list"] if "--" in args else ["--", "--list"])
         print("Inventory:", shlex.join(["cargo"] + probe), file=sys.stderr, flush=True)
-        result = subprocess.run(["cargo"] + probe, env=environment(database, integration),
-                                stdout=subprocess.PIPE, text=True, check=True,
-                                timeout=remaining_timeout(index, args, timeout, deadlines))
+        result = run_cargo(probe, env=environment(database, integration),
+                           stdout=subprocess.PIPE, text=True,
+                           timeout=remaining_timeout(index, args, timeout, deadlines))
         if any(line.endswith(": test") for line in result.stdout.splitlines()):
             return True
     return False
@@ -206,8 +228,8 @@ def execute(commands):
     for index, (args, database, integration, timeout, budget) in enumerate(commands):
         print("Running:", shlex.join(["cargo"] + args), flush=True)
         start = time.monotonic()
-        subprocess.run(["cargo"] + args, env=environment(database, integration),
-                       check=True, timeout=remaining_timeout(index, args, timeout, deadlines))
+        run_cargo(args, env=environment(database, integration),
+                  timeout=remaining_timeout(index, args, timeout, deadlines))
         if budget:
             property_seconds += time.monotonic() - start
     if any(item[4] for item in commands):

@@ -79,7 +79,18 @@ one timing-only worker would reintroduce the critical path. The cold runtime
 `other` worker first compiles the exact `alive` test target without running it,
 under a 10-minute preparation bound. Its subsequent inventory and execution
 still share one 60-second deadline. Preparation failure stops the partition;
-compile-only commands never earn ignored-test execution credit.
+compile-only commands never earn ignored-test execution credit. Timeboxed Cargo
+invocations run in isolated process groups; deadline expiry terminates their
+children too, for inventory as well as execution.
+
+The test-inventory scanner treats the partition runner as an opaque entrypoint.
+It validates the connected planner, workers, strict finals and `ci-ok`, then
+credits ordinary discovery and declared package-specific runtime targets. It does
+not prove Python reachability. Independent execution-ledger/argv tests qualify
+command selection, future-target discovery and failure propagation; completion
+receipts alone do not prove every intended test ran. Offline workflow policy
+fixtures use deterministic metadata, while prepared workers still resolve the
+real workspace. Neither synthetic test establishes LLVM/LCOV parity or latency.
 
 Coverage splits both ignored and nonignored sweeps by package before assigning
 29 legs to eight runners: 14 sweep owners and 15 dedicated replays. The ignored
