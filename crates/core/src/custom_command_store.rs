@@ -252,6 +252,34 @@ pub async fn set_command_enabled<'c>(
     Ok(())
 }
 
+/// Patch one definition's editable columns, preserving name, creator,
+/// creation time and the enabled flag. The caller holds the guild lifecycle
+/// lock and audits the edit in the same transaction, so a failed audit rolls
+/// the patch back.
+pub async fn update_command_fields<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    row: &StoredCommand,
+    updated_by: &str,
+    updated_at_iso: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE automation_commands
+         SET description = $3, template = $4, text_trigger = $5,
+             updated_by = $6, updated_at = $7::text::timestamptz
+         WHERE guild_id = $1 AND name = $2",
+    )
+    .bind(&row.guild_id)
+    .bind(&row.name)
+    .bind(&row.description)
+    .bind(&row.template)
+    .bind(&row.text_trigger)
+    .bind(updated_by)
+    .bind(updated_at_iso)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Delete one definition; true when a row went away.
 pub async fn delete_command<'c>(
     executor: impl Executor<'c, Database = Postgres>,

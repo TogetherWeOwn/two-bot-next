@@ -49,6 +49,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("lfg-edit", "docs/parity.md §1 #26 Next-only companion"),
     ("command-disable", "docs/parity.md §1 command-disable"),
     ("command-enable", "docs/parity.md §1 command-enable"),
+    ("command-edit", "docs/parity.md §1 command-edit"),
     ("giveaway", "docs/parity.md §1 giveaway"),
     ("feed-pause", "docs/parity.md §1 feed-pause"),
     ("feed-resume", "docs/parity.md §1 feed-resume"),
@@ -416,6 +417,34 @@ pub fn expected_registry() -> Value {
             }),
         );
     }
+    // Next-only in-place correction: an independent literal, never built from
+    // production shapes. Published immediately after `command-enable`.
+    let after_enable = commands
+        .iter()
+        .position(|command| command["name"] == "command-enable")
+        .expect("lifecycle pair remains published")
+        + 1;
+    commands.insert(
+        after_enable,
+        json!({
+            "name": "command-edit",
+            "description": "Correct one saved custom command, keeping omitted fields",
+            "dm_permission": false,
+            "default_member_permissions": "32",
+            "options": [
+                {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
+                 "required": true, "max_length": 32},
+                {"name": "template", "description": "New response text (omit to keep the saved text)",
+                 "type": 3, "max_length": 2000},
+                {"name": "description", "description": "New command-picker description (omit to keep it)",
+                 "type": 3, "max_length": 100},
+                {"name": "text-trigger", "description": "New !trigger (omit to keep it)",
+                 "type": 3, "max_length": 33},
+                {"name": "clear-trigger", "description": "True removes the !trigger (not with text-trigger)",
+                 "type": 5}
+            ]
+        }),
+    );
     // Next-only current-channel discovery has its own independent literal.
     // No production constants or registry builders supply either expectation.
     let lfg_list = json!({
@@ -435,8 +464,8 @@ pub fn expected_registry() -> Value {
         + 1;
     commands.insert(after_edit, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 19, immediately after sticky-remove, with
-    // game-mix, welcome-preview, pause/resume and inspection inserts above)
+    // publish position (index 20, immediately after sticky-remove, with
+    // game-mix, welcome-preview, pause/resume, edit and inspection inserts above)
     // as the exact published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
         CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
@@ -575,7 +604,7 @@ pub fn expected_registry() -> Value {
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(19, giveaway);
+    commands.insert(20, giveaway);
     // Next-only feed lifecycle pair. These independent literals pin the whole
     // publication contract; never manufacture them from production shapes.
     // The feed-remove lookup stays dynamic so the giveaway insert above does

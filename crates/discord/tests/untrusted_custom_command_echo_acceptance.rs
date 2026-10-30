@@ -45,8 +45,13 @@ fn runtime(pool: sqlx::PgPool, mock: &MockRest) -> CustomCommandRuntime {
 
 fn slash(id: u64, command: &str, name: &str) -> Interaction {
     let mut options = vec![json!({"name": "name", "type": 3, "value": name})];
-    if command == "command" {
-        options.push(json!({"name": "template", "type": 3, "value": "Saved answer"}));
+    if matches!(command, "command" | "command-edit") {
+        let template = if command == "command-edit" {
+            "Edited answer"
+        } else {
+            "Saved answer"
+        };
+        options.push(json!({"name": "template", "type": 3, "value": template}));
     }
     serde_json::from_value(json!({
         "id": id.to_string(), "application_id": "1111", "type": 2,
@@ -345,6 +350,44 @@ async fn ordinary_names_and_invalid_toggle_refusals_remain_byte_identical() {
             observe(&runtime, &mock, slash(400 + index as u64, command, name)).await,
             expected,
             publishes,
+        ));
+    }
+    mock.shutdown().await;
+    drop(runtime);
+    db.close().await.expect("explicit teardown");
+    for (requests, expected, publishes) in observed {
+        assert_eq!(content(&requests, publishes), expected);
+    }
+}
+
+#[tokio::test]
+async fn edit_receipts_escape_valid_names_without_changing_plain_names() {
+    let db = database().await;
+    let mock = discord().await;
+    let runtime = runtime(db.pool().clone(), &mock);
+    let mut observed = Vec::new();
+    for (index, (name, shown)) in [("__forged__", "\\_\\_forged\\_\\_"), ("faq", "faq")]
+        .into_iter()
+        .enumerate()
+    {
+        let id = 500 + index as u64 * 3;
+        observed.push((
+            observe(&runtime, &mock, slash(id, "command-edit", name)).await,
+            format!("No command /{shown} found."),
+            0,
+        ));
+        seed(db.pool(), name, true).await;
+        observed.push((
+            observe(&runtime, &mock, slash(id + 1, "command-edit", name)).await,
+            format!("Saved /{shown}: updated template."),
+            1,
+        ));
+        observed.push((
+            observe(&runtime, &mock, slash(id + 2, "command-edit", name)).await,
+            format!(
+                "/{shown} is unchanged: the supplied values already match the saved definition."
+            ),
+            0,
         ));
     }
     mock.shutdown().await;

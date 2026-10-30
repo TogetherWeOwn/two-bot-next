@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 44,
+  "count": 45,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -501,6 +501,69 @@
           "min_value": null,
           "max_value": null,
           "max_length": 32,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke."
+    },
+    {
+      "name": "command-edit",
+      "description": "Correct one saved custom command, keeping omitted fields",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Saved command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        },
+        {
+          "name": "template",
+          "description": "New response text (omit to keep the saved text)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 2000,
+          "choices": []
+        },
+        {
+          "name": "description",
+          "description": "New command-picker description (omit to keep it)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 100,
+          "choices": []
+        },
+        {
+          "name": "text-trigger",
+          "description": "New !trigger (omit to keep it)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 33,
+          "choices": []
+        },
+        {
+          "name": "clear-trigger",
+          "description": "True removes the !trigger (not with text-trigger)",
+          "type": "boolean",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
           "choices": []
         }
       ],
