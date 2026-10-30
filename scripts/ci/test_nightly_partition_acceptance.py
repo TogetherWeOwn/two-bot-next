@@ -1047,8 +1047,11 @@ def real_cargo_workspace(scratch):
     except HarnessCleanupError:
         safe_to_remove = False
         raise
+    except BaseException:
+        safe_to_remove = not any((temporary / "control").glob("active-*"))
+        raise
     finally:
-        if safe_to_remove:
+        if safe_to_remove and not any((temporary / "control").glob("active-*")):
             shutil.rmtree(temporary)
 
 
@@ -1119,51 +1122,182 @@ def pooled_cargo_call(configuration, arguments):
 
 def run_admitted_command(command, *, cwd, env, timeout=180, cleanup_timeout=10):
     control = Path(env["NIGHTLY_HARNESS_CONTROL"])
-    process = subprocess.Popen(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, start_new_session=True)
+    process, interrupted = None, None
+
+    def defer(number, _frame):
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = number
+
+    handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    for number in handlers:
+        signal.signal(number, defer)
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-        if list(control.glob("active-*")):
-            raise HarnessCleanupError("command exited before admitted descendants were reaped")
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-    except BaseException:
-        # Keep the runner alive to reap its shim; the shim forwards cancellation
-        # to the bounded wrapper, which owns Cargo's separate process session.
-        (control / "cancelled").touch()
-        deadline, signalled = time.monotonic() + cleanup_timeout, set()
-        while True:
-            for active in control.glob("active-*"):
-                pid = int(active.name.removeprefix("active-"))
-                if pid in signalled:
-                    continue
+        # Never raise from a signal handler: cancellation can arrive before the
+        # child handle is published, or again while wrapper cleanup is running.
+        process = subprocess.Popen(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                if interrupted is not None:
+                    raise KeyboardInterrupt(f"harness parent received signal {interrupted}")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
                 try:
-                    if os.getpgid(pid) != process.pid:
-                        raise HarnessCleanupError("refused to signal a process outside the owned command group")
-                    os.kill(pid, signal.SIGTERM)
-                    signalled.add(pid)
-                except ProcessLookupError:
-                    pass
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HarnessCleanupError("bounded wrapper cleanup did not finish; workspace preserved")
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
+                if interrupted is not None:
+                    raise KeyboardInterrupt(f"harness parent received signal {interrupted}")
+                break
+            if list(control.glob("active-*")):
+                raise HarnessCleanupError("command exited before admitted descendants were reaped")
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        except BaseException:
             try:
-                process.communicate(timeout=min(0.1, remaining))
-            except subprocess.TimeoutExpired:
-                continue
-            if not list(control.glob("active-*")):
-                raise
-            time.sleep(min(0.01, remaining))
+                # The runner stays alive to reap its shim, which forwards once
+                # to the bounded wrapper and waits for Cargo-session cleanup.
+                (control / "cancelled").touch()
+                deadline, signalled = time.monotonic() + cleanup_timeout, set()
+                while True:
+                    for active in control.glob("active-*"):
+                        pid = int(active.name.removeprefix("active-"))
+                        if pid in signalled:
+                            continue
+                        try:
+                            if os.getpgid(pid) != process.pid:
+                                raise HarnessCleanupError("refused to signal a process outside the owned command group")
+                            os.kill(pid, signal.SIGTERM)
+                            signalled.add(pid)
+                        except ProcessLookupError:
+                            pass
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise HarnessCleanupError("bounded wrapper cleanup did not finish; workspace preserved")
+                    try:
+                        process.communicate(timeout=min(0.1, remaining))
+                    except subprocess.TimeoutExpired:
+                        continue
+                    if not list(control.glob("active-*")):
+                        break
+                    time.sleep(min(0.01, remaining))
+            except BaseException as error:
+                raise HarnessCleanupError("wrapper cleanup interrupted or unconfirmed; workspace preserved") from error
+            raise
     finally:
-        if process.poll() is not None:
+        if process is not None and process.poll() is not None:
             process.stdout.close()
             process.stderr.close()
+        for number, handler in handlers.items():
+            signal.signal(number, handler)
+
+
+def parent_signal_supervisor(mode, evidence):
+    # Subreaping is confined to this disposable Linux test process. It lets a
+    # failing parent-signal regression still reap every orphaned fake descendant.
+    import ctypes
+
+    library = ctypes.CDLL(None, use_errno=True)
+    if library.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "could not contain fake signal-test descendants")
+    log = evidence / "events.jsonl"
+
+    def records():
+        try:
+            return [json.loads(line) for line in log.read_text().splitlines()]
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    stopping = False
+
+    def defer(_number, _frame):
+        nonlocal stopping
+        stopping = True
+
+    handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    for number in handlers:
+        signal.signal(number, defer)
+    probe = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--parent-signal-probe", mode, str(evidence)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    sent, reaped, problem = [], [], None
+
+    def wait_for(name):
+        deadline = time.monotonic() + 3
+        while not any(row["event"] == name for row in records()):
+            if stopping:
+                raise KeyboardInterrupt("fake signal supervisor cancelled")
+            if probe.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("parent did not reach " + name)
+            time.sleep(0.01)
+
+    try:
+        wait_for("parent-spawn-pending" if mode == "sigint-spawn" else "parent-communicating")
+        number = signal.SIGTERM if mode == "sigterm" else signal.SIGINT
+        os.kill(probe.pid, number)
+        sent.append({"pid": probe.pid, "signal": int(number), "afterWrapperAck": False})
+        (evidence / "spawn-release").touch()
+        wait_for("wrapper-cancelled")
+        if mode != "sigterm":
+            os.kill(probe.pid, signal.SIGINT)
+            sent.append({"pid": probe.pid, "signal": int(signal.SIGINT), "afterWrapperAck": True})
+        (evidence / "cleanup-release").touch()
+        stdout, stderr = probe.communicate(timeout=5)
+    except BaseException as error:
+        problem = repr(error)
+    finally:
+        (evidence / "spawn-release").touch()
+        (evidence / "cleanup-release").touch()
+        if probe.poll() is None:
+            probe.terminate()
+        try:
+            stdout, stderr = probe.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            stdout, stderr = probe.communicate()
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if pid:
+                reaped.append({"pid": pid, "status": status})
+                continue
+            children = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
+            for child in children:
+                try:
+                    os.kill(int(child), signal.SIGTERM if time.monotonic() < deadline else signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.01)
+        for number, handler in handlers.items():
+            signal.signal(number, handler)
+        probe.stdout.close()
+        probe.stderr.close()
+
+    receipt = evidence / "probe.json"
+    result = json.loads(receipt.read_text()) if receipt.exists() else {"ok": False}
+    events = records()
+    outer_file, owned_file = evidence / "owned-outer", evidence / "owned-workspace"
+    if outer_file.exists() and owned_file.exists():
+        outer, owned = Path(outer_file.read_text()), Path(owned_file.read_text())
+        if outer.is_dir():
+            if not outer.name.startswith("nightly-cancellation-proof-") or owned.parent != outer:
+                raise AssertionError("refused to remove a fixture outside the owned signal proof")
+            shutil.rmtree(outer)
+    return {"mode": mode, "probePid": probe.pid, "probeExit": probe.returncode, "sentSignals": sent,
+            "checksPassed": probe.returncode == 0 and result["ok"], "probe": result, "events": events,
+            "allChildrenReaped": True, "supervisorReaped": reaped, "problem": problem,
+            "stdout": stdout, "stderr": stderr}
 
 
 class HarnessCancellationAcceptance(unittest.TestCase):
-    def exercise_cancellation(self, *, through_runner=False, parent_failure=False):
+    def exercise_cancellation(self, *, through_runner=False, parent_failure=False, parent_signal=None, evidence=None):
         with tempfile.TemporaryDirectory(prefix="nightly-cancellation-proof-") as directory:
             outer = Path(directory).resolve()
-            log = outer / "events.jsonl"
+            log = (evidence or outer) / "events.jsonl"
             wrapper = outer / "fake-wrapper.py"
             worker = (
                 'import json, os, pathlib, signal, sys\n'
@@ -1177,7 +1311,7 @@ class HarnessCancellationAcceptance(unittest.TestCase):
                 'event("compiler-ready")\n'
                 'signal.pause()\n')
             wrapper.write_text(
-                'import json, os, pathlib, signal, subprocess, sys\n'
+                'import json, os, pathlib, signal, subprocess, sys, time\n'
                 'log = pathlib.Path(os.environ["NIGHTLY_CANCELLATION_LOG"])\n'
                 'workspace = pathlib.Path(os.environ["NIGHTLY_CANCELLATION_WORKSPACE"])\n'
                 'child, stopping = None, False\n'
@@ -1188,6 +1322,9 @@ class HarnessCancellationAcceptance(unittest.TestCase):
                 '    if stopping: return\n'
                 '    stopping = True\n'
                 '    event("wrapper-cancelled")\n'
+                '    if os.environ.get("NIGHTLY_PARENT_SIGNAL_PROOF"):\n'
+                '        deadline = time.monotonic() + 2\n'
+                '        while not (log.parent / "cleanup-release").exists() and time.monotonic() < deadline: time.sleep(0.01)\n'
                 '    if child is not None: child.terminate()\n'
                 'signal.signal(signal.SIGTERM, stop)\n'
                 '(log.parent / "fake-lease-sentinel").touch()\n'
@@ -1214,38 +1351,59 @@ class HarnessCancellationAcceptance(unittest.TestCase):
                 except json.JSONDecodeError:
                     return []
 
+            def event(name):
+                with log.open("a") as stream:
+                    stream.write(json.dumps({"event": name, "pid": os.getpid()}) + "\n")
+
+            def ready(process):
+                deadline = time.monotonic() + 3
+                while not any(row["event"] == "compiler-ready" for row in records()):
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        self.fail("fake compiler did not reach the cancellation gate")
+                    time.sleep(0.01)
+
             processes, first = [], True
             popen, communicate = subprocess.Popen, subprocess.Popen.communicate
 
             def spawn(*args, **kwargs):
                 process = popen(*args, **kwargs)
                 processes.append(process)
+                if parent_signal == "sigint-spawn":
+                    ready(process)
+                    event("parent-spawn-pending")
+                    deadline = time.monotonic() + 3
+                    while not (log.parent / "spawn-release").exists():
+                        if time.monotonic() >= deadline:
+                            self.fail("supervisor did not release parent spawn")
+                        time.sleep(0.01)
                 return process
 
             def gated_communicate(process, *args, **kwargs):
                 nonlocal first
                 if first:
                     first = False
-                    deadline = time.monotonic() + 3
-                    while not any(row["event"] == "compiler-ready" for row in records()):
-                        if process.poll() is not None or time.monotonic() >= deadline:
-                            self.fail("fake compiler did not reach the cancellation gate")
-                        time.sleep(0.01)
+                    ready(process)
+                    if parent_signal:
+                        event("parent-communicating")
                     if parent_failure:
                         raise RuntimeError("fixture parent failure")
                 return communicate(process, *args, **kwargs)
 
             with real_cargo_workspace(str(outer)) as owned:
-                original_path = os.pathsep.join(str((Path.cwd() / item).resolve()) for item in os.environ["PATH"].split(os.pathsep))
+                original_path = os.pathsep.join(str(Path.cwd() / item) for item in os.environ["PATH"].split(os.pathsep))
                 environment = pooled_cargo_environment(owned, wrapper, original_path)
                 environment.update(NIGHTLY_CANCELLATION_LOG=str(log), NIGHTLY_CANCELLATION_WORKSPACE=str(owned))
+                if parent_signal:
+                    environment["NIGHTLY_PARENT_SIGNAL_PROOF"] = "1"
+                    (log.parent / "owned-workspace").write_text(str(owned))
+                    (log.parent / "owned-outer").write_text(str(outer))
                 command = ["cargo", "test", *CARGO_FLAGS, "--", "--include-ignored", "--test-threads=1"]
                 if through_runner:
                     command = [sys.executable, str(RUNNER), "--index", "0", "--count", "1", "--", *command]
-                expected = RuntimeError if parent_failure else subprocess.TimeoutExpired
+                expected = KeyboardInterrupt if parent_signal else RuntimeError if parent_failure else subprocess.TimeoutExpired
                 with patch.object(subprocess, "Popen", spawn), patch.object(popen, "communicate", gated_communicate):
                     with self.assertRaises(expected):
-                        run_admitted_command(command, cwd=owned, env=environment, timeout=0.05, cleanup_timeout=5)
+                        run_admitted_command(command, cwd=owned, env=environment, timeout=4 if parent_signal else 0.05, cleanup_timeout=5)
                 self.assertTrue(owned.is_dir(), "fixture must exist until wrapper cleanup completes")
                 self.assertFalse(list((owned / "control").glob("active-*")))
                 events = records()
@@ -1261,10 +1419,85 @@ class HarnessCancellationAcceptance(unittest.TestCase):
                             os.kill(pid, 0)
                 self.assertTrue(all(process.returncode is not None for process in processes))
             self.assertFalse(owned.exists(), "fixture removal must follow completed reaping")
-            self.assertTrue((outer / "fake-lease-sentinel").exists(), "cancellation must not clear a retained lease sentinel")
-            return {"throughRunner": through_runner, "parentFailure": parent_failure, "events": events,
+            self.assertTrue((log.parent / "fake-lease-sentinel").exists(), "cancellation must not clear a retained lease sentinel")
+            return {"throughRunner": through_runner, "parentFailure": parent_failure, "parentSignal": parent_signal, "events": events,
                     "rootExitCodes": [process.returncode for process in processes], "fixtureRemoved": not owned.exists(),
                     "allRecordedPidsReaped": True, "fakeLeaseSentinelRetained": True}
+
+    def exercise_parent_signal(self, mode):
+        with real_cargo_workspace(None) as evidence:
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--parent-signal-supervisor", mode, str(evidence)],
+                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            try:
+                stdout, stderr = process.communicate(timeout=20)
+            except BaseException:
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                    process.communicate(timeout=20)
+                except BaseException as error:
+                    raise HarnessCleanupError("signal supervisor cleanup unconfirmed; proof workspace preserved") from error
+                raise
+            finally:
+                if process.poll() is not None:
+                    process.stdout.close()
+                    process.stderr.close()
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            report = json.loads((evidence / "supervisor.json").read_text())
+            self.assertTrue(report["allChildrenReaped"], report)
+            self.assertTrue(report["checksPassed"], json.dumps(report, indent=2))
+            expected = [int(signal.SIGTERM)] if mode == "sigterm" else [int(signal.SIGINT), int(signal.SIGINT)]
+            self.assertEqual([row["signal"] for row in report["sentSignals"]], expected)
+            self.assertTrue(all(row["pid"] == report["probePid"] for row in report["sentSignals"]),
+                            "signals must target the harness parent, not just its shim")
+            if mode != "sigterm":
+                self.assertTrue(report["sentSignals"][1]["afterWrapperAck"])
+            return report
+
+    def test_repeated_parent_sigint_cannot_interrupt_spawn_or_reaping(self):
+        for mode in ("sigint", "sigint-spawn"):
+            with self.subTest(mode=mode):
+                self.exercise_parent_signal(mode)
+
+    def test_parent_only_sigterm_reaps_the_admitted_fake_family(self):
+        self.exercise_parent_signal("sigterm")
+
+    def test_interrupted_cleanup_preserves_the_fixture(self):
+        class Interrupted:
+            pid, returncode, calls = 123456789, None, 0
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            def communicate(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(["fixture"], 0)
+                raise KeyboardInterrupt("fixture interrupted reaping")
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory(prefix="nightly-interrupted-cleanup-") as directory:
+            owned, uncertain, failure = None, None, None
+            try:
+                try:
+                    with real_cargo_workspace(directory) as owned:
+                        environment = pooled_cargo_environment(owned, owned / "unused-wrapper.py", os.environ["PATH"])
+                        with patch.object(subprocess, "Popen", return_value=Interrupted()):
+                            run_admitted_command(["fixture"], cwd=owned, env=environment, timeout=0, cleanup_timeout=1)
+                except BaseException as error:
+                    failure = error
+                self.assertTrue(owned.is_dir(), "interrupted reaping must not remove an unconfirmed fixture")
+                self.assertIsInstance(failure, HarnessCleanupError)
+                with self.assertRaises(KeyboardInterrupt):
+                    with real_cargo_workspace(directory) as uncertain:
+                        (uncertain / "control").mkdir()
+                        (uncertain / "control/active-0").touch()
+                        raise KeyboardInterrupt("fixture interrupted with active descendants")
+                self.assertTrue(uncertain.is_dir(), "active descendant evidence must preserve the fixture on any interruption")
+            finally:
+                for temporary in (owned, uncertain):
+                    if temporary is not None and temporary.exists():
+                        shutil.rmtree(temporary)
 
     def test_timeout_reaps_wrapper_and_separate_session_before_fixture_removal(self):
         for through_runner in (False, True):
@@ -1342,8 +1575,12 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
             root = temporary / "repo"
             (root / "scripts").mkdir(parents=True)
             (root / "rust-toolchain.toml").write_bytes((ROOT / "rust-toolchain.toml").read_bytes())
-            real_bin = temporary if path_style == "empty" else temporary / ("bin" if path_style == "relative" else "original-path")
+            real_bin = temporary if path_style == "empty" else temporary / ("bin" if path_style == "relative" else "tools:bin" if path_style == "symlink" else "original-path")
             real_bin.mkdir(exist_ok=True)
+            route = real_bin
+            if path_style == "symlink":
+                route = temporary / "tools-alias"
+                route.symlink_to(real_bin, target_is_directory=True)
             cargo = real_bin / "cargo"
             fake = FAKE_CARGO.replace(
                 'args = sys.argv[1:]',
@@ -1370,7 +1607,7 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
                 'if len(ledger.read_text().splitlines()) == int(os.environ["NIGHTLY_POOL_REFUSE_AT"]):\n'
                 '    print("fixture bounded pool refused admission", file=sys.stderr)\n'
                 '    sys.exit(75)\n'
-                f'if os.environ["PATH"].split(os.pathsep)[0] != {str(real_bin)!r}: sys.exit(96)\n'
+                f'if os.environ["PATH"].split(os.pathsep)[0] != {str(route)!r}: sys.exit(96)\n'
                 'sys.exit(subprocess.run(["cargo", *sys.argv[3:]]).returncode)\n')
             inventory = temporary / "fixture.json"
             inventory.write_text(json.dumps({
@@ -1383,7 +1620,7 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
             }))
             ledger = temporary / "cargo.jsonl"
             pool_ledger = temporary / "pool.jsonl"
-            first_path = "bin" if path_style == "relative" else "" if path_style == "empty" else str(real_bin)
+            first_path = "bin" if path_style == "relative" else "" if path_style == "empty" else str(route)
             environment = {
                 "PATH": first_path + os.pathsep + os.environ["PATH"],
                 "NIGHTLY_FIXTURE": str(inventory), "NIGHTLY_LEDGER": str(ledger),
@@ -1485,6 +1722,14 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
                 self.assertEqual(sum(event["event"] == "command" for event in events), 7)
                 self.assertTrue(all(Path(row["path"].split(os.pathsep)[0]).is_absolute() for row in admissions))
 
+    def test_symlink_path_spelling_does_not_introduce_a_separator(self):
+        result, output, events, admissions = self.exercise_real_suite_offline(path_style="symlink")
+        self.assertTrue(result.wasSuccessful(), output)
+        self.assertEqual(len(admissions), 7)
+        self.assertEqual(sum(event["event"] == "command" for event in events), 7)
+        self.assertTrue(all(row["path"].split(os.pathsep)[0].endswith("/tools-alias") for row in admissions),
+                        "the colon-free alias must remain a single original PATH entry")
+
     def test_a_late_refusal_fences_all_later_admission_attempts(self):
         result, output, events, admissions = self.exercise_real_suite_offline(refuse_at=4)
         self.assertFalse(result.wasSuccessful(), "a late refusal must not be reported green")
@@ -1507,7 +1752,7 @@ def real_cargo_suite():
                             and not any(character.isspace() for character in str(interpreter)),
                             "unsafe Cargo interception: unsupported interpreter path")
             original_cwd = Path.cwd()
-            original_path = os.pathsep.join(str((original_cwd / entry).resolve())
+            original_path = os.pathsep.join(str(original_cwd / entry)
                                             for entry in os.environ["PATH"].split(os.pathsep))
             scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")
             scratch = str(Path(scratch).resolve()) if scratch else None
@@ -1583,6 +1828,22 @@ def real_cargo_suite():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--parent-signal-probe"]:
+        evidence = Path(sys.argv[3])
+        try:
+            proof = HarnessCancellationAcceptance().exercise_cancellation(
+                through_runner=True, parent_signal=sys.argv[2], evidence=evidence)
+        except BaseException as error:
+            receipt = {"ok": False, "error": repr(error)}
+        else:
+            receipt = {"ok": True, "proof": proof}
+        (evidence / "probe.json").write_text(json.dumps(receipt))
+        raise SystemExit(0 if receipt["ok"] else 1)
+    if sys.argv[1:2] == ["--parent-signal-supervisor"]:
+        evidence = Path(sys.argv[3])
+        proof = parent_signal_supervisor(sys.argv[2], evidence)
+        (evidence / "supervisor.json").write_text(json.dumps(proof))
+        raise SystemExit(0)
     if sys.argv[1:2] == ["--pooled-cargo-shim"]:
         raise SystemExit(pooled_cargo_call(Path(sys.argv[2]), sys.argv[3:]))
     if sys.argv[1:] == ["--real-cargo"]:
