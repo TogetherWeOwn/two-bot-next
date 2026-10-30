@@ -39,7 +39,10 @@ Use `/help command:rank` for a command's description, usage and optional member\
 argument; `/help command:privacy` explains its subcommands and required inputs.\n\
 The optional `command` selector trims surrounding whitespace, accepts one\n\
 leading slash and compares ASCII case-insensitively. It does not expand aliases\n\
-or name prefixes. Unknown or unpublished names return a correction to `/help`,\n\
+or name prefixes. The optional `subcommand` selector focuses one exact\n\
+space-separated subcommand/group path within the selected command, with its\n\
+own option budget; unknown, malformed or rootless paths return a correction\n\
+to `/help`. Unknown or unpublished names return a correction to `/help`,\n\
 never unpublished definitions. Custom commands appear only after publication\n\
 is confirmed; failed or in-flight changes do not replace the confirmed help.\n\
 Help is ephemeral and does not execute the selected command. The command picker\n\
@@ -707,6 +710,29 @@ fn schedule_preview_option_renders_in_command_reference() {
     assert!(
         section.contains("Preview the proposed post and its first firing without saving it"),
         "preview description renders: {section}"
+    );
+}
+
+#[test]
+fn help_subcommand_option_renders_in_command_reference() {
+    let section = render_commands()
+        .split("## `/help`\n")
+        .nth(1)
+        .expect("help section renders")
+        .split("\n## ")
+        .next()
+        .expect("help section ends")
+        .to_owned();
+    assert!(
+        section.contains("| `command` | string | false |"),
+        "existing command selector stays rendered: {section}"
+    );
+    assert!(
+        section.contains(
+            "| `subcommand` | string | false | — | — | 96 | — | \
+             Subcommand path, space-separated (requires command) |"
+        ),
+        "subcommand renders as an optional length-96 string: {section}"
     );
 }
 

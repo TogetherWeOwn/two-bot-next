@@ -111,6 +111,9 @@ pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
+pub mod moderation_recent;
+#[cfg(feature = "db")]
+pub mod moderation_recent_store;
 pub mod music_voice;
 pub mod onboarding;
 pub mod onboarding_destination;

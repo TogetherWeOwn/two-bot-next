@@ -221,9 +221,11 @@ otherwise the loop is unchanged.
   `handle_at_with_message_disposition` exactly once and fires the message hook
   only when `runs_text_automations` passes the trigger verdict — `None`
   (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:343-347`,
-  `crates/bot/src/gateway.rs:56-70`). The hook carries
+  `crates/bot/src/gateway.rs:52-72`). The hook carries
   the trigger verdict into the trigger handler, where a missing verdict fails
-  closed (`crates/bot/src/command_runtime.rs:1031-1052`, `crates/bot/src/gateway_commands.rs:89-100`). Per outcome class
+  closed (`CommandRuntime::dispatch_with_verdict` in
+  `crates/bot/src/command_runtime.rs`, `acceptance_for_verdict`
+  at `crates/bot/src/gateway_commands.rs:100-116`). Per outcome class
   (`ActivationOutcome` in `crates/discord/src/automod_activation.rs:74-86`):
 
   | Outcome | `funnel` | `trigger` | Text automations run? |

@@ -247,6 +247,74 @@ class TrackerUnitTests(unittest.TestCase):
         self.assertEqual(stored["verdict"], "held")
         self.assertEqual(stored["action"], "none")
 
+    def test_ring_input_is_unique_temp_file_beside_exposition(self):
+        # The driver input must be a per-invocation temp file beside the
+        # exposition output, never the shared cwd sidecar: two runs see
+        # different paths and leave no sidecar behind.
+        evidence = str(self.dir / "evidence.json")
+        expo = self.dir / "expo.prom"
+        held = {"slow": False, "fast": False, "held": True, "ring": [],
+                "slowCovered": False}
+        sidecar = Path("slow-burn-ring-prev.json")
+        sidecar_before = sidecar.read_bytes() if sidecar.exists() else None
+        seen = []
+
+        def capture(node, driver, exposition_path, ring_path, now):
+            seen.append(Path(ring_path))
+            self.assertTrue(Path(ring_path).is_file())
+            return held
+
+        argv = ["--fixture", "fire", "--evidence-out", evidence,
+                "--exposition-out", str(expo)]
+        with mock.patch.object(tracker, "run_driver", side_effect=capture):
+            with mock.patch("subprocess.run",
+                             side_effect=AssertionError("gh must not run")):
+                self.assertEqual(tracker.main(list(argv), base_env()), 0)
+                self.assertEqual(tracker.main(list(argv), base_env()), 0)
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+        for ring_path in seen:
+            self.assertEqual(ring_path.parent.parent.resolve(),
+                             expo.resolve().parent)
+            self.assertTrue(
+                ring_path.parent.name.startswith("slow-burn-ring-"))
+            self.assertFalse(ring_path.exists())
+            self.assertFalse(ring_path.parent.exists())
+        leftovers = [p for p in expo.parent.iterdir()
+                     if p.name.startswith("slow-burn-ring-")]
+        self.assertEqual(leftovers, [])
+        # The old shared-input path clobbered this tracked file mid-suite.
+        if sidecar_before is None:
+            self.assertFalse(sidecar.exists())
+        else:
+            self.assertEqual(sidecar.read_bytes(), sidecar_before)
+
+    def test_ring_temp_input_cleaned_up_after_driver_error(self):
+        evidence = str(self.dir / "evidence.json")
+        expo = self.dir / "expo.prom"
+        sidecar = Path("slow-burn-ring-prev.json")
+        sidecar_before = sidecar.read_bytes() if sidecar.exists() else None
+        seen = []
+
+        def failing(node, driver, exposition_path, ring_path, now):
+            seen.append(Path(ring_path))
+            raise tracker.TrackError("burn evaluation failed: driver did not run")
+
+        with mock.patch.object(tracker, "run_driver", side_effect=failing):
+            code = tracker.main(
+                ["--fixture", "fire", "--evidence-out", evidence,
+                 "--exposition-out", str(expo)],
+                base_env())
+        self.assertEqual(code, 1)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].parent.name.startswith("slow-burn-ring-"))
+        self.assertFalse(seen[0].exists())
+        self.assertFalse(seen[0].parent.exists())
+        if sidecar_before is None:
+            self.assertFalse(sidecar.exists())
+        else:
+            self.assertEqual(sidecar.read_bytes(), sidecar_before)
+
     def test_main_without_argv_reads_process_arguments(self):
         # A bare main() must read sys.argv: with `argv or []` a fixture
         # dispatch silently ran live and wrote under the real label.
@@ -849,6 +917,7 @@ class TrackerCacheDuplicateKeyTests(unittest.TestCase):
 
 # Keep protected intake acceptance tests in the existing CI entrypoint.
 from test_slow_burn_tracker_intake_acceptance import TrackerIntakeAcceptanceTests
+from test_slow_burn_tracker_scratch_acceptance import TrackerScratchAcceptanceTests
 
 
 if __name__ == "__main__":

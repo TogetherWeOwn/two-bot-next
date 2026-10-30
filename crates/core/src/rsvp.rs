@@ -1202,8 +1202,8 @@ mod tests {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices merge cleanly");
         // 7 core + 25 feature commands, including pause/resume, lfg-edit and feed-inspect,
-        // + 9 mutations + 3 reads: nothing deduped away.
-        assert_eq!(merged.len(), 44);
+        // + 9 mutations + 4 reads: nothing deduped away.
+        assert_eq!(merged.len(), 45);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         for name in [
             "attendance",
@@ -1212,6 +1212,8 @@ mod tests {
             "lfg-edit",
             "lfg-list",
             "feed-inspect",
+            "tempban-list",
+            "moderation-recent",
         ] {
             assert_eq!(
                 names.iter().filter(|n| **n == name).count(),

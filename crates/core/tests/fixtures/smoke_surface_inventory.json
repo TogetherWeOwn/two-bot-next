@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 43,
+  "count": 44,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -54,6 +54,16 @@
           "min_value": null,
           "max_value": null,
           "max_length": 32,
+          "choices": []
+        },
+        {
+          "name": "subcommand",
+          "description": "Subcommand path, space-separated (requires command)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 96,
           "choices": []
         }
       ],
@@ -397,7 +407,7 @@
     },
     {
       "name": "command-inspect",
-      "description": "Inspect a saved command or privately preview an unsaved draft",
+      "description": "Inspect saved state and text-trigger eligibility, or preview an unsaved draft",
       "family": "automations",
       "gate": "automations",
       "default_member_permissions": "32",
@@ -1596,6 +1606,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only private read; covered by offline preview/inspect acceptance, outside the unchanged top-five live smoke."
+    },
+    {
+      "name": "moderation-recent",
+      "description": "Privately list recent saved moderation actions",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "1099511627776",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "page",
+          "description": "Page of saved moderation actions (1 is newest)",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": 20,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private staff read of saved ledger rows; covered by the offline recent-actions acceptance, outside the unchanged top-five live smoke."
     }
   ]
 }

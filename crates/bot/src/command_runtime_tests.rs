@@ -39,6 +39,8 @@ mod member_authority_cause_acceptance;
 mod member_dispatch_authority_acceptance;
 #[path = "member_strict_decode_acceptance.rs"]
 mod member_strict_decode_acceptance;
+#[path = "moderation_recent_acceptance.rs"]
+mod moderation_recent_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
 mod sticky_uncertain_acceptance_tests;
 #[path = "sticky_unsaved_preview_acceptance_tests.rs"]
@@ -46,12 +48,16 @@ mod sticky_unsaved_preview_acceptance_tests;
 #[path = "tempban_inventory_acceptance_tests.rs"]
 mod tempban_inventory_acceptance_tests;
 
+#[path = "custom_command_inspect_eligibility_acceptance.rs"]
+mod custom_command_inspect_eligibility_acceptance;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 #[path = "custom_command_toggle_acceptance.rs"]
 mod custom_command_toggle_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
+#[path = "help_focus_acceptance.rs"]
+mod help_focus_acceptance;
 
 #[path = "game_mix_acceptance_tests.rs"]
 mod game_mix_acceptance_tests;
@@ -122,8 +128,9 @@ use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options_strict, feed_id_option, feed_list_page_request,
-    feed_remove_option_strict, help_command_selector, new_id, router_with_commands,
-    sticky_options_strict, CommandRuntime, FeedListPage, RegistrySyncError,
+    feed_remove_option_strict, help_command_selector, help_focus_selector, new_id,
+    router_with_commands, sticky_options_strict, CommandRuntime, FeedListPage, HelpSubcommand,
+    RegistrySyncError,
 };
 use crate::feed_jobs::ANNOUNCEMENTS_KEY;
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
@@ -3562,6 +3569,116 @@ fn help_command_selector_keeps_omitted_absent_and_malformed_present() {
         let interaction = slash("help", Some(CHANNEL), vec![option("command", value)]);
         assert_eq!(help_command_selector(&interaction), Some(String::new()));
     }
+}
+
+#[test]
+fn help_focus_selector_rejects_duplicate_command_with_a_path() {
+    let command = |name: &str| option("command", CommandOptionValue::String(name.to_owned()));
+    let path = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    let focused = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank"), path.clone()],
+    );
+    assert_eq!(help_focus_selector(&focused), HelpSubcommand::Malformed);
+    // One root keeps the focused path.
+    let single = slash("help", Some(CHANNEL), vec![command("privacy"), path]);
+    assert_eq!(
+        help_focus_selector(&single),
+        HelpSubcommand::Path("deletion-status".to_owned())
+    );
+    // Without a path the existing root decode is untouched.
+    let root_only = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank")],
+    );
+    assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
+}
+
+#[tokio::test]
+async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let runtime = CommandRuntime::new(
+        pool,
+        executor,
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    runtime.set_identity(1111, 1111);
+    runtime
+        .publish_registry_checked(Some(1111))
+        .await
+        .expect("confirmed registry");
+    let command = |root: &str| option("command", CommandOptionValue::String(root.to_owned()));
+    let focus = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    // A valid control ensures the confirmed snapshot can actually render the
+    // focused detail that a first-root-wins regression would leak.
+    for roots in [
+        vec!["privacy"],
+        vec!["privacy", "rank"],
+        vec!["rank", "privacy"],
+    ] {
+        let mut options: Vec<_> = roots.iter().map(|root| command(root)).collect();
+        options.push(focus.clone());
+        let mut interaction = slash("help", Some(CHANNEL), options);
+        interaction.member.as_mut().expect("member").permissions = Some(Permissions::empty());
+        let before = mock.requests().len();
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            runtime.on_interaction(&interaction),
+        )
+        .await
+        .expect("help cannot wait on the closed pool");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), before + 1, "only one help callback");
+        let callback = &requests[before];
+        assert_eq!(callback.method, "POST");
+        assert!(callback.path.ends_with("/callback"));
+        let reply: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback JSON");
+        assert_eq!(reply["type"], 4, "immediate response, never defer");
+        assert_eq!(reply["data"]["flags"], 64, "private response");
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        let content = reply["data"]["content"].as_str().expect("help content");
+        if roots.len() == 1 {
+            assert!(
+                content.contains("Usage: /privacy deletion-status <request-id>"),
+                "{content}"
+            );
+        } else {
+            assert!(content.contains("/help"), "{content}");
+            assert!(content.contains("confirmed"), "{content}");
+            assert!(content.contains("Unknown subcommand"), "{content}");
+            assert!(content.encode_utf16().count() <= 2000, "finite correction");
+            assert!(
+                !content.contains("/privacy"),
+                "no focused detail: {content}"
+            );
+            assert!(!content.contains("/rank"), "no root detail: {content}");
+            assert!(
+                !content.contains("deletion-status"),
+                "no input echo: {content}"
+            );
+        }
+    }
+    mock.shutdown().await;
 }
 
 #[test]
