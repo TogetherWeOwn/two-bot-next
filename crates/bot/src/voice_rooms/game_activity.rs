@@ -1207,6 +1207,25 @@ pub async fn flush_due_guilds(
     }
 }
 
+/// Persist whatever every guild has buffered, due or not.
+///
+/// Shutdown-only counterpart of [`flush_due_guilds`]: the final partial
+/// interval is not yet "due", so the hourly gate would skip it. Each guild
+/// goes through the same drain-then-persist path, so a guild the hourly tick
+/// already flushed contributes only what arrived since and is never counted
+/// twice. A gate failure leaves the buffers intact and is not retried: the
+/// process is exiting.
+pub async fn flush_remaining_guilds(
+    pool: &sqlx::PgPool,
+    collector: &GameActivityCollector,
+    now_ms: i64,
+    gap_timeout_ms: i64,
+) {
+    for guild in collector.guilds() {
+        let _ = persist_guild(pool, collector, guild, gap_timeout_ms, now_ms).await;
+    }
+}
+
 fn now_ms() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -1220,16 +1239,26 @@ fn now_ms() -> i64 {
 /// Hourly per-guild persist loop for the voice runtime's collector.
 ///
 /// Wakes every `FLUSH_POLL_INTERVAL` and persists each guild due per
-/// [`flush_due`]. Detached on purpose: the voice sink owns no shutdown
-/// handle, and each tick persists at most once per interval, so a deploy
-/// boundary at worst drops the current partial interval — the next tick
-/// continues from drained buffers, never double-counting.
-pub async fn flush_loop(pool: sqlx::PgPool, collector: Arc<GameActivityCollector>) {
+/// [`flush_due`]. When `shutdown` latches (including before the first poll)
+/// the loop runs one trailing [`flush_remaining_guilds`] and returns, so the
+/// caller can join it. A persist already in flight is never cancelled: the
+/// latch is observed only between ticks, and the trailing flush reads the
+/// already-drained buffers, so the interval is counted once.
+pub async fn flush_loop(
+    pool: sqlx::PgPool,
+    collector: Arc<GameActivityCollector>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let mut last_flush_ms: HashMap<Snowflake, i64> = HashMap::new();
     let mut tick = tokio::time::interval(FLUSH_POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            biased;
+            // A dropped sender also ends the loop: nothing can latch anymore.
+            _ = shutdown.wait_for(|latched| *latched) => break,
+            _ = tick.tick() => {}
+        }
         flush_due_guilds(
             &pool,
             &collector,
@@ -1239,6 +1268,7 @@ pub async fn flush_loop(pool: sqlx::PgPool, collector: Arc<GameActivityCollector
         )
         .await;
     }
+    flush_remaining_guilds(&pool, &collector, now_ms(), GAME_ACTIVITY_GAP_TIMEOUT_MS).await;
 }
 
 #[cfg(test)]
