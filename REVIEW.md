@@ -31,8 +31,11 @@ Severity is impact times confidence, after the disproof pass below:
 - **Investigate/flag, not a bug:** the mechanism depends on an assumption you
   could not verify against this code or the pinned Twilight/Discord contract.
 - **Security exception:** never drop or downgrade a plausible security issue
-  for lack of full verification. Report it as a security Warning and state
-  the unverified step; reserve Critical for a traced, verified path.
+  for lack of full verification. Report it privately as a security Warning,
+  including the unverified step, via the process in `SECURITY.md`; reserve
+  Critical for a traced, verified path. Do not disclose vulnerability details
+  or the mechanism in public review output. If appropriate, leave only a
+  non-sensitive public notice that a private report is required.
 
 ## Disproof pass (before posting any finding)
 
@@ -79,8 +82,11 @@ A missing test alone is not a runtime bug. These are blocking findings:
 
 - **Gateway lifecycle** (`crates/bot/src/gateway*.rs`, `audit_gateway.rs`,
   `automod_gateway.rs`): session persistence and resume, duplicate-event
-  deduplication keys, poison-event handling that drops one event without
-  stalling the stream, backoff that cannot spin or stampede on reconnect.
+  deduplication keys, poison-event handling, and backoff that cannot spin or
+  stampede on reconnect. Drop and continue only for proven safe no-op or
+  refusal events; never advance the checkpoint past required uncommitted
+  effects. Parse, compression, and database errors stop the runner as
+  described in `docs/gateway-recovery.md`.
 - **Moderation and automod:** every automated action needs its permission,
   role-hierarchy, and target checks on the actual event path; a rule that
   can act on moderators, the bot itself, or already-actioned messages is a
@@ -119,7 +125,8 @@ the behavior/dependency change, not cosmetic diff noise.
 
 ## Finding format and coverage
 
-One concise inline finding per root cause, anchored to the smallest changed
+Except for vulnerability details requiring private reporting under `SECURITY.md`,
+use one concise inline finding per root cause, anchored to the smallest changed
 range: title, severity with its reason, triggering scenario, evidence
 (file/symbol), smallest corrective direction. State the commit you reviewed
 and anything material you did not cover; "no issues" must not claim coverage
