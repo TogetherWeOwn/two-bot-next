@@ -765,7 +765,7 @@ async fn myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitte
         "completion must not silently clamp a row: {} scalars",
         text.chars().count()
     );
-    let shown = complete_private_rows(text, &ids);
+    let shown = complete_private_rows(&text, &ids);
     let attachments = response
         .data
         .as_ref()

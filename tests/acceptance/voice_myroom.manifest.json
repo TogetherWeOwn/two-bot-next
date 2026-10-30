@@ -1,12 +1,13 @@
 {
   "schemaVersion": 1,
   "purpose": "Protected test-only review correction for owned-room discovery: observed ACL privacy, context-free refusal diagnostics, fail-closed imports, rollback cleanup and existing custom-command compatibility",
-  "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
+  "baseCommit": "74389d2845e762db8a502da9890f3f98a64f8f46",
+  "originalFeatureBase": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
   "branch": "feat/myroom-owned-rooms",
   "protectedFiles": [
     {
       "path": "crates/bot/src/voice_myroom_acceptance_tests.rs",
-      "sha256": "125b6c380edf29e59d98c01537c13fea58ccac085f9f75fd6baba0b9b50baaee",
+      "sha256": "4b4e675ac1607183390aaa55faac00b68cc792578700fd10bd202cc1f09db32f",
       "tests": 16,
       "change": "Room 501 now has an observed guild @everyone Connect deny. All original refusal, owner identity, ephemeral reply, poisoned-store and pre/post no-write assertions remain. Adds genuine partial-public failure, unknown ACL, controlled reconnect, deleted/disconnected controls and bounded long-response cases."
     },
@@ -128,19 +129,24 @@
         "command": "python3 scripts/generate_command_reference.py --controller",
         "exit": 75,
         "reason": "no idle, below-budget slot; no per-worktree fallback"
-      },
-      {
-        "command": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_config command_roles_accept_only_restrictable_voice_commands -- --nocapture",
-        "exit": 75,
-        "reason": "no idle, below-budget slot; no per-worktree fallback"
       }
     ],
+    "focusedRustNotRun": "Generated-reference prerequisite refused exit 75; the focused Rust command was not started.",
+    "previousHeadNativeCompile": {
+      "head": "74389d2845e762db8a502da9890f3f98a64f8f46",
+      "jobUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41061347830/job/124081722265",
+      "error": "E0308: expected &str, found String",
+      "location": "crates/bot/src/voice_myroom_acceptance_tests.rs:768:39",
+      "reviewedFailedJobs": 7,
+      "distinctCompilerErrors": 1,
+      "classification": "Real test-source compile error, not an assertion RED or a flake. Every compiler diagnostic in the reviewed failed-job logs identifies this same call."
+    },
     "rustCompiled": false,
     "observedRed": false,
     "observedGreen": false
   },
   "limitations": [
-    "No Rust target compiled or executed: command-reference generation and the focused codec test both refused Cargo admission with exit 75 (no idle, below-budget slot; no per-worktree fallback). No observed failing assertions or passing controls are claimed.",
+    "No corrected-head Rust compile or assertion result is observed. Local command-reference generation refused admission with exit 75, so focused Rust tests were not started. The predecessor's native jobs failed compilation with E0308 at the corrected call; that failure is not assertion RED. No passing controls are claimed.",
     "The deterministic lifecycle case proves the actor-dispatch ordering boundary, not single-read-guard atomicity inside the synchronous lookup. The one-guard requirement remains in force for Builder implementation and independent review.",
     "The real VoiceResponder is exercised, but the RoomHttp completion clamp/wire adapter is not. Its loopback constructor is private to the Discord crate and no existing downstream seam is exported. No production hook was added; a bounded responder input makes the existing clamp an identity, but that is reasoning, not an observed transport traversal.",
     "Previous-image compatibility uses a frozen strict command validator and the runtime policy JSON shape, not a compiled previous image or production database."
@@ -152,9 +158,9 @@
     "The cache refusal is not RED proof. Record actual baseline assertion/control results when compilation is admitted; this handoff does not waive any test, CI, review or shipping requirement."
   ],
   "revision": {
-    "version": 3,
-    "supersedes": "7d0763bee7979c499cf9b46e90726f80e9d2629c",
-    "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
-    "reason": "Corrects the normal private-room fixture to carry its actual Connect deny rather than infer ACL privacy from persisted retry state. Separately corrects the config-import allowlist assumption and reservation-only capacity arithmetic, preserving runtime myroom restriction support and genuine overflow. Adds requested review regressions without weakening the original ownership, refusal or no-write assertions."
+    "version": 4,
+    "supersedes": "74389d2845e762db8a502da9890f3f98a64f8f46",
+    "baseCommit": "74389d2845e762db8a502da9890f3f98a64f8f46",
+    "reason": "Compile-only correction: borrow the String returned by response_text when calling complete_private_rows(&text, &ids), whose parameter is &str. The only Rust edit is the added borrow at line 768; every assertion and all other protected test files are byte-identical to the predecessor. All round-4 contracts, limitations and no-companion-PR requirements remain unchanged."
   }
 }
