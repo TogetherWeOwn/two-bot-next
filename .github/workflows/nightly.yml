@@ -139,15 +139,19 @@ jobs:
       - name: Job-container prerequisites (job-private loopback forward)
         run: |
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          # Keep the package lists off the job-container overlay.
+          rm -rf /var/lib/apt/lists/*
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for _ in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
       - name: Guarded fixture routing and doc references (offline)
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+          # The partition acceptance suite parses the workflow contract.
+          python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/pyyaml" 'PyYAML==6.0.3'
+          PYTHONPATH="$RUNNER_TEMP/pyyaml" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
           test -f scripts/ci/test_nightly_partition_acceptance.py
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_nightly_partition_acceptance.py' -v
+          PYTHONPATH="$RUNNER_TEMP/pyyaml" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_nightly_partition_acceptance.py' -v
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
@@ -514,12 +518,23 @@ jobs:
   sweep-result:
     name: nightly ignored tests and docs
     needs: [changes, sweep]
-    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    permissions: {}
-    runs-on: ubuntu-latest
+    # This verdict runs unless the selector explicitly opted out: an explicit
+    # `rust == 'false'` on a successful `changes` leg whose sweep legs never
+    # failed or were cancelled may skip it. Every other case — a failed,
+    # cancelled or skipped `changes` leg, a selected-but-never-run sweep leg,
+    # or a failing sweep — must reach this failing aggregate instead of
+    # skipping green. The step below fails any non-success result.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.sweep.result == 'failure' || needs.sweep.result == 'cancelled') }}
+    permissions:
+      contents: read
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep-result') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
       - name: Require all four serial partitions and downstream proofs
         env:
           SWEEP_RESULT: ${{ needs.sweep.result }}
-        run: test "$SWEEP_RESULT" = success
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: |
+          test "$CHANGES_RESULT" = success || { printf 'changes leg failed (result=%s)\n' "$CHANGES_RESULT" >&2; exit 1; }
+          test "$SWEEP_RESULT" = success || { printf 'sweep legs did not succeed (result=%s)\n' "$SWEEP_RESULT" >&2; exit 1; }
