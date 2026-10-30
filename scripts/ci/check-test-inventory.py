@@ -562,11 +562,16 @@ def _runner_routes(root):
     integration = functions["integration_commands"].body
     runtime = functions["runtime_commands"].body
     execution_loop = 'for index, (args, database, integration, timeout, budget) in enumerate(commands):\n    print("Running:", shlex.join(["cargo"] + args), flush=True)\n    start = time.monotonic()\n    subprocess.run(["cargo"] + args, env=environment(database, integration), check=True, timeout=remaining_timeout(index, args, timeout, deadlines))\n    if budget:\n        property_seconds += time.monotonic() - start'
-    if not (tree.body and isinstance(tree.body[-1], ast.If) and
-            _same_ast(tree.body[-1].test, ast.parse('__name__ == "__main__"', mode='eval').body) and
-            len(tree.body[-1].body) == 1 and isinstance(tree.body[-1].body[0], ast.Try) and
-            tree.body[-1].body[0].body and
-            _same_ast(tree.body[-1].body[0].body[0], _stmt('main()')) and
+    # Only the known fatal wrapper proves failure propagation. A swallowing
+    # handler or a result-replacing else/finally must not earn runner credit.
+    entrypoint = _stmt('''if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        print(f"partition failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+''')
+    if not (tree.body and _same_ast(tree.body[-1], entrypoint) and
             _contains_stmt(main, 'parser.add_argument("--lane", required=True, action="append", choices=PARTITIONS)') and
             _contains_stmt(main, 'selection = parser.add_mutually_exclusive_group(required=True)') and
             _contains_stmt(main, 'selection.add_argument("--list", action="append_const", const=True)') and
