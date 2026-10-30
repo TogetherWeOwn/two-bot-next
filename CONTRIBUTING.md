@@ -87,6 +87,34 @@ can cause component-install conflicts before fmt runs. The offline workflow
 policy suite pins all ten installers to the repository version; bump them and
 the toolchain and builder-image pins together.
 
+### Nightly ignored-test partitions
+
+The nightly `sweep` matrix has four independent disposable Postgres services and
+keeps the 45-minute timeout **per partition**. Ten scheduled runs from October
+20–29, 2026 timed out before the guarded suites, backups and strict rustdoc step.
+In run [40853356658](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40853356658),
+compilation took 5m21s; the bot binary's 2,427 serial tests were still running
+roughly 37 minutes later. The last green night had 1,080 binary tests (16m21s).
+Partitioning keeps the wedged-job bound rather than hiding growth with a raise.
+
+`scripts/ci/run-nightly-partition.py` inventories the original workspace,
+all-feature, ignored-test selection with its existing skip filters. Each unique
+libtest name belongs to `sha256(name)[:8] % 4` (big-endian), including equal names
+across different targets. Exact positive filters prevent prefix-sharing names
+from leaking into or being lost between partitions. Libraries, binaries,
+integration tests and examples retain one thread; batches bound command-line
+size. Inventory, compile and test failures are fatal, and empty partitions are
+not success. Doctests use the original filters once on partition 0 because
+rustdoc splits whitespace in names. All guarded-URL replays, backup roundtrip,
+backup publication and `cargo doc -D warnings` also run once on partition 0.
+The matrix does not fail fast, and `sweep-result` requires all four successful
+legs; skipped, cancelled and failed legs cannot satisfy it.
+
+Completion evidence is a **scheduled** nightly on `main`: record the run, all
+four partition durations, and successful guarded suites, both backup steps and
+strict rustdoc. PR CI alone is not that proof. Rollback is a revert of the single
+squash commit; this changes no deployment, credentials or persistent data.
+
 ### Pull-request size labels (advisory)
 
 `.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
