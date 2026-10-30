@@ -31,11 +31,12 @@ Severity is impact times confidence, after the disproof pass below:
 - **Investigate/flag, not a bug:** the mechanism depends on an assumption you
   could not verify against this code or the pinned Twilight/Discord contract.
 - **Security exception:** never drop or downgrade a plausible security issue
-  for lack of full verification. Report it privately as a security Warning,
-  including the unverified step, via the process in `SECURITY.md`; reserve
-  Critical for a traced, verified path. Do not disclose vulnerability details
-  or the mechanism in public review output. If appropriate, leave only a
-  non-sensitive public notice that a private report is required.
+  for lack of full verification; reserve Critical for a traced, verified path.
+  If the vulnerable code is new in this unmerged PR, post a security Warning
+  with the class, location and unverified step, but no exploit steps or
+  payloads. If it affects code already on `main` or deployed, do not describe
+  it publicly: post only a non-sensitive notice that a private report under
+  `SECURITY.md` is required.
 
 ## Disproof pass (before posting any finding)
 
@@ -89,8 +90,10 @@ A missing test alone is not a runtime bug. These are blocking findings:
   described in `docs/gateway-recovery.md`.
 - **Moderation and automod:** every automated action needs its permission,
   role-hierarchy, and target checks on the actual event path; a rule that
-  can act on moderators, the bot itself, or already-actioned messages is a
-  defect — show the reachable event sequence.
+  can act on the bot itself, already-actioned messages, or an executor that
+  `docs/containment.md` excludes (trusted, protected, bot) is a defect - show
+  the reachable event sequence. Documented containment of an untrusted,
+  unprotected executor is intended, not a defect.
 - **Signed internal actions and secrets:** signature verification, replay
   windows, and single-use semantics (one conditional write, not
   read-check-write); tokens and secrets must never reach logs, audit
@@ -100,8 +103,9 @@ A missing test alone is not a runtime bug. These are blocking findings:
   shared with the website, which reads the bot-owned `web_v1` views
   (`sql/web_v1.sql`) — a view change is a cross-repo compatibility change.
   Never edit an applied migration; schema changes stay backward-compatible
-  for the running container (expand before contract); writes repeat every
-  predicate they read; claims/leases release on enqueue failure.
+  for the running container (expand before contract); writes repeat the
+  predicates they read or hold the lock/constraint that serialized them;
+  claims/leases release on enqueue failure.
 - **Command surface:** generated command reference and publication registry
   must match the compiled router in `crates/core`; flag a definition,
   permission default, or publication-gate change with no matching runtime
@@ -125,7 +129,7 @@ the behavior/dependency change, not cosmetic diff noise.
 
 ## Finding format and coverage
 
-Except for vulnerability details requiring private reporting under `SECURITY.md`,
+Except for deployed-code vulnerability details (see Security exception),
 use one concise inline finding per root cause, anchored to the smallest changed
 range: title, severity with its reason, triggering scenario, evidence
 (file/symbol), smallest corrective direction. State the commit you reviewed
