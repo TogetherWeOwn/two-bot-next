@@ -801,12 +801,9 @@ jobs:
           print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
           PY
 
-      # Dependency build cache, saved on pushes to main only. `shared-key: check` keeps
-      # the pre-split entry key so the test-profile dependency cache stays warm; this
-      # lane writes it and the two ignored-db lanes restore it (same non-instrumented
-      # graph). The coverage shards own per-shard `coverage-shard-N` entries: their
-      # llvm-cov graph never builds here, so sharing would cold-build every run
-      # after a rotation.
+      # Each worker writes its own test-profile cache on pushes to main only.
+      # Coverage shards keep separate instrumented entries; ignored-db workers
+      # own their own keys rather than restoring an entry with no writer.
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -897,6 +894,7 @@ jobs:
           name: test-partition-rust-tests-${{ matrix.partition }}
           path: ${{ runner.temp }}/test-partition-receipts/rust-tests-${{ matrix.partition }}.json
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
       - name: Report Postgres storage headroom (post-suite)
@@ -2019,13 +2017,13 @@ jobs:
           print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
           PY
 
-      # Restore-only: the entry is written by the `rust-tests` lane.
+      # This lane owns its cache; no partition writes the former shared key.
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
-          shared-key: check
-          save-if: false
+          shared-key: ignored-db-stores
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Prepare isolated test databases
         run: |
@@ -2497,13 +2495,13 @@ jobs:
           print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
           PY
 
-      # Restore-only: the entry is written by the `rust-tests` lane.
+      # Each runtime worker owns a distinct cache, saved on pushes to main only.
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
           shared-key: ignored-db-runtime-${{ matrix.partition }}
-          save-if: false
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Prepare isolated test databases
         run: |
@@ -2585,6 +2583,7 @@ jobs:
           name: test-partition-ignored-db-runtime-${{ matrix.partition }}
           path: ${{ runner.temp }}/test-partition-receipts/ignored-db-runtime-${{ matrix.partition }}.json
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
       - name: Report Postgres storage headroom (post-suite)

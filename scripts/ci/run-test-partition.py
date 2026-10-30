@@ -168,16 +168,28 @@ def environment(database, integration):
     return env
 
 
-def has_tests(commands):
+def remaining_timeout(index, args, timeout, deadlines):
+    if timeout is None:
+        return None
+    if index not in deadlines:
+        deadlines[index] = time.monotonic() + timeout
+    remaining = deadlines[index] - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(["cargo"] + args, timeout)
+    return remaining
+
+
+def has_tests(commands, deadlines):
     # Probe the selected commands, not the workspace as a whole. This also fails
     # closed on compile failures and never treats an empty partition as success.
-    for args, database, integration, _, _ in commands:
+    for index, (args, database, integration, timeout, _) in enumerate(commands):
         if args[0] != "test" or "--doc" in args:
             continue
         probe = args + (["--list"] if "--" in args else ["--", "--list"])
         print("Inventory:", shlex.join(["cargo"] + probe), file=sys.stderr, flush=True)
         result = subprocess.run(["cargo"] + probe, env=environment(database, integration),
-                                stdout=subprocess.PIPE, text=True, check=True)
+                                stdout=subprocess.PIPE, text=True, check=True,
+                                timeout=remaining_timeout(index, args, timeout, deadlines))
         if any(line.endswith(": test") for line in result.stdout.splitlines()):
             return True
     return False
@@ -186,14 +198,16 @@ def has_tests(commands):
 def execute(commands):
     if any(item[2] for item in commands):
         Path(environment(None, True)["PAPERCLIP_RUN_SCRATCH_DIR"]).mkdir(parents=True, exist_ok=True)
-    if not has_tests(commands):
+    # Timeboxed commands share one deadline across compilation/listing and execution.
+    deadlines = {}
+    if not has_tests(commands, deadlines):
         raise ValueError("partition selected no tests")
     property_seconds = 0.0
-    for args, database, integration, timeout, budget in commands:
+    for index, (args, database, integration, timeout, budget) in enumerate(commands):
         print("Running:", shlex.join(["cargo"] + args), flush=True)
         start = time.monotonic()
         subprocess.run(["cargo"] + args, env=environment(database, integration),
-                       check=True, timeout=timeout)
+                       check=True, timeout=remaining_timeout(index, args, timeout, deadlines))
         if budget:
             property_seconds += time.monotonic() - start
     if any(item[4] for item in commands):

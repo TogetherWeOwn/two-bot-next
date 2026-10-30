@@ -513,6 +513,21 @@ def _contains_stmt(body, source):
     return any(_same_ast(node, expected) for node in body)
 
 
+def _has_unrecognized_exit(body, allowed=()):
+    """Fail closed on exits nested in any unrecognized statement.
+
+    The few legitimate selection and validation branches are accepted only as
+    complete AST matches; merely nesting an exit inside a conditional, loop,
+    or try block cannot make it invisible to the routing proof.
+    """
+    allowed_nodes = [_stmt(source) for source in allowed]
+    return any(
+        any(isinstance(child, (ast.Return, ast.Raise)) for child in ast.walk(node))
+        for node in body
+        if not any(_same_ast(node, accepted) for accepted in allowed_nodes)
+    )
+
+
 def _runner_routes(root):
     """Recognize the runner's narrow executable AST interface, without importing it.
 
@@ -533,6 +548,7 @@ def _runner_routes(root):
     rust = functions["rust_commands"].body
     integration = functions["integration_commands"].body
     runtime = functions["runtime_commands"].body
+    execution_loop = 'for index, (args, database, integration, timeout, budget) in enumerate(commands):\n    print("Running:", shlex.join(["cargo"] + args), flush=True)\n    start = time.monotonic()\n    subprocess.run(["cargo"] + args, env=environment(database, integration), check=True, timeout=remaining_timeout(index, args, timeout, deadlines))\n    if budget:\n        property_seconds += time.monotonic() - start'
     if not (tree.body and isinstance(tree.body[-1], ast.If) and
             _same_ast(tree.body[-1].test, ast.parse('__name__ == "__main__"', mode='eval').body) and
             len(tree.body[-1].body) == 1 and isinstance(tree.body[-1].body[0], ast.Try) and
@@ -552,7 +568,7 @@ def _runner_routes(root):
             _contains_stmt(main, 'commands = rust_commands(partition) if lane == "rust-tests" else runtime_commands(partition)') and
             _contains_stmt(main, 'seconds = execute(commands)') and
             _contains_stmt(main, 'write_receipt(lane, partition, seconds)') and
-            _contains_stmt(execute, 'for args, database, integration, timeout, budget in commands:\n    print("Running:", shlex.join(["cargo"] + args), flush=True)\n    start = time.monotonic()\n    subprocess.run(["cargo"] + args, env=environment(database, integration), check=True, timeout=timeout)\n    if budget:\n        property_seconds += time.monotonic() - start') and
+            _contains_stmt(execute, execution_loop) and
             _contains_stmt(functions["command"].body, 'return (args, database, integration, timeout, budget)')):
         return False, False, False, set()
     # The receipt check must validate exactly the expected partition files.
@@ -561,13 +577,20 @@ def _runner_routes(root):
             _contains_stmt(verify, 'entries = list(directory.iterdir())') and
             _contains_stmt(verify, 'if {p.name for p in entries} != set(expected) or any(not p.is_file() or p.is_symlink() for p in entries):\n    raise ValueError("receipt directory must contain exactly one file for each lane partition")')):
         return False, False, False, set()
-    # An early unconditional return defeats all later evidence.
-    if (any(isinstance(n, (ast.Return, ast.Raise)) for n in main[:main.index(next(n for n in main if _same_ast(n, _stmt('seconds = execute(commands)'))))]) or
-            any(isinstance(n, (ast.Return, ast.Raise)) for n in execute[:-1])):
+    # Exits before dispatch or Cargo execution must be recognized validation or
+    # selection branches, even when nested under another control-flow statement.
+    main_end = next(i for i, n in enumerate(main) if _same_ast(n, _stmt('seconds = execute(commands)')))
+    execute_end = next(i for i, n in enumerate(execute) if _same_ast(n, _stmt(execution_loop)))
+    if (_has_unrecognized_exit(main[:main_end], (
+            'if args.list:\n    print(json.dumps({"include": [{"partition": p} for p in PARTITIONS[lane]]}, separators=(",", ":")))\n    return',
+            'if args.verify_receipts is not None:\n    if len(args.verify_receipts) != 1 or not args.verify_receipts[0]:\n        parser.error("receipt directory must be specified exactly once")\n    verify_receipts(lane, args.verify_receipts[0])\n    return')) or
+            _has_unrecognized_exit(execute[:execute_end], (
+                'if not has_tests(commands, deadlines):\n    raise ValueError("partition selected no tests")',))):
         return False, False, False, set()
     integration_dispatch = _contains_stmt(rust, 'if partition.startswith("integration-"):\n    return integration_commands(int(partition[-1]))')
     discovery = (integration_dispatch and integration and
-        not any(isinstance(n, (ast.Return, ast.Raise)) for n in integration[:-1]) and
+        not _has_unrecognized_exit(integration[:-1], (
+            'if core is None or not members.issubset(nodes):\n    raise ValueError("Cargo metadata is missing workspace dependency resolution")',)) and
         isinstance(integration[0], ast.Assign) and len(integration[0].targets) == 1 and
         isinstance(integration[0].targets[0], ast.Name) and integration[0].targets[0].id == 'proc' and
         isinstance(integration[0].value, ast.Call) and
