@@ -15,7 +15,9 @@ from unittest.mock import patch
 
 import yaml
 
-from test_critical_path_support import IGNORED_BOT_LEGS, sweep_package
+from test_critical_path_support import (
+    IGNORED_BOT_LEGS, offline_integration_fixture, strict_cargo_metadata_run, sweep_package,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 _HISTORY_SPEC = importlib.util.spec_from_file_location(
@@ -4074,6 +4076,53 @@ def partition_receipt_upload_errors(jobs):
     return errors
 
 
+WORKER_SETUP_NODE_PIN = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+WORKER_AUDIT_COMMAND = "npm audit --audit-level=high --include=dev --json"
+
+
+def worker_setup_node_errors(job):
+    """Throttled-cache refusal plus the mandatory Node/npm gates.
+
+    The worker lane disables automatic package-manager caching and must
+    not restore the optional npm Actions cache; a throttled restore would
+    consume the ten-minute budget. The pinned setup-node, Node version,
+    audit, install, typecheck and tests stay mandatory.
+    """
+    errors = []
+    if job.get("timeout-minutes") != "10":
+        errors.append("worker: timeout must stay 10 minutes")
+    steps = job.get("steps") or []
+    nodes = [step for step in steps if "setup-node" in str(step.get("uses", ""))]
+    if len(nodes) != 1:
+        errors.append(f"worker: expected exactly one setup-node step, found {len(nodes)}")
+        return errors
+    node = nodes[0]
+    if node.get("uses") != WORKER_SETUP_NODE_PIN:
+        errors.append(f"worker: setup-node must stay pinned at {WORKER_SETUP_NODE_PIN}")
+    with_inputs = node.get("with") or {}
+    if with_inputs.get("node-version") != "22":
+        errors.append("worker: setup-node must stay at node 22")
+    if with_inputs.get("package-manager-cache") != "false":
+        errors.append("worker: setup-node must disable automatic package-manager caching")
+    if "cache" in with_inputs:
+        errors.append("worker: setup-node must not restore the throttled npm cache")
+    if "cache-dependency-path" in with_inputs:
+        errors.append("worker: setup-node must not set cache-dependency-path without a cache")
+    audits = [step for step in steps if step.get("run") == WORKER_AUDIT_COMMAND]
+    if len(audits) != 1:
+        errors.append("worker: expected exactly one npm audit gate")
+        return errors
+    audit_index = steps.index(audits[0])
+    for command in ("npm ci", "npm run typecheck", "npm test"):
+        matches = [step for step in steps if step.get("run") == command]
+        if len(matches) != 1:
+            errors.append(f"worker: expected exactly one {command!r} step")
+            continue
+        if steps.index(matches[0]) < audit_index:
+            errors.append(f"worker: {command!r} must run after the npm audit gate")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
@@ -5463,9 +5512,13 @@ class WorkflowTests(unittest.TestCase):
                     for name in sorted(names):
                         with self.subTest(fixture=name):
                             self.assertIn(name, partitions.INTEGRATION_SKIPS)
+                    fixture = offline_integration_fixture()
                     integration = []
-                    for index in (0, 1, 2):
-                        integration.extend(partitions.integration_commands(index))
+                    with patch.object(partitions.subprocess, "run",
+                                      side_effect=strict_cargo_metadata_run(fixture)), \
+                            patch("shutil.which", return_value="/fake/cargo-available"):
+                        for index in (0, 1, 2):
+                            integration.extend(partitions.integration_commands(index))
                     swept = [entry for entry in integration if entry[2]]
                     self.assertTrue(swept, "integration partitions must sweep targets")
                     for argv, database, _, _, _ in swept:
@@ -6498,7 +6551,11 @@ class WorkflowTests(unittest.TestCase):
         # shell emissions for every package, not just the remainder. This
         # is an argv binding; feature semantics still have their separate
         # declaration/ledger oracle in the critical-path acceptance suite.
-        workspace = planner._metadata_from_cargo()
+        fixture = offline_integration_fixture()
+        with patch.object(planner.subprocess, "run",
+                          side_effect=strict_cargo_metadata_run(fixture)), \
+                patch("shutil.which", return_value="/fake/cargo-available"):
+            workspace = planner._metadata_from_cargo()
         self.assertIsNotNone(workspace, "coverage feature graph must resolve offline")
         logical = shell_logical_lines(step["run"])
         # Invocation counts and family modes are checked from each selected
@@ -6604,7 +6661,11 @@ class WorkflowTests(unittest.TestCase):
             "sweep_owners_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
         planner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(planner)
-        workspace = planner._metadata_from_cargo()
+        fixture = offline_integration_fixture()
+        with patch.object(planner.subprocess, "run",
+                          side_effect=strict_cargo_metadata_run(fixture)), \
+                patch("shutil.which", return_value="/fake/cargo-available"):
+            workspace = planner._metadata_from_cargo()
         self.assertIsNotNone(workspace, "coverage feature graph must resolve offline")
         packages = {"core": "two-bot-core", "discord": "two-bot-discord", "bot": "two-bot",
                     "cutover": "two-bot-cutover", "store": "two-bot-store"}
@@ -8421,6 +8482,86 @@ class WorkflowTests(unittest.TestCase):
                          if step.get("name") == "Aggregate CI verdict")
         self.assertEqual(aggregate["env"]["WORKER_RESULT"], "${{ needs.worker.result }}")
         self.assertIn('(\"worker\", \"WORKER_RESULT\", \"WORKER_SELECTED\")', aggregate["run"])
+
+    def test_worker_setup_node_disables_throttled_cache_restores(self):
+        job = self.workflows["check.yml"]["jobs"]["worker"]
+        self.assertEqual(worker_setup_node_errors(job), [])
+        node = next(step for step in job["steps"]
+                    if "setup-node" in str(step.get("uses", "")))
+        self.assertEqual(node["uses"], WORKER_SETUP_NODE_PIN)
+        with_inputs = node.get("with") or {}
+        self.assertEqual(with_inputs.get("node-version"), "22")
+        self.assertEqual(with_inputs.get("package-manager-cache"), "false")
+        self.assertNotIn("cache", with_inputs)
+        self.assertNotIn("cache-dependency-path", with_inputs)
+        self.assertEqual(job.get("timeout-minutes"), "10")
+        audit = next(step for step in job["steps"]
+                     if step.get("run") == WORKER_AUDIT_COMMAND)
+        audit_index = job["steps"].index(audit)
+        for command in ("npm ci", "npm run typecheck", "npm test"):
+            with self.subTest(command=command):
+                step = next(step for step in job["steps"] if step.get("run") == command)
+                self.assertGreater(job["steps"].index(step), audit_index)
+        # Reload the exact predecessor configuration through the production
+        # workflow loader. Comments/formatting are not part of this contract.
+        predecessor = deepcopy(self.workflows["check.yml"])
+        prior_node = next(step for step in predecessor["jobs"]["worker"]["steps"]
+                          if "setup-node" in str(step.get("uses", "")))
+        prior_node["with"].pop("package-manager-cache")
+        prior_node["with"].update({
+            "cache": "npm", "cache-dependency-path": "wrangler/package-lock.json"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".github/workflows/check.yml"
+            path.parent.mkdir(parents=True)
+            path.write_text(yaml.safe_dump(predecessor, sort_keys=False), encoding="utf-8")
+            with patch.dict(load_workflows.__globals__, {"ROOT": Path(tmp)}):
+                reloaded = load_workflows()["check.yml"]
+            errors = worker_setup_node_errors(reloaded["jobs"]["worker"])
+            self.assertTrue(errors, "predecessor npm cache restore must be rejected")
+            self.assertTrue(any("package-manager" in error for error in errors))
+            self.assertTrue(any("throttled npm cache" in error for error in errors))
+            self.assertTrue(any("cache-dependency-path" in error for error in errors))
+
+        def mutate(change):
+            copy = deepcopy(job)
+            change(copy)
+            return worker_setup_node_errors(copy)
+
+        def node_step(copy):
+            return next(step for step in copy["steps"]
+                        if "setup-node" in str(step.get("uses", "")))
+
+        def drop_run(copy, command):
+            index = next(i for i, step in enumerate(copy["steps"])
+                         if step.get("run") == command)
+            copy["steps"].pop(index)
+
+        def swap_audit_and_install(copy):
+            steps = copy["steps"]
+            audit_at = next(i for i, step in enumerate(steps)
+                            if step.get("run") == WORKER_AUDIT_COMMAND)
+            install_at = next(i for i, step in enumerate(steps)
+                              if step.get("run") == "npm ci")
+            steps[audit_at], steps[install_at] = steps[install_at], steps[audit_at]
+
+        changes = {
+            "longer timeout": lambda j: j.update({"timeout-minutes": "20"}),
+            "unpinned setup-node": lambda j: node_step(j).update({"uses": "actions/setup-node@v7"}),
+            "older node": lambda j: node_step(j)["with"].update({"node-version": "20"}),
+            "automatic cache": lambda j: node_step(j)["with"].update({"package-manager-cache": "true"}),
+            "missing opt-out": lambda j: node_step(j)["with"].pop("package-manager-cache"),
+            "explicit npm cache": lambda j: node_step(j)["with"].update({"cache": "npm"}),
+            "dependency path without cache": lambda j: node_step(j)["with"].update(
+                {"cache-dependency-path": "wrangler/package-lock.json"}),
+            "missing audit": lambda j: drop_run(j, WORKER_AUDIT_COMMAND),
+            "missing npm ci": lambda j: drop_run(j, "npm ci"),
+            "missing typecheck": lambda j: drop_run(j, "npm run typecheck"),
+            "missing npm test": lambda j: drop_run(j, "npm test"),
+            "audit after install": swap_audit_and_install,
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
 
     def test_staging_privacy_verify_read_shape_is_pinned(self):
         workflows = self.workflows

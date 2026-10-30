@@ -525,6 +525,43 @@ class _FakeClock:
         return self.wall
 
 
+class _RecordedProcess:
+    """Deterministic process boundary for either run() or Popen() callers."""
+
+    def __init__(self, recorder, argv, kwargs, pid):
+        self.recorder, self.args, self.kwargs = recorder, list(argv), kwargs
+        self.pid, self.returncode, self.output = pid, None, None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.wait()
+
+    def communicate(self, input=None, timeout=None):
+        if self.returncode is None:
+            result = self.recorder.run(self.args, **(self.kwargs | {"timeout": timeout}))
+            self.returncode, self.output = result.returncode, result.stdout
+        return self.output, None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.communicate(timeout=timeout)
+        return self.returncode
+
+    def send_signal(self, sig):
+        self.returncode = -sig
+
+    def kill(self):
+        self.send_signal(9)
+
+    def terminate(self):
+        self.send_signal(15)
+
+
 class _SubprocessRecorder:
     """Consumes fake durations under the actual timeout supplied by the runner."""
 
@@ -538,6 +575,23 @@ class _SubprocessRecorder:
         self._advanced = False
         self._inventory_timeout = inventory_timeout
         self._execution_timeout = execution_timeout
+        self.processes = []
+
+    def popen(self, argv, **kwargs):
+        process = _RecordedProcess(self, argv, kwargs, 900_000_000 + len(self.processes))
+        self.processes.append(process)
+        return process
+
+    def process(self, pid):
+        return next(process for process in self.processes if process.pid == pid)
+
+    def signal_group(self, pid, sig):
+        # Never send a host signal for a synthetic PID. Real process-tree
+        # termination is independently tested with finite native children.
+        self.process(pid).send_signal(sig)
+
+    def group_id(self, pid):
+        return self.process(pid).pid
 
     def run(self, argv, **kwargs):
         argv = list(argv)
@@ -587,7 +641,9 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
     def patched(self, recorder):
         clock = recorder.clock
         return (
-            patch.object(self.runner.subprocess, "run", recorder.run),
+            patch.object(self.runner.subprocess, "Popen", recorder.popen),
+            patch.object(self.runner.os, "killpg", recorder.signal_group),
+            patch.object(self.runner.os, "getpgid", recorder.group_id),
             patch.object(self.runner.time, "monotonic", clock.monotonic),
             patch.object(self.runner.time, "monotonic_ns", clock.monotonic_ns),
             patch.object(self.runner.time, "perf_counter", clock.monotonic),

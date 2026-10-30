@@ -1,9 +1,10 @@
 """Partition-routing acceptance for the test-inventory gate.
 
-Every integration test target must be executed by some CI job. Partitioned
-lanes execute via ``scripts/ci/run-test-partition.py`` behind a
-planner/worker/stable-final matrix; this file pins the smallest executed
-routing contract:
+Every integration target must be built or run by some CI job; an ignored
+target needs an execution route, not a build/list command. Partitioned lanes
+invoke ``scripts/ci/run-test-partition.py`` behind a planner/worker/stable-final
+matrix. The runner is opaque to this gate: these tests pin workflow wiring,
+not static interpretation of arbitrary Python bodies:
 
 * Worker steps execute the runner with ``--lane "$CI_TEST_LANE"
   --partition "$CI_TEST_PARTITION"``, where ``CI_TEST_LANE`` is a literal
@@ -20,22 +21,26 @@ routing contract:
 * Package identity matters: the runtime lane owns ``two-bot/alive``
   (``crates/bot/tests/alive.rs`` with a ``two-bot`` manifest). The same
   target name in another package is unowned.
-* Unignored targets are covered only by executed Cargo-metadata discovery
-  and dispatch in the runner; ignored targets only by an executed
-  ``--test`` owner for their package. Comments, unused literals, decoy
-  strings, empty discovery (``return []``) or removed dispatch do not
-  route, even when the file still mentions the names.
+* A connected workflow owns ordinary discovery and its declared runtime
+  package/target routes. Missing files or disconnected paths earn no credit;
+  unrelated ignored targets still need a direct owner or reasoned exemption.
+* Discovery, dispatch, all-command execution and failure propagation are
+  qualified by the real-runner argv/ledger/receipt suites in
+  ``test_critical_path_partitions_acceptance.py`` and
+  ``test_critical_path_gates_acceptance.py``. This gate does not inspect early
+  returns, list mutations, decoy literals or exception-handler Python bodies.
 
-Fixtures build a miniature repo with a connected workflow and a copy of
-the real runner, stubbing only the asserted execution. No Cargo build,
-database, network or workflow dispatch occurs. Diagnostics keep the
-existing ``orphaned test target`` / ``missing`` shape with the ignored
-kind preserved.
+Fixtures build a miniature repo; the scanner never executes its runner copy.
+The bounded entrypoint controls below execute only the real runner's list,
+validation and receipt modes with Cargo forbidden. No Cargo build, database,
+network or workflow dispatch occurs. A receipt proves partition completion,
+not that every intended test ran; execution-ledger equality provides that
+separate synthetic-inventory obligation, not real LLVM/LCOV parity.
 """
 
-import ast
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -308,6 +313,14 @@ class ValidRunnerRoutingTests(unittest.TestCase):
         errors = check_fixture(VALID_CHECK_YML, NIGHTLY_YML, files)
         self.assertEqual(errors, [], f"both lanes should route the owned tree: {errors}")
 
+    def test_connected_workflow_does_not_interpret_runner_bodies(self):
+        # The file deliberately describes no commands. Runtime selection and
+        # failure semantics belong to execution controls, not another prover.
+        opaque = '"""Entrypoint qualified independently by execution-ledger tests."""\n'
+        files = dict(MYCRATE_PLAIN) | dict(MYCRATE_FUTURE) | dict(BOT_ALIVE)
+        self.assertEqual(check_fixture(
+            VALID_CHECK_YML, NIGHTLY_YML, files, runner_text=opaque), [])
+
     def test_cli_passes_valid_runner_tree(self):
         assert_valid_dag(self, parse_jobs(VALID_CHECK_YML))
         tmp, root = make_root(VALID_CHECK_YML, NIGHTLY_YML, dict(BOT_ALIVE))
@@ -534,22 +547,6 @@ class DisconnectedPathRejectedTests(unittest.TestCase):
             f"broken runner must not cover doc: {errors}")
 
 
-def break_metadata_call(runner_text):
-    return runner_text.replace('"cargo", "metadata"', '"cargo", "REDACTED"')
-
-
-def with_metadata_decoys(runner_text):
-    return '# cargo metadata dynamic discovery\nunused_metadata = "cargo metadata"\n' + runner_text
-
-
-def break_alive_owner(runner_text):
-    return runner_text.replace('"alive"', '"redacted_alive"')
-
-
-def with_alive_decoys(runner_text):
-    return '# alive owner\ndecoy_alive = "alive"\n' + runner_text
-
-
 class OwnershipAndDiscoveryTests(unittest.TestCase):
     def test_unowned_ignored_remains_orphaned_behind_valid_runner(self):
         files = {
@@ -572,55 +569,6 @@ class OwnershipAndDiscoveryTests(unittest.TestCase):
         errors = check_fixture(with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML, dict(OTHER_ALIVE))
         assert_orphaned(self, errors, "alive", True)
 
-    def test_runner_without_cargo_metadata_does_not_cover_unignored(self):
-        broken = break_metadata_call(REAL_RUNNER_TEXT)
-        self.assertNotIn('"cargo", "metadata"', broken)
-        errors = check_fixture(
-            with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML, dict(MYCRATE_PLAIN), runner_text=broken)
-        assert_orphaned(self, errors, "plain", False)
-
-    def test_metadata_comment_and_unused_literal_do_not_route(self):
-        broken = with_metadata_decoys(break_metadata_call(REAL_RUNNER_TEXT))
-        self.assertIn("cargo metadata", broken)
-        self.assertNotIn('"cargo", "metadata"', broken)
-        errors = check_fixture(
-            with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML, dict(MYCRATE_PLAIN), runner_text=broken)
-        assert_orphaned(self, errors, "plain", False)
-
-    def test_empty_discovery_return_does_not_route(self):
-        broken = REAL_RUNNER_TEXT.replace(
-            "def integration_commands(index):\n",
-            "def integration_commands(index):\n    return []\n", 1)
-        self.assertIn('"cargo", "metadata"', broken)
-        self.assertIn("return []", broken)
-        errors = check_fixture(
-            with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML, dict(MYCRATE_PLAIN), runner_text=broken)
-        assert_orphaned(self, errors, "plain", False)
-
-    def test_removed_dispatch_does_not_route(self):
-        broken = REAL_RUNNER_TEXT.replace(
-            "return integration_commands(int(partition[-1]))", "return []", 1)
-        self.assertIn('"cargo", "metadata"', broken)
-        self.assertNotIn("return integration_commands(int(partition[-1]))", broken)
-        errors = check_fixture(
-            with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML, dict(MYCRATE_PLAIN), runner_text=broken)
-        assert_orphaned(self, errors, "plain", False)
-
-    def test_runner_without_owned_name_does_not_cover_ignored(self):
-        broken = break_alive_owner(REAL_RUNNER_TEXT)
-        self.assertNotIn('"alive"', broken)
-        errors = check_fixture(
-            with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML, dict(BOT_ALIVE), runner_text=broken)
-        assert_orphaned(self, errors, "alive", True)
-
-    def test_alive_comment_and_unused_literal_do_not_route(self):
-        broken = with_alive_decoys(break_alive_owner(REAL_RUNNER_TEXT))
-        self.assertIn("alive", broken)
-        self.assertNotIn('"alive"', broken.replace('decoy_alive = "alive"', ""))
-        errors = check_fixture(
-            with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML, dict(BOT_ALIVE), runner_text=broken)
-        assert_orphaned(self, errors, "alive", True)
-
     def test_reasoned_exemption_still_covers_unowned_runner_target(self):
         real_exempt = gate.EXEMPT
         gate.EXEMPT = {**real_exempt, "db_store_unowned": "fixture reason"}
@@ -633,114 +581,6 @@ class OwnershipAndDiscoveryTests(unittest.TestCase):
         finally:
             gate.EXEMPT = real_exempt
         self.assertEqual(errors, [])
-
-
-def insert_at_function_start(runner_text, function, snippet):
-    lines = runner_text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if line.startswith(f"def {function}("):
-            return "".join(lines[:index + 1]) + snippet + "".join(lines[index + 1:])
-    raise AssertionError(f"runner fixture lost def {function}()")
-
-
-class ConditionalEarlyExitRejectedTests(unittest.TestCase):
-    """A nested unconditional exit before Cargo must earn no runner credit.
-
-    The scanner already rejects a bare top-level ``return`` in ``execute``.
-    The same exit wrapped in a constant condition, a loop or a ``try``
-    block executes just as surely before any Cargo command runs, so it
-    must lose the same discovery, unit/doc and ignored-target credit.
-    These controls exercise the real scanner on a rewritten runner; they
-    do not count source substrings in the fixture.
-    """
-
-    def assert_no_runner_credit(self, errors):
-        assert_orphaned(self, errors, "plain", False)
-        assert_orphaned(self, errors, "alive", True)
-        self.assertTrue(
-            any("workspace lib/bins unit run" in error for error in errors),
-            f"early exit kept the lib/bins marker: {errors}")
-        self.assertTrue(
-            any("workspace doc-test run" in error for error in errors),
-            f"early exit kept the doc marker: {errors}")
-
-    def check_rewritten_runner(self, runner_text):
-        files = dict(MYCRATE_PLAIN) | dict(BOT_ALIVE)
-        return check_fixture(
-            VALID_CHECK_YML, NIGHTLY_YML, files, runner_text=runner_text)
-
-    def test_intact_runner_still_routes_mixed_tree(self):
-        self.assertEqual(self.check_rewritten_runner(REAL_RUNNER_TEXT), [])
-
-    def test_direct_early_return_in_execute_is_rejected(self):
-        broken = insert_at_function_start(
-            REAL_RUNNER_TEXT, "execute", "    return 0.0\n")
-        self.assert_no_runner_credit(self.check_rewritten_runner(broken))
-
-    def test_conditional_early_exits_in_execute_do_not_route(self):
-        exits = {
-            "if_true": "    if True:\n        return 0.0\n",
-            "if_true_deeply_nested": (
-                "    if True:\n        if True:\n            return 0.0\n"),
-            "while_true": "    while True:\n        return 0.0\n",
-            "try_finally": (
-                "    try:\n        return 0.0\n"
-                "    finally:\n        pass\n"),
-            "if_true_raise": "    if True:\n        raise SystemExit(0)\n",
-        }
-        for kind, snippet in exits.items():
-            with self.subTest(kind=kind):
-                broken = insert_at_function_start(
-                    REAL_RUNNER_TEXT, "execute", snippet)
-                self.assert_no_runner_credit(
-                    self.check_rewritten_runner(broken))
-
-    def test_process_exit_calls_before_dispatch_earn_no_runner_credit(self):
-        # These are scanner inputs only: never execute the rewritten runner.
-        # A successful process exit is no more live routing than a return.
-        calls = ("sys.exit(0)", "exit(0)", "quit(0)", "os._exit(0)")
-        wrappers = {
-            "direct": "    {call}\n",
-            "if_true": "    if True:\n        {call}\n",
-            "nested_if": "    if True:\n        if True:\n            {call}\n",
-            "while_true": "    while True:\n        {call}\n",
-            "try_finally": "    try:\n        {call}\n    finally:\n        pass\n",
-        }
-        for function in ("main", "execute"):
-            for call in calls:
-                for shape, template in wrappers.items():
-                    with self.subTest(function=function, call=call, shape=shape):
-                        broken = insert_at_function_start(
-                            REAL_RUNNER_TEXT, function, template.format(call=call))
-                        self.assert_no_runner_credit(
-                            self.check_rewritten_runner(broken))
-
-    def test_conditional_early_return_in_main_does_not_route(self):
-        # main() legitimately returns from its --list/--verify-receipts
-        # branches; an unconditional return ahead of lane dispatch is a
-        # different statement and must not hide behind those branches.
-        broken = insert_at_function_start(
-            REAL_RUNNER_TEXT, "main", "    if True:\n        return\n")
-        self.assert_no_runner_credit(self.check_rewritten_runner(broken))
-
-    def test_conditional_early_return_in_discovery_does_not_route(self):
-        # Insert after the metadata call: an exit at the very first
-        # statement is already caught by the scanner's first-statement
-        # pin, while one here still discards every discovered target.
-        anchor = "    graph = json.loads(proc.stdout)\n"
-        self.assertIn(anchor, REAL_RUNNER_TEXT)
-        exits = {
-            "if_true": "    if True:\n        return []\n",
-            "while_true": "    while True:\n        return []\n",
-        }
-        for kind, snippet in exits.items():
-            with self.subTest(kind=kind):
-                broken = REAL_RUNNER_TEXT.replace(anchor, snippet + anchor, 1)
-                self.assertIn('"cargo", "metadata"', broken)
-                errors = check_fixture(
-                    with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML,
-                    dict(MYCRATE_PLAIN), runner_text=broken)
-                assert_orphaned(self, errors, "plain", False)
 
 
 class CompileOnlyIgnoredTargetRejectedTests(unittest.TestCase):
@@ -882,6 +722,85 @@ class CompileOnlyIgnoredTargetRejectedTests(unittest.TestCase):
                     self.direct_workflow(command), NIGHTLY_YML,
                     dict(MYCRATE_PLAIN), runner_text=None), [])
 
+    def test_build_and_list_intent_never_own_ignored_execution(self):
+        # Replacing the sole real ignored owner with a build or libtest list
+        # must orphan alive, even through a wrapper's separate `--` delimiter.
+        commands = (
+            "cargo check -p two-bot --locked --test alive",
+            "cargo build -p two-bot --locked --test alive",
+            "cargo clippy -p two-bot --locked --test alive",
+            self.EXECUTE + " --list",
+            self.EXECUTE.replace("--ignored", "--include-ignored") + " --list",
+            "cargo test -p two-bot --locked --test alive -- --list",
+        )
+        for command in commands:
+            for wrapper in ("", "env ", "env -- "):
+                for shape in ("direct", "loop"):
+                    with self.subTest(command=command, wrapper=wrapper, shape=shape):
+                        invocation = wrapper + command
+                        check_yml = (self.direct_workflow(invocation) if shape == "direct"
+                                     else self.loop_workflow(invocation))
+                        errors = check_fixture(
+                            check_yml, NIGHTLY_YML, dict(BOT_ALIVE), runner_text=None)
+                        assert_orphaned(self, errors, "alive", True)
+                        routed, _ = gate.routed_targets(check_yml)
+                        self.assertNotIn("alive", routed)
+
+    def test_ordinary_named_targets_keep_build_and_list_ownership(self):
+        # The HARD inventory contract is built OR run for ordinary targets.
+        for command in (
+            "cargo check -p my-crate --locked --test plain",
+            "cargo build -p my-crate --locked --test plain",
+            "cargo clippy -p my-crate --locked --test plain",
+            "cargo test -p my-crate --locked --test plain -- --list",
+        ):
+            for wrapper in ("", "env ", "env -- "):
+                with self.subTest(command=command, wrapper=wrapper):
+                    self.assertEqual(check_fixture(
+                        self.direct_workflow(wrapper + command), NIGHTLY_YML,
+                        dict(MYCRATE_PLAIN), runner_text=None), [])
+
+    def test_include_ignored_execution_survives_wrapper_delimiters(self):
+        for wrapper in ("", "env ", "env -- "):
+            for shape in ("direct", "loop"):
+                command = wrapper + self.EXECUTE.replace("--ignored", "--include-ignored")
+                with self.subTest(wrapper=wrapper, shape=shape):
+                    check_yml = (self.direct_workflow(command) if shape == "direct"
+                                 else self.loop_workflow(command))
+                    self.assertEqual(check_fixture(
+                        check_yml, NIGHTLY_YML, dict(BOT_ALIVE), runner_text=None), [])
+
+    QUOTED_SKIP_ARGV = (
+        (r' --skip "slow\"test"', ["--skip", 'slow"test']),
+        (" --skip 'slow\"test'", ["--skip", 'slow"test']),
+        (r' --skip slow\"test', ["--skip", 'slow"test']),
+        (r' --skip="slow\"test"', ['--skip=slow"test']),
+        (" --skip='slow\"test'", ['--skip=slow"test']),
+    )
+
+    def test_equivalent_escaped_quote_skip_argv_preserves_execution(self):
+        for skip, expected in self.QUOTED_SKIP_ARGV:
+            self.assertEqual(shlex.split(skip), expected,
+                             "the escaped and single-quoted Bash fixtures must agree")
+            for wrapper in ("", "env ", "env -- "):
+                for shape in ("direct", "loop"):
+                    command = wrapper + self.EXECUTE + skip
+                    with self.subTest(skip=skip, wrapper=wrapper, shape=shape):
+                        check_yml = (self.direct_workflow(command) if shape == "direct"
+                                     else self.loop_workflow(command))
+                        self.assertEqual(check_fixture(
+                            check_yml, NIGHTLY_YML, dict(BOT_ALIVE), runner_text=None), [])
+
+    def test_escaped_quote_skip_argv_never_rescues_build_or_list(self):
+        for skip, expected in self.QUOTED_SKIP_ARGV:
+            self.assertEqual(shlex.split(skip), expected)
+            for command in (self.PREP, self.EXECUTE + " --list"):
+                with self.subTest(skip=skip, command=command):
+                    errors = check_fixture(
+                        self.direct_workflow("env -- " + command + skip), NIGHTLY_YML,
+                        dict(BOT_ALIVE), runner_text=None)
+                    assert_orphaned(self, errors, "alive", True)
+
     def test_compile_preparation_preserves_intact_connected_runner_credit(self):
         check_yml = self.connected_workflow()
         assert_valid_dag(self, parse_jobs(check_yml))
@@ -903,9 +822,6 @@ class CompileOnlyIgnoredTargetRejectedTests(unittest.TestCase):
                 connected.replace(
                     'run-test-partition.py --lane "$CI_TEST_LANE" --verify-receipts test-partition-receipts',
                     'echo verify-receipts'), REAL_RUNNER_TEXT),
-            "runner exits before Cargo": (
-                connected, insert_at_function_start(
-                    REAL_RUNNER_TEXT, "execute", "    if True:\n        return 0.0\n")),
         }
         for kind, (check_yml, runner_text) in cases.items():
             with self.subTest(kind=kind):
@@ -915,62 +831,12 @@ class CompileOnlyIgnoredTargetRejectedTests(unittest.TestCase):
                 assert_orphaned(self, errors, "alive", True)
 
 
-class NonfatalEntrypointRejectedTests(unittest.TestCase):
-    """A main() call alone cannot prove the runner propagates failure."""
+class RunnerEntrypointExecutionTests(unittest.TestCase):
+    """Exercise the real entrypoint instead of recognizing a Python handler."""
 
-    def with_handler(self, body, tail=""):
-        guard = ast.parse(REAL_RUNNER_TEXT).body[-1]
-        self.assertIsInstance(guard, ast.If)
-        prefix = "".join(REAL_RUNNER_TEXT.splitlines(keepends=True)[:guard.lineno - 1])
-        handler = "".join("        " + line + "\n" for line in body.splitlines())
-        return prefix + (
-            'if __name__ == "__main__":\n'
-            '    try:\n'
-            '        main()\n'
-            '    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:\n'
-            '        print(f"partition failed: {exc}", file=sys.stderr)\n'
-            + handler + tail)
-
-    def nonfatal_handlers(self):
-        return {
-            "exit zero": self.with_handler("sys.exit(0)"),
-            "no exit": self.with_handler(""),
-            "pass": self.with_handler("pass"),
-            "exit without status": self.with_handler("sys.exit()"),
-            "false status": self.with_handler("sys.exit(False)"),
-            "raise zero": self.with_handler("raise SystemExit(0)"),
-            "unreachable fatal exit": self.with_handler("if False:\n    sys.exit(1)"),
-            "swallowed SystemExit": self.with_handler(
-                "try:\n    sys.exit(1)\nexcept SystemExit:\n    pass"),
-        }
-
-    def replacing_tails(self):
-        return {
-            "finally exits zero": self.with_handler(
-                "sys.exit(1)", "    finally:\n        sys.exit(0)\n"),
-            "finally raises zero": self.with_handler(
-                "sys.exit(1)", "    finally:\n        raise SystemExit(0)\n"),
-            "fatal else is not an exception exit": self.with_handler(
-                "pass", "    else:\n        sys.exit(1)\n"),
-        }
-
-    def check_runner(self, runner_text):
-        return check_fixture(
-            VALID_CHECK_YML, NIGHTLY_YML,
-            dict(BOT_ALIVE) | dict(MYCRATE_PLAIN), runner_text=runner_text)
-
-    def assert_no_credit(self, errors):
-        assert_orphaned(self, errors, "plain", False)
-        assert_orphaned(self, errors, "alive", True)
-        for marker in ("workspace lib/bins unit run", "workspace doc-test run"):
-            self.assertTrue(any(marker in error for error in errors),
-                            f"nonfatal runner kept {marker}: {errors}")
-
-    def run_cli_without_cargo(self, runner_text, *args):
+    def run_cli_without_cargo(self, *args):
         with tempfile.TemporaryDirectory(prefix="runner-exit-control-") as directory:
             root = Path(directory)
-            runner = root / "run-test-partition.py"
-            runner.write_text(runner_text)
             binary = root / "bin"
             binary.mkdir()
             marker = root / "unexpected-cargo"
@@ -985,22 +851,18 @@ class NonfatalEntrypointRejectedTests(unittest.TestCase):
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
             proc = subprocess.run(
-                [sys.executable, str(runner), *args], cwd=root, env=env,
+                [sys.executable, str(REAL_RUNNER), *args], cwd=root, env=env,
                 capture_output=True, text=True, timeout=10)
             self.assertFalse(marker.exists(), "receipt/selector control invoked Cargo")
             self.assertFalse((root / "test-partition-receipts").exists(),
                              "receipt/selector control wrote an execution receipt")
             return proc
 
-    def test_intact_handler_keeps_routing_and_rejects_invalid_receipts(self):
-        self.assertEqual(self.check_runner(REAL_RUNNER_TEXT), [])
+    def test_actual_entrypoint_rejects_invalid_receipts_without_cargo(self):
         proc = self.run_cli_without_cargo(
-            REAL_RUNNER_TEXT, "--lane", "rust-tests", "--verify-receipts", "missing-receipts")
+            "--lane", "rust-tests", "--verify-receipts", "missing-receipts")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("partition failed:", proc.stderr)
-
-    def test_genuinely_fatal_entrypoint_keeps_full_scanner_credit(self):
-        self.assertEqual(self.check_runner(self.with_handler("sys.exit(1)")), [])
 
     def test_legitimate_list_and_validation_branches_keep_their_exit_status(self):
         expected = {
@@ -1009,42 +871,16 @@ class NonfatalEntrypointRejectedTests(unittest.TestCase):
         }
         for lane, partitions in expected.items():
             with self.subTest(lane=lane):
-                proc = self.run_cli_without_cargo(REAL_RUNNER_TEXT, "--lane", lane, "--list")
+                proc = self.run_cli_without_cargo("--lane", lane, "--list")
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual([row["partition"] for row in json.loads(proc.stdout)["include"]],
                                  partitions)
         for args in (("--lane", "wrong-lane", "--list"), ("--lane", "rust-tests"),
                      ("--lane", "rust-tests", "--partition", "wrong-partition")):
             with self.subTest(args=args):
-                proc = self.run_cli_without_cargo(REAL_RUNNER_TEXT, *args)
+                proc = self.run_cli_without_cargo(*args)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("error:", proc.stderr)
-
-    def test_missing_main_dispatch_is_already_rejected_for_every_credit(self):
-        broken = self.with_handler("sys.exit(1)").replace(
-            "        main()\n", "        pass\n", 1)
-        self.assert_no_credit(self.check_runner(broken))
-
-    def test_nonfatal_exception_handlers_earn_no_runner_credit(self):
-        for name, runner_text in self.nonfatal_handlers().items():
-            with self.subTest(handler=name):
-                self.assert_no_credit(self.check_runner(runner_text))
-
-    def test_replacing_finally_or_else_paths_earn_no_runner_credit(self):
-        for name, runner_text in self.replacing_tails().items():
-            with self.subTest(tail=name):
-                self.assert_no_credit(self.check_runner(runner_text))
-
-    def test_adverse_handlers_really_return_success_for_invalid_receipts(self):
-        # Qualify the hostile inputs through bounded native Python execution,
-        # not a count of source mentions. These are rewritten copies, never
-        # the checked-in production runner; no Cargo/DB operation is selected.
-        for name, runner_text in (self.nonfatal_handlers() | self.replacing_tails()).items():
-            with self.subTest(handler=name):
-                proc = self.run_cli_without_cargo(
-                    runner_text, "--lane", "rust-tests", "--verify-receipts", "missing-receipts")
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertIn("partition failed:", proc.stderr)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,15 @@ def partition_runner():
         sys.path.remove(str(PARTITION_RUNNER.parent))
 
 
+def offline_support():
+    """Share deterministic metadata and the strict subprocess double with CI pins."""
+    spec = importlib.util.spec_from_file_location(
+        "nightly_routing_offline_support", ROOT / "scripts/ci/test_critical_path_support.py")
+    support = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(support)
+    return support
+
+
 class NightlyRoutingTests(unittest.TestCase):
     def test_every_ignored_channel_fixture_is_routed_out_of_broad_bootstrap(self):
         source = (ROOT / "crates/core/src/channel_moderation_store.rs").read_text()
@@ -297,19 +306,24 @@ class NightlyRoutingTests(unittest.TestCase):
             worker,
         )
         runner = partition_runner()
+        support = offline_support()
+        fixture = support.offline_integration_fixture()
         targets = []
-        for index in range(3):
-            commands = runner.integration_commands(index)
-            for args, database, integration, _timeout, budget in commands:
-                # Each owning package command also carries a property_ replay
-                # of the same targets; ownership is the ordinary execution.
-                if budget:
-                    continue
-                selected = [
-                    args[i + 1] for i, word in enumerate(args[:-1]) if word == "--test"
-                ]
-                if "leveling_store" in selected:
-                    targets.append((index, args, database, integration))
+        with mock.patch.object(runner.subprocess, "run",
+                               side_effect=support.strict_cargo_metadata_run(fixture)), \
+                mock.patch("shutil.which", return_value="/fake/cargo-available"):
+            for index in range(3):
+                commands = runner.integration_commands(index)
+                for args, database, integration, _timeout, budget in commands:
+                    # Each owning package command also carries a property_ replay
+                    # of the same targets; ownership is the ordinary execution.
+                    if budget:
+                        continue
+                    selected = [
+                        args[i + 1] for i, word in enumerate(args[:-1]) if word == "--test"
+                    ]
+                    if "leveling_store" in selected:
+                        targets.append((index, args, database, integration))
         self.assertEqual(
             len(targets), 1,
             "leveling_store must have exactly one ordinary integration-partition owner",

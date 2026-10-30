@@ -270,6 +270,35 @@ def metadata(rows):
     return graph
 
 
+def offline_integration_fixture():
+    """Representative metadata, not a real-workspace coverage qualification."""
+    targets = (
+        ("two-bot-core", "leveling_store"),
+        ("two-bot-core", "future_unlisted_contract"),
+        ("two-bot-discord", "internal_channel_moderation"),
+        ("two-bot-store", "invite_uses_saturation_acceptance"),
+        ("two-bot-cutover", "raid_list_db"),
+        ("two-bot", "containment_worker_soak"),
+    )
+    return metadata([dict(package=package, kind="test", target=target,
+                          name="ordinary", ignored=False)
+                     for package, target in targets])
+
+
+def strict_cargo_metadata_run(fixture):
+    """Answer only metadata; unexpected subprocess access fails, never skips."""
+    payload = json.dumps(fixture)
+    expected = ["cargo", "metadata", "--format-version", "1", "--locked",
+                "--features", "two-bot-core/db"]
+
+    def run(argv, **kwargs):
+        if list(argv) != expected:
+            raise AssertionError(f"unexpected subprocess use in offline test: {argv!r}")
+        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+
+    return run
+
+
 def selections(argv, rows, graph=None):
     """Independent, deliberately narrow Cargo/libtest selector oracle.
 
