@@ -10,13 +10,16 @@ acceptance remain separate empirical work, not synthetic assertions here.
 
 import copy
 import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from test_critical_path_partitions_acceptance import ROWS, planner, workers
 from test_critical_path_support import (
@@ -338,7 +341,10 @@ class ReportGateControls(unittest.TestCase):
     def test_real_hard_gate_rejects_seventy_percent_and_accepts_eighty_percent(self):
         root = self.sandbox.root
         def git(*args):
-            return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+            return subprocess.check_output(
+                ["git", "-C", str(root), "-c", "commit.gpgsign=false",
+                 "-c", "core.hooksPath=/dev/null", *args],
+                text=True, timeout=30).strip()
         git("init", "-q")
         git("config", "user.name", "Acceptance Fixture")
         git("config", "user.email", "fixture@example.invalid")
@@ -359,6 +365,91 @@ class ReportGateControls(unittest.TestCase):
                     f"DA:{i + 2},{int(i < covered)}\n" for i in range(10)) + "end_of_record\n")
                 proc = self.sandbox.run(step["run"], {"QUALITY_BASE": base, "QUALITY_HEAD": head}, cwd=root)
                 self.assertEqual(proc.returncode, expected, assertions_message(proc))
+
+
+class HardGateGitIsolationControls(unittest.TestCase):
+    """Contributor signing/hooks must not replace the real coverage oracle.
+
+    These controls use native Git from the OS path, not a provider wrapper.
+    Every Git repository, identity, configuration and executable is synthetic;
+    no real worktree/global Git configuration or credential is read or edited.
+    """
+
+    def check_native_fixture(self, hostile):
+        native_git = shutil.which("git", path=os.defpath)
+        self.assertIsNotNone(native_git, "native local Git is required for this fixture")
+        with tempfile.TemporaryDirectory(prefix="coverage-git-isolation-") as directory:
+            root = Path(directory)
+            marker = root / "ambient-config-executed"
+            hooks = root / "hooks"
+            hooks.mkdir()
+            signer = root / "synthetic-signer"
+            signer.write_text("#!/bin/sh\nprintf signer >> " + shlex.quote(str(marker)) + "\nexit 73\n")
+            signer.chmod(0o755)
+            hook = hooks / "pre-commit"
+            hook_body = "#!/bin/sh\nprintf hook >> " + shlex.quote(str(marker)) + "\n"
+            if hostile == "hook-rewrite":
+                hook_body += (
+                    "printf 'pub fn replaced_by_ambient_hook() {}\\n' > src/lib.rs\n"
+                    + shlex.quote(native_git) + " add src/lib.rs\n")
+            else:
+                hook_body += "exit 74\n"
+            hook.write_text(hook_body)
+            hook.chmod(0o755)
+            config = root / "global.gitconfig"
+            settings = ""
+            if hostile == "signing":
+                settings += "[commit]\n    gpgsign = true\n[gpg]\n    program = " + json.dumps(str(signer)) + "\n"
+            elif hostile.startswith("hook-"):
+                settings += "[core]\n    hooksPath = " + json.dumps(str(hooks)) + "\n"
+            else:
+                self.assertEqual(hostile, "clean")
+            config.write_text(settings)
+            env = {
+                "PATH": os.defpath, "HOME": str(root), "LC_ALL": "C",
+                "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "Acceptance Fixture",
+                "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                "GIT_COMMITTER_NAME": "Acceptance Fixture",
+                "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            observed = []
+            real_run = Sandbox.run
+
+            def record_gate(sandbox, shell, *args, **kwargs):
+                proc = real_run(sandbox, shell, *args, **kwargs)
+                if "check-patch-coverage.py" in shell:
+                    lines = (sandbox.root / "lcov.info").read_text().splitlines()
+                    hits = [line for line in lines if line.startswith("DA:")]
+                    observed.append((sum(int(line.rsplit(",", 1)[1]) > 0 for line in hits),
+                                     len(hits), proc.returncode))
+                return proc
+
+            result = unittest.TestResult()
+            case = ReportGateControls(
+                "test_real_hard_gate_rejects_seventy_percent_and_accepts_eighty_percent")
+            with patch.dict(os.environ, env, clear=True), patch.object(Sandbox, "run", record_gate):
+                case.run(result)
+            self.assertTrue(
+                result.wasSuccessful(),
+                f"native fixture did not reach/pass its real HARD-gate assertions: "
+                f"errors={result.errors}, failures={result.failures}")
+            self.assertEqual(observed, [(7, 10, 1), (8, 10, 0), (9, 10, 0)],
+                             "signing/hook isolation replaced or skipped the coverage boundary")
+            self.assertFalse(marker.exists(), "ambient signer/hook executed in the synthetic repository")
+
+    def test_native_git_clean_control_executes_the_real_coverage_boundary(self):
+        self.check_native_fixture("clean")
+
+    def test_hostile_global_commit_signing_cannot_abort_the_fixture(self):
+        self.check_native_fixture("signing")
+
+    def test_hostile_global_precommit_hook_cannot_abort_the_fixture(self):
+        self.check_native_fixture("hook-abort")
+
+    def test_hostile_global_precommit_hook_cannot_replace_the_fixture(self):
+        self.check_native_fixture("hook-rewrite")
 
 
 class PartitionReceiptVerificationAcceptance(unittest.TestCase):

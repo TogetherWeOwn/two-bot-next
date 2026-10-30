@@ -33,6 +33,9 @@ existing ``orphaned test target`` / ``missing`` shape with the ignored
 kind preserved.
 """
 
+import ast
+import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -820,6 +823,135 @@ class CompileOnlyIgnoredTargetRejectedTests(unittest.TestCase):
                     with_direct_markers(check_yml), NIGHTLY_YML,
                     dict(BOT_ALIVE), runner_text=runner_text)
                 assert_orphaned(self, errors, "alive", True)
+
+
+class NonfatalEntrypointRejectedTests(unittest.TestCase):
+    """A main() call alone cannot prove the runner propagates failure."""
+
+    def with_handler(self, body, tail=""):
+        guard = ast.parse(REAL_RUNNER_TEXT).body[-1]
+        self.assertIsInstance(guard, ast.If)
+        prefix = "".join(REAL_RUNNER_TEXT.splitlines(keepends=True)[:guard.lineno - 1])
+        handler = "".join("        " + line + "\n" for line in body.splitlines())
+        return prefix + (
+            'if __name__ == "__main__":\n'
+            '    try:\n'
+            '        main()\n'
+            '    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:\n'
+            '        print(f"partition failed: {exc}", file=sys.stderr)\n'
+            + handler + tail)
+
+    def nonfatal_handlers(self):
+        return {
+            "exit zero": self.with_handler("sys.exit(0)"),
+            "no exit": self.with_handler(""),
+            "pass": self.with_handler("pass"),
+            "exit without status": self.with_handler("sys.exit()"),
+            "false status": self.with_handler("sys.exit(False)"),
+            "raise zero": self.with_handler("raise SystemExit(0)"),
+            "unreachable fatal exit": self.with_handler("if False:\n    sys.exit(1)"),
+            "swallowed SystemExit": self.with_handler(
+                "try:\n    sys.exit(1)\nexcept SystemExit:\n    pass"),
+        }
+
+    def replacing_tails(self):
+        return {
+            "finally exits zero": self.with_handler(
+                "sys.exit(1)", "    finally:\n        sys.exit(0)\n"),
+            "finally raises zero": self.with_handler(
+                "sys.exit(1)", "    finally:\n        raise SystemExit(0)\n"),
+            "fatal else is not an exception exit": self.with_handler(
+                "pass", "    else:\n        sys.exit(1)\n"),
+        }
+
+    def check_runner(self, runner_text):
+        return check_fixture(
+            VALID_CHECK_YML, NIGHTLY_YML,
+            dict(BOT_ALIVE) | dict(MYCRATE_PLAIN), runner_text=runner_text)
+
+    def assert_no_credit(self, errors):
+        assert_orphaned(self, errors, "plain", False)
+        assert_orphaned(self, errors, "alive", True)
+        for marker in ("workspace lib/bins unit run", "workspace doc-test run"):
+            self.assertTrue(any(marker in error for error in errors),
+                            f"nonfatal runner kept {marker}: {errors}")
+
+    def run_cli_without_cargo(self, runner_text, *args):
+        with tempfile.TemporaryDirectory(prefix="runner-exit-control-") as directory:
+            root = Path(directory)
+            runner = root / "run-test-partition.py"
+            runner.write_text(runner_text)
+            binary = root / "bin"
+            binary.mkdir()
+            marker = root / "unexpected-cargo"
+            cargo = binary / "cargo"
+            cargo.write_text(f"#!{sys.executable}\nfrom pathlib import Path\n"
+                             f"Path({str(marker)!r}).touch()\nraise SystemExit(91)\n")
+            cargo.chmod(0o755)
+            env = {
+                "PATH": str(binary) + os.pathsep + os.defpath,
+                "HOME": str(root), "RUNNER_TEMP": str(root),
+                "PYTHONPATH": str(REAL_RUNNER.parent),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            proc = subprocess.run(
+                [sys.executable, str(runner), *args], cwd=root, env=env,
+                capture_output=True, text=True, timeout=10)
+            self.assertFalse(marker.exists(), "receipt/selector control invoked Cargo")
+            self.assertFalse((root / "test-partition-receipts").exists(),
+                             "receipt/selector control wrote an execution receipt")
+            return proc
+
+    def test_intact_handler_keeps_routing_and_rejects_invalid_receipts(self):
+        self.assertEqual(self.check_runner(REAL_RUNNER_TEXT), [])
+        proc = self.run_cli_without_cargo(
+            REAL_RUNNER_TEXT, "--lane", "rust-tests", "--verify-receipts", "missing-receipts")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("partition failed:", proc.stderr)
+
+    def test_legitimate_list_and_validation_branches_keep_their_exit_status(self):
+        expected = {
+            "rust-tests": ["unit-bin", "integration-0", "integration-1", "integration-2", "replays"],
+            "ignored-db-runtime": ["onboarding", "gateway", "runtime", "cutover", "other"],
+        }
+        for lane, partitions in expected.items():
+            with self.subTest(lane=lane):
+                proc = self.run_cli_without_cargo(REAL_RUNNER_TEXT, "--lane", lane, "--list")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual([row["partition"] for row in json.loads(proc.stdout)["include"]],
+                                 partitions)
+        for args in (("--lane", "wrong-lane", "--list"), ("--lane", "rust-tests"),
+                     ("--lane", "rust-tests", "--partition", "wrong-partition")):
+            with self.subTest(args=args):
+                proc = self.run_cli_without_cargo(REAL_RUNNER_TEXT, *args)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("error:", proc.stderr)
+
+    def test_missing_main_dispatch_is_already_rejected_for_every_credit(self):
+        broken = self.with_handler("sys.exit(1)").replace(
+            "        main()\n", "        pass\n", 1)
+        self.assert_no_credit(self.check_runner(broken))
+
+    def test_nonfatal_exception_handlers_earn_no_runner_credit(self):
+        for name, runner_text in self.nonfatal_handlers().items():
+            with self.subTest(handler=name):
+                self.assert_no_credit(self.check_runner(runner_text))
+
+    def test_replacing_finally_or_else_paths_earn_no_runner_credit(self):
+        for name, runner_text in self.replacing_tails().items():
+            with self.subTest(tail=name):
+                self.assert_no_credit(self.check_runner(runner_text))
+
+    def test_adverse_handlers_really_return_success_for_invalid_receipts(self):
+        # Qualify the hostile inputs through bounded native Python execution,
+        # not a count of source mentions. These are rewritten copies, never
+        # the checked-in production runner; no Cargo/DB operation is selected.
+        for name, runner_text in (self.nonfatal_handlers() | self.replacing_tails()).items():
+            with self.subTest(handler=name):
+                proc = self.run_cli_without_cargo(
+                    runner_text, "--lane", "rust-tests", "--verify-receipts", "missing-receipts")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("partition failed:", proc.stderr)
 
 
 if __name__ == "__main__":

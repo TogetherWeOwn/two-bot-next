@@ -45,14 +45,17 @@ shard counts above the leg count, non-check workflow files, and merge_group
 events.
 """
 
+import copy
 import importlib.util
 import io
 import json
 import re
+import shlex
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from test_critical_path_support import IGNORED_BOT_LEGS
 
@@ -339,10 +342,12 @@ class FullLegListTests(unittest.TestCase):
                     self.assertIn("--lib --bins --tests", cmd)
                     if package == "other":
                         self.assertIn("--workspace", cmd)
+                        argv = shlex.split(cmd)
+                        pairs = set(zip(argv, argv[1:]))
                         for excluded in ("two-bot-core", "two-bot-discord",
                                          "two-bot", "two-bot-cutover",
                                          "two-bot-store"):
-                            self.assertIn(f"--exclude {excluded}", cmd)
+                            self.assertIn(("--exclude", excluded), pairs)
                     else:
                         self.assertNotIn("--workspace", cmd)
         # Only the two "other" remainders still carry --workspace.
@@ -351,6 +356,30 @@ class FullLegListTests(unittest.TestCase):
             sorted(leg["id"] for leg in workspace),
             ["sweep-ignored-other", "sweep-nonignored-other"],
         )
+
+    def test_other_sweeps_reject_each_missing_exact_package_exclusion(self):
+        planner = load_planner(self)
+        for leg_id in ("sweep-nonignored-other", "sweep-ignored-other"):
+            for package in ("two-bot-core", "two-bot-discord", "two-bot",
+                            "two-bot-cutover", "two-bot-store"):
+                with self.subTest(leg=leg_id, missing=package):
+                    legs = copy.deepcopy(planner.FULL_LEGS)
+                    leg = next(row for row in legs if row["id"] == leg_id)
+                    argv = shlex.split(command_text(leg))
+                    positions = [i for i, value in enumerate(argv[:-1])
+                                 if value == "--exclude" and argv[i + 1] == package]
+                    self.assertEqual(len(positions), 1, "mutant needs one exact exclusion pair")
+                    del argv[positions[0]:positions[0] + 2]
+                    leg["command"] = shlex.join(argv)
+                    result = unittest.TestResult()
+                    with patch.object(planner, "FULL_LEGS", legs):
+                        FullLegListTests("test_workspace_sweeps_are_present").run(result)
+                    self.assertEqual(result.testsRun, 1)
+                    self.assertEqual(result.errors, [], "mutation failed before reaching the oracle")
+                    self.assertFalse(
+                        result.wasSuccessful(),
+                        f"workspace-sweep oracle accepted missing exact --exclude {package} in {leg_id}")
+                    self.assertTrue(any(package in details for _, details in result.failures))
 
     def test_every_dedicated_leg_matches_exactly_one_expected_leg(self):
         planner = load_planner(self)
