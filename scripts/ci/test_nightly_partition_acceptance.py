@@ -3,15 +3,19 @@
 
 import ast
 from collections import Counter
+from contextlib import contextmanager
 import io
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -216,6 +220,12 @@ cargo, harness = args[1:], []
 if "--" in cargo:
     index = cargo.index("--")
     cargo, harness = cargo[:index], cargo[index + 1:]
+
+if args[0] == "build":
+    invalid = set(cargo) & {"--no-fail-fast", "--no-run", "--doc"}
+    if invalid or harness:
+        print("error: unexpected argument for cargo build: " + repr(sorted(invalid) or harness), file=sys.stderr)
+        sys.exit(2)
 
 is_doc = "--doc" in cargo
 is_list = "--list" in harness
@@ -605,6 +615,21 @@ class RunnerAcceptance(CargoFixture):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("fixture failure", result.stdout + result.stderr)
                 self.assertFalse(self.executions(events))
+
+    def test_fake_cargo_rejects_test_only_build_options(self):
+        for option in ("--no-fail-fast", "--no-run", "--doc"):
+            with self.subTest(option=option):
+                command = shlex.join(["cargo", "build", "--workspace", "--all-features", "--locked", "--all-targets", option])
+                result, events = self.run_partition(fixture(), 0, shell_command=command)
+                self.assertNotEqual(result.returncode, 0, "the fake accepted an invalid Cargo build command")
+                self.assertIn("unexpected argument", result.stderr)
+                self.assertFalse(any(event["event"] == "compile" for event in events))
+
+    def test_fake_cargo_accepts_valid_build_options_without_running_tests(self):
+        result, events = self.run_partition(fixture(), 0, shell_command="cargo build --workspace --all-features --locked --all-targets")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(event["event"] == "compile" for event in events))
+        self.assertFalse(self.executions(events))
 
     def test_missing_subprocess_is_not_a_success(self):
         result, events = self.run_partition(fixture(), 0, cargo_name="missing-nightly-cargo-command")
@@ -1009,16 +1034,316 @@ class WorkflowAcceptance(CargoFixture):
             self.assertTrue(failed, "missing acceptance file was silently accepted as zero tests")
 
 
+class HarnessCleanupError(RuntimeError):
+    """Incomplete cancellation must preserve the owned workspace for diagnosis."""
+
+
+@contextmanager
+def real_cargo_workspace(scratch):
+    temporary = Path(tempfile.mkdtemp(prefix="nightly-real-cargo-", dir=scratch)).resolve()
+    safe_to_remove = True
+    try:
+        yield temporary
+    except HarnessCleanupError:
+        safe_to_remove = False
+        raise
+    finally:
+        if safe_to_remove:
+            shutil.rmtree(temporary)
+
+
+def pooled_cargo_environment(temporary, wrapper, original_path):
+    control = temporary / "control"
+    control.mkdir()
+    configuration = control / "shim.json"
+    configuration.write_text(json.dumps({"python": sys.executable, "wrapper": str(wrapper),
+                                         "path": original_path, "control": str(control)}))
+    cargo = temporary / "bin/cargo"
+    cargo.parent.mkdir()
+    cargo.write_text(
+        f'#!{sys.executable}\nimport os, sys\n'
+        f'os.execv({sys.executable!r}, [{sys.executable!r}, {str(Path(__file__).resolve())!r}, '
+        f'"--pooled-cargo-shim", {str(configuration)!r}, *sys.argv[1:]])\n')
+    cargo.chmod(0o755)
+    if not cargo.is_file() or not os.access(cargo, os.X_OK):
+        raise ValueError("unsafe Cargo interception: shim is missing or unexecutable")
+    environment = os.environ.copy()
+    # No fallback PATH entries: missing/broken interception may never reach Cargo.
+    environment["PATH"] = str(cargo.parent)
+    environment["NIGHTLY_HARNESS_CONTROL"] = str(control)
+    return environment
+
+
+def pooled_cargo_call(configuration, arguments):
+    settings = json.loads(configuration.read_text())
+    control = Path(settings["control"])
+    refused, cancelled = control / "refused", control / "cancelled"
+    if refused.exists() or cancelled.exists():
+        return 75
+    active = control / f"active-{os.getpid()}"
+    child, stopping = None, None
+
+    def interrupt(signum, _frame):
+        nonlocal stopping
+        if stopping is not None:
+            return
+        stopping = signum
+        cancelled.touch()
+        if child is not None:
+            child.send_signal(signum)
+
+    handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    for number in handlers:
+        signal.signal(number, interrupt)
+    try:
+        active.write_text(str(os.getpid()))
+        if refused.exists() or cancelled.exists():
+            return 75
+        environment = os.environ.copy()
+        environment["PATH"] = settings["path"]
+        child = subprocess.Popen([settings["python"], settings["wrapper"], "run", "--", *arguments], env=environment)
+        if stopping is not None:
+            child.send_signal(stopping)
+        result = child.wait()
+        if result == 75:
+            refused.touch()
+        return result
+    finally:
+        if child is not None and child.poll() is None:
+            child.send_signal(signal.SIGTERM)
+            child.wait()
+        active.unlink(missing_ok=True)
+        for number, handler in handlers.items():
+            signal.signal(number, handler)
+
+
+def run_admitted_command(command, *, cwd, env, timeout=180, cleanup_timeout=10):
+    control = Path(env["NIGHTLY_HARNESS_CONTROL"])
+    process = subprocess.Popen(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        if list(control.glob("active-*")):
+            raise HarnessCleanupError("command exited before admitted descendants were reaped")
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except BaseException:
+        # Keep the runner alive to reap its shim; the shim forwards cancellation
+        # to the bounded wrapper, which owns Cargo's separate process session.
+        (control / "cancelled").touch()
+        deadline, signalled = time.monotonic() + cleanup_timeout, set()
+        while True:
+            for active in control.glob("active-*"):
+                pid = int(active.name.removeprefix("active-"))
+                if pid in signalled:
+                    continue
+                try:
+                    if os.getpgid(pid) != process.pid:
+                        raise HarnessCleanupError("refused to signal a process outside the owned command group")
+                    os.kill(pid, signal.SIGTERM)
+                    signalled.add(pid)
+                except ProcessLookupError:
+                    pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessCleanupError("bounded wrapper cleanup did not finish; workspace preserved")
+            try:
+                process.communicate(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            if not list(control.glob("active-*")):
+                raise
+            time.sleep(min(0.01, remaining))
+    finally:
+        if process.poll() is not None:
+            process.stdout.close()
+            process.stderr.close()
+
+
+class HarnessCancellationAcceptance(unittest.TestCase):
+    def exercise_cancellation(self, *, through_runner=False, parent_failure=False):
+        with tempfile.TemporaryDirectory(prefix="nightly-cancellation-proof-") as directory:
+            outer = Path(directory).resolve()
+            log = outer / "events.jsonl"
+            wrapper = outer / "fake-wrapper.py"
+            worker = (
+                'import json, os, pathlib, signal, sys\n'
+                'log = pathlib.Path(os.environ["NIGHTLY_CANCELLATION_LOG"])\n'
+                'def event(name):\n'
+                '    with log.open("a") as stream: stream.write(json.dumps({"event": name, "pid": os.getpid()}) + "\\n")\n'
+                'def stop(signum, frame):\n'
+                '    event("compiler-stopped")\n'
+                '    sys.exit(0)\n'
+                'signal.signal(signal.SIGTERM, stop)\n'
+                'event("compiler-ready")\n'
+                'signal.pause()\n')
+            wrapper.write_text(
+                'import json, os, pathlib, signal, subprocess, sys\n'
+                'log = pathlib.Path(os.environ["NIGHTLY_CANCELLATION_LOG"])\n'
+                'workspace = pathlib.Path(os.environ["NIGHTLY_CANCELLATION_WORKSPACE"])\n'
+                'child, stopping = None, False\n'
+                'def event(name, **fields):\n'
+                '    with log.open("a") as stream: stream.write(json.dumps({"event": name, **fields}) + "\\n")\n'
+                'def stop(signum, frame):\n'
+                '    global stopping\n'
+                '    if stopping: return\n'
+                '    stopping = True\n'
+                '    event("wrapper-cancelled")\n'
+                '    if child is not None: child.terminate()\n'
+                'signal.signal(signal.SIGTERM, stop)\n'
+                '(log.parent / "fake-lease-sentinel").touch()\n'
+                'try:\n'
+                f'    child = subprocess.Popen([{sys.executable!r}, "-c", {worker!r}], start_new_session=True)\n'
+                '    event("wrapper-started", pid=os.getpid(), shim=os.getppid(), compiler=child.pid, compiler_group=os.getpgid(child.pid))\n'
+                '    if stopping: child.terminate()\n'
+                '    child.wait(timeout=3)\n'
+                'finally:\n'
+                '    if child is not None and child.poll() is None:\n'
+                '        child.terminate()\n'
+                '        try: child.wait(timeout=1)\n'
+                '        except subprocess.TimeoutExpired:\n'
+                '            child.kill()\n'
+                '            child.wait()\n'
+                '    event("wrapper-reaped", fixture_exists=workspace.is_dir())\n'
+                'sys.exit(75)\n')
+
+            def records():
+                if not log.exists():
+                    return []
+                try:
+                    return [json.loads(line) for line in log.read_text().splitlines()]
+                except json.JSONDecodeError:
+                    return []
+
+            processes, first = [], True
+            popen, communicate = subprocess.Popen, subprocess.Popen.communicate
+
+            def spawn(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                processes.append(process)
+                return process
+
+            def gated_communicate(process, *args, **kwargs):
+                nonlocal first
+                if first:
+                    first = False
+                    deadline = time.monotonic() + 3
+                    while not any(row["event"] == "compiler-ready" for row in records()):
+                        if process.poll() is not None or time.monotonic() >= deadline:
+                            self.fail("fake compiler did not reach the cancellation gate")
+                        time.sleep(0.01)
+                    if parent_failure:
+                        raise RuntimeError("fixture parent failure")
+                return communicate(process, *args, **kwargs)
+
+            with real_cargo_workspace(str(outer)) as owned:
+                original_path = os.pathsep.join(str((Path.cwd() / item).resolve()) for item in os.environ["PATH"].split(os.pathsep))
+                environment = pooled_cargo_environment(owned, wrapper, original_path)
+                environment.update(NIGHTLY_CANCELLATION_LOG=str(log), NIGHTLY_CANCELLATION_WORKSPACE=str(owned))
+                command = ["cargo", "test", *CARGO_FLAGS, "--", "--include-ignored", "--test-threads=1"]
+                if through_runner:
+                    command = [sys.executable, str(RUNNER), "--index", "0", "--count", "1", "--", *command]
+                expected = RuntimeError if parent_failure else subprocess.TimeoutExpired
+                with patch.object(subprocess, "Popen", spawn), patch.object(popen, "communicate", gated_communicate):
+                    with self.assertRaises(expected):
+                        run_admitted_command(command, cwd=owned, env=environment, timeout=0.05, cleanup_timeout=5)
+                self.assertTrue(owned.is_dir(), "fixture must exist until wrapper cleanup completes")
+                self.assertFalse(list((owned / "control").glob("active-*")))
+                events = records()
+                names = [row["event"] for row in events]
+                self.assertLess(names.index("wrapper-cancelled"), names.index("compiler-stopped"))
+                self.assertLess(names.index("compiler-stopped"), names.index("wrapper-reaped"))
+                self.assertTrue(next(row for row in events if row["event"] == "wrapper-reaped")["fixture_exists"])
+                started = next(row for row in events if row["event"] == "wrapper-started")
+                self.assertEqual(started["compiler_group"], started["compiler"], "fake compiler must own a separate session")
+                for pid in (started["pid"], started["compiler"], started["shim"]):
+                    with self.subTest(reaped_pid=pid):
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(pid, 0)
+                self.assertTrue(all(process.returncode is not None for process in processes))
+            self.assertFalse(owned.exists(), "fixture removal must follow completed reaping")
+            self.assertTrue((outer / "fake-lease-sentinel").exists(), "cancellation must not clear a retained lease sentinel")
+            return {"throughRunner": through_runner, "parentFailure": parent_failure, "events": events,
+                    "rootExitCodes": [process.returncode for process in processes], "fixtureRemoved": not owned.exists(),
+                    "allRecordedPidsReaped": True, "fakeLeaseSentinelRetained": True}
+
+    def test_timeout_reaps_wrapper_and_separate_session_before_fixture_removal(self):
+        for through_runner in (False, True):
+            with self.subTest(through_runner=through_runner):
+                self.exercise_cancellation(through_runner=through_runner)
+
+    def test_parent_failure_uses_the_same_descendant_cleanup_path(self):
+        self.exercise_cancellation(through_runner=True, parent_failure=True)
+
+    def test_signal_during_spawn_is_forwarded_and_repeated_signal_cannot_skip_reaping(self):
+        with tempfile.TemporaryDirectory(prefix="nightly-spawn-cancellation-") as directory:
+            temporary = Path(directory).resolve()
+            environment = pooled_cargo_environment(temporary, temporary / "unused-wrapper.py", os.environ["PATH"])
+            configuration = Path(environment["NIGHTLY_HARNESS_CONTROL"]) / "shim.json"
+            events = []
+
+            class Wrapper:
+                returncode = None
+
+                def send_signal(self, number):
+                    events.append(("forward", number))
+
+                def wait(self):
+                    signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                    self.returncode = 75
+                    events.append(("reaped", None))
+                    return 75
+
+                def poll(self):
+                    return self.returncode
+
+            def spawn(*args, **kwargs):
+                events.append(("spawn", None))
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                return Wrapper()
+
+            with patch.object(subprocess, "Popen", spawn):
+                self.assertEqual(pooled_cargo_call(configuration, ["test"]), 75)
+            self.assertEqual(events, [("spawn", None), ("forward", signal.SIGTERM), ("reaped", None)])
+            self.assertFalse(list(configuration.parent.glob("active-*")))
+            self.assertTrue((configuration.parent / "cancelled").exists())
+
+    def test_incomplete_cleanup_preserves_the_fixture(self):
+        class Unfinished:
+            pid = 123456789
+            returncode = None
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            def communicate(self, *args, **kwargs):
+                raise subprocess.TimeoutExpired(["fixture"], 0)
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory(prefix="nightly-preservation-proof-") as directory:
+            owned = None
+            try:
+                with self.assertRaises(HarnessCleanupError):
+                    with real_cargo_workspace(directory) as owned:
+                        environment = pooled_cargo_environment(owned, owned / "unused-wrapper.py", os.environ["PATH"])
+                        with patch.object(subprocess, "Popen", return_value=Unfinished()):
+                            run_admitted_command(["fixture"], cwd=owned, env=environment, timeout=0, cleanup_timeout=0)
+                self.assertTrue(owned.is_dir(), "incomplete cleanup must never delete the fixture")
+            finally:
+                if owned is not None and owned.exists():
+                    shutil.rmtree(owned)
+
+
 class RealCargoHarnessAcceptance(unittest.TestCase):
-    def exercise_real_suite_offline(self, *, refuse=False):
+    def exercise_real_suite_offline(self, *, refuse=False, refuse_at=0, scratch_shape=None,
+                                    interpreter_shape=None, shim_state=None, path_style=None):
         # Replace only build admission and Cargo, not the harness or real runner.
         with tempfile.TemporaryDirectory(prefix="nightly-harness-acceptance-") as directory:
-            temporary = Path(directory)
+            temporary = Path(directory).resolve()
             root = temporary / "repo"
             (root / "scripts").mkdir(parents=True)
             (root / "rust-toolchain.toml").write_bytes((ROOT / "rust-toolchain.toml").read_bytes())
-            real_bin = temporary / "original-path"
-            real_bin.mkdir()
+            real_bin = temporary if path_style == "empty" else temporary / ("bin" if path_style == "relative" else "original-path")
+            real_bin.mkdir(exist_ok=True)
             cargo = real_bin / "cargo"
             fake = FAKE_CARGO.replace(
                 'args = sys.argv[1:]',
@@ -1038,10 +1363,11 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
             wrapper = root / "scripts/cargo_cache.py"
             wrapper.write_text(
                 f'#!{sys.executable}\nimport json, os, pathlib, subprocess, sys\n'
-                'with pathlib.Path(os.environ["NIGHTLY_POOL_LEDGER"]).open("a") as log:\n'
+                'ledger = pathlib.Path(os.environ["NIGHTLY_POOL_LEDGER"])\n'
+                'with ledger.open("a") as log:\n'
                 '    log.write(json.dumps({"args": sys.argv[1:], "path": os.environ["PATH"]}) + "\\n")\n'
                 'if sys.argv[1:3] != ["run", "--"]: sys.exit(97)\n'
-                'if os.environ["NIGHTLY_POOL_REFUSE"] == "1":\n'
+                'if len(ledger.read_text().splitlines()) == int(os.environ["NIGHTLY_POOL_REFUSE_AT"]):\n'
                 '    print("fixture bounded pool refused admission", file=sys.stderr)\n'
                 '    sys.exit(75)\n'
                 f'if os.environ["PATH"].split(os.pathsep)[0] != {str(real_bin)!r}: sys.exit(96)\n'
@@ -1057,15 +1383,39 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
             }))
             ledger = temporary / "cargo.jsonl"
             pool_ledger = temporary / "pool.jsonl"
+            first_path = "bin" if path_style == "relative" else "" if path_style == "empty" else str(real_bin)
             environment = {
-                "PATH": str(real_bin) + os.pathsep + os.environ["PATH"],
+                "PATH": first_path + os.pathsep + os.environ["PATH"],
                 "NIGHTLY_FIXTURE": str(inventory), "NIGHTLY_LEDGER": str(ledger),
-                "NIGHTLY_POOL_LEDGER": str(pool_ledger), "NIGHTLY_POOL_REFUSE": "1" if refuse else "0",
+                "NIGHTLY_POOL_LEDGER": str(pool_ledger), "NIGHTLY_POOL_REFUSE_AT": str(1 if refuse else refuse_at),
             }
+            if scratch_shape:
+                scratch = temporary / ("unsafe:scratch" if scratch_shape == "colon" else "scratch")
+                scratch.mkdir()
+                environment["PAPERCLIP_RUN_SCRATCH_DIR"] = "scratch" if scratch_shape == "relative" else str(scratch)
+            interpreter = sys.executable
+            if interpreter_shape:
+                interpreter = str(temporary / "python with spaces")
+                Path(interpreter).symlink_to(sys.executable)
+            chmod = Path.chmod
+
+            def intercept(path, mode, *args, **kwargs):
+                if shim_state and path.name == "cargo" and path.parent.name == "bin":
+                    if shim_state == "missing":
+                        path.unlink()
+                        return
+                    return chmod(path, 0, *args, **kwargs)
+                return chmod(path, mode, *args, **kwargs)
+
             output = io.StringIO()
-            with patch.dict(globals(), {"ROOT": root}), patch.dict(os.environ, environment):
-                with patch("sys.stdout", output):
-                    result = unittest.TextTestRunner(stream=output, verbosity=2).run(real_cargo_suite())
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(temporary)
+                with patch.dict(globals(), {"ROOT": root}), patch.dict(os.environ, environment):
+                    with patch("sys.stdout", output), patch.object(sys, "executable", interpreter), patch.object(Path, "chmod", intercept):
+                        result = unittest.TextTestRunner(stream=output, verbosity=2).run(real_cargo_suite())
+            finally:
+                os.chdir(original_cwd)
             events = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
             admissions = [json.loads(line) for line in pool_ledger.read_text().splitlines()] if pool_ledger.exists() else []
             return result, output.getvalue(), events, admissions
@@ -1090,15 +1440,79 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
         self.assertEqual(len(admissions), 1, "refusal must not trigger retries or a fallback")
         self.assertFalse(events, "no compiler may run after refused admission")
 
+    def test_unsafe_interception_cannot_fall_through_to_a_direct_compiler(self):
+        for options in ({"scratch_shape": "colon"}, {"interpreter_shape": "spaces"},
+                        {"shim_state": "missing"}, {"shim_state": "unexecutable"}):
+            with self.subTest(options=options):
+                result, output, events, admissions = self.exercise_real_suite_offline(**options)
+                self.assertFalse(result.wasSuccessful(), "unsafe interception must fail closed")
+                self.assertFalse(admissions, output)
+                self.assertFalse(events, "unsafe interception reached a direct compiler without admission")
+
+    def test_interception_lost_after_setup_has_no_path_fallback(self):
+        for state in ("missing", "unexecutable"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory(prefix="nightly-lost-interceptor-") as directory:
+                outer = Path(directory).resolve()
+                fallback = outer / "fallback"
+                fallback.mkdir()
+                direct = outer / "direct-compiler"
+                executable = fallback / "cargo"
+                executable.write_text(f'#!{sys.executable}\nfrom pathlib import Path\nPath({str(direct)!r}).touch()\n')
+                executable.chmod(0o755)
+                with real_cargo_workspace(str(outer)) as owned:
+                    environment = pooled_cargo_environment(owned, outer / "unused-wrapper.py", str(fallback))
+                    shim = owned / "bin/cargo"
+                    if state == "missing":
+                        shim.unlink()
+                    else:
+                        shim.chmod(0)
+                    with self.assertRaises(OSError):
+                        run_admitted_command(["cargo", "test"], cwd=owned, env=environment)
+                    self.assertFalse(direct.exists(), "PATH lookup fell through after interceptor loss")
+
+    def test_relative_scratch_is_resolved_before_changing_the_workspace_cwd(self):
+        result, output, events, admissions = self.exercise_real_suite_offline(scratch_shape="relative")
+        self.assertTrue(result.wasSuccessful(), output)
+        self.assertEqual(len(admissions), 7)
+        self.assertEqual(sum(event["event"] == "command" for event in events), 7)
+
+    def test_relative_and_empty_original_path_entries_do_not_recurse(self):
+        for style in ("relative", "empty"):
+            with self.subTest(path_style=style):
+                result, output, events, admissions = self.exercise_real_suite_offline(path_style=style)
+                self.assertTrue(result.wasSuccessful(), output)
+                self.assertEqual(len(admissions), 7)
+                self.assertEqual(sum(event["event"] == "command" for event in events), 7)
+                self.assertTrue(all(Path(row["path"].split(os.pathsep)[0]).is_absolute() for row in admissions))
+
+    def test_a_late_refusal_fences_all_later_admission_attempts(self):
+        result, output, events, admissions = self.exercise_real_suite_offline(refuse_at=4)
+        self.assertFalse(result.wasSuccessful(), "a late refusal must not be reported green")
+        self.assertEqual(len(result.failures), 1, output)
+        self.assertEqual(len(result.errors), 0, output)
+        self.assertIn("bounded Cargo pool refused admission", output)
+        self.assertEqual(len(admissions), 4, "doctest diagnostics must not request another lease after refusal")
+        self.assertEqual(sum(event["event"] == "command" for event in events), 3)
+        self.assertFalse(any(event["event"] == "command" and "--doc" in event["args"] for event in events))
+
 
 def real_cargo_suite():
     """Explicit integration mode: every compilation uses the existing bounded pool."""
     class RealCargoExamples(unittest.TestCase):
         def test_original_default_example_selection_and_normal_build_errors(self):
             wrapper = ROOT / "scripts/cargo_cache.py"
-            with tempfile.TemporaryDirectory(prefix="nightly-real-cargo-",
-                                             dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as directory:
-                temporary = Path(directory)
+            self.assertEqual(os.name, "posix", "unsafe Cargo interception: cancellation requires POSIX process ownership")
+            interpreter = Path(sys.executable)
+            self.assertTrue(interpreter.is_absolute() and interpreter.is_file() and os.access(interpreter, os.X_OK)
+                            and not any(character.isspace() for character in str(interpreter)),
+                            "unsafe Cargo interception: unsupported interpreter path")
+            original_cwd = Path.cwd()
+            original_path = os.pathsep.join(str((original_cwd / entry).resolve())
+                                            for entry in os.environ["PATH"].split(os.pathsep))
+            scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")
+            scratch = str(Path(scratch).resolve()) if scratch else None
+            with real_cargo_workspace(scratch) as temporary:
+                self.assertNotIn(os.pathsep, str(temporary), "unsafe Cargo interception: scratch path contains a PATH separator")
                 (temporary / "Cargo.toml").write_text(
                     '[workspace]\n[package]\nname = "nightly-example-acceptance"\nversion = "0.0.0"\nedition = "2024"\n'
                     '[lib]\npath = "lib.rs"\n'
@@ -1120,29 +1534,22 @@ def real_cargo_suite():
                     '    let mut marker = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();\n'
                     '    writeln!(marker, "eligible").unwrap();\n'
                     '}\n')
-                refused = temporary / "pool-refused"
                 marker = temporary / "example-executions"
-                cargo = temporary / "bin/cargo"
-                cargo.parent.mkdir()
-                # Admission must resolve Cargo on the original PATH, not recurse into this shim.
-                cargo.write_text(
-                    f'#!{sys.executable}\nimport os, pathlib, subprocess, sys\n'
-                    'environment = os.environ.copy()\n'
-                    f'environment["PATH"] = {os.environ["PATH"]!r}\n'
-                    f'result = subprocess.run([{sys.executable!r}, {str(wrapper)!r}, "run", "--", *sys.argv[1:]], env=environment)\n'
-                    f'if result.returncode == 75: pathlib.Path({str(refused)!r}).touch()\n'
-                    'sys.exit(result.returncode)\n')
-                cargo.chmod(0o755)
-                environment = os.environ.copy()
-                environment["PATH"] = str(cargo.parent) + os.pathsep + environment["PATH"]
+                try:
+                    environment = pooled_cargo_environment(temporary, wrapper, original_path)
+                except ValueError as error:
+                    self.fail(str(error))
+                refused = Path(environment["NIGHTLY_HARNESS_CONTROL"]) / "refused"
                 environment["NIGHTLY_EXAMPLE_MARKER"] = str(marker)
                 original = ["cargo", "test", *CARGO_FLAGS, "--", "--include-ignored", "--test-threads=1"]
                 partitioned = [sys.executable, str(RUNNER), "--index", "0", "--count", "1", "--", *original]
 
                 def run(command):
                     print("real-Cargo command:", shlex.join(command), flush=True)
-                    result = subprocess.run(command, cwd=temporary, env=environment,
-                                            text=True, capture_output=True, timeout=180)
+                    try:
+                        result = run_admitted_command(command, cwd=temporary, env=environment)
+                    except subprocess.TimeoutExpired:
+                        self.fail("real-Cargo command timed out; admitted wrapper cleanup completed before fixture removal")
                     output = result.stdout + result.stderr
                     print("real-Cargo exit:", result.returncode, flush=True)
                     print(output, flush=True)
@@ -1176,6 +1583,8 @@ def real_cargo_suite():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--pooled-cargo-shim"]:
+        raise SystemExit(pooled_cargo_call(Path(sys.argv[2]), sys.argv[3:]))
     if sys.argv[1:] == ["--real-cargo"]:
         raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(real_cargo_suite()).wasSuccessful())
     unittest.main()
