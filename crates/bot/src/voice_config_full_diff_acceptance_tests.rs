@@ -1045,3 +1045,354 @@ fn input_size_cap_is_exact_at_boundary() {
         other => panic!("one byte over must refuse: {other:?}"),
     }
 }
+
+// --- myroom config-import refusal -------------------------------------------
+// Config writes `voice_command_roles`; the runtime reads
+// `voice_access_controls`. Until this import route enforces `myroom`, the
+// codec must refuse it in parse/import, preview and forged Confirm, with no
+// saved success and no writes. Established valid commands (e.g. `kick`) are
+// the controls that still preview and confirm.
+
+fn myroom_restricted_config() -> VoiceConfiguration {
+    let mut incoming = empty_config();
+    incoming.settings.command_roles = vec![config_codec::CommandRoles {
+        command: "myroom".to_owned(),
+        role_ids: vec![],
+    }];
+    incoming
+}
+
+fn kick_restricted_config() -> VoiceConfiguration {
+    let mut incoming = empty_config();
+    incoming.settings.command_roles = vec![config_codec::CommandRoles {
+        command: "kick".to_owned(),
+        role_ids: vec![GUILD.to_string()],
+    }];
+    incoming
+}
+
+#[test]
+fn myroom_command_roles_preview_and_forged_confirm_refuse_in_planning() {
+    let inventory = config_inventory();
+    let current = empty_config();
+
+    // Preview planning refuses `myroom`.
+    let myroom_bytes = serde_json::to_vec(&myroom_restricted_config()).unwrap();
+    match plan_import_preview(&current, &myroom_bytes, &inventory) {
+        ImportDecision::Refuse { message } => {
+            assert!(
+                message.contains("settings.command_roles[0].command"),
+                "myroom refusal names the field: {message:?}"
+            );
+            assert!(message.contains("Nothing was changed"), "{message:?}");
+        }
+        other => panic!("myroom preview must refuse, got {other:?}"),
+    }
+
+    // Forged Confirm planning refuses `myroom` with a dummy hash and with the
+    // recomputed content hash: validation precedes the hash check, so no
+    // forged candidate can apply. Refuse writes nothing by contract (only
+    // Preview writes pending, only Apply touches the store).
+    let candidate = myroom_restricted_config();
+    for hash in [
+        "0000000000000000".to_owned(),
+        diff_content_hash(&current, &candidate),
+    ] {
+        match plan_import_confirm(&current, &candidate, &inventory, &hash) {
+            ImportDecision::Refuse { message } => {
+                assert!(
+                    message.contains("settings.command_roles[0].command"),
+                    "forged Confirm refuses myroom for {hash}: {message:?}"
+                );
+                assert!(message.contains("Nothing was changed"), "{message:?}");
+            }
+            other => panic!("forged Confirm with myroom must refuse, got {other:?}"),
+        }
+    }
+
+    // Controls: established `kick` still previews and confirms.
+    let kick_bytes = serde_json::to_vec(&kick_restricted_config()).unwrap();
+    match plan_import_preview(&current, &kick_bytes, &inventory) {
+        ImportDecision::Preview { .. } => {}
+        other => panic!("kick preview must succeed, got {other:?}"),
+    }
+    let kick_candidate = kick_restricted_config();
+    let kick_hash = diff_content_hash(&current, &kick_candidate);
+    match plan_import_confirm(&current, &kick_candidate, &inventory, &kick_hash) {
+        ImportDecision::Apply { .. } => {}
+        other => panic!("kick Confirm must apply, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn myroom_command_roles_preview_refuses_without_write() {
+    // Control first: established `kick` previews via dispatch with buttons
+    // and attachment, but writes nothing before Confirm.
+    {
+        let trace = Trace::default();
+        let kick_bytes = serde_json::to_vec(&kick_restricted_config()).unwrap();
+        let (runtime, shared) =
+            import_harness(trace.clone(), empty_config(), vec![Ok(kick_bytes.clone())]);
+        let inventory = config_inventory();
+        let upload = import_interaction(kick_bytes.len() as u64, manager(), UPLOADER);
+        let (owned, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+        assert!(owned);
+        let preview = response.expect("kick preview");
+        let _ = preview_buttons(&preview);
+        assert!(attachments_of(&preview).is_some());
+        assert!(!runtime.pending_imports.lock().unwrap().is_empty());
+        assert_eq!(*shared.lock().unwrap(), empty_config());
+        assert!(!applied(&trace));
+    }
+
+    // `myroom` refuses via dispatch with no saved success and no writes: no
+    // buttons, no attachment, no pending state, shared config untouched.
+    let trace = Trace::default();
+    let myroom_bytes = serde_json::to_vec(&myroom_restricted_config()).unwrap();
+    let (runtime, shared) = import_harness(
+        trace.clone(),
+        empty_config(),
+        vec![Ok(myroom_bytes.clone())],
+    );
+    let inventory = config_inventory();
+    assert!(runtime.pending_imports.lock().unwrap().is_empty());
+    let upload = import_interaction(myroom_bytes.len() as u64, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("myroom refusal");
+    let text = response_text(&response);
+    assert!(
+        text.contains("settings.command_roles[0].command"),
+        "myroom refusal names the field: {text:?}"
+    );
+    assert!(text.contains("Nothing was changed"), "{text:?}");
+    assert!(!text.starts_with("Saved."), "no saved success: {text:?}");
+    assert_no_buttons(&response);
+    assert!(
+        attachments_of(&response).is_none(),
+        "refusal carries no attachment"
+    );
+    assert!(
+        runtime.pending_imports.lock().unwrap().is_empty(),
+        "pending state cleaned on refusal"
+    );
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn myroom_command_roles_forged_confirm_revalidates_before_any_write() {
+    // A pending candidate from an older image or forged cache entry must not
+    // bypass the codec refusal just because its hash and uploader are valid.
+    for role_ids in [vec![], vec![GUILD.to_string()]] {
+        let trace = Trace::default();
+        let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![]);
+        let inventory = config_inventory();
+        let mut candidate = myroom_restricted_config();
+        candidate.settings.command_roles[0].role_ids = role_ids;
+        let hash = diff_content_hash(&empty_config(), &candidate);
+        runtime.remember_pending_import(GUILD, UPLOADER, &hash, candidate);
+        let confirm_id = import_confirm_custom_id(UPLOADER, &hash);
+        let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+        let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+        assert!(owned);
+        let response = response.expect("forged Confirm refusal");
+        let text = response_text(&response);
+        assert!(text.contains("settings.command_roles[0].command"), "{text}");
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(!text.starts_with("Saved."), "{text}");
+        assert_ephemeral(&response);
+        assert_no_buttons(&response);
+        assert!(attachments_of(&response).is_none());
+        assert!(runtime.pending_imports.lock().unwrap().is_empty());
+        assert_eq!(*shared.lock().unwrap(), empty_config());
+        assert!(!applied(&trace));
+        assert!(
+            trace.lock().unwrap().is_empty(),
+            "Confirm performs no write"
+        );
+    }
+}
+
+/// Previous-reader compatibility for `/access restrict myroom`.
+///
+/// Baseline `89c4fba7e` did not list `myroom` in `VOICE_COMMANDS`, so its
+/// strict validator refused a `myroom` key as unknown. The current image
+/// persists `myroom` via `/access` into the runtime policy store
+/// (`voice_access_controls`, JSON `command_roles`), which a previous reader
+/// would reject on readback. This pins the cleanup sequence through the real
+/// `/access` dispatch and actual JSON round-trips of the runtime policy store
+/// (not config export): new saves `myroom` plus an unrelated restriction, the
+/// previous validator is incompatible before cleanup, `/access unrestrict
+/// myroom` removes only that key, and the previous validator passes after
+/// cleanup. No database or Discord.
+#[tokio::test]
+async fn myroom_access_restriction_previous_reader_compat_sequence() {
+    use std::collections::BTreeMap;
+    use two_bot_core::voice_access::{validate_access_controls, AccessControls};
+
+    // Frozen from baseline 89c4fba7e: `VOICE_COMMANDS` without `myroom`.
+    const PREVIOUS_VOICE_COMMANDS: &[&str] = &[
+        "alias",
+        "alwaysprivate",
+        "channelinfo",
+        "create",
+        "defaultlimit",
+        "export",
+        "group",
+        "import",
+        "inheritpermissions",
+        "invite",
+        "kick",
+        "limit",
+        "logging",
+        "name",
+        "nick",
+        "ping",
+        "position",
+        "private",
+        "public",
+        "reclaim",
+        "setup",
+        "template",
+        "templateassistant",
+        "textchannels",
+        "transfer",
+        "unlimit",
+    ];
+
+    fn previous_validate(controls: &AccessControls) -> Result<(), String> {
+        if controls.required_role.is_some_and(|role| role == 0) {
+            return Err("role IDs must be nonzero".to_owned());
+        }
+        for (command, roles) in &controls.command_roles {
+            if !PREVIOUS_VOICE_COMMANDS.contains(&command.as_str()) {
+                return Err(format!("unknown voice command {command}"));
+            }
+            if roles.contains(&0) {
+                return Err("role IDs must be nonzero".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    // Production `voice_access_controls` JSON shape: `command_roles` as
+    // `{command: [role_id_strings]}`. Encode and decode exactly as the store
+    // does, so the validator sees what a previous reader would read.
+    fn encode_runtime_policy(controls: &AccessControls) -> String {
+        let map: BTreeMap<&str, Vec<String>> = controls
+            .command_roles
+            .iter()
+            .map(|(command, roles)| {
+                (
+                    command.as_str(),
+                    roles.iter().map(ToString::to_string).collect(),
+                )
+            })
+            .collect();
+        serde_json::to_string(&map).unwrap()
+    }
+
+    fn decode_runtime_policy(
+        json: &str,
+        room_creation_enabled: bool,
+        required_role: Option<u64>,
+    ) -> AccessControls {
+        let stored: BTreeMap<String, Vec<String>> = serde_json::from_str(json).unwrap();
+        let command_roles = stored
+            .into_iter()
+            .map(|(command, roles)| {
+                let roles = roles
+                    .into_iter()
+                    .map(|role| role.parse::<u64>().unwrap())
+                    .collect();
+                (command, roles)
+            })
+            .collect();
+        AccessControls {
+            room_creation_enabled,
+            required_role,
+            command_roles,
+        }
+    }
+
+    // Seed with an unrelated existing restriction.
+    let shared = std::sync::Arc::new(std::sync::Mutex::new({
+        let mut controls = AccessControls::default();
+        controls.command_roles.insert("kick".to_owned(), vec![7]);
+        controls
+    }));
+    let runtime = shared_runtime(Trace::default(), shared.clone(), None);
+
+    // New saves `myroom` via the real `/access restrict` dispatch.
+    let restrict = access_interaction(
+        sub_option(
+            "restrict",
+            vec![command_option("command", "myroom"), role_option("role", 8)],
+        ),
+        true,
+    );
+    let (owned, response) = handle_capture(&runtime, &restrict).await;
+    assert!(owned, "access stays owned");
+    let text = response_text(&response.expect("restrict reply"));
+    assert!(text.starts_with("Saved."), "new saves myroom: {text:?}");
+    let saved = shared.lock().unwrap().clone();
+    assert_eq!(saved.command_roles.len(), 2, "myroom plus kick: {saved:?}");
+    assert_eq!(saved.command_roles.get("kick"), Some(&vec![7]));
+    assert_eq!(saved.command_roles.get("myroom"), Some(&vec![8]));
+
+    // Before cleanup, actual JSON readback is previous-reader-incompatible.
+    let json = encode_runtime_policy(&saved);
+    assert!(json.contains("myroom"), "JSON carries myroom: {json:?}");
+    assert!(json.contains("kick"), "JSON carries kick: {json:?}");
+    let decoded = decode_runtime_policy(&json, saved.room_creation_enabled, saved.required_role);
+    assert_eq!(decoded, saved, "JSON round-trip preserves runtime policy");
+    assert!(
+        validate_access_controls(&decoded).is_ok(),
+        "new reader accepts myroom"
+    );
+    let err = previous_validate(&decoded).unwrap_err();
+    assert!(
+        err.contains("myroom"),
+        "previous reader rejects myroom: {err:?}"
+    );
+
+    // `/access unrestrict myroom` via real dispatch removes only that key.
+    let unrestrict = access_interaction(
+        sub_option("unrestrict", vec![command_option("command", "myroom")]),
+        true,
+    );
+    let (owned, response) = handle_capture(&runtime, &unrestrict).await;
+    assert!(owned, "access stays owned");
+    let text = response_text(&response.expect("unrestrict reply"));
+    assert!(text.starts_with("Saved."), "unrestrict saves: {text:?}");
+    let cleaned = shared.lock().unwrap().clone();
+    assert_eq!(
+        cleaned.command_roles.len(),
+        1,
+        "unrestrict removes ONLY myroom: {cleaned:?}"
+    );
+    assert_eq!(cleaned.command_roles.get("kick"), Some(&vec![7]));
+    assert!(
+        !cleaned.command_roles.contains_key("myroom"),
+        "myroom gone: {cleaned:?}"
+    );
+
+    // After cleanup, actual JSON readback is previous-reader-compatible.
+    let json = encode_runtime_policy(&cleaned);
+    assert!(
+        !json.contains("myroom"),
+        "JSON no longer carries myroom: {json:?}"
+    );
+    let decoded =
+        decode_runtime_policy(&json, cleaned.room_creation_enabled, cleaned.required_role);
+    assert_eq!(decoded, cleaned, "JSON round-trip preserves cleaned policy");
+    assert!(
+        previous_validate(&decoded).is_ok(),
+        "previous reader compatible after cleanup"
+    );
+    assert!(
+        validate_access_controls(&decoded).is_ok(),
+        "new reader still accepts cleaned policy"
+    );
+}
