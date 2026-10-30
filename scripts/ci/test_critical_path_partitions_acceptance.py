@@ -40,6 +40,7 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -508,9 +509,11 @@ class TestLanePartitionAcceptance(unittest.TestCase):
 class _FakeClock:
     def __init__(self):
         self.now = 10_000.0
+        self.wall = 1_700_000_000.0
 
-    def advance(self, seconds):
+    def advance(self, seconds, wall_jump=0.0):
         self.now += seconds
+        self.wall += seconds + wall_jump
 
     def monotonic(self):
         return self.now
@@ -518,37 +521,48 @@ class _FakeClock:
     def monotonic_ns(self):
         return int(self.now * 1_000_000_000)
 
+    def time(self):
+        return self.wall
+
 
 class _SubprocessRecorder:
-    """Records Cargo subprocess calls and advances a fake clock on probes."""
+    """Consumes fake durations under the actual timeout supplied by the runner."""
 
     def __init__(self, *, inventory_advance=0.0, inventory_timeout=False,
-                 execution_timeout=False):
+                 execution_timeout=False, wall_jump=0.0, execution_advance=0.0):
         self.clock = _FakeClock()
         self.calls = []
         self._inventory_advance = inventory_advance
+        self._execution_advance = execution_advance
+        self._wall_jump = wall_jump
         self._advanced = False
         self._inventory_timeout = inventory_timeout
         self._execution_timeout = execution_timeout
 
     def run(self, argv, **kwargs):
         argv = list(argv)
+        timeout = kwargs.get("timeout")
         self.calls.append({
             "argv": argv,
-            "timeout": kwargs.get("timeout"),
+            "timeout": timeout,
             "env": kwargs.get("env") or {},
         })
+        duration = 0.0
         if "--list" in argv:
             if not self._advanced:
-                self.clock.advance(self._inventory_advance)
+                duration = self._inventory_advance
+                self.clock.advance(duration, self._wall_jump)
                 self._advanced = True
-            if self._inventory_timeout:
-                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
-            return subprocess.CompletedProcess(
-                argv, 0, stdout="alive_fixture: test\n")
-        if self._execution_timeout and "alive" in argv:
-            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
-        return subprocess.CompletedProcess(argv, 0, stdout="")
+            forced_timeout = self._inventory_timeout
+        else:
+            if "alive" in argv:
+                duration = self._execution_advance
+                self.clock.advance(duration)
+            forced_timeout = self._execution_timeout and "alive" in argv
+        if forced_timeout or (timeout is not None and duration > timeout):
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="alive_fixture: test\n" if "--list" in argv else "")
 
     def inventory_calls(self):
         return [call for call in self.calls if "--list" in call["argv"]]
@@ -577,15 +591,14 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
             patch.object(self.runner.time, "monotonic", clock.monotonic),
             patch.object(self.runner.time, "monotonic_ns", clock.monotonic_ns),
             patch.object(self.runner.time, "perf_counter", clock.monotonic),
-            patch.object(self.runner.time, "time", clock.monotonic),
+            patch.object(self.runner.time, "time", clock.time),
         )
 
     def execute_other(self, recorder):
-        patches = self.patched(recorder)
-        for patched in patches:
-            patched.start()
-            self.addCleanup(patched.stop)
-        return self.runner.execute(self.runner.runtime_commands("other"))
+        with ExitStack() as patches:
+            for patched in self.patched(recorder):
+                patches.enter_context(patched)
+            return self.runner.execute(self.runner.runtime_commands("other"))
 
     def run_main_other(self, recorder, runner_temp):
         receipt = (Path(runner_temp) / "test-partition-receipts"
@@ -599,13 +612,13 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
             patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}),
         )
         failure = None
-        for patched in patches:
-            patched.start()
-            self.addCleanup(patched.stop)
-        try:
-            self.runner.main()
-        except BaseException as exc:  # SystemExit is also a fatal outcome
-            failure = exc
+        with ExitStack() as stack:
+            for patched in patches:
+                stack.enter_context(patched)
+            try:
+                self.runner.main()
+            except BaseException as exc:  # SystemExit is also a fatal outcome
+                failure = exc
         return failure, receipt
 
     def assert_fatal(self, failure):
@@ -613,9 +626,12 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
         if isinstance(failure, SystemExit):
             self.assertNotEqual(failure.code, 0)
 
-    def test_alive_inventory_and_execution_share_one_deadline(self):
-        recorder = _SubprocessRecorder(inventory_advance=25.0)
-        seconds = self.execute_other(recorder)
+    def assert_alive_remainder(self, elapsed, wall_jump, expected):
+        recorder = _SubprocessRecorder(inventory_advance=elapsed, wall_jump=wall_jump)
+        try:
+            seconds = self.execute_other(recorder)
+        except subprocess.TimeoutExpired as exc:
+            self.fail(f"wall-clock adjustment exhausted a positive monotonic remainder: {exc}")
         self.assertEqual(seconds, 0.0)
         inventory = [call for call in recorder.inventory_calls()
                      if "alive" in call["argv"]]
@@ -629,6 +645,7 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
             probe["timeout"], "alive inventory probe ran without a timeout")
         self.assertGreater(probe["timeout"], 0)
         self.assertLessEqual(probe["timeout"], 60)
+        self.assertAlmostEqual(probe["timeout"], 60.0, delta=0.000001)
         executions = recorder.execution_calls()
         self.assertEqual(len(executions), 5)
         alive = executions[0]
@@ -638,9 +655,8 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
              "--", "--ignored", "--nocapture"])
         self.assertIsNotNone(alive["timeout"])
         self.assertAlmostEqual(
-            alive["timeout"], 35.0, delta=1.0,
-            msg="execution kept a fresh 60 seconds after a 25-second probe "
-                "instead of the remainder of one total deadline")
+            alive["timeout"], expected, delta=0.000001,
+            msg="execution did not receive the positive remainder of the one 60-second deadline")
         # Non-timeboxed commands keep their unbounded shape and routing.
         self.assertTrue(all(call["timeout"] is None
                             for call in executions[1:]))
@@ -650,17 +666,46 @@ class PartitionRunnerTimeoutTests(unittest.TestCase):
                 "/two_bot_test_ci"),
             "the restore_drill replay lost its disposable database")
 
+    def test_alive_inventory_and_execution_share_one_deadline(self):
+        # Independent wall jumps must neither enlarge nor consume elapsed-time
+        # budgets. Literal remainders catch a fixed 35-second minimum as well.
+        for elapsed, expected in ((0.0, 60.0), (25.0, 35.0),
+                                  (50.0, 10.0), (59.5, 0.5)):
+            for wall_jump in (-3600.0, 0.0, 3600.0):
+                with self.subTest(elapsed=elapsed, wall_jump=wall_jump):
+                    self.assert_alive_remainder(elapsed, wall_jump, expected)
+
     def test_exhausted_alive_deadline_prevents_execution_and_receipt(self):
-        recorder = _SubprocessRecorder(inventory_advance=61.0)
-        with tempfile.TemporaryDirectory() as runner_temp:
-            failure, receipt = self.run_main_other(recorder, runner_temp)
-            self.assertFalse(receipt.exists(),
-                             "exhausted deadline left a success receipt")
-        self.assert_fatal(failure)
-        self.assertTrue(recorder.inventory_calls())
-        self.assertEqual(
-            recorder.execution_calls(), [],
-            "execution started after the total deadline was already spent")
+        for elapsed in (60.0, 61.0):
+            for wall_jump in (-3600.0, 0.0, 3600.0):
+                with self.subTest(elapsed=elapsed, wall_jump=wall_jump):
+                    recorder = _SubprocessRecorder(
+                        inventory_advance=elapsed, wall_jump=wall_jump)
+                    with tempfile.TemporaryDirectory() as runner_temp:
+                        failure, receipt = self.run_main_other(recorder, runner_temp)
+                        self.assertFalse(receipt.exists(),
+                                         "exhausted deadline left a success receipt")
+                    self.assert_fatal(failure)
+                    self.assertTrue(recorder.inventory_calls())
+                    self.assertEqual(
+                        recorder.execution_calls(), [],
+                        "execution started after the total deadline was already spent")
+
+    def test_execution_cannot_outlive_a_small_positive_remainder(self):
+        for wall_jump in (-3600.0, 0.0, 3600.0):
+            with self.subTest(wall_jump=wall_jump):
+                recorder = _SubprocessRecorder(
+                    inventory_advance=50.0, execution_advance=11.0, wall_jump=wall_jump)
+                with tempfile.TemporaryDirectory() as runner_temp:
+                    failure, receipt = self.run_main_other(recorder, runner_temp)
+                    self.assertFalse(receipt.exists(),
+                                     "11-second execution outlived its 10-second remainder")
+                self.assert_fatal(failure)
+                self.assertIsInstance(failure, subprocess.TimeoutExpired)
+                executions = recorder.execution_calls()
+                self.assertEqual(len(executions), 1, "expired execution did not stop the lane")
+                self.assertIn("alive", executions[0]["argv"])
+                self.assertAlmostEqual(executions[0]["timeout"], 10.0, delta=0.000001)
 
     def test_inventory_timeout_is_fatal_without_execution_or_receipt(self):
         recorder = _SubprocessRecorder(inventory_timeout=True)

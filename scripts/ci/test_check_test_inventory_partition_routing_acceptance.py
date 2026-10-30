@@ -695,6 +695,26 @@ class ConditionalEarlyExitRejectedTests(unittest.TestCase):
                 self.assert_no_runner_credit(
                     self.check_rewritten_runner(broken))
 
+    def test_process_exit_calls_before_dispatch_earn_no_runner_credit(self):
+        # These are scanner inputs only: never execute the rewritten runner.
+        # A successful process exit is no more live routing than a return.
+        calls = ("sys.exit(0)", "exit(0)", "quit(0)", "os._exit(0)")
+        wrappers = {
+            "direct": "    {call}\n",
+            "if_true": "    if True:\n        {call}\n",
+            "nested_if": "    if True:\n        if True:\n            {call}\n",
+            "while_true": "    while True:\n        {call}\n",
+            "try_finally": "    try:\n        {call}\n    finally:\n        pass\n",
+        }
+        for function in ("main", "execute"):
+            for call in calls:
+                for shape, template in wrappers.items():
+                    with self.subTest(function=function, call=call, shape=shape):
+                        broken = insert_at_function_start(
+                            REAL_RUNNER_TEXT, function, template.format(call=call))
+                        self.assert_no_runner_credit(
+                            self.check_rewritten_runner(broken))
+
     def test_conditional_early_return_in_main_does_not_route(self):
         # main() legitimately returns from its --list/--verify-receipts
         # branches; an unconditional return ahead of lane dispatch is a
@@ -791,6 +811,76 @@ class CompileOnlyIgnoredTargetRejectedTests(unittest.TestCase):
                 self.assertEqual(check_fixture(
                     check_yml, NIGHTLY_YML, dict(BOT_ALIVE),
                     runner_text=None), [])
+
+    def loop_workflow(self, command):
+        self.assertIn("--test alive", command)
+        # Use the workflow's supported literal run block, not a YAML emitter's
+        # quoted multiline scalar (which is outside the scanner interface).
+        return self.direct_workflow(
+            '|\n          for target in alive; do\n            '
+            + command.replace("--test alive", '--test "$target"')
+            + '\n          done')
+
+    def test_wrapper_delimiters_do_not_turn_compilation_into_ignored_execution(self):
+        for wrapper in ("", "env ", "env -- "):
+            for shape in ("direct", "loop"):
+                command = wrapper + self.PREP
+                with self.subTest(wrapper=wrapper, shape=shape):
+                    check_yml = (self.direct_workflow(command) if shape == "direct"
+                                 else self.loop_workflow(command))
+                    errors = check_fixture(
+                        check_yml, NIGHTLY_YML, dict(BOT_ALIVE), runner_text=None)
+                    assert_orphaned(self, errors, "alive", True)
+
+    def test_wrapper_delimiters_preserve_genuine_ignored_execution(self):
+        for wrapper in ("", "env ", "env -- "):
+            for shape in ("direct", "loop"):
+                command = wrapper + self.EXECUTE
+                with self.subTest(wrapper=wrapper, shape=shape):
+                    check_yml = (self.direct_workflow(command) if shape == "direct"
+                                 else self.loop_workflow(command))
+                    self.assertEqual(check_fixture(
+                        check_yml, NIGHTLY_YML, dict(BOT_ALIVE), runner_text=None), [])
+
+    def test_valid_quoted_skip_tokens_preserve_real_ignored_execution(self):
+        for skip in ("", " --skip slow_test", ' --skip "slow_test"',
+                     " --skip 'slow_test'", ' --skip="slow_test"',
+                     " --skip='slow_test'"):
+            for shape in ("direct", "loop"):
+                command = self.EXECUTE + skip
+                with self.subTest(skip=skip, shape=shape):
+                    check_yml = (self.direct_workflow(command) if shape == "direct"
+                                 else self.loop_workflow(command))
+                    self.assertEqual(check_fixture(
+                        check_yml, NIGHTLY_YML, dict(BOT_ALIVE), runner_text=None), [])
+
+    def test_quoted_skip_tokens_cannot_rescue_compile_only_ignored_targets(self):
+        for skip in ("", " --skip slow_test", ' --skip "slow_test"',
+                     " --skip 'slow_test'", ' --skip="slow_test"',
+                     " --skip='slow_test'"):
+            for wrapper in ("", "env ", "env -- "):
+                for shape in ("direct", "loop"):
+                    # The Cargo --no-run remains before the libtest delimiter.
+                    command = wrapper + self.PREP + " -- --ignored" + skip
+                    with self.subTest(skip=skip, wrapper=wrapper, shape=shape):
+                        check_yml = (self.direct_workflow(command) if shape == "direct"
+                                     else self.loop_workflow(command))
+                        errors = check_fixture(
+                            check_yml, NIGHTLY_YML, dict(BOT_ALIVE), runner_text=None)
+                        assert_orphaned(self, errors, "alive", True)
+
+    def test_nonignored_targets_keep_compile_only_build_ownership(self):
+        # Only ignored targets require execution. The inventory contract still
+        # accepts building a named ordinary target, not just running it.
+        assert_orphaned(self, check_fixture(
+            self.direct_workflow("true"), NIGHTLY_YML,
+            dict(MYCRATE_PLAIN), runner_text=None), "plain", False)
+        for wrapper in ("", "env ", "env -- "):
+            command = wrapper + "cargo test -p my-crate --test plain --locked --no-run"
+            with self.subTest(wrapper=wrapper):
+                self.assertEqual(check_fixture(
+                    self.direct_workflow(command), NIGHTLY_YML,
+                    dict(MYCRATE_PLAIN), runner_text=None), [])
 
     def test_compile_preparation_preserves_intact_connected_runner_credit(self):
         check_yml = self.connected_workflow()
@@ -908,6 +998,9 @@ class NonfatalEntrypointRejectedTests(unittest.TestCase):
             REAL_RUNNER_TEXT, "--lane", "rust-tests", "--verify-receipts", "missing-receipts")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("partition failed:", proc.stderr)
+
+    def test_genuinely_fatal_entrypoint_keeps_full_scanner_credit(self):
+        self.assertEqual(self.check_runner(self.with_handler("sys.exit(1)")), [])
 
     def test_legitimate_list_and_validation_branches_keep_their_exit_status(self):
         expected = {

@@ -3881,55 +3881,143 @@ PARTITION_LANES = (
 )
 
 
-def rust_lane_cache_errors(jobs):
-    """Producer/consumer errors for explicit shared-key cargo caches.
+def _cache_save_mode(save_if):
+    """Restore-only, push-only, or None. `"false"` and False are restore-only."""
+    if save_if is False or save_if == "false":
+        return "restore-only"
+    if save_if == PUSH_ONLY_SAVE:
+        return "push-only"
+    return None
 
-    Every restored explicit entry needs a continuing writer: exactly one
-    job saving that entry, and only on push. A restore-only lane whose
-    former writer moved to another key silently cold-builds forever, and
-    two writers (or one matrix job whose legs share one expanded key)
-    race on save. Receipt-only final aggregates build nothing and must
-    not restore a cache at all.
+
+_PUSH_ELIGIBLE_IFS = {
+    "needs.job-inputs.outputs.rust != 'false'",
+    "${{ always() }}",
+    "always() && needs.job-inputs.outputs.rust != 'false'",
+    "${{ always() && !cancelled() && needs.job-inputs.outputs.rust != 'false'"
+    " && needs.coverage-plan.result == 'success' }}",
+}
+
+
+def _push_excluded_by_if(if_value):
+    """True unless the gate is a known push-eligible spelling (fail closed)."""
+    if if_value is None or if_value is True:
+        return False
+    if if_value is False:
+        return True
+    return str(if_value).strip() not in _PUSH_ELIGIBLE_IFS
+
+
+def _expand_cache_template(template, partitions):
+    """Concrete keys for a shared-key template (partition legs expanded)."""
+    if "${{ matrix.partition }}" in template:
+        if template.startswith("rust-tests-"):
+            lane = "rust-tests"
+        elif template.startswith("ignored-db-runtime-"):
+            lane = "ignored-db-runtime"
+        else:
+            return [template]
+        return [template.replace("${{ matrix.partition }}", part)
+                for part in partitions.get(lane, ())]
+    return [template]
+
+
+def _cache_inputs(job, step):
+    """Static inputs/env hashed by the pinned rust-cache action.
+
+    config.ts hashes nonempty CARGO/CC/CFLAGS/CXX/CMAKE/RUST-prefixed
+    environment into both primary and restore keys (enabled by default).
+    Dynamic action exports still need hosted evidence; YAML cannot prove hits.
     """
+    inputs = {key: value for key, value in (step.get("with") or {}).items()
+              if key not in ("shared-key", "save-if")}
+    env = (job.get("env") or {}) | (step.get("env") or {})
+    inputs["environment"] = {
+        key: str(value) for key, value in env.items()
+        if key.startswith(("CARGO", "CC", "CFLAGS", "CXX", "CMAKE", "RUST"))
+        and value not in (None, "")}
+    return inputs
+
+
+def _expanded_cache_errors(files, partitions):
+    """One producer/consumer oracle over concrete expanded keys."""
     errors = []
-    entries = {}
-    for job_id, job in jobs.items():
-        for step in job.get("steps") or []:
-            if "Swatinem/rust-cache@" not in str(step.get("uses", "")):
-                continue
-            shared_key = (step.get("with") or {}).get("shared-key")
-            if shared_key is None:
-                continue
-            entries.setdefault(shared_key, []).append(
-                (job_id, (step.get("with") or {}).get("save-if")))
-    for shared_key, users in sorted(entries.items()):
-        for job_id, save_if in users:
-            if save_if not in ("false", PUSH_ONLY_SAVE):
-                errors.append(
-                    f"{job_id}: cargo cache {shared_key!r} save-if "
-                    f"{save_if!r} is neither restore-only nor push-only")
-        writers = [job_id for job_id, save_if in users
-                   if save_if == PUSH_ONLY_SAVE]
+    concrete = {}
+    for file_label, jobs in files:
+        single = len(files) == 1
+        for job_id, job in jobs.items():
+            job_blocked = _push_excluded_by_if(job.get("if"))
+            is_matrix = (job.get("strategy") or {}).get("matrix") is not None
+            for step in job.get("steps") or []:
+                if "Swatinem/rust-cache@" not in str(step.get("uses", "")):
+                    continue
+                with_inputs = step.get("with") or {}
+                template = with_inputs.get("shared-key")
+                if template is None:
+                    continue
+                mode = _cache_save_mode(with_inputs.get("save-if"))
+                label = job_id if single else f"{file_label}:{job_id}"
+                if mode is None:
+                    errors.append(
+                        f"{label}: cargo cache {template!r} save-if "
+                        f"{with_inputs.get('save-if')!r} is neither "
+                        "restore-only nor push-only")
+                    continue
+                blocked = job_blocked or _push_excluded_by_if(step.get("if"))
+                if mode == "push-only" and blocked:
+                    errors.append(
+                        f"{label}: cargo cache {template!r} writer is "
+                        "disabled on push by its job/step gate")
+                eligible = mode == "push-only" and not blocked
+                if eligible and is_matrix and "${{ matrix." not in template:
+                    errors.append(
+                        f"{label}: matrix legs race on one expanded cargo "
+                        f"cache key {template!r}")
+                for key in _expand_cache_template(template, partitions):
+                    concrete.setdefault(key, []).append(
+                        (label, eligible, _cache_inputs(job, step)))
+    for key in sorted(concrete):
+        users = concrete[key]
+        writers = [label for label, eligible, _inputs in users if eligible]
         if not writers:
             errors.append(
-                f"cargo cache {shared_key!r} is restored by "
-                f"{[job_id for job_id, _ in users]} but no job saves it on push")
+                f"cargo cache {key!r} is restored by "
+                f"{[label for label, _, _ in users]} but no job saves it on push")
         elif len(writers) > 1:
             errors.append(
-                f"cargo cache {shared_key!r} has concurrent writers {writers}")
-        for job_id in writers:
-            matrix = (jobs.get(job_id, {}).get("strategy") or {}).get("matrix")
-            if matrix is not None and "${{ matrix." not in shared_key:
-                errors.append(
-                    f"{job_id}: matrix legs race on one expanded cargo "
-                    f"cache key {shared_key!r}")
+                f"cargo cache {key!r} has concurrent writers {writers}")
+        else:
+            writer_inputs = next(inputs for _, eligible, inputs in users
+                                 if eligible)
+            for label, eligible, inputs in users:
+                if not eligible and inputs != writer_inputs:
+                    errors.append(
+                        f"{label}: cargo cache {key!r} inputs {inputs!r} "
+                        f"do not match producer {writers[0]} {writer_inputs!r}")
+    check_jobs = next(jobs for label, jobs in files if label == "check.yml")
     for aggregate in ("rust-tests", "ignored-db-runtime"):
-        for step in jobs.get(aggregate, {}).get("steps") or []:
+        for step in check_jobs.get(aggregate, {}).get("steps") or []:
             if "Swatinem/rust-cache@" in str(step.get("uses", "")):
                 errors.append(
                     f"{aggregate}: receipt-only final aggregate restores "
                     "a cargo cache")
     return errors
+
+
+def rust_lane_cache_errors(jobs, partitions=None):
+    """Producer/consumer errors for explicit shared-key caches (expanded)."""
+    if partitions is None:
+        partitions = load_partition_module().PARTITIONS
+    return _expanded_cache_errors([("check.yml", jobs)], partitions)
+
+
+def rust_cache_cross_file_errors(check_jobs, reusable_jobs, partitions=None):
+    """Cross-file topology/static-input checks, not native cache-hit evidence."""
+    if partitions is None:
+        partitions = load_partition_module().PARTITIONS
+    return _expanded_cache_errors(
+        [("check.yml", check_jobs),
+         ("reusable-rust-nextest.yml", reusable_jobs)], partitions)
 
 
 def partition_receipt_upload_errors(jobs):
@@ -4305,6 +4393,223 @@ class WorkflowTests(unittest.TestCase):
                 changed = deepcopy(jobs)
                 mutate(changed)
                 self.assertTrue(rust_lane_cache_errors(changed), label)
+
+    def test_rust_lane_cache_push_eligibility_is_required(self):
+        # Push-only writers need a known push-eligible gate (fail closed).
+        # Lint keeps its Rust selector; workers keep job Rust routing with no
+        # step gate. Any other gate (contradictory, disabled, unknown) blocks.
+        jobs = self.workflows["check.yml"]["jobs"]
+        self.assertEqual(rust_lane_cache_errors(jobs), [])
+
+        def cache_step(mutated, job_id):
+            return next(
+                step for step in mutated[job_id]["steps"]
+                if step.get("name") == "Restore cargo cache")
+
+        with self.subTest(label="lint keeps conditional Rust eligibility"):
+            self.assertEqual(
+                cache_step(jobs, "check").get("if"),
+                "needs.job-inputs.outputs.rust != 'false'")
+        for job_id in ("rust-tests-partition", "coverage-shard",
+                       "ignored-db-stores", "ignored-db-runtime-partition"):
+            with self.subTest(label=f"{job_id} keeps full-push routing"):
+                self.assertIn("needs.job-inputs.outputs.rust != 'false'",
+                              jobs[job_id].get("if", ""))
+                self.assertIsNone(cache_step(jobs, job_id).get("if"))
+
+        def step_gate(mutated, job_id, gate):
+            cache_step(mutated, job_id)["if"] = gate
+
+        def job_gate(mutated, job_id, gate):
+            mutated[job_id]["if"] = gate
+
+        push_gate = "github.event_name != 'push'"
+        job_push_gate = ("needs.job-inputs.outputs.rust != 'false' "
+                         "&& github.event_name != 'push'")
+        mutations = {
+            "stores step excludes push": lambda m: step_gate(
+                m, "ignored-db-stores", push_gate),
+            "runtime step excludes push": lambda m: step_gate(
+                m, "ignored-db-runtime-partition", push_gate),
+            "stores job excludes push": lambda m: job_gate(
+                m, "ignored-db-stores", job_push_gate),
+            "runtime job excludes push": lambda m: job_gate(
+                m, "ignored-db-runtime-partition", job_push_gate),
+            "rust-tests step excludes push": lambda m: step_gate(
+                m, "rust-tests-partition", push_gate),
+            "lint step excludes push": lambda m: step_gate(m, "check", push_gate),
+            "stores step PR-only": lambda m: step_gate(
+                m, "ignored-db-stores",
+                "github.event_name == 'pull_request'"),
+            "stores step disabled string": lambda m: step_gate(
+                m, "ignored-db-stores", "false"),
+            "stores step disabled bool": lambda m: step_gate(
+                m, "ignored-db-stores", False),
+            "runtime step disabled string": lambda m: step_gate(
+                m, "ignored-db-runtime-partition", "false"),
+            "runtime step disabled bool": lambda m: step_gate(
+                m, "ignored-db-runtime-partition", False),
+            "runtime job disabled": lambda m: job_gate(
+                m, "ignored-db-runtime-partition", "false"),
+            "stores step unknown gate": lambda m: step_gate(
+                m, "ignored-db-stores", "some-new-condition"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                changed = deepcopy(jobs)
+                mutate(changed)
+                self.assertTrue(rust_lane_cache_errors(changed), label)
+
+    def test_reusable_consumer_restores_produced_unit_bin_entry(self):
+        # Reusable nextest restores the rust-tests `unit-bin` expansion (RED:
+        # consumer still names orphan `check`). YAML proves neither hit nor
+        # speed, only a produced entry with matching inputs.
+        check_jobs = self.workflows["check.yml"]["jobs"]
+        reusable_jobs = self.workflows["reusable-rust-nextest.yml"]["jobs"]
+        worker = check_jobs["rust-tests-partition"]
+        reusable = reusable_jobs["nextest"]
+        producer = next(
+            step for step in worker["steps"]
+            if step.get("name") == "Restore cargo cache")
+        self.assertEqual(producer["with"]["shared-key"],
+                         "rust-tests-${{ matrix.partition }}")
+        self.assertEqual(producer["with"]["save-if"], PUSH_ONLY_SAVE)
+        self.assertIn("unit-bin", load_partition_module().PARTITIONS["rust-tests"])
+        consumer = next(
+            step for step in reusable["steps"]
+            if "Swatinem/rust-cache@" in str(step.get("uses", "")))
+        self.assertEqual(_cache_save_mode(consumer["with"].get("save-if")),
+                         "restore-only")
+        # Compatible inputs/env, not just the key (mismatch fails here).
+        self.assertEqual(consumer["with"].get("prefix-key"),
+                         producer["with"].get("prefix-key"))
+        self.assertEqual(consumer.get("uses"), producer.get("uses"))
+        self.assertEqual(reusable.get("container"), worker.get("container"))
+        for key in ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG",
+                    "CARGO_PROFILE_DEV_INCREMENTAL",
+                    "CARGO_PROFILE_TEST_INCREMENTAL"):
+            with self.subTest(env=key):
+                self.assertEqual(reusable.get("env", {}).get(key),
+                                 worker.get("env", {}).get(key))
+        worker_toolchain = next(
+            step for step in worker["steps"]
+            if step.get("name") == "Install Rust toolchain")
+        reusable_toolchain = next(
+            step for step in reusable["steps"]
+            if step.get("name") == "Install Rust toolchain")
+        self.assertEqual(reusable_toolchain["with"]["toolchain"],
+                         worker_toolchain["with"]["toolchain"])
+        self.assertEqual(
+            rust_cache_cross_file_errors(check_jobs, reusable_jobs), [])
+        self.assertEqual(consumer["with"]["shared-key"], "rust-tests-unit-bin")
+
+    def test_reusable_consumer_has_compatible_static_cache_environment(self):
+        # The pinned action hashes RUSTC_WRAPPER into the restore prefix too.
+        # Equal shared-key/prefix inputs alone do not bridge this mismatch.
+        worker = self.workflows["check.yml"]["jobs"]["rust-tests-partition"]
+        reusable = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        producer = next(step for step in worker["steps"]
+                        if "Swatinem/rust-cache@" in str(step.get("uses", "")))
+        consumer = next(step for step in reusable["steps"]
+                        if "Swatinem/rust-cache@" in str(step.get("uses", "")))
+        self.assertEqual(_cache_inputs(reusable, consumer)["environment"],
+                         _cache_inputs(worker, producer)["environment"])
+
+    def test_reusable_consumer_projected_fix_is_compatible(self):
+        # Synthetic matched key/environment, then mutation controls. No
+        # workflow edit or native hit/speed proof; "false"/False restore-only.
+        check_jobs = self.workflows["check.yml"]["jobs"]
+        reusable_jobs = self.workflows["reusable-rust-nextest.yml"]["jobs"]
+
+        def consumer_step(mutated_reusable):
+            return next(
+                step for step in mutated_reusable["nextest"]["steps"]
+                if "Swatinem/rust-cache@" in str(step.get("uses", "")))
+
+        def check_cache_step(mutated_check, job_id):
+            return next(
+                step for step in mutated_check[job_id]["steps"]
+                if step.get("name") == "Restore cargo cache")
+
+        def projected():
+            fixed_check = deepcopy(check_jobs)
+            fixed_reusable = deepcopy(reusable_jobs)
+            consumer_step(fixed_reusable)["with"]["shared-key"] = (
+                "rust-tests-unit-bin")
+            # A matched synthetic cache environment qualifies this oracle;
+            # it is not a selected workflow fix. The real key-only retarget
+            # still differs on RUSTC_WRAPPER and is not claimed compatible.
+            consumer_step(fixed_reusable)["env"] = {"RUSTC_WRAPPER": ""}
+            return fixed_check, fixed_reusable
+
+        fixed_check, fixed_reusable = projected()
+        self.assertEqual(
+            rust_cache_cross_file_errors(fixed_check, fixed_reusable), [])
+
+        # Bool versus string restore-only pins (direct, no workflow read).
+        self.assertEqual(_cache_save_mode("false"), "restore-only")
+        self.assertEqual(_cache_save_mode(False), "restore-only")
+        self.assertIsNone(_cache_save_mode("False"))
+        self.assertIsNone(_cache_save_mode("true"))
+        self.assertEqual(_cache_save_mode(PUSH_ONLY_SAVE), "push-only")
+
+        # The raw-YAML bool spelling stays green on the projected fix.
+        bool_check, bool_reusable = projected()
+        consumer_step(bool_reusable)["with"]["save-if"] = False
+        self.assertEqual(
+            rust_cache_cross_file_errors(bool_check, bool_reusable), [])
+
+        def second_writer(m_check, m_reusable):
+            consumer_step(m_reusable)["with"]["save-if"] = PUSH_ONLY_SAVE
+
+        def prefix_mismatch(m_check, m_reusable):
+            consumer_step(m_reusable)["with"]["prefix-key"] = (
+                "${{ runner.os }}-other")
+
+        def saves_on_pull_requests(m_check, m_reusable):
+            consumer_step(m_reusable)["with"]["save-if"] = "true"
+
+        def producer_disabled(m_check, m_reusable):
+            check_cache_step(m_check, "rust-tests-partition")["if"] = (
+                "github.event_name != 'push'")
+
+        def producer_loses_matrix(m_check, m_reusable):
+            check_cache_step(m_check, "rust-tests-partition")["with"][
+                "shared-key"] = "rust-tests"
+
+        def aggregate_restores(m_check, m_reusable):
+            m_check["rust-tests"]["steps"].append(
+                deepcopy(check_cache_step(m_check, "ignored-db-stores")))
+
+        def consumer_regresses_to_orphan(m_check, m_reusable):
+            consumer_step(m_reusable)["with"]["shared-key"] = "check"
+
+        mutations = {
+            "second writer on the expanded family": second_writer,
+            "consumer prefix does not match producer": prefix_mismatch,
+            "consumer wrapper changes the restore prefix": lambda _check, reusable: (
+                consumer_step(reusable)["env"].__setitem__("RUSTC_WRAPPER", "different-wrapper")),
+            "consumer saves on pull requests": saves_on_pull_requests,
+            "producer disabled on push": producer_disabled,
+            "producer matrix legs share one key": producer_loses_matrix,
+            "cache on a receipt-only aggregate": aggregate_restores,
+            "consumer regresses to the orphaned key": (
+                consumer_regresses_to_orphan),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                m_check, m_reusable = projected()
+                mutate(m_check, m_reusable)
+                self.assertTrue(
+                    rust_cache_cross_file_errors(m_check, m_reusable), label)
+        with self.subTest(label="lint consumer needs the exact pin"):
+            m_check, m_reusable = projected()
+            consumer_step(m_reusable)["with"]["shared-key"] = "lint"
+            self.assertEqual(
+                rust_cache_cross_file_errors(m_check, m_reusable), [])
+            self.assertNotEqual(
+                consumer_step(m_reusable)["with"]["shared-key"],
+                "rust-tests-unit-bin")
 
     def test_partition_workers_and_aggregates_are_strict(self):
         # The lanes run partitioned: the planner emits per-lane matrices,

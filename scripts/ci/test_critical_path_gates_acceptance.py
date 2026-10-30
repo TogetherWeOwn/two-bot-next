@@ -340,11 +340,26 @@ class ReportGateControls(unittest.TestCase):
 
     def test_real_hard_gate_rejects_seventy_percent_and_accepts_eighty_percent(self):
         root = self.sandbox.root
+        native_git = native_git_executable()
+        self.assertIsNotNone(native_git, "native local Git is required for this fixture")
+        # Build from the sandbox allowlist, not ambient GIT_DIR/WORK_TREE,
+        # index/object routes or command-scope configuration. Only the hostile
+        # controls below explicitly supply a synthetic global configuration.
+        git_env = self.sandbox.env | {
+            "PATH": os.pathsep.join((str(Path(native_git).parent),
+                                     self.sandbox.env["PATH"], os.environ.get("PATH", ""))),
+            "GIT_CONFIG_GLOBAL": str(getattr(self, "git_config_global", os.devnull)),
+            "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "0", "LC_ALL": "C",
+            "GIT_AUTHOR_NAME": "Acceptance Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "Acceptance Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+        }
+
         def git(*args):
             return subprocess.check_output(
-                ["git", "-C", str(root), "-c", "commit.gpgsign=false",
+                [native_git, "-C", str(root), "-c", "commit.gpgsign=false",
                  "-c", "core.hooksPath=/dev/null", *args],
-                text=True, timeout=30).strip()
+                env=git_env, text=True, timeout=30).strip()
         git("init", "-q")
         git("config", "user.name", "Acceptance Fixture")
         git("config", "user.email", "fixture@example.invalid")
@@ -363,7 +378,8 @@ class ReportGateControls(unittest.TestCase):
             with self.subTest(covered=covered):
                 (root / "lcov.info").write_text("SF:src/lib.rs\n" + "".join(
                     f"DA:{i + 2},{int(i < covered)}\n" for i in range(10)) + "end_of_record\n")
-                proc = self.sandbox.run(step["run"], {"QUALITY_BASE": base, "QUALITY_HEAD": head}, cwd=root)
+                proc = self.sandbox.run(
+                    step["run"], git_env | {"QUALITY_BASE": base, "QUALITY_HEAD": head}, cwd=root)
                 self.assertEqual(proc.returncode, expected, assertions_message(proc))
 
 
@@ -444,6 +460,7 @@ class HardGateGitIsolationControls(unittest.TestCase):
             result = unittest.TestResult()
             case = ReportGateControls(
                 "test_real_hard_gate_rejects_seventy_percent_and_accepts_eighty_percent")
+            case.git_config_global = config
             with patch.dict(os.environ, env, clear=True), patch.object(Sandbox, "run", record_gate):
                 case.run(result)
             self.assertTrue(
@@ -453,6 +470,86 @@ class HardGateGitIsolationControls(unittest.TestCase):
             self.assertEqual(observed, [(7, 10, 1), (8, 10, 0), (9, 10, 0)],
                              "signing/hook isolation replaced or skipped the coverage boundary")
             self.assertFalse(marker.exists(), "ambient signer/hook executed in the synthetic repository")
+
+    def test_foreign_git_repository_routing_cannot_mutate_the_standalone_fixture(self):
+        native_git = native_git_executable()
+        self.assertIsNotNone(native_git, "native local Git is required for this fixture")
+        execution_path = os.pathsep.join(
+            (str(Path(native_git).parent), os.defpath, os.environ.get("PATH", "")))
+        with tempfile.TemporaryDirectory(prefix="foreign-git-routing-") as directory:
+            root = Path(directory)
+            foreign = root / "foreign"
+            foreign.mkdir()
+            env = {
+                "PATH": execution_path, "HOME": str(root), "LC_ALL": "C",
+                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": "0",
+                "GIT_AUTHOR_NAME": "Synthetic Other Owner",
+                "GIT_AUTHOR_EMAIL": "other@example.invalid",
+                "GIT_COMMITTER_NAME": "Synthetic Other Owner",
+                "GIT_COMMITTER_EMAIL": "other@example.invalid",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+
+            def git(*args):
+                return subprocess.check_output(
+                    [native_git, "-C", str(foreign), "-c", "commit.gpgsign=false",
+                     "-c", "core.hooksPath=/dev/null", *args],
+                    env=env, text=True, timeout=30).strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Synthetic Other Owner")
+            git("config", "user.email", "other@example.invalid")
+            (foreign / "foreign.txt").write_text("foreign worktree must remain unchanged\n")
+            git("add", "foreign.txt")
+            git("commit", "-qm", "test: synthetic foreign repository")
+
+            def snapshot():
+                # Includes local config, index, refs, logs, objects and worktree bytes.
+                return {str(p.relative_to(foreign)): p.read_bytes()
+                        for p in foreign.rglob("*") if p.is_file()}
+
+            routes = {
+                "absolute-dir-and-worktree": {
+                    "GIT_DIR": str(foreign / ".git"), "GIT_WORK_TREE": str(foreign)},
+                "all-repository-routes": {
+                    "GIT_DIR": str(foreign / ".git"), "GIT_WORK_TREE": str(foreign),
+                    "GIT_COMMON_DIR": str(foreign / ".git"),
+                    "GIT_INDEX_FILE": str(foreign / ".git/index"),
+                    "GIT_OBJECT_DIRECTORY": str(foreign / ".git/objects"),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(foreign / ".git/objects"),
+                },
+            }
+            for name, routing in routes.items():
+                with self.subTest(routing=name):
+                    git("config", "user.name", "Synthetic Other Owner")
+                    git("config", "user.email", "other@example.invalid")
+                    before = snapshot()
+                    observed = []
+                    real_run = Sandbox.run
+
+                    def record_gate(sandbox, shell, env=None, **kwargs):
+                        proc = real_run(sandbox, shell, env, **kwargs)
+                        if "check-patch-coverage.py" in shell:
+                            hits = [line for line in (sandbox.root / "lcov.info").read_text().splitlines()
+                                    if line.startswith("DA:")]
+                            observed.append((sum(int(line.rsplit(",", 1)[1]) > 0 for line in hits),
+                                             len(hits), proc.returncode))
+                        return proc
+
+                    result = unittest.TestResult()
+                    case = ReportGateControls(
+                        "test_real_hard_gate_rejects_seventy_percent_and_accepts_eighty_percent")
+                    with patch.dict(os.environ, env | routing, clear=True), patch.object(
+                            Sandbox, "run", record_gate):
+                        case.run(result)
+                    after = snapshot()
+                    changed = sorted(path for path in set(before) | set(after)
+                                     if before.get(path) != after.get(path))
+                    self.assertEqual(changed, [], "standalone fixture mutated a foreign repository")
+                    self.assertTrue(result.wasSuccessful(),
+                                    f"foreign routing corrupted the real gate: {result.errors}, {result.failures}")
+                    self.assertEqual(observed, [(7, 10, 1), (8, 10, 0), (9, 10, 0)])
 
     def test_path_only_native_git_executes_all_four_coverage_controls(self):
         native_git = native_git_executable()
