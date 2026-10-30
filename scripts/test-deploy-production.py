@@ -368,7 +368,7 @@ class StaticGuardTests(unittest.TestCase):
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak", "recheck",
-                                      "production"])
+                                      "promotion-skipped", "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -381,6 +381,11 @@ class StaticGuardTests(unittest.TestCase):
                 key: value(block)
                 for key, block in children(children(job[1:], 4)["permissions"][1:], 6).items()
             }
+            if name == "promotion-skipped":
+                # Reporting and uploading a receipt grants no repository authority.
+                self.assertEqual(value(children(job[1:], 4)["permissions"]), "{}")
+                self.assertEqual(granted, {})
+                continue
             self.assertTrue(granted, name)
             if name == "production":
                 # Checkout plus the deploy-ID lifecycle: count today's
