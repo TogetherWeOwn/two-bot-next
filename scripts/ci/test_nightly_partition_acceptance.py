@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shlex
 import shutil
 import signal
@@ -1154,7 +1155,7 @@ def run_admitted_command(command, *, cwd, env, timeout=180, cleanup_timeout=10):
                 break
             if list(control.glob("active-*")):
                 raise HarnessCleanupError("command exited before admitted descendants were reaped")
-            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         except BaseException:
             try:
                 # The runner stays alive to reap its shim, which forwards once
@@ -1192,6 +1193,10 @@ def run_admitted_command(command, *, cwd, env, timeout=180, cleanup_timeout=10):
             process.stderr.close()
         for number, handler in handlers.items():
             signal.signal(number, handler)
+    # Completion checks and handler restoration can also latch cancellation.
+    if interrupted is not None:
+        raise KeyboardInterrupt(f"harness parent received signal {interrupted}")
+    return result
 
 
 def parent_signal_supervisor(mode, evidence):
@@ -1233,16 +1238,17 @@ def parent_signal_supervisor(mode, evidence):
             time.sleep(0.01)
 
     try:
-        wait_for("parent-spawn-pending" if mode == "sigint-spawn" else "parent-communicating")
-        number = signal.SIGTERM if mode == "sigterm" else signal.SIGINT
-        os.kill(probe.pid, number)
-        sent.append({"pid": probe.pid, "signal": int(number), "afterWrapperAck": False})
-        (evidence / "spawn-release").touch()
-        wait_for("wrapper-cancelled")
-        if mode != "sigterm":
-            os.kill(probe.pid, signal.SIGINT)
-            sent.append({"pid": probe.pid, "signal": int(signal.SIGINT), "afterWrapperAck": True})
-        (evidence / "cleanup-release").touch()
+        if not mode.startswith("late-"):
+            wait_for("parent-spawn-pending" if mode == "sigint-spawn" else "parent-communicating")
+            number = signal.SIGTERM if mode == "sigterm" else signal.SIGINT
+            os.kill(probe.pid, number)
+            sent.append({"pid": probe.pid, "signal": int(number), "afterWrapperAck": False})
+            (evidence / "spawn-release").touch()
+            wait_for("wrapper-cancelled")
+            if mode != "sigterm":
+                os.kill(probe.pid, signal.SIGINT)
+                sent.append({"pid": probe.pid, "signal": int(signal.SIGINT), "afterWrapperAck": True})
+            (evidence / "cleanup-release").touch()
         stdout, stderr = probe.communicate(timeout=5)
     except BaseException as error:
         problem = repr(error)
@@ -1446,6 +1452,10 @@ class HarnessCancellationAcceptance(unittest.TestCase):
             report = json.loads((evidence / "supervisor.json").read_text())
             self.assertTrue(report["allChildrenReaped"], report)
             self.assertTrue(report["checksPassed"], json.dumps(report, indent=2))
+            if mode.startswith("late-"):
+                self.assertTrue(report["probe"]["proof"]["cancelled"])
+                self.assertTrue(report["probe"]["proof"]["allRecordedPidsReaped"])
+                return report
             expected = [int(signal.SIGTERM)] if mode == "sigterm" else [int(signal.SIGINT), int(signal.SIGINT)]
             self.assertEqual([row["signal"] for row in report["sentSignals"]], expected)
             self.assertTrue(all(row["pid"] == report["probePid"] for row in report["sentSignals"]),
@@ -1595,6 +1605,8 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
                 '                if os.environ.get("NIGHTLY_EXAMPLE_MARKER"):\n'
                 '                    with Path(os.environ["NIGHTLY_EXAMPLE_MARKER"]).open("a") as marker:\n'
                 '                        marker.write("eligible\\n")\n')
+            fake = fake.replace('record({"event": "command", "args": args})',
+                                'record({"event": "command", "args": args, "pid": os.getpid()})')
             cargo.write_text(fake)
             cargo.chmod(0o755)
             wrapper = root / "scripts/cargo_cache.py"
@@ -1602,7 +1614,7 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
                 f'#!{sys.executable}\nimport json, os, pathlib, subprocess, sys\n'
                 'ledger = pathlib.Path(os.environ["NIGHTLY_POOL_LEDGER"])\n'
                 'with ledger.open("a") as log:\n'
-                '    log.write(json.dumps({"args": sys.argv[1:], "path": os.environ["PATH"]}) + "\\n")\n'
+                '    log.write(json.dumps({"args": sys.argv[1:], "path": os.environ["PATH"], "pid": os.getpid(), "shim": os.getppid()}) + "\\n")\n'
                 'if sys.argv[1:3] != ["run", "--"]: sys.exit(97)\n'
                 'if len(ledger.read_text().splitlines()) == int(os.environ["NIGHTLY_POOL_REFUSE_AT"]):\n'
                 '    print("fixture bounded pool refused admission", file=sys.stderr)\n'
@@ -1656,6 +1668,121 @@ class RealCargoHarnessAcceptance(unittest.TestCase):
             events = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
             admissions = [json.loads(line) for line in pool_ledger.read_text().splitlines()] if pool_ledger.exists() else []
             return result, output.getvalue(), events, admissions
+
+    def exercise_late_parent_signal(self, point, number):
+        admitted, glob, install = run_admitted_command, Path.glob, signal.signal
+        handlers = {item: signal.getsignal(item) for item in (signal.SIGTERM, signal.SIGINT)}
+        sent, observations, cancelled = [], [], False
+
+        def observe(command, *, cwd, env, **options):
+            control, completed = Path(env["NIGHTLY_HARNESS_CONTROL"]), False
+
+            def deliver():
+                sent.append({"pid": os.getpid(), "signal": int(number), "point": point})
+                os.kill(os.getpid(), number)
+
+            def final_markers(path, pattern):
+                nonlocal completed
+                entries = list(glob(path, pattern))
+                if path == control and pattern == "active-*" and not entries:
+                    completed = True
+                    if point == "markers" and not sent:
+                        deliver()
+                return iter(entries)
+
+            def restore(item, handler):
+                if point == "restoration" and completed and item == number and handler == handlers[item] and not sent:
+                    deliver()
+                return install(item, handler)
+
+            try:
+                with patch.object(Path, "glob", final_markers), patch.object(signal, "signal", restore):
+                    return admitted(command, cwd=cwd, env=env, **options)
+            finally:
+                admissions = [json.loads(line) for line in Path(env["NIGHTLY_POOL_LEDGER"]).read_text().splitlines()]
+                events = [json.loads(line) for line in Path(env["NIGHTLY_LEDGER"]).read_text().splitlines()]
+                pids = {row[key] for row in admissions for key in ("pid", "shim")}
+                pids.update(row["pid"] for row in events if row["event"] == "command")
+                live = []
+                for pid in pids:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        continue
+                    live.append(pid)
+                observations.append({"command": command, "admissions": admissions, "events": events,
+                                     "recordedPids": sorted(pids), "livePids": live,
+                                     "activeMarkers": [str(path) for path in glob(control, "active-*")]})
+
+        with patch.dict(globals(), {"run_admitted_command": observe}):
+            try:
+                self.exercise_real_suite_offline()
+            except KeyboardInterrupt:
+                cancelled = True
+        proof = {"sentSignals": sent, "cancelled": cancelled, "commands": observations,
+                 "allRecordedPidsReaped": all(not row["livePids"] and not row["activeMarkers"] for row in observations)}
+        self.assertTrue(cancelled, "actual suite lost late parent cancellation: " + json.dumps(proof))
+        self.assertEqual(sent, [{"pid": os.getpid(), "signal": int(number), "point": point}])
+        self.assertEqual(len(observations), 1, "the actual caller started another command after cancellation")
+        self.assertEqual(len(observations[0]["admissions"]), 1)
+        self.assertEqual(sum(row["event"] == "command" for row in observations[0]["events"]), 1)
+        self.assertTrue(proof["allRecordedPidsReaped"], json.dumps(proof))
+        for item, handler in handlers.items():
+            self.assertEqual(signal.getsignal(item), handler, "parent handlers must be restored before propagation")
+        return proof
+
+    def test_late_parent_cancellation_at_final_markers_stops_the_actual_suite(self):
+        for number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=number):
+                HarnessCancellationAcceptance().exercise_parent_signal(f"late-markers-{int(number)}")
+
+    def test_late_parent_cancellation_during_handler_restoration_stops_the_actual_suite(self):
+        for number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=number):
+                HarnessCancellationAcceptance().exercise_parent_signal(f"late-restoration-{int(number)}")
+
+    def test_original_cwd_cannot_introduce_path_separators_before_any_launch(self):
+        resolve = runpy.run_path(str(ROOT / "scripts/cargo_cache.py"))["resolve_cargo"]
+        for entry in ("", "."):
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory(prefix="nightly-cwd-path-") as directory:
+                outer = Path(directory).resolve()
+                origin, scratch = outer / "origin:bin", outer / "scratch"
+                origin.mkdir()
+                scratch.mkdir()
+                intended = origin / "cargo"
+                intended.write_text(f"#!{sys.executable}\nraise AssertionError('inert Cargo must never execute')\n")
+                intended.chmod(0o755)
+                reached = []
+
+                def inspect_without_launch(command, *, cwd, env, **options):
+                    settings = json.loads((Path(env["NIGHTLY_HARNESS_CONTROL"]) / "shim.json").read_text())
+                    saved_cwd = Path.cwd()
+                    try:
+                        os.chdir(cwd)
+                        with patch.dict(os.environ, {"PATH": settings["path"]}):
+                            reached.append({"savedPath": settings["path"], "resolvedCargo": resolve("cargo"),
+                                            "interceptor": str(Path(cwd) / "bin/cargo")})
+                    finally:
+                        os.chdir(saved_cwd)
+                    raise AssertionError("unsafe original PATH reached command launch: " + json.dumps(reached))
+
+                previous_cwd, output = Path.cwd(), io.StringIO()
+                try:
+                    os.chdir(origin)
+                    environment = {"PATH": entry + os.pathsep + os.defpath, "PAPERCLIP_RUN_SCRATCH_DIR": str(scratch)}
+                    with patch.dict(os.environ, environment):
+                        self.assertTrue(Path(resolve("cargo")).samefile(intended), "original lookup must be valid")
+                        with patch.dict(globals(), {"run_admitted_command": inspect_without_launch}), patch("sys.stdout", output):
+                            with patch.object(subprocess, "Popen", side_effect=AssertionError("process launch prohibited")) as spawn:
+                                result = unittest.TextTestRunner(stream=output, verbosity=2).run(real_cargo_suite())
+                        spawn.assert_not_called()
+                finally:
+                    os.chdir(previous_cwd)
+                self.assertFalse(reached, "absolutized PATH reached the actual resolver: " + json.dumps(reached))
+                self.assertFalse(result.wasSuccessful(), "separator-bearing original components must fail closed")
+                self.assertEqual(len(result.failures), 1, output.getvalue())
+                self.assertEqual(len(result.errors), 0, output.getvalue())
+                self.assertIn("original PATH component contains a PATH separator", output.getvalue())
 
     def test_real_cargo_harness_uses_the_supported_interface_without_compiling(self):
         result, output, events, admissions = self.exercise_real_suite_offline()
@@ -1752,8 +1879,10 @@ def real_cargo_suite():
                             and not any(character.isspace() for character in str(interpreter)),
                             "unsafe Cargo interception: unsupported interpreter path")
             original_cwd = Path.cwd()
-            original_path = os.pathsep.join(str(original_cwd / entry)
-                                            for entry in os.environ["PATH"].split(os.pathsep))
+            original_entries = [str(original_cwd / entry) for entry in os.environ["PATH"].split(os.pathsep)]
+            for entry in original_entries:
+                self.assertNotIn(os.pathsep, entry, "unsafe Cargo interception: original PATH component contains a PATH separator")
+            original_path = os.pathsep.join(original_entries)
             scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")
             scratch = str(Path(scratch).resolve()) if scratch else None
             with real_cargo_workspace(scratch) as temporary:
@@ -1831,8 +1960,12 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--parent-signal-probe"]:
         evidence = Path(sys.argv[3])
         try:
-            proof = HarnessCancellationAcceptance().exercise_cancellation(
-                through_runner=True, parent_signal=sys.argv[2], evidence=evidence)
+            if sys.argv[2].startswith("late-"):
+                _, point, number = sys.argv[2].split("-")
+                proof = RealCargoHarnessAcceptance().exercise_late_parent_signal(point, int(number))
+            else:
+                proof = HarnessCancellationAcceptance().exercise_cancellation(
+                    through_runner=True, parent_signal=sys.argv[2], evidence=evidence)
         except BaseException as error:
             receipt = {"ok": False, "error": repr(error)}
         else:
