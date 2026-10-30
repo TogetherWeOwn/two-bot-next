@@ -367,17 +367,31 @@ class ReportGateControls(unittest.TestCase):
                 self.assertEqual(proc.returncode, expected, assertions_message(proc))
 
 
+def native_git_executable():
+    # Prefer OS bins, then contributor PATH; script shims cannot supply native proof.
+    for directory in os.defpath.split(os.pathsep) + os.get_exec_path():
+        candidate = shutil.which("git", path=directory)
+        if candidate:
+            resolved = Path(candidate).resolve()
+            with resolved.open("rb") as executable:
+                if executable.read(2) != b"#!":
+                    return str(resolved)
+    return None
+
+
 class HardGateGitIsolationControls(unittest.TestCase):
     """Contributor signing/hooks must not replace the real coverage oracle.
 
-    These controls use native Git from the OS path, not a provider wrapper.
+    These controls prefer OS Git, then native contributor-PATH Git, never script shims.
     Every Git repository, identity, configuration and executable is synthetic;
     no real worktree/global Git configuration or credential is read or edited.
     """
 
     def check_native_fixture(self, hostile):
-        native_git = shutil.which("git", path=os.defpath)
+        native_git = native_git_executable()
         self.assertIsNotNone(native_git, "native local Git is required for this fixture")
+        execution_path = os.pathsep.join(
+            (str(Path(native_git).parent), os.defpath, os.environ.get("PATH", "")))
         with tempfile.TemporaryDirectory(prefix="coverage-git-isolation-") as directory:
             root = Path(directory)
             marker = root / "ambient-config-executed"
@@ -406,7 +420,7 @@ class HardGateGitIsolationControls(unittest.TestCase):
                 self.assertEqual(hostile, "clean")
             config.write_text(settings)
             env = {
-                "PATH": os.defpath, "HOME": str(root), "LC_ALL": "C",
+                "PATH": execution_path, "HOME": str(root), "LC_ALL": "C",
                 "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_AUTHOR_NAME": "Acceptance Fixture",
                 "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
@@ -417,8 +431,8 @@ class HardGateGitIsolationControls(unittest.TestCase):
             observed = []
             real_run = Sandbox.run
 
-            def record_gate(sandbox, shell, *args, **kwargs):
-                proc = real_run(sandbox, shell, *args, **kwargs)
+            def record_gate(sandbox, shell, env=None, **kwargs):
+                proc = real_run(sandbox, shell, (env or {}) | {"PATH": execution_path}, **kwargs)
                 if "check-patch-coverage.py" in shell:
                     lines = (sandbox.root / "lcov.info").read_text().splitlines()
                     hits = [line for line in lines if line.startswith("DA:")]
@@ -438,6 +452,36 @@ class HardGateGitIsolationControls(unittest.TestCase):
             self.assertEqual(observed, [(7, 10, 1), (8, 10, 0), (9, 10, 0)],
                              "signing/hook isolation replaced or skipped the coverage boundary")
             self.assertFalse(marker.exists(), "ambient signer/hook executed in the synthetic repository")
+
+    def test_path_only_native_git_executes_all_four_coverage_controls(self):
+        native_git = native_git_executable()
+        self.assertIsNotNone(native_git, "native local Git is required for this fixture")
+        with tempfile.TemporaryDirectory(prefix="path-only-native-git-") as directory:
+            root = Path(directory)
+            system = root / "system-bin"
+            profile = root / "profile-bin"
+            shim = root / "provider-bin"
+            for binary_directory in (system, profile, shim):
+                binary_directory.mkdir()
+            (profile / "git").symlink_to(native_git)
+            marker = root / "provider-wrapper-executed"
+            wrapper = shim / "git"
+            wrapper.write_text("#!/bin/sh\nprintf invoked >> " + shlex.quote(str(marker)) + "\nexit 0\n")
+            wrapper.chmod(0o755)
+            ordinary = os.environ.get("PATH", "")
+            for prefix in (str(profile), str(shim) + os.pathsep + str(profile)):
+                with patch.object(os, "defpath", str(system)), patch.dict(
+                        os.environ, {"PATH": prefix + os.pathsep + ordinary}):
+                    self.assertIsNone(shutil.which("git", path=os.defpath))
+                    for hostile in ("clean", "signing", "hook-abort", "hook-rewrite"):
+                        with self.subTest(path=prefix, hostile=hostile):
+                            self.check_native_fixture(hostile)
+                self.assertFalse(marker.exists(), "provider wrapper was accepted as native Git")
+            with patch.object(os, "defpath", str(system)), patch.dict(
+                    os.environ, {"PATH": str(shim)}):
+                with self.assertRaisesRegex(AssertionError, "native local Git is required"):
+                    self.check_native_fixture("clean")
+            self.assertFalse(marker.exists(), "script-only PATH executed a provider wrapper")
 
     def test_native_git_clean_control_executes_the_real_coverage_boundary(self):
         self.check_native_fixture("clean")
