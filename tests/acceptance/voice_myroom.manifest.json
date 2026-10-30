@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "purpose": "Protected test-only review correction for owned-room discovery: observed ACL privacy, context-free refusal diagnostics, fail-closed imports, rollback cleanup and existing custom-command compatibility",
-  "baseCommit": "8a467ef5ad72fac87561dc74f1818f3b9c3037bc",
+  "baseCommit": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
   "originalFeatureBase": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
   "branch": "feat/myroom-owned-rooms",
   "protectedFiles": [
@@ -67,7 +67,7 @@
       "endLine": 706,
       "sha256": "735a8954abcdec0a1274c7c0f0b78d57bd124b3d4b22a0014542e2c272d54a60",
       "baselineStartLine": 641,
-      "baselineEndLine": 663,
+      "baselineEndLine": 706,
       "unchangedOutsideRegionSha256": "4f9b8e1c6cb1b3ba95c33ce38d4b74418dea1f1401c7fcc714e2294170bb8c07",
       "change": "Pins legal 33-row creation, same-content convergence and no-growth updates, then whole-diff refusal of a genuine 34-row catalog and a union of 33 updates plus one new row."
     },
@@ -76,10 +76,10 @@
       "function": "write_reservations_cover_the_maximal_publish_set_and_capacity",
       "cfgTestModuleLine": 1135,
       "startLine": 1419,
-      "endLine": 1480,
-      "sha256": "19bd0c344d3dfad0b0bafdde47ca5af738a7762b0fcaeb58f719a79d3e4be62c",
+      "endLine": 1486,
+      "sha256": "ffa41f857045e0a66026191afdadbbb10b93bd34bec1797ffe3f43a9719d30dd",
       "baselineStartLine": 1419,
-      "baselineEndLine": 1468,
+      "baselineEndLine": 1480,
       "unchangedOutsideRegionSha256": "5a26505e6fefa7b7c72ba26aaf08ca4578b9d5250c800587e9f61a8a735b02e9",
       "change": "Preserves fresh assistant-name refusal and reservation coverage; independently proves 67+33=100, admission of the 33rd row and same-name maintenance, and true 34-row admission/publication overflow."
     }
@@ -97,7 +97,8 @@
     "capacityHostile": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test automation_transfer_hostile -- --nocapture",
     "capacityCoreSweep": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib --test automation_transfer_hostile -- --nocapture",
     "referencePrerequisite": "python3 scripts/generate_command_reference.py --controller",
-    "format": "cargo fmt --all -- --check"
+    "format": "cargo fmt --all -- --check",
+    "unwrapGate": "python3 scripts/ci/check-unwrap-request-paths.py --base-ref origin/main --head-ref HEAD"
   },
   "expectedBaseline": {
     "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
@@ -157,7 +158,7 @@
     "note": "The expected lists are historical predictions, not extra observed failures. Observed predecessor baseline summaries are recorded separately above: six Rust-job and seven nextest assertion failures. No source-fix-head or corrected-test-head GREEN is established by that evidence."
   },
   "boundaries": {
-    "source": "Relative to exact source-fix head 8a467ef5ad72fac87561dc74f1818f3b9c3037bc, changes are confined to the two named cfg(test) functions, one hostile-parser test function and this manifest. All bytes outside those function regions, including production implementation and unrelated tests, are byte-identical. The original eight protected files remain byte-identical. No main sync, new hook, workflow, dependency, budget, generated pin, configuration or documentation change.",
+    "source": "Relative to exact delivered head 4e6f84f8515ba2fce5fae9a327b72f3cb83bddad, the only Rust change is unwrap() to expect(\"33 legal rows publish\") inside the protected cfg(test) publication-capacity assertion. Its value remains 100 and every other assertion/control is unchanged. All nine protected files, the other inline region, and every byte outside the changed function are byte-identical. Only that test function and this manifest change; no production, main sync, gate/rule, hook, workflow, dependency, budget, generated pin, configuration or documentation change.",
     "externalServices": "No database, live Discord, staging or production mutation during authoring. Database-backed cases require the repository-guarded disposable TestDatabase service; HTTP effects use existing local doubles.",
     "runtime": "Real parsing, role/access gates, actor command dispatch, service/transaction/import/replay paths and response rendering; command-only actors exclude unrelated timer maintenance.",
     "readOnly": "Current owner versus original creator, one ephemeral reply, poisoned room-store reads, durable and runtime room/privacy snapshots, queue, create claims, overwrite writes and effect traces remain pinned."
@@ -205,12 +206,38 @@
       ],
       "limit": "The provider CLI refused logs while the run was in progress. Failed test names, counts, additional compiler/oracle issues and the final conclusion were not observed; no wait, rerun or polling was performed."
     },
+    "functionalGreenPredecessor": {
+      "head": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
+      "runUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41073032768",
+      "nextestJobUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41073032768/job/124122221543",
+      "nextestProviderConclusion": "success",
+      "reportedMetrics": {
+        "testsRun": 5641,
+        "passed": 5641,
+        "failed": 0,
+        "skipped": 496,
+        "myroomCasesPassed": 31,
+        "failBracketLines": 0
+      },
+      "metricsLimit": "The successful job state and exact head were independently verified. Counts and myroom metrics come from the handoff report: raw CLI logs could not be fetched while the overall run was in progress. This is predecessor functional GREEN, not all-required-checks GREEN or verification of the new correction."
+    },
+    "hardGateBefore": {
+      "head": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
+      "command": "python3 scripts/ci/check-unwrap-request-paths.py --base-ref origin/main --head-ref HEAD",
+      "exit": 1,
+      "addedFindings": 1,
+      "location": "crates/core/src/custom_commands.rs:1462",
+      "reason": "The pre-existing unwrap was reflowed onto an added diff line inside the inline test module. The HARD gate includes inline tests.",
+      "nativeCheckJobUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41073032768/job/124122221254",
+      "nativeCheckProviderConclusion": "failure"
+    },
+    "gateCorrection": "Replace only the protected publication assertion's unwrap with a contextual expect, preserving its expected 100 and every other control. The checker, rules and exclusions are unchanged; post-commit gate evidence is recorded on the task.",
     "correctedHeadRustCompiled": false,
     "baselineAssertionRedObserved": true,
     "correctedHeadGreenObserved": false
   },
   "limitations": [
-    "The earlier be41a183b baseline is now observed to compile and record assertion RED plus passing controls, as detailed above. No post-oracle-correction compile or GREEN is observed: local reference generation refused admission with exit 75 and the core targets were not started. Source-fix head 8a467ef5a had two failed Rust jobs at its bounded CI snapshot, but logs and their failure causes were unavailable while that run remained in progress.",
+    "Predecessor 4e6f84f85 has a provider-verified successful nextest job, with 5641 passing tests and 31 myroom passes reported in the handoff. Its remaining unwrap HARD-gate failure was reproduced locally. The expect-only correction's Rust compile and full required-checks GREEN are not observed: local reference generation again refused admission with exit 75, so focused Rust tests were not started. Raw predecessor native logs were unavailable through the CLI while the overall run remained in progress.",
     "The deterministic lifecycle case proves the actor-dispatch ordering boundary, not single-read-guard atomicity inside the synchronous lookup. The one-guard requirement remains in force for Builder implementation and independent review.",
     "The real VoiceResponder is exercised, but the RoomHttp completion clamp/wire adapter is not. Its loopback constructor is private to the Discord crate and no existing downstream seam is exported. No production hook was added; a bounded responder input makes the existing clamp an identity, but that is reasoning, not an observed transport traversal.",
     "Previous-image compatibility uses a frozen strict command validator and the runtime policy JSON shape, not a compiled previous image or production database."
@@ -222,9 +249,9 @@
     "Native pre-implementation assertion RED and passing controls are recorded; local cache refusal is not additional RED proof. Verify corrected-head GREEN when compilation is admitted. This handoff does not waive any test, CI, review or shipping requirement."
   ],
   "revision": {
-    "version": 5,
-    "supersedes": "be41a183baf7104579b785987413d79bababa632",
-    "baseCommit": "8a467ef5ad72fac87561dc74f1818f3b9c3037bc",
-    "reason": "Author-owned correction of three stale 32-row capacity assumptions: only 67 definitions publish while the assistant name remains reserved. Pins 33 legal rows and genuine 34-row whole-diff/admission/publication overflow, retaining no-growth, hostile-input, fresh-name and all prior safety controls. Two source files change solely inside the exact cfg(test) regions recorded above; every production byte and the original eight protected files remain byte-identical to the source-fix base."
+    "version": 6,
+    "supersedes": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
+    "baseCommit": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
+    "reason": "HARD-gate correction only: replace the reflowed pre-existing unwrap with expect(\"33 legal rows publish\") in the protected publication-capacity assertion. Its expected 100, 33rd-row admission, same-name maintenance, genuine 34-row refusal and every other assertion stay unchanged. The nine protected files and the other inline region remain byte-identical; no production or gate/rule change."
   }
 }

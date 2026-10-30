@@ -1459,7 +1459,13 @@ mod tests {
                 enabled: true,
             })
             .collect();
-        assert_eq!(router.publish_set(&custom).unwrap().len(), 100);
+        assert_eq!(
+            router
+                .publish_set(&custom)
+                .expect("33 legal rows publish")
+                .len(),
+            100
+        );
         assert_eq!(check_capacity(32, true, published.len()), Ok(()));
         assert_eq!(check_capacity(33, false, published.len()), Ok(()));
         assert_eq!(
