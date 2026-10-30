@@ -293,6 +293,7 @@ test("a non-finite or far-future guard timestamp restarts the guard", () => {
     lastRecommendedAtSeconds,
     scopes: {
       "voice-stall": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   });
@@ -356,4 +357,72 @@ test("a fractional production clock survives the storage round-trip and still re
   assert.equal(refire.messages.length, 1);
   assert.equal(refire.messages[0]!.kind, "ceo-page");
   assert.equal(refire.state.scopes["voice-stall"].suppressed, true);
+});
+
+// TOG-45425: the deaf voice actor (`two_bot_voice_live_not_ready_seconds`
+// past its bound) pages but no remediation existed for it, so the signal the
+// host voice-stall-watch timer used to act on had no in-contract recovery.
+// It gets its own scope: `voice_live_not_ready` and `voice_creator_map_stale`
+// are different faults, and sharing one guard would let either burn the
+// other's cooldown window and failure count.
+const DEAF = ["voice_live_not_ready"];
+
+test("a deaf voice actor owns its own scope, so the creator-map trigger cannot consume its window", () => {
+  const { messages, state } = evaluateRemediation(DEAF, EMPTY_REMEDIATION_STATE, NOW);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]!.kind, "recommend");
+  assert.equal(messages[0]!.scope, "voice-live");
+  assert.equal(messages[0]!.action, "dispatch-retry");
+  assert.match(messages[0]!.text, /REMEDIATION voice-live: dispatch-retry/);
+  assert.match(messages[0]!.text, /No host action/);
+  // The sibling scope stays untouched: a deaf actor must not spend or count
+  // against the creator-map guard, and vice versa.
+  assert.deepEqual(state.scopes["voice-stall"], EMPTY_REMEDIATION_STATE.scopes["voice-stall"]);
+  assert.equal(state.scopes["voice-live"].phase, "reload-recommended");
+  assert.equal(state.scopes["voice-live"].consecutiveFailures, 0);
+});
+
+test("the deaf scope escalates to the same one-card same-sha-takeover path as the others", () => {
+  const first = evaluateRemediation(DEAF, EMPTY_REMEDIATION_STATE, NOW);
+  const second = evaluateRemediation(DEAF, first.state, NOW + REMEDIATION_COOLDOWN_SECONDS);
+  assert.equal(second.messages.length, 1);
+  assert.equal(second.messages[0]!.action, "same-sha-takeover");
+  assert.match(second.messages[0]!.text, /Operator: file one host-action card/);
+  assert.equal(second.state.scopes["voice-live"].phase, "takeover-recommended");
+  assert.equal(second.state.scopes["voice-live"].consecutiveFailures, 1);
+});
+
+test("both voice scopes firing at once each keep their own guard and the cooldown is global", () => {
+  const first = evaluateRemediation([...STALE, ...DEAF], EMPTY_REMEDIATION_STATE, NOW);
+  // Table order decides who spends the global window; the other waits.
+  assert.equal(first.messages.length, 1);
+  assert.equal(first.messages[0]!.scope, "voice-stall");
+  assert.deepEqual(first.state.scopes["voice-live"], EMPTY_REMEDIATION_STATE.scopes["voice-live"]);
+  // Clearing the creator-map alert hands the next window to the deaf scope,
+  // which still has its own idle guard rather than the stall's spend.
+  const next = evaluateRemediation(DEAF, first.state, NOW + REMEDIATION_COOLDOWN_SECONDS);
+  assert.equal(next.messages.length, 1);
+  assert.equal(next.messages[0]!.scope, "voice-live");
+  assert.equal(next.messages[0]!.action, "dispatch-retry");
+  assert.equal(next.state.scopes["voice-stall"].consecutiveFailures, 0);
+  assert.equal(next.state.scopes["voice-live"].consecutiveFailures, 0);
+  // Every window still holds exactly one recommendation across the table.
+  const again = evaluateRemediation([...STALE, ...DEAF], next.state, NOW + 2 * REMEDIATION_COOLDOWN_SECONDS);
+  assert.equal(again.messages.length, 1);
+});
+
+test("a guard persisted before the deaf scope existed still sanitizes, and the new scope starts idle", () => {
+  // Older production DO storage carries only the two original scopes. Adding
+  // a scope must not wipe the persisted guard: the stored guard survives and
+  // only the missing one is filled with an idle default.
+  const legacy = structuredClone(EMPTY_REMEDIATION_STATE) as RemediationState & {
+    scopes: Record<string, unknown>;
+  };
+  const staleGuard = legacy.scopes["voice-stall"]!;
+  (staleGuard as { phase: string }).phase = "reload-recommended";
+  delete (legacy.scopes as Record<string, unknown>)["voice-live"];
+  const sanitized = sanitizeRemediationState(legacy, NOW);
+  assert.deepEqual(sanitized.scopes["voice-stall"], staleGuard);
+  assert.deepEqual(sanitized.scopes["voice-live"], EMPTY_REMEDIATION_STATE.scopes["voice-live"]);
+  assert.deepEqual(sanitized.scopes["crash-loop"], EMPTY_REMEDIATION_STATE.scopes["crash-loop"]);
 });

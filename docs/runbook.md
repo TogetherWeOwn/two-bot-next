@@ -917,6 +917,14 @@ Escalate when the age survives the restart, or when several guilds go
 not-ready together (gateway-side, not one guild's view) — the fix belongs
 to the on-call engineer, not another redeploy.
 
+Guarded remediation recommends alongside this alert, in its own scope so it
+cannot spend the creator-map scope's window: `dispatch-retry` first (the bot's
+own dispatch republishes a not-ready view from the gateway cache on every voice
+frame, so a self-healing view can clear with no step at all), then one
+same-SHA-takeover Operator card if the alert survives that window (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
+The restart above is that takeover card, not an ad-hoc host action.
+
 #### Alert: voice queue stall
 
 `two_bot_voice_queue_oldest_age_seconds` past 120 s: the oldest queued (not
@@ -2165,15 +2173,23 @@ Execution-path decision: the Worker cannot restart containers, so remediation
 is recommendation plus guard state, evaluated in `wrangler/src/remediation.ts`
 on every keepalive tick. Nothing there mutates the container, the ownership
 record, or any deployment. Execution stays inside the existing machine
-contract: the bot's own in-process reload (no host action), then one Operator
+contract: the bot's own in-process load — the creator-map merge, or the
+live-view republish from the gateway cache (no host action) — then one Operator
 host-action card per host step for a same-SHA deployment-takeover through the
 existing deploy workflow. No new endpoint, credential, spend, or authority.
+
+Each scope owns its phase/failure guard: `voice_creator_map_stale` (merges not
+landing) and `voice_live_not_ready` (a deaf live view on a connected gateway)
+are different faults with different first steps, so a shared guard would let
+either spend the other's cooldown window and failure count. The 30-minute
+cooldown below is global and still caps the whole table.
 
 Trigger table (a recommendation fires only while its trigger key fires):
 
 | Scope | Trigger firing key | R1 (first) | R2 (escalation) |
 |---|---|---|---|
 | `voice-stall` | `voice_creator_map_stale` | `creator-map-reload`: the bot's maintenance tick retries the merge every 5 minutes; no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
+| `voice-live` | `voice_live_not_ready` | `dispatch-retry`: the bot's own dispatch republishes a not-ready live view from the gateway cache on every voice frame (`voice_live_self_heal_total` counts the repairs); no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
 | `crash-loop` | `gateway_unpaired_disconnect` | skipped: no in-process reload can fix a gateway that never came back | `same-sha-takeover`: one Operator card, same path as above |
 
 Guard state (persisted in DO storage next to the alert state):
@@ -2204,7 +2220,8 @@ Guard state (persisted in DO storage next to the alert state):
 Operator card shape for `same-sha-takeover`: name the firing key, the build
 revision from the alert line, and the deploy workflow run to dispatch at that
 same SHA. File a host-action card only from a `same-sha-takeover` line: the
-first (`creator-map-reload`) line is never card authority. File exactly one
+first step (`creator-map-reload` or `dispatch-retry`) is never card authority.
+File exactly one
 card per host step; act only while the alert is firing. A repeated takeover
 line for the same still-firing alert is the escalation retry, not a second
 step: file it only after the first card's action completed without clearing

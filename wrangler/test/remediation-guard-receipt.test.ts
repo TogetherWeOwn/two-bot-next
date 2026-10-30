@@ -75,6 +75,7 @@ test("suppressed firing without a message is quiet, not recovery", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "takeover-recommended", consecutiveFailures: 2, suppressed: true, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -87,6 +88,7 @@ test("firing inside the global cooldown without a message is held", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "reload-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -99,6 +101,7 @@ test("quiet tick on a non-idle guard is the sustained-clear hold-down", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "takeover-recommended", consecutiveFailures: 1, suppressed: false, clearSinceSeconds: NOW + 60 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -111,6 +114,7 @@ test("success receipt reflects the persisted read-back with exact correlation", 
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "reload-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -134,6 +138,7 @@ test("mismatched read-back is a failure receipt, never a false success", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "reload-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };

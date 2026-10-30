@@ -7,19 +7,26 @@
  * tick emits one public-safe recommendation line (Worker log plus the same
  * optional webhook the alert itself uses) and records the guard state in DO
  * storage. Execution stays inside the existing machine contract: the bot's
- * own in-process creator-map reload (maintenance tick, no host action), then
- * — if the alert is still firing — one Operator host-action card for a
- * same-SHA deployment-takeover via the existing deploy workflow, never a new
- * endpoint, credential, or spend. See docs/runbook.md#auto-remediation-guarded-stall-and-crash-loop-response.
+ * own in-process load (creator-map merge, or live-view republish from the
+ * gateway cache — no host action), then — if the alert is still firing — one
+ * Operator host-action card for a same-SHA deployment-takeover via the
+ * existing deploy workflow, never a new endpoint, credential, or spend. See
+ * docs/runbook.md#auto-remediation-guarded-stall-and-crash-loop-response.
+ *
+ * One scope per distinct fault: `voice_creator_map_stale` (merges not landing)
+ * and `voice_live_not_ready` (a deaf live view on a connected gateway) are
+ * different failures with different first steps, and a shared guard would let
+ * either spend the other's cooldown window and failure count. Each scope owns
+ * its phase/failure guard, and the global cooldown still caps the whole table.
  */
 
 import { RUNBOOK_BASE_URL } from "./alert-rules.ts";
 
 /** Independent remediation domains; each owns its phase/failure guard. */
-export type RemediationScope = "voice-stall" | "crash-loop";
+export type RemediationScope = "voice-stall" | "voice-live" | "crash-loop";
 
 /** Remediation steps, weakest first. */
-export type RemediationAction = "creator-map-reload" | "same-sha-takeover";
+export type RemediationAction = "creator-map-reload" | "dispatch-retry" | "same-sha-takeover";
 
 /** At most one recommendation per this window across all scopes. */
 export const REMEDIATION_COOLDOWN_SECONDS = 1800;
@@ -59,9 +66,17 @@ export const EMPTY_REMEDIATION_STATE: RemediationState = {
   lastRecommendedAtSeconds: 0,
   scopes: {
     "voice-stall": { ...IDLE_GUARD },
+    "voice-live": { ...IDLE_GUARD },
     "crash-loop": { ...IDLE_GUARD },
   },
 };
+
+/** Scopes in persisted-guard order; a new scope must enter this list. */
+export const REMEDIATION_SCOPES: readonly RemediationScope[] = [
+  "voice-stall",
+  "voice-live",
+  "crash-loop",
+];
 
 const REMEDIATION_PHASES: readonly RemediationPhase[] = [
   "idle",
@@ -119,7 +134,19 @@ export function sanitizeRemediationState(stored: unknown, nowSeconds: number): R
   if (!isScopeGuard(guards["voice-stall"]) || !isScopeGuard(guards["crash-loop"])) {
     return EMPTY_REMEDIATION_STATE;
   }
-  return stored as RemediationState;
+  // A guard persisted before a later scope was added must not be wiped: a
+  // full reset would drop a live cooldown and a two-failure stop, so an
+  // unknown-but-valid missing scope is filled from the idle default while
+  // every stored guard survives.
+  const known: Record<string, unknown> = {};
+  for (const scope of REMEDIATION_SCOPES) {
+    const guard = guards[scope];
+    known[scope] = isScopeGuard(guard) ? guard : { ...IDLE_GUARD };
+  }
+  return {
+    lastRecommendedAtSeconds,
+    scopes: known,
+  } as RemediationState;
 }
 
 export interface TriggerDef {
@@ -142,6 +169,13 @@ export const REMEDIATION_TRIGGERS: readonly TriggerDef[] = [
     summary: "creator joins served from a stale map; the bot's maintenance tick retries the merge every 5 minutes",
   },
   {
+    scope: "voice-live",
+    firingKey: "voice_live_not_ready",
+    firstAction: "dispatch-retry",
+    runbook: "runbook.md#alert-voice-live-not-ready",
+    summary: "a guild's live view stays not ready on a connected gateway, so its creator joins drop with no accept or refusal line",
+  },
+  {
     scope: "crash-loop",
     firingKey: "gateway_unpaired_disconnect",
     firstAction: "same-sha-takeover",
@@ -157,9 +191,13 @@ export function remediationRunbookUrl(trigger: TriggerDef): string {
 
 /** Operator instruction carried by each recommendation; no host action for R1. */
 export function operatorInstruction(action: RemediationAction): string {
-  return action === "creator-map-reload"
-    ? "No host action: the bot's maintenance tick retries the creator-map merge every 5 minutes. If this alert is still firing at the next remediation window, a same-sha-takeover line follows; file a host-action card only from that line."
-    : "Operator: file one host-action card for a same-SHA deployment-takeover through the existing deploy workflow; one card per host step.";
+  if (action === "creator-map-reload") {
+    return "No host action: the bot's maintenance tick retries the creator-map merge every 5 minutes. If this alert is still firing at the next remediation window, a same-sha-takeover line follows; file a host-action card only from that line.";
+  }
+  if (action === "dispatch-retry") {
+    return "No host action: the bot's own dispatch republishes a not-ready live view from the gateway cache on every voice frame (two_bot_voice_live_self_heal_total counts the repairs), so a self-healing view can clear without any step. If this alert is still firing at the next remediation window, a same-sha-takeover line follows; file a host-action card only from that line.";
+  }
+  return "Operator: file one host-action card for a same-SHA deployment-takeover through the existing deploy workflow; one card per host step.";
 }
 
 export type RemediationMessageKind = "recommend" | "ceo-page";
@@ -221,6 +259,7 @@ export function evaluateRemediation(
   const messages: RemediationMessage[] = [];
   const scopes: Record<RemediationScope, ScopeGuard> = {
     "voice-stall": { ...prev.scopes["voice-stall"] },
+    "voice-live": { ...prev.scopes["voice-live"] },
     "crash-loop": { ...prev.scopes["crash-loop"] },
   };
   let lastRecommendedAtSeconds = prev.lastRecommendedAtSeconds;
@@ -268,7 +307,7 @@ export function evaluateRemediation(
       });
     } else {
       scopes[trigger.scope] = {
-        phase: action === "creator-map-reload" ? "reload-recommended" : "takeover-recommended",
+        phase: action === "same-sha-takeover" ? "takeover-recommended" : "reload-recommended",
         consecutiveFailures,
         suppressed: false,
         clearSinceSeconds: 0,
@@ -326,7 +365,9 @@ function isIdleGuard(guard: ScopeGuard): boolean {
 }
 
 function isIdleState(state: RemediationState): boolean {
-  return isIdleGuard(state.scopes["voice-stall"]) && isIdleGuard(state.scopes["crash-loop"]);
+  // Every scope must be idle: omitting one would report `clear-hold` on a
+  // fully reset guard whenever that scope alone held a hold-down.
+  return REMEDIATION_SCOPES.every((scope) => isIdleGuard(state.scopes[scope]));
 }
 
 /**
