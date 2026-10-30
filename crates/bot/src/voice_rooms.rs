@@ -3942,13 +3942,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// matching `kick_room_of`. A disconnected or just-loaded worker may track
     /// rooms Discord no longer has, so it must not call them live.
     pub fn live_owned_rooms(&self, member: Snowflake) -> Option<Vec<(Snowflake, bool)>> {
-        if !self.live.read_state().ready || self.halted {
+        // Read privacy before taking this guard: owned_rooms reads live
+        // overwrites, and recursively taking the snapshot lock can deadlock.
+        let mut rooms = self.owned_rooms(member);
+        let live = self.live.read_state();
+        if !live.ready || self.halted {
             return None;
         }
-        Some(self.owned_rooms(member))
+        // Gateway channel removal precedes reconciliation of tracked rows.
+        rooms.retain(|(channel, _)| live.channels.contains_key(channel));
+        Some(rooms)
     }
 
-    /// The member's currently owned live rooms as `(room channel, runtime
+    /// The member's currently owned tracked rooms as `(room channel, runtime
     /// private)` pairs in channel order. Ownership is the current
     /// `owner_id`, never the original creator. Privacy is the effective
     /// closed state: the live worker flag, or Connect denied to @everyone

@@ -1,76 +1,160 @@
 {
   "schemaVersion": 1,
-  "purpose": "Protected test-only handoff for private discovery of a member's own live voice rooms through /myroom, with the recorded per-user-cap refusal kept context-free",
-  "baseCommit": "1a87869f898cbe4e3c9171a4fcf9885119202ade",
-  "branch": "test/voice-myroom-acceptance",
+  "purpose": "Protected test-only review correction for owned-room discovery: observed ACL privacy, context-free refusal diagnostics, fail-closed imports, rollback cleanup and existing custom-command compatibility",
+  "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
+  "branch": "feat/myroom-owned-rooms",
   "protectedFiles": [
     {
       "path": "crates/bot/src/voice_myroom_acceptance_tests.rs",
-      "sha256": "55655980d0987442fee212c81f208a8b80f1e801cb7e0590f20fa8b44df8e126",
-      "tests": 9
+      "sha256": "125b6c380edf29e59d98c01537c13fea58ccac085f9f75fd6baba0b9b50baaee",
+      "tests": 16,
+      "change": "Room 501 now has an observed guild @everyone Connect deny. All original refusal, owner identity, ephemeral reply, poisoned-store and pre/post no-write assertions remain. Adds genuine partial-public failure, unknown ACL, controlled reconnect, deleted/disconnected controls and bounded long-response cases."
     },
     {
       "path": "crates/core/tests/voice_myroom_acceptance.rs",
       "sha256": "073154c4eb1897c172a63fcbdc39e8dc3285548231c72fb5b6dccaf08193031b",
-      "tests": 4
+      "tests": 4,
+      "change": "Unchanged."
     },
     {
       "path": "crates/bot/src/voice_rooms_tests.rs",
-      "sha256": "dbc29c618f272104b689e667341bbbbeb4c32de0d9a8d546372a8bfadb21a3b4",
-      "change": "Only the myroom_acceptance child-module registration and \"myroom\" in the voice_command_set_is_gated_on_two_voice expected command list were added; other tests unchanged"
+      "sha256": "3904842472f8862cfb4ed26acc64029b568a1f2cfe80669cf499bb1e5f1f24f7",
+      "change": "Unchanged from the exact feature base; existing registrations, 45+22=67 publication pins and unrelated tests are preserved."
+    },
+    {
+      "path": "crates/core/tests/voice_config.rs",
+      "sha256": "899efb91fe9885f7dfd438fa1187a2e4b11da646e55bef3493a627a033920da7",
+      "tests": 25,
+      "change": "Author correction: runtime VOICE_COMMANDS still contains myroom, but the config-import supported subset excludes it. All original invalid-command controls remain; established commands still import."
+    },
+    {
+      "path": "crates/bot/src/voice_config_full_diff_acceptance_tests.rs",
+      "sha256": "751e6d733c4449bf6a1cf25967fd88098871681f87ceb07b75bbcab83b634200",
+      "tests": 31,
+      "change": "Adds codec/preview/real forged-Confirm refusal without saved success or writes, established-command controls, and real access restrict/unrestrict cleanup with a frozen previous-reader fixture. Existing full-diff oracles are unchanged."
+    },
+    {
+      "path": "crates/discord/tests/custom_command_toggle_acceptance.rs",
+      "sha256": "2612095f12cd352f2d57f50f3512ab55dba7cf3077d78d31e22737c2d4bff0ea",
+      "tests": 24,
+      "change": "Author correction: legal stored capacity is independently 33 because only 67 definitions publish; the reservation-only assistant name does not consume a publication slot. The 34th-row overflow control remains strict. Adds parser/planner/service/publication coverage and grandfathered myroom maintenance, fresh-name reservation and voice-precedence controls. Existing faq reply checks retain the same named assertions through a shared helper."
+    },
+    {
+      "path": "crates/bot/src/custom_command_toggle_acceptance.rs",
+      "sha256": "41f3e4399c55dbb477ea4bc303297bde66ac6a2e9344c821cc761a8a4c30944d",
+      "tests": 2,
+      "change": "Adds production gateway dispatch coverage for saved custom myroom with voice off and voice-sink precedence with voice on; existing toggle test is unchanged."
+    },
+    {
+      "path": "crates/bot/src/internal_action_http/tests/automations.rs",
+      "sha256": "15154d350c86314e46d9cd9529cadfc1e24109f1354d0b688e86df44b766b082",
+      "tests": 11,
+      "change": "Adds real signed receiver import, no-growth update, idempotent replay and 34-row refusal using only a guarded disposable database fixture."
     }
   ],
   "commands": {
-    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib --locked voice_rooms::tests::myroom_acceptance:: -- --nocapture --test-threads=1",
-    "discovery": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_myroom_acceptance --locked -- --nocapture",
-    "compatibility": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest --test smoke_surface_inventory --test registry_golden --test reference_docs --locked",
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::myroom_acceptance:: -- --nocapture --test-threads=1",
+    "configCodec": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_config command_roles_accept_only_restrictable_voice_commands -- --nocapture",
+    "configRuntime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::full_diff_acceptance::myroom_ -- --nocapture --test-threads=1",
+    "discovery": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_myroom_acceptance -- --nocapture",
+    "customCatalog": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_toggle_acceptance -- --nocapture --test-threads=1",
+    "gateway": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot command_runtime_tests::custom_command_toggle_acceptance:: -- --nocapture --test-threads=1",
+    "internalImport": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot internal_action_http::tests::automations::import_33_row_backup_updates_and_replays_but_34_rows_never_write -- --nocapture --test-threads=1",
+    "referencePrerequisite": "python3 scripts/generate_command_reference.py --controller",
     "format": "cargo fmt --all -- --check"
   },
   "expectedBaseline": {
-    "runtime": {
-      "tests": 9,
-      "missingBehaviorFailures": 4,
-      "controls": 5
-    },
-    "discovery": {
-      "tests": 4,
-      "missingBehaviorFailures": 3,
-      "controls": 1
-    },
-    "note": "Expected counts are a contract, not a claim that a Rust run was observed. Consult the task handoff for actual execution evidence."
+    "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
+    "observedRustResults": null,
+    "expectedRed": [
+      "myroom_partial_public_delete_refusal_reports_observed_open_acl_without_retiring_retry",
+      "myroom_unknown_overwrites_are_unavailable_through_facade_and_handler",
+      "myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitted_accounting",
+      "command_roles_accept_only_restrictable_voice_commands",
+      "myroom_command_roles_preview_and_forged_confirm_refuse_in_planning",
+      "myroom_command_roles_preview_refuses_without_write",
+      "myroom_command_roles_forged_confirm_revalidates_before_any_write",
+      "custom_catalog_33_row_export_parses_and_diffs_without_growth",
+      "custom_catalog_service_import_33_succeeds_and_34_overflows_with_bulk_updates",
+      "toggle_at_capacity_can_resume_existing_definition_but_cannot_add_another",
+      "grandfathered_myroom_publishes_dispatches_edits_and_toggles_with_voice_off",
+      "import_33_row_backup_updates_and_replays_but_34_rows_never_write"
+    ],
+    "expectedAddedControls": [
+      "myroom_queued_read_disconnects_before_dispatch_then_reconnect_uses_new_acl",
+      "control_myroom_deleted_channel_is_omitted_without_reconciling_away_the_owned_row",
+      "control_myroom_explicit_empty_overwrites_are_known_public_evidence",
+      "control_myroom_disconnected_actor_never_claims_live_rooms",
+      "myroom_access_restriction_previous_reader_compat_sequence",
+      "all_enabled_publication_67_plus_33_equals_100_with_voice_off_and_on",
+      "myroom_router_precedence_off_runs_custom_and_on_yields_to_voice_sink",
+      "voice_on_retains_myroom_precedence_and_collision_safety",
+      "toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice_sink"
+    ],
+    "note": "These are expected assertion/control classifications, not observed compile or test results. Cargo admission refused exit 75 before compilation; neither RED nor GREEN has been observed."
   },
   "boundaries": {
-    "externalServices": "No database, Discord, staging or production access; only stateful persistence and Discord doubles",
-    "runtime": "Real parser, authority/access gates, runtime actor channel, production apply_command and response rendering; the command-only actor driver excludes unrelated timer maintenance",
-    "liveState": "The loaded worker owns two caller rooms and one other-owner room; stored room rows and privacy are deliberately changed after load, and a room-store read is scripted to fail",
-    "readOnly": "Before-read snapshots pin persisted and runtime room/privacy state, the pending mutation queue, create claims, overwrite writes and effect trace"
+    "source": "No production source, configuration, dependency, workflow, budget, generated pin or documentation changes; no main sync. All edits are test files or this test manifest on the exact feature base.",
+    "externalServices": "No database, live Discord, staging or production mutation during authoring. Database-backed cases require the repository-guarded disposable TestDatabase service; HTTP effects use existing local doubles.",
+    "runtime": "Real parsing, role/access gates, actor command dispatch, service/transaction/import/replay paths and response rendering; command-only actors exclude unrelated timer maintenance.",
+    "readOnly": "Current owner versus original creator, one ephemeral reply, poisoned room-store reads, durable and runtime room/privacy snapshots, queue, create claims, overwrite writes and effect traces remain pinned."
   },
   "contract": {
-    "cap": "The recorded UserCap refusal stays the context-free \"You already have a temporary voice channel.\" with or without known owned rooms, and all four non-cap messages remain byte-identical; the recorded failure is an operator diagnostic, so no member room id enters it",
-    "admission": "Pure reason codes/messages remain context-free; a refusal claims once, precedes every Discord write, binds/settles nothing and never retries",
-    "memberRead": "One ephemeral /myroom reply lists only authenticated current-owner live tracked rooms, including channel links and associated public/private state; being outside voice is allowed",
-    "empty": "No owned live room is stated truthfully, with joining a creator lobby as the next action",
-    "discovery": "Exactly one guild-only no-option ordinary-member command with voice on; voice sink owns dispatch before custom rows; help lists it with the member voice commands",
-    "compatibility": "Builder owns staging voice publish manifest, help/count pins and rendered docs/commands.md. Existing voice-off smoke/legacy registry fixtures must remain truthful; do not increase voice-off counts for a voice-only surface."
+    "cap": "Recorded UserCap and the four non-cap operator diagnostics remain byte-identical and context-free, with or without known owned rooms. No member-specific room IDs enter diagnostic dedup keys or notices.",
+    "privacy": "Observed known @everyone Connect ACL determines the listed state. An accepted Connect-open overwrite followed by refused Join deletion must list public while persisted private=true and retry bookkeeping remain unchanged. Unknown overwrites yield unavailable, not public; explicitly empty overwrites remain known public evidence.",
+    "singleSnapshot": "Ready, presence and ACL facts must come from one live read guard. The deterministic test covers queued-read disconnect/reconnect ordering and new-generation ACL results; it does not reproduce an intrafunction interleaving between synchronous guard acquisitions.",
+    "configImport": "Reject myroom command_roles entries in codec/import, preview and Confirm, including empty role lists, until that distinct policy store can enforce them. Runtime /access restrict and the runtime allowlist continue to support myroom.",
+    "rollback": "Before reverting to the prior strict reader, use /access show and /access unrestrict command:myroom in every affected guild and read back the runtime store. Cleanup removes only myroom; unrelated established restrictions remain old-reader compatible. Config export/import is not runtime-store clearance evidence.",
+    "capacity": "33 noncolliding custom rows remain exportable/importable and manageable without growth. Voice off/on publication remains 45+33=78 and 67+33=100. Held assistant metadata reserves its name, not another publication slot. 34-row genuine overflow is refused with no partial transaction writes; internal import and replay use the same bound.",
+    "legacyCustom": "With automations on and voice off, saved pre-upgrade custom myroom continues to publish, dispatch, edit and pause/resume. With voice on, the voice slash handler wins. Fresh names remain safe and other saved customs remain usable.",
+    "responseBound": "61 private rooms with 19-digit IDs produce a completion input of at most 2000 scalars with complete rows and explicit omitted-room accounting, or an inspectable bounded complete UTF-8 room-list attachment. Exactly one private response and no room mutations remain required."
   },
+  "authorVerification": {
+    "passed": [
+      "cargo fmt --all -- --check",
+      "git diff --check",
+      "python3 scripts/check-secret-debug.py --test",
+      "python3 scripts/check-secret-debug.py",
+      "python3 scripts/test-docker-deps.py",
+      "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_cargo_cache.py -v",
+      "python3 scripts/check_soak_checklist.py",
+      "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_soak_checklist.py -v",
+      "python3 tests/voice_templates/validate.py",
+      "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/voice_templates -p test_*.py -v",
+      "python3 scripts/ci/check-test-inventory.py"
+    ],
+    "refused": [
+      {
+        "command": "python3 scripts/generate_command_reference.py --controller",
+        "exit": 75,
+        "reason": "no idle, below-budget slot; no per-worktree fallback"
+      },
+      {
+        "command": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_config command_roles_accept_only_restrictable_voice_commands -- --nocapture",
+        "exit": 75,
+        "reason": "no idle, below-budget slot; no per-worktree fallback"
+      }
+    ],
+    "rustCompiled": false,
+    "observedRed": false,
+    "observedGreen": false
+  },
+  "limitations": [
+    "No Rust target compiled or executed: command-reference generation and the focused codec test both refused Cargo admission with exit 75 (no idle, below-budget slot; no per-worktree fallback). No observed failing assertions or passing controls are claimed.",
+    "The deterministic lifecycle case proves the actor-dispatch ordering boundary, not single-read-guard atomicity inside the synchronous lookup. The one-guard requirement remains in force for Builder implementation and independent review.",
+    "The real VoiceResponder is exercised, but the RoomHttp completion clamp/wire adapter is not. Its loopback constructor is private to the Discord crate and no existing downstream seam is exported. No production hook was added; a bounded responder input makes the existing clamp an identity, but that is reasoning, not an observed transport traversal.",
+    "Previous-image compatibility uses a frozen strict command validator and the runtime policy JSON shape, not a compiled previous image or production database."
+  ],
   "handoff": [
-    "Do not merge this deliberately failing test-only branch by itself.",
-    "Consume the immutable handoff SHA, preserve every protected file byte-for-byte and return test corrections to the test author.",
-    "The Builder owns the implementation and compatibility pins/docs, exact-head green required checks, independent review and squash auto-merge.",
-    "The acceptance task remains open until the intended assertion failures and passing controls have been observed; a cache admission refusal is not RED evidence."
+    "Keep the one existing feature PR; never merge this intentionally failing test-only delta by itself or open a companion test PR.",
+    "Consume the immutable handoff commit and preserve the protected paths byte-for-byte; return oracle/compile corrections to the test author.",
+    "Builder owns the source fixes, any author-coordinated older inline-test assumptions, required rollback documentation, exact-head green checks, independent review and auto-merge.",
+    "The cache refusal is not RED proof. Record actual baseline assertion/control results when compilation is admitted; this handoff does not waive any test, CI, review or shipping requirement."
   ],
   "revision": {
-    "version": 2,
-    "supersedes": "23b3a9f950720b2956a7f006fc48cbd0aacb2532",
-    "reason": "Corrects one oracle. Revision 1 pinned owned-room mentions inside the recorded UserCap refusal (LifecycleFailure::CreateRefused.message). That record is an operator diagnostic rendered only by the admin /setup failure line and logging notices; a gateway voice join has no per-member reply, so the guidance never reached the member, and member room ids would enter operator notices and split the failure dedup key. The replacement control pins the recorded UserCap message byte-identical to the context-free text even when the member owns rooms; members discover their rooms with /myroom. The voice_rooms_tests.rs pin now also covers the voice command-set expectation gaining \"myroom\", and this revision merges current main so every pin matches a main-based tree.",
-    "baseCommit": "1a87869f898cbe4e3c9171a4fcf9885119202ade",
-    "passed": [
-      "cargo fmt --all -- --check"
-    ],
-    "not_executed": [
-      "focused Rust runtime and discovery acceptance targets (cargo pool refused exit 75: pool contents do not match immutable policy; refusal is neither RED nor GREEN)",
-      "compatibility targets",
-      "workspace clippy and tests"
-    ]
+    "version": 3,
+    "supersedes": "7d0763bee7979c499cf9b46e90726f80e9d2629c",
+    "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
+    "reason": "Corrects the normal private-room fixture to carry its actual Connect deny rather than infer ACL privacy from persisted retry state. Separately corrects the config-import allowlist assumption and reservation-only capacity arithmetic, preserving runtime myroom restriction support and genuine overflow. Adds requested review regressions without weakening the original ownership, refusal or no-write assertions."
   }
 }

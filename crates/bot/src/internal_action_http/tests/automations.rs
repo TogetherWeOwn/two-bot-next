@@ -76,6 +76,122 @@ async fn audit_count(pool: &sqlx::PgPool) -> i64 {
         .unwrap()
 }
 
+fn capacity_import_payload(count: usize, overwrite: bool, updated: bool) -> String {
+    let commands: Vec<Value> = (0..count).map(|index| {
+        json!({
+            "name": format!("zzbackup{index:02}"),
+            "description": format!("Backup {index}"),
+            "template": if updated { format!("Updated {index}") } else { format!("Original {index}") },
+            "text_trigger": format!("!zzbackup{index:02}"),
+        })
+    }).collect();
+    json!({
+        "action": "automations.import", "actor_id": AUTOMATIONS_ACTOR,
+        "version": 1, "overwrite": overwrite, "commands": commands,
+    })
+    .to_string()
+}
+
+async fn capacity_command_rows(pool: &sqlx::PgPool) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT to_jsonb(c) FROM automation_commands c WHERE guild_id = $1 ORDER BY name",
+    )
+    .bind(staging_guild())
+    .fetch_all(pool)
+    .await
+    .expect("owned fixture rows")
+}
+
+#[tokio::test]
+async fn import_33_row_backup_updates_and_replays_but_34_rows_never_write() {
+    // Break caught: internal-action/replay callers retain a 32-entry budget
+    // after real publication still fits 67 builtins +33 noncolliding rows.
+    let db = database()
+        .await
+        .expect("explicit disposable test bootstrap required");
+    let _flag = AUTOMATIONS_FLAG_LOCK.lock().await;
+    set_automations_flags(true, true);
+    let app = automations_app(db.pool().clone());
+    let raw = capacity_import_payload(33, false, false);
+    let (first_status, first_headers, first) =
+        answer(app.clone(), signed(&raw, "old", "backup33-initial")).await;
+    let initial_rows = capacity_command_rows(db.pool()).await;
+    let update = capacity_import_payload(33, true, true);
+    let (update_status, _, updated) =
+        answer(app.clone(), signed(&update, "old", "backup33-update")).await;
+    let updated_rows = capacity_command_rows(db.pool()).await;
+    let audit_before_replay = audit_count(db.pool()).await;
+    let (replay_status, replay_headers, replay) =
+        answer(app.clone(), signed(&raw, "new", "backup33-initial")).await;
+    let replay_rows = capacity_command_rows(db.pool()).await;
+    let audit_after_replay = audit_count(db.pool()).await;
+    let overflow = capacity_import_payload(34, true, true);
+    let (overflow_status, _, refused) =
+        answer(app, signed(&overflow, "old", "backup34-overflow")).await;
+    let after_overflow = capacity_command_rows(db.pool()).await;
+    let audit_after_overflow = audit_count(db.pool()).await;
+    set_automations_flags(false, false);
+    db.close()
+        .await
+        .expect("drop only owned disposable fixture");
+
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "33-row backup is legal: {first}"
+    );
+    assert!(!first_headers.contains_key("idempotent-replay"));
+    assert_eq!(first["result"]["imported"], 33);
+    assert_eq!(initial_rows.len(), 33);
+    assert_eq!(
+        update_status,
+        StatusCode::OK,
+        "no-growth bulk update: {updated}"
+    );
+    assert_eq!(updated["result"]["imported"], 33);
+    assert_eq!(updated_rows.len(), 33);
+    assert!(updated_rows
+        .iter()
+        .all(|row| row["template"].as_str().unwrap().starts_with("Updated ")));
+    assert_eq!(
+        replay_status,
+        StatusCode::OK,
+        "replay still parses 33: {replay}"
+    );
+    assert_eq!(
+        replay_headers
+            .get("idempotent-replay")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        replay["result"], first["result"],
+        "original receipt, not a new diff"
+    );
+    assert_eq!(
+        replay_rows, updated_rows,
+        "replay does not restore original templates"
+    );
+    assert_eq!(
+        audit_before_replay, audit_after_replay,
+        "no second replay audit/apply"
+    );
+    assert_eq!(
+        overflow_status,
+        StatusCode::BAD_REQUEST,
+        "34 rows exceed the real bound: {refused}"
+    );
+    assert_eq!(refused["error"]["code"], "malformed");
+    assert_eq!(
+        after_overflow, updated_rows,
+        "overflow writes no rows or timestamps"
+    );
+    assert_eq!(
+        audit_after_overflow, audit_after_replay,
+        "parser refusal never applies"
+    );
+}
+
 #[tokio::test]
 async fn export_returns_redacted_document_keyless() {
     let Some(db) = database().await else { return };

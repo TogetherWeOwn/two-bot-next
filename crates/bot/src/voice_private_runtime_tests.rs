@@ -1266,3 +1266,15 @@ async fn myroom_through_a_running_actor_never_lists_rooms_while_disconnected() {
     runtime.actors.lock().unwrap().clear();
     handle.abort();
 }
+
+#[tokio::test]
+async fn myroom_read_excludes_deleted_channels_before_reconciliation() {
+    let (live, store, http, _) = parts();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![(ROOM, false)]));
+    // The gateway removes channels immediately, but the worker still retains
+    // their persisted rows until reconciliation. Those rows are not live rooms.
+    worker.live.remove_channel(ROOM);
+    assert!(worker.rooms.contains_key(&ROOM));
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(Vec::new()));
+}
