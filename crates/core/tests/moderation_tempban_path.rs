@@ -6,8 +6,8 @@
 //!   to the member-moderation handler; anything without it refuses with the
 //!   actionable copy (Discord permission name, slash command, granter).
 //! - duration: `duration_seconds` accepts the inclusive edges 60 and
-//!   `MAX_TEMPBAN_SECONDS` (365 days) and refuses 59 and 365 days + 1 before
-//!   any Discord call, audit row or staged unban. The command-layer validator
+//!   `MAX_TEMPBAN_SECONDS` (365 days) and refuses 59 and 365 days + 1 with
+//!   only a denial audit row: no Discord call or staged unban. The command-layer validator
 //!   edges live in `moderation_caps.rs::tempban_caps_at_365_days`; this file
 //!   pins the executor's own copy of the same bounds and that the two agree.
 //! - policy/executor (`MemberModerationService::execute`): the permission bit,
@@ -146,10 +146,31 @@ fn assert_no_effects(discord: &MockMemberDiscord, store: &MemMemberStore, reques
     );
 }
 
-/// Malformed duration refusals remain unaudited.
-fn assert_no_side_effects(discord: &MockMemberDiscord, store: &MemMemberStore, request_id: &str) {
-    assert_no_effects(discord, store, request_id);
-    assert!(store.audits().is_empty(), "refusal wrote an audit row");
+/// A malformed-duration refusal records only its bound `denied` audit row:
+/// no Discord call, no staged unban, no prepared ban attempt.
+fn assert_validation_denial(
+    discord: &MockMemberDiscord,
+    store: &MemMemberStore,
+    exec: &MemberExecution,
+) {
+    assert_no_effects(discord, store, &exec.request_id);
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    let row = &audits[0];
+    assert_eq!(row.request_id, format!("{}:denied", exec.request_id));
+    assert_eq!(row.outcome, "denied");
+    assert_eq!(row.action, "moderation.tempban");
+    assert_eq!(row.guild_id, GUILD_ID);
+    assert_eq!(row.actor_id, ACTOR_ID);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET_ID));
+    assert_eq!(row.idempotency_key, exec.idempotency_key);
+    assert_eq!(row.reason, "Member moderation policy refused the request");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&row.metadata_json).expect("audit metadata is JSON");
+    assert_eq!(
+        metadata,
+        serde_json::json!({ "stage": "validation", "request_id": exec.request_id })
+    );
 }
 
 fn assert_policy_denial(
@@ -294,7 +315,7 @@ async fn tempban_duration_accepts_the_inclusive_edges() {
 }
 
 #[tokio::test]
-async fn tempban_duration_outside_the_bounds_refuses_before_any_side_effect() {
+async fn tempban_duration_outside_the_bounds_refuses_with_denial_only() {
     // 59 and 365 days + 1 are the adjacent refusals; zero, negative and
     // missing durations are malformed the same way.
     let outside = [
@@ -325,7 +346,7 @@ async fn tempban_duration_outside_the_bounds_refuses_before_any_side_effect() {
             "{bad:?} must refuse as malformed duration_seconds, got {err:?}"
         );
         assert_eq!(err.to_string(), DURATION_COPY, "{bad:?}");
-        assert_no_side_effects(&discord, &store, REQUEST_ID);
+        assert_validation_denial(&discord, &store, &exec);
 
         // The refusal happened before any idempotency claim, so the same key
         // succeeds once the caller presents a valid duration.
@@ -333,6 +354,15 @@ async fn tempban_duration_outside_the_bounds_refuses_before_any_side_effect() {
         let result = svc.execute(&exec).await.expect("retry after fix");
         assert_eq!(result.outcome, MemberOutcome::TemporarilyBanned, "{bad:?}");
         assert!(!result.replayed, "{bad:?}");
+        // The denial row is kept; the accepted retry adds its own plain
+        // success row instead of masking it.
+        let audits = store.audits();
+        assert_eq!(audits.len(), 2, "{bad:?}");
+        assert_eq!(audits[0].request_id, format!("{}:denied", REQUEST_ID));
+        assert_eq!(audits[0].outcome, "denied", "{bad:?}");
+        assert_eq!(audits[1].request_id, REQUEST_ID, "{bad:?}");
+        assert_eq!(audits[1].outcome, "temporarily_banned", "{bad:?}");
+        assert_eq!(audits[1].action, "moderation.tempban", "{bad:?}");
     }
 }
 

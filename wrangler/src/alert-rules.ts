@@ -31,6 +31,7 @@ export const JOB_INTERVAL_SECONDS: Record<string, number> = {
   presence_probe: 3600,
   community_scorecard: 60,
   inactivity: 3600,
+  lfg_sweep: 60,
 };
 
 export const STALE_INTERVALS = 2;
@@ -311,7 +312,7 @@ export const HANDLER_SATURATED_SHARE = 0.01;
 /** Consecutive saturated handler windows before the ticket. */
 export const HANDLER_SATURATED_SAMPLES = 3;
 /** Fixed job labels for `two_bot_job_runs_total`, pinned to Rust `JOBS`. */
-export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"];
+export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "other"];
 /** Fixed outcomes for `two_bot_job_runs_total`, pinned to Rust `JOB_OUTCOMES`. */
 export const JOB_RUNS_OUTCOMES: readonly string[] = ["success", "failure"];
 /** Failed runs must exceed this share of a judged window... */
@@ -320,6 +321,36 @@ export const JOB_FAILURE_SHARE_RATIO = 0.1;
 export const JOB_FAILURE_SHARE_MIN_RUNS = 10;
 /** ...with at least this many failures; one bad run never tickets. */
 export const JOB_FAILURE_SHARE_MIN_FAILURES = 2;
+/** Fixed error classes for `two_bot_feed_fetch_errors_total`, pinned to Rust `FEED_FETCH_ERROR_CLASSES`. */
+export const FEED_FETCH_ERROR_CLASSES: readonly string[] = ["invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other"];
+/** Fixed kinds for `two_bot_eventsub_classified_total`, pinned to Rust `EVENTSUB_DELIVERY_KINDS`. */
+export const EVENTSUB_CLASSIFIED_KINDS: readonly string[] = ["challenge", "notification", "revocation", "tampered", "ignored", "invalid_secret", "invalid_header", "body_too_large", "bad_signature", "invalid_timestamp", "stale_timestamp", "invalid_body", "duplicate_keys", "wrong_subscription", "invalid_challenge", "invalid_callback", "invalid_broadcaster_id", "too_many_broadcasters", "other"];
+/** Consecutive valid samples with received deliveries ahead of classified ones before the ticket. */
+export const EVENTSUB_RECEIVE_GAP_SAMPLES = 3;
+/** Fixed verbs for `two_bot_moderation_enforcements_total`, pinned to Rust `MODERATION_VERBS`. */
+export const MODERATION_VERBS: readonly string[] = ["ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock"];
+/**
+ * Moderation enforcement outcomes that ticket: `discord_error` (uncertain
+ * Discord failures: timeout, unreachable, rate-limited) and `storage_error`
+ * (persistence failures). `success` landed, `refused` is policy proving no
+ * mutation (admission policy working as designed, like the `refused` voice
+ * operations the `voice_failures` rule skips), and `other` is an unknown
+ * collapse that is not evidence of failure. A subset of
+ * `MODERATION_ENFORCEMENT_OUTCOMES` in `crates/core/src/metrics.rs`.
+ */
+export const MODERATION_FAILURE_OUTCOMES = ["discord_error", "storage_error"] as const;
+/**
+ * Voice REST in-flight age above this many whole seconds counts toward the
+ * ticket; a valid sample at or below it resolves. 60 s is six times the 10 s
+ * wire timeout around every voice REST send (`crates/discord/src/voice_rooms.rs`),
+ * so a healthy attempt (which always completes, times out or drops its guard
+ * inside ~10 s) never reaches it, while a wedged attempt surfaces on the
+ * next publish and persists. REST begin/drop events, actor ticks and the
+ * independent observer republish the gauge, including during a hung dispatch.
+ */
+export const VOICE_REST_STUCK_SECONDS = 60;
+/** Sustained above-threshold in-flight REST age samples before the ticket. */
+export const VOICE_REST_STUCK_SAMPLES = 3;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
@@ -368,6 +399,14 @@ export const RULES: readonly RuleDef[] = [
   { id: "rest_token_invalid", summary: `bot token latched invalid (credential death; every REST send refuses)`, runbook: "runbook.md#alert-rest-token-invalid" },
   { id: "rest_refusal_surge", summary: `guard invalid + refused requests grew ${REST_REFUSAL_SURGE_MIN}+ between samples`, runbook: "runbook.md#alert-rest-refusal-surge" },
   { id: "rest_global_responses_stuck", summary: `global-pause response bodies unresolved for ${REST_PENDING_STUCK_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-rest-global-responses-stuck" },
+  { id: "feed_fetch_failures", summary: `feed fetch errors increased between samples`, runbook: "runbook.md#alert-feed-fetch-failures", severity: "ticket" },
+  { id: "eventsub_receive_gap", summary: `EventSub received deliveries exceed classified deliveries for ${EVENTSUB_RECEIVE_GAP_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-receive-gap", severity: "ticket" },
+  { id: "eventsub_reconcile_prior_failed", summary: `EventSub reconcile prior-failed subscription findings increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-prior-failed", severity: "ticket" },
+  { id: "automod_sanction_refused", summary: `automod sanction refusals increased between samples`, runbook: "runbook.md#alert-automod-sanction-refused", severity: "ticket" },
+  { id: "moderation_enforcement_failures", summary: `moderation enforcement failures increased between samples`, runbook: "runbook.md#alert-moderation-enforcement-failures", severity: "ticket" },
+  { id: "voice_rest_stuck", summary: `voice REST attempt in flight past ${VOICE_REST_STUCK_SECONDS} s for ${VOICE_REST_STUCK_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-voice-rest-stuck", severity: "ticket" },
+  { id: "voice_global_backoff_capped", summary: `voice global-backoff caps increased between samples`, runbook: "runbook.md#alert-voice-global-backoff-capped", severity: "ticket" },
+  { id: "gateway_drain_skips", summary: `gateway auxiliary drains skipped for schema gaps increased between samples`, runbook: "runbook.md#alert-gateway-drain-skips", severity: "ticket" },
 ];
 
 /**
@@ -530,6 +569,9 @@ export interface MetricsAlertState {
   retentionReplayNeeded?: number;
   /** False until a valid sample stores the retention baseline: the first sample never fires. */
   retentionReplayNeededSeen?: boolean;
+  /** Last valid auxiliary-drain skip count; legacy storage baselines first. */
+  gatewayDrainSkips?: number;
+  gatewayDrainSkipsSeen?: boolean;
   /** `two_bot_voice_dispatch_timeouts_total` at the last valid sample; absent in legacy storage. */
   voiceDispatchTimeouts?: number;
   /** False until a valid sample stores the dispatch-timeout baseline: the first sample never fires. */
@@ -550,6 +592,36 @@ export interface MetricsAlertState {
   restGlobalPauses?: number;
   /** False until a valid sample stores the global-pause baseline: the first sample never fires. */
   restGlobalPausesSeen?: boolean;
+  /** Summed `two_bot_feed_fetch_errors_total` at the last valid sample; absent in legacy storage. */
+  feedFetchErrors?: number;
+  /** False until a valid sample stores the feed baseline: the first sample never fires. */
+  feedFetchErrorsSeen?: boolean;
+  /** Consecutive valid samples with received ahead of classified, capped at EVENTSUB_RECEIVE_GAP_SAMPLES; absent in legacy storage. */
+  eventsubReceiveGapStreak?: number;
+  /** `reconcile_prior_failed` errors at the last judged pass window; absent in legacy storage. */
+  reconcilePriorFailed?: number;
+  /** Healthy-pass baseline paired with the finding window; absent in legacy storage. */
+  reconcilePriorFailedPassHealthy?: number;
+  /** Pending-pass baseline paired with the finding window; absent in legacy storage. */
+  reconcilePriorFailedPassPending?: number;
+  /** Failed-pass counter baseline for prior-failed suppression; absent in legacy storage. */
+  reconcilePriorFailedPassFailed?: number;
+  /** False until a valid sample stores the prior-failed baseline: the first sample never fires. */
+  reconcilePriorFailedSeen?: boolean;
+  /** `sanction_refused` automod decisions at the last valid sample; absent in legacy storage. */
+  automodSanctionRefused?: number;
+  /** False until a valid sample stores the sanction baseline: the first sample never fires. */
+  automodSanctionRefusedSeen?: boolean;
+  /** Summed moderation `discord_error`/`storage_error` outcomes at the last valid sample; absent in legacy storage. */
+  moderationEnforcementFailures?: number;
+  /** False until a valid sample stores the moderation baseline: the first sample never fires. */
+  moderationEnforcementFailuresSeen?: boolean;
+  /** Consecutive valid samples with a stuck voice REST attempt, capped at VOICE_REST_STUCK_SAMPLES; absent in legacy storage. */
+  voiceRestStuckStreak?: number;
+  /** `two_bot_voice_global_backoff_capped_total` at the last valid sample; absent in legacy storage. */
+  voiceBackoffCapped?: number;
+  /** False until a valid sample stores the backoff baseline: the first sample never fires. */
+  voiceBackoffCappedSeen?: boolean;
   /**
    * Last finite gateway latency reading in seconds; absent when the last
    * valid sample was unknown (NaN/absent). NaN is never stored: JSON state
@@ -773,10 +845,11 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, restPendingStuckStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, voiceLiveSelfHeal: 0, voiceLiveSelfHealSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false, retentionReplayNeeded: 0, retentionReplayNeededSeen: false, voiceDispatchTimeouts: 0, voiceDispatchTimeoutsSeen: false, voiceWatchdogStucks: 0, voiceWatchdogStucksSeen: false, voiceHaltRecoveries: 0, voiceHaltRecoveriesSeen: false, restBreakerOpens: 0, restBreakerOpensSeen: false, restGlobalPauses: 0, restGlobalPausesSeen: false, gatewayLatencyDeadStreak: 0, gatewayLatencySeen: false, gatewayReconnects: 0, gatewayReconnectsSeen: false, gatewayReconnectStreak: 0, handlerBuckets: {}, handlerStreak: 0, jobShareBase: {}, jobShareSeen: false };
-/** An unsuccessful scrape breaks the dispatch, breaker, lag, pending-global, latency, reconnect and handler streaks, never an existing alert. */
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, restPendingStuckStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, voiceLiveSelfHeal: 0, voiceLiveSelfHealSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false, retentionReplayNeeded: 0, retentionReplayNeededSeen: false, voiceDispatchTimeouts: 0, voiceDispatchTimeoutsSeen: false, voiceWatchdogStucks: 0, voiceWatchdogStucksSeen: false, voiceHaltRecoveries: 0, voiceHaltRecoveriesSeen: false, restBreakerOpens: 0, restBreakerOpensSeen: false, restGlobalPauses: 0, restGlobalPausesSeen: false, gatewayLatencyDeadStreak: 0, gatewayLatencySeen: false, gatewayReconnects: 0, gatewayReconnectsSeen: false, gatewayReconnectStreak: 0, handlerBuckets: {}, handlerStreak: 0, jobShareBase: {}, jobShareSeen: false, feedFetchErrors: 0, feedFetchErrorsSeen: false, eventsubReceiveGapStreak: 0, reconcilePriorFailed: 0, reconcilePriorFailedPassHealthy: 0, reconcilePriorFailedPassPending: 0, reconcilePriorFailedPassFailed: 0, reconcilePriorFailedSeen: false, automodSanctionRefused: 0, automodSanctionRefusedSeen: false, moderationEnforcementFailures: 0, moderationEnforcementFailuresSeen: false, voiceRestStuckStreak: 0, voiceBackoffCapped: 0, voiceBackoffCappedSeen: false };
+
+/** An unsuccessful scrape breaks the dispatch, breaker, lag, pending-global, latency, reconnect, handler, receive-gap, and REST-stuck streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0, restPendingStuckStreak: 0, gatewayLatencyDeadStreak: 0, gatewayLatencySeen: false, gatewayReconnectStreak: 0, gatewayReconnectsSeen: false, handlerBuckets: {}, handlerStreak: 0 };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0, restPendingStuckStreak: 0, gatewayLatencyDeadStreak: 0, gatewayLatencySeen: false, gatewayReconnectStreak: 0, gatewayReconnectsSeen: false, handlerBuckets: {}, handlerStreak: 0, eventsubReceiveGapStreak: 0, voiceRestStuckStreak: 0 };
 }
 
 /** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
@@ -1929,8 +2002,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // Helix (`two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed
   // `healthy`/`pending`/`failed` outcomes); parked or refused startup passes
   // never reach Helix and record no sample. Only the pass outcome is an alert
-  // input: the detailed per-site error counters stay exposition-only so one
-  // failed pass raises one ticket however many error sites moved. The first
+  // input here: the detailed per-site error counters stay exposition-only so
+  // one failed pass raises one ticket however many error sites moved (the
+  // prior-failed rule below only fires on windows where no failed pass grew,
+  // so it never multiplies this ticket). The first
   // valid sample only stores a baseline. A later positive failed-pass delta
   // fires (even beside a healthy delta); healthy-only or pending-only growth
   // never fires. A flat failed counter never recovers: only a healthy-pass
@@ -2004,6 +2079,19 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     retentionReplayNeeded = retentionNow;
     retentionReplayNeededSeen = true;
     if (retentionSeen && retentionNow > prevRetention) firing.push(RETENTION_REPLAY_RULE);
+  }
+
+  // Auxiliary XP skipped on a missing table/grant: ticket on growth, like
+  // retention. First sample/reset baselines; missing or invalid is no window.
+  const drainSkipsNow = exactSeries(gauge("two_bot_gateway_drain_skips_total"), {});
+  const prevDrainSkips = prev.gatewayDrainSkips ?? 0;
+  const drainSkipsSeen = prev.gatewayDrainSkipsSeen ?? false;
+  let gatewayDrainSkips = prevDrainSkips;
+  let gatewayDrainSkipsSeen = drainSkipsSeen;
+  if (drainSkipsNow !== undefined) {
+    gatewayDrainSkips = drainSkipsNow;
+    gatewayDrainSkipsSeen = true;
+    if (drainSkipsSeen && drainSkipsNow > prevDrainSkips) firing.push("gateway_drain_skips");
   }
 
   // Voice dispatch turns past the observe bound (one ticket per slow turn):
@@ -2389,7 +2477,248 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     }
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, restRefusalInvalid, restRefusalRejected, restRefusalSeen, restPendingStuckStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, voiceLiveSelfHeal, voiceLiveSelfHealSeen, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, retentionReplayNeeded, retentionReplayNeededSeen, voiceDispatchTimeouts, voiceDispatchTimeoutsSeen, voiceWatchdogStucks, voiceWatchdogStucksSeen, voiceHaltRecoveries, voiceHaltRecoveriesSeen, restBreakerOpens, restBreakerOpensSeen, restGlobalPauses, restGlobalPausesSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak, gatewayLatencyLast, gatewayLatencyDeadStreak, gatewayLatencySeen, gatewayReconnects, gatewayReconnectsSeen, gatewayReconnectStreak, handlerBuckets, handlerStreak, jobShareBase, jobShareSeen }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
+  // Failed feed fetches (one ticket per window with new failures): any
+  // increase of `two_bot_feed_fetch_errors_total` summed over the twelve
+  // fixed error classes between two valid samples means a feed poll failed.
+  // Ticket, not page: one dead source (or one transient transport blip)
+  // never pages, while a poller failing every window keeps the ticket open
+  // without re-notifying. The family records failures only, so even `other`
+  // counts: an unknown class is a failed fetch with a lost reason, not healthy volume.
+  // The sibling attempts family stays unconsumed (see the catalog): every
+  // non-success attempt pairs 1:1 with an error increment
+  // (`record_feed_fetch` in `crates/core/src/feeds_connector.rs`), so this
+  // sum carries the same signal with finer reason codes. The first valid
+  // sample only stores the baseline and never fires; a backwards sum means
+  // the process restarted and re-baselines silently; a missing or malformed
+  // family (older containers never emitted it, or a class row short) is no
+  // window: it keeps the previous baseline and never fires on its own. `??`
+  // covers DO storage written before these fields existed.
+  const FEED_FETCH_FAILURES_RULE = "feed_fetch_failures";
+  const feedErrorRows = gauge("two_bot_feed_fetch_errors_total");
+  let feedErrorsNow: number | undefined;
+  {
+    let sum = 0;
+    let complete = true;
+    for (const errorClass of FEED_FETCH_ERROR_CLASSES) {
+      const value = exactSeries(feedErrorRows, { error_class: errorClass });
+      if (value === undefined) {
+        complete = false;
+        break;
+      }
+      sum += value;
+    }
+    if (complete) feedErrorsNow = sum;
+  }
+  const prevFeedErrors = prev.feedFetchErrors ?? 0;
+  const feedErrorsSeen = prev.feedFetchErrorsSeen ?? false;
+  let feedFetchErrors = prevFeedErrors;
+  let feedFetchErrorsSeen = feedErrorsSeen;
+  if (feedErrorsNow !== undefined) {
+    feedFetchErrors = feedErrorsNow;
+    feedFetchErrorsSeen = true;
+    if (feedErrorsSeen && feedErrorsNow > prevFeedErrors) firing.push(FEED_FETCH_FAILURES_RULE);
+  }
+
+  // EventSub receive/classify gap (deliveries accepted but never classified):
+  // the receiver increments `two_bot_eventsub_received_total` at body intake
+  // and exactly one `two_bot_eventsub_classified_total{kind}` row before
+  // answering (`receive` in `crates/bot/src/eventsub_http.rs`), with no
+  // await between the two, so a healthy scrape shows received equal to the
+  // summed kinds. A positive gap persisting across
+  // EVENTSUB_RECEIVE_GAP_SAMPLES consecutive valid samples tickets (never
+  // pages): one gapped scrape can land mid-delivery, but a stuck gap means
+  // intake outruns classification. A joint reset resolves: the wedge died
+  // with the old process. A negative gap cannot happen in one process (every
+  // classification was received first), so a corrupt sample is no window.
+  // Missing or malformed families (older containers without either row, or a
+  // kind row short) break the streak but preserve a firing ticket, and never
+  // let label values reach state or keys. Failed scrapes reset the streak
+  // through interruptDispatchDrops.
+  const RECEIVE_GAP_RULE = "eventsub_receive_gap";
+  const wasGapFiring = prev.firing.includes(RECEIVE_GAP_RULE);
+  const receivedNow = exactSeries(gauge("two_bot_eventsub_received_total"), {});
+  const classifiedRows = gauge("two_bot_eventsub_classified_total");
+  let classifiedNow: number | undefined;
+  {
+    let sum = 0;
+    let complete = true;
+    for (const kind of EVENTSUB_CLASSIFIED_KINDS) {
+      const value = exactSeries(classifiedRows, { kind });
+      if (value === undefined) {
+        complete = false;
+        break;
+      }
+      sum += value;
+    }
+    if (complete) classifiedNow = sum;
+  }
+  let gapValue: number | undefined;
+  if (receivedNow !== undefined && classifiedNow !== undefined && receivedNow >= classifiedNow) {
+    gapValue = receivedNow - classifiedNow;
+  }
+  const prevGapStreak = prev.eventsubReceiveGapStreak ?? 0;
+  let eventsubReceiveGapStreak: number;
+  if (gapValue === undefined) {
+    eventsubReceiveGapStreak = 0;
+    if (wasGapFiring) firing.push(RECEIVE_GAP_RULE);
+  } else if (gapValue === 0) {
+    eventsubReceiveGapStreak = 0;
+  } else {
+    eventsubReceiveGapStreak = Math.min(prevGapStreak + 1, EVENTSUB_RECEIVE_GAP_SAMPLES);
+    if (wasGapFiring || eventsubReceiveGapStreak >= EVENTSUB_RECEIVE_GAP_SAMPLES) firing.push(RECEIVE_GAP_RULE);
+  }
+
+  // EventSub reconcile prior-failed findings: ticket on finding growth only
+  // once a healthy/pending pass completes, with no failed-pass growth in the
+  // window. Rust records the finding before awaiting repairs and verification,
+  // so a mid-pass scrape must retain all baselines rather than consume the
+  // delta or ticket a repair that has not landed. A failed completion consumes
+  // the finding silently: the failed-pass sibling already names the incident.
+  // The other error sites pair with a failed pass (see the catalog).
+  // Require the finding and all three pass outcomes. Keep separate companion
+  // baselines because the failed-pass rule may advance while the finding row
+  // is missing. Any backwards counter re-baselines the whole window silently;
+  // the first complete sample (including legacy storage) also only baselines.
+  const PRIOR_FAILED_RULE = "eventsub_reconcile_prior_failed";
+  const priorFailedNow = exactSeries(gauge("two_bot_eventsub_reconcile_errors_total"), { error_class: "reconcile_prior_failed" });
+  const prevPriorFailed = prev.reconcilePriorFailed ?? 0;
+  const prevPriorHealthy = prev.reconcilePriorFailedPassHealthy ?? 0;
+  const prevPriorPending = prev.reconcilePriorFailedPassPending ?? 0;
+  const prevPriorFailedPasses = prev.reconcilePriorFailedPassFailed ?? 0;
+  const priorFailedSeen = (prev.reconcilePriorFailedSeen ?? false)
+    && prev.reconcilePriorFailedPassHealthy !== undefined
+    && prev.reconcilePriorFailedPassPending !== undefined;
+  let reconcilePriorFailed = prevPriorFailed;
+  let reconcilePriorFailedPassHealthy = prevPriorHealthy;
+  let reconcilePriorFailedPassPending = prevPriorPending;
+  let reconcilePriorFailedPassFailed = prevPriorFailedPasses;
+  let reconcilePriorFailedSeen = priorFailedSeen;
+  if (priorFailedNow !== undefined && reconcileHealthyNow !== undefined
+    && reconcilePendingNow !== undefined && reconcileFailedNow !== undefined) {
+    const reset = priorFailedNow < prevPriorFailed || reconcileHealthyNow < prevPriorHealthy
+      || reconcilePendingNow < prevPriorPending || reconcileFailedNow < prevPriorFailedPasses;
+    const nonFailedGrew = reconcileHealthyNow > prevPriorHealthy || reconcilePendingNow > prevPriorPending;
+    const failedGrew = reconcileFailedNow > prevPriorFailedPasses;
+    if (!priorFailedSeen || reset || nonFailedGrew || failedGrew) {
+      reconcilePriorFailed = priorFailedNow;
+      reconcilePriorFailedPassHealthy = reconcileHealthyNow;
+      reconcilePriorFailedPassPending = reconcilePendingNow;
+      reconcilePriorFailedPassFailed = reconcileFailedNow;
+      reconcilePriorFailedSeen = true;
+      if (priorFailedSeen && !reset && nonFailedGrew && !failedGrew && priorFailedNow > prevPriorFailed) {
+        firing.push(PRIOR_FAILED_RULE);
+      }
+    }
+  }
+
+  // Automod sanction refusals (one ticket per window with new refusals): any
+  // increase of `two_bot_automod_decisions_total{outcome="sanction_refused"}`
+  // between two valid samples means a delete-adjacent sanction could not run.
+  // Ticket, not page: the content decision still recorded, but the ladder
+  // step never landed. The other seven outcomes stay quiet (see the catalog):
+  // clean/exempt/dry-run verdicts and landed ladders are policy working as
+  // designed, and counted retries are normal resilience. Unknown outcomes
+  // collapse to `sanction_refused` in Rust, so a ticket can also mean a new
+  // outcome needs classification. Baseline, restart and gap semantics mirror
+  // the feed rule above.
+  const SANCTION_REFUSED_RULE = "automod_sanction_refused";
+  const sanctionRefusedNow = exactSeries(gauge("two_bot_automod_decisions_total"), { outcome: "sanction_refused" });
+  const prevSanctionRefused = prev.automodSanctionRefused ?? 0;
+  const sanctionRefusedSeen = prev.automodSanctionRefusedSeen ?? false;
+  let automodSanctionRefused = prevSanctionRefused;
+  let automodSanctionRefusedSeen = sanctionRefusedSeen;
+  if (sanctionRefusedNow !== undefined) {
+    automodSanctionRefused = sanctionRefusedNow;
+    automodSanctionRefusedSeen = true;
+    if (sanctionRefusedSeen && sanctionRefusedNow > prevSanctionRefused) firing.push(SANCTION_REFUSED_RULE);
+  }
+
+  // Moderation enforcement failures (one ticket per window with new failures):
+  // any increase of `two_bot_moderation_enforcements_total` summed over every
+  // verb and the `discord_error`/`storage_error` outcomes between two valid
+  // samples means an enforcement never completed (uncertain Discord failure
+  // or persistence failure). Ticket, not page: one rate-limited kick never
+  // pages, while a Discord or store outage re-tickets every window. `success`
+  // landed, `refused` is policy proving no mutation (like the `refused` voice
+  // operations the `voice_failures` rule skips), and `other` is an unknown
+  // collapse that is not evidence of failure, so all three stay quiet (see
+  // the catalog). Baseline, restart and gap semantics mirror the feed rule
+  // above.
+  const MODERATION_FAILURES_RULE = "moderation_enforcement_failures";
+  const enforcementRows = gauge("two_bot_moderation_enforcements_total");
+  let moderationNow: number | undefined;
+  {
+    let sum = 0;
+    let complete = true;
+    for (const verb of MODERATION_VERBS) {
+      for (const outcome of MODERATION_FAILURE_OUTCOMES) {
+        const value = exactSeries(enforcementRows, { verb, outcome });
+        if (value === undefined) {
+          complete = false;
+          break;
+        }
+        sum += value;
+      }
+      if (!complete) break;
+    }
+    if (complete) moderationNow = sum;
+  }
+  const prevModeration = prev.moderationEnforcementFailures ?? 0;
+  const moderationSeen = prev.moderationEnforcementFailuresSeen ?? false;
+  let moderationEnforcementFailures = prevModeration;
+  let moderationEnforcementFailuresSeen = moderationSeen;
+  if (moderationNow !== undefined) {
+    moderationEnforcementFailures = moderationNow;
+    moderationEnforcementFailuresSeen = true;
+    if (moderationSeen && moderationNow > prevModeration) firing.push(MODERATION_FAILURES_RULE);
+  }
+
+  // Stuck voice REST attempts: `two_bot_voice_rest_in_flight_age_seconds`
+  // above VOICE_REST_STUCK_SECONDS across VOICE_REST_STUCK_SAMPLES consecutive
+  // valid samples tickets (never pages). Every voice REST send wraps its wire
+  // attempt in a 10 s timeout with an in-flight guard that drops on timeout,
+  // so a healthy gauge never reads past ~10 s; a sustained high age means an
+  // attempt neither completed nor dropped its slot. A valid sample at or
+  // below the bound resolves. Missing or malformed samples (absent family on
+  // older containers, labeled, duplicated, fractional or negative rows) break
+  // the streak but preserve a firing ticket. Failed scrapes reset the streak
+  // through interruptDispatchDrops.
+  const VOICE_REST_STUCK_RULE = "voice_rest_stuck";
+  const wasVoiceStuckFiring = prev.firing.includes(VOICE_REST_STUCK_RULE);
+  const stuckNow = exactSeries(gauge("two_bot_voice_rest_in_flight_age_seconds"), {});
+  const prevVoiceStuckStreak = prev.voiceRestStuckStreak ?? 0;
+  let voiceRestStuckStreak: number;
+  if (stuckNow === undefined) {
+    voiceRestStuckStreak = 0;
+    if (wasVoiceStuckFiring) firing.push(VOICE_REST_STUCK_RULE);
+  } else if (stuckNow <= VOICE_REST_STUCK_SECONDS) {
+    voiceRestStuckStreak = 0;
+  } else {
+    voiceRestStuckStreak = Math.min(prevVoiceStuckStreak + 1, VOICE_REST_STUCK_SAMPLES);
+    if (wasVoiceStuckFiring || voiceRestStuckStreak >= VOICE_REST_STUCK_SAMPLES) firing.push(VOICE_REST_STUCK_RULE);
+  }
+
+  // Voice global-backoff caps (one ticket per window with new caps): any
+  // increase of `two_bot_voice_global_backoff_capped_total` between two valid
+  // samples means a voice action hit a global rate-limit wait past
+  // GLOBAL_BACKOFF_MAX (30 s) and shed to tick-driven queue backoff instead
+  // of parking the guild actor. Ticket, never page: the shed is the designed
+  // backpressure shape and no operator action shortens Discord-side limits,
+  // but a storm of caps points at our own request pattern. Baseline, restart
+  // and gap semantics mirror the feed rule above.
+  const BACKOFF_CAPPED_RULE = "voice_global_backoff_capped";
+  const backoffCappedNow = exactSeries(gauge("two_bot_voice_global_backoff_capped_total"), {});
+  const prevBackoffCapped = prev.voiceBackoffCapped ?? 0;
+  const backoffCappedSeen = prev.voiceBackoffCappedSeen ?? false;
+  let voiceBackoffCapped = prevBackoffCapped;
+  let voiceBackoffCappedSeen = backoffCappedSeen;
+  if (backoffCappedNow !== undefined) {
+    voiceBackoffCapped = backoffCappedNow;
+    voiceBackoffCappedSeen = true;
+    if (backoffCappedSeen && backoffCappedNow > prevBackoffCapped) firing.push(BACKOFF_CAPPED_RULE);
+  }
+
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, restRefusalInvalid, restRefusalRejected, restRefusalSeen, restPendingStuckStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, voiceLiveSelfHeal, voiceLiveSelfHealSeen, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, retentionReplayNeeded, retentionReplayNeededSeen, gatewayDrainSkips, gatewayDrainSkipsSeen, voiceDispatchTimeouts, voiceDispatchTimeoutsSeen, voiceWatchdogStucks, voiceWatchdogStucksSeen, voiceHaltRecoveries, voiceHaltRecoveriesSeen, restBreakerOpens, restBreakerOpensSeen, restGlobalPauses, restGlobalPausesSeen, feedFetchErrors, feedFetchErrorsSeen, eventsubReceiveGapStreak, reconcilePriorFailed, reconcilePriorFailedPassHealthy, reconcilePriorFailedPassPending, reconcilePriorFailedPassFailed, reconcilePriorFailedSeen, automodSanctionRefused, automodSanctionRefusedSeen, moderationEnforcementFailures, moderationEnforcementFailuresSeen, voiceRestStuckStreak, voiceBackoffCapped, voiceBackoffCappedSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak, gatewayLatencyLast, gatewayLatencyDeadStreak, gatewayLatencySeen, gatewayReconnects, gatewayReconnectsSeen, gatewayReconnectStreak, handlerBuckets, handlerStreak, jobShareBase, jobShareSeen }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

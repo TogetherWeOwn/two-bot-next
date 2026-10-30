@@ -1,6 +1,38 @@
 #![cfg(test)]
 //! Builder-owned live settings, boot refusal and no-effect regression tests.
 
+use crate::hotpath_settings_test_support as hotpath_scope;
+
+// Independently catches a global snapshot on cold refresh and a global poll
+// count on warm refresh, through the actual runtime (not a store-only call).
+#[tokio::test]
+async fn containment_worker_hotpath_settings_reads_are_guild_scoped() {
+    use hotpath_scope::queries::Queries;
+    let key = "TWO_ANTI_NUKE_HEAT_THRESHOLD";
+    let db = hotpath_scope::database(key).await;
+    let mut source = StoreSettings::new(db.pool().clone(), 22, vars(&[(key, "7")]));
+    source.max_age = Duration::ZERO;
+    let (cold, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(cold.unwrap().heat_threshold, 3);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    let (warm, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(warm.unwrap().heat_threshold, 3);
+    hotpath_scope::assert_reads(&reads, None, true);
+    let store = SettingsStore::new(db.pool());
+    store
+        .set("22", key, Some(serde_json::json!(5)), "fixture")
+        .await
+        .unwrap();
+    let (changed, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(changed.unwrap().heat_threshold, 5);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    store.set("22", key, None, "fixture").await.unwrap();
+    let (fallback, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(fallback.unwrap().heat_threshold, 7);
+    hotpath_scope::assert_reads(&reads, Some(1), true);
+    db.close().await.unwrap();
+}
+
 use super::*;
 use crate::tuning_test_support as support;
 use support::{closed_pool, snapshot, vars, Capture, GUILD, SENTINEL};

@@ -75,22 +75,20 @@ EXEMPT_SERIES = {
     "two_bot_voice_compensation_pending": _VOICE_SERIES_REASON,
     "two_bot_voice_names_total": _VOICE_SERIES_REASON,
     "two_bot_voice_vote_kick_total": _VOICE_SERIES_REASON,
-    "two_bot_voice_join_occupancy_total": _VOICE_SERIES_REASON,
+    "two_bot_event_voice_tick_total": _VOICE_SERIES_REASON,
     "two_bot_dispatch_drops_total": _ALERT_INPUT_REASON + " (dispatch_drops)",
     "two_bot_gateway_checkpoint_failures_total": (
         _ALERT_INPUT_REASON + " (gateway_checkpoint_failures)"
     ),
     "two_bot_internal_actions_total": _ALERT_INPUT_REASON + " (receiver_refusals)",
     "two_bot_send_admissions_total": _ALERT_INPUT_REASON + " (send_admission_blocked)",
-    # Voice stall-observability remainder (lobby-stall follow-up): backoff cap
-    # and in-flight REST age. All rows live in docs/metrics.md; the catalog
-    # covers voice_event log fields. (joins_received, dispatch_timeouts,
+    # (The backoff cap, in-flight REST age and join occupancy left this map
+    # once the catalog named them: the first two as alert inputs, occupancy
+    # in the deliberate-deferral note. joins_received, dispatch_timeouts,
     # watchdog_stucks, halt_recoveries and the creator-map generation/age
-    # pair are cataloged as alert inputs, and the worker-halted / queue-pending
-    # / queue-oldest-age stall gauges gained catalog rows, so none of those
-    # carry an exemption.)
-    "two_bot_voice_global_backoff_capped_total": _VOICE_SERIES_REASON,
-    "two_bot_voice_rest_in_flight_age_seconds": _VOICE_SERIES_REASON,
+    # pair are likewise cataloged as alert inputs, and the worker-halted /
+    # queue-pending / queue-oldest-age stall gauges gained catalog rows, so
+    # none of those carry an exemption.)
     # Histogram `_bucket` child consumed as an alert input: the gate
     # normalizes catalog families (stripping `_bucket`) but compares raw
     # alert-input names, so only an exemption covers this spelling. The base
@@ -109,6 +107,14 @@ EXEMPT_SERIES = {
         "two_bot_handler_duration_seconds family; alert input for "
         "handler_duration_saturated (per-le deltas with the p99 bound); "
         "documented in docs/metrics.md and the catalog alert-rule rows"
+    ),
+    # Ticket admission saturation: backpressure signal with no alert rule.
+    # Documented in docs/metrics.md and docs/tickets.md (saturation code
+    # and on-call next action); the catalog covers event fields, not this
+    # label-free counter.
+    "two_bot_ticket_component_drops_total": (
+        "ticket admission saturation signal documented in docs/metrics.md "
+        "and docs/tickets.md; consumed by no alert rule"
     ),
 }
 

@@ -217,6 +217,26 @@ fn check_fixed_matrix() {
         })
     );
 
+    // Signed duplicate bodies pass authentication but never classify a delivery.
+    for kind in [
+        "webhook_callback_verification",
+        "notification",
+        "revocation",
+    ] {
+        for body in [
+            br#"{"b":1,"b":2}"#.as_slice(),
+            br#"{"b":2,"b":1}"#.as_slice(),
+            br#"{"b":1,"b":1}"#.as_slice(),
+            br#"{"nested":{"b":1,"b":2}}"#.as_slice(),
+            br#"{"items":[{"b":1,"b":2}]}"#.as_slice(),
+        ] {
+            let sig = sign(id, &fresh, body);
+            let h = headers(id, &fresh, &sig, kind).unwrap();
+            assert_eq!(verify_delivery(&secret, &h, body, NOW_MS), Ok(()));
+            assert_eq!(classify(kind, body), Err(EventSubError::DuplicateKeys));
+        }
+    }
+
     // Tampered signature: flip the final hex digit, keeping the shape valid.
     let body = notification_body();
     let mut sig = sign(id, &fresh, &body);
@@ -497,6 +517,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(matches!(
                 err,
                 EventSubError::InvalidBody
+                    | EventSubError::DuplicateKeys
                     | EventSubError::WrongSubscription
                     | EventSubError::InvalidChallenge
             ));

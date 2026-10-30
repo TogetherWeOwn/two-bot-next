@@ -217,9 +217,9 @@ four values.
   401, never a 500.
 - Echoes `Delivery::Challenge` as `200 text/plain`; acknowledges
   `Revocation`, `Ignored` and deterministic classification
-  errors (`WrongSubscription`, `InvalidBody`) as `200 {"ok":true}` so Twitch
-  does not retry what will never succeed. A verified `Notification` is
-  acknowledged the same way while no delivery dependencies are injected;
+  errors (`WrongSubscription`, `InvalidBody`, `DuplicateKeys`) as `200 {"ok":true}`
+  so Twitch does not retry what will never succeed. A verified `Notification`
+  is acknowledged the same way while no delivery dependencies are injected;
   with them, it runs `deliver_go_live` and answers its disposition (200, or
   a retryable 503 after a transient ledger/send failure).
 - Answers `400` for a malformed challenge, `401` for a missing or mismatched

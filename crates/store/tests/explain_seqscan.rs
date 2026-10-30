@@ -144,8 +144,12 @@ async fn web_contract_views_report_unindexed_seq_scans() {
     .await
     .unwrap();
     assert!(
-        views.len() >= 9,
+        views.len() >= 10,
         "web contract views vanished from {web}: {views:?}"
+    );
+    assert!(
+        views.iter().any(|view| view == "rank_ladder"),
+        "web_v1.rank_ladder missing from {web}: {views:?}"
     );
 
     // One session for the setting and every EXPLAIN.

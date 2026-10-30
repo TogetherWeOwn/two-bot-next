@@ -26,7 +26,9 @@ use two_bot_core::{
     leveling_store::LevelingStoreError, send_admission::AdmissionError,
 };
 use two_bot_discord::{
-    executor::DiscordError, leveling_runtime::LevelingRuntimeError, ChannelResponseError,
+    executor::DiscordError,
+    leveling_runtime::{LevelingRuntimeError, RoleApplicationError},
+    ChannelResponseError,
 };
 
 /// Fixed token naming a database failure without its internals.
@@ -100,6 +102,18 @@ pub(crate) fn leveling_class(error: &LevelingRuntimeError) -> &'static str {
         LevelingRuntimeError::Store(LevelingStoreError::InvalidRewards(_)) => "invalid_rewards",
         LevelingRuntimeError::Discord(discord) => discord_class(discord),
         LevelingRuntimeError::InvalidInteraction => "invalid_interaction",
+        LevelingRuntimeError::LevelingPoisoned => "deferred_leveling_poisoned",
+        LevelingRuntimeError::CommunityFactsPoisoned => "deferred_community_facts_poisoned",
+        LevelingRuntimeError::RoleApplication { cause, .. } => match cause {
+            RoleApplicationError::Store(LevelingStoreError::Db(inner)) => db_class(inner),
+            RoleApplicationError::Store(LevelingStoreError::InvalidTimestamp(_)) => {
+                "invalid_timestamp"
+            }
+            RoleApplicationError::Store(LevelingStoreError::InvalidRewards(_)) => "invalid_rewards",
+            RoleApplicationError::Discord(discord) => discord_class(discord),
+            RoleApplicationError::Plan(_) => "role_cap_exceeded",
+            RoleApplicationError::Refused { .. } => "role_write_refused",
+        },
     }
 }
 
@@ -343,6 +357,67 @@ mod tests {
         assert_eq!(
             leveling_class(&LevelingRuntimeError::InvalidInteraction),
             "invalid_interaction"
+        );
+        assert_eq!(
+            leveling_class(&LevelingRuntimeError::LevelingPoisoned),
+            "deferred_leveling_poisoned"
+        );
+        assert_eq!(
+            leveling_class(&LevelingRuntimeError::CommunityFactsPoisoned),
+            "deferred_community_facts_poisoned"
+        );
+    }
+
+    #[test]
+    fn role_application_failures_classify_after_the_committed_award() {
+        let role = |cause| LevelingRuntimeError::RoleApplication {
+            cause,
+            awards: Vec::new(),
+        };
+        assert_eq!(
+            leveling_class(&role(RoleApplicationError::Store(LevelingStoreError::Db(
+                sqlx::Error::PoolClosed
+            )))),
+            "pool_closed"
+        );
+        assert_eq!(
+            leveling_class(&role(RoleApplicationError::Store(
+                LevelingStoreError::InvalidTimestamp("x".to_owned())
+            ))),
+            "invalid_timestamp"
+        );
+        assert_eq!(
+            leveling_class(&role(RoleApplicationError::Store(
+                LevelingStoreError::InvalidRewards(
+                    two_bot_core::leveling::RewardConfigError::InvalidLevel
+                )
+            ))),
+            "invalid_rewards"
+        );
+        assert_eq!(
+            leveling_class(&role(RoleApplicationError::Discord(
+                two_bot_discord::executor::DiscordError::Timeout
+            ))),
+            "timeout"
+        );
+        assert_eq!(
+            leveling_class(&role(RoleApplicationError::Plan(
+                two_bot_core::leveling::RewardPlanError::CapExceeded {
+                    list: "grant",
+                    count: 11,
+                    cap: 10
+                }
+            ))),
+            "role_cap_exceeded"
+        );
+        assert_eq!(
+            leveling_class(&role(RoleApplicationError::Refused {
+                role_id: "1".to_owned(),
+                reason: "r".to_owned(),
+                applied: Vec::new(),
+                skipped: Vec::new()
+            })),
+            "role_write_refused"
         );
     }
 

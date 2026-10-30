@@ -55,6 +55,10 @@ pub(crate) const CADENCE: Duration = Duration::from_secs(30);
 /// Below the cadence: a full batch at ~3 paced REST calls per row finishes in
 /// seconds, and a wedged sweep is cut before the next deadline.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(25);
+/// Stop history reads before the supervisor cancels the sweep, reserving time
+/// for the bounded cursor transaction and claim release. DB failure still
+/// leaves the original send evidence fenced for the next healthy owner.
+const CHECKPOINT_RESERVE: Duration = Duration::from_secs(2);
 
 /// Destination keys in `AuditChannelIds` order (audit, voice, moderation).
 const CHANNEL_KEYS: [&str; 3] = [
@@ -495,6 +499,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     /// staleness evaluation; an unreadable halt keeps the last reported
     /// state instead of fabricating a clear.
     pub(crate) async fn sweep(&self) -> Result<Sweep, ErrorClass> {
+        let deadline = tokio::time::Instant::now() + (TIMEOUT - CHECKPOINT_RESERVE);
         let wired = self.wired().await?;
         let Ok(halt) = wired.store.delivery_halt().await else {
             tracing::warn!(job = JOB, "audit_retry_halt_unreadable");
@@ -507,7 +512,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         }
         let report = wired
             .service
-            .drain_pending()
+            .drain_pending_until(deadline)
             .await
             .map_err(|_| ErrorClass::Database)?;
         log_report(&report);
@@ -530,7 +535,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
 /// Per-outcome counts, plus entry IDs for rows that need an operator:
 /// quarantines (with the bounded reason) and store failures (without text).
 fn log_report(report: &DrainReport) {
-    let mut counts = [0usize; 8];
+    let mut counts = [0usize; 9];
     for (entry_id, outcome) in &report.deliveries {
         let slot = match outcome {
             DeliverOutcome::Delivered { .. } => 0,
@@ -543,7 +548,8 @@ fn log_report(report: &DrainReport) {
                 tracing::warn!(job = JOB, entry_id = %entry_id, reason = ?reason, "audit_entry_quarantined");
                 6
             }
-            DeliverOutcome::Unclaimed => 7,
+            DeliverOutcome::ScanBoundReached => 7,
+            DeliverOutcome::Unclaimed => 8,
         };
         counts[slot] += 1;
     }
@@ -555,7 +561,7 @@ fn log_report(report: &DrainReport) {
         tracing::debug!(job = JOB, "audit_retry_idle");
         return;
     }
-    let [delivered, reconciled, held, deferred, rejected, ambiguous, quarantined, unclaimed] =
+    let [delivered, reconciled, held, deferred, rejected, ambiguous, quarantined, scan_bound_reached, unclaimed] =
         counts;
     tracing::info!(
         job = JOB,
@@ -567,6 +573,7 @@ fn log_report(report: &DrainReport) {
         rejected,
         ambiguous,
         quarantined,
+        scan_bound_reached,
         unclaimed,
         failed = report.failed.len(),
         "audit_retry_swept"

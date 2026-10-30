@@ -11,6 +11,8 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -304,6 +306,25 @@ class SupplyChainTests(unittest.TestCase):
             routed = "'[\"ubuntu-latest\"]'"
             self.assertNotIn("ubuntu-latest", code.replace(routed, ""), str(path))
 
+    def test_every_trivy_invocation_uses_the_official_database_source(self):
+        supply = yaml.load((ROOT / ".github/workflows/sbom.yml").read_text(), Loader=yaml.BaseLoader)
+        invocations = []
+        for job_name, job in supply["jobs"].items():
+            for step in job.get("steps", []):
+                if not step.get("uses", "").startswith("aquasecurity/trivy-action@"):
+                    continue
+                # Actions resolves env from workflow to job to step. One job
+                # declaration must cover all four scans; a step may not undo it.
+                env = {**supply.get("env", {}), **job.get("env", {}), **step.get("env", {})}
+                invocations.append((job_name, step["name"], env.get("TRIVY_DB_REPOSITORY")))
+                # Preserve the existing scanner, fresh DB and vulnerability gates.
+                self.assertEqual(step["with"]["version"], "v0.69.3")
+        self.assertEqual(len(invocations), 4, "both inventories and both vulnerability gates are covered")
+        for job_name, name, repository in invocations:
+            with self.subTest(job=job_name, step=name):
+                self.assertEqual(repository, "ghcr.io/aquasecurity/trivy-db:2",
+                                 "each Trivy invocation must select the official GHCR DB, not the default mirror")
+
     def test_no_shared_caches(self):
         # The reusable workflow can run in default-branch context against an
         # arbitrary inputs.ref (release dispatch), so no cross-run cache may
@@ -418,10 +439,10 @@ class SupplyChainTests(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/sbom.yml", check)
         self.assertIn("uses: ./.github/workflows/sbom.yml", release)
         self.assertNotIn("uses: ./.github/workflows/supply-chain.yml", check + release)
-        self.assertIn("inputs.dry_run != true", release)
+        self.assertIn("inputs.dry_run == true || inputs.release_tag != ''", release)
         self.assertIn("needs.sbom-target.outputs.tag != ''", release)
         self.assertIn("needs.release-sbom.result == 'success'", release)
-        self.assertIn("needs.tag.outputs.released == 'true'", release)
+        self.assertNotIn("needs.tag.outputs.released", release)
         self.assertIn("ref: ${{ inputs.ref }}", supply)
         self.assertIn("persist-credentials: false", supply)
         self.assertEqual(supply.count("exit-code: '1'"), 2)

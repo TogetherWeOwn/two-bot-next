@@ -41,7 +41,7 @@ for (const [file, refusal] of Object.entries(REFUSALS)) {
   test(`${file}: executes and imports from a real percent-escaped path`, (t) => {
     const root = mkdtempSync(join(tmpdir(), "safety CLI % # "));
     t.after(() => rmSync(root, { recursive: true, force: true }));
-    for (const dependency of [...Object.keys(REFUSALS), "is-direct-invocation.mjs"]) {
+    for (const dependency of [...Object.keys(REFUSALS), "is-direct-invocation.mjs", "ownership-control-response.mjs"]) {
       copyFileSync(new URL(`../scripts/${dependency}`, import.meta.url), join(root, dependency));
     }
     const script = join(root, file);

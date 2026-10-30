@@ -68,6 +68,28 @@ export const MAX_AUDIT_RESPONSE_BYTES = 64 * 1024;
 
 const ACTOR_PATTERN = /^[a-zA-Z0-9_.:@/-]{1,128}$/;
 const ALLOWED_FLAGS: ReadonlySet<string> = new Set(FORWARDED_FLAGS);
+/**
+ * Reach/identity keys the PUT allowlist refuses (Slice 0a, spec section 3.1
+ * mismatch decision + B5): `SETTING_CLASSES` marks them EnvOnly, yet they
+ * stay forwarded so the container's env-only reach bounds arrive via env.
+ * They leave only the PUT path, never forwarding. Stored-record validation
+ * stays lenient on purpose: a record written before the narrowing still
+ * serves, and the Rust runtime drops reach keys read-side.
+ */
+const PUT_REFUSED_FLAGS: ReadonlySet<string> = new Set([
+  "TWO_MODERATION",
+  "TWO_MODERATION_PROTECTED_ROLE_IDS",
+  "TWO_OWEN_USER_ID",
+  "TWO_ONBOARDING_MODE",
+  "TWO_ANTI_NUKE_PROTECTED_USER_IDS",
+  "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
+  "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
+  "TWO_ASSISTANT_ENDPOINT",
+  "TWO_ASSISTANT_MODEL",
+  // Catalogue edits must serialize with durable self-role work in Postgres;
+  // the independently expiring ops layer cannot honor that drain boundary.
+  "TWO_SELF_ROLE_PANELS",
+]);
 const FENCE_KEYS = ["automation", "automod", "publish", "gateway_park"] as const;
 export type FenceKey = (typeof FENCE_KEYS)[number];
 export type Fences = Record<FenceKey, boolean>;
@@ -158,6 +180,21 @@ function validOverrides(overrides: unknown): overrides is Record<string, string>
   return true;
 }
 
+/**
+ * PUT-time override check: the forwarded shape plus the reach/identity
+ * refuse set. Whole-record, fail-closed like unknown keys: one refused name
+ * refuses the entire PUT. Stored-record validation (`validConfigRecord`)
+ * deliberately uses the lenient `validOverrides` so pre-narrowing records
+ * still serve.
+ */
+function validPutOverrides(overrides: unknown): overrides is Record<string, string> {
+  if (!validOverrides(overrides)) return false;
+  for (const key of Object.keys(overrides)) {
+    if (PUT_REFUSED_FLAGS.has(key)) return false;
+  }
+  return true;
+}
+
 function validFences(fences: unknown): fences is Fences {
   if (!fences || typeof fences !== "object" || Array.isArray(fences)) return false;
   const record = fences as Record<string, unknown>;
@@ -221,7 +258,7 @@ export interface KillswitchPost {
 export function parseConfigPut(value: unknown): ConfigPut | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
-  if (!validOverrides(v.overrides) || !validEpoch(v.expectedEpoch) || !validActor(v.actor)) {
+  if (!validPutOverrides(v.overrides) || !validEpoch(v.expectedEpoch) || !validActor(v.actor)) {
     return null;
   }
   return {

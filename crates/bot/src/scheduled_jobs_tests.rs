@@ -1,3 +1,9 @@
+#[path = "event_reminder_acceptance_tests.rs"]
+mod event_reminder_acceptance;
+#[path = "event_reminder_regression_tests.rs"]
+mod event_reminder_regression;
+#[path = "scheduled_phase_isolation_acceptance_tests.rs"]
+mod phase_isolation_acceptance;
 #[path = "scheduled_uncertainty_acceptance_tests.rs"]
 mod uncertainty_acceptance;
 
@@ -1058,7 +1064,7 @@ async fn supervised_runs_reach_the_metrics_endpoint() {
     .await
     .expect("first supervised tick succeeds");
     stop.send(true).unwrap();
-    supervisor.await.unwrap();
+    supervisor.await.unwrap().unwrap();
     assert_eq!(posts(&mock).len(), 1);
 
     let response = crate::metrics_http::router()

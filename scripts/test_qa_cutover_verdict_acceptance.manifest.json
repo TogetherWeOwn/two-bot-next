@@ -7,7 +7,7 @@
   "protected_files": [
     {
       "path": "scripts/test_qa_cutover_verdict_acceptance.py",
-      "sha256": "55ad310b47d45cb8db265ecafcb8472f0a03a2243c9e2307e070208ad6604ac6"
+      "sha256": "1ace18c35f503a7633fd642d94bbaf9ed890fb04d0441fb234ac35e3a3ffe38d"
     }
   ],
   "run": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_qa_cutover_verdict_acceptance.py' -v",

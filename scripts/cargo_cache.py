@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""TWO-only Cargo admission, read-only retention audit, and filesystem alarm.
+"""TWO-only Cargo admission, retention, and filesystem alarm.
 
-No deletion, mounting, credential access, or service control. Linux + stdlib only.
-A filesystem quota is the hard byte bound; the sampled guard is defense in depth.
+Admission isolates worktrees (per-worktree target/scratch subdirs, evicting
+other worktrees' build output under the held slot lock) and migrates legacy
+shared-target layouts after a build-output-only check. Shared-pool retention
+reclaims eligible slots with the lock held through mutation. The legacy
+worktree audit is read-only. No mounting, credential access, or service
+control. Linux + stdlib only. A filesystem quota is the hard byte bound;
+the sampled guard is defense in depth.
 """
 
 import argparse
+import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import stat
@@ -27,6 +35,13 @@ TERMINAL = {'done', 'cancelled'}
 # into candidate ineligibility instead of hanging past the receipt guard.
 # Local Git probes answer in well under a second; 30s bounds the stall.
 PROVENANCE_GIT_TIMEOUT_SECONDS = 30
+
+# Per-worktree subdir names under a leased slot: ws-<32 hex>.
+# Cargo dep-info uses relative paths, so a shared slot target/ lets one
+# worktree reuse another tree's artifacts keyed only by mtime (observed
+# duplicate-crate E0631). Each worktree gets its own subdir; acquire evicts
+# other worktrees' subdirs to preserve the slot byte budget.
+WS_DIR_RE = re.compile(r'ws-[0-9a-f]{32}')
 
 
 class Refusal(Exception):
@@ -92,12 +107,123 @@ def load_policy(pool):
     return policy
 
 
-def acquire(pool, policy):
+def workspace_subdir_name(workspace):
+    """Deterministic per-worktree subdir name for a canonical workspace path."""
+    canonical = str(workspace)
+    digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]
+    return f'ws-{digest}'
+
+
+def _prepare_worktree_dirs(slot, ws_name):
+    """Ensure slot target/scratch hold only this worktree's subdir.
+
+    Returns the worktree target subdir Path. Evicts other worktrees'
+    subdirs (build output from completed runs; the slot lock proves no
+    live writer) to preserve the slot byte budget. Migrates legacy
+    shared-target layouts (Cargo top-level entries directly under
+    target/) after verifying build-output-only provenance; foreign or
+    mixed contents refuse the slot for Operator inspection.
+
+    Both parents are fully preflighted (layout, symlink, and veto
+    checks) before either is mutated, and each evicted subdir passes
+    the same preservation veto retention uses: a veto-refused slot is
+    left unchanged, never partially evicted. Filesystem errors during
+    eviction refuse the slot so acquire can try the next one.
+    """
+    plans = []
+    for parent_name, veto_fn in (('target', preservation_veto),
+                                 ('scratch', scratch_preservation_veto)):
+        parent = slot / parent_name
+        try:
+            entries = list(parent.iterdir())
+        except OSError as error:
+            raise Refusal(f'cannot list {parent_name} in {slot.name}: {error}') from error
+        if not entries:
+            plans.append((parent, parent_name, [], False))
+            continue
+        names = {p.name for p in entries}
+        if all(WS_DIR_RE.fullmatch(name) for name in names):
+            evict = []
+            for entry in entries:
+                if entry.name == ws_name:
+                    if entry.is_symlink() or not entry.is_dir():
+                        raise Refusal(f'worktree subdir is not a real directory: {entry}')
+                    continue
+                if entry.is_symlink():
+                    raise Refusal(f'symlink in slot output: {entry}')
+                if not entry.is_dir():
+                    raise Refusal(f'mixed worktree and foreign contents in '
+                                  f'{parent_name}: {slot.name}')
+                veto = veto_fn(entry)
+                if veto is not None:
+                    raise Refusal(f'{veto} in {entry.name}; cannot evict '
+                                  f'{slot.name}')
+                evict.append(entry)
+            plans.append((parent, parent_name, evict, False))
+            continue
+        if any(WS_DIR_RE.fullmatch(name) for name in names):
+            raise Refusal(f'mixed worktree and foreign contents in '
+                          f'{parent_name}: {slot.name}')
+        veto = veto_fn(parent)
+        if veto is not None:
+            raise Refusal(f'{veto} in {parent_name}; cannot migrate '
+                          f'{slot.name} to per-worktree layout')
+        for entry in entries:
+            if entry.is_symlink():
+                raise Refusal(f'symlink in {parent_name} during migration: {entry.name}')
+        plans.append((parent, parent_name, list(entries), True))
+    for parent, parent_name, evict, is_migration in plans:
+        try:
+            for entry in evict:
+                if entry.is_symlink():
+                    raise Refusal(f'symlink in {parent_name} during eviction: {entry.name}')
+                if entry.is_dir():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+            (parent / ws_name).mkdir(exist_ok=True)
+        except OSError as error:
+            raise Refusal(f'cannot prepare {parent_name} in {slot.name}: {error}') from error
+        real_directory(parent / ws_name)
+        if is_migration:
+            print(json.dumps({'finding': 'worktree_layout_migrated', 'slot': slot.name,
+                              'parent': parent_name, 'workspace_subdir': ws_name},
+                             sort_keys=True), file=sys.stderr)
+    return slot / 'target' / ws_name
+
+
+def warn_provisioning_mismatch(pool, policy):
+    """Warn (never refuse) when the policy cannot fit the pool filesystem.
+
+    Startup-only admission check: if floor + all slot budgets or the hard
+    limit exceeds the pool filesystem's total size, the installed numbers
+    assume a larger backing filesystem than exists. Print a structured
+    stderr finding and continue unchanged so degraded pools stay usable
+    until the host is reprovisioned. Must stay out of load_policy: the
+    retain recovery path calls it and must never gain a provisioning gate.
+    """
+    fs = os.statvfs(pool)
+    size = fs.f_blocks * fs.f_frsize
+    floor_plus_budgets = (policy['min_available_bytes']
+                          + policy['slots'] * policy['slot_budget_bytes'])
+    if floor_plus_budgets > size or policy['hard_limit_bytes'] > size:
+        print(json.dumps({'finding': 'pool_provisioning_mismatch',
+                          'floor_plus_budgets_bytes': floor_plus_budgets,
+                          'hard_limit_bytes': policy['hard_limit_bytes'],
+                          'filesystem_size_bytes': size,
+                          'slots': policy['slots'],
+                          'slot_budget_bytes': policy['slot_budget_bytes'],
+                          'min_available_bytes': policy['min_available_bytes']},
+                         sort_keys=True), file=sys.stderr)
+
+
+def acquire(pool, policy, workspace):
+    ws_name = workspace_subdir_name(workspace)
     for number in range(policy['slots']):
         slot = real_directory(pool / f'slot-{number}')
         if {p.name for p in slot.iterdir()} - {'lock', 'target', 'scratch', 'lease.json'}:
             raise Refusal(f'unexpected slot contents: {slot}')
-        target = real_directory(slot / 'target')
+        real_directory(slot / 'target')
         real_directory(slot / 'scratch')
         fd = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
         try:
@@ -124,10 +250,24 @@ def acquire(pool, policy):
                                       'slot': slot.name, **lease}, sort_keys=True),
                           file=sys.stderr)
                     (slot / 'lease.json').unlink()
-                    return slot, target, fd
+                else:
+                    os.close(fd)
+                    continue  # Interrupted/oversized/live run: Operator must inspect it.
+            try:
+                target = _prepare_worktree_dirs(slot, ws_name)
+            except Refusal as error:
+                print(json.dumps({'finding': 'slot_worktree_unpreparable', 'slot': slot.name,
+                                  'reason': str(error)}, sort_keys=True), file=sys.stderr)
                 os.close(fd)
-                continue  # Interrupted/oversized/live run: Operator must inspect it.
-            if usage(slot) >= policy['slot_budget_bytes']:
+                continue  # Foreign/mixed contents: Operator must inspect it.
+            try:
+                measured = usage(slot)
+            except Refusal as error:
+                print(json.dumps({'finding': 'slot_unmeasurable', 'slot': slot.name,
+                                  'reason': str(error)}, sort_keys=True), file=sys.stderr)
+                os.close(fd)
+                continue
+            if measured >= policy['slot_budget_bytes']:
                 os.close(fd)
                 continue  # Oversized retained output: Operator must inspect it.
             return slot, target, fd
@@ -206,9 +346,12 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         required = [flag for flag in ('--offline', '--locked') if flag not in cargo_flags]
         args = [args[0]] + required + args[1:]
     policy = load_policy(pool)
+    warn_provisioning_mismatch(pool, policy)
     if available(pool) < policy['min_available_bytes']:
         raise Refusal('backing filesystem has insufficient user-available bytes')
-    slot, target, fd = acquire(pool, policy)
+    slot, target, fd = acquire(pool, policy, workspace)
+    ws_name = workspace_subdir_name(workspace)
+    scratch_dir = real_directory(slot / 'scratch' / ws_name)
     child = None
     previous = {}
     clean_exit = False
@@ -238,18 +381,20 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
             previous[sig] = signal.signal(sig, interrupted)
         # Exclusive create + persistent sentinel protect against wrapper death.
         with (slot / 'lease.json').open('x') as output:
-            json.dump({'workspace': str(workspace), 'wrapper_pid': os.getpid(),
-                       'started_at': time.time()}, output)
+            json.dump({'workspace': str(workspace), 'workspace_subdir': ws_name,
+                       'wrapper_pid': os.getpid(), 'started_at': time.time()}, output)
         env = os.environ.copy()
         # Repository tests prefer PAPERCLIP_RUN_SCRATCH_DIR over temp_dir
         # (crates/core/src/mac.rs), so repository scratch selectors must also
-        # point at lease scratch. Child-only overrides; the parent is unchanged.
+        # point at the worktree lease scratch. Child-only overrides; the
+        # parent is unchanged. Per-worktree subdirs keep Cargo
+        # dep-info/fingerprints coherent across worktrees sharing a slot.
         env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_TARGET_DIR=str(target),
                    CARGO_BUILD_BUILD_DIR=str(target),
-                   TMPDIR=str(slot / 'scratch'), TMP=str(slot / 'scratch'),
-                   TEMP=str(slot / 'scratch'),
-                   PAPERCLIP_RUN_SCRATCH_DIR=str(slot / 'scratch'),
-                   PAPERCLIP_SCRATCH_DIR=str(slot / 'scratch'),
+                   TMPDIR=str(scratch_dir), TMP=str(scratch_dir),
+                   TEMP=str(scratch_dir),
+                   PAPERCLIP_RUN_SCRATCH_DIR=str(scratch_dir),
+                   PAPERCLIP_SCRATCH_DIR=str(scratch_dir),
                    CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0',
                    CARGO_PROFILE_TEST_DEBUG='0')
         # A fallback-resolved rustup proxy needs its sibling proxies (rustc,
@@ -269,9 +414,10 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
             raise
         # Record Cargo's process group (start_new_session: pgid == child pid)
         # so a later acquire can tell a dead group from an escaped descendant
-        # that closed the fd. Atomic rewrite; the temp file lives in scratch
-        # so a crash can never leave an unexpected top-level slot entry.
-        tmp_path = slot / 'scratch' / 'lease.json.tmp'
+        # that closed the fd. Atomic rewrite; the temp file lives in the
+        # worktree scratch subdir so a crash can never leave an unexpected
+        # top-level slot or scratch entry.
+        tmp_path = scratch_dir / 'lease.json.tmp'
         with tmp_path.open('w') as output:
             json.dump({**json.loads((slot / 'lease.json').read_text()),
                        'cargo_pgid': child.pid}, output)
@@ -324,8 +470,9 @@ def process_references(proc_root):
 
     Scans cwd/exe/fd/maps plus cmdline argv tokens. Inodes are compared too,
     so container mount path spellings need not match the host. cmdline entries
-    that no longer stat are kept as lexical-only references (dev/ino None);
-    any other denied read aborts the whole scan.
+    that no longer stat, or whose token exceeds PATH_MAX (ENAMETOOLONG),
+    are kept as lexical-only references (dev/ino None); any other denied
+    read aborts the whole scan.
 
     Deleted entries are (path, device, inode, stat_backed): fd/cwd/exe
     devices come from stat and compare directly with slot stat devices;
@@ -453,8 +600,16 @@ def process_references(proc_root):
                         references.append((text, None, None))
                     except NotADirectoryError:
                         references.append((text, None, None))
-                    except (PermissionError, OSError):
-                        raise Refusal(f'incomplete process visibility: pid {entry.name}')
+                    except OSError as error:
+                        # A token longer than PATH_MAX (headless Chrome
+                        # rewrites its argv into one long title) can never
+                        # name a real file; keep it lexical like a missing
+                        # path. PermissionError and every other OSError
+                        # still fail the whole scan closed.
+                        if error.errno == errno.ENAMETOOLONG:
+                            references.append((text, None, None))
+                        else:
+                            raise Refusal(f'incomplete process visibility: pid {entry.name}')
                     else:
                         references.append((text, info.st_dev, info.st_ino))
         except FileNotFoundError:
@@ -519,14 +674,8 @@ PROTECTED_DIR_NAMES = frozenset(
      'incident', 'incidents', 'receipt', 'receipts'})
 
 
-def preservation_veto(target):
-    """Reason a target's contents veto retention, or None when build-output-only.
-
-    Calibrated against real Cargo output: a genuine target holds only
-    debug/release/doc/package/tmp trees at top level. Nested build-script
-    codegen (debug/build/*/out/*.rs) is expected; .rs anywhere else is not
-    Cargo output. Unknown foreign top-level entries fail closed to a veto.
-    """
+def _preservation_veto_legacy(target):
+    """Legacy single-target veto: target/ holds Cargo output directly."""
     def unreadable(error):
         raise Refusal(f'incomplete target scan: {error.filename}')
 
@@ -556,6 +705,36 @@ def preservation_veto(target):
                     continue  # build-script codegen output, not stashed source
                 return f'preserved file in target: {name}'
     return None
+
+
+def preservation_veto(target):
+    """Reason a target's contents veto retention, or None when build-output-only.
+
+    Calibrated against real Cargo output: a genuine target holds only
+    debug/release/doc/package/tmp trees at top level. Nested build-script
+    codegen (debug/build/*/out/*.rs) is expected; .rs anywhere else is not
+    Cargo output. Unknown foreign top-level entries fail closed to a veto.
+
+    Per-worktree layout: target/ holds only ws-* subdirs, each
+    holding Cargo output. Each subdir is veto-checked with the legacy
+    rules; mixed worktree/foreign top levels veto.
+    """
+    try:
+        entries = list(Path(target).iterdir())
+    except OSError as error:
+        raise Refusal(f'incomplete target scan: {error.filename}')
+    if any(WS_DIR_RE.fullmatch(p.name) for p in entries):
+        for entry in entries:
+            if not WS_DIR_RE.fullmatch(entry.name):
+                return f'preserved foreign top-level entry: {entry.name}'
+            if entry.is_symlink() or not entry.is_dir():
+                return f'preserved foreign top-level entry: {entry.name}'
+        for entry in sorted(entries):
+            veto = _preservation_veto_legacy(entry)
+            if veto is not None:
+                return f'{veto} in {entry.name}'
+        return None
+    return _preservation_veto_legacy(target)
 
 
 def workspace_inodes(workspace):
@@ -600,16 +779,8 @@ def _veto_scan_names(base, target, dirs, files, check_top_level, first):
     return None
 
 
-def scratch_preservation_veto(scratch):
-    """Reason a slot scratch tree vetoes retention, or None.
-
-    Scratch holds cooperative compiler/test temp files with arbitrary names,
-    so unlike target there is no Cargo-defined top-level allowlist: any
-    non-protected entry is treated as regenerable temp output. Protected
-    directory names, protected file stems/suffixes, foreign symlinks and any
-    other top-level foreign material still veto. Heuristics are a backstop
-    veto only; eligibility still needs the attested classification.
-    """
+def _scratch_preservation_veto_legacy(scratch):
+    """Legacy scratch veto: arbitrary temp names, protected-name backstop."""
     def unreadable(error):
         raise Refusal(f'incomplete scratch scan: {error.filename}')
 
@@ -625,6 +796,37 @@ def scratch_preservation_veto(scratch):
         if veto is not None:
             return veto.replace('in target', 'in scratch')
     return None
+
+
+def scratch_preservation_veto(scratch):
+    """Reason a slot scratch tree vetoes retention, or None.
+
+    Scratch holds cooperative compiler/test temp files with arbitrary names,
+    so unlike target there is no Cargo-defined top-level allowlist: any
+    non-protected entry is treated as regenerable temp output. Protected
+    directory names, protected file stems/suffixes, foreign symlinks and any
+    other top-level foreign material still veto. Heuristics are a backstop
+    veto only; eligibility still needs the attested classification.
+
+    Per-worktree layout: scratch/ holds only ws-* subdirs.
+    Mixed worktree/foreign top levels veto for Operator inspection.
+    """
+    try:
+        entries = list(Path(scratch).iterdir())
+    except OSError as error:
+        raise Refusal(f'incomplete scratch scan: {error.filename}')
+    if any(WS_DIR_RE.fullmatch(p.name) for p in entries):
+        for entry in entries:
+            if not WS_DIR_RE.fullmatch(entry.name):
+                return f'preserved foreign top-level entry in scratch: {entry.name}'
+            if entry.is_symlink() or not entry.is_dir():
+                return f'symlink in scratch: {entry.name}'
+        for entry in sorted(entries):
+            veto = _scratch_preservation_veto_legacy(entry)
+            if veto is not None:
+                return f'{veto} in {entry.name}'
+        return None
+    return _scratch_preservation_veto_legacy(scratch)
 
 
 def slot_output_inodes(target, scratch):
@@ -661,9 +863,12 @@ def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
        "captured_at_unix": <unix>,
        "slots": [{"path": "<pool>/slot-N", "issue_id": "<uuid>",
                   "status": "done|...", "live_run": bool, "referenced": bool,
-                  "target_provenance": "build_output_only"}, ...]}
+                  "target_provenance": "build_output_only",
+                  "idle_stale": bool (optional)}, ...]}
     live_run covers running/queued/retry runs; referenced covers all
-    execution/project/shared workspace refs. Returns (indexed, captured).
+    execution/project/shared workspace refs. idle_stale lets a nonterminal
+    row pass the status gate; every other gate is unchanged.
+    Returns (indexed, captured).
     """
     if (inventory.get('version') != 1 or inventory.get('complete') is not True
             or inventory.get('process_scope') != 'host'):
@@ -684,7 +889,9 @@ def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
         canonical = os.path.normpath(raw)
         if raw != canonical or canonical in indexed:
             raise Refusal('ambiguous slot attribution')
-        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
+        if (type(row.get('live_run')) is not bool
+                or type(row.get('referenced')) is not bool
+                or ('idle_stale' in row and type(row['idle_stale']) is not bool)):
             raise Refusal('ambiguous slot attribution')
         if not row.get('issue_id') or row.get('status') not in TERMINAL | {
                 'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
@@ -817,7 +1024,12 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': 'unattributed slot; skipped, lease kept'}
                     continue
-                if row['status'] not in TERMINAL or row['live_run'] or row['referenced']:
+                # An over-budget slot is never handed out by acquire(), so its
+                # retained output helps nobody. A row the control plane marks
+                # idle_stale passes the nonterminal-status gate; live_run,
+                # referenced, and every gate below are unchanged.
+                if ((row['status'] not in TERMINAL and row.get('idle_stale') is not True)
+                        or row['live_run'] or row['referenced']):
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': ('live run, slot reference, or nonterminal issue; '
                                                 'skipped, lease kept')}

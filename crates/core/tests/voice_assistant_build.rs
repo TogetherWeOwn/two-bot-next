@@ -113,6 +113,10 @@ fn config() -> AssistantConfig {
             "TWO_ASSISTANT_MODEL".to_string(),
             "example-model".to_string(),
         ),
+        (
+            "TWO_ASSISTANT_API_KEY".to_string(),
+            "fixture-assistant-credential".to_string(),
+        ),
     ]))
     .expect("endpoint enables")
 }
@@ -275,10 +279,16 @@ async fn blank_request_never_calls_the_endpoint() {
 
 #[tokio::test]
 async fn blank_model_fails_before_any_call() {
-    let unmodeled = AssistantConfig::from_map(&HashMap::from([(
-        "TWO_ASSISTANT_ENDPOINT".to_string(),
-        "https://example.com/v1".to_string(),
-    )]))
+    let unmodeled = AssistantConfig::from_map(&HashMap::from([
+        (
+            "TWO_ASSISTANT_ENDPOINT".to_string(),
+            "https://example.com/v1".to_string(),
+        ),
+        (
+            "TWO_ASSISTANT_API_KEY".to_string(),
+            "fixture-assistant-credential".to_string(),
+        ),
+    ]))
     .expect("endpoint enables");
     let transport = ScriptTransport::new(vec![]);
     let Err(BuildError::BadModel(ModelNameError::Blank)) = build_template(

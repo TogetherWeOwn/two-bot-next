@@ -1617,3 +1617,56 @@ async fn a_revoke_delete_overtaken_by_a_newer_entry_replans_before_retiring() {
     assert_eq!(cached_outsider(&worker), Some(newer));
     assert!(stored_grants(&worker).is_empty());
 }
+
+async fn lost_join_decision_worker_reply(drop_reply: bool) {
+    let (runtime, mut rx) = stalled_worker_runtime();
+    let interaction =
+        component_interaction(&join_custom_id(JoinDecision::Approve, ROOM, 7), None, OWNER);
+    let call = handle_capture(&runtime, &interaction);
+    tokio::pin!(call);
+    let command = tokio::select! {
+        command = rx.recv() => command.expect("accepted join decision"),
+        _ = &mut call => panic!("join handler did not reach its worker boundary"),
+    };
+    assert!(matches!(command, ActorCommand::JoinDecision { .. }));
+    // Retain the accepted sender to exercise timeout, or drop it to exercise closure.
+    let held = if drop_reply {
+        drop(command);
+        None
+    } else {
+        Some(command)
+    };
+    let (owned, response) = bounded_sibling_wait(&mut call).await;
+    assert!(owned);
+    assert_sibling_worker_lost_reply(&response.expect("one join-decision failure reply"));
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_join_decision_worker_reply_returns_honest_user_copy() {
+    lost_join_decision_worker_reply(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_join_decision_worker_reply_returns_honest_user_copy() {
+    lost_join_decision_worker_reply(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn join_decision_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    let decision = JoinDecisionCommand {
+        actor_id: MEMBER,
+        click: JoinClick {
+            decision: JoinDecision::Approve,
+            room_id: ROOM,
+            request_id: 7,
+            epoch: None,
+        },
+    };
+    assert!(
+        bounded_sibling_wait(runtime.run_join_decision(GUILD, decision))
+            .await
+            .is_none()
+    );
+}

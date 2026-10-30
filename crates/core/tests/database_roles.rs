@@ -397,6 +397,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "contract_meta",
         "live_counts",
         "rank_counts",
+        "rank_ladder",
         "members",
         "member_milestones",
         "upcoming_events",

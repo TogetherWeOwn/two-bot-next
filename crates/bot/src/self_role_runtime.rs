@@ -7,8 +7,9 @@
 use std::{
     collections::HashSet,
     future::Future,
+    hash::BuildHasher,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -17,7 +18,7 @@ use std::{
 use tracing::warn;
 use two_bot_core::self_roles::{
     event_order_from_snowflake, plan_select_delta, plan_self_role_change, PanelMode, PlanRejection,
-    RoleOperation, SelfRolePanel, SelfRolePlan, SettledOutcome,
+    RoleOperation, SafeRefusal, SelfRolePanel, SelfRolePlan, SettledOutcome,
 };
 use two_bot_cutover::self_role_store::{
     AuditEffects, EventClaim, ExchangeIntent, ExchangeReceipt, ExchangeTicket, PanelClaim,
@@ -36,6 +37,29 @@ const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE_TIMEOUT: Duration = Duration::from_secs(60);
 const LANE_WAIT: Duration = Duration::from_secs(20);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Process-wide contention sequence: every Busy sleep draws a fresh seed so
+/// simultaneous contenders — and consecutive retries of one claimant — spread
+/// across the jitter window instead of retrying in lockstep.
+static CONTENTION_SEED_SEQ: AtomicU64 = AtomicU64::new(0x9E3779B97F4A7C15);
+
+/// Fresh seed for one Busy sleep on `key` at contention `retry`.
+///
+/// Mixes the panel identity (contenders for different panels differ), the
+/// retry count (one claimant's consecutive sleeps differ), a process-wide
+/// sequence (simultaneous contenders differ) and fresh `RandomState` keys
+/// (processes differ). Call sites must pass the result straight through —
+/// never a fixed seed, or the lockstep returns.
+fn contention_seed(key: &PanelKey, retry: u32) -> u64 {
+    let seq = CONTENTION_SEED_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::collections::hash_map::RandomState::new().hash_one((
+        &key.guild_id,
+        &key.member_id,
+        &key.panel_id,
+        retry,
+        seq,
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum Selection {
@@ -136,10 +160,26 @@ pub(crate) enum StoreErrorKind {
 pub(crate) enum RuntimeError {
     Store(StoreErrorKind),
     Rest(SelfRoleRestError),
+    CatalogueChanged,
     Stale,
     InvalidSnapshot,
     PendingExchange,
 }
+
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Store(_) => "self-role store operation failed",
+            Self::Rest(_) => "self-role REST operation failed",
+            Self::CatalogueChanged => "self-role catalogue changed",
+            Self::Stale => "self-role claim is stale",
+            Self::InvalidSnapshot => "self-role snapshot is invalid",
+            Self::PendingExchange => "self-role exchange is pending",
+        })
+    }
+}
+
+impl std::error::Error for RuntimeError {}
 
 async fn store_io<T>(
     operation: impl Future<Output = Result<T, StoreError>>,
@@ -148,6 +188,7 @@ async fn store_io<T>(
         .await
         .map_err(|_| RuntimeError::Store(StoreErrorKind::Timeout))?
         .map_err(|error| match error {
+            StoreError::CatalogueChanged => RuntimeError::CatalogueChanged,
             StoreError::StaleClaim => RuntimeError::Stale,
             StoreError::PendingExchange => RuntimeError::PendingExchange,
             _ => RuntimeError::Store(StoreErrorKind::Database),
@@ -942,6 +983,9 @@ impl SelfRoleRuntime {
             panel_id: panel.id.clone(),
         };
         let deadline = tokio::time::Instant::now() + LANE_WAIT;
+        // The jittered sleeps stay within the local base; trip if the shared const drifts.
+        debug_assert_eq!(two_bot::lane_jitter::LANE_BACKOFF_BASE, LANE_BACKOFF);
+        let mut contention: u32 = 0;
         let lane = loop {
             if owner.lost.load(Ordering::SeqCst)
                 || !store_io(self.store.owns_superseded_claim(&owner.claim)).await?
@@ -951,7 +995,12 @@ impl SelfRoleRuntime {
             match store_io(self.store.claim_panel(&key, None)).await? {
                 PanelClaimResult::Acquired(claim) => break claim,
                 PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(LANE_BACKOFF).await;
+                    let backoff = two_bot::lane_jitter::lane_backoff_jittered(
+                        contention,
+                        contention_seed(&key, contention),
+                    );
+                    contention = contention.saturating_add(1);
+                    tokio::time::sleep(backoff).await;
                 }
                 _ => return Err(RuntimeError::Stale),
             }
@@ -1167,10 +1216,30 @@ impl SelfRoleRuntime {
 
     /// Claim first, exclusive lane second, authoritative policy/member last.
     /// No gateway/cache role set or permission mask participates in planning.
+    #[cfg(test)]
     pub async fn prepare(
         &self,
         request: &SelfRoleRequest,
         panel: &SelfRolePanel,
+    ) -> Result<Admission, RuntimeError> {
+        self.prepare_with_revision(request, panel, None).await
+    }
+
+    pub async fn prepare_at_revision(
+        &self,
+        request: &SelfRoleRequest,
+        panel: &SelfRolePanel,
+        revision: i64,
+    ) -> Result<Admission, RuntimeError> {
+        self.prepare_with_revision(request, panel, Some(revision))
+            .await
+    }
+
+    async fn prepare_with_revision(
+        &self,
+        request: &SelfRoleRequest,
+        panel: &SelfRolePanel,
+        revision: Option<i64>,
     ) -> Result<Admission, RuntimeError> {
         if request.guild_id != self.guild_id
             || request.channel_id != panel.channel_id
@@ -1202,7 +1271,7 @@ impl SelfRoleRuntime {
             desired_role_ids: vec![],
             pre_mutation_role_ids: vec![],
         };
-        self.prepare_audit(audit, panel, Some(request.selection.clone()))
+        self.prepare_audit(audit, panel, Some(request.selection.clone()), revision)
             .await
     }
 
@@ -1239,7 +1308,7 @@ impl SelfRoleRuntime {
             desired_role_ids: vec![],
             pre_mutation_role_ids: vec![],
         };
-        self.prepare_audit(audit, panel, None).await
+        self.prepare_audit(audit, panel, None, None).await
     }
 
     pub async fn recovery_candidates(
@@ -1262,8 +1331,18 @@ impl SelfRoleRuntime {
         mut audit: SelfRoleAudit,
         panel: &SelfRolePanel,
         selection: Option<Selection>,
+        revision: Option<i64>,
     ) -> Result<Admission, RuntimeError> {
-        let Some(mut event) = store_io(self.store.claim_pending_audit(&audit)).await? else {
+        let claim = match revision {
+            Some(revision) => {
+                match store_io(self.store.claim_pending_audit_at_revision(&audit, revision)).await {
+                    Err(RuntimeError::CatalogueChanged) => return Ok(Admission::Ignored),
+                    result => result?,
+                }
+            }
+            None => store_io(self.store.claim_pending_audit(&audit)).await?,
+        };
+        let Some(mut event) = claim else {
             return Ok(Admission::Duplicate);
         };
         let selection = match selection {
@@ -1301,6 +1380,9 @@ impl SelfRoleRuntime {
                 panel_id: panel.id.clone(),
             };
             let deadline = tokio::time::Instant::now() + LANE_WAIT;
+            // The jittered sleeps stay within the local base; trip if the shared const drifts.
+            debug_assert_eq!(two_bot::lane_jitter::LANE_BACKOFF_BASE, LANE_BACKOFF);
+            let mut contention: u32 = 0;
             loop {
                 if lost.load(Ordering::SeqCst) || !store_io(self.store.owns_claim(&event)).await? {
                     return Err(RuntimeError::Stale);
@@ -1333,7 +1415,12 @@ impl SelfRoleRuntime {
                         return Ok(Admission::Rejected("superseded_by_later_event"));
                     }
                     PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(LANE_BACKOFF).await;
+                        let backoff = two_bot::lane_jitter::lane_backoff_jittered(
+                            contention,
+                            contention_seed(&key, contention),
+                        );
+                        contention = contention.saturating_add(1);
+                        tokio::time::sleep(backoff).await;
                     }
                     PanelClaimResult::Busy => {
                         return self.reject(audit, &event, None, "panel_busy").await;
@@ -1415,11 +1502,12 @@ impl SelfRoleRuntime {
             .iter()
             .map(|option| option.role_id.clone())
             .collect();
-        if snapshot
-            .validate(&request.guild_id, panel, &offered)
-            .is_some()
-        {
-            return Ok(Err("unsafe_live_roles"));
+        if let Some(failure) = snapshot.validate(&request.guild_id, panel, &offered) {
+            // Only the closed, member-explainable categories keep their code;
+            // every other failure stays the opaque generic one.
+            return Ok(Err(failure
+                .safe_refusal()
+                .map_or("unsafe_live_roles", SafeRefusal::code)));
         }
         // Seed only from a verifiable exclusive selection, never from new
         // uncommitted input. A malformed/multiple initial selection stays unknown.

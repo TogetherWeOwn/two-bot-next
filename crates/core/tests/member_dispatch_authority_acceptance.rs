@@ -257,7 +257,10 @@ async fn an_in_flight_delete_is_not_cleared_by_a_new_policy_denial() {
         .expect("accepted");
     clock.store(NOW + 60_001, Ordering::SeqCst);
     discord.fail_with("unban", DiscordError::Timeout);
-    assert!(service.run_due_unbans(GUILD).await.is_err());
+    assert_eq!(
+        service.run_due_unbans(GUILD).await.expect("timeout fenced"),
+        0
+    );
     let before = store
         .surface_uncertain(GUILD)
         .await

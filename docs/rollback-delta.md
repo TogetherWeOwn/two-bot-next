@@ -134,7 +134,10 @@ via `created_at`/`owner_touched_at`/`name_touched_at`/`privacy_touched_at`,
 `voice_room_blocks` via `created_at`, `voice_join_grants` via `created_at`,
 the owner-grant journal (`voice_owner_grants`) via `touched_at`,
 `voice_text_companions` via
-`created_at`, and the append-only `voice_vote_kick_audit` via `occurred_at`) need no
+`created_at`, the append-only `voice_vote_kick_audit` via `occurred_at`, and
+the event voice pair (`event_voice_channels` via
+`created_at`/`updated_at`, `event_voice_presence` via
+`joined_at`/`left_at`)) need no
 disposition: their counts are the evidence. The journal is not append-only
 deletion history: completion deletes non-current recipients and marks the
 retained row completed (`pending = FALSE`, `touched_at` refreshed), so the

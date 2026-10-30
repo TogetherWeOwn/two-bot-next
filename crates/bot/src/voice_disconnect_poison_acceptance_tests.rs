@@ -1,8 +1,14 @@
 //! Real actor/view cleanup behind VoiceEventSink, paired with the binary's
 //! actual VoiceConnectionGuard drop tests (the guard is binary-private).
+//! Pins the drop-only `disconnect_from_drop` path: live `disconnect` fails
+//! loud on a poisoned registry (pinned by
+//! `voice_disconnect_loud_acceptance_tests.rs`), while the guard's drop
+//! still reaches all cleanup with a counted recovery.
+//! Builder retarget (Test Author delegation, see the loud file's header).
 #![cfg(test)]
 
 use super::*;
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 async fn disconnect(poison_actors: bool, poison_view: bool) {
@@ -31,7 +37,12 @@ async fn disconnect(poison_actors: bool, poison_view: bool) {
     }
 
     let sink: Arc<dyn VoiceEventSink> = runtime.clone();
-    let outcome = catch_unwind(AssertUnwindSafe(|| sink.disconnect()));
+    // A poisoned registry counts on the process-global series: hold the
+    // shared lock so this cleanup cannot land in a delta window.
+    let outcome = {
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        catch_unwind(AssertUnwindSafe(|| sink.disconnect_from_drop()))
+    };
     let gateway_disconnected = !runtime.gateway_connected.load(Ordering::Acquire);
     let (ready, after_generation, not_ready_since) = {
         let live = actor.live.read_state();
@@ -47,7 +58,7 @@ async fn disconnect(poison_actors: bool, poison_view: bool) {
 
     assert!(
         outcome.is_ok(),
-        "real VoiceEventSink::disconnect must not panic"
+        "real VoiceEventSink::disconnect_from_drop must not panic"
     );
     assert!(
         gateway_disconnected,

@@ -7,7 +7,7 @@ import {
   type MetricsAlertState,
 } from "../src/alert-rules.ts";
 import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
-import { metricsBody } from "./fixtures/metrics.ts";
+import { metricsBody, rustLabels } from "./fixtures/metrics.ts";
 
 const NOW = 1_000_000;
 function body(extra: string[]): string {
@@ -991,7 +991,16 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "job_failure_share",
     "rest_token_invalid",
     "rest_refusal_surge",
-    "rest_global_responses_stuck",  ]);
+    "rest_global_responses_stuck",
+    "feed_fetch_failures",
+    "eventsub_receive_gap",
+    "eventsub_reconcile_prior_failed",
+    "automod_sanction_refused",
+    "moderation_enforcement_failures",
+    "voice_rest_stuck",
+    "voice_global_backoff_capped",
+    "gateway_drain_skips",
+  ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
   assert.equal(packetFilename("rest_429_rate", window), `evidence-rest_429_rate-${window}.json`);
@@ -1038,6 +1047,13 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("rest_token_invalid", window), `evidence-rest_token_invalid-${window}.json`);
   assert.equal(packetFilename("rest_refusal_surge", window), `evidence-rest_refusal_surge-${window}.json`);
   assert.equal(packetFilename("rest_global_responses_stuck", window), `evidence-rest_global_responses_stuck-${window}.json`);
+  assert.equal(packetFilename("feed_fetch_failures", window), `evidence-feed_fetch_failures-${window}.json`);
+  assert.equal(packetFilename("eventsub_receive_gap", window), `evidence-eventsub_receive_gap-${window}.json`);
+  assert.equal(packetFilename("eventsub_reconcile_prior_failed", window), `evidence-eventsub_reconcile_prior_failed-${window}.json`);
+  assert.equal(packetFilename("automod_sanction_refused", window), `evidence-automod_sanction_refused-${window}.json`);
+  assert.equal(packetFilename("moderation_enforcement_failures", window), `evidence-moderation_enforcement_failures-${window}.json`);
+  assert.equal(packetFilename("voice_rest_stuck", window), `evidence-voice_rest_stuck-${window}.json`);
+  assert.equal(packetFilename("voice_global_backoff_capped", window), `evidence-voice_global_backoff_capped-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -1268,6 +1284,7 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   firing.push(...ev(["two_bot_voice_queue_oldest_age_seconds 121"]).firing);
   for (const series of [
     "two_bot_retention_replay_needed_total",
+    "two_bot_gateway_drain_skips_total",
     "two_bot_voice_dispatch_timeouts_total",
     "two_bot_voice_watchdog_stucks_total",
     "two_bot_voice_halt_recoveries_total",
@@ -1324,6 +1341,39 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   stuck = ev(["two_bot_rest_guard_pending_global_responses 2"], stuck.state);
   stuck = ev(["two_bot_rest_guard_pending_global_responses 1"], stuck.state);
   firing.push(...stuck.firing);
+  const feedErrors = (transport: number) => [
+    "invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other",
+  ].map((c) => `two_bot_feed_fetch_errors_total{error_class="${c}"} ${c === "transport" ? transport : 0}`);
+  firing.push(...ev(feedErrors(1), ev(feedErrors(0)).state).firing);
+  const gapLines = (received: number, classified: number) => [
+    `two_bot_eventsub_received_total ${received}`,
+    ...rustLabels("EVENTSUB_DELIVERY_KINDS").map((k) =>
+      `two_bot_eventsub_classified_total{kind="${k}"} ${k === "notification" ? classified : 0}`),
+  ];
+  let gap = ev(gapLines(100, 100));
+  for (const n of [101, 102, 103]) gap = ev(gapLines(n, 100), gap.state);
+  firing.push(...gap.firing);
+  const priorFailed = (n: number) => [
+    `two_bot_eventsub_reconcile_errors_total{error_class="reconcile_prior_failed"} ${n}`,
+    ...reconcilePasses(n, 0, 0),
+  ];
+  firing.push(...ev(priorFailed(1), ev(priorFailed(0)).state).firing);
+  const sanctionRefused = (n: number) => [`two_bot_automod_decisions_total{outcome="sanction_refused"} ${n}`];
+  firing.push(...ev(sanctionRefused(1), ev(sanctionRefused(0)).state).firing);
+  const enforcements = (kickDiscord: number) => {
+    const lines: string[] = [];
+    for (const verb of ["ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock"]) {
+      for (const outcome of ["discord_error", "storage_error"]) {
+        lines.push(`two_bot_moderation_enforcements_total{verb="${verb}",outcome="${outcome}"} ${verb === "kick" && outcome === "discord_error" ? kickDiscord : 0}`);
+      }
+    }
+    return lines;
+  };
+  firing.push(...ev(enforcements(1), ev(enforcements(0)).state).firing);
+  let voiceStuck = ev(["two_bot_voice_rest_in_flight_age_seconds 0"]);
+  for (const n of [61, 75, 90]) voiceStuck = ev([`two_bot_voice_rest_in_flight_age_seconds ${n}`], voiceStuck.state);
+  firing.push(...voiceStuck.firing);
+  firing.push(...ev(["two_bot_voice_global_backoff_capped_total 1"], ev(["two_bot_voice_global_backoff_capped_total 0"]).state).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

@@ -19,7 +19,7 @@
  */
 
 /** Git SHA, full (40) or abbreviated (7+), lowercase hex only. */
-const RELEASE_TOKEN = /^[0-9a-f]{7,40}$/;
+export const RELEASE_TOKEN = /^[0-9a-f]{7,40}$/;
 
 /** Cloudflare Worker version id (UUID); anything else is untrusted. */
 const WORKER_VERSION_TOKEN = /^[0-9A-Za-z-]{8,64}$/;

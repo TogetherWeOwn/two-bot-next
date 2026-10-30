@@ -9,11 +9,14 @@ from.
 
 These tests pin the fix: no ``assert`` statement remains in the verifier, and
 a broken fixture layer fails (nonzero exit, no PASS) both normally and under
-``python -O``. The verifier derives its repo root from its own path, so each
-case copies the committed script into a throwaway fixture root — the real
-Dockerfile is never mutated. Hermetic: stdlib only, no Docker, no network, no
-cargo (without ``--cargo`` the fetch suffix is parsed, never executed; the
-replay needs only ``sh``, as does the verifier itself)::
+``python -O``. They also pin the probe layer replay and the voice-probe
+workspace wiring: a lagging probe Dockerfile, a probe in default-members, or
+a probe missing from members each refuse. The verifier derives its repo root
+from its own path, so each case copies the committed script into a throwaway
+fixture root — the real Dockerfile is never mutated. Hermetic: stdlib only,
+no Docker, no network, no cargo (without ``--cargo`` the fetch suffix is
+parsed, never executed; the replay needs only ``sh``, as does the verifier
+itself)::
 
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts \\
         -p 'test_docker_deps_no_assert.py' -v
@@ -37,11 +40,18 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["crates/a"]
+members = ["crates/a", "crates/voice-probe"]
+default-members = [".", "crates/a"]
 """
 FIXTURE_MEMBER = """\
 [package]
 name = "a"
+version = "0.1.0"
+edition = "2021"
+"""
+FIXTURE_PROBE_MEMBER = """\
+[package]
+name = "voice-probe-fixture"
 version = "0.1.0"
 edition = "2021"
 """
@@ -50,8 +60,23 @@ FROM rust:1.98-trixie AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/a/Cargo.toml crates/a/
-RUN mkdir -p src crates/a/src && echo '' > src/lib.rs \\
-    && echo '' > crates/a/src/lib.rs && cargo fetch --locked
+COPY crates/voice-probe/Cargo.toml crates/voice-probe/
+RUN mkdir -p src crates/a/src crates/voice-probe/src && echo '' > src/lib.rs \\
+    && echo '' > crates/a/src/lib.rs && echo '' > crates/voice-probe/src/lib.rs \\
+    && echo 'fn main(){}' > crates/voice-probe/src/main.rs && cargo fetch --locked
+COPY . .
+"""
+# Probe image layer mirrors the root one; the verifier replays every layer
+# before "COPY . .", so drift in either copy must refuse.
+FIXTURE_PROBE_DOCKER = """\
+FROM rust:1.98-trixie AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates/a/Cargo.toml crates/a/
+COPY crates/voice-probe/Cargo.toml crates/voice-probe/
+RUN mkdir -p src crates/a/src crates/voice-probe/src && echo '' > src/lib.rs \\
+    && echo '' > crates/a/src/lib.rs && echo '' > crates/voice-probe/src/lib.rs \\
+    && echo 'fn main(){}' > crates/voice-probe/src/main.rs && cargo fetch --locked
 COPY . .
 """
 # Same layer, but the member target is never created: the per-member
@@ -66,19 +91,36 @@ BROKEN_MANIFEST_DOCKER = FIXTURE_DOCKER.replace(
 # the suffix pin must refuse it before running anything.
 BROKEN_SUFFIX_DOCKER = FIXTURE_DOCKER.replace(
     " && cargo fetch --locked", " && true")
+# Valid root layer, but the probe copy lags: the probe manifest COPY is gone,
+# so the probe replay must refuse it.
+BROKEN_PROBE_DOCKER = FIXTURE_PROBE_DOCKER.replace(
+    "COPY crates/voice-probe/Cargo.toml crates/voice-probe/\n", "")
+# The probe joins default-members: the root image would silently start
+# compiling it, so the wiring pin must refuse it.
+DEFAULT_MEMBER_MANIFEST = FIXTURE_MANIFEST.replace(
+    'default-members = [".", "crates/a"]',
+    'default-members = [".", "crates/a", "crates/voice-probe"]')
+# The probe leaves the workspace: the wiring pin must refuse it.
+NON_MEMBER_MANIFEST = FIXTURE_MANIFEST.replace(
+    'members = ["crates/a", "crates/voice-probe"]', 'members = ["crates/a"]')
 
 
-def make_fixture_root(parent, docker_text):
-    """A throwaway repo root running the committed verifier against one layer."""
+def make_fixture_root(parent, docker_text, probe_docker_text=FIXTURE_PROBE_DOCKER,
+                      manifest_text=FIXTURE_MANIFEST):
+    """A throwaway repo root running the committed verifier against its layers."""
     root = Path(parent) / "root"
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(SCRIPT, scripts / "test-docker-deps.py")
     (root / "Dockerfile").write_text(docker_text)
-    (root / "Cargo.toml").write_text(FIXTURE_MANIFEST)
+    probe_dockerfile = root / "crates" / "voice-probe" / "Dockerfile"
+    probe_dockerfile.parent.mkdir(parents=True, exist_ok=True)
+    probe_dockerfile.write_text(probe_docker_text)
+    (root / "Cargo.toml").write_text(manifest_text)
     (root / "Cargo.lock").write_text("version = 4\n")
     (root / "crates" / "a").mkdir(parents=True)
     (root / "crates" / "a" / "Cargo.toml").write_text(FIXTURE_MEMBER)
+    (root / "crates" / "voice-probe" / "Cargo.toml").write_text(FIXTURE_PROBE_MEMBER)
     return root
 
 
@@ -107,9 +149,12 @@ class NoAssertTests(unittest.TestCase):
 class BrokenLayerTests(unittest.TestCase):
     """A broken layer fails closed, normally and under ``python -O``."""
 
-    def check_broken(self, docker_text, *extra_args):
+    def check_broken(self, docker_text, *extra_args,
+                     probe_docker_text=FIXTURE_PROBE_DOCKER,
+                     manifest_text=FIXTURE_MANIFEST):
         with tempfile.TemporaryDirectory(prefix="docker-deps-no-assert-") as tmp:
-            root = make_fixture_root(tmp, docker_text)
+            root = make_fixture_root(tmp, docker_text, probe_docker_text,
+                                     manifest_text)
             proc = run_verifier(root, *extra_args)
         self.assertNotEqual(
             proc.returncode, 0,
@@ -146,6 +191,38 @@ class BrokenLayerTests(unittest.TestCase):
         # an unpinned command, then prints PASS.
         self.check_broken(BROKEN_SUFFIX_DOCKER, "-O")
 
+    def test_probe_layer_drift_refuses(self):
+        proc = self.check_broken(
+            FIXTURE_DOCKER, probe_docker_text=BROKEN_PROBE_DOCKER)
+        self.assertIn("Refusal: crates/voice-probe", proc.stderr)
+
+    def test_probe_layer_drift_refuses_under_optimization(self):
+        # RED on a probe-blind verifier: the root layer passes and the lagging
+        # probe copy prints PASS with it.
+        proc = self.check_broken(
+            FIXTURE_DOCKER, "-O", probe_docker_text=BROKEN_PROBE_DOCKER)
+        self.assertIn("Refusal: crates/voice-probe", proc.stderr)
+
+    def test_probe_in_default_members_refuses(self):
+        proc = self.check_broken(
+            FIXTURE_DOCKER, manifest_text=DEFAULT_MEMBER_MANIFEST)
+        self.assertIn(
+            "Refusal: voice-probe must stay out of default-members", proc.stderr)
+
+    def test_probe_in_default_members_refuses_under_optimization(self):
+        # RED on an unpinned verifier: the layers pass and the wiring mutant
+        # prints PASS with them.
+        proc = self.check_broken(
+            FIXTURE_DOCKER, "-O", manifest_text=DEFAULT_MEMBER_MANIFEST)
+        self.assertIn(
+            "Refusal: voice-probe must stay out of default-members", proc.stderr)
+
+    def test_probe_missing_from_members_refuses(self):
+        proc = self.check_broken(
+            FIXTURE_DOCKER, manifest_text=NON_MEMBER_MANIFEST)
+        self.assertIn(
+            "Refusal: voice-probe must stay a workspace member", proc.stderr)
+
 
 class PinnedLayerTests(unittest.TestCase):
     """Control: the valid layer passes, normally and under ``python -O``."""
@@ -162,6 +239,10 @@ class PinnedLayerTests(unittest.TestCase):
 
     def test_valid_layer_passes_under_optimization(self):
         self.check_valid("-O")
+
+
+# Keep the protected COPY intake battery on the existing CI entrypoint.
+from test_docker_replay_intake_acceptance import DockerCopyIntakeAcceptanceTests
 
 
 if __name__ == "__main__":

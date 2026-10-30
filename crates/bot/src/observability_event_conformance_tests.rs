@@ -16,14 +16,18 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all twenty traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 20] = [
+/// `crates/bot/src/gateway.rs`: all twenty-four traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 24] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
     "gateway leveling dispatch failed",
+    "gateway leveling dispatch skipped; schema gap",
+    "gateway leveling collect failed",
     "gateway community facts dispatch failed",
     "gateway community facts dispatch timed out",
+    "gateway community facts buffer poisoned",
+    "gateway dispatch refused: duplicate JSON key",
     "gateway onboarding job invalid",
     "gateway ready; checkpoint committed",
     "onboarding interaction interrupted; member must reselect",
@@ -40,10 +44,11 @@ const GATEWAY_RS_EVENTS: [&str; 20] = [
     "retention purge skipped; schema gap, operator replay required",
 ];
 
-/// `crates/bot/src/main.rs`: the eleven cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 11] = [
+/// `crates/bot/src/main.rs`: the twelve cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 12] = [
     "gateway intents resolved",
     "durable gateway initialized; shard connecting",
+    "community facts arming refused; capture disabled",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
     "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill",
     "container service failed",
@@ -199,8 +204,9 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 25] = [
+const VOICE_RS_ADJACENT: [&str; 26] = [
     "voice succession refused",
+    "voice succession handed the room to the longest-present member",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
     "voice notice settings unreadable",
@@ -519,13 +525,11 @@ fn voice_event_values_are_bounded_by_the_catalog() {
 }
 
 /// `crates/bot/src/eventsub_http.rs`: the unique Twitch EventSub receiver
-/// messages. The receiver file is not one of the six `SCOPED_SOURCES` (it lands
-/// with the receiver slice, after this pin), so it is read from disk at test
-/// time instead of via `include_str!`: a missing file must fail this one test,
-/// not break compilation of the whole suite. Once the file is permanent, fold
-/// it into `SCOPED_SOURCES` and drop the disk read.
-const EVENTSUB_RS_EVENTS: [&str; 8] = [
+/// messages. Read from disk so a missing receiver fails this test without
+/// breaking compilation of the whole suite.
+const EVENTSUB_RS_EVENTS: [&str; 9] = [
     "eventsub delivery refused",
+    "eventsub delivery classification failed",
     "challenge answered",
     "notification acknowledged",
     "revocation acknowledged",

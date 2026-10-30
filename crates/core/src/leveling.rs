@@ -648,14 +648,47 @@ pub struct RewardRolePlan {
     pub revoke_reason: Option<String>,
 }
 
-#[must_use]
+/// Most role writes one level-up plan may carry per list. Grants and revokes
+/// are capped separately, so a plan may hold up to twice this many writes in
+/// total. A ladder larger than this refuses the whole role-write portion
+/// instead of fanning out an unbounded number of paced REST calls.
+pub const ROLE_WRITE_CAP: usize = 10;
+
+/// A reward plan refused before any role write.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RewardPlanError {
+    #[error("level role {list} cap exceeded: {count} planned over the cap of {cap}")]
+    CapExceeded {
+        /// Which list hit the cap: `grant` or `revoke`.
+        list: &'static str,
+        count: usize,
+        cap: usize,
+    },
+}
+
+/// Refuse a plan list longer than [`ROLE_WRITE_CAP`].
+fn check_role_write_cap(list: &'static str, entries: &[String]) -> Result<(), RewardPlanError> {
+    if entries.len() > ROLE_WRITE_CAP {
+        return Err(RewardPlanError::CapExceeded {
+            list,
+            count: entries.len(),
+            cap: ROLE_WRITE_CAP,
+        });
+    }
+    Ok(())
+}
+
+/// Plan the level-up role writes. Each list is capped at [`ROLE_WRITE_CAP`]:
+/// a plan over the cap refuses with [`RewardPlanError::CapExceeded`] and the
+/// caller applies no role write. Suppressed role writes plan nothing and never
+/// refuse.
 pub fn plan_reward_roles(
     level: u64,
     rewards: &[LevelRoleReward],
     member_role_ids: &[String],
     role_writes: bool,
     staging_revoke_allowed: bool,
-) -> RewardRolePlan {
+) -> Result<RewardRolePlan, RewardPlanError> {
     let empty = RewardRolePlan {
         grant: Vec::new(),
         revoke: Vec::new(),
@@ -663,7 +696,7 @@ pub fn plan_reward_roles(
         revoke_reason: None,
     };
     if !role_writes {
-        return empty;
+        return Ok(empty);
     }
     let held: std::collections::HashSet<&str> =
         member_role_ids.iter().map(String::as_str).collect();
@@ -689,17 +722,19 @@ pub fn plan_reward_roles(
     grant.dedup();
     revoke.sort();
     revoke.dedup();
+    check_role_write_cap("grant", &grant)?;
+    check_role_write_cap("revoke", &revoke)?;
     let revoke_reason = if revoke.is_empty() {
         None
     } else {
         Some(revoke_audit_reason(level))
     };
-    RewardRolePlan {
+    Ok(RewardRolePlan {
         grant,
         revoke,
         grant_reason: grant_audit_reason(level),
         revoke_reason,
-    }
+    })
 }
 
 /// Validate a custom-command name (legacy `NAME_PATTERN = /^[a-z0-9_-]{1,32}$/`).
@@ -1043,6 +1078,40 @@ mod tests {
     }
 
     #[test]
+    fn reward_plan_refuses_a_list_over_the_cap_with_a_fixed_error() {
+        let ladder: Vec<LevelRoleReward> = (1..=ROLE_WRITE_CAP as u64 + 1)
+            .map(|level| LevelRoleReward {
+                level,
+                role_id: format!("4000000000000000{level:02}"),
+            })
+            .collect();
+        let level = ROLE_WRITE_CAP as u64 + 1;
+        let error = plan_reward_roles(level, &ladder, &[], true, false).unwrap_err();
+        assert_eq!(
+            error,
+            RewardPlanError::CapExceeded {
+                list: "grant",
+                count: ROLE_WRITE_CAP + 1,
+                cap: ROLE_WRITE_CAP
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "level role grant cap exceeded: 11 planned over the cap of 10"
+        );
+        let held: Vec<String> = ladder.iter().map(|r| r.role_id.clone()).collect();
+        let error = plan_reward_roles(0, &ladder, &held, true, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .starts_with("level role revoke cap exceeded"));
+        // Suppressed role writes never refuse, even over the cap.
+        assert!(plan_reward_roles(level, &ladder, &[], false, true)
+            .unwrap()
+            .grant
+            .is_empty());
+    }
+
+    #[test]
     fn level_role_writes_follow_onboarding_mode() {
         assert!(
             level_role_writes_allowed(false),
@@ -1067,7 +1136,7 @@ mod tests {
             },
         ];
         // Level 10 holding nothing: grants both rungs.
-        let plan = plan_reward_roles(10, &rewards, &[], true, false);
+        let plan = plan_reward_roles(10, &rewards, &[], true, false).expect("under cap");
         assert_eq!(
             plan.grant,
             vec![
@@ -1079,7 +1148,7 @@ mod tests {
         assert_eq!(plan.grant_reason, "TWO leveling: reached level 10");
         assert!(plan.revoke_reason.is_none());
         // Re-planning after applying is empty (idempotent grants).
-        let replan = plan_reward_roles(10, &rewards, &plan.grant, true, false);
+        let replan = plan_reward_roles(10, &rewards, &plan.grant, true, false).expect("under cap");
         assert!(replan.grant.is_empty() && replan.revoke.is_empty());
         // Level 5 holding the level-10 role: keeps 5, revokes 10, grants
         // nothing; non-ladder roles are never touched.
@@ -1093,7 +1162,8 @@ mod tests {
             ],
             true,
             true,
-        );
+        )
+        .expect("under cap");
         assert!(plan.grant.is_empty());
         assert_eq!(plan.revoke, vec!["400000000000000010".to_owned()]);
         assert_eq!(
@@ -1101,7 +1171,7 @@ mod tests {
             Some("TWO leveling: below level thresholds at level 5")
         );
         // Session mode: no writes at all.
-        let plan = plan_reward_roles(10, &rewards, &[], false, true);
+        let plan = plan_reward_roles(10, &rewards, &[], false, true).expect("suppressed");
         assert!(plan.grant.is_empty() && plan.revoke.is_empty());
     }
 
@@ -1157,7 +1227,7 @@ mod tests {
             role_id: "400000000000000010".to_owned(),
         }];
         let held = ["400000000000000010".to_owned()];
-        let plan = plan_reward_roles(5, &rewards, &held, true, false);
+        let plan = plan_reward_roles(5, &rewards, &held, true, false).expect("under cap");
         assert!(plan.grant.is_empty() && plan.revoke.is_empty());
         assert!(plan.revoke_reason.is_none());
     }

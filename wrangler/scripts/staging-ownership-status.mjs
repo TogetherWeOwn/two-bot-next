@@ -77,6 +77,9 @@ export async function readOwnershipStatus({ url, token }, send = fetch, now = ()
     // Fail closed on transport/redirect failures without echoing raw text.
     // Only the control client's fixed-text validation errors are printable.
     if (isPrintableControlError(error)) {
+      if (error.message === 'Invalid ownership control response') {
+        throw new StatusError('Invalid ownership status response; stop without substituting credentials');
+      }
       throw error;
     }
     throw new StatusError('Ownership status check failed; stop and report without substituting credentials');

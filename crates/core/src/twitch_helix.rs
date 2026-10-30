@@ -546,6 +546,10 @@ impl<T: HelixTransport> HelixClient<T> {
         }
         let document: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|_| HelixError::BadResponse("token response is not JSON"))?;
+        // Bytes already parsed above: a repeated key is the only refusal left,
+        // and it fires before anything is stored.
+        crate::duplicate_keys::reject_duplicate_keys(&response.body)
+            .map_err(|_| HelixError::BadResponse("body contains a duplicate JSON object key"))?;
         let now = (self.clock)();
         self.token = Some(parse_token_response(&document, now)?);
         Ok(())
@@ -642,6 +646,11 @@ impl<T: HelixTransport> HelixClient<T> {
                 .await?;
             let document: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|_| HelixError::BadResponse("subscription listing is not JSON"))?;
+            // Bytes already parsed above: a repeated key on any page fails the
+            // whole listing, so reconcile never plans from a prefix.
+            crate::duplicate_keys::reject_duplicate_keys(&response.body).map_err(|_| {
+                HelixError::BadResponse("body contains a duplicate JSON object key")
+            })?;
             // Fail closed on malformed envelopes via the shared pure
             // validator (also driven by the fuzz target); see
             // [`validate_subscription_listing_page`].

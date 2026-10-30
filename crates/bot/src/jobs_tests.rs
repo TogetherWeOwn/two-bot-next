@@ -69,7 +69,7 @@ async fn cadence_keeps_startup_phase_and_jitter_is_bounded() {
     settle().await;
     assert_eq!(count.load(Ordering::SeqCst), 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -95,7 +95,7 @@ async fn overrunning_job_skips_deadlines_without_overlap_or_catchup() {
     settle().await;
     assert_eq!(count.load(Ordering::SeqCst), 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -119,7 +119,7 @@ async fn delayed_supervisor_does_not_replay_a_busy_deadline() {
     settle().await;
     assert_eq!(count.load(Ordering::SeqCst), 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -156,7 +156,7 @@ async fn timeout_cancels_attempt_and_next_success_resets_failure_streak() {
     assert_eq!(status.read().await["timeout"].last_error_class, None);
     assert_eq!(status.read().await["timeout"].consecutive_failures, 0);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -191,7 +191,7 @@ async fn panics_in_future_and_factory_do_not_kill_other_jobs() {
     assert_eq!(count.load(Ordering::SeqCst), 2);
     assert_eq!(status.read().await["panic"].consecutive_failures, 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -334,7 +334,7 @@ async fn shutdown_while_waiting_for_status_lock_never_starts_an_attempt() {
         drop(stop);
         settle().await;
         drop(locked);
-        task.await.unwrap();
+        task.await.unwrap().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
         let current = &status.read().await["good"];
         assert_eq!(current.last_start, None);
@@ -477,7 +477,9 @@ async fn timeout_and_panics_report_failure_with_bounded_labels() {
     settle().await;
     let text = metrics.render(None);
     assert_eq!(text.lines().count(), before);
-    assert!(!text.contains("secret"));
+    // `invalid_secret` is a legitimate bounded kind: match the hostile
+    // `secret=value` injection marker, not the bare substring.
+    assert!(!text.contains("secret="));
     assert!(!text.contains("job=\"panic\""));
     assert!(!text.contains("job=\"factory\""));
     assert!(text.contains("two_bot_job_runs_total{job=\"other\",outcome=\"failure\"} 3\n"));
@@ -565,7 +567,7 @@ async fn dynamic_cadence_reschedules_the_next_tick_without_restart() {
         "t=180: last run t=80 + 100 s"
     );
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 /// A decrease observed long after last-run + new cadence fires one prompt
@@ -601,7 +603,7 @@ async fn dynamic_cadence_decrease_past_due_runs_once_promptly() {
     settle().await;
     assert_eq!(count.load(Ordering::SeqCst), 3);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 /// A decrease that becomes due while the action still runs is remembered and
@@ -664,7 +666,7 @@ async fn dynamic_cadence_prompt_during_active_runs_after_completion() {
     }
     assert_eq!(count.load(Ordering::SeqCst), 3, "next slot after prompt");
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -678,7 +680,27 @@ async fn already_stopped_or_closed_signal_never_starts_a_job() {
             statuses(&["good"], false),
             rx,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn supervise_fails_fast_on_an_unregistered_name() {
+    let status = statuses(&["good"], false);
+    let (_stop, rx) = watch::channel(false);
+    let error = supervise(
+        vec![job("ghost", Arc::new(|| Box::pin(async { Ok(()) })))],
+        status.clone(),
+        rx,
+    )
+    .await
+    .expect_err("an unregistered name fails at spawn, never in a supervisor task");
+    assert_eq!(error.to_string(), "unregistered job: ghost");
+    assert!(!status.read().await.contains_key("ghost"));
+    assert!(
+        !status.read().await["good"].running,
+        "no task spawns after a registration failure"
+    );
 }

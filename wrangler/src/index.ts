@@ -194,6 +194,11 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   /** Exact "1" admits POST /ops/kill-switch. Staging-only; never production
    * without the CISO review (AC4). Enforced by check-env-bindings.py. */
   OPS_KILLSWITCH_ENABLED?: string;
+  /** Operator-set Worker var: full GET URL of the /ops/config record the
+   * container polls on every settings tick (Slice 0a). Forwarded on its own
+   * explicit containerEnvVars line when set, never flag-forwarded (`_URL`
+   * names cannot join FORWARDED_FLAGS). */
+  TWO_OPS_CONFIG_URL?: string;
   /** Optional Hyperdrive binding to shared Postgres; absent → snapshot, clicks dropped. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -800,6 +805,17 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
       if (env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID) vars["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"] = env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID;
       if (env.TWO_EVENTSUB_INVITE_URL) vars["TWO_EVENTSUB_INVITE_URL"] = env.TWO_EVENTSUB_INVITE_URL;
     }
+  }
+  // /ops override enforcement (Slice 0a): the container GETs the ops record
+  // from this URL on every settings tick. Non-secret but URL-shaped, so it
+  // is never flag-forwarded (NOT_FORWARDED in container-env.ts). Absent stays
+  // absent and the Rust layer stays disabled. The fetch bearer is the control
+  // token's value, forwarded only while the URL is set so existing
+  // OPS_CONTROL_TOKEN deployments do not hand the container a token it cannot
+  // use; it is never logged.
+  if (env.TWO_OPS_CONFIG_URL) vars["TWO_OPS_CONFIG_URL"] = env.TWO_OPS_CONFIG_URL;
+  if (env.TWO_OPS_CONFIG_URL && env.OPS_CONTROL_TOKEN) {
+    vars["TWO_OPS_CONFIG_TOKEN"] = env.OPS_CONTROL_TOKEN;
   }
   return vars;
 }

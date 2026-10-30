@@ -189,6 +189,31 @@ impl Context {
     }
 }
 
+#[cfg(test)]
+impl Context {
+    /// Test-only constructor for sibling test modules, which cannot name the
+    /// private `observation`/`events_gate` fields. Pre-seeds the pool cell with
+    /// the caller's pool so offline tests never dial. Never compiled into the
+    /// deployed binary.
+    pub(crate) fn for_tests(
+        url: String,
+        pool: PgPool,
+        rest: ActionExecutor,
+        guild: String,
+    ) -> Self {
+        let cell = OnceCell::new();
+        cell.set(pool).expect("seed the pool cell");
+        Self {
+            url,
+            pool: cell,
+            rest,
+            guild,
+            observation: Mutex::new(()),
+            events_gate: JobGate::default(),
+        }
+    }
+}
+
 /// Fallback cancellation if the HTTP owner is dropped before graceful cleanup.
 struct Shutdown(watch::Sender<bool>);
 impl Drop for Shutdown {
@@ -344,6 +369,18 @@ pub async fn serve(
                 let scheduled = scheduled_jobs::register(context.clone(), &activation);
                 let scheduled_parked = scheduled.is_none();
                 registered.extend(scheduled);
+                if let Some(job) = crate::giveaway_runtime::register(context.clone(), &activation) {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::giveaway_runtime::REFRESH_JOB);
+                }
+                if let Some(job) =
+                    crate::giveaway_runtime::register_draw(context.clone(), &activation)
+                {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::giveaway_runtime::DRAW_JOB);
+                }
                 // The unban sweep shares the boot-composed member consumer:
                 // one guild store across commands and sweep, never a second
                 // same-guild consumer with its own local queues.
@@ -360,6 +397,11 @@ pub async fn serve(
                     registered.push(job);
                 } else {
                     parked.push(feed_jobs::NAME);
+                }
+                if let Some(job) = crate::lfg_jobs::register(context.clone(), &activation) {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::lfg_jobs::NAME);
                 }
                 // Repeat-history expiry rides the shared supervisor.
                 if crate::automod_gateway::enabled() {
@@ -388,7 +430,7 @@ pub async fn serve(
     if let Some(service) = self_roles {
         registered.push(service.recovery_job());
     }
-    let status = registered_statuses(&registered, &parked).await;
+    let status = prepare_job_statuses(&registered, &parked, &shutdown).await?;
     let public = server::serve(listener, gateway, status.clone(), shutdown.clone());
     let http = async {
         match (receiver, eventsub_receiver) {
@@ -467,9 +509,28 @@ fn retention_registration(config: &Config) -> RetentionRegistration {
     }
 }
 
-async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
+/// Prepare boot status, cancelling boot-owned siblings on registration failure.
+async fn prepare_job_statuses(
+    registered: &[Job],
+    parked: &[&str],
+    shutdown: &watch::Sender<bool>,
+) -> std::io::Result<jobs::SharedStatus> {
+    registered_statuses(registered, parked)
+        .await
+        .map_err(|error| {
+            // The boot owner joins reconcile after serve returns, even when
+            // registration fails before serve_jobs installs its shutdown guard.
+            shutdown.send_replace(true);
+            std::io::Error::other(error)
+        })
+}
+
+async fn registered_statuses(
+    registered: &[Job],
+    parked: &[&str],
+) -> Result<jobs::SharedStatus, jobs::UnregisteredJob> {
     // NAMES already carries the DB-only settings poll alongside the
-    // REST-backed domains, so the status map lists all eleven jobs.
+    // REST-backed domains, so the status map lists all sixteen jobs.
     let mut names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)
@@ -478,6 +539,9 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
         .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
+        .chain([crate::giveaway_runtime::REFRESH_JOB])
+        .chain([crate::giveaway_runtime::DRAW_JOB])
+        .chain([crate::lfg_jobs::NAME])
         .chain([crate::retention_jobs::NAME])
         .collect();
     if crate::automod_gateway::enabled() {
@@ -489,11 +553,15 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
     let status = jobs::statuses(&names, true);
     {
         let mut entries = status.write().await;
+        // Fail fast before unparking anything: an unknown name is a
+        // registration bug, not a status to invent.
+        jobs::check_registered(registered, &entries)?;
         for job in registered {
-            entries
-                .get_mut(job.name)
-                .expect("known registered job")
-                .parked = false;
+            // Proven by the check above: every registered name resolves.
+            let Some(entry) = entries.get_mut(job.name) else {
+                unreachable!("registered_statuses validated every job name: {}", job.name);
+            };
+            entry.parked = false;
         }
         for name in parked {
             if let Some(entry) = entries.get_mut(*name) {
@@ -501,7 +569,7 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
             }
         }
     }
-    status
+    Ok(status)
 }
 
 /// First listener termination stops admission everywhere and drains its sibling.
@@ -540,7 +608,17 @@ pub(crate) async fn serve_jobs(
     shutdown: watch::Sender<bool>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
 ) -> std::io::Result<()> {
+    // Registration failures must also cancel sibling tasks owned by boot.
     let shutdown = Shutdown(shutdown);
+    // Fail fast before spawning the supervisor task or draining HTTP: its
+    // completion is joined with `let _`, so a registration error returned from
+    // inside the task would read as a silent idle instead of a boot failure.
+    // The guard is scoped: the read lock must be released before the
+    // supervisor spawns, or the jobs' first status write would block on it.
+    {
+        let statuses = status.read().await;
+        jobs::check_registered(&registered, &statuses).map_err(std::io::Error::other)?;
+    }
     let supervisor = tokio::spawn(jobs::supervise(registered, status, shutdown.0.subscribe()));
     let result = drain_http(http, shutdown.0.subscribe()).await;
     shutdown.0.send_replace(true);

@@ -21,7 +21,7 @@ use sqlx::{Pool, Postgres};
 use super::rsvp::{
     checkin_idempotency_key, checkin_metadata_json, checkin_source, checkin_source_event_id,
     AttendanceProof, RsvpAudit, RsvpRecord, RsvpStatus, RsvpTransition, ATTENDANCE_EVENT_TYPE,
-    AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
     MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION,
 };
 
@@ -109,16 +109,33 @@ async fn upsert_rsvp_row(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     record: &RsvpRecord,
 ) -> Result<Option<(String, sqlx::types::time::OffsetDateTime)>, RsvpStoreError> {
-    // Coarser lock first, always in this order: the event lock serializes the
-    // admission count below across distinct members, and the identity lock
-    // then serializes the read-modify-write on this member's row. Arity
-    // differs (2 vs 3 elements), so the two keys never alias by construction.
+    // Coarser lock first, always in this order on every RSVP write path:
+    // event, then user budget, then identity. The event lock serializes the
+    // admission count below across distinct members. The user-budget lock
+    // serializes the per-user rate check plus its audit-consuming write
+    // across distinct events: the ledger below counts by (guild, user), so
+    // same-user writers on different events must meet here or a single
+    // remaining budget slot admits both. The identity lock then serializes
+    // the read-modify-write on this member's row. Independent users take
+    // distinct budget keys and never contend; per-event capacity still
+    // serializes on the event key. The budget key carries a literal tag so
+    // it can never alias the untagged 2- and 3-element keys (whose first
+    // element is always a numeric guild snowflake); a hash collision only
+    // causes extra contention, never an incorrect transition.
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended(
             jsonb_build_array($1::text, $2::text)::text, 0))",
     )
     .bind(&record.guild_id)
     .bind(&record.event_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array('rsvp-user-budget-v1', $1::text, $2::text)::text, 0))",
+    )
+    .bind(&record.guild_id)
+    .bind(&record.user_id)
     .execute(&mut **tx)
     .await?;
     // FOR UPDATE cannot lock an absent row. Serialize the complete identity
@@ -261,7 +278,7 @@ pub async fn write_audit(pool: &Pool<Postgres>, audit: &RsvpAudit) -> Result<boo
 /// The audit append shared by [`write_audit`] and [`put_rsvp_with_audit`]:
 /// same row SQL and bindings on either a pool or an open transaction, so the
 /// standalone and atomic paths can never drift apart.
-async fn insert_audit_row<'e, E>(exec: E, audit: &RsvpAudit) -> Result<bool, sqlx::Error>
+pub(crate) async fn insert_audit_row<'e, E>(exec: E, audit: &RsvpAudit) -> Result<bool, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
@@ -323,12 +340,50 @@ pub struct CheckinWrite {
 /// The shared table lock serializes with concurrent opt-outs (which take
 /// SHARE ROW EXCLUSIVE over these tables): whoever locks first wins, so a
 /// write that passes the gate can never land after the purge.
+///
+/// Callers that must audit the check-in use [`record_checkin_with_audit`]:
+/// the fact and its audit row commit in one transaction, so a failed audit
+/// insert rolls the fact back with it. This standalone path writes no audit
+/// row.
 pub async fn record_checkin(
     pool: &Pool<Postgres>,
     checkin: &CheckinWrite,
 ) -> Result<bool, RsvpStoreError> {
+    let (inserted, _) = record_checkin_inner(pool, checkin, None).await?;
+    Ok(inserted)
+}
+
+/// Record one verified-attendance fact with its required audit row, sharing
+/// one transaction like [`put_rsvp_with_audit`]: the fact insert and the
+/// audit insert commit together, so a failed audit insert rolls the fact
+/// back and no partial write can survive this path. Returns
+/// `(fact_inserted, audit_inserted)`: duplicates, `rsvp` proofs and
+/// suppressed pairs report `(false, false)` with no audit write, and a
+/// retried audit id dedupes (`ON CONFLICT DO NOTHING`) exactly as
+/// [`write_audit`] does — the fact still records while `audit_inserted`
+/// reports `false`, so the caller must handle that boolean explicitly
+/// instead of discarding it. An audit-step transport failure surfaces as
+/// [`RsvpStoreError::AuditDb`], distinct from a fact-step
+/// [`RsvpStoreError::Db`].
+pub async fn record_checkin_with_audit(
+    pool: &Pool<Postgres>,
+    checkin: &CheckinWrite,
+    audit: &RsvpAudit,
+) -> Result<(bool, bool), RsvpStoreError> {
+    record_checkin_inner(pool, checkin, Some(audit)).await
+}
+
+/// The transactional check-in write shared by [`record_checkin`] and
+/// [`record_checkin_with_audit`], so admission order, lock order, gate order
+/// and row SQL stay identical on both paths. The audit insert runs only when
+/// the fact insert lands, inside the same transaction.
+async fn record_checkin_inner(
+    pool: &Pool<Postgres>,
+    checkin: &CheckinWrite,
+    audit: Option<&RsvpAudit>,
+) -> Result<(bool, bool), RsvpStoreError> {
     if !checkin.proof.writes_fact() {
-        return Ok(false);
+        return Ok((false, false));
     }
     let key = checkin_idempotency_key(&checkin.event_occurrence_id, &checkin.member_id);
     let source = checkin_source(&checkin.event_occurrence_id);
@@ -341,7 +396,7 @@ pub async fn record_checkin(
         .await?;
     if crate::privacy::suppressed_in(&mut tx, &checkin.guild_id, &checkin.member_id).await? {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, false));
     }
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended(
@@ -357,7 +412,7 @@ pub async fn record_checkin(
             .fetch_optional(&mut *tx)
             .await?;
     if duplicate.is_some() {
-        return Ok(false);
+        return Ok((false, false));
     }
     let facts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM community_facts WHERE guild_id = $1 AND source = $2",
@@ -398,8 +453,18 @@ pub async fn record_checkin(
     ))
     .fetch_optional(&mut *tx)
     .await?;
+    let fact_inserted = inserted.is_some();
+    // Only a landed fact earns its audit row, in the same transaction: a
+    // duplicate, suppression or lost race writes no audit row, and a failed
+    // audit insert rolls the fact back with it.
+    let audit_inserted = match (fact_inserted, audit) {
+        (true, Some(audit)) => insert_audit_row(&mut *tx, audit)
+            .await
+            .map_err(RsvpStoreError::AuditDb)?,
+        _ => false,
+    };
     tx.commit().await?;
-    Ok(inserted.is_some())
+    Ok((fact_inserted, audit_inserted))
 }
 
 /// RA-03 compensation (TOG-19773): undo exactly the RSVP write one attempt
@@ -407,13 +472,25 @@ pub async fn record_checkin(
 /// A first response (`previous` is `None`) deletes the row this attempt
 /// wrote; a re-response restores the member's exact prior row (status plus
 /// timestamp) instead, so a refused rewrite never destroys the earlier
-/// response that was live before this attempt. Both paths are guarded by
-/// this attempt's `responded_at`: a newer concurrent rewrite of the same
-/// member's row survives (the newer attempt delivers its own reply), while
-/// this attempt's audit row — owned by its unique id — is always removed.
-/// Net effect on refusal when this call succeeds: the table looks as if this
-/// attempt never ran. A failed call can leave the attempt's rows; the caller
-/// reports that as a `compensation_failed` diagnostic.
+/// response that was live before this attempt.
+///
+/// The response cleanup is fenced to this attempt's write identity — its
+/// audit row's `(outcome, created_at)` plus insertion commit order — never
+/// `responded_at` alone and never timestamp order: a later-committed rewrite
+/// (including an identical same-millisecond status rewrite, or an earlier
+/// timestamp committed second) survives older compensation, while this
+/// attempt's audit row — owned by its unique id — is always removed. When
+/// the audit row is absent (idempotent retry or a write that never
+/// ledgered), the fence falls back to the `responded_at` guard so the
+/// exact-timestamp case still cleans up.
+///
+/// The response cleanup and the audit delete share one transaction under
+/// the same identity lock writers take, so a midway database failure
+/// rolls both back and a same-identity rewrite cannot land between the
+/// fence check and the cleanup. Net effect on refusal when this call
+/// succeeds: the table looks as if this attempt never ran. A failed call
+/// leaves both pre-cleanup rows intact; the caller reports that as a
+/// `compensation_failed` diagnostic.
 pub async fn compensate_rsvp_write(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -423,60 +500,184 @@ pub async fn compensate_rsvp_write(
     audit_id: &str,
     previous: Option<(RsvpStatus, &str)>,
 ) -> Result<(), RsvpStoreError> {
-    if let Some((status, previous_responded_at)) = previous {
-        sqlx::query(
-            "UPDATE event_rsvps SET status = $4, responded_at = $5::timestamptz
-             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
-               AND responded_at = $6::timestamptz",
-        )
-        .bind(guild_id)
-        .bind(event_id)
-        .bind(user_id)
-        .bind(status.as_str())
-        .bind(previous_responded_at)
-        .bind(responded_at)
-        .execute(pool)
-        .await?;
-    } else {
-        sqlx::query(
-            "DELETE FROM event_rsvps
-             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
-               AND responded_at = $4::timestamptz",
-        )
-        .bind(guild_id)
-        .bind(event_id)
-        .bind(user_id)
-        .bind(responded_at)
-        .execute(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    // Serialize with same-identity writers and compensations. Writers take
+    // event -> budget -> identity; taking only the identity key here cannot
+    // deadlock (this path never waits for event/budget while holding it)
+    // and still blocks a same-identity rewrite from landing mid-cleanup.
+    // Tuple encoding matches the writer identity key exactly.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    // This attempt's own audit row is the write-identity witness: its
+    // outcome/created_at names what the attempt wrote, and its insertion
+    // commit order decides which attempt is newer — timestamps never order
+    // attempts because mint order can differ from commit order.
+    let owned: Option<(String, sqlx::types::time::OffsetDateTime)> =
+        sqlx::query_as("SELECT outcome, created_at FROM announcements_audit_log WHERE id = $1")
+            .bind(audit_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current: Option<(String, sqlx::types::time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT status, responded_at FROM event_rsvps
+         WHERE guild_id = $1 AND event_id = $2 AND user_id = $3 FOR UPDATE",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let owned_response = match (&owned, &current) {
+        (Some((outcome, created)), Some((status, responded))) => {
+            // Values must still be this attempt's write, and no later
+            // same-identity attempt may exist — otherwise the row belongs
+            // to the newer attempt and survives this compensation.
+            status == outcome
+                && responded == created
+                && !has_newer_rsvp_audit(&mut tx, guild_id, user_id, event_id, audit_id).await?
+        }
+        // No audit row to witness ownership: keep the legacy
+        // responded_at-guarded cleanup so the exact-timestamp case still
+        // removes its row (the guard below no-ops on mismatch).
+        (None, Some(_)) => true,
+        // No response row: nothing to clean, only the audit delete below.
+        (_, None) => false,
+    };
+    if owned_response {
+        if let Some((status, previous_responded_at)) = previous {
+            sqlx::query(
+                "UPDATE event_rsvps SET status = $4, responded_at = $5::timestamptz
+                 WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+                   AND responded_at = $6::timestamptz",
+            )
+            .bind(guild_id)
+            .bind(event_id)
+            .bind(user_id)
+            .bind(status.as_str())
+            .bind(previous_responded_at)
+            .bind(responded_at)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "DELETE FROM event_rsvps
+                 WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+                   AND responded_at = $4::timestamptz",
+            )
+            .bind(guild_id)
+            .bind(event_id)
+            .bind(user_id)
+            .bind(responded_at)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
         .bind(audit_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
+/// SQL predicate "`newer` committed after `owned`", comparing 32-bit
+/// transaction ids the way PostgreSQL itself does (`TransactionIdPrecedes`):
+/// the forward distance modulo 2^32 must fall in `[1, 2^31)`. A plain `>`
+/// on `xmin` inverts once the two ids straddle a transaction-id wraparound
+/// (an older pre-wrap audit then looks numerically greater than a new
+/// post-wrap attempt), so the fence must never compare `xmin` numerically.
+/// Operands interpolate as SQL fragments (column expressions in the fence,
+/// literals in the regression test) — never caller input.
+fn xid_committed_after(newer: &str, owned: &str) -> String {
+    format!("((({newer}) - ({owned}) + 4294967296) % 4294967296) BETWEEN 1 AND 2147483647")
+}
+
+/// True when a later same-identity RSVP attempt committed after `audit_id`,
+/// by insertion commit order (`xmin`) alone. Timestamps never order
+/// attempts: the handler mints `responded_at` before pool and lock
+/// acquisition, so concurrent attempts can mint in one order and commit in
+/// the other, and the store accepts decreasing timestamps. Same-user
+/// writers serialize on the budget lock and same-identity writers on the
+/// identity lock, so commit order matches write order here; the `xmin`
+/// comparison is wraparound-aware (see [`xid_committed_after`]), so it
+/// stays correct when transaction ids straddle a wraparound. Scoped to
+/// `event.rsvp` rows so other slices sharing the log table never fence an
+/// RSVP cleanup.
+async fn has_newer_rsvp_audit(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    guild_id: &str,
+    user_id: &str,
+    event_id: &str,
+    audit_id: &str,
+) -> Result<bool, sqlx::Error> {
+    // SAFETY: only the fixed predicate fragment interpolates; values bind.
+    let newer_after_owned =
+        xid_committed_after("newer.xmin::text::bigint", "owned.xmin::text::bigint");
+    let sql = format!(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM announcements_audit_log AS newer,
+                announcements_audit_log AS owned
+           WHERE owned.id = $5
+             AND newer.guild_id = $1
+             AND newer.actor_id = $2
+             AND newer.action = $3
+             AND newer.target_key = $4
+             AND newer.id <> owned.id
+             AND {newer_after_owned}
+         )",
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(guild_id)
+        .bind(user_id)
+        .bind(RSVP_AUDIT_ACTION)
+        .bind(event_id)
+        .bind(audit_id)
+        .fetch_one(&mut **tx)
+        .await
+}
+
 /// RA-03 compensation (TOG-19773): remove the attendance fact one attempt
-/// inserted when post-write revalidation finds a membership gone. The delete
-/// keys on the exact idempotency key, so only this identity's fact can match.
+/// inserted when post-write revalidation finds a membership gone, plus the
+/// audit row that attempt wrote — both deletes in one transaction, so either
+/// both rows go or neither does. The fact delete keys on the exact
+/// idempotency key, so only this identity's fact can match; `audit_id` is
+/// `Some` only when this attempt inserted its audit row (a deduped audit id
+/// belongs to the earlier attempt and must survive), so a refused attempt
+/// leaves neither row it owns — like [`compensate_rsvp_write`], which always
+/// removes its attempt's audit row too.
 pub async fn compensate_checkin_write(
     pool: &Pool<Postgres>,
     idempotency_key: &str,
+    audit_id: Option<&str>,
 ) -> Result<(), RsvpStoreError> {
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM community_facts WHERE idempotency_key = $1")
         .bind(idempotency_key)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    if let Some(audit_id) = audit_id {
+        sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
+            .bind(audit_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
 /// RA-03 retention (TOG-19773): delete RSVP rows and this slice's own audit
 /// rows strictly older than `cutoff_iso`, returning
 /// `(rsvps_deleted, audits_deleted)`. The audit delete is scoped to
-/// [`RSVP_AUDIT_ACTION`] rows: the log table is shared with feed, LFG and
-/// recovery writers, and their evidence must survive an RSVP purge. The
-/// cutoff must be older than the audit retention floor
+/// [`RSVP_AUDIT_ACTION`] and [`CHECKIN_AUDIT_ACTION`] rows: the log table is
+/// shared with feed, LFG and recovery writers, and their evidence must
+/// survive an RSVP purge. The cutoff must be older than the audit retention floor
 /// ([`AUDIT_RETENTION_DAYS`], the stricter horizon, which also covers the
 /// RSVP floor); a newer cutoff is refused with
 /// [`RsvpStoreError::CutoffTooRecent`] before any delete, so required
@@ -502,10 +703,11 @@ pub async fn prune_rsvp_history(
         .rows_affected();
     let audits = sqlx::query(
         "DELETE FROM announcements_audit_log
-         WHERE action = $2 AND created_at < $1::timestamptz",
+         WHERE action IN ($2, $3) AND created_at < $1::timestamptz",
     )
     .bind(cutoff_iso)
     .bind(RSVP_AUDIT_ACTION)
+    .bind(CHECKIN_AUDIT_ACTION)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1158,6 +1360,95 @@ mod tests {
         drop_schema(&pool, &schema).await;
     }
 
+    /// Check-in audit parity: a recorded fact commits its audit row in the
+    /// same transaction; a retried audit id dedupes while the fact still
+    /// records; a duplicate writes neither; and a failed audit insert rolls
+    /// the fact back, so no partial write survives.
+    #[tokio::test]
+    async fn checkin_with_audit_commits_fact_and_audit_atomically() {
+        let Some((pool, schema)) = test_pool("checkin_audit")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let audit = |id: &str, member: &str| {
+            RsvpAudit::for_checkin(
+                id,
+                "1545644954272137297",
+                "host-1",
+                "occ-audit",
+                member,
+                "2026-09-02T10:00:00.000Z",
+            )
+        };
+        // Recorded: one fact, one audit row.
+        assert_eq!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m1", "2026-09-02T10:00:00.000Z"),
+                &audit("checkin:1", "m1"),
+            )
+            .await
+            .expect("recorded"),
+            (true, true)
+        );
+        // Duplicate: neither a new fact nor a new audit row, even with a
+        // fresh audit id.
+        assert_eq!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m1", "2026-09-02T10:01:00.000Z"),
+                &audit("checkin:2", "m1"),
+            )
+            .await
+            .expect("duplicate"),
+            (false, false)
+        );
+        // Retried audit id: the new member's fact still records while the
+        // audit dedupes — the caller must handle that `false` explicitly.
+        assert_eq!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m2", "2026-09-02T10:02:00.000Z"),
+                &audit("checkin:1", "m2"),
+            )
+            .await
+            .expect("audit retry"),
+            (true, false)
+        );
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM community_facts),
+                    (SELECT COUNT(*) FROM announcements_audit_log)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("counts");
+        assert_eq!(counts, (2, 1));
+        // A failed audit insert rolls the fact back: dropping the audit
+        // table stands in for an unavailable audit write.
+        sqlx::query("DROP TABLE announcements_audit_log")
+            .execute(&pool)
+            .await
+            .expect("drop audit table");
+        assert!(matches!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m3", "2026-09-02T10:03:00.000Z"),
+                &audit("checkin:3", "m3"),
+            )
+            .await,
+            Err(RsvpStoreError::AuditDb(_))
+        ));
+        let facts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
+            .fetch_one(&pool)
+            .await
+            .expect("facts");
+        assert_eq!(facts, 2, "refused audit write leaves no fact");
+        drop_schema(&pool, &schema).await;
+    }
+
     /// RA-03 retention: history older than the cutoff is purged from both
     /// tables while floored rows survive; a cutoff newer than the audit
     /// floor is refused before any delete, and a malformed cutoff fails as
@@ -1183,6 +1474,20 @@ mod tests {
         write_audit(&pool, &RsvpAudit::for_rsvp("audit-old", &old))
             .await
             .expect("old audit");
+        // This slice's check-in audit rows purge with RSVP history.
+        write_audit(
+            &pool,
+            &RsvpAudit::for_checkin(
+                "audit-checkin-old",
+                "1545644954272137297",
+                "host-1",
+                "occ-old",
+                "old-member",
+                "2020-01-01T00:00:00.000Z",
+            ),
+        )
+        .await
+        .expect("old check-in audit");
         let fresh = rsvp(RsvpStatus::Interested, "new-user", &recent);
         put_rsvp(&pool, &fresh).await.expect("recent write");
         write_audit(&pool, &RsvpAudit::for_rsvp("audit-new", &fresh))
@@ -1208,7 +1513,7 @@ mod tests {
         let pruned = prune_rsvp_history(&pool, "2021-06-01T00:00:00.000Z")
             .await
             .expect("history purge");
-        assert_eq!(pruned, (1, 1));
+        assert_eq!(pruned, (1, 2));
         let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
             .await
             .expect("list");
@@ -1220,6 +1525,10 @@ mod tests {
                 .await
                 .expect("audit ids");
         assert_eq!(audits, ["audit-foreign".to_owned(), "audit-new".to_owned()]);
+        assert!(
+            !audits.iter().any(|id| id == "audit-checkin-old"),
+            "old check-in audit row purges with RSVP history"
+        );
         assert_eq!(
             prune_rsvp_history(&pool, "2021-06-01T00:00:00.000Z")
                 .await
@@ -1321,14 +1630,96 @@ mod tests {
             .expect("m2"),
             "m2 records"
         );
-        compensate_checkin_write(&pool, &checkin_idempotency_key("occ-comp", "m1"))
-            .await
-            .expect("compensate m1");
+        compensate_checkin_write(
+            &pool,
+            &checkin_idempotency_key("occ-comp", "m1"),
+            Some("audit-missing"),
+        )
+        .await
+        .expect("compensate m1");
         let keys: Vec<String> = sqlx::query_scalar("SELECT idempotency_key FROM community_facts")
             .fetch_all(&pool)
             .await
             .expect("keys");
         assert_eq!(keys, [checkin_idempotency_key("occ-comp", "m2")]);
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// RA-03 compensation ownership: when this attempt's audit id deduped, it
+    /// owns no audit row, so compensation removes the fact but keeps the
+    /// earlier attempt's row (`None` deletes no audit row); when the attempt
+    /// inserted its row, compensation removes both rows together.
+    #[tokio::test]
+    async fn compensation_keeps_unowned_audit_row() {
+        let Some((pool, schema)) = test_pool("checkin_comp_own")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Earlier attempt's audit row, still owned by that attempt.
+        let prior = RsvpAudit::for_checkin(
+            "checkin:prior",
+            "1545644954272137297",
+            "host-1",
+            "occ-own",
+            "m1",
+            "2026-09-02T10:00:00.000Z",
+        );
+        write_audit(&pool, &prior).await.expect("prior audit");
+        // This attempt records its fact while the audit id dedupes.
+        let (inserted, audit_inserted) = record_checkin_with_audit(
+            &pool,
+            &checkin("occ-own", "m1", "2026-09-02T10:00:00.000Z"),
+            &prior,
+        )
+        .await
+        .expect("deduped write");
+        assert!(inserted, "fact records");
+        assert!(!audit_inserted, "retried audit id dedupes");
+        // Refusal compensates with no owned audit row.
+        compensate_checkin_write(&pool, &checkin_idempotency_key("occ-own", "m1"), None)
+            .await
+            .expect("compensate unowned");
+        // Owned audit row: compensation removes both rows together.
+        let owned = RsvpAudit::for_checkin(
+            "checkin:owned",
+            "1545644954272137297",
+            "host-1",
+            "occ-own",
+            "m2",
+            "2026-09-02T10:00:00.000Z",
+        );
+        let (inserted, audit_inserted) = record_checkin_with_audit(
+            &pool,
+            &checkin("occ-own", "m2", "2026-09-02T10:00:00.000Z"),
+            &owned,
+        )
+        .await
+        .expect("owned write");
+        assert!(inserted && audit_inserted, "fact and audit record");
+        compensate_checkin_write(
+            &pool,
+            &checkin_idempotency_key("occ-own", "m2"),
+            Some("checkin:owned"),
+        )
+        .await
+        .expect("compensate owned");
+        let facts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
+            .fetch_one(&pool)
+            .await
+            .expect("facts");
+        assert_eq!(facts, 0, "refused facts are removed");
+        let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+            .fetch_all(&pool)
+            .await
+            .expect("audit ids");
+        assert_eq!(
+            audits,
+            ["checkin:prior".to_owned()],
+            "earlier attempt's audit row survives"
+        );
         drop_schema(&pool, &schema).await;
     }
 
@@ -1400,6 +1791,114 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, RsvpStatus::Declined);
         assert_eq!(rows[0].responded_at, "2026-09-10T10:02:00.000Z");
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Commit order, not timestamp order, decides which attempt is newer: the
+    /// handler mints `responded_at` before lock acquisition, so a later
+    /// timestamp can commit first and an earlier timestamp second. Compensating
+    /// the last-committed attempt must restore its predecessor even though the
+    /// predecessor's timestamp is greater.
+    #[tokio::test]
+    async fn compensation_restores_predecessor_when_commit_order_inverts_timestamps() {
+        let Some((pool, schema)) = test_pool("rsvp_fence_order_inversion")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Later timestamp commits first ...
+        let first = rsvp(RsvpStatus::Interested, "u1", "2026-09-10T10:00:00.500Z");
+        put_rsvp(&pool, &first).await.expect("first");
+        write_audit(&pool, &RsvpAudit::for_rsvp("audit-inversion-first", &first))
+            .await
+            .expect("audit");
+        // ... then the earlier timestamp commits second and owns the row.
+        let second = rsvp(RsvpStatus::Going, "u1", "2026-09-10T10:00:00.000Z");
+        let transition = put_rsvp(&pool, &second).await.expect("second");
+        write_audit(
+            &pool,
+            &RsvpAudit::for_rsvp("audit-inversion-second", &second),
+        )
+        .await
+        .expect("audit");
+        assert_eq!(
+            transition.previous_response(),
+            Some((RsvpStatus::Interested, "2026-09-10T10:00:00.500Z"))
+        );
+        compensate_rsvp_write(
+            &pool,
+            "1545644954272137297",
+            "1546451670500642999",
+            "u1",
+            "2026-09-10T10:00:00.000Z",
+            "audit-inversion-second",
+            transition.previous_response(),
+        )
+        .await
+        .expect("compensate inverted");
+        let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, RsvpStatus::Interested);
+        assert_eq!(rows[0].responded_at, "2026-09-10T10:00:00.500Z");
+        let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+            .fetch_all(&pool)
+            .await
+            .expect("audit ids");
+        assert_eq!(audits, ["audit-inversion-first".to_owned()]);
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// The fence's commit-order predicate stays correct across transaction-id
+    /// wraparound: a plain numeric `>` on `xmin` inverts once ids straddle
+    /// the 2^32 boundary. Real `xmin` wraparound is not fabricable in a
+    /// test, so this pins the exact shared predicate over boundary
+    /// literals — including the wrap-straddling pairs a numeric comparison
+    /// gets backwards.
+    #[tokio::test]
+    async fn fence_commit_order_survives_transaction_id_wraparound() {
+        let Some((pool, schema)) = test_pool("rsvp_fence_xid_wraparound")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // (newer xid, owned xid, newer committed after owned)
+        let cases = [
+            ("101", "100", true),
+            ("100", "100", false),
+            ("100", "101", false),
+            // Post-wrap attempt after a pre-wrap audit: numerically
+            // smaller, but committed later.
+            ("5", "4294967295", true),
+            // Pre-wrap audit against a post-wrap attempt: numerically
+            // greater, but committed earlier — this is the inversion a
+            // numeric `xmin` comparison gets wrong.
+            ("4294967295", "5", false),
+            // Frozen-era audit against a recent attempt.
+            ("500000000", "2", true),
+            // Modulo-2^32 boundary, matching TransactionIdPrecedes: a
+            // forward distance of 2^31 - 1 is after, 2^31 is not.
+            ("2147483648", "1", true),
+            ("2147483649", "1", false),
+        ];
+        for (newer, owned, expected) in cases {
+            // SAFETY: only numeric literals interpolate; the predicate is
+            // the exact fragment the fence query uses.
+            let sql = format!("SELECT {}", xid_committed_after(newer, owned));
+            let actual: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .fetch_one(&pool)
+                .await
+                .expect("predicate probe");
+            assert_eq!(
+                actual, expected,
+                "commit order of newer={newer} against owned={owned}"
+            );
+        }
         drop_schema(&pool, &schema).await;
     }
 }

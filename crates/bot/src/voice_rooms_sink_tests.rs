@@ -5,6 +5,8 @@ use twilight_model::gateway::payload::incoming::{
 };
 use two_bot_discord::MemPipeline;
 
+#[path = "voice_access_role_slot_scope_tests.rs"]
+mod access_role_slot_scope;
 #[path = "voice_actor_init_jitter_adoption_tests.rs"]
 mod init_jitter_adoption;
 #[path = "voice_actor_init_recovery_tests.rs"]
@@ -173,6 +175,40 @@ impl RoomPersistence for Arc<Store> {
         member: u64,
     ) -> Result<(), StoreError> {
         self.as_ref().remove_join_grant(guild, room, member).await
+    }
+    async fn record_event_voice_join(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.as_ref().record_event_voice_join(channel, member).await
+    }
+    async fn record_event_voice_leave(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.as_ref()
+            .record_event_voice_leave(channel, member)
+            .await
+    }
+    async fn event_voice_guild_bindings(
+        &self,
+        guild: u64,
+    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
+        self.as_ref().event_voice_guild_bindings(guild).await
+    }
+    async fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        occupants: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.as_ref()
+            .flush_event_voice_presence(event_id, instance, occupants)
+            .await
+    }
+    async fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        present: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.as_ref()
+            .close_event_voice_spans_absent(event_id, instance, present)
+            .await
     }
 }
 
@@ -565,11 +601,13 @@ async fn create_notifies_existing_actor_before_next_join() {
     assert!(response_text(seen.lock().unwrap().as_ref().unwrap()).contains("Created <#500>"));
     feed(&runtime, &pipeline, voice_event(MEMBER, Some(500)));
     wait_trace(&trace, "move:300:501").await;
+    // The presence hook records the join ahead of room handling.
     assert_eq!(
         *trace.lock().unwrap(),
         [
             "create",
             "add_creator:500",
+            "evjoin:500:300",
             "create",
             "persist:501",
             "move:300:501"
@@ -959,6 +997,80 @@ async fn guild_create_seeds_display_names_for_restarted_rooms() {
         .expect("probe deadline")
         .expect("actor exists");
     assert!(directory.knows(MEMBER));
+}
+
+/// Snapshot occupants never sent a transition (`publish_snapshot` only
+/// sends `Reconcile`): the actor bootstrap flushes them join-only, so a
+/// member already sitting in a channel at GuildCreate owns an open span.
+/// Without the flush no join is recorded for the snapshot occupant.
+#[tokio::test]
+async fn guild_create_snapshot_occupant_gets_a_join_span_at_bootstrap() {
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    feed(&runtime, &pipeline, ready_event());
+    let mut guild: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap();
+    guild["roles"][0]["permissions"] = json!(permissions().bits().to_string());
+    guild["members"].as_array_mut().unwrap().push(json!({
+        "user": {"id": MEMBER.to_string(), "username": "alex", "global_name": "Alex", "discriminator": "0"},
+        "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW
+    }));
+    guild["voice_states"] = json!([{
+        "channel_id": CREATOR.to_string(), "user_id": MEMBER.to_string(), "session_id": "voice",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    }]);
+    feed(
+        &runtime,
+        &pipeline,
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).unwrap(),
+        ))),
+    );
+    wait_trace(&trace, &format!("evjoin:{CREATOR}:{MEMBER}")).await;
+}
+
+/// The actor maintenance tick drives the event-voice guild repair through
+/// the real actor loop: with a live binding seeded, the first maintenance
+/// tick (immediate, because the repair starts due) flushes the occupant
+/// snapshot and closes absent spans. Without the wiring — the snapshot
+/// collection, the due gate or the call itself — the repair markers never
+/// appear.
+#[tokio::test]
+async fn maintenance_tick_repairs_event_voice_spans_through_the_actor() {
+    let (store, http, trace) = fixture();
+    store.ev_bindings.lock().unwrap().push(EventVoiceBinding {
+        channel: CREATOR,
+        event_id: "ev-repair".to_owned(),
+        instance: OffsetDateTime::now_utc(),
+    });
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    feed(&runtime, &pipeline, ready_event());
+    let mut guild: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap();
+    guild["roles"][0]["permissions"] = json!(permissions().bits().to_string());
+    guild["members"].as_array_mut().unwrap().push(json!({
+        "user": {"id": MEMBER.to_string(), "username": "alex", "global_name": "Alex", "discriminator": "0"},
+        "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW
+    }));
+    guild["voice_states"] = json!([{
+        "channel_id": CREATOR.to_string(), "user_id": MEMBER.to_string(), "session_id": "voice",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    }]);
+    feed(
+        &runtime,
+        &pipeline,
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).unwrap(),
+        ))),
+    );
+    // MEMBER sits in the bound channel, so the repair sees one present
+    // occupant: both the flush and the close-absent run through the loop.
+    wait_trace(&trace, "evrepair_flush:ev-repair:1").await;
+    wait_trace(&trace, "evrepair_close:ev-repair:1").await;
 }
 
 async fn creator_ids(runtime: &Runtime) -> Vec<u64> {

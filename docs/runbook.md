@@ -1,5 +1,81 @@
 # two-bot-next operations runbook
 
+<!-- start-here -->
+**Start here — section map**
+
+- [Start here](#start-here)
+- [Is it alive?](#is-it-alive)
+- [Persisted ownership control](#persisted-ownership-control)
+- [Redeploy and rollback](#redeploy-and-rollback)
+- [Restart semantics: durable RESUME, not full state recovery](#restart-semantics-durable-resume-not-full-state-recovery)
+- [Containment, kill switches and feature flags](#containment-kill-switches-and-feature-flags)
+- [Backup, restore and drill commands](#backup-restore-and-drill-commands)
+- [Common failures](#common-failures)
+- [Incident playbooks](#incident-playbooks)
+- [Secret inventory: names only](#secret-inventory-names-only)
+- [Legacy review and deliberately unported operations](#legacy-review-and-deliberately-unported-operations)
+- [Keep the runbook honest](#keep-the-runbook-honest)
+- [Giveaways](#giveaways)
+
+**Alert anchors**
+
+- [job stale](#alert-job-stale)
+- [job unknown stale](#alert-job-unknown-stale)
+- [job failures](#alert-job-failures)
+- [job failure share](#alert-job-failure-share)
+- [REST 429](#alert-rest-429)
+- [REST 5xx](#alert-rest-5xx)
+- [REST admission breaker open](#alert-rest-admission-breaker-open)
+- [REST token invalid](#alert-rest-token-invalid)
+- [REST refusal surge](#alert-rest-refusal-surge)
+- [REST global responses stuck](#alert-rest-global-responses-stuck)
+- [DB pool](#alert-db-pool)
+- [DB errors](#alert-db-errors)
+- [send admission blocked](#alert-send-admission-blocked)
+- [voice failures](#alert-voice-failures)
+- [voice join fast burn](#alert-voice-join-fast-burn)
+- [voice join slow burn](#alert-voice-join-slow-burn)
+- [voice creator-map stale](#alert-voice-creator-map-stale)
+- [voice worker halted](#alert-voice-worker-halted)
+- [voice live self-heal](#alert-voice-live-self-heal)
+- [voice live not ready](#alert-voice-live-not-ready)
+- [voice queue stall](#alert-voice-queue-stall)
+- [error budget fast burn](#alert-error-budget-fast-burn)
+- [error budget slow burn](#alert-error-budget-slow-burn)
+- [gateway missed events](#alert-gateway-missed-events)
+- [gateway unpaired disconnect](#alert-gateway-unpaired-disconnect)
+- [gateway not ready](#alert-gateway-not-ready)
+- [gateway latency dead](#alert-gateway-latency-dead)
+- [gateway reconnect flapping](#alert-gateway-reconnect-flapping)
+- [ticker stale](#alert-ticker-stale)
+- [receiver refusals](#alert-receiver-refusals)
+- [checkpoint failures](#alert-checkpoint-failures)
+- [dispatch drops](#alert-dispatch-drops)
+- [handler duration saturated](#alert-handler-duration-saturated)
+- [prefix trigger verdict refusals](#alert-prefix-trigger-verdict-refusals)
+- [community facts drain failures](#alert-community-facts-drain-failures)
+- [EventSub post failed share](#alert-eventsub-post-failed-share)
+- [event-store consumer lag](#alert-event-store-consumer-lag)
+- [metrics scrape lost](#alert-metrics-scrape-lost)
+- [audit delivery halt](#alert-audit-delivery-halt)
+- [eventsub reconcile failed](#alert-eventsub-reconcile-failed)
+- [EventSub tampered](#alert-eventsub-tampered)
+- [gateway drain skips](#alert-gateway-drain-skips)
+- [retention replay needed](#alert-retention-replay-needed)
+- [voice dispatch timeouts](#alert-voice-dispatch-timeouts)
+- [voice watchdog stucks](#alert-voice-watchdog-stucks)
+- [voice halt recoveries](#alert-voice-halt-recoveries)
+- [REST breaker opens](#alert-rest-breaker-opens)
+- [REST global pauses](#alert-rest-global-pauses)
+- [feed fetch failures](#alert-feed-fetch-failures)
+- [EventSub receive gap](#alert-eventsub-receive-gap)
+- [EventSub reconcile prior failed](#alert-eventsub-reconcile-prior-failed)
+- [automod sanction refused](#alert-automod-sanction-refused)
+- [moderation enforcement failures](#alert-moderation-enforcement-failures)
+- [voice REST stuck](#alert-voice-rest-stuck)
+- [voice global backoff capped](#alert-voice-global-backoff-capped)
+<!-- /start-here -->
+
 For the on-call operator of the Rust bot and its Cloudflare Worker/Container.
 The bot is live in production on one Cloudflare Container; this describes the
 shipped source, not proof that a soak passed or that any specific recovery is
@@ -21,7 +97,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.151.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.152.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -120,7 +196,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.151.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.152.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 Container stdout is also in the Workers Observability `containers` dataset, which a
@@ -1647,6 +1723,31 @@ reconcile-failure alerts, or when `notification` traffic for the same window
 collapses while tampered rises — the receiver may be refusing legitimate work
 and the fix belongs to the on-call engineer, not another redeploy.
 
+#### Alert: gateway drain skips
+
+`two_bot_gateway_drain_skips_total` rose between valid keepalive samples.
+`gateway_drain_skips` is a ticket: auxiliary leveling XP was skipped for
+SQLSTATE `42P01` (missing table) or `42501` (missing grant), not a gateway
+packet-loss signal. First sample and counter resets only baseline; flat
+samples resolve, missing/invalid families retain the baseline without a
+window verdict. Older containers may omit the counter.
+
+**First response:** inspect the `gateway leveling dispatch skipped; schema gap`
+warn with `drain=leveling`, bounded `cause`, `error_code` and committed-award
+count. Never enable raw SQL or error-chain logging. Compare the deployed build
+with the migration ledger and effective grants using the existing read-only
+inspection procedure. Route a confirmed mismatch to the authorized Operator's
+existing schema/ACL repair plan; do not run an ad hoc production migration.
+
+A skip allows checkpoint advance and may lose the failed auxiliary awards;
+it promises no automatic replay. Do not invoke retention purge replay for XP.
+Non-gap errors and deadlines still hold the cursor and retain their cause;
+use the checkpoint-failure procedure instead of bypassing that hold. Dropped
+interaction completion and invalid onboarding jobs keep fixed pre-commit
+reasons; the missing-ingress-ticket reason remains explicitly post-commit.
+After an approved repair, confirm the counter stays flat under normal traffic.
+This slice changes rule code only: no alert forwarding or deployment is claimed.
+
 #### Alert: retention replay needed
 
 `two_bot_retention_replay_needed_total` increased between two keepalive
@@ -1834,6 +1935,230 @@ limit), when episodes coincide with breaker trips and sustained 429 rates, or
 when a pause never clears past its learned deadline — the hold is then
 unexplained and the fix belongs to the on-call engineer, not another redeploy.
 
+#### Alert: feed fetch failures
+
+`two_bot_feed_fetch_errors_total` summed over the twelve fixed `error_class`
+values increased between two keepalive samples. A feed poll failed: the
+`error_class` names the cause (`transport`, `deadline`, `http_error` for a
+completed non-2xx fetch, `resolve`, source-policy refusals, or `other` for
+an unknown class), and every failed fetch counts exactly once. Successful
+fetches record nothing here, so any increase is a real failure, however
+small. The first sample after monitoring arms only stores the baseline and
+never fires, and a counter reset (process restart) skips the window rather
+than firing. This is a **ticket**, not a page: one dead source or one
+transient blip never pages, while a poller failing every window keeps the
+alert firing. The transition path sends one ticket when firing starts and
+does not re-notify while it remains firing.
+
+First response: read the `error_class` breakdown from the authorized
+`/ops/metrics` scrape, then the feed poller warn/error lines for the same
+window — they carry the failing source and the attempt detail the
+per-outcome (never per-feed) counter omits. A lone `transport` or `deadline`
+blip next to healthy polls is one slow origin — note it and watch the next
+windows. A stuck `invalid_source` or `non_public_address` class means the
+configured source can never succeed: fix or remove the source rather than
+watching the ticket repeat. Do not restart the container to "clear" the
+counter; a replacement resets the baseline without healing the source.
+
+Escalate when failures repeat across windows on many classes at once (the
+poller or the network path is down, not one source), when they coincide with
+`feeds` job failures or DB-error alerts suggesting a wider incident, or when
+`http_error` persists after the origin recovered — the fetch shape may be
+broken and the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: EventSub receive gap
+
+`two_bot_eventsub_received_total` exceeded the summed
+`two_bot_eventsub_classified_total{kind}` rows for 3 consecutive keepalive
+samples. Deliveries are accepted at body intake but never classified: the
+receiver counts each delivery at intake and exactly one classification
+(`challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`)
+before answering, with no await between the two, so a healthy scrape shows
+the two sides equal. One gapped scrape can land mid-delivery; a gap that
+persists across three scrapes (~2 min) means intake outruns classification.
+This is a **ticket**, not a page: no delivery is refused or lost by the gap
+itself, but unclassified deliveries are unanswered Twitch traffic.
+
+First response: read the received counter and the six classified-kind rows
+from the authorized `/ops/metrics` scrape and confirm the gap is still open,
+then read the container logs for `eventsub delivery refused` and
+`eventsub_receiver` lines over the same window — panics or wedged tasks
+between intake and classification leave traces there, while a quiet log next
+to a steady gap points at the classification path itself. Confirm no deploy
+is in progress (a fresh deploy restarts the process and resets both
+counters, which closes the gap). Do not restart the container to "clear" the
+gap; a replacement resets the counters without explaining the stall.
+
+Escalate when the gap grows across windows (intake keeps outrunning
+classification), when it coincides with tampered-signature or reconcile
+alerts suggesting receiver trouble, or when classified counts freeze
+entirely while received climbs — the classification path is then wedged and
+the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: EventSub reconcile prior failed
+
+`two_bot_eventsub_reconcile_errors_total{error_class="reconcile_prior_failed"}`
+increased between two keepalive samples. A reconcile pass found Twitch-side
+subscriptions on our callback already failing and repaired them (delete +
+re-create). The repair already landed — this ticket fires even when the pass
+converges healthy and the failed-pass rule stays silent — but Twitch failing
+our subscriptions means the receiver was erroring (for example,
+notification failures from refused or slow deliveries), so the cause is
+worth a look. The rule waits for healthy or pending pass growth before
+judging the finding: Rust counts the finding before awaiting the repair and
+verification, so mid-pass scrapes retain all baselines without firing. A
+failed completion consumes the finding silently; the failed-pass ticket
+already names it, even when the finding and the outcome land in different
+scrapes. The first complete sample only stores the baseline and never fires.
+A backwards finding or pass-outcome counter (process restart) re-baselines
+all four counters silently; missing or invalid rows preserve the baselines.
+This is a **ticket**, not a page: no action is overdue, but every finding is
+a receiver-health question. Passes that never run (dark, parked or a wedged
+scheduler) record nothing and cannot ticket — this rule watches findings,
+not the absence of passes.
+
+First response: read-only diagnosis only — no Helix request and no
+reconciliation behavior change. Read the `prior_failed` count from the
+authorized `/ops/metrics` scrape, then the `eventsub reconcile found failed
+subscriptions` error lines for the window (bounded broadcaster and
+prior-failed counts only, never subscription IDs), and correlate with
+receiver refusals and tampered-signature traffic over the same window: a
+finding next to refused deliveries explains itself. Confirm the following
+passes converge healthy. Do not retry Helix calls, re-list subscriptions,
+or restart the container to "clear" the counter; a replacement resets the
+baseline without answering why Twitch failed the subscriptions.
+
+Escalate when findings repeat across passes (subscriptions keep failing
+faster than reconcile repairs them), when they coincide with failed-pass
+tickets (the repair itself is failing), or when a finding names
+notification failures with no matching receiver refusal — deliveries may be
+failing downstream of the ack and the fix belongs to the on-call engineer,
+not another redeploy.
+
+#### Alert: automod sanction refused
+
+`two_bot_automod_decisions_total{outcome="sanction_refused"}` increased
+between two keepalive samples. An inspection concluded but its
+delete-adjacent sanction could not run: the content decision still recorded,
+but the ladder step (delete, warn or timeout follow-through) never landed.
+The other seven outcomes stay silent — clean, exempt, dry-run and
+already-processed verdicts plus landed ladders are policy working as
+designed — so this ticket always means enforcement fell short. Unknown
+outcomes collapse to `sanction_refused` in Rust, so a ticket can also mean a
+new outcome needs classification rather than a failed sanction. The first
+sample after monitoring arms only stores the baseline and never fires, and
+a counter reset (process restart) skips the window rather than firing. This
+is a **ticket**, not a page: one refused sanction never pages, while a
+refusal every window means the ladder is broken for a live abuse class.
+
+First response: read the sanction-refused count from the authorized
+`/ops/metrics` scrape, then the automod decision warn/error lines for the
+window — they carry the fixed refusal reason (missing permission, lost
+race with a manual delete, store write refused) without message text or
+user IDs. A lone refusal next to landed deletes is one lost race — note it
+and watch the next windows. A refusal naming a missing permission needs the
+bot role fixed, not the rule. Do not restart the container to "clear" the
+counter; a replacement resets the baseline without landing the sanction.
+
+Escalate when refusals repeat across windows on the same reason (the ladder
+is systematically broken), when they coincide with Discord-error or
+store-error alerts suggesting the sanction path is down, or when the
+refusal reason is unfamiliar — a new outcome may be collapsing into the
+watched bucket and the classification belongs to the on-call engineer, not
+another redeploy.
+
+#### Alert: moderation enforcement failures
+
+`two_bot_moderation_enforcements_total` summed over every verb and the
+`discord_error`/`storage_error` outcomes increased between two keepalive
+samples. An enforcement never completed: `discord_error` is an uncertain
+Discord failure (timeout, unreachable, rate-limited — the mutation may or
+may not have landed), and `storage_error` is a persistence failure. Landed
+enforcements (`success`), policy refusals proving no mutation (`refused`),
+and unknown collapses (`other`) stay silent. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter
+reset (process restart) skips the window rather than firing. This is a
+**ticket**, not a page: one rate-limited kick never pages, while failures
+every window mean moderation is not landing.
+
+First response: read the verb/outcome breakdown from the authorized
+`/ops/metrics` scrape, then the moderation enforcement error lines for the
+window — they carry the fixed failure reason without member IDs or reason
+text. `discord_error` first: check the REST 429/5xx rules for the same
+window (backpressure explains timeouts and rate-limited writes); `403` or
+`404` shapes inside `discord_error` mean a lost permission or a
+manually-removed target, not an outage. `storage_error` points at the
+database path — check the DB-error and pool rules. Do not retry the
+enforcement by hand on an uncertain `discord_error` without checking
+whether it landed; do not restart the container to "clear" the counter — a
+replacement resets the baseline without completing the enforcement.
+
+Escalate when failures repeat across windows on many verbs at once (the
+Discord or store path is down, not one target), when `storage_error`
+coincides with DB-error or pool-saturation alerts, or when `discord_error`
+persists with no 429/5xx explanation — the request shape may be broken and
+the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice REST stuck
+
+`two_bot_voice_rest_in_flight_age_seconds` read above 60 s for 3 consecutive
+keepalive samples. A voice REST attempt has been in flight for over a minute:
+every voice REST send wraps its wire attempt in a 10 s timeout with an
+in-flight guard that drops on timeout, completion or early return, so a
+healthy gauge never reads past ~10 s and a sustained high age means an
+attempt neither completed nor dropped its slot. REST begin/drop events,
+actor ticks and an independent observer republish the gauge, so the age
+keeps advancing even during a hung dispatch. A stuck reading that survives
+three scrapes is a wedged attempt, not a slow one. This is a **ticket**, not
+a page: one wedged attempt never pages, while member-visible join degradation
+already pages through the join-budget burn rules.
+
+First response: read the in-flight age from the authorized `/ops/metrics`
+scrape and confirm it is still climbing or pinned high, then check the
+sibling posture from the same scrape: the queue oldest age, the live
+not-ready age, dispatch-timeout tickets and the join-budget burn rules. A
+stuck age next to a healthy queue and quiet burn rules is one wedged wire
+attempt — note it and watch the next windows. Do not restart the container
+to "clear" the gauge; a replacement drops the slot without explaining the
+wedge.
+
+Escalate when the age stays pinned across windows with no dispatch progress
+(the REST path is wedged, not one attempt), when it coincides with
+dispatch-timeout or watchdog-stuck tickets, or when it coincides with
+sustained join-budget burn — queued members are then waiting on the wedged
+path and the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice global backoff capped
+
+`two_bot_voice_global_backoff_capped_total` increased between two keepalive
+samples. A voice action hit a Discord global rate-limit wait past
+`GLOBAL_BACKOFF_MAX` (30 s) and shed to tick-driven queue backoff
+(`RateLimited` for the action queue) instead of parking the guild actor.
+The shed is the designed backpressure shape — the actor stays live and the
+gauges stay visible — and no operator action shortens Discord-side limits,
+which is why this is a **ticket**, never a page. But every cap is a voice
+action deferred by a far-future global limit, and a storm of caps points at
+our own request pattern tripping the global limit. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter
+reset (process restart) skips the window rather than firing.
+
+First response: read the `voice global backoff capped; returning RateLimited
+for queue backoff` warn lines for the window (bounded wait seconds only),
+plus the global-pause and 429 posture from the authorized `/ops/metrics`
+scrape; confirm whether a deploy is in progress (a fresh deploy shipping a
+request storm trips the global limit fast). A lone cap next to a Discord-side
+limit episode is expected backpressure — note it and watch the next
+windows. There is no manual backoff release: do not restart the container
+to "clear" it — a restart only resets the counter and the new process
+re-learns the same global deadline.
+
+Escalate when caps arrive back-to-back across windows with no Discord-side
+incident (our own request pattern may be tripping the global limit), when
+they coincide with breaker trips and sustained 429 rates, or when caps
+coincide with sustained join-budget burn — deferred voice actions are then
+member-visible and the fix belongs to the on-call engineer, not another
+redeploy.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation
@@ -1934,7 +2259,9 @@ disarms the drill by redeploy.
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
    --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
-   Dispatches bypass the hold, so arm and disarm work while it is armed.
+   Explicit arm/disarm dispatches bypass the hold. Error-rate rollback proofs,
+   including the daily automated dispatch, honor it and fail without deploying
+   while it is armed; do not clear the hold for a proof.
    The arm run stays red by design: the history guard fails it after a green
    deploy and synthetic so the pin never reads as staging history for the
    head. Read the deploy and synthetic steps, not the run color.
@@ -2479,7 +2806,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.151 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.152 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
@@ -2504,8 +2831,8 @@ authorization, then repeat health/readiness/log observations. Confirm only one
 gateway session and record version, image, first ready time and remaining
 limitations. None of these examples were a live rollback drill.
 
-**Staging drill.** The manual `staging-rollback-drill` workflow (dispatch from
-`main`, input `target_version`) runs this procedure end to end in the protected
+**Staging drill.** The manual Worker-only option of `staging-rollback-drill`
+(dispatch from `main`, input `target_version`) runs this procedure end to end in the protected
 `staging` environment: fence, one unforced Cloudflare deployment of the target
 with `code_update_strategy: immediate`, epoch-checked takeover, a 2 s
 `/readyz` + `/health` poll, then the same sequence back to the original version.
@@ -2515,7 +2842,9 @@ refuses an unknown or never-deployed id). The job summary and evidence file hold
 the fence, rollback, takeover and first-ready times, the time-to-ready against
 the workflow's 60 s budget, probe counts, the container image digest and
 instance counts. This workflow interval is not an outage-start recovery
-measurement and cannot prove B2's under-60-second recovery criterion.
+measurement and cannot prove B2's under-60-second recovery criterion. An empty
+`target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
+which also runs on a daily schedule and verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
@@ -2674,7 +3003,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |
 | Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Conditionally registered supervised job; durable retry budget and completion rules apply. A successful/no-op tick is not fresh publication proof. See the [database playbook](#neon-or-hyperdrive-outage). |
-| Internal actions | `announcement.post`, `role.assign` and `event.upsert` are on whenever the receiver is; `event.cancel` needs `TWO_INTERNAL_ALLOW_EVENT_CANCEL=1`, `event.read` needs `TWO_INTERNAL_ALLOW_EVENT_READ=1`, `settings.get`/`settings.set` need `TWO_INTERNAL_ALLOW_SETTINGS=1`, `guild.add_member` needs `TWO_INTERNAL_ALLOW_ADD_MEMBER=1`, member and channel moderation need `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; remaining verbs stay refused. | Wired receivers are `announcement.post`, `role.assign` and `event.upsert` (no extra flag: contained only by the dark switch below), `event.cancel`, `event.read`, `settings.get`, `settings.set`, `guild.add_member`, `moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`, `moderation.timeout`, `moderation.purge`, `moderation.slowmode`, `moderation.lockdown`, `moderation.unlock`, staging only: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. Unsetting an allow flag stops that verb. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark) and the [receiver verb list](internal-actions-receiver.md). |
+| Internal actions | Direct-container support and optional gates are described in the [receiver contract](internal-actions-receiver.md#implementation-and-deployment-boundary), not proof of shipped Worker capabilities. | Staging-only and default dark under both ingress gates. The Worker does not forward role keys or optional receiver capability gates; adding secrets cannot enable them. Use the [single wiring table](internal-actions-receiver.md#container-wiring) and [intake/forwarding recovery contract](internal-actions-receiver.md#intake-forwarding-and-correlation). Production has no ingress. |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
 Source: [`automod.rs`](../crates/core/src/automod.rs),
@@ -3322,3 +3651,104 @@ command existence, **not authorization, successful deployment, backup custody,
 Discord effects, or a live rollback**. Required exact-head merge gates remain
 `ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB test
 lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.
+
+## Giveaways
+
+`/giveaway create|list|cancel|end|pause|resume|extend|reroll` requires Manage
+Server; entry buttons are open to human members with per-interaction role and
+age checks. Limits: prize 1–200 characters, duration 1–43200 minutes,
+winners 1–100, 10 active giveaways per guild, 1000 entrants each (one paced
+membership re-check per entrant must fit the 300 s draw run). Entry
+attempts have a bounded process-local 10/minute member budget, and successful
+entries share a durable 10/minute guild/member budget across giveaways and
+restarts. Duplicates collapse to one row. `gw:<id>` carries only the opaque
+id; the server resolves guild, message, deadline, status, requirements and
+capacity.
+
+The giveaway row is recorded before its message posts. If sending or the
+message-id attachment fails, never blindly re-post: inspect the channel for
+a delivered message and cancel the recorded id if needed. An unconfirmed
+definition holds an active slot and takes no entries.
+
+`giveaway_countdown` ticks every 15 seconds; durable claims permit at most
+one cosmetic refresh at each 1h, 10min, 1min and ending-soon threshold
+through the shared REST pacing guard. Count edits are best-effort; the
+entry row stays authoritative when a display edit fails.
+
+`giveaway_draw` ticks every 15 seconds: it claims due giveaways under a
+10-minute lease, re-validates eligibility from fresh membership reads, runs
+the pure draw, commits one draw row and flips to drawn, then announces (edit
+the giveaway message, post the winners with seed and revealed nonce, mark
+announced). Drawn-but-unannounced rows re-announce from the stored row and
+never re-draw; a stale claim with a stored draw skips to announce. Pause
+excludes a giveaway from the due scan; resume extends the deadline by the
+paused span. Rerolls append a new draw round and leave history intact. No
+winner DMs: deferred until a DM send path exists. Staging smoke: create,
+enter from two test members, verify two rows plus ephemeral replies, end,
+verify the draw row plus winners post, reroll, verify a second round, then
+cancel a fresh giveaway and verify a later entry is refused.
+
+### Lifecycle audit and saved-versus-delivered state
+
+Successful pause, resume and extension commands commit one minimal fact in
+`automation_audit_log` in the **same transaction** as the lifecycle/deadline
+change. `actor_id` is the authenticated staff member, not the giveaway creator;
+store-only system calls use NULL. Actions are `giveaway.pause`,
+`giveaway.resume` and `giveaway.extend`, with `guild_id`, the giveaway id as
+`target_key`, `outcome = 'ok'`, a stable fact `id` and `created_at`; `reason`
+stays NULL. No prize/body, entrant roster, seed/nonce, claim capability or raw
+database error belongs in these facts or command logs.
+
+Pause still requires an unclaimed open row. Resume locks the paused row and
+adds the nonnegative paused span before reopening entries. Extend locks an
+open or paused row, adds the validated duration and preserves its status.
+Unknown/foreign targets, wrong states and invalid deadlines create neither a
+transition nor a success fact. Audit insertion failure rolls back the change
+and returns `Giveaway unavailable; try again later.` without a message refresh.
+A resume with a backwards clock still changes paused to open and records a fact,
+even when its deadline does not move.
+
+A fact's random per-write suffix distinguishes repeated valid extensions and
+pause/resume cycles, including equal-timestamp writes. It is **not** a durable
+interaction replay key: submitting a fresh extension can extend again. Existing
+create/cancel identities and round-numbered draw/reroll audit identities do not
+change. Do not infer ordering from the random suffix.
+
+With existing authorized database read access, inspect one guild and giveaway
+using this bounded read (replace both placeholders; no new endpoint or grant):
+
+```sql
+SELECT id, guild_id, actor_id, action, target_key, outcome, created_at
+FROM automation_audit_log
+WHERE guild_id = '<guild-id>' AND target_key = '<giveaway-id>'
+  AND action IN ('giveaway.pause', 'giveaway.resume', 'giveaway.extend')
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+```
+
+The result is a capped snapshot, not a full-history export. An empty successful
+read means no matching retained facts; a failed read means unknown, not empty.
+There is no automatic age-based expiry or actor pseudonymization for this table;
+the 45-day `operational_audit_log` cache policy applies to a different table.
+Existing [member erasure](privacy.md) deletes entire rows matching guild and
+`actor_id`, subject to safety checks, not every fact about that member's
+giveaways. NULL/system and other-actor facts can remain. A true guild removal
+queues guild-wide deletion, including these facts, but only a successful
+executing retention run deletes them: dry-run deletes nothing, rejoin cancels
+the queue entry and guards/failures can defer completion. No new retention
+window, purge trigger or grant is introduced. Existing MCP/ops audit readers
+are not giveaway-audit listing APIs.
+
+The transaction confirms **saved state**, not Discord delivery. The subsequent
+message edit is separate and best-effort: `Giveaway paused/resumed/extended; its
+message could not be refreshed.` means the state and audit are already saved.
+Inspect the saved giveaway and channel before retrying; in particular, do not
+repeat an extension just to repair its display. Even a saved success fact does
+not prove that the final interaction reply reached Discord. For a repeatable
+disposable-DB check, run the protected runtime corpus:
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
+  --test giveaway_actor_audit_acceptance -- --test-threads=1
+```

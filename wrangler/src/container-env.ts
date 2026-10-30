@@ -96,6 +96,10 @@ export const FORWARDED_FLAGS = [
   // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Event voice channels (per-event create + after-party handoff): required
+  // category id. Non-secret runtime flag; the bot fails closed (inactive,
+  // TBD `no_category`) until a usable category exists.
+  "TWO_EVENT_VOICE_CATEGORY_ID",
   // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
   // attaches the Lavalink voice-update forwarder. Staging vars only, same
   // treatment as TWO_VOICE; the node password travels as its own Container
@@ -285,6 +289,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
+  "TWO_ASSISTANT_API_KEY": SECRET,
+  TWO_ASSISTANT_TOKEN: "unapproved credential-name decoy used only by the acceptance battery; never a binding",
+  TWO_ASSISTANT_SECRET: "unapproved credential-name decoy used only by the acceptance battery; never a binding",
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
@@ -309,6 +316,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_GUILD_CONFIG_UPLOAD_CMD: BACKUP,
   TWO_RESTORE_DRILL_BOOTSTRAP_URL: BACKUP,
   TWO_RESTORE_DRILL_EVIDENCE_DIR: BACKUP,
+  TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S: BACKUP,
   TWO_ANTI_NUKE_SNAPSHOT_PATH: "filesystem write path; Container disk is ephemeral",
   TWO_HEALTH_BIND_HOST: BIND,
   TWO_HEALTH_PORT: BIND,
@@ -340,6 +348,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_STAGING_RESTART_CONTAINMENT: LEGACY,
   TWO_STAGING_RESTART_SYNTHETIC_ACTORS: LEGACY,
   TWO_TEST_DATABASE_URL: TEST,
+  TWO_TEST_LIVE_EXCLUSIONS_CHILD: TEST,
   TWO_BOT_TEST_DATABASE_URL: TEST,
   TWO_GATEWAY_TEST_DATABASE_URL: TEST,
   TWO_ROLES_TEST_DATABASE_URL: TEST,
@@ -369,10 +378,19 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_TYPO_KEYS: TEST,
   TWO_UNKNOWN: TEST,
   TWO_TUNING_LOG_TEST_CHILD: TEST,
+  TWO_TEST_VOICE_OVERFLOW_METRICS_CHILD: TEST,
+  TWO_QUERY_OBSERVER_CALLSITE_CHILD: TEST,
   // Store-only guild setting: the invite responder resolves it from the live
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.
   TWO_GUILD_INVITE_CODE: "store-only guild setting; read from the live settings snapshot, never from the process environment",
+  // /ops override enforcement (Slice 0a): the Rust settings poll GETs this
+  // URL on every tick for the DO ops record. URL-shaped values are never
+  // flags (the allowlist test rejects `_URL`), so it travels only here.
+  TWO_OPS_CONFIG_URL: "ops-record fetch URL; reaches the Container only through an explicit containerEnvVars line when the Operator sets it, never this flag allowlist",
+  // Bearer the container sends on that fetch: the ops control token's value,
+  // forwarded only while the fetch URL is set, on its own secret line.
+  TWO_OPS_CONFIG_TOKEN: SECRET,
 };
 
 /**

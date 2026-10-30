@@ -122,8 +122,10 @@ test("audit window refuses fences with an extra fifth key", async () => {
   await assert.rejects(harness([[key(1), extra]]).ops.readAudit("fixture"), invalid);
 });
 
+// Writer-valid fixtures must avoid PUT-refused keys (TWO_MODERATION is refused
+// at PUT time); TWO_DEPLOY_ENV keeps the same 14-character envelope.
 const AFTER_DROP_FLAGS = [
-  "TWO_AUTOMATIONS", "TWO_AUTOMOD", "TWO_MODERATION", "TWO_TEXT_COMMANDS",
+  "TWO_AUTOMATIONS", "TWO_AUTOMOD", "TWO_DEPLOY_ENV", "TWO_TEXT_COMMANDS",
   "TWO_ANNOUNCEMENTS", "TWO_VOICE", "TWO_ANTI_NUKE", "TWO_TEMP_VOICE",
 ];
 

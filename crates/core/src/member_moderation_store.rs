@@ -168,6 +168,55 @@ impl PgMemberModerationStore {
         })
     }
 
+    /// Read-only staff inventory, not the operator uncertainty query or due-job
+    /// claim path. SQL owns ordering and the page-plus-one materialization bound.
+    pub async fn saved_expiries(
+        &self,
+        guild_id: &str,
+        page: crate::tempban_inventory::ExpiryPage,
+    ) -> Result<Vec<crate::tempban_inventory::SavedExpiry>, StoreError> {
+        use crate::tempban_inventory::{ExpiryState, SavedExpiry, PAGE_SIZE};
+
+        self.ensure_guild(guild_id)?;
+        let rows = sqlx::query(
+            "SELECT request_id, user_id, FLOOR(EXTRACT(EPOCH FROM execute_at))::bigint AS execute_at,
+               state, dispatch_uncertain, execute_at <= CURRENT_TIMESTAMP AS due
+             FROM moderation_scheduled_unbans AS expiry
+             WHERE guild_id = $1 AND state IN ('pending', 'staged', 'running', 'quarantined')
+             ORDER BY expiry.execute_at, request_id COLLATE \"C\"
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(&self.guild_id)
+        .bind((PAGE_SIZE + 1) as i64)
+        .bind(page.offset())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let state = match row
+                    .try_get::<String, _>("state")
+                    .map_err(db_error)?
+                    .as_str()
+                {
+                    "pending" => ExpiryState::Pending,
+                    "staged" => ExpiryState::Staged,
+                    "running" => ExpiryState::Running,
+                    "quarantined" => ExpiryState::Quarantined,
+                    _ => return Err(StoreError::new("unknown saved expiry state")),
+                };
+                Ok(SavedExpiry {
+                    request_id: row.try_get("request_id").map_err(db_error)?,
+                    user_id: row.try_get("user_id").map_err(db_error)?,
+                    execute_at: row.try_get("execute_at").map_err(db_error)?,
+                    state,
+                    dispatch_uncertain: row.try_get("dispatch_uncertain").map_err(db_error)?,
+                    due: row.try_get("due").map_err(db_error)?,
+                })
+            })
+            .collect()
+    }
+
     /// Bounded operator page over the same fenced rows `surface_uncertain`
     /// reports, oldest request first: at most `limit` rows plus the total
     /// fenced count so `--list` can print its truncation receipt. The limit
@@ -404,7 +453,11 @@ impl MemberModerationStore for PgMemberModerationStore {
             "INSERT INTO moderation_audit
              (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
               outcome, idempotency_key, metadata_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, NOW())
+             SELECT $1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, NOW()
+             WHERE NOT EXISTS (
+               SELECT 1 FROM moderation_audit
+               WHERE guild_id = $2 AND request_id = $10
+             )
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(&row.request_id)
@@ -416,6 +469,12 @@ impl MemberModerationStore for PgMemberModerationStore {
         .bind(row.outcome)
         .bind(&row.idempotency_key)
         .bind(&row.metadata_json)
+        // Preserve accepted-effect evidence when only completion is uncertain.
+        .bind(
+            (row.outcome == "in_progress")
+                .then(|| row.request_id.strip_suffix(":in_progress"))
+                .flatten(),
+        )
         .execute(&self.pool)
         .await
         .map_err(db_error)?;

@@ -58,7 +58,7 @@ pub const SOAK_LEDGER_RULE_ID: &str = "soak_expected_committed";
 /// derives its fired-packet names from the same spellings via `ruleFor`, so
 /// this list must stay identical to `RULES` in `wrangler/src/alert-rules.ts`;
 /// the table test below and the Worker test both pin every spelling.
-pub const ALERT_RULE_IDS: [&str; 46] = [
+pub const ALERT_RULE_IDS: [&str; 54] = [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
@@ -105,6 +105,14 @@ pub const ALERT_RULE_IDS: [&str; 46] = [
     "rest_token_invalid",
     "rest_refusal_surge",
     "rest_global_responses_stuck",
+    "feed_fetch_failures",
+    "eventsub_receive_gap",
+    "eventsub_reconcile_prior_failed",
+    "automod_sanction_refused",
+    "moderation_enforcement_failures",
+    "voice_rest_stuck",
+    "voice_global_backoff_capped",
+    "gateway_drain_skips",
 ];
 
 /// Stamped packet filename carrying the producer identity:
@@ -1022,6 +1030,14 @@ mod tests {
                 "rest_token_invalid",
                 "rest_refusal_surge",
                 "rest_global_responses_stuck",
+                "feed_fetch_failures",
+                "eventsub_receive_gap",
+                "eventsub_reconcile_prior_failed",
+                "automod_sanction_refused",
+                "moderation_enforcement_failures",
+                "voice_rest_stuck",
+                "voice_global_backoff_capped",
+                "gateway_drain_skips",
             ]
         );
         // The soak ledger stamps its own ledger identity, not an alert rule.

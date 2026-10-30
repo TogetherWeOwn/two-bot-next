@@ -14,7 +14,7 @@ creator) and asserts:
 | create | a new room appears in the creator's category |
 | moved | the test bot lands in that new room after joining the creator |
 | name | the room is created already carrying a template name, not the `<display>'s room` fallback |
-| position | the room is directly below its creator, or below the creator's existing rooms when some are open (matching the placement planner) |
+| position | the room is directly below its creator, or below the creator's existing rooms still open when the slot is read — a predecessor the empty-room sweep deleted mid-run does not anchor the slot (matching the placement planner) |
 | owner | the room has a member overwrite for the joiner allowing View, Connect and Manage Channels |
 | status | a voice-channel status line is set on the room |
 | rejoin | the test bot hops from that room straight back into the creator, and a second new room appears and it is moved into that room (a member must never stay in the lobby) |

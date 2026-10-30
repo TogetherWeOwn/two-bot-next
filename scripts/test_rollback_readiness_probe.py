@@ -313,6 +313,34 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v11", results["PASS manifest"])
 
+    def test_current_dump_version_12_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=12)),
+                              mtime=2_120_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v12", results["PASS manifest"])
+
+    def test_current_dump_version_13_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=13)),
+                              mtime=2_130_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v13", results["PASS manifest"])
+
+    def test_current_dump_version_14_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=14)),
+                              mtime=2_140_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v14", results["PASS manifest"])
+
+    def test_current_dump_version_15_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=15)),
+                              mtime=2_150_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v15", results["PASS manifest"])
+
     def assert_invalid_created_at(self, value):
         self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
                               archive_lines(manifest(createdAt=value)))
@@ -477,7 +505,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "empty archive": ([], None, "is empty"),
             "manifest not JSON": ([b"{manifest", *good[1:]], None, "manifest line is not JSON"),
             "row before manifest": (good[1:], None, "first line is not a manifest"),
-            "unknown version": (lines(version=12), None, "manifest version 12 is not one of (3, 4, 5, 6, 7, 8, 9, 10, 11)"),
+            "unknown version": (lines(version=16), None, "manifest version 16 is not one of (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)"),
             "boolean version": (lines(version=True), None, "manifest version True"),
             "no createdAt": (lines(createdAt=None), None, "no createdAt timestamp"),
             "negative eventsSequence": (lines(eventsSequence=-1), None, "invalid eventsSequence"),

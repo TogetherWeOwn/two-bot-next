@@ -353,7 +353,7 @@ async fn admission_fresh_reads_recovery_and_both_lease_renewals() -> TestResult 
         })
         .connect_with(options)
         .await?;
-    let result = exercise(&pool).await;
+    let result = Box::pin(exercise(&pool)).await;
     pool.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
@@ -362,7 +362,43 @@ async fn admission_fresh_reads_recovery_and_both_lease_renewals() -> TestResult 
     result
 }
 
+async fn stale_catalogue_admission_is_ignored_before_rest(pool: &PgPool) -> TestResult {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let feature = runtime(pool, &clock, &mock);
+    let request = request(
+        "stale-catalogue",
+        Selection::Button {
+            option_key: "new".into(),
+        },
+    );
+    assert!(matches!(
+        feature
+            .prepare_at_revision(&request, &panel(PanelMode::Button), -1)
+            .await?,
+        Admission::Ignored
+    ));
+    assert!(
+        mock.requests().is_empty(),
+        "retired input is not already being handled"
+    );
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM self_role_audit WHERE event_id=$1")
+        .bind(&request.event_id)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(count, 0);
+    mock.shutdown().await;
+    Ok(())
+}
+
 async fn exercise(pool: &PgPool) -> TestResult {
+    // The production service's fresh admission shares the settings revision
+    // lock. This fixture has no settings rows/poller, so its boot view is 0.
+    sqlx::raw_sql(
+        "CREATE TABLE guild_settings_revision (singleton BOOLEAN PRIMARY KEY CHECK (singleton), revision BIGINT NOT NULL); INSERT INTO guild_settings_revision VALUES (TRUE, 0)",
+    )
+    .execute(pool)
+    .await?;
     sqlx::raw_sql(include_str!("../../cutover/migrations/0200_self_roles.sql"))
         .execute(pool)
         .await?;
@@ -396,39 +432,48 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
-    processing_superseded_before_preparation(pool).await?;
-    terminal_restart_repairs_committed_target(pool).await?;
-    terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;
-    terminal_restart_preserves_inherited_pending(pool).await?;
-    terminal_restart_cancellation_preserves_journal(pool).await?;
-    terminal_partial_repair_exchange_outcomes(pool).await?;
-    processing_receipts_survive_generation_transfer(pool).await?;
-    repeated_processing_tickets_preserve_pending(pool).await?;
-    terminal_late_response_after_independent_transfer(pool).await?;
-    terminal_pacing_loss_is_definite_no_send(pool).await?;
-    terminal_post_journal_wait_is_definite_no_send(pool).await?;
-    mixed_terminal_processing_sweep_and_dry_run(pool).await?;
-    supervised_processing_recovery(pool).await?;
-    bounded_processing_sweep(pool).await?;
-    durable_processing_recovery_without_redelivery(pool).await?;
-    shared_reaction_dispatch_and_disabled_gate(pool).await?;
-    shared_component_orchestration(pool).await?;
-    dry_run_audits_without_mutation_or_target_publication(pool).await?;
-    execution_and_compensation(pool).await?;
-    stale_inflight_repairs_committed_target(pool).await?;
-    stale_handoff_preserves_unknown_and_refuses_other_owners(pool).await?;
-    service_continues_unknown_work_without_redelivery(pool).await?;
-    interrupted_exchange_cannot_settle(pool).await?;
-    unknown_target_is_not_empty(pool).await?;
-    dry_run_refuses_recovered_mutation(pool).await?;
-    recovery_and_renewal(pool).await?;
-    empty_select_recovery(pool).await?;
-    reaction_partial_and_duplicate(pool).await?;
-    exclusive_lane_before_reads(pool).await?;
-    lost_panel_lane_release_is_logged(pool).await?;
-    zero_row_receipt_completion_is_unmatched_receipt(pool).await?;
-    settlement_timeout_note_and_ambiguous_class(pool).await?;
-    timeout_note_store_failure_stays_non_fatal(pool).await?;
+    // Heap-pin each fixture step so the aggregate future and its poll frame stay
+    // bounded on the default test-thread stack. Execution remains sequential.
+    Box::pin(stale_catalogue_admission_is_ignored_before_rest(pool)).await?;
+    Box::pin(processing_superseded_before_preparation(pool)).await?;
+    Box::pin(terminal_restart_repairs_committed_target(pool)).await?;
+    Box::pin(terminal_restart_refuses_unknown_or_uninitialized_target(
+        pool,
+    ))
+    .await?;
+    Box::pin(terminal_restart_preserves_inherited_pending(pool)).await?;
+    Box::pin(terminal_restart_cancellation_preserves_journal(pool)).await?;
+    Box::pin(terminal_partial_repair_exchange_outcomes(pool)).await?;
+    Box::pin(processing_receipts_survive_generation_transfer(pool)).await?;
+    Box::pin(repeated_processing_tickets_preserve_pending(pool)).await?;
+    Box::pin(terminal_late_response_after_independent_transfer(pool)).await?;
+    Box::pin(terminal_pacing_loss_is_definite_no_send(pool)).await?;
+    Box::pin(terminal_post_journal_wait_is_definite_no_send(pool)).await?;
+    Box::pin(mixed_terminal_processing_sweep_and_dry_run(pool)).await?;
+    Box::pin(supervised_processing_recovery(pool)).await?;
+    Box::pin(bounded_processing_sweep(pool)).await?;
+    Box::pin(durable_processing_recovery_without_redelivery(pool)).await?;
+    Box::pin(shared_reaction_dispatch_and_disabled_gate(pool)).await?;
+    Box::pin(shared_component_orchestration(pool)).await?;
+    Box::pin(dry_run_audits_without_mutation_or_target_publication(pool)).await?;
+    Box::pin(execution_and_compensation(pool)).await?;
+    Box::pin(stale_inflight_repairs_committed_target(pool)).await?;
+    Box::pin(stale_handoff_preserves_unknown_and_refuses_other_owners(
+        pool,
+    ))
+    .await?;
+    Box::pin(service_continues_unknown_work_without_redelivery(pool)).await?;
+    Box::pin(interrupted_exchange_cannot_settle(pool)).await?;
+    Box::pin(unknown_target_is_not_empty(pool)).await?;
+    Box::pin(dry_run_refuses_recovered_mutation(pool)).await?;
+    Box::pin(recovery_and_renewal(pool)).await?;
+    Box::pin(empty_select_recovery(pool)).await?;
+    Box::pin(reaction_partial_and_duplicate(pool)).await?;
+    Box::pin(exclusive_lane_before_reads(pool)).await?;
+    Box::pin(lost_panel_lane_release_is_logged(pool)).await?;
+    Box::pin(zero_row_receipt_completion_is_unmatched_receipt(pool)).await?;
+    Box::pin(settlement_timeout_note_and_ambiguous_class(pool)).await?;
+    Box::pin(timeout_note_store_failure_stays_non_fatal(pool)).await?;
     Ok(())
 }
 
@@ -4363,4 +4408,64 @@ async fn timeout_note_store_failure_stays_non_fatal(pool: &PgPool) -> TestResult
     drop(prepared);
     mock.shutdown().await;
     Ok(())
+}
+
+// --------------------------------------- contention-seed freshness pins --
+
+/// Call-site source for the freshness pins below: the production half of this
+/// file, above the test-module marker (the tests below also mention panel
+/// claims and must never satisfy these pins).
+const RUNTIME_SRC: &str = include_str!("self_role_runtime.rs");
+
+fn production_src() -> &'static str {
+    RUNTIME_SRC
+        .split_once("#[path = \"self_role_runtime_tests.rs\"]")
+        .expect("test-module marker moved; update these pins on the card")
+        .0
+}
+
+/// Both Busy arms must draw a fresh `contention_seed` per sleep: a fixed seed
+/// replays one delay and the lockstep this slice breaks returns. The adoption
+/// guard pins the jittered call; this pins the seed freshness it cannot see.
+#[test]
+fn both_busy_arms_seed_jitter_from_fresh_contention() {
+    let prod = production_src();
+    let mut arms = 0;
+    let mut rest = prod;
+    while let Some(at) = rest.find("PanelClaimResult::Busy if") {
+        let window: Vec<&str> = rest[at..].lines().take(14).collect();
+        assert!(
+            window.iter().any(|line| line.contains("contention_seed(")),
+            "Busy arm sleeps a fixed seed: pass contention_seed(&key, contention) \
+             so simultaneous contenders spread"
+        );
+        arms += 1;
+        rest = &rest[at + "PanelClaimResult::Busy if".len()..];
+    }
+    assert_eq!(arms, 2, "expected exactly the two Busy arms");
+}
+
+/// The seed helper itself spreads: identical inputs on consecutive calls draw
+/// different seeds (process-wide sequence), so one claimant's retries and
+/// simultaneous contenders never share a delay stream.
+#[test]
+fn contention_seeds_differ_across_consecutive_sleeps() {
+    let key = PanelKey {
+        guild_id: GUILD.to_owned(),
+        member_id: USER.to_owned(),
+        panel_id: "games".to_owned(),
+    };
+    let first = super::contention_seed(&key, 0);
+    let second = super::contention_seed(&key, 0);
+    assert_ne!(first, second, "consecutive sleeps must not share a seed");
+    let other = PanelKey {
+        guild_id: GUILD.to_owned(),
+        member_id: OTHER.to_owned(),
+        panel_id: "games".to_owned(),
+    };
+    assert_ne!(
+        super::contention_seed(&other, 0),
+        super::contention_seed(&key, 0),
+        "simultaneous contenders must not share a seed"
+    );
 }

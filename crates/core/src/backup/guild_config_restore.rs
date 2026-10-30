@@ -1501,24 +1501,44 @@ pub async fn apply_restore_plan(
     api: &mut super::guild_config_api::GuildConfigDiscordApi,
     plan: &RestorePlan,
 ) -> Result<RestoreIdMaps, RestorePlanError> {
+    apply_restore_plan_with_progress(api, plan, |_| {})
+        .await
+        .map_err(|(err, _)| err)
+}
+
+/// [`apply_restore_plan`] with per-operation completion reporting: `on_landed`
+/// runs after each operation whose write succeeded with a valid receipt, and
+/// the error carries the count of landed operations so the caller can name
+/// landed vs pending operations. A failed write, an unresolvable reference,
+/// or a success with no Discord id receipt does not count as landed.
+pub async fn apply_restore_plan_with_progress(
+    api: &mut super::guild_config_api::GuildConfigDiscordApi,
+    plan: &RestorePlan,
+    mut on_landed: impl FnMut(&RestoreOperation),
+) -> Result<RestoreIdMaps, (RestorePlanError, usize)> {
     // Plans are public/mutable: defend the write boundary as well as planning.
-    validate_ordered_dependencies(plan)?;
+    validate_ordered_dependencies(plan).map_err(|err| (err, 0))?;
     let mut roles = plan.known_ids.roles.clone();
     let mut channels = plan.known_ids.channels.clone();
     let mut emojis = plan.known_ids.emojis.clone();
-    for op in &plan.operations {
-        let path = resolve_path(&op.path, &channels)?;
-        let body = resolve_value(&op.body, &roles, &channels)?;
+    for (landed, op) in plan.operations.iter().enumerate() {
+        let path = resolve_path(&op.path, &channels).map_err(|err| (err, landed))?;
+        let body = resolve_value(&op.body, &roles, &channels).map_err(|err| (err, landed))?;
         let result = api
             .write(&op.method, &path, body)
             .await
-            .map_err(|e| RestorePlanError(e.to_string()))?;
+            .map_err(|e| (RestorePlanError(e.to_string()), landed))?;
         if let Some((resource, source)) = &op.capture_id {
             let id = result
                 .as_ref()
                 .and_then(|b| b.get("id"))
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| RestorePlanError(format!("{} returned no Discord id.", op.label)))?;
+                .ok_or_else(|| {
+                    (
+                        RestorePlanError(format!("{} returned no Discord id.", op.label)),
+                        landed,
+                    )
+                })?;
             match resource.as_str() {
                 "role" => {
                     roles.insert(source.clone(), id.to_owned());
@@ -1531,6 +1551,7 @@ pub async fn apply_restore_plan(
                 }
             }
         }
+        on_landed(op);
     }
     Ok(RestoreIdMaps {
         roles,

@@ -255,6 +255,16 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   audit-retry job, the scheduled-messages job, the self-role recovery job, the
   gated `feeds` job and the DB-only settings poll, each parked when its service
   is unregistered), even when announcements are off.
+- The five community keys (`TWO_COMMUNITY_SCORECARD`,
+  `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`,
+  `TWO_PRESENCE_PROBE`, `TWO_INACTIVITY_DAYS`) are hot-wired: every tick
+  layers the poller-published snapshot over the boot gates store-first
+  (`bot::community_jobs::LIVE_KEYS`), so a dashboard write applies within
+  one 15 s poll. A stored `0` on either enable gate skips that tick; an
+  absent or unparsable stored count falls back to boot per key. Boot
+  registration is unchanged: a job parked at boot needs a restart to start
+  ticking, the facts sink arms once at boot, and the scorecard command
+  surface publishes at boot (see [configuration](configuration.md)).
 
 ## Verification
 
@@ -268,6 +278,59 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   Database cases require `TWO_TEST_DATABASE_URL` on agent-testdb/CI services;
   absent configuration skips locally and fails in CI. Existing hosted CI's
   unit/binary step runs them without changing the workflow.
+- The live-apply pins run fully offline (pure in-memory `live_channel`, no
+  `TWO_TEST_DATABASE_URL` needed):
+
+  ```sh
+  python3 scripts/cargo_cache.py run -- test -p two-bot-core --test community_presence_inactivity_live_keys_acceptance
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot community_jobs::
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot settings_jobs::community_live_log_acceptance_tests
+  ```
+
+  A staging apply-check stays a rollout step, not a test gate.
+- The stored actor/staging exclusion live-apply pins run fully offline too
+  (in-memory `live_channel` plus the real pipeline seam, no database):
+
+  ```sh
+  python3 scripts/cargo_cache.py run -- test -p two-bot-core --test community_exclusion_live_keys_acceptance
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test community_exclusion_pipeline_acceptance
+  ```
+
+- The gateway and attendance regressions call the shared production overlay,
+  real settings poll and migrated disposable fact store. Voice, member joins
+  and rules acceptance must observe replacement, empty and deleted exclusions
+  without an intervening message, including alternating guilds on one pipeline.
+  Five independent overlay controls cover all exclusion keys. Attendance uses
+  the production command composition in both direct and ordered completion;
+  a poll after acknowledgement must affect the check-in classification while
+  preserving membership/event validation, host-check-in proof and audit rows.
+  The ordered gateway also refreshes member removals before ending voice facts.
+  Both bot runtime constructors install the same execution-time provider; the
+  classifier version stays deployment-only.
+
+  ```sh
+  TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+    python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot gateway::live_exclusions_acceptance_tests:: -- --test-threads=1
+  ```
+
+- The production-call-site regressions in `community_live_tick_tests.rs`
+  additionally require the disposable test database. Each uses a child process
+  to register the real settings poll, publish committed overrides and run the
+  production tick without leaking the process-wide reader into other tests.
+  Presence and scorecard must skip all work on stored `0` and resume after
+  deletion; inactivity must persist flags using the stored horizon and restore
+  the boot horizon after deletion. Independent scorecard cases publish
+  recommendations and correction cycles different from boot, then assert the
+  persisted `recommendationsEnabled` and `killSwitchActive` payload fields.
+  Missing stream coverage exercises the two-correction kill switch. Each delete
+  runs in the next eligible week, requiring a fresh output with boot fallback
+  instead of reusing a completed scorecard. Only Discord REST is doubled.
+
+  ```sh
+  TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+    python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot community_jobs::live_tick_tests:: -- --test-threads=1
+  ```
+
 - Run `cargo test -p two-bot-core --features db --locked --lib <filter>`
   separately for `community::tests`, `presence::tests`, `inactivity::tests`,
   `funnel::tests`, `community_store`, `presence_store`, and `inactivity_store`,

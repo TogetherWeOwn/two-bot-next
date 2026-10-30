@@ -352,11 +352,20 @@ def evaluate(obs):
     out.append(check("name", bool(name) and not FALLBACK.match(name),
                      f"created name {name!r} (fallback pattern <display>'s room must not match)"))
     order = [c["id"] for c in voice_order(obs.get("channels", []), creator.get("parent_id"))]
-    block = [r for r in creator_block(obs.get("channels_before", []), creator) if r != room_id]
+    live = set(order)
+    before_block = [r for r in creator_block(obs.get("channels_before", []), creator) if r != room_id]
+    # A snapshotted predecessor the empty-room sweep deleted mid-run is not a
+    # misplacement: the expected slot follows the predecessors still present
+    # when the room's position is read, and the detail names the swept ones.
+    block = [r for r in before_block if r in live]
     after = block[-1] if block else creator["id"]
     ok = room_id in order and after in order and order.index(room_id) == order.index(after) + 1
-    out.append(check("position", ok, f"category voice order {order}; room must follow {after} "
-                                     f"(creator {creator['id']}, its existing rooms {block})"))
+    detail = (f"category voice order {order}; room must follow {after} "
+              f"(creator {creator['id']}, its existing rooms {block})")
+    swept = [r for r in before_block if r not in live]
+    if swept:
+        detail += f"; swept since the snapshot: {swept}"
+    out.append(check("position", ok, detail))
     mine = [o for o in created.get("permission_overwrites", [])
             if o.get("type") == 1 and o.get("id") == obs["me"]]
     allow = int(mine[0]["allow"]) if mine else 0

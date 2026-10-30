@@ -63,7 +63,7 @@ use super::{private_runtime::can_edit_overwrites, *};
 
 /// A public correlation nonce, not an authorization token. Ownership and the
 /// command gate are still checked on every click.
-type WorkerEpoch = [u8; 16];
+pub(super) type WorkerEpoch = [u8; 16];
 
 const PAUSED: &str = "Voice rooms are paused: Discord refused the bot credential. \
                       Fix the token, then restart the bot.";
@@ -193,6 +193,33 @@ pub(super) enum JoinReply {
     Decided(String),
 }
 
+/// Split a join button id into its codec core and worker epoch: `Some((core,
+/// epoch))` for a bare codec id (`epoch` is `None`) and for a runtime id with
+/// a valid 32-hex epoch suffix, `None` when the id has the epoch shape but the
+/// suffix is not valid lowercase hex. Shared by the sink's
+/// [`join_component_action`] and the stale-control ownership check, so the two
+/// can never disagree on what the sink claims.
+pub(super) fn split_runtime_join_id(custom_id: &str) -> Option<(&str, Option<WorkerEpoch>)> {
+    if custom_id.len() > two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS {
+        return None;
+    }
+    if custom_id.matches(':').count() == 5 {
+        let (core_id, encoded) = custom_id.rsplit_once(':')?;
+        if encoded.len() != 32
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let mut epoch = [0; 16];
+        hex::decode_to_slice(encoded, &mut epoch).ok()?;
+        Some((core_id, Some(epoch)))
+    } else {
+        Some((custom_id, None))
+    }
+}
+
 /// Parse a join-request button press. `None` for anything else, so other
 /// components (including other `two:voice:` ids) stay with their owners.
 pub(super) fn join_component_action(interaction: &Interaction) -> Option<JoinClick> {
@@ -203,24 +230,7 @@ pub(super) fn join_component_action(interaction: &Interaction) -> Option<JoinCli
     let InteractionData::MessageComponent(data) = interaction.data.as_ref()? else {
         return None;
     };
-    if data.custom_id.len() > two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS {
-        return None;
-    }
-    let (core_id, epoch) = if data.custom_id.matches(':').count() == 5 {
-        let (core_id, encoded) = data.custom_id.rsplit_once(':')?;
-        if encoded.len() != 32
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return None;
-        }
-        let mut epoch = [0; 16];
-        hex::decode_to_slice(encoded, &mut epoch).ok()?;
-        (core_id, Some(epoch))
-    } else {
-        (data.custom_id.as_str(), None)
-    };
+    let (core_id, epoch) = split_runtime_join_id(&data.custom_id)?;
     let (decision, room_id, request_id) = match parse_voice_custom_id(core_id)? {
         VoiceAction::JoinApprove {
             room_id,
@@ -326,6 +336,7 @@ where
         .run_join_decision(guild_id, JoinDecisionCommand { actor_id, click })
         .await
     {
+        None if runtime.has_actor(guild_id) => ephemeral_response(WORKER_LOST_REPLY),
         None => ephemeral_response(WARMING),
         Some(JoinReply::Refused(text)) => ephemeral_response(&text),
         Some(JoinReply::Decided(text)) => decided_response(&text),
@@ -340,8 +351,9 @@ where
     H: RoomWrites + Send + 'static,
 {
     /// Run one press through the guild actor. `None` when the guild has no
-    /// live actor yet or its inbox already drained.
-    async fn run_join_decision(
+    /// live actor yet, when its inbox already drained, or when no answer
+    /// arrived within `WORKER_ACK_WAIT`.
+    pub(super) async fn run_join_decision(
         &self,
         guild: Snowflake,
         decision: JoinDecisionCommand,
@@ -352,7 +364,10 @@ where
             .tx
             .send(ActorCommand::JoinDecision { decision, reply })
             .ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 }
 

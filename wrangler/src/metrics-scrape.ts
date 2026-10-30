@@ -1,9 +1,9 @@
-import { processIncarnation, type Sample } from "./alert-rules.ts";
+import { JOB_RUNS_JOBS, processIncarnation, type Sample } from "./alert-rules.ts";
 
 /** Required inputs consumed by alert rules; pinned to metrics.rs in tests. */
 export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
-  two_bot_job_last_success_timestamp_seconds: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
-  two_bot_job_consecutive_failures: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
+  two_bot_job_last_success_timestamp_seconds: { job: JOB_RUNS_JOBS },
+  two_bot_job_consecutive_failures: { job: JOB_RUNS_JOBS },
   two_bot_rest_requests_total: {
     route: ["GET /channels/:channel", "GET /channels/:channel/messages", "GET /guilds/:guild", "GET /guilds/:guild/members", "GET /guilds/:guild/scheduled-events", "DELETE /guilds/:guild/bans/:member", "DELETE /channels/:channel/permissions/:overwrite", "PUT /applications/:application/commands", "PUT /applications/:application/guilds/:guild/commands", "POST /interactions/:interaction/:token/callback", "POST /channels/:channel/messages", "DELETE /channels/:channel/messages/:message", "DELETE /guilds/:guild/members/:member", "PUT /guilds/:guild/bans/:member", "PATCH /guilds/:guild/members/:member", "PATCH /channels/:channel", "PUT /channels/:channel/voice-status", "PUT /channels/:channel/permissions/:overwrite", "POST /channels/:channel/messages/bulk-delete", "PUT /guilds/:guild/members/:member/roles/:role", "DELETE /guilds/:guild/members/:member/roles/:role", "POST /guilds/:guild/scheduled-events", "PATCH /guilds/:guild/scheduled-events/:event", "DELETE /guilds/:guild/scheduled-events/:event", "POST /guilds/:guild/channels", "DELETE /channels/:channel", "GET /guilds/:guild/members/:member", "GET /users/@me", "PATCH /webhooks/:application/:token/messages/@original", "other"],
     result: ["2xx", "3xx", "4xx", "429", "5xx", "transport"],
@@ -40,7 +40,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_gateway_latency_seconds: {},
   two_bot_gateway_reconnects_total: {},
   two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
-  two_bot_job_runs_total: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], outcome: ["success", "failure"] },
+  two_bot_job_runs_total: { job: JOB_RUNS_JOBS, outcome: ["success", "failure"] },
 };
 
 /**
@@ -69,12 +69,18 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * and global-pause counters) is optional for the same reason, with the
  * safety-series tickets held. Breaker closes
  * (`two_bot_rest_guard_breaker_closes_total`) stays unvalidated: no rule
- * consumes it (see the catalog deferral). The evaluator already tolerates
- * their absence.
+ * consumes it (see the catalog deferral). The domain-outcome family below
+ * (feed-fetch errors, EventSub received and reconcile errors, automod
+ * decisions, moderation enforcements, voice REST in-flight age and
+ * global-backoff caps) is optional for the same reason: an older container
+ * without it must still scrape, with the domain-outcome tickets held rather
+ * than every rule silenced. The evaluator already tolerates their absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
-  two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
+  // Rollback containers predate this counter; validate it only when present.
+  two_bot_gateway_drain_skips_total: {},
+  two_bot_job_last_error_class: { job: JOB_RUNS_JOBS, class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
   two_bot_rest_guard_breaker_open: {},
@@ -88,7 +94,7 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_eventsub_posts_total: { outcome: ["attempted", "succeeded", "failed", "other"] },
   two_bot_eventsub_reconcile_passes_total: { outcome: ["healthy", "pending", "failed"] },
   two_bot_voice_vote_kick_total: { outcome: ["started", "evidence_unavailable", "not_a_room", "initiator_not_occupant", "target_not_occupant", "self_target", "protected_target", "privileged_target", "authority_unavailable", "active_vote_exists", "cooldown", "initiator_limited", "reused_vote_id", "unknown_vote", "wrong_vote_boundary", "ineligible_voter", "repeated_vote", "invalid_time", "connect_denied_and_disconnected", "connect_denied_target_absent", "skipped_room_gone", "skipped_target_protected", "permission_missing", "discord_error", "gave_up", "other"] },
-  two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
+  two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "invalid_secret", "invalid_header", "body_too_large", "bad_signature", "invalid_timestamp", "stale_timestamp", "invalid_body", "duplicate_keys", "wrong_subscription", "invalid_challenge", "invalid_callback", "invalid_broadcaster_id", "too_many_broadcasters", "other"] },
   two_bot_event_store_consumer_lag_seconds: {},
   // Voice stall family; old containers may omit the whole family.
   two_bot_voice_worker_halted: {},
@@ -102,6 +108,17 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_halt_recoveries_total: {},
   two_bot_rest_guard_breaker_opens_total: {},
   two_bot_rest_guard_global_pauses_total: {},
+  // Domain-outcome and voice-liveness family; old containers may omit the whole family.
+  two_bot_feed_fetch_errors_total: { error_class: ["invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other"] },
+  two_bot_eventsub_received_total: {},
+  two_bot_eventsub_reconcile_errors_total: { error_class: ["reconcile_action_failed", "reconcile_prior_failed", "reconcile_unhealthy", "reconcile_failed", "other"] },
+  two_bot_automod_decisions_total: { outcome: ["accepted", "already_processed", "dry_run", "protected", "deleted", "warned", "timed_out", "sanction_refused"] },
+  two_bot_moderation_enforcements_total: {
+    verb: ["ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock"],
+    outcome: ["success", "refused", "discord_error", "storage_error", "other"],
+  },
+  two_bot_voice_rest_in_flight_age_seconds: {},
+  two_bot_voice_global_backoff_capped_total: {},
   // Same-scrape lifecycle evidence; old containers may omit the whole family.
   two_bot_process_incarnation: { part: ["0", "1", "2", "3"] },
 };

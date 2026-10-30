@@ -16,6 +16,32 @@ Parity: [parity](parity.md) §1 #20–21 (`/sticky`, `/sticky-remove`) and the �
 `automationMessageAccepted` sticky re-post. Legacy `onChannelActivity` order is
 claim → post replacement → record → delete previous (best-effort).
 
+## Preview unsaved input privately
+
+Use `/sticky body:Read the rules debounce:5 preview:true` before replacing a
+working configuration. Under the same guild, feature and Manage Server gates
+as saving, it returns **Preview — not saved**, proposed content and the
+normalized debounce (1–300 seconds; omitted means 5). It validates the same raw
+body as saving: 1–2000 UTF-16 units, not empty or invisible-only. The private
+rendering uses delivery's mention sanitizer, additionally breaks user/role
+mention pills and marks content truncated to fit the response framing.
+
+Preview does **not** read or write saved stickies, audits, delivery claims,
+uncertainty fences, counters or jobs, and sends/edits/deletes no channel message.
+It does not verify actual delivery permissions or state, promise identical live
+rendering, or recover uncertain delivery. Save separately with the same body and
+debounce and `preview:false` (or omit preview); saving revalidates and retains
+its existing audit/recovery semantics. Wrong-type, duplicate and unknown options
+refuse privately before any storage access, never falling through to save.
+
+`crates/bot/src/sticky_unsaved_preview_acceptance_tests.rs` drives real dispatch
+with an unavailable pool, a live SQL-acquisition spy, whole-row state snapshots
+and mock REST. It covers validation, authority, strict flags, mention/Unicode
+bounds, registry/help discovery, zero preview effects, and real save/remove/
+uncertainty-reset controls. It runs in the normal bot unit suite; the disposable
+DB cases require the authorized test bootstrap. No live-guild execution is
+claimed by these fixtures.
+
 ## Acceptance matrix
 
 | # | Contract | Tests |
@@ -37,12 +63,20 @@ exercise it. In `crates/bot/src/command_runtime.rs`:
   precheck → the atomic `store::claim_sticky_post` → `executor.post_message`
   → `store::record_sticky_post` → best-effort delete of the previous sticky →
   a `sticky.run` audit row. A replacement is only recorded when Discord
-  returns a usable non-zero numeric message id. On a post error or an
-  unusable id it releases the claim, audits `post_failed` and keeps the
-  previous sticky, so the next eligible activity can retry (a claim that
-  cannot be released still expires after 60 s). If recording
-  fails or reports the claim moved on, it deletes the just-posted orphan
-  instead of retiring the previous sticky.
+  returns a usable non-zero numeric message id. Only a proven no-send
+  (explicit rejection, rate limit, local guard, pre-wire admission
+  refusal) releases the claim so the next eligible activity can retry.
+  Anything ambiguous — a timeout, transport loss, unusable success id, or
+  a record failure with unconfirmed orphan cleanup — keeps the
+  `delivery_uncertain` fence the atomic claim armed: the next activity
+  holds instead of sending a possible duplicate, across restarts and past
+  the 60 s claim lease, until an administrator reconfigures. Every
+  uncertain outcome audits `post_failed` (never `ok`) and logs the bounded
+  `sticky_delivery_uncertain` diagnostic with its inspection-first
+  recovery action. A record failure with proven orphan absence, or a
+  moved-on claim with confirmed cleanup, reports held without fencing;
+  an unconfirmed cleanup on the moved-on branch re-arms the fence
+  instead.
 - `/sticky` (`sticky_set`) validates the body and debounce, upserts the row,
   audits (`sticky.create`/`sticky.update`, `ok` or `rejected`) and replies;
   `/sticky-remove` (`sticky_remove`) deletes the row,
@@ -53,16 +87,17 @@ exercise it. In `crates/bot/src/command_runtime.rs`:
   which is separate from the activity-driven re-post retry above.
 - All state goes through the `two_bot_core::sticky::store` functions over
   `sticky_messages` and `automation_audit_log`: `get_sticky`, `put_sticky`
-  (conflict update preserves the post columns and clears any claim),
-  `claim_sticky_post`, `record_sticky_post`, `release_sticky_post`,
-  `delete_sticky` and `audit_sticky`.
+  (conflict update preserves the post columns and clears any claim and
+  uncertainty fence — the supported recovery path), `claim_sticky_post`,
+  `record_sticky_post`, `release_sticky_post`,
+  `mark_sticky_delivery_uncertain`, `delete_sticky` and `audit_sticky`.
 
 That behavior is pinned by the database-backed tests in
 `crates/bot/src/command_runtime_tests.rs` — for example
 `burst_coalesces_to_one_repost_and_retires_previous`,
 `held_claim_blocks_the_second_attempt`, `debounce_window_holds_the_repost`,
-`post_failure_releases_claim_and_audits_post_failed`,
-`unconfirmed_replacement_preserves_previous_and_releases_claim`,
+`post_transport_failure_retains_uncertainty_fence`,
+`unusable_success_receipt_retains_uncertainty_fence`,
 `sticky_set_writes_row_audits_and_confirms`,
 `sticky_set_rejection_audits_rejected_and_still_replies`,
 `sticky_remove_clears_state_and_deletes_the_message`,
@@ -71,6 +106,18 @@ That behavior is pinned by the database-backed tests in
 locally, run in CI against the test-database service
 (`cargo test -p two-bot --locked command_runtime_tests -- --ignored`), and
 drive a mock Discord REST server — not a live guild.
+
+## Uncertain delivery recovery
+
+If a re-post attempt cannot prove its outcome (lost response, unreadable
+receipt, or a record failure with unconfirmed orphan cleanup), the channel's
+sticky is fenced: further activity holds instead of sending a possible
+duplicate, across restarts and lease expiry, and the bot logs
+`code="sticky_delivery_uncertain"` with
+`next_action="inspect_channel_before_sticky_reset"`. Recovery: inspect the
+channel, delete any duplicate or orphan sticky post, then run `/sticky` again
+to reset the fence (or `/sticky-remove` plus `/sticky` to start over). Never
+wait out the fence or resend blindly.
 
 ## Not covered here
 
@@ -88,7 +135,12 @@ drive a mock Discord REST server — not a live guild.
 - Body-validation bounds, reply text and audit action/outcome strings are
   pinned by the unit tests in `crates/core/src/sticky.rs`, not by this pure
   suite.
-- Previous-copy and orphan deletes are best-effort: a failed delete is logged
-  and the flow continues, so removal of the old copy is not guaranteed. The
-  record-failure and claim-moved-on orphan-cleanup branches in `on_message`
-  have code but no dedicated test yet.
+- Previous-copy retirement after a confirmed record stays best-effort: a
+  failed delete is logged and the flow continues, so removal of the old
+  copy is not guaranteed. Orphan cleanup on the record-failure and
+  claim-moved-on branches is confirming instead: only proven absence
+  reopens the window, and an unconfirmed cleanup keeps or re-arms the
+  uncertainty fence. Those branches are pinned by
+  `completion_db_failure_audits_post_failed_and_preserves_newer_claim`,
+  the obsolete-completion tests, and the
+  `sticky_uncertain_acceptance_tests` corpus.

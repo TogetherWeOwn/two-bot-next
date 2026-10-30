@@ -17,11 +17,73 @@
 
 #![cfg(test)]
 
+#[path = "feed_read_strict_decode_acceptance_tests.rs"]
+mod feed_read_strict_decode_acceptance_tests;
+#[path = "feed_sticky_strict_decode_acceptance_tests.rs"]
+mod feed_sticky_strict_decode_acceptance_tests;
+#[path = "reopen_dispatch_review_acceptance_tests.rs"]
+mod reopen_dispatch_review_acceptance_tests;
+
+#[path = "leveling_ack_ordering_acceptance_tests.rs"]
+mod leveling_ack_ordering_acceptance_tests;
+#[path = "leveling_ack_visibility_acceptance_tests.rs"]
+mod leveling_ack_visibility_acceptance_tests;
+#[path = "member_authority_cause_acceptance.rs"]
+mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
+#[path = "member_strict_decode_acceptance.rs"]
+mod member_strict_decode_acceptance;
+#[path = "moderation_recent_acceptance.rs"]
+mod moderation_recent_acceptance;
+#[path = "sticky_uncertain_acceptance_tests.rs"]
+mod sticky_uncertain_acceptance_tests;
+#[path = "sticky_unsaved_preview_acceptance_tests.rs"]
+mod sticky_unsaved_preview_acceptance_tests;
+#[path = "tempban_inventory_acceptance_tests.rs"]
+mod tempban_inventory_acceptance_tests;
 
+#[path = "custom_command_inspect_eligibility_acceptance.rs"]
+mod custom_command_inspect_eligibility_acceptance;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
+#[path = "custom_command_toggle_acceptance.rs"]
+mod custom_command_toggle_acceptance;
+#[path = "help_detail_acceptance.rs"]
+mod help_detail_acceptance;
+#[path = "help_focus_acceptance.rs"]
+mod help_focus_acceptance;
+
+#[path = "game_mix_acceptance_tests.rs"]
+mod game_mix_acceptance_tests;
+#[path = "game_mix_browse_acceptance_tests.rs"]
+mod game_mix_browse_acceptance_tests;
+#[path = "game_mix_content_acceptance_tests.rs"]
+mod game_mix_content_acceptance_tests;
+// Builder-owned: pins the classified store-failure warn the protected
+// modules cannot cover without Test Author edits.
+#[path = "game_mix_store_error_log_tests.rs"]
+mod game_mix_store_error_log_tests;
+#[path = "giveaway_admission_edge_acceptance_tests.rs"]
+mod giveaway_admission_edge_acceptance_tests;
+#[path = "giveaway_countdown_edge_acceptance_tests.rs"]
+mod giveaway_countdown_edge_acceptance_tests;
+#[path = "giveaway_create_entry_acceptance_tests.rs"]
+mod giveaway_create_entry_acceptance_tests;
+#[path = "giveaway_list_facts_acceptance_tests.rs"]
+mod giveaway_list_facts_acceptance_tests;
+#[path = "privacy_action_scope_acceptance_tests.rs"]
+mod privacy_action_scope_acceptance_tests;
+#[path = "schedule_absolute_acceptance_tests.rs"]
+mod schedule_absolute_acceptance;
+#[path = "schedule_absolute_correction_tests.rs"]
+mod schedule_absolute_correction_tests;
+#[path = "schedule_delivery_truth_acceptance_tests.rs"]
+mod schedule_delivery_truth_acceptance_tests;
+#[path = "schedule_preview_dispatch_acceptance.rs"]
+mod schedule_preview_dispatch_acceptance;
+#[path = "schedule_strict_decode_acceptance_tests.rs"]
+mod schedule_strict_decode_acceptance_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -59,13 +121,18 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
-    sticky_options, CommandRuntime, RegistrySyncError,
+    actor_id, ephemeral, feed_add_options_strict, feed_id_option, feed_list_page_request,
+    feed_remove_option_strict, help_command_selector, help_focus_selector, new_id,
+    router_with_commands, sticky_options_strict, CommandRuntime, FeedListPage, HelpSubcommand,
+    RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
-use crate::member_runtime::MemberRuntime;
+use crate::member_runtime::{sweep_job, MemberRuntime};
 use crate::privacy_command::{deletion_request_id, privacy_action, PrivacyAction};
-use crate::schedule_runtime::{schedule_options, schedule_remove_option};
+use crate::schedule_runtime::{
+    schedule_list_page_option_strict, schedule_options, schedule_options_strict,
+    schedule_remove_option, schedule_remove_option_strict,
+};
 
 const GUILD: u64 = 2222;
 const GUILD_S: &str = "2222";
@@ -362,11 +429,22 @@ pub(crate) fn slash(
             guild: Some(AnonymizableId::Id(Id::new(GUILD))),
             user: None,
         },
-        channel: None,
+        // Real Discord populates both for guild slash commands: the
+        // registration guild (identity resolution scopes guild receipts by
+        // it) and the channel object (template context needs it).
+        channel: channel.map(|id| {
+            serde_json::from_value::<twilight_model::channel::Channel>(serde_json::json!({
+                "id": id.to_string(),
+                "guild_id": GUILD.to_string(),
+                "type": 0,
+                "name": "commands",
+            }))
+            .expect("slash fixture channel")
+        }),
         channel_id: channel.map(Id::new),
         context: None,
         data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
-            guild_id: None,
+            guild_id: Some(Id::new(GUILD)),
             id: Id::new(1),
             name: name.to_owned(),
             kind: CommandType::ChatInput,
@@ -433,12 +511,41 @@ fn interaction_event(interaction: Interaction) -> Event {
 
 /// A router-refused command: the first thing it does is one REST callback, so
 /// a delayed mock reply holds its worker slot without any database.
+/// Move an interaction to another invocation guild. Real guild slash
+/// payloads carry the same guild in `data.guild_id`, so keep both aligned.
+fn set_guild(
+    interaction: &mut Interaction,
+    guild: Option<twilight_model::id::Id<twilight_model::id::marker::GuildMarker>>,
+) {
+    interaction.guild_id = guild;
+    if let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_mut() {
+        if command.guild_id.is_some() {
+            command.guild_id = guild;
+        }
+    }
+}
+
 fn open_command(member: u64) -> Event {
     interaction_event(from_member(
         slash("sticky-remove", Some(CHANNEL), Vec::new()),
         member,
         Permissions::empty(),
     ))
+}
+
+/// `open_command` as a global-registration payload (no registration guild).
+/// Scope-closure probes use it so a registry installed earlier in the test
+/// cannot swallow the invocation before the closed scope is consulted.
+fn open_command_global(member: u64) -> Event {
+    let mut interaction = from_member(
+        slash("sticky-remove", Some(CHANNEL), Vec::new()),
+        member,
+        Permissions::empty(),
+    );
+    if let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_mut() {
+        command.guild_id = None;
+    }
+    interaction_event(interaction)
 }
 
 /// `/timeout` from a member who holds `MODERATE_MEMBERS`; moderation is gated
@@ -587,7 +694,8 @@ fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRun
 async fn activation_boot_publishes_only_permitted_capabilities() {
     use two_bot_core::{
         activation::LiveCapability, announcement_commands, automation_commands,
-        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId,
+        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId, SlashContext,
+        SlashOutcome,
     };
     const STAGING: u64 = 1545644954272137297;
     const LIVE: u64 = 326474832151838730;
@@ -643,13 +751,41 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
                 definition.name
             );
         }
+        let prefixed = token.starts_with("Bot ");
+        assert_eq!(
+            names.contains(&"lfg-list"),
+            staging,
+            "lfg-list publication, guild={guild}, app={app}, prefixed={prefixed}"
+        );
         for handler in [
             HandlerId::AutomationAdmin,
+            HandlerId::Giveaway,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
             HandlerId::FeedList,
+            HandlerId::FeedInspect,
         ] {
-            assert_eq!(runtime.router().handler_for(&handler).is_some(), staging);
+            assert_eq!(
+                runtime.router().handler_for(&handler).is_some(),
+                staging,
+                "conditional {handler:?} registration, guild={guild}, app={app}, prefixed={prefixed}"
+            );
+        }
+        // LFG adapter ownership is composed unconditionally, unlike the
+        // activation-fenced publication and invocation checked separately.
+        for handler in [
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::LfgEdit,
+            HandlerId::LfgList,
+        ] {
+            assert_eq!(
+                runtime.router().handler_for(&handler).map(|h| h.id()),
+                Some(handler),
+                "LFG ownership {handler:?}, guild={guild}, app={app}, prefixed={prefixed}"
+            );
         }
         assert_eq!(
             runtime
@@ -671,6 +807,88 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
             let msg = message(4444, CHANNEL, false, Some(guild));
             assert_eq!(runtime.on_message(&msg).await, ActivityOutcome::None);
             assert_eq!(mock.requests().len(), 1, "no sticky side effect");
+        }
+        for interaction_guild in [Some(guild), Some(9999), None] {
+            for permissions in [
+                Some(Permissions::MANAGE_EVENTS),
+                Some(Permissions::MANAGE_GUILD),
+                Some(Permissions::empty()),
+                None,
+            ] {
+                let expected = if interaction_guild != Some(guild) {
+                    SlashOutcome::Ignore
+                } else if !staging {
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::AnnouncementsDisabled,
+                    }
+                } else if permissions == Some(Permissions::MANAGE_EVENTS) {
+                    SlashOutcome::Handled {
+                        handler: HandlerId::LfgList,
+                    }
+                } else {
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageEventsRequired,
+                    }
+                };
+                let context = format!(
+                    "lfg-list guild={guild}, app={app}, prefixed={prefixed}, \
+                     interaction_guild={interaction_guild:?}, permissions={permissions:?}"
+                );
+                assert_eq!(
+                    runtime.router().route_slash(&SlashContext {
+                        name: "lfg-list",
+                        guild_id: interaction_guild,
+                        actor_permissions: permissions.map(|p| p.bits()),
+                        custom_row: None,
+                    }),
+                    expected,
+                    "{context}"
+                );
+                if matches!(expected, SlashOutcome::Handled { .. }) {
+                    // Positive routing control only: do not execute the DB read.
+                    continue;
+                }
+                let mut interaction = slash("lfg-list", Some(CHANNEL), Vec::new());
+                interaction.application_id = Id::new(app);
+                // Global-registration payload: an unpublished command has no
+                // guild registration to resolve, so the router must see it.
+                interaction.guild_id = interaction_guild.map(Id::new);
+                if let Some(InteractionData::ApplicationCommand(command)) =
+                    interaction.data.as_mut()
+                {
+                    command.guild_id = None;
+                }
+                interaction.member.as_mut().unwrap().permissions = permissions;
+                let before = mock.requests().len();
+                tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
+                    .await
+                    .unwrap_or_else(|_| panic!("refusal must precede DB execution: {context}"));
+                let requests = mock.requests();
+                match expected {
+                    SlashOutcome::Ignore => {
+                        assert_eq!(requests.len(), before, "silent guild fence: {context}");
+                    }
+                    SlashOutcome::Refuse { refusal } => {
+                        assert_eq!(
+                            requests.len(),
+                            before + 1,
+                            "one refusal only; no lookup, defer, edit or effects: {context}"
+                        );
+                        let callback = &requests[before];
+                        assert_eq!(callback.method, "POST", "{context}");
+                        assert_eq!(
+                            callback.path, "/api/v10/interactions/7/sticky-test-token/callback",
+                            "{context}"
+                        );
+                        let reply: serde_json::Value =
+                            serde_json::from_slice(&callback.body).unwrap();
+                        assert_eq!(reply["type"], 4, "immediate refusal: {context}");
+                        assert_eq!(reply["data"]["flags"], 64, "ephemeral: {context}");
+                        assert_eq!(reply["data"]["content"], refusal.message(), "{context}");
+                    }
+                    other => panic!("unexpected negative control {other:?}: {context}"),
+                }
+            }
         }
         mock.shutdown().await;
     }
@@ -723,7 +941,15 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help", "privacy"],
+                vec![
+                    "rank",
+                    "leaderboard",
+                    "help",
+                    "privacy",
+                    "reopen",
+                    "welcome-preview",
+                    "game-mix"
+                ],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -837,7 +1063,18 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(
+            names,
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview",
+                "game-mix"
+            ]
+        );
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -1096,25 +1333,125 @@ async fn activation_boot_call_site_fixture() {
 }
 
 #[test]
-fn sticky_options_extract_body_and_debounce() {
-    let interaction = slash(
+fn sticky_options_strict_decodes_valid_and_ignores_unknown_names() {
+    let full = slash(
         "sticky",
         Some(CHANNEL),
         vec![
             option("body", CommandOptionValue::String("remember".to_owned())),
             option("debounce", CommandOptionValue::Integer(7)),
+            option("other", CommandOptionValue::Boolean(true)),
         ],
     );
     assert_eq!(
-        sticky_options(&interaction),
-        (Some("remember".to_owned()), Some(7))
+        sticky_options_strict(&full),
+        Ok(("remember".to_owned(), Some(7)))
+    );
+    let omitted_debounce = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option(
+            "body",
+            CommandOptionValue::String("remember".to_owned()),
+        )],
+    );
+    assert_eq!(
+        sticky_options_strict(&omitted_debounce),
+        Ok(("remember".to_owned(), None))
     );
 }
 
 #[test]
-fn sticky_options_missing_options_validate_to_rejection_inputs() {
-    let interaction = slash("sticky", Some(CHANNEL), Vec::new());
-    assert_eq!(sticky_options(&interaction), (None, None));
+fn sticky_options_strict_refuses_wrong_types_duplicates_and_missing_body() {
+    let wrong_body = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option("body", CommandOptionValue::Integer(9))],
+    );
+    assert_eq!(
+        sticky_options_strict(&wrong_body),
+        Err("Invalid body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let wrong_debounce = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("debounce", CommandOptionValue::String("soon".to_owned())),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&wrong_debounce),
+        Err("Invalid debounce. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let duplicate_body = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&duplicate_body),
+        Err("Duplicate body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let duplicate_debounce = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("debounce", CommandOptionValue::Integer(7)),
+            option("debounce", CommandOptionValue::Integer(7)),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&duplicate_debounce),
+        Err("Duplicate debounce. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let missing_body = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option("debounce", CommandOptionValue::Integer(7))],
+    );
+    assert_eq!(
+        sticky_options_strict(&missing_body),
+        Err("Missing body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    // Duplicates win over wrong types, and `body` wins over `debounce`.
+    let duplicate_wins = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("pin me".to_owned())),
+            option("body", CommandOptionValue::Integer(9)),
+            option("debounce", CommandOptionValue::String("soon".to_owned())),
+        ],
+    );
+    assert_eq!(
+        sticky_options_strict(&duplicate_wins),
+        Err("Duplicate body. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    // Wrong types beat a missing `body`: the unusable `debounce` is named
+    // even though `body` is absent.
+    let wrong_type_beats_missing = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option(
+            "debounce",
+            CommandOptionValue::String("soon".to_owned()),
+        )],
+    );
+    assert_eq!(
+        sticky_options_strict(&wrong_type_beats_missing),
+        Err("Invalid debounce. Use /sticky body:<text> debounce:<seconds>.")
+    );
+    let mut no_data = slash("sticky", Some(CHANNEL), Vec::new());
+    no_data.data = None;
+    assert_eq!(
+        sticky_options_strict(&no_data),
+        Err("Missing body. Use /sticky body:<text> debounce:<seconds>.")
+    );
 }
 
 #[test]
@@ -1270,13 +1607,20 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "sticky-remove"
                         | "feed-add"
                         | "feed-remove"
+                        | "feed-pause"
+                        | "feed-resume"
                         | "feed-list"
+                        | "feed-inspect"
                         | "purge"
+                        | "purge-preview"
+                        | "channel-inspect"
                         | "slowmode"
                         | "lockdown"
                         | "unlock"
                         | "lfg"
                         | "lfg-close"
+                        | "lfg-edit"
+                        | "lfg-list"
                         | "schedule"
                         | "schedule-remove"
                         | "schedule-list"
@@ -1284,13 +1628,22 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "giveaway"
+                        | "reopen"
+                        | "welcome-preview"
+                        | "game-mix"
                 )
             })
             .collect();
+        assert!(!unwired.contains(&"giveaway"));
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"lfg-list"));
+        assert!(!unwired.contains(&"reopen"));
+        assert!(!unwired.contains(&"welcome-preview"));
+        assert!(!unwired.contains(&"game-mix"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -1430,7 +1783,7 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_with_audit() {
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
         let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
-        runtime.on_interaction(&member_slash(name)).await;
+        runtime.on_interaction(&timed_member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
         assert_eq!(requests[1].method, "GET");
@@ -1482,7 +1835,7 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
         ])
         .await;
         let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
-        runtime.on_interaction(&member_slash(name)).await;
+        runtime.on_interaction(&timed_member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
@@ -1521,7 +1874,7 @@ async fn member_verbs_share_actor_cooldown_before_role_reads() {
         .into_iter()
         .enumerate()
     {
-        let mut interaction = member_slash(name);
+        let mut interaction = timed_member_slash(name);
         interaction.id = Id::new(100 + index as u64);
         runtime.on_interaction(&interaction).await;
         let requests = mock.requests();
@@ -1577,7 +1930,7 @@ fn authority_reads(first_command: bool) -> Vec<RestResponse> {
 
 fn timed_member_slash(name: &str) -> Interaction {
     let mut interaction = member_slash(name);
-    if name == "timeout" {
+    if matches!(name, "tempban" | "timeout") {
         let Some(InteractionData::ApplicationCommand(data)) = &mut interaction.data else {
             panic!("command fixture")
         };
@@ -1688,7 +2041,9 @@ async fn a_completed_kick_replays_after_its_target_left_without_a_denial() {
                 .to_owned()
         })
         .collect();
-    assert_eq!(replies, ["Kicked.", "Kicked. Already applied."]);
+    // The fixture interaction carries no resolved user block, so the reply
+    // slot falls back to the raw target user id.
+    assert_eq!(replies, ["Kicked 3333.", "Kicked 3333. Already applied."]);
     let kicks: Vec<_> = requests
         .iter()
         .filter(|r| r.method == "DELETE" && r.path.starts_with("/api/v10/guilds/"))
@@ -1759,6 +2114,162 @@ async fn member_ban_refuses_without_ban_permission() {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn rejected_ban_through_command_path_logs_detail_with_ids_and_replies_fixed_copy() {
+    // The command path must wire execute() to error_text_with_log: the
+    // moderator gets exactly the fixed copy while the server log keeps the
+    // full detail with the interaction and request ids. Reverting execute()
+    // to error_text keeps the reply byte-identical but drops the log line,
+    // so this test reads the process-wide capture (fresh text only) with a
+    // unique interaction id.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    let capture = crate::tracing_capture::global();
+    let log_start = capture.text().len();
+    let mut script = vec![RestResponse::status(200)];
+    script.extend(authority_reads(true));
+    script.push(scripted_json(serde_json::json!(
+        {"user": {"id": "3333", "bot": false}, "roles": []}
+    )));
+    script.push(scripted_json(
+        serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["103"]}),
+    ));
+    script.push(RestResponse::status(403));
+    script.push(RestResponse::status(200));
+    let (mock, origin) = MockRest::start_script(script).await;
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+    let mut interaction = member_slash("ban");
+    interaction.id = Id::new(9007001);
+    runtime.on_interaction(&interaction).await;
+    let reply = mock.deferred_reply();
+    assert_eq!(
+        reply["content"],
+        "Discord refused the request; nothing was applied. Check the bot's permissions or ask an operator."
+    );
+    assert!(
+        !reply["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("403"),
+        "rejection copy carries no status detail: {reply}"
+    );
+    let bans: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PUT" && r.path.contains("/bans/"))
+        .collect();
+    assert_eq!(bans.len(), 1, "one refused ban dispatch");
+    let logged = capture.text().split_off(log_start);
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("member moderation discord failure")
+                && line.contains("9007001")
+                && line.contains("Discord refused the request with 403")
+        })
+        .unwrap_or_else(|| panic!("rejection must log detail with ids; fresh log: {logged:?}"));
+    assert!(
+        line.contains("request_id"),
+        "log carries the request id: {line:?}"
+    );
+    mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn sweep_tick_reports_a_failed_unban_as_a_rest_job_failure() {
+    // The sweep continues past per-job failures, but the tick must report
+    // them: Ok would reset the member_unban_sweep consecutive-failure
+    // streak and silence its failure-only alert while expired tempbans
+    // never lift.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    let mut script = vec![RestResponse::status(200)];
+    script.extend(authority_reads(true));
+    script.push(scripted_json(serde_json::json!(
+        {"user": {"id": "3333", "bot": false}, "roles": []}
+    )));
+    script.push(scripted_json(
+        serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["103"]}),
+    ));
+    script.push(RestResponse::status(204));
+    script.push(RestResponse::status(200));
+    let (mock, origin) = MockRest::start_script(script).await;
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+    let mut interaction = member_slash("tempban");
+    let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_mut() else {
+        panic!("command fixture");
+    };
+    data.options.push(option(
+        "duration_seconds",
+        CommandOptionValue::Integer(3600),
+    ));
+    runtime.on_interaction(&interaction).await;
+    assert_eq!(mock.deferred_reply()["content"], "Temporarily banned 3333.");
+    // The successful PUT activates the row staged -> pending; the sweep
+    // claims pending rows whose execute_at has passed.
+    let scheduled: (String,) =
+        sqlx::query_as("SELECT state FROM moderation_scheduled_unbans WHERE guild_id = $1")
+            .bind(GUILD_S)
+            .fetch_one(db.pool())
+            .await
+            .expect("tempban stages its unban");
+    assert_eq!(scheduled.0, "pending");
+    sqlx::query(
+        "UPDATE moderation_scheduled_unbans SET execute_at = '2020-01-01T00:00:00+00:00' WHERE guild_id = $1",
+    )
+    .bind(GUILD_S)
+    .execute(db.pool())
+    .await
+    .expect("backdate the staged job");
+    mock.shutdown().await;
+
+    // The DELETE is refused: the job requeues, the failure is audited, and
+    // the tick reports Rest so the job streak records the failure.
+    let (sweep_mock, sweep_origin) = MockRest::start_script(vec![
+        scripted_json(serde_json::to_value(user(4444, true)).unwrap()),
+        RestResponse::status(403),
+    ])
+    .await;
+    let sweep_rest = ActionExecutor::with_proxy("test-token".to_owned(), Some(sweep_origin))
+        .expect("mock executor");
+    let member = MemberRuntime::for_test(db.pool().clone(), GUILD_S);
+    let result = (sweep_job(member, sweep_rest).action)().await;
+    assert!(
+        matches!(result, Err(crate::jobs::ErrorClass::Rest)),
+        "a failed sweep reports Rest, got {result:?}"
+    );
+    let failures: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM moderation_audit WHERE guild_id = $1 AND outcome = 'unban_failed'",
+    )
+    .bind(GUILD_S)
+    .fetch_one(db.pool())
+    .await
+    .expect("failure audit");
+    assert_eq!(failures.0, 1);
+    assert_eq!(sweep_mock.deletes().len(), 1, "one refused DELETE");
+    sweep_mock.shutdown().await;
+
+    // Nothing due anywhere else stays a clean Ok: the failure signal fires
+    // only when a job actually failed.
+    let (idle_mock, idle_origin) = MockRest::start_script(vec![scripted_json(
+        serde_json::to_value(user(4444, true)).unwrap(),
+    )])
+    .await;
+    let idle_rest = ActionExecutor::with_proxy("test-token".to_owned(), Some(idle_origin))
+        .expect("mock executor");
+    let idle = MemberRuntime::for_test(db.pool().clone(), "9999");
+    let idle_result = (sweep_job(idle, idle_rest).action)().await;
+    assert!(
+        matches!(idle_result, Ok(())),
+        "an empty sweep succeeds, got {idle_result:?}"
+    );
+    idle_mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
+}
+
+#[tokio::test]
 async fn unknown_command_replies_ephemerally_without_other_effects() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
@@ -1793,11 +2304,29 @@ async fn foreign_non_moderation_commands_remain_silent() {
     for name in ["not-a-command", "rank", "rsvp", "command", "schedule"] {
         for guild in [Some(Id::new(9999)), None] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             runtime.on_interaction(&interaction).await;
         }
     }
     assert!(mock.requests().is_empty(), "router Ignore stays silent");
+    mock.shutdown().await;
+}
+
+/// `/reopen` routes `Handled` but executes in the onboarding worker, not
+/// here: this runtime must stay silent (no unavailable reply, no defer),
+/// exactly like it does for the picker components, so the single initial
+/// callback belongs to the onboarding owner.
+#[tokio::test]
+async fn reopen_stays_silent_for_the_onboarding_owner() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash("reopen", Some(CHANNEL), Vec::new()))
+        .await;
+    assert!(
+        mock.requests().is_empty(),
+        "the onboarding worker owns /reopen; this runtime answers nothing"
+    );
     mock.shutdown().await;
 }
 
@@ -1816,7 +2345,7 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
     ] {
         for guild in [Some(Id::new(9999)), None] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             let handled = leveling
                 .handle_interaction(&interaction, handler)
                 .await
@@ -1890,7 +2419,7 @@ async fn foreign_moderation_preserves_the_router_guild_refusal() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(false, false), false, origin);
     let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
-    interaction.guild_id = Some(Id::new(9999));
+    set_guild(&mut interaction, Some(Id::new(9999)));
     runtime.on_interaction(&interaction).await;
     let callbacks = mock.posts_to("/callback").await;
     assert_eq!(callbacks.len(), 1);
@@ -2097,7 +2626,7 @@ async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_e
     .await;
     let sent = mock.requests().len();
     assert!(
-        !runtime.dispatch(&open_command(500)),
+        !runtime.dispatch(&open_command_global(500)),
         "closed scope refuses new work"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2364,7 +2893,8 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
     runtime.set_identity(1111, 1111);
 
     // Each accepted route fails validation before SQL: LFG lacks required
-    // options, sticky has no channel, and feeds have an invalid kind/id.
+    // options, sticky has no channel, and feeds lack required options (a
+    // strict-decode refusal naming the option with a correction).
     // This exercises feature execution, not just registry coexistence.
     for (index, (name, channel, permissions, expected)) in [
         (
@@ -2375,6 +2905,12 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
         ),
         (
             "lfg-close",
+            Some(CHANNEL),
+            Permissions::MANAGE_EVENTS,
+            "Missing id option.",
+        ),
+        (
+            "lfg-edit",
             Some(CHANNEL),
             Permissions::MANAGE_EVENTS,
             "Missing id option.",
@@ -2395,13 +2931,13 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
             "feed-add",
             Some(CHANNEL),
             Permissions::MANAGE_GUILD,
-            "Unknown feed kind.",
+            "Missing kind. Use /feed-add kind:rss source:<https-url>.",
         ),
         (
             "feed-remove",
             Some(CHANNEL),
             Permissions::MANAGE_GUILD,
-            "Invalid feed id.",
+            "Missing id. Use /feed-remove id:<relay-id>.",
         ),
     ]
     .into_iter()
@@ -2449,6 +2985,55 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
 }
 
 #[tokio::test]
+async fn lfg_list_store_failure_reaches_read_path_without_other_rest_effects() {
+    for automations in [false, true] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        // Fail reads immediately without connecting to any database.
+        pool.close().await;
+        let runtime = CommandRuntime::new(
+            pool,
+            executor_at(origin),
+            router_with_commands(gates(automations, true)),
+            GUILD,
+            automations,
+        );
+        let mut interaction = slash("lfg-list", Some(CHANNEL), Vec::new());
+        interaction.member.as_mut().unwrap().permissions = Some(Permissions::MANAGE_EVENTS);
+        tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
+            .await
+            .expect("unavailable list must finish with a bounded reply");
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the callback; no identity, channel, history, defer/edit or mutation REST"
+        );
+        let callback = &requests[0];
+        assert_eq!(callback.method, "POST");
+        assert_eq!(
+            callback.path,
+            "/api/v10/interactions/7/sticky-test-token/callback"
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(reply["type"], 4, "one immediate callback, not a defer");
+        assert_eq!(reply["data"]["flags"], 64, "ephemeral discovery reply");
+        assert_eq!(
+            reply["data"]["content"], "Unable to list game posts. Try /lfg-list again.",
+            "the real read path owns the command even with automations={automations}"
+        );
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn lfg_commands_preserve_manage_events_and_disabled_refusals() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     for (announcements, permissions, expected) in [
@@ -2467,7 +3052,7 @@ async fn lfg_commands_preserve_manage_events_and_disabled_refusals() {
     ] {
         let runtime = runtime_without_db(gates(true, announcements), true, origin.clone());
         runtime.set_identity(1111, 1111);
-        for name in ["lfg", "lfg-close"] {
+        for name in ["lfg", "lfg-close", "lfg-edit"] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
             interaction.member.as_mut().unwrap().permissions = permissions;
             let before = mock.requests().len();
@@ -2523,6 +3108,7 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
         for name in [
             "lfg",
             "lfg-close",
+            "lfg-edit",
             "sticky",
             "sticky-remove",
             "feed-add",
@@ -2530,13 +3116,13 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
             "feed-list",
         ] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             interaction.member.as_mut().unwrap().permissions =
                 Some(Permissions::MANAGE_EVENTS | Permissions::MANAGE_GUILD);
             runtime.on_interaction(&interaction).await;
         }
         let mut interaction = lfg_select(Vec::new());
-        interaction.guild_id = guild;
+        set_guild(&mut interaction, guild);
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -2547,7 +3133,7 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
     // Moderation's guild fence remains an explicit refusal, unlike the
     // announcement/automation routes above, even with its feature gate off.
     let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
-    interaction.guild_id = Some(Id::new(9999));
+    set_guild(&mut interaction, Some(Id::new(9999)));
     runtime.on_interaction(&interaction).await;
     let requests = mock.requests();
     assert_eq!(requests.len(), 1, "only the moderation guild refusal");
@@ -2625,6 +3211,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             for name in [
                 "lfg",
                 "lfg-close",
+                "lfg-edit",
                 "sticky",
                 "sticky-remove",
                 "feed-add",
@@ -2683,7 +3270,7 @@ async fn foreign_application_interactions_never_reach_a_feature() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     runtime.set_identity(1111, 1111);
-    for name in ["lfg", "lfg-close", "sticky", "feed-add"] {
+    for name in ["lfg", "lfg-close", "lfg-edit", "sticky", "feed-add"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         interaction.application_id = Id::new(9999);
         interaction.member.as_mut().unwrap().permissions =
@@ -2705,7 +3292,7 @@ async fn foreign_application_interactions_never_reach_a_feature() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn feed_add_options_extract_kind_and_source() {
+fn feed_add_options_strict_decodes_valid_and_ignores_unknown_names() {
     let interaction = slash(
         "feed-add",
         Some(CHANNEL),
@@ -2715,36 +3302,376 @@ fn feed_add_options_extract_kind_and_source() {
                 "source",
                 CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
             ),
+            option("other", CommandOptionValue::Boolean(true)),
         ],
     );
     assert_eq!(
-        feed_add_options(&interaction),
-        (
-            Some("rss".to_owned()),
-            Some("https://example.com/feed.xml".to_owned())
-        )
+        feed_add_options_strict(&interaction),
+        Ok(("rss".to_owned(), "https://example.com/feed.xml".to_owned()))
     );
 }
 
 #[test]
-fn feed_add_options_missing_values_decode_to_none() {
-    let interaction = slash("feed-add", Some(CHANNEL), Vec::new());
-    assert_eq!(feed_add_options(&interaction), (None, None));
+fn feed_add_options_strict_refuses_wrong_types_duplicates_and_missing_options() {
+    let wrong_kind = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::Integer(1)),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+            ),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_kind),
+        Err("Invalid kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let wrong_source = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::String("rss".to_owned())),
+            option("source", CommandOptionValue::Integer(7)),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_source),
+        Err("Invalid source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let duplicate_kind = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::String("rss".to_owned())),
+            option("kind", CommandOptionValue::String("rss".to_owned())),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+            ),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&duplicate_kind),
+        Err("Duplicate kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    // Duplicates win over wrong types, and `kind` wins over `source`.
+    let duplicate_wins = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::Integer(1)),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/a.xml".to_owned()),
+            ),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/b.xml".to_owned()),
+            ),
+        ],
+    );
+    assert_eq!(
+        feed_add_options_strict(&duplicate_wins),
+        Err("Duplicate source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    // Wrong types beat missing options across options: a present-but-unusable
+    // value is named even when the other option is absent.
+    let wrong_type_beats_missing = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("source", CommandOptionValue::Integer(7))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_type_beats_missing),
+        Err("Invalid source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let wrong_kind_alone = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("kind", CommandOptionValue::Integer(1))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_kind_alone),
+        Err("Invalid kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let missing_kind = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option(
+            "source",
+            CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+        )],
+    );
+    assert_eq!(
+        feed_add_options_strict(&missing_kind),
+        Err("Missing kind. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let missing_source = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("kind", CommandOptionValue::String("rss".to_owned()))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&missing_source),
+        Err("Missing source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let mut no_data = slash("feed-add", Some(CHANNEL), Vec::new());
+    no_data.data = None;
+    assert_eq!(
+        feed_add_options_strict(&no_data),
+        Err("Missing kind. Use /feed-add kind:rss source:<https-url>.")
+    );
 }
 
 #[test]
-fn feed_remove_option_extracts_id() {
+fn feed_id_option_extracts_id_for_inspect() {
+    // `/feed-remove` decodes strictly via `feed_remove_option_strict`; the
+    // lenient helper serves `/feed-inspect` only.
+    let name = "feed-inspect";
     let interaction = slash(
-        "feed-remove",
+        name,
         Some(CHANNEL),
         vec![option(
             "id",
             CommandOptionValue::String("feed-1".to_owned()),
         )],
     );
-    assert_eq!(feed_remove_option(&interaction), Some("feed-1".to_owned()));
+    assert_eq!(
+        feed_id_option(&interaction),
+        Some("feed-1".to_owned()),
+        "{name} decodes its id"
+    );
+    let missing = slash(name, Some(CHANNEL), Vec::new());
+    assert_eq!(feed_id_option(&missing), None, "{name} id may be absent");
+}
+
+#[test]
+fn feed_remove_option_strict_decodes_valid_and_ignores_unknown_names() {
+    let interaction = slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![
+            option("id", CommandOptionValue::String("feed-1".to_owned())),
+            option("other", CommandOptionValue::Boolean(true)),
+        ],
+    );
+    assert_eq!(
+        feed_remove_option_strict(&interaction),
+        Ok("feed-1".to_owned())
+    );
+    // Present-but-empty still decodes: the planner's `validate_id` owns
+    // that refusal.
+    let empty = slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::String(String::new()))],
+    );
+    assert_eq!(feed_remove_option_strict(&empty), Ok(String::new()));
+}
+
+#[test]
+fn feed_remove_option_strict_refuses_wrong_type_duplicate_and_missing_id() {
+    let wrong_type = slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::Integer(42))],
+    );
+    assert_eq!(
+        feed_remove_option_strict(&wrong_type),
+        Err("Invalid id. Use /feed-remove id:<relay-id>.")
+    );
+    let duplicate = slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![
+            option("id", CommandOptionValue::String("feed-1".to_owned())),
+            option("id", CommandOptionValue::String("feed-1".to_owned())),
+        ],
+    );
+    assert_eq!(
+        feed_remove_option_strict(&duplicate),
+        Err("Duplicate id. Use /feed-remove id:<relay-id>.")
+    );
     let missing = slash("feed-remove", Some(CHANNEL), Vec::new());
-    assert_eq!(feed_remove_option(&missing), None);
+    assert_eq!(
+        feed_remove_option_strict(&missing),
+        Err("Missing id. Use /feed-remove id:<relay-id>.")
+    );
+    let mut no_data = slash("feed-remove", Some(CHANNEL), Vec::new());
+    no_data.data = None;
+    assert_eq!(
+        feed_remove_option_strict(&no_data),
+        Err("Missing id. Use /feed-remove id:<relay-id>.")
+    );
+}
+
+#[test]
+fn feed_list_page_request_defaults_and_refuses_unusable_values() {
+    let missing = slash("feed-list", Some(CHANNEL), Vec::new());
+    assert_eq!(feed_list_page_request(&missing), FeedListPage::Default);
+    for (value, expected) in [
+        (CommandOptionValue::Integer(1), FeedListPage::Page(1)),
+        (CommandOptionValue::Integer(2), FeedListPage::Page(2)),
+        (
+            CommandOptionValue::Integer(i64::MAX),
+            FeedListPage::Page(i64::MAX),
+        ),
+        // Range is refused by the reply composer, not the decoder.
+        (CommandOptionValue::Integer(0), FeedListPage::Page(0)),
+        (CommandOptionValue::Integer(-2), FeedListPage::Page(-2)),
+    ] {
+        let interaction = slash("feed-list", Some(CHANNEL), vec![option("page", value)]);
+        assert_eq!(feed_list_page_request(&interaction), expected);
+    }
+    // A present option with a non-integer wire value must refuse, never
+    // silently list the default page.
+    for value in [
+        CommandOptionValue::String("second".to_owned()),
+        CommandOptionValue::Number(1.5),
+        CommandOptionValue::Boolean(true),
+    ] {
+        let interaction = slash("feed-list", Some(CHANNEL), vec![option("page", value)]);
+        assert_eq!(feed_list_page_request(&interaction), FeedListPage::Invalid);
+    }
+}
+
+#[test]
+fn help_command_selector_keeps_omitted_absent_and_malformed_present() {
+    // An omitted option means the grouped index.
+    let missing = slash("help", Some(CHANNEL), Vec::new());
+    assert_eq!(help_command_selector(&missing), None);
+    // A string selector passes through untouched.
+    let named = slash(
+        "help",
+        Some(CHANNEL),
+        vec![option(
+            "command",
+            CommandOptionValue::String("rank".to_owned()),
+        )],
+    );
+    assert_eq!(help_command_selector(&named), Some("rank".to_owned()));
+    // A present option with a non-string wire value is malformed: decode to
+    // an empty selector (the unknown-name correction), never the index.
+    for value in [
+        CommandOptionValue::Integer(1),
+        CommandOptionValue::Number(1.5),
+        CommandOptionValue::Boolean(true),
+    ] {
+        let interaction = slash("help", Some(CHANNEL), vec![option("command", value)]);
+        assert_eq!(help_command_selector(&interaction), Some(String::new()));
+    }
+}
+
+#[test]
+fn help_focus_selector_rejects_duplicate_command_with_a_path() {
+    let command = |name: &str| option("command", CommandOptionValue::String(name.to_owned()));
+    let path = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    let focused = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank"), path.clone()],
+    );
+    assert_eq!(help_focus_selector(&focused), HelpSubcommand::Malformed);
+    // One root keeps the focused path.
+    let single = slash("help", Some(CHANNEL), vec![command("privacy"), path]);
+    assert_eq!(
+        help_focus_selector(&single),
+        HelpSubcommand::Path("deletion-status".to_owned())
+    );
+    // Without a path the existing root decode is untouched.
+    let root_only = slash(
+        "help",
+        Some(CHANNEL),
+        vec![command("privacy"), command("rank")],
+    );
+    assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
+}
+
+#[tokio::test]
+async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let runtime = CommandRuntime::new(
+        pool,
+        executor,
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    runtime.set_identity(1111, 1111);
+    runtime
+        .publish_registry_checked(Some(1111))
+        .await
+        .expect("confirmed registry");
+    let command = |root: &str| option("command", CommandOptionValue::String(root.to_owned()));
+    let focus = option(
+        "subcommand",
+        CommandOptionValue::String("deletion-status".to_owned()),
+    );
+    // A valid control ensures the confirmed snapshot can actually render the
+    // focused detail that a first-root-wins regression would leak.
+    for roots in [
+        vec!["privacy"],
+        vec!["privacy", "rank"],
+        vec!["rank", "privacy"],
+    ] {
+        let mut options: Vec<_> = roots.iter().map(|root| command(root)).collect();
+        options.push(focus.clone());
+        let mut interaction = slash("help", Some(CHANNEL), options);
+        interaction.member.as_mut().expect("member").permissions = Some(Permissions::empty());
+        let before = mock.requests().len();
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            runtime.on_interaction(&interaction),
+        )
+        .await
+        .expect("help cannot wait on the closed pool");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), before + 1, "only one help callback");
+        let callback = &requests[before];
+        assert_eq!(callback.method, "POST");
+        assert!(callback.path.ends_with("/callback"));
+        let reply: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback JSON");
+        assert_eq!(reply["type"], 4, "immediate response, never defer");
+        assert_eq!(reply["data"]["flags"], 64, "private response");
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        let content = reply["data"]["content"].as_str().expect("help content");
+        if roots.len() == 1 {
+            assert!(
+                content.contains("Usage: /privacy deletion-status <request-id>"),
+                "{content}"
+            );
+        } else {
+            assert!(content.contains("/help"), "{content}");
+            assert!(content.contains("confirmed"), "{content}");
+            assert!(content.contains("Unknown subcommand"), "{content}");
+            assert!(content.encode_utf16().count() <= 2000, "finite correction");
+            assert!(
+                !content.contains("/privacy"),
+                "no focused detail: {content}"
+            );
+            assert!(!content.contains("/rank"), "no root detail: {content}");
+            assert!(
+                !content.contains("deletion-status"),
+                "no input echo: {content}"
+            );
+        }
+    }
+    mock.shutdown().await;
 }
 
 #[test]
@@ -2801,23 +3728,120 @@ fn schedule_remove_option_extracts_id() {
     assert_eq!(schedule_remove_option(&missing), None);
 }
 
+// Exact value pins for the production strict decoders: the lenient helpers
+// above are test-only, so these are what catch a corrupted body, a scaled
+// delay or a swapped timing field on the path the handlers actually run.
+#[test]
+fn schedule_options_strict_decodes_exact_distinct_values() {
+    let interaction = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("hello".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+            option("every-minutes", CommandOptionValue::Integer(90)),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&interaction),
+        Ok((Some("hello".to_owned()), Some(30), Some(90)))
+    );
+    // Option order must not change which value lands in which slot.
+    let reordered = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("every-minutes", CommandOptionValue::Integer(90)),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+            option("body", CommandOptionValue::String("hello".to_owned())),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&reordered),
+        Ok((Some("hello".to_owned()), Some(30), Some(90)))
+    );
+}
+
+#[test]
+fn schedule_options_strict_decodes_single_timing_and_missing() {
+    let only_in = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("ping".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&only_in),
+        Ok((Some("ping".to_owned()), Some(30), None))
+    );
+    let only_every = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("ping".to_owned())),
+            option("every-minutes", CommandOptionValue::Integer(45)),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&only_every),
+        Ok((Some("ping".to_owned()), None, Some(45)))
+    );
+    let none = slash("schedule", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_options_strict(&none), Ok((None, None, None)));
+}
+
+#[test]
+fn schedule_remove_and_page_strict_decode_exact_values() {
+    let remove = slash(
+        "schedule-remove",
+        Some(CHANNEL),
+        vec![option(
+            "id",
+            CommandOptionValue::String("abc123".to_owned()),
+        )],
+    );
+    assert_eq!(
+        schedule_remove_option_strict(&remove),
+        Ok(Some("abc123".to_owned()))
+    );
+    let missing = slash("schedule-remove", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_remove_option_strict(&missing), Ok(None));
+    let page = slash(
+        "schedule-list",
+        Some(CHANNEL),
+        vec![option("page", CommandOptionValue::Integer(7))],
+    );
+    assert_eq!(schedule_list_page_option_strict(&page), Ok(Some(7)));
+    let no_page = slash("schedule-list", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_list_page_option_strict(&no_page), Ok(None));
+}
+
 #[tokio::test]
 async fn feed_commands_refuse_ephemerally_while_announcements_off() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     // announcements OFF in the router gates → the shared router refuses all
-    // three feed commands; the runtime answers through the shared executor.
+    // six feed commands; the runtime answers through the shared executor.
     let runtime = runtime_without_db(gates(true, false), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list"] {
+    for name in [
+        "feed-add",
+        "feed-remove",
+        "feed-pause",
+        "feed-resume",
+        "feed-list",
+        "feed-inspect",
+    ] {
         runtime
             .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
             .await;
     }
     let requests = mock.requests();
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 3, "one ephemeral refusal per command");
+    assert_eq!(callbacks.len(), 6, "one ephemeral refusal per command");
     assert_eq!(
         requests.len(),
-        3,
+        6,
         "no defer, no edit, no publish: {requests:?}"
     );
     for callback in &callbacks {
@@ -2860,9 +3884,16 @@ async fn feed_add_without_manage_server_is_refused() {
 async fn feed_commands_from_other_guilds_are_silent() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list"] {
+    for name in [
+        "feed-add",
+        "feed-remove",
+        "feed-pause",
+        "feed-resume",
+        "feed-list",
+        "feed-inspect",
+    ] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-        interaction.guild_id = Some(Id::new(9999));
+        set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -2930,7 +3961,7 @@ async fn schedule_commands_from_other_guilds_are_silent() {
     let runtime = runtime_without_db(gates(true, true), true, origin);
     for name in ["schedule", "schedule-remove", "schedule-list"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-        interaction.guild_id = Some(Id::new(9999));
+        set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -2987,13 +4018,188 @@ async fn feed_add_with_non_https_source_replies_ssrf_guard_error() {
 }
 
 #[tokio::test]
-async fn feed_remove_without_id_replies_invalid_id() {
+async fn feed_remove_without_id_names_the_missing_option() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     runtime
         .on_interaction(&slash("feed-remove", Some(CHANNEL), Vec::new()))
         .await;
-    assert_eq!(mock.deferred_reply()["content"], "Invalid feed id.");
+    // A missing `id` is a strict-decode refusal with a correction, not the
+    // planner's `InvalidId`: present-but-empty still replies "Invalid feed
+    // id." via `validate_id`.
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Missing id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_without_kind_names_the_missing_option() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![option(
+                "source",
+                CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+            )],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Missing kind. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_without_body_names_the_missing_option() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![option("debounce", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    // A missing `body` refuses before the existence read and the `rejected`
+    // audit; present-but-empty still validates (and audits) as before.
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Missing body. Use /sticky body:<text> debounce:<seconds>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_wrong_typed_source_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option("source", CommandOptionValue::Integer(7)),
+            ],
+        ))
+        .await;
+    // Exact dispatch pin: a fixed-text regression (e.g. always replying the
+    // missing-kind text) must fail here even though the corrected invocation
+    // names both options.
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid source. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_duplicated_kind_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option(
+                    "source",
+                    CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+                ),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate kind. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_remove_wrong_typed_id_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_remove_duplicated_id_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![
+                option("id", CommandOptionValue::String("feed-1".to_owned())),
+                option("id", CommandOptionValue::String("feed-1".to_owned())),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_wrong_typed_body_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![option("body", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid body. Use /sticky body:<text> debounce:<seconds>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_duplicated_debounce_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("remember".to_owned())),
+                option("debounce", CommandOptionValue::Integer(7)),
+                option("debounce", CommandOptionValue::Integer(7)),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate debounce. Use /sticky body:<text> debounce:<seconds>."
+    );
     mock.shutdown().await;
 }
 
@@ -3062,13 +4268,17 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "schedule-list",
         "sticky",
         "sticky-remove",
+        "giveaway",
         "rsvp",
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-edit",
+        "lfg-list",
         "feed-add",
         "feed-remove",
         "feed-list",
+        "feed-inspect",
     ] {
         assert!(
             names.contains(&expected),
@@ -3109,7 +4319,19 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
             "published set is missing {expected}"
         );
     }
-    for withheld in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+    for withheld in [
+        "feed-add",
+        "feed-remove",
+        "feed-pause",
+        "feed-resume",
+        "feed-list",
+        "feed-inspect",
+        "rsvp",
+        "lfg",
+        "lfg-close",
+        "lfg-edit",
+        "lfg-list",
+    ] {
         assert!(
             !names.contains(&withheld),
             "gated-off {withheld} must not publish"
@@ -3174,7 +4396,14 @@ async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
             );
         }
         // The non-voice registry is untouched either way.
-        for expected in ["rank", "leaderboard", "sticky", "rsvp", "feed-list"] {
+        for expected in [
+            "rank",
+            "leaderboard",
+            "game-mix",
+            "sticky",
+            "rsvp",
+            "feed-list",
+        ] {
             assert!(names.contains(&expected), "{expected} must still publish");
         }
         mock.shutdown().await;
@@ -3199,16 +4428,28 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Reopen,
+            HandlerId::WelcomePreview,
+            HandlerId::GameMix,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
+            HandlerId::Giveaway,
             HandlerId::Rsvp,
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
             HandlerId::LfgClose,
+            HandlerId::LfgEdit,
+            HandlerId::LfgList,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
             HandlerId::FeedList,
+            HandlerId::FeedInspect,
+            HandlerId::PurgePreview,
+            HandlerId::ChannelInspect,
+            HandlerId::TempbanList,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids
@@ -3216,7 +4457,7 @@ fn production_router_matches_composed_production_wiring() {
 
     // Composition mirrors production: the real `router_with_commands`, the
     // member verbs `CommandRuntime::build` adds while the member consumer
-    // exists, and the LFG pair `InteractionRuntime::with_router` adds. Only
+    // exists, and the LFG handlers `InteractionRuntime::with_router` adds. Only
     // `handler_for` presence is compared.
     fn composed(gates: RouterGates, member_present: bool) -> InteractionRouter {
         let mut router = router_with_commands(gates);
@@ -3230,9 +4471,12 @@ fn production_router_matches_composed_production_wiring() {
             ] {
                 router.register(Box::new(Marker(HandlerId::Moderation(action))));
             }
+            router.register(Box::new(Marker(HandlerId::TempbanList)));
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
+        router.register(Box::new(Marker(HandlerId::LfgEdit)));
+        router.register(Box::new(Marker(HandlerId::LfgList)));
         router
     }
 
@@ -3264,6 +4508,26 @@ fn production_router_matches_composed_production_wiring() {
                         };
                         let real = composed(gates, member_present);
                         let seam = InteractionRouter::production_router(gates, member_present);
+                        // Equal absence is not conformance: both constructors
+                        // must register the dedicated handler while enabled.
+                        for (name, router) in [("composed", &real), ("seam", &seam)] {
+                            assert_eq!(
+                                router.handler_for(&HandlerId::Giveaway).map(|h| h.id()),
+                                automations.then_some(HandlerId::Giveaway),
+                                "{name} giveaway registration follows automations \
+                                 (scorecard={scorecard} automations={automations} \
+                                 announcements={announcements} moderation={moderation} \
+                                 member={member_present})"
+                            );
+                            assert_eq!(
+                                router.handler_for(&HandlerId::FeedInspect).map(|h| h.id()),
+                                announcements.then_some(HandlerId::FeedInspect),
+                                "{name} feed-inspect registration follows announcements \
+                                 (scorecard={scorecard} automations={automations} \
+                                 announcements={announcements} moderation={moderation} \
+                                 member={member_present})"
+                            );
+                        }
                         for id in every_handler_id() {
                             assert_eq!(
                                 real.handler_for(&id).is_some(),
@@ -3273,13 +4537,13 @@ fn production_router_matches_composed_production_wiring() {
                                  moderation={moderation} member={member_present})"
                             );
                         }
-                        // The exception list is the same five verbs the owner
-                        // map guards on the consumer, and nothing else.
+                        // The exception list is the five verbs plus the private
+                        // expiry read the owner map guards on the consumer.
                         let exceptions =
                             InteractionRouter::intentional_registration_exceptions(member_present);
                         assert_eq!(
                             exceptions.len(),
-                            if member_present { 0 } else { 5 },
+                            if member_present { 0 } else { 6 },
                             "member={member_present}"
                         );
                     }
@@ -3349,7 +4613,17 @@ async fn resumed_boot_synchronizes_current_gates_once_without_ready() {
         for name in ["rank", "leaderboard", "sticky", "sticky-remove"] {
             assert!(names.contains(&name), "resumed registry is complete");
         }
-        for name in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+            "rsvp",
+            "lfg",
+            "lfg-list",
+        ] {
             assert_eq!(
                 names.contains(&name),
                 announcements,
@@ -3452,7 +4726,7 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
         two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
             .await
             .expect("migrated test database; no credential fallback");
-    let (mock, origin) = MockRest::start(vec![204; 4]).await;
+    let (mock, origin) = MockRest::start(vec![204, 200, 204, 200, 204, 200, 204, 200]).await;
     let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
     let runtime = CommandRuntime::new(
         db.pool().clone(),
@@ -3489,56 +4763,65 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
     runtime.on_interaction(&leaderboard).await;
     for name in ["rank", "leaderboard"] {
         let mut foreign = slash(name, Some(CHANNEL), Vec::new());
-        foreign.guild_id = Some(Id::new(9999));
+        set_guild(&mut foreign, Some(Id::new(9999)));
         runtime.on_interaction(&foreign).await;
     }
     let requests = mock.requests();
     assert_eq!(
         requests.len(),
-        4,
-        "exactly one callback per accepted command"
+        8,
+        "exactly one defer plus one completion edit per accepted command"
     );
-    assert!(requests
+    let callbacks: Vec<&RestRequest> = requests
         .iter()
-        .all(|r| r.method == "POST" && r.path.ends_with("/callback")));
-    let replies: Vec<serde_json::Value> = requests
+        .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+        .collect();
+    let edits: Vec<&RestRequest> = requests
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/messages/@original"))
+        .collect();
+    assert_eq!(callbacks.len(), 4, "one acknowledgement per command");
+    assert_eq!(edits.len(), 4, "one completion edit per command");
+    let defers: Vec<serde_json::Value> = callbacks
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
-    for reply in &replies {
-        assert_eq!(reply["type"], 4, "no generic defer or second response");
+    for defer in &defers {
+        assert_eq!(defer["type"], 5, "leveling acknowledges with a defer");
     }
+    for defer in &defers[..2] {
+        assert_eq!(defer["data"]["flags"], 64, "rank defers ephemerally");
+    }
+    for defer in &defers[2..] {
+        assert_ne!(defer["data"]["flags"], 64, "leaderboard defers publicly");
+    }
+    let replies: Vec<serde_json::Value> = edits
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
     for (reply, name) in replies[..2].iter().zip(["member", "Target member"]) {
-        assert_eq!(reply["data"]["flags"], 64, "rank is ephemeral");
         assert_eq!(
-            reply["data"]["content"],
+            reply["content"],
             two_bot_core::leveling::rank_text(name, 0, None, 0, 0)
         );
     }
     assert_eq!(
-        replies[2]["data"]["content"],
+        replies[2]["content"],
         two_bot_core::leveling::leaderboard_reply_for_season(&[], &season).content
     );
-    for reply in &replies[2..] {
-        assert!(reply["data"]["flags"].is_null(), "leaderboard stays public");
+    for reply in &replies {
         assert_eq!(
-            reply["data"]["allowed_mentions"]["parse"],
-            serde_json::json!([])
+            reply["allowed_mentions"]["parse"],
+            serde_json::json!([]),
+            "every completion edit suppresses mentions"
         );
-        assert!(reply["data"]["components"].is_null(), "no invented paging");
     }
     assert_eq!(
-        replies[3]["data"]["content"]
-            .as_str()
-            .unwrap()
-            .lines()
-            .count(),
-        11
+        replies[3]["content"].as_str().unwrap().lines().count(),
+        11,
+        "no invented paging on the completed board"
     );
-    assert!(!replies[3]["data"]["content"]
-        .as_str()
-        .unwrap()
-        .contains("<@77>"));
+    assert!(!replies[3]["content"].as_str().unwrap().contains("<@77>"));
     drop(pipeline);
     drop(runtime);
     mock.shutdown().await;
@@ -4211,10 +5494,10 @@ async fn failed_defer_leaves_set_and_remove_state_untouched() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
+async fn unusable_success_receipt_retains_uncertainty_fence() {
     let db = TestDb::new().await;
     db.seed(Some("8888"), 120_000, 5).await;
-    for body in [
+    for (index, body) in [
         "{}",
         "not JSON",
         r#"{"id":null}"#,
@@ -4222,9 +5505,15 @@ async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
         r#"{"id":""}"#,
         r#"{"id":"0"}"#,
         r#"{"id":"abc"}"#,
-        r#"{"id":"+123"}"#,
+        // "+123" is covered by its own seeded test below: the executor
+        // accepts it (`u64` parses a leading '+') while the runtime
+        // all-digits guard rejects it, so only a fresh fence exercises
+        // the Ok(_) unusable-receipt branch.
         r#"{"id":"18446744073709551616"}"#,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (runtime, mock) = db_runtime_script(
             &db,
             vec![RestResponse {
@@ -4241,31 +5530,123 @@ async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
             ActivityOutcome::Held,
             "{body}"
         );
+        let (remembered, last_id, claim) = db.row().await.expect("row retained");
+        assert_eq!(remembered, "remember this", "{body}");
+        assert_eq!(last_id.as_deref(), Some("8888"), "{body}");
+        assert!(
+            claim.is_some(),
+            "uncertain delivery keeps the fence for {body}"
+        );
+        // Only the first attempt reaches the wire; the fence holds the rest.
         assert_eq!(
-            db.row().await,
-            Some(("remember this".into(), Some("8888".into()), None)),
+            mock.posts_to("/messages").await.len(),
+            usize::from(index == 0),
             "{body}"
         );
-        assert_eq!(mock.posts_to("/messages").await.len(), 1);
         assert!(mock.deletes().is_empty(), "no retirement for {body}");
         mock.shutdown().await;
     }
-    let audits = db.audits().await;
-    assert_eq!(audits.len(), 9);
-    assert!(audits
-        .iter()
-        .all(|(action, outcome)| action == "sticky.run" && outcome == "post_failed"));
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "only the first attempt audits; fenced holds stay silent"
+    );
+    // The fence outlives the 60s claim lease: a probe past expiry is held,
+    // and the next accepted message holds without posting a duplicate.
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "lease-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "uncertainty survives lease expiry"
+    );
     let (runtime, mock) = db_runtime(&db, vec![]).await;
     assert_eq!(
         runtime
             .on_message(&message(25, CHANNEL, false, Some(GUILD)))
             .await,
-        ActivityOutcome::Reposted
+        ActivityOutcome::Held
     );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn plus_prefixed_receipt_id_retains_uncertainty_fence() {
+    // The executor accepts "+123" (`u64::from_str` allows a leading '+')
+    // but the runtime all-digits guard routes it to the Ok(_) branch. A
+    // fresh fence is required: sharing the loop above would hold before
+    // the wire and never execute that branch.
+    let db = TestDb::new().await;
+    db.seed(Some("8888"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"+123"}"#.into()),
+            delay: Duration::ZERO,
+        }],
+    )
+    .await;
     assert_eq!(
-        mock.deletes().len(),
+        runtime
+            .on_message(&message(26, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held,
+    );
+    let (remembered, last_id, claim) = db.row().await.expect("row retained");
+    assert_eq!(remembered, "remember this");
+    assert_eq!(last_id.as_deref(), Some("8888"));
+    assert!(claim.is_some(), "unusable receipt keeps the fence armed");
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
         1,
-        "subsequent confirmed replacement retires previous"
+        "the POST reaches the wire before the receipt is judged unusable"
+    );
+    assert!(mock.deletes().is_empty(), "no retirement");
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+    );
+    // The fence outlives the 60s claim lease: a probe past expiry is held,
+    // and the next accepted message holds without posting a duplicate.
+    // (Reverting the Ok(_) branch to release would turn the claim, probe
+    // and follow-up assertions red.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "plus-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "uncertainty survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(27, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
     );
     mock.shutdown().await;
     db.close().await;
@@ -4376,7 +5757,7 @@ async fn debounce_window_holds_the_repost() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn post_failure_releases_claim_and_audits_post_failed() {
+async fn post_transport_failure_retains_uncertainty_fence() {
     let db = TestDb::new().await;
     db.seed(Some("8000000000000000004"), 120_000, 5).await;
     // First request (the replacement post) fails 500; default 200 after.
@@ -4392,19 +5773,22 @@ async fn post_failure_releases_claim_and_audits_post_failed() {
     );
     let (_, last_id, claim) = db.row().await.expect("row exists");
     assert_eq!(last_id.as_deref(), Some("8000000000000000004"), "unchanged");
-    assert_eq!(claim, None, "claim released for the next activity");
+    assert!(claim.is_some(), "ambiguous 500 keeps the fence");
 
-    // The released claim lets the very next activity re-post successfully.
+    // The fence holds the next activity: no duplicate reaches the wire.
     let outcome = runtime
         .on_message(&message(23, CHANNEL, false, Some(GUILD)))
         .await;
-    assert_eq!(outcome, ActivityOutcome::Reposted);
-    // Failed attempt + the retry both hit the wire; only the retry lands.
-    assert_eq!(mock.posts_to("/messages").await.len(), 2);
-    let audits = db.audits().await;
+    assert_eq!(outcome, ActivityOutcome::Held);
     assert_eq!(
-        audits.last().map(|(a, o)| (a.as_str(), o.as_str())),
-        Some(("sticky.run", "ok"))
+        mock.posts_to("/messages").await.len(),
+        1,
+        "failed attempt only; no retry while fenced"
+    );
+    assert_eq!(
+        db.audits().await.len(),
+        1,
+        "fenced hold audits nothing more"
     );
     mock.shutdown().await;
     db.close().await;
@@ -4487,6 +5871,496 @@ async fn obsolete_post_after_admin_update_preserves_admin_state() {
     assert!(
         db.audits().await.is_empty(),
         "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_update_with_failed_cleanup_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000013"), 120_000, 5).await;
+    // Hold the accepted POST open so the administrator update lands between
+    // the wire post and the store record; the orphan DELETE then fails
+    // (403), leaving a possibly-live replacement that must re-arm the
+    // fence. The script is consumed in request order: POST, then DELETE.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![
+            RestResponse {
+                status: 200,
+                body: None,
+                delay: Duration::from_millis(1000),
+            },
+            RestResponse::status(403),
+        ],
+    )
+    .await;
+    let msg = message(32, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v2",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // The orphan replacement cleanup was attempted exactly once.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the held POST",
+    );
+
+    // Administrator state wins on the row, but the unconfirmed cleanup
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v2");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000013"),
+        "obsolete record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unconfirmed cleanup audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the moved-on fence_uncertain call turns the
+    // probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "moved-on re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(33, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn failed_record_with_admin_update_during_cleanup_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000017"), 120_000, 5).await;
+    // Scoped completion-only fault, as in
+    // completion_db_failure_audits_post_failed_and_preserves_newer_claim:
+    // the trigger rejects only the record that carries this test's orphan
+    // id. The claim and the administrator upsert pass through.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION sticky_test_fail_orphan() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.last_message_id = '9000000000000000000' THEN
+             RAISE EXCEPTION 'scoped completion-only failure';
+           END IF;
+           RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault function");
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop stale fault trigger");
+    sqlx::query(
+        "CREATE TRIGGER sticky_test_fail_orphan_trg
+           BEFORE UPDATE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION sticky_test_fail_orphan()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault trigger");
+
+    // Hold the orphan DELETE open so the administrator update lands between
+    // the failed record and the failed cleanup (403): the row is disarmed
+    // at diagnose time with a possibly-live orphan, the same state as an
+    // update landing during the POST. The script is consumed in request
+    // order: POST, then DELETE.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![
+            RestResponse {
+                status: 200,
+                body: None,
+                delay: Duration::ZERO,
+            },
+            RestResponse {
+                status: 403,
+                body: None,
+                delay: Duration::from_millis(1000),
+            },
+        ],
+    )
+    .await;
+    let msg = message(36, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "DELETE" && r.path.contains("/messages/"))
+            },
+            "orphan DELETE entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v3",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "failed record reports held");
+
+    // The orphan replacement cleanup was attempted exactly once.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the accepted POST",
+    );
+
+    // Administrator state wins on the row, but the unconfirmed cleanup
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v3");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000017"),
+        "failed record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unconfirmed cleanup audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the record-failed fence_uncertain call turns the
+    // probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "record-failed re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(37, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn ambiguous_post_error_with_admin_update_during_post_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000021"), 120_000, 5).await;
+    // Hold the ambiguous POST (500) open so the administrator update lands
+    // mid-flight: the claim's fence is disarmed at diagnose time with a
+    // possibly-live post, and only a claim-blind re-arm holds the window.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 500,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(40, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "ambiguous POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v4",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(
+        outcome,
+        ActivityOutcome::Held,
+        "ambiguous error reports held"
+    );
+
+    // The ambiguous attempt reached the wire exactly once; with no usable
+    // receipt there is no orphan cleanup to attempt.
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
+        1,
+        "failed attempt only"
+    );
+    assert!(mock.deletes().is_empty(), "no orphan id, no cleanup");
+
+    // Administrator state wins on the row, but the ambiguous outcome
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v4");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000021"),
+        "ambiguous post records nothing",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "ambiguous outcome audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the ambiguous-error fence_uncertain call turns
+    // the probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "ambiguous-error re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(41, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn unusable_receipt_with_admin_update_during_post_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000022"), 120_000, 5).await;
+    // Plus-prefixed receipt the executor accepts but the runtime
+    // all-digits guard rejects, held open so the administrator update
+    // lands mid-flight: the post may be live but can be neither recorded
+    // nor deleted, and only a claim-blind re-arm holds the window.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"+123"}"#.into()),
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(42, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "unusable-receipt POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v5",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(
+        outcome,
+        ActivityOutcome::Held,
+        "unusable receipt reports held"
+    );
+
+    // The POST reached the wire before the receipt was judged unusable;
+    // the unusable id leaves no orphan cleanup to attempt.
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
+        1,
+        "the POST reaches the wire before the receipt is judged unusable"
+    );
+    assert!(mock.deletes().is_empty(), "no orphan id, no cleanup");
+
+    // Administrator state wins on the row, but the unusable receipt
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v5");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000022"),
+        "unusable receipt records nothing",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unusable receipt audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the unusable-receipt fence_uncertain call turns
+    // the probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "unusable-receipt re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(43, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
     );
     mock.shutdown().await;
     db.close().await;
@@ -5443,28 +7317,76 @@ async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
     assert_eq!(rows_before.len(), 25, "seeded capacity");
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
+    // Whole rows page instead of squeezing sources: the default reply is
+    // page 1 with navigation, and every id stays reachable exactly once
+    // across the reachable pages.
     runtime
         .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
         .await;
+    let first = patch_contents(&mock)[0].clone();
+    let total: usize = first
+        .split("Page 1 of ")
+        .nth(1)
+        .expect("default reply announces its total")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("numeric total");
+    assert!((2..=25).contains(&total), "capacity pages: {first}");
+    for page in 2..=total as i64 {
+        runtime
+            .on_interaction(&slash(
+                "feed-list",
+                Some(CHANNEL),
+                vec![option("page", CommandOptionValue::Integer(page))],
+            ))
+            .await;
+    }
 
-    // deferred_reply pins the ephemeral defer (flags 64) and mention safety
-    // (allowed_mentions parse []) on the single completion.
-    let json = mock.deferred_reply();
-    let content = json["content"].as_str().expect("list content");
-    assert!(
-        content.encode_utf16().count() <= 2000,
-        "response exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
-        content.encode_utf16().count()
+    // One ephemeral defer (flags 64) plus one mention-safe completion
+    // (allowed_mentions parse []) per invocation, no extra calls.
+    let requests = mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+            .count(),
+        total,
+        "one defer per page"
     );
-    for id in &own_ids {
+    let contents = patch_contents(&mock);
+    assert_eq!(contents.len(), total, "one completion per page");
+    let mut seen = Vec::new();
+    for (index, content) in contents.iter().enumerate() {
+        let page = index + 1;
         assert!(
-            content.contains(&format!("`{id}`")),
-            "configured-guild relay {id} discoverable at capacity: {content}"
+            content.encode_utf16().count() <= 2000,
+            "page {page} exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
+            content.encode_utf16().count()
+        );
+        assert!(
+            content.contains(&format!("Page {page} of {total}")),
+            "page {page} identifies itself: {content}"
+        );
+        assert!(
+            content.contains("/feed-list") && content.contains("page"),
+            "page {page} gives usable navigation: {content}"
+        );
+        assert!(
+            !content.contains(&foreign_id),
+            "other guild's relay never listed: {content}"
+        );
+        seen.extend(
+            content
+                .lines()
+                .filter_map(|line| line.strip_prefix('`')?.split_once('`').map(|(id, _)| id))
+                .map(str::to_owned),
         );
     }
-    assert!(
-        !content.contains(&foreign_id),
-        "other guild's relay never listed: {content}"
+    assert_eq!(
+        seen, own_ids,
+        "every configured-guild id reachable exactly once, in stable order"
     );
     assert_eq!(
         db.feed_rows().await,
@@ -5477,6 +7399,28 @@ async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+/// Completion bodies for every invocation so far, pinning mention safety
+/// (`allowed_mentions` parse `[]`) on each PATCH the way `deferred_reply`
+/// does for the single-completion case.
+fn patch_contents(mock: &MockRest) -> Vec<String> {
+    mock.requests()
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| {
+            let json: serde_json::Value = serde_json::from_slice(&r.body).expect("completion json");
+            assert_eq!(
+                json["allowed_mentions"]["parse"],
+                serde_json::json!([]),
+                "mention-safe completion"
+            );
+            json["content"]
+                .as_str()
+                .expect("completion content")
+                .to_owned()
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -5564,9 +7508,10 @@ async fn feed_store_failure_replies_generic_and_audits_nothing() {
 // Postgres message, which can carry statement or fixture detail).
 // `target_key` names the attempted relay: the fresh attempt id for adds,
 // the user-supplied id for removes. The user reply stays the existing
-// fixed store-failure text. Feed-list stays unaudited even on failure
-// (legacy parity): a failed list replies with the same safe text and
-// writes no audit row. A dead pool (the audit write itself impossible)
+// fixed store-failure text. Feed-list and feed-inspect stay unaudited even
+// on failure (legacy list parity): a failed read replies with the same safe
+// text and writes no audit row. A dead pool (the audit write itself
+// impossible)
 // degrades to a warn log plus that same safe reply with no panic and no
 // leaked internals.
 
@@ -5718,6 +7663,14 @@ fn feed_add_interaction() -> Interaction {
 fn feed_remove_interaction(id: &str) -> Interaction {
     slash(
         "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::String(id.to_owned()))],
+    )
+}
+
+fn feed_inspect_interaction(id: &str) -> Interaction {
+    slash(
+        "feed-inspect",
         Some(CHANNEL),
         vec![option("id", CommandOptionValue::String(id.to_owned()))],
     )
@@ -5917,6 +7870,142 @@ async fn feed_list_store_failure_writes_no_audit_row() {
     db.close().await;
 }
 
+/// Inspect is a pure guild-scoped read: the saved relay renders with exact
+/// id, kind, destination, enabled state, safe source and last attempt, while
+/// configuration and audit stay untouched. `deferred_reply` pins the
+/// ephemeral defer (type 5, flags 64) plus the mention-safe completion.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_shows_saved_relay_detail_without_mutation() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-own", "rss").await;
+    db.seed_feed("9999", "feed-foreign", "twitch").await;
+    let rows_before = db.feed_rows().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-own"))
+        .await;
+
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("inspect content");
+    assert!(content.contains("`feed-own`"), "exact id: {content}");
+    assert!(content.contains("rss"), "kind stays visible: {content}");
+    assert!(
+        content.contains(&format!("<#{CHANNEL_S}>")),
+        "destination stays visible: {content}"
+    );
+    assert!(
+        content.contains("enabled"),
+        "enabled state stays visible: {content}"
+    );
+    assert!(
+        content.contains("example.com"),
+        "safe source host stays visible: {content}"
+    );
+    assert!(
+        content.to_ascii_lowercase().contains("attempt"),
+        "last attempt stays visible: {content}"
+    );
+    assert!(
+        !content.contains("feed-foreign"),
+        "other guild's relay never leaks: {content}"
+    );
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "inspect leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Absent and foreign-guild ids share one refusal: the guild-scoped read
+/// finds nothing either way, and the copy must not oracle foreign relays.
+/// Invalid ids and store failures refuse distinctly (see below).
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_absent_and_foreign_ids_refuse_without_mutation() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-own", "rss").await;
+    db.seed_feed("9999", "feed-foreign", "twitch").await;
+    let rows_before = db.feed_rows().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    for id in ["feed-missing", "feed-foreign"] {
+        runtime.on_interaction(&feed_inspect_interaction(id)).await;
+    }
+
+    let contents = patch_contents(&mock);
+    assert_eq!(contents.len(), 2, "one completion per invocation");
+    for content in &contents {
+        assert_eq!(content, "No feed relay with that id.");
+    }
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "refused inspect leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "refused inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Invalid ids refuse at plan time, before any store read: with the table
+/// dropped, every read would fail, so the invalid-id copy proves no read.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_invalid_id_refuses_before_any_store_read() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("bad id"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], "Invalid feed id.");
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "an invalid inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Inspect stays unaudited even when its read fails — the same safe reply
+/// as the other feed commands, and still no audit row.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_store_failure_writes_no_audit_row() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-own"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], FEED_STORE_FAILURE_REPLY);
+    assert!(
+        feed_audit_rows(&db).await.is_empty(),
+        "a failed inspect writes no audit row"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "a failed inspect writes no feed audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
 /// Dead-pool control: with a closed pool, the audit write is impossible by
 /// construction, so every feed command must still emit a warn for the
 /// operator and finish with the fixed safe reply — no panic, no hang, no
@@ -5948,11 +8037,14 @@ async fn feed_store_failures_on_dead_pool_warn_and_reply_safely() {
     runtime
         .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
         .await;
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-xyz"))
+        .await;
 
-    let replies = feed_store_failure_replies(&mock, 3);
+    let replies = feed_store_failure_replies(&mock, 4);
     assert_eq!(
         replies,
-        vec![FEED_STORE_FAILURE_REPLY.to_owned(); 3],
+        vec![FEED_STORE_FAILURE_REPLY.to_owned(); 4],
         "dead pool degrades every feed command to the safe reply"
     );
     for reply in &replies {
@@ -6826,7 +8918,7 @@ async fn schedule_list_invalid_and_out_of_range_pages_refuse_without_writes() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
+async fn schedule_list_over_cap_keeps_truncation_visible_across_packed_pages() {
     let db = TestDb::new().await;
     // 27 rows (direct seeds bypass quota admission), inserted newest-first.
     // The listing cap is pinned at 25: raising it must break this test.
@@ -6842,25 +8934,45 @@ async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    runtime
-        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
-        .await;
+    // Localized due-time rows pack into two replies. Walk both pages of the
+    // first capped window so every listed row and the overflow remain visible.
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
 
-    // deferred_reply() already asserts the ephemeral defer (flags 64).
-    let json = mock.deferred_reply();
-    let content = json["content"].as_str().expect("list content");
-    let mut expected_lines: Vec<String> = (0..25u32)
-        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+    let contents = schedule_list_reply_contents(&mock, 2);
+    assert_eq!(schedule_list_page_indicator(&contents[0]), Some((1, 2)));
+    assert_eq!(schedule_list_page_indicator(&contents[1]), Some((2, 2)));
+    let listed_ids: Vec<&str> = contents
+        .iter()
+        .flat_map(|content| schedule_list_row_lines(content))
+        .map(schedule_list_row_id)
         .collect();
-    expected_lines.push("(truncated, 2 more)".to_owned());
+    let expected_ids: Vec<String> = (0..25u32).map(|n| format!("cap-{n:02}")).collect();
     assert_eq!(
-        content,
-        expected_lines.join("\n"),
-        "over-cap listing: 25 earliest rows, then the overflow line"
+        listed_ids,
+        expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        "the first capped window lists its 25 earliest ids exactly once"
+    );
+    for line in contents
+        .iter()
+        .flat_map(|content| schedule_list_row_lines(content))
+    {
+        assert!(
+            line.contains("<t:")
+                && line.contains(":F>. The 15s ticker and delivery may be delayed."),
+            "each whole row includes its localized due time and uncertainty: {line}"
+        );
+    }
+    assert!(
+        contents[1].contains("(truncated, 2 more)") && contents[1].contains("Continued on page 3."),
+        "the last first-window page names both the cut and the reachable continuation: {}",
+        contents[1]
     );
     assert!(
-        !content.contains("cap-25") && !content.contains("cap-26"),
-        "rows past the cap are counted, not listed: {content}"
+        !contents
+            .iter()
+            .any(|content| content.contains("cap-25") || content.contains("cap-26")),
+        "rows past the cap are counted, not listed: {contents:?}"
     );
     assert!(
         db.schedule_audits().await.is_empty(),
@@ -6872,7 +8984,7 @@ async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
+async fn schedule_list_at_cap_enumerates_every_row_without_an_overflow_line() {
     let db = TestDb::new().await;
     for n in (0..25u32).rev() {
         db.seed_schedule_row(
@@ -6886,34 +8998,56 @@ async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    runtime
-        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
-        .await;
-
-    let json = mock.deferred_reply();
-    let content = json["content"].as_str().expect("list content");
-    let expected_lines: Vec<String> = (0..25u32)
-        .map(|n| format!("`full-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
-        .collect();
-    assert_eq!(
-        content,
-        expected_lines.join("\n"),
-        "exactly at the cap nothing is truncated"
-    );
+    invoke_schedule_list(&runtime, None).await;
+    let first = schedule_list_reply_contents(&mock, 1);
+    let (current, total_pages) = schedule_list_page_indicator(&first[0])
+        .expect("localized cap-sized list spans announced pages");
+    assert_eq!(current, 1);
     assert!(
-        !content.contains("truncated"),
-        "no overflow line at the cap: {content}"
+        total_pages >= 2,
+        "localized rows require more than one page"
     );
+    for page in 2..=total_pages {
+        invoke_schedule_list(&runtime, Some(page)).await;
+    }
+
+    let contents = schedule_list_reply_contents(&mock, total_pages as usize);
+    let listed_ids: Vec<&str> = contents
+        .iter()
+        .flat_map(|content| schedule_list_row_lines(content))
+        .map(schedule_list_row_id)
+        .collect();
+    let expected_ids: Vec<String> = (0..25u32).map(|n| format!("full-{n:02}")).collect();
+    assert_eq!(
+        listed_ids,
+        expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        "exactly at the cap still exposes every configured id in order"
+    );
+    for (index, content) in contents.iter().enumerate() {
+        assert_eq!(
+            schedule_list_page_indicator(content),
+            Some((index as i64 + 1, total_pages)),
+            "every packed page announces its position"
+        );
+        assert!(
+            !content.contains("truncated"),
+            "no overflow line at the cap: {content}"
+        );
+        assert!(
+            content.encode_utf16().count() <= 2000,
+            "whole-row page stays within Discord's cap: {content}"
+        );
+    }
     mock.shutdown().await;
     db.close().await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
+async fn schedule_list_over_cap_third_page_lists_hidden_rows() {
     let db = TestDb::new().await;
-    // Same 27-row over-cap guild as the page-1 acceptance test: page 2 must
-    // reach the bounded hidden window instead of re-paging the first 25.
+    // The localized first window packs across pages 1 and 2, so page 3 must
+    // reach the bounded hidden window instead of re-paging the first 25 rows.
     for n in (0..27u32).rev() {
         db.seed_schedule_row(
             GUILD_S,
@@ -6926,15 +9060,31 @@ async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     let contents = schedule_list_reply_contents(&mock, 1);
+    let rows = schedule_list_row_lines(&contents[0]);
     assert_eq!(
-        contents[0],
-        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
-         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
-        "page 2 lists exactly the rows past the capped first window"
+        rows.iter()
+            .map(|line| schedule_list_row_id(line))
+            .collect::<Vec<_>>(),
+        vec!["cap-25", "cap-26"],
+        "page 3 lists exactly the rows past the capped first window"
     );
+    for (line, due) in rows
+        .iter()
+        .zip(["2030-01-26T00:00:00.000Z", "2030-01-27T00:00:00.000Z"])
+    {
+        assert!(
+            line.contains(due),
+            "hidden row keeps its canonical due time: {line}"
+        );
+        assert!(
+            line.contains("<t:")
+                && line.contains(":F>. The 15s ticker and delivery may be delayed."),
+            "hidden row retains its localized due time and uncertainty: {line}"
+        );
+    }
     assert!(
         db.schedule_audits().await.is_empty(),
         "list writes no audit row"
@@ -6945,11 +9095,11 @@ async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
+async fn schedule_list_far_over_cap_walks_hidden_rows_and_names_remaining_overflow() {
     let db = TestDb::new().await;
     // 52 rows: the hidden window itself fills (25 rows) with 2 more behind
-    // it, so page 2 carries its own overflow line; minute-spaced stamps keep
-    // (next_run_at, id) order aligned with id order.
+    // it. Localized rows may use several replies, but every hidden id remains
+    // reachable and the terminal hidden page must name the remaining cut.
     for n in (0..52u32).rev() {
         db.seed_schedule_row(
             GUILD_S,
@@ -6962,32 +9112,79 @@ async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
-    invoke_schedule_list(&runtime, Some(99)).await;
-
-    let contents = schedule_list_reply_contents(&mock, 2);
-    let mut expected_lines: Vec<String> = (25..50u32)
-        .map(|n| {
-            format!(
-                "`big-{n:02}` `<#3333>` 2030-03-01T{:02}:{:02}:00.000Z",
-                n / 60,
-                n % 60
-            )
-        })
-        .collect();
-    expected_lines.push("(truncated, 2 more)".to_owned());
+    invoke_schedule_list(&runtime, None).await;
+    let first = schedule_list_reply_contents(&mock, 1);
+    let (_, first_total) = schedule_list_page_indicator(&first[0])
+        .expect("the localized first window announces its packed page count");
+    assert!(
+        first_total > 1,
+        "localized rows require more than one first-window page: {}",
+        first[0]
+    );
+    let first_hidden_page = first_total + 1;
+    invoke_schedule_list(&runtime, Some(first_total)).await;
+    let first_window = schedule_list_reply_contents(&mock, 2);
+    assert!(
+        first_window[1].contains(&format!("Continued on page {first_hidden_page}.")),
+        "the terminal first-window page names the reachable hidden page: {}",
+        first_window[1]
+    );
+    invoke_schedule_list(&runtime, Some(first_hidden_page)).await;
+    let initial_contents = schedule_list_reply_contents(&mock, 3);
+    let (_, total_pages) = schedule_list_page_indicator(&initial_contents[2])
+        .expect("a multi-page hidden window carries global page numbers");
     assert_eq!(
-        contents[0],
-        expected_lines.join("\n"),
-        "page 2 lists the full hidden window plus its own overflow line"
+        schedule_list_page_indicator(&initial_contents[2]).map(|(current, _)| current),
+        Some(first_hidden_page),
+        "the first page after the capped window starts the hidden range"
+    );
+    for page in first_hidden_page + 1..=total_pages {
+        invoke_schedule_list(&runtime, Some(page)).await;
+    }
+
+    let invocations = 2 + usize::try_from(total_pages - first_total)
+        .expect("global page total follows the first window");
+    let contents = schedule_list_reply_contents(&mock, invocations);
+    let hidden_ids: Vec<&str> = contents
+        .iter()
+        .skip(2)
+        .flat_map(|content| schedule_list_row_lines(content))
+        .map(schedule_list_row_id)
+        .collect();
+    let expected_hidden_ids: Vec<String> = (25..50u32).map(|n| format!("big-{n:02}")).collect();
+    assert_eq!(
+        hidden_ids,
+        expected_hidden_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "walking every hidden page exposes the bounded second window in order"
+    );
+    let terminal_hidden_page = contents.last().expect("at least one hidden page");
+    assert!(
+        terminal_hidden_page.contains("(truncated, 2 more)"),
+        "the terminal hidden page names rows beyond the bounded window: {terminal_hidden_page}"
     );
     assert!(
-        !contents[0].contains("big-50") && !contents[0].contains("big-51"),
-        "rows past the hidden window are counted, not listed: {}",
-        contents[0]
+        !contents
+            .iter()
+            .any(|content| content.contains("big-50") || content.contains("big-51")),
+        "rows past the hidden window are counted, not listed: {contents:?}"
     );
+    for content in &contents {
+        assert!(
+            content.encode_utf16().count() <= 2000,
+            "every packed response stays within Discord's cap: {content}"
+        );
+    }
+
+    invoke_schedule_list(&runtime, Some(99)).await;
+    let contents = schedule_list_reply_contents(&mock, invocations + 1);
     assert_eq!(
-        contents[1], "Page 99 is out of range: this server has 2 page(s) of schedules.",
+        contents.last(),
+        Some(&format!(
+            "Page 99 is out of range: this server has {total_pages} page(s) of schedules."
+        )),
         "pages past both windows refuse with the combined page total"
     );
     assert!(
@@ -7000,7 +9197,7 @@ async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn schedule_list_under_cap_renders_byte_identical_to_before() {
+async fn schedule_list_under_cap_preserves_rows_with_localized_due_and_uncertainty() {
     let db = TestDb::new().await;
     db.seed_schedule_row(
         GUILD_S,
@@ -7020,6 +9217,15 @@ async fn schedule_list_under_cap_renders_byte_identical_to_before() {
         false,
     )
     .await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "completed",
+        "2026-10-01T00:00:00.000Z",
+        None,
+        false,
+    )
+    .await;
+    let before = schedule_absolute_correction_tests::state(&db.pool).await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
     runtime
@@ -7030,10 +9236,16 @@ async fn schedule_list_under_cap_renders_byte_identical_to_before() {
     let json = mock.deferred_reply();
     assert_eq!(
         json["content"],
-        "`once` `<#3333>` 2030-01-01T00:00:00.000Z\n\
+        "`completed` `<#3333>` 2026-10-01T00:00:00.000Z (disabled)\n\
+         `once` `<#3333>` 2030-01-01T00:00:00.000Z <t:1893456000:F>. The 15s ticker and delivery may be delayed.\n\
          `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled)\n\
-         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m",
-        "under-cap listing must not change a single byte"
+         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m <t:1896321906:F>. The 15s ticker and delivery may be delayed.",
+        "list retains ordered complete rows, intervals and disabled state, with localized due times and delivery uncertainty only for enabled rows"
+    );
+    assert_eq!(
+        schedule_absolute_correction_tests::state(&db.pool).await,
+        before,
+        "listing cannot change schedules, audits or commands"
     );
     assert!(
         db.schedule_audits().await.is_empty(),
@@ -7095,7 +9307,10 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
         .collect();
     assert_eq!(edits.len(), 3, "one completion per remove");
     let removed: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
-    assert_eq!(removed["content"], "Cancelled.");
+    schedule_delivery_truth_acceptance_tests::assert_removed_receipt(
+        removed["content"].as_str().expect("removal receipt"),
+        "xyz999",
+    );
     let ambiguous: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
     assert_eq!(
         ambiguous["content"],
@@ -7401,7 +9616,10 @@ async fn schedule_remove_invalid_ids_leave_store_untouched() {
         .collect();
     assert_eq!(edits.len(), 10, "one completion per interaction");
     let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
-    assert_eq!(valid["content"], "Cancelled.");
+    schedule_delivery_truth_acceptance_tests::assert_removed_receipt(
+        valid["content"].as_str().expect("removal receipt"),
+        "xyz999",
+    );
     mock.shutdown().await;
     db.close().await;
 }
@@ -7853,7 +10071,8 @@ async fn fail_scheduled_selects_matching(db: &TestDb, pattern: &str) {
 }
 
 /// The 27-row over-cap guild shared by the deep-pagination tests; direct
-/// seeds bypass quota admission, and page 2 is the first deep page.
+/// seeds bypass quota admission, and page 3 follows the two localized
+/// first-window pages.
 async fn seed_over_cap_schedule_rows(db: &TestDb) {
     for n in (0..27u32).rev() {
         db.seed_schedule_row(
@@ -7875,7 +10094,7 @@ async fn schedule_list_hidden_window_store_failure_audits_one_rejected_row() {
     fail_scheduled_selects_matching(&db, "%OFFSET%").await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     assert_eq!(
         schedule_list_reply_contents(&mock, 1),
@@ -7917,7 +10136,7 @@ async fn schedule_list_unknown_overflow_store_failure_audits_one_rejected_row() 
     fail_scheduled_selects_matching(&db, "%count(*)%").await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     assert_eq!(
         schedule_list_reply_contents(&mock, 1),
@@ -7952,9 +10171,9 @@ async fn schedule_list_unknown_overflow_store_failure_audits_one_rejected_row() 
 }
 
 /// Control: with the fault view installed but matching no statement, the
-/// page-1 over-cap render and the successful deep page are byte-identical
-/// to the unfaulted listings and neither writes an audit row. This proves
-/// the fault harness itself, not just the failures it induces, is inert.
+/// packed page-1 render and the successful hidden page retain their rows and
+/// neither writes an audit row. This proves the fault harness itself, not just
+/// the failures it induces, is inert.
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
@@ -7964,22 +10183,35 @@ async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
     invoke_schedule_list(&runtime, Some(1)).await;
-    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(3)).await;
 
     let contents = schedule_list_reply_contents(&mock, 2);
-    let mut expected_lines: Vec<String> = (0..25u32)
-        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
-        .collect();
-    expected_lines.push("(truncated, 2 more)".to_owned());
     assert_eq!(
-        contents[0],
-        expected_lines.join("\n"),
-        "page-1 over-cap render is unchanged"
+        schedule_list_page_indicator(&contents[0]),
+        Some((1, 2)),
+        "the first capped window remains packed across its localized pages"
     );
+    let first_rows = schedule_list_row_lines(&contents[0]);
     assert_eq!(
-        contents[1],
-        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
-         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
+        first_rows.first().map(|line| schedule_list_row_id(line)),
+        Some("cap-00"),
+        "page 1 starts at the earliest row"
+    );
+    assert!(
+        first_rows.iter().all(|line| {
+            line.contains("<t:")
+                && line.contains(":F>. The 15s ticker and delivery may be delayed.")
+        }),
+        "the inert fault view preserves enriched page-1 rows: {}",
+        contents[0]
+    );
+    let hidden_ids: Vec<&str> = schedule_list_row_lines(&contents[1])
+        .iter()
+        .map(|line| schedule_list_row_id(line))
+        .collect();
+    assert_eq!(
+        hidden_ids,
+        vec!["cap-25", "cap-26"],
         "a successful deep page still lists the hidden rows"
     );
     assert!(
@@ -7991,7 +10223,7 @@ async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
 }
 
 /// Dead-pool control for a deep page: a closed pool fails the first read,
-/// so no audit write is possible either; asking for page 2 must still
+/// so no audit write is possible either; asking for page 3 must still
 /// finish with the fixed safe reply — no panic, no leaked internals.
 #[tokio::test]
 async fn schedule_list_deep_page_on_dead_pool_replies_safely() {
@@ -8012,7 +10244,7 @@ async fn schedule_list_deep_page_on_dead_pool_replies_safely() {
         .on_interaction(&slash(
             "schedule-list",
             Some(CHANNEL),
-            vec![option("page", CommandOptionValue::Integer(2))],
+            vec![option("page", CommandOptionValue::Integer(3))],
         ))
         .await;
 
@@ -8151,7 +10383,7 @@ fn kick_as(permissions: Permissions, guild: u64) -> Interaction {
         vec![option("member", CommandOptionValue::User(Id::new(303)))],
     );
     interaction.member.as_mut().unwrap().permissions = Some(permissions);
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 
@@ -9003,6 +11235,10 @@ async fn worker_trigger_gate_observes_sticky_http_and_state() {
     assert!(after["claim_token"].is_null(), "record releases claim");
     assert!(after["claimed_at"].is_null(), "record clears claim time");
     assert_eq!(
+        after["delivery_uncertain"], false,
+        "record disarms the delivery fence"
+    );
+    assert_eq!(
         audits().await,
         vec![(
             "sticky.run".to_owned(),
@@ -9196,7 +11432,7 @@ fn privacy_interaction(member: u64, subcommand: Option<&str>) -> Interaction {
 /// purge. Callers pass real-shaped snowflake IDs for both.
 fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> Interaction {
     let mut interaction = privacy_interaction(member, subcommand);
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 
@@ -9223,7 +11459,7 @@ fn privacy_request_interaction_in(
         member,
         Permissions::empty(),
     );
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 
@@ -9245,12 +11481,23 @@ fn privacy_action_decodes_known_analytics_and_deletion_subcommands() {
         privacy_action(&privacy_interaction(88, Some("delete"))),
         PrivacyAction::DeletionRequest
     );
+    // Lookup actions require their complete published request-id shape.
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-status"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-status",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionStatus
     );
     assert_eq!(
-        privacy_action(&privacy_interaction(88, Some("deletion-receipt"))),
+        privacy_action(&privacy_request_interaction_in(
+            100000000000000431,
+            100000000000000432,
+            "deletion-receipt",
+            Some("del-0123456789abcdef"),
+        )),
         PrivacyAction::DeletionReceipt
     );
     // Missing options, a non-subcommand value and an unknown name all
@@ -9916,4 +12163,251 @@ async fn privacy_command_repeat_opt_out_skips_purge_and_cooldown_blocks_rapid_re
     );
     mock.shutdown().await;
     db.close().await.expect("drop own disposable database");
+}
+
+// ---------------------------------------------------------------------------
+// Stale-control review pins: voice-epoch/ballot silence, cross-channel stale
+// replies, and split bot-author arms. The protected acceptance module owns the
+// normative suite; these pin the review fixes without touching it.
+// ---------------------------------------------------------------------------
+
+fn stale_unknown_component(
+    custom_id: &str,
+    component_type: ComponentType,
+    values: Vec<String>,
+) -> Interaction {
+    let mut interaction = slash("unused", Some(CHANNEL), Vec::new());
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type,
+            resolved: None,
+            values,
+        },
+    )));
+    interaction
+}
+
+fn assert_one_expired_reply(requests: &[RestRequest]) {
+    use two_bot_core::router::replies::EXPIRED_COMPONENT_REPLY;
+
+    assert_eq!(requests.len(), 1, "one callback, zero other effects");
+    let request = &requests[0];
+    assert_eq!(request.method, "POST");
+    assert!(
+        request.path.ends_with("/callback"),
+        "callback path: {}",
+        request.path
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&request.body).expect("reply json");
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    assert_eq!(reply["data"]["content"], EXPIRED_COMPONENT_REPLY);
+}
+
+#[tokio::test]
+async fn epoch_suffixed_voice_join_stays_silent() {
+    use two_bot_core::voice_custom_id::join_custom_id;
+    use two_bot_core::voice_private::JoinDecision;
+
+    let room = 777_000_111_222_333_444u64;
+    let request = 888_000_111_222_333_444u64;
+    // Production runtime shape, not the bare codec id.
+    let custom_id = format!(
+        "{}:0123456789abcdef0123456789abcdef",
+        join_custom_id(JoinDecision::Approve, room, request)
+    );
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let button = stale_unknown_component(&custom_id, ComponentType::Button, Vec::new());
+    runtime.on_interaction(&button).await;
+    assert!(
+        mock.requests().is_empty(),
+        "epoch-suffixed join belongs to the voice sink: silence"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn votekick_ballot_buttons_stay_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    for custom_id in [
+        "votekick:7000000111222333444:yes",
+        "votekick:7000000111222333444:no",
+    ] {
+        let button = stale_unknown_component(custom_id, ComponentType::Button, Vec::new());
+        runtime.on_interaction(&button).await;
+    }
+    assert!(
+        mock.requests().is_empty(),
+        "ballots belong to the voice sink: silence"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn bot_only_on_member_user_stays_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let mut button = stale_unknown_component(
+        "two:stale-widget:deadbeef",
+        ComponentType::Button,
+        Vec::new(),
+    );
+    button
+        .member
+        .as_mut()
+        .expect("guild member")
+        .user
+        .as_mut()
+        .expect("member user")
+        .bot = true;
+    assert!(
+        !button.user.as_ref().expect("top-level user").bot,
+        "top-level user stays non-bot: pins the member arm alone"
+    );
+    runtime.on_interaction(&button).await;
+    assert!(
+        mock.requests().is_empty(),
+        "bot on member.user only stays silent"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn bot_only_on_top_level_user_stays_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let mut button = stale_unknown_component(
+        "two:stale-widget:deadbeef",
+        ComponentType::Button,
+        Vec::new(),
+    );
+    button.user.as_mut().expect("top-level user").bot = true;
+    assert!(
+        !button
+            .member
+            .as_ref()
+            .expect("guild member")
+            .user
+            .as_ref()
+            .expect("member user")
+            .bot,
+        "member.user stays non-bot: pins the top-level arm alone"
+    );
+    runtime.on_interaction(&button).await;
+    assert!(
+        mock.requests().is_empty(),
+        "bot on top-level user only stays silent"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn cross_channel_replaced_self_role_gets_expired_reply() {
+    use std::collections::HashSet;
+    use two_bot_core::self_roles::{
+        self_role_custom_id, PanelMode, SelfRoleGates, SelfRoleOption, SelfRolePanel,
+    };
+    use two_bot_cutover::self_role_store::SelfRoleStore;
+
+    use crate::self_role_handlers::SelfRoleService;
+    use crate::self_role_runtime::SelfRoleRuntime;
+
+    const SR_GUILD: u64 = 100_000_000_000_000_001;
+    const OLD_CHANNEL: u64 = 100_000_000_000_000_007;
+    const OLD_MESSAGE: u64 = 100_000_000_000_000_008;
+    const NEW_CHANNEL: &str = "100000000000000017";
+    const NEW_MESSAGE: &str = "100000000000000018";
+    const SR_USER: u64 = 100_000_000_000_000_002;
+    const SR_BOT: &str = "100000000000000003";
+    const SR_EVENT: u64 = 100_000_000_000_000_011;
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let executor = ActionExecutor::with_proxy("test-token".to_owned(), Some(origin.clone()))
+        .expect("mock executor");
+    // The panel moved to a new channel and message; the old source survives.
+    let service = Arc::new(
+        SelfRoleService::new(
+            SelfRoleRuntime {
+                store: SelfRoleStore::new(pool.clone()),
+                executor: executor.clone(),
+                guild_id: SR_GUILD.to_string(),
+                bot_id: SR_BOT.to_owned(),
+            },
+            SelfRoleGates {
+                panels: vec![SelfRolePanel {
+                    id: "games".into(),
+                    channel_id: NEW_CHANNEL.into(),
+                    message_id: NEW_MESSAGE.into(),
+                    mode: PanelMode::Button,
+                    exclusive: false,
+                    color: false,
+                    options: vec![SelfRoleOption {
+                        key: "new".into(),
+                        label: "New".into(),
+                        role_id: "100000000000000004".into(),
+                        permissions: "0".into(),
+                        emoji: None,
+                        description: None,
+                    }],
+                }],
+                dry_run: false,
+            },
+            &[SR_GUILD.to_string()].into_iter().collect::<HashSet<_>>(),
+        )
+        .expect("self-role service"),
+    );
+    let runtime = CommandRuntime::new_with_self_roles(
+        pool,
+        executor,
+        router_with_commands(RouterGates {
+            configured_guild: Some(SR_GUILD),
+            scorecard: false,
+            automations: true,
+            announcements: true,
+            moderation: false,
+            voice: false,
+            voice_assistant: false,
+            tickets: false,
+            self_roles: true,
+            onboarding_picker: false,
+            session_picker: false,
+        }),
+        SR_GUILD,
+        true,
+        service,
+    );
+    // A press on the old panel message in the old channel.
+    let mut press = slash("unused", Some(OLD_CHANNEL), Vec::new());
+    press.guild_id = Some(Id::new(SR_GUILD));
+    press.id = Id::new(SR_EVENT);
+    press.kind = InteractionType::MessageComponent;
+    press
+        .member
+        .as_mut()
+        .expect("guild member")
+        .user
+        .as_mut()
+        .expect("member user")
+        .id = Id::new(SR_USER);
+    let mut source = message(1, OLD_CHANNEL, false, Some(SR_GUILD));
+    source.id = Id::new(OLD_MESSAGE);
+    press.message = Some(source);
+    press.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: self_role_custom_id("games", Some("new")),
+            component_type: ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    runtime.on_interaction(&press).await;
+    assert_one_expired_reply(&mock.requests());
+    mock.shutdown().await;
 }

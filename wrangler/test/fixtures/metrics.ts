@@ -64,6 +64,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   two_bot_eventsub_classified_total: { kind: "EVENTSUB_DELIVERY_KINDS" },
   two_bot_event_store_consumer_lag_seconds: {},
   two_bot_retention_replay_needed_total: {},
+  two_bot_gateway_drain_skips_total: {},
   two_bot_voice_dispatch_timeouts_total: {},
   two_bot_voice_watchdog_stucks_total: {},
   two_bot_voice_halt_recoveries_total: {},
@@ -76,6 +77,13 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   // literal here, pinned against the validator and the rule below.
   two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
   two_bot_job_runs_total: { job: "JOBS", outcome: "JOB_OUTCOMES" },
+  two_bot_feed_fetch_errors_total: { error_class: "FEED_FETCH_ERROR_CLASSES" },
+  two_bot_eventsub_received_total: {},
+  two_bot_eventsub_reconcile_errors_total: { error_class: "EVENTSUB_RECONCILE_ERROR_CLASSES" },
+  two_bot_automod_decisions_total: { outcome: "AUTOMOD_DECISION_OUTCOMES" },
+  two_bot_moderation_enforcements_total: { verb: "MODERATION_VERBS", outcome: "MODERATION_ENFORCEMENT_OUTCOMES" },
+  two_bot_voice_rest_in_flight_age_seconds: {},
+  two_bot_voice_global_backoff_capped_total: {},
 };
 
 /** Complete consumed-input fixture generated from the Rust label contract, not the validator. */

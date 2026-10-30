@@ -203,6 +203,10 @@ two-bot operator commands
       target's current counts). Without --dry-run, --force is required and
       TWO_RESTORE_URL must name the target. The target variable is
       deliberately NOT TWO_DATABASE_URL: restoring replaces target data.
+      A target that normalizes to the live database, or whose database
+      cannot be proven (name it explicitly), is refused (exit 2,
+      code=restore_live_target_refused), even with --force; --dry-run
+      still previews without that comparison.
       Requires a fresh migrated target without moderation history. --force
       confirms intent, not authorization or a safety-guard bypass.
       `RESTORE VERIFIED` on the last line, and exit 0, is the only success.
@@ -239,7 +243,9 @@ two-bot operator commands
       Plan (default) or apply a sealed snapshot to the staging guild.
       Refuses tampered backups (exit 3) before any Discord call; refuses
       the live guild and any non-staging token. --apply requires
-      --confirm-staging-guild.
+      --confirm-staging-guild. Completion prints per operation only as
+      each operation lands; a mid-apply failure names landed vs pending
+      operations (code=guild_restore_apply_failed).
 ";
 
 /// The subcommands whose help is `USAGE`; `db` and `erase-member` parse
@@ -574,6 +580,30 @@ async fn cmd_restore(args: &[String]) -> i32 {
 
     if dry_run {
         return cmd_restore_dry_run(&file, url.as_deref()).await;
+    }
+
+    // A prod URL in TWO_RESTORE_URL plus --force used to wipe production: the
+    // guard above only checked presence and scheme, never the target's value.
+    // Refuse by normalized value (scheme alias, host case, default ports and
+    // credential/query spellings cannot evade it), production database
+    // markers, and unprovable targets (an omitted database or an empty
+    // override cannot be proven different from live), before any file parse
+    // or connection attempt. --force confirms intent, never a live target;
+    // --dry-run previews without this comparison.
+    // Fixed refusal: the URLs and their secrets never reach output.
+    if let Some(target) = url.as_deref() {
+        if two_bot_core::database_url::restore_target_is_live(
+            target,
+            env_var("TWO_DATABASE_URL").as_deref(),
+        ) {
+            eprintln!(
+                "restore: refusing a live database target; restores go to scratch only. code=restore_live_target_refused"
+            );
+            eprintln!(
+                "restore: TWO_RESTORE_URL must not name the live database. See docs/backup.md."
+            );
+            return 2;
+        }
     }
 
     // Every failure is a bounded constant from `open_restore_pool`: the URL and
@@ -1500,11 +1530,11 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         if apply { "applying" } else { "planned" },
         plan.counts.operations
     );
-    for op in &plan.operations {
-        println!("{} {}", if apply { "DID" } else { "WOULD" }, op.label);
-    }
 
     if !apply {
+        for op in &plan.operations {
+            println!("WOULD {}", op.label);
+        }
         println!(
             "guild-config-restore: counts={:?}; add --confirm-staging-guild --apply to write",
             (
@@ -1518,13 +1548,36 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 0;
     }
 
-    let restored_ids = match guild_config_restore::apply_restore_plan(&mut api, &plan).await {
-        Ok(ids) => ids,
-        Err(err) => {
-            eprintln!("guild-config-restore: apply failed: {err}");
-            return 1;
-        }
-    };
+    // Completion prints only as each operation lands: pre-printing every DID
+    // left operators believing pending operations had run when the apply
+    // failed halfway. A mid-apply failure names landed vs pending operations
+    // (labels only, never request bodies) with a stable code.
+    let restored_ids =
+        match guild_config_restore::apply_restore_plan_with_progress(&mut api, &plan, |op| {
+            println!("DID {}", op.label)
+        })
+        .await
+        {
+            Ok(ids) => ids,
+            Err((err, landed)) => {
+                eprintln!(
+                    "guild-config-restore: apply failed: {err} code=guild_restore_apply_failed"
+                );
+                let (landed_ops, pending_ops) =
+                    plan.operations.split_at(landed.min(plan.operations.len()));
+                if landed_ops.is_empty() {
+                    eprintln!("guild-config-restore: landed (0): none");
+                } else {
+                    for op in landed_ops {
+                        eprintln!("guild-config-restore: landed: {}", op.label);
+                    }
+                }
+                for op in pending_ops {
+                    eprintln!("guild-config-restore: pending: {}", op.label);
+                }
+                return 1;
+            }
+        };
     let after = match api.capture().await {
         Ok(after) => after,
         Err(err) => {
@@ -2005,15 +2058,10 @@ mod tests {
         }
     }
 
-    /// Serialises the fixture write-and-spawn window of the bounded
-    /// upload-helper tests. `write_upload_fixture` leaves the script open
-    /// for writing while a sibling test on another thread forks; the forked
-    /// child inherits the write fd until its own exec, so exec of the fresh
-    /// script fails with ETXTBSY and the helper reports a spurious
-    /// `SpawnFailed`. Holding this guard from the fixture write through
-    /// `run_upload_command` keeps those windows disjoint. The mutex is
-    /// async-aware (`tokio::sync`) so holding the guard across `.await` is
-    /// allowed and does not block the executor.
+    /// Serialises the bounded upload-helper fixtures. Other suites can
+    /// still fork while a script is open for writing, so these tests run
+    /// scripts through `/bin/sh` rather than exec the freshly written file:
+    /// an inherited write fd must not cause a spurious ETXTBSY spawn failure.
     #[cfg(unix)]
     static UPLOAD_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -2041,6 +2089,13 @@ mod tests {
             UPLOAD_SECRET_MARKER.to_owned(),
             file.to_owned(),
         ]
+    }
+
+    #[cfg(unix)]
+    fn upload_fixture_argv(helper: &std::path::Path, file: &str) -> Vec<String> {
+        let mut args = vec![helper.to_string_lossy().into_owned()];
+        args.extend(secret_argv(file));
+        args
     }
 
     #[test]
@@ -2098,8 +2153,8 @@ mod tests {
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 0\n",
         );
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -2127,9 +2182,14 @@ mod tests {
             "upload-fail.sh",
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 3\n",
         );
+        // Model a writable fd inherited by an unrelated concurrent child.
+        let _writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&helper)
+            .unwrap();
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -2220,8 +2280,8 @@ mod tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             super::run_upload_command(
-                &helper.to_string_lossy(),
-                &secret_argv("archive.ndjson.gz"),
+                "/bin/sh",
+                &upload_fixture_argv(&helper, "archive.ndjson.gz"),
                 std::time::Duration::from_millis(300),
             ),
         )

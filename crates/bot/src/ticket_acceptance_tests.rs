@@ -131,6 +131,56 @@ fn channel() -> Value {
     ]})
 }
 
+fn private_channel(topic: &str) -> Value {
+    let common = (Permissions::VIEW_CHANNEL
+        | Permissions::SEND_MESSAGES
+        | Permissions::READ_MESSAGE_HISTORY)
+        .bits();
+    let mut body = channel();
+    body["topic"] = json!(topic);
+    body["permission_overwrites"] = json!([
+        {"id":"100","type":0,"allow":"0","deny":Permissions::VIEW_CHANNEL.bits().to_string()},
+        {"id":"400","type":1,"allow":(common | Permissions::MANAGE_CHANNELS.bits()).to_string(),"deny":"0"},
+        {"id":"500","type":1,"allow":common.to_string(),"deny":"0"},
+        {"id":"300","type":0,"allow":common.to_string(),"deny":"0"},
+    ]);
+    body
+}
+
+// Only these successful lifecycle scripts use a request-bound topic. Identity and
+// private overwrites remain independent fixture literals, not request echoes.
+async fn creation_receipt_mock(
+    script: Vec<ScriptedResponse>,
+    default: ScriptedResponse,
+) -> MockRest {
+    let state = std::sync::Mutex::new((std::collections::VecDeque::from(script), None::<String>));
+    MockRest::with_responder(move |request| {
+        let mut state = state.lock().unwrap();
+        if request.method == "POST" && request.path == "/api/v10/guilds/100/channels" {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            state.1 = Some(body["topic"].as_str().expect("reservation topic").into());
+        }
+        let mut response = state.0.pop_front().unwrap_or_else(|| default.clone());
+        if let Ok(mut body) = serde_json::from_slice::<Value>(&response.body) {
+            if body["topic"] == "" {
+                body["topic"] = json!(state.1.as_ref().expect("create precedes channel receipt"));
+                response.body = serde_json::to_vec(&body).unwrap();
+            }
+        }
+        response
+    })
+    .await
+}
+
+#[path = "ticket_receipt_retry_tests.rs"]
+mod receipt_retry_tests;
+
+#[path = "ticket_open_retry_acceptance_tests.rs"]
+mod open_retry_acceptance_tests;
+
+#[path = "ticket_open_retry_store_tests.rs"]
+mod open_retry_store_tests;
+
 fn history(id: u64) -> Value {
     json!({"id":id.to_string(),"timestamp":two_bot_core::funnel::format_iso_millis(id as i64),
         "author":{"id":"500","username":"member","discriminator":"0"},
@@ -234,14 +284,15 @@ async fn failed_shared_defer_never_mutates_or_creates_a_channel() {
 #[ignore = "requires agent-testdb or CI service container"]
 async fn shared_router_lifecycle_defers_ephemerally_and_edits_without_leaking_transcript() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(
+    let mock = creation_receipt_mock(
         vec![
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
-            ScriptedResponse::json(201, json!({"id":"600"})),
+            ScriptedResponse::json(201, private_channel("")),
             ScriptedResponse::json(200, json!({"id":"900"})),
             ScriptedResponse::json(200, json!({})),
             ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id":"901"})),
             ScriptedResponse::json(200, json!({})),
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, channel()),
@@ -280,7 +331,7 @@ async fn shared_router_lifecycle_defers_ephemerally_and_edits_without_leaking_tr
     assert_eq!(ticket.claimed_by.as_deref(), Some("501"));
     assert!(tickets.store.transcript_exists(&ticket.id).await.unwrap());
     let requests = mock.requests();
-    assert_eq!(requests.len(), 14);
+    assert_eq!(requests.len(), 15);
     let callbacks: Vec<_> = requests
         .iter()
         .filter(|r| r.path.ends_with("/callback"))
@@ -307,12 +358,13 @@ async fn shared_router_lifecycle_defers_ephemerally_and_edits_without_leaking_tr
 #[ignore = "requires agent-testdb or CI service container"]
 async fn lifecycle_races_and_transcript_commit_precede_discord_delete() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(
+    let mock = creation_receipt_mock(
         vec![
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
-            ScriptedResponse::json(201, json!({"id":"600"})),
+            ScriptedResponse::json(201, private_channel("")),
             ScriptedResponse::json(200, json!({"id":"900"})),
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
+            ScriptedResponse::json(200, json!({"id":"901"})),
             ScriptedResponse::json(200, channel()),
             ScriptedResponse::status(204),
             ScriptedResponse::json(
@@ -507,7 +559,7 @@ async fn uncertain_create_survives_restart_and_uses_exact_topic_without_duplicat
                 200,
                 json!([{"id":"600","type":0,"topic":format!("two-ticket:{}",ticket.id)}]),
             ),
-            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::json(200, private_channel(&format!("two-ticket:{}", ticket.id))),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
@@ -535,14 +587,14 @@ async fn uncertain_create_survives_restart_and_uses_exact_topic_without_duplicat
 #[ignore = "requires agent-testdb or CI service container"]
 async fn safe_create_rejection_releases_reservation_but_failed_controls_cleanup_is_durable() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(
+    let mock = creation_receipt_mock(
         vec![
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
             ScriptedResponse::json(403, json!({"code":50013})),
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
-            ScriptedResponse::json(201, json!({"id":"600"})),
+            ScriptedResponse::json(201, private_channel("")),
             ScriptedResponse::status(500),
-            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::json(200, private_channel("")),
             ScriptedResponse::json(403, json!({"code":50013})),
             ScriptedResponse::json(404, json!({"code":10003})),
         ],
@@ -581,7 +633,7 @@ async fn ready_recovers_controls_and_panel_without_duplicates_and_purges_expired
     panel_channel["id"] = json!("700");
     let mock = MockRest::start(
         vec![
-            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::json(200, private_channel("two-ticket:open")),
             ScriptedResponse::json(200, json!([])),
             ScriptedResponse::json(200, json!({"id":"800"})),
             ScriptedResponse::json(200, panel_channel.clone()),
@@ -847,7 +899,7 @@ async fn cold_resumed_dispatch_recovers_controls_panel_and_purges_without_ready(
     let mock = MockRest::start(
         vec![
             ScriptedResponse::json(200, json!({"id":"400","bot":true})),
-            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::json(200, private_channel("two-ticket:open-resume")),
             ScriptedResponse::json(200, json!([])),
             ScriptedResponse::json(200, json!({"id":"800"})),
             ScriptedResponse::json(200, panel),
@@ -1073,11 +1125,12 @@ async fn failed_cold_resumed_identity_retries_during_recovery_without_another_ga
 #[ignore = "requires agent-testdb or CI service container"]
 async fn ticket_copy_success_confirmation_claim_and_close_are_pinned() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(
+    let mock = creation_receipt_mock(
         vec![
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
-            ScriptedResponse::json(201, json!({"id":"600"})),
+            ScriptedResponse::json(201, private_channel("")),
             ScriptedResponse::json(200, json!({"id":"900"})),
+            ScriptedResponse::json(200, json!({"id":"901"})),
             ScriptedResponse::json(200, channel()),
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, json!([history(1)])),
@@ -1138,9 +1191,12 @@ async fn ticket_copy_success_confirmation_claim_and_close_are_pinned() {
     db.close().await;
 }
 
-// Pins the three open-refusal literals through the real reserve path. Each
-// refusal still fetches the category first, so the script holds three
-// category documents: one per refused open.
+// Pins the open-refusal replies through the real reserve path: the duplicate
+// names its usable Open channel, creating without a channel keeps recovery
+// guidance, and cooldown names a bounded next-try time (the bare "please
+// wait" literal was replaced by the open-explanation outcome). Each refusal
+// still fetches the category first, so the script holds three category
+// documents: one per refused open.
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
 async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
@@ -1232,7 +1288,24 @@ async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
         Ok(reply) => reply,
         Err(error) => panic!("cooldown refusal is Ok: {}", error.reply()),
     };
-    assert_eq!(cooldown, "Please wait before opening another ticket.");
+    let cooldown_lower = cooldown.to_lowercase();
+    assert!(
+        cooldown_lower.contains("try") || cooldown_lower.contains("retry"),
+        "cooldown says when to try next: {cooldown}"
+    );
+    assert!(
+        cooldown_lower.contains("next"),
+        "cooldown words it as the next time to try: {cooldown}"
+    );
+    assert!(
+        !cooldown_lower.contains("reserv") && !cooldown_lower.contains("guarantee"),
+        "a next-try hint is not a reservation or guarantee: {cooldown}"
+    );
+    let expected_seconds = ((now + 300_000 + 999) / 1000) as u64;
+    assert!(
+        cooldown.contains(&format!("<t:{expected_seconds}:")),
+        "next-eligible is last creation + cooldown: {cooldown}"
+    );
     assert_eq!(mock.requests().len(), 3);
     mock.shutdown().await;
     db.close().await;

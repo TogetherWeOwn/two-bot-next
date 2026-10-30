@@ -42,10 +42,11 @@ pub const WEB_CONTRACT_VERSION: &str = "1.0";
 
 /// Every view in the contract, in `sql/web_v1.sql` order. The website reads
 /// exactly these; a view added here needs a `web_v1` edit, not a migration.
-pub const WEB_CONTRACT_VIEWS: [&str; 9] = [
+pub const WEB_CONTRACT_VIEWS: [&str; 10] = [
     "contract_meta",
     "live_counts",
     "rank_counts",
+    "rank_ladder",
     "members",
     "member_milestones",
     "upcoming_events",
@@ -426,6 +427,18 @@ pub async fn replace_events(
             )",
     )
     .bind(guild_id)
+    .execute(&mut *tx)
+    .await?;
+    // Event voice presence is guild-scoped through this mirror (neither
+    // event voice table carries a guild column): an event leaving the
+    // snapshot would orphan its spans past member erasure and the guild
+    // purge, so spans with no mirror row left go in the same transaction.
+    // Event ids are Discord-global, so a mirror row in any guild protects
+    // the event.
+    sqlx::query(
+        "DELETE FROM event_voice_presence p
+         WHERE NOT EXISTS (SELECT 1 FROM scheduled_events s WHERE s.event_id = p.event_id)",
+    )
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE web_contract_meta SET guild_id = $1 WHERE singleton = TRUE")

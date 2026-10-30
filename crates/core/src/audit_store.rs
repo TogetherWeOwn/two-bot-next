@@ -74,6 +74,8 @@ pub struct StoredAudit {
     pub attempted_at: Option<OffsetDateTime>,
     pub nonce: Option<String>,
     pub search_before: Option<String>,
+    /// Deepest fully inspected recovery page; NULL starts at channel head.
+    pub reconcile_before: Option<String>,
     pub mirror_message_id: Option<String>,
     pub accepted_at: Option<OffsetDateTime>,
     pub mirrored_at: Option<OffsetDateTime>,
@@ -119,11 +121,25 @@ pub enum DeliveryFailure {
     UncertainAcceptance,
 }
 
+/// Result of spending a reconciliation scan budget under a live owner fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileBound {
+    Yielded,
+    Quarantined,
+    LostClaim,
+}
+
+// A durable first-bound classification, preserved by ambiguous read failures.
+// Two bound hits terminate; neither is counted as a Discord POST attempt.
+const RECONCILE_SCAN_BOUND: &str = "discord_reconcile_scan_bound";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuarantineReason {
     MarkerMissing,
     PermissionRevoked,
     EvidenceConflict,
+    /// Two scans spent their budget without proving presence or absence.
+    ScanBoundExceeded,
 }
 
 impl QuarantineReason {
@@ -132,6 +148,7 @@ impl QuarantineReason {
             Self::MarkerMissing => "discord_marker_missing",
             Self::PermissionRevoked => "mirror_channel_permission_revoked",
             Self::EvidenceConflict => "delivery_evidence_conflict",
+            Self::ScanBoundExceeded => "discord_reconcile_scan_exhausted",
         }
     }
 }
@@ -529,7 +546,8 @@ impl AuditStore {
         let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'pending',
                delivery_claim_token = NULL, delivery_lease_until = NULL,
-               delivery_last_error = $4,
+               delivery_last_error = CASE
+                 WHEN NOT $5 AND delivery_last_error = $6 THEN delivery_last_error ELSE $4 END,
                delivery_yielded_at = clock_timestamp(),
                delivery_search_before = CASE WHEN $5 THEN NULL ELSE delivery_search_before END
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
@@ -545,6 +563,7 @@ impl AuditStore {
             "discord_post_ambiguous"
         })
         .bind(definite)
+        .bind(RECONCILE_SCAN_BOUND)
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -553,16 +572,100 @@ impl AuditStore {
         Ok(updated)
     }
 
+    /// Checkpoint fully inspected history and release ownership atomically.
+    /// Strictly older progress resets the consecutive no-progress budget;
+    /// two bounds without progress quarantine, never authorize another POST.
+    /// The locked row, not the claim snapshot, owns the cursor and evidence.
+    pub(crate) async fn bound_reconcile_scan(
+        &self,
+        claim: &AuditClaim,
+        inspected_before: Option<&str>,
+    ) -> Result<ReconcileBound, AuditStoreError> {
+        if claim.intent() != DeliveryIntent::Reconcile {
+            return Ok(ReconcileBound::LostClaim);
+        }
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let current = sqlx::query(
+            "SELECT delivery_reconcile_before, delivery_search_before
+             FROM operational_audit_log
+             WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
+               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
+               AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL",
+        )
+        .bind(&claim.row.event.entry_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current) = current else {
+            return Ok(ReconcileBound::LostClaim);
+        };
+        let saved: Option<String> = current.try_get("delivery_reconcile_before")?;
+        let boundary: String = current.try_get("delivery_search_before")?;
+        let progressed = if let Some(floor) = inspected_before {
+            // Reuse the history contract: canonical nonzero u64, not lexical
+            // ordering (e.g. 100 -> 99), overflow or a zero sentinel.
+            crate::audit_mirror::validate_history_page(&[], Some(floor), 1)
+                .map_err(|_| AuditStoreError::Invalid("reconcile cursor"))?;
+            if !crate::audit_mirror::snowflake_at_or_after(floor, &boundary)
+                || saved
+                    .as_deref()
+                    .is_some_and(|saved| !crate::audit_mirror::snowflake_at_or_after(saved, floor))
+            {
+                return Err(AuditStoreError::Invalid("reconcile cursor direction"));
+            }
+            saved
+                .as_deref()
+                .is_none_or(|saved| !crate::audit_mirror::snowflake_at_or_after(floor, saved))
+        } else {
+            false
+        };
+        let state: Option<String> = sqlx::query_scalar(
+            "UPDATE operational_audit_log SET
+               delivery_state = CASE WHEN NOT $7 AND delivery_last_error = $4
+                 THEN 'quarantined' ELSE 'pending' END,
+               delivery_last_error = CASE WHEN $7 THEN 'discord_post_ambiguous'
+                 WHEN delivery_last_error = $4 THEN $5 ELSE $4 END,
+               delivery_reconcile_before = CASE WHEN $7 THEN $6 ELSE delivery_reconcile_before END,
+               delivery_claim_token = NULL, delivery_lease_until = NULL,
+               delivery_yielded_at = clock_timestamp()
+             WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
+               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
+               AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL
+             RETURNING delivery_state",
+        )
+        .bind(&claim.row.event.entry_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(RECONCILE_SCAN_BOUND)
+        .bind(QuarantineReason::ScanBoundExceeded.as_str())
+        .bind(inspected_before)
+        .bind(progressed)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match state.as_deref() {
+            Some("pending") => Ok(ReconcileBound::Yielded),
+            Some("quarantined") => Ok(ReconcileBound::Quarantined),
+            None => Ok(ReconcileBound::LostClaim),
+            _ => Err(AuditStoreError::Invalid("bounded scan state")),
+        }
+    }
+
     /// Renew an active owner only; expiration cannot be undone by a stale
-    /// worker. Recovery may renew while scanning, but may never POST.
+    /// worker. Recovery stops scanning once acceptance is recorded; it may
+    /// complete that evidence, but must not renew it to keep reading or POST.
     pub async fn renew(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_row(&mut tx, &claim.row.event.entry_id).await?;
         let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() + interval '5 minutes'
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
-               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()",
+               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
+               AND ($4 OR mirror_message_id IS NULL)",
         ).bind(&claim.row.event.entry_id).bind(claim.token.expose()).bind(claim.generation)
+            .bind(claim.intent() == DeliveryIntent::Send)
             .execute(&mut *tx).await?.rows_affected() == 1;
         tx.commit().await?;
         Ok(updated)
@@ -717,6 +820,7 @@ fn stored(row: &PgRow) -> Result<StoredAudit, AuditStoreError> {
         attempted_at: row.try_get("delivery_attempted_at")?,
         nonce: row.try_get("delivery_nonce")?,
         search_before: row.try_get("delivery_search_before")?,
+        reconcile_before: row.try_get("delivery_reconcile_before")?,
         mirror_message_id: row.try_get("mirror_message_id")?,
         accepted_at: row.try_get("delivery_accepted_at")?,
         mirrored_at: row.try_get("mirrored_at")?,
@@ -732,6 +836,10 @@ fn snowflake_cursor(value: &str) -> bool {
 fn snowflake_id(value: &str) -> bool {
     snowflake_cursor(value) && value.bytes().any(|b| b != b'0')
 }
+
+#[cfg(test)]
+#[path = "audit_cursor_checkpoint_acceptance.rs"]
+mod cursor_checkpoint_acceptance;
 
 #[cfg(test)]
 mod tests {
@@ -753,6 +861,7 @@ mod tests {
                 attempted_at: None,
                 nonce: None,
                 search_before: None,
+                reconcile_before: None,
                 mirror_message_id: None,
                 accepted_at: None,
                 mirrored_at: None,

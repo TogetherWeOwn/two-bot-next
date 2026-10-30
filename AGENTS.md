@@ -15,6 +15,15 @@ tested and reviewable.
 4. [`SECURITY.md`](SECURITY.md): private vulnerability reporting and secret handling.
 5. [`CONSTRAINTS.md`](CONSTRAINTS.md): the quality bar. Read it before writing code. Do not weaken it to make a change pass.
 
+Browse the [documentation map](docs/README.md) before searching individual guides.
+When adding a doc, add its purpose/link there; run `python3 scripts/check_docs_index.py --json`.
+The index merges with union (`.gitattributes`); after rebasing a docs change, run `python3 scripts/check_docs_index.py --dedupe --json` and repair any rows it still reports instead of hand-merging the index.
+Union is a local merge/rebase aid, not proof of GitHub mergeability: GitHub
+can still report an index conflict when local `git merge-tree` is clean.
+Check GitHub's mergeability;
+resolve a reported conflict locally, run the dedupe checker above and repair
+its remaining findings, then push the resolution before expecting GitHub to merge.
+
 ## Pull request contract
 
 - Work on a branch and open a PR. Never push to `main`.
@@ -45,9 +54,16 @@ order, is in [`CONTRIBUTING.md`](CONTRIBUTING.md#pre-push-checklist).
 
 ```sh
 cargo fmt --all -- --check
+python3 scripts/generate_command_reference.py
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
+
+The generated reference is ignored at `docs/generated/commands.md`; the tracked
+`docs/commands.md` is its landing page. Generate explicitly before test-target
+compilation. On the controller use `python3 scripts/generate_command_reference.py --controller`;
+this builds only the generator through the bounded cache wrapper. The generator
+never rewrites tracked configuration or independent publication fixtures.
 
 On the persistent Paperclip controller, run the compiling commands through the
 cache wrapper described under [Controller builds](#controller-builds).

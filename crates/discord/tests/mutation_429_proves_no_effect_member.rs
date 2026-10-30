@@ -10,13 +10,13 @@
 #![cfg(feature = "db")]
 
 use common::{MockRest, ScriptedResponse};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::Duration;
 use two_bot_core::commands::{PERM_BAN_MEMBERS, PERM_KICK_MEMBERS, PERM_MODERATE_MEMBERS};
 use two_bot_core::internal_actions::ErrorCode;
-use two_bot_core::member_moderation::MemMemberStore;
+use two_bot_core::member_moderation::{AuditRow, MemMemberStore};
 use two_bot_core::{ModerationActor, ModerationPolicy, ModerationTarget};
 use two_bot_discord::internal_member_moderation::{
     InternalMemberConfig, InternalMemberExecutor, InternalMemberRequest,
@@ -109,6 +109,70 @@ fn executor(store: MemMemberStore, mock: &MockRest) -> InternalMemberExecutor<Me
     .unwrap()
 }
 
+fn assert_failed_discord_audit(row: &AuditRow, request_id: &str, key: &str) {
+    assert_eq!(row.request_id, format!("{request_id}:failed"));
+    assert_eq!(row.outcome, "failed");
+    assert_eq!(row.action, "moderation.ban");
+    assert_eq!(row.guild_id, GUILD);
+    assert_eq!(row.actor_id, ACTOR);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET_A));
+    assert_eq!(row.idempotency_key, key);
+    assert_eq!(row.reason, "Member moderation did not complete");
+    let metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+    assert_eq!(
+        metadata,
+        json!({"stage": "discord", "request_id": request_id})
+    );
+}
+
+fn assert_in_progress_discord_audit(row: &AuditRow, request_id: &str, key: &str) {
+    assert_eq!(row.request_id, format!("{request_id}:in_progress"));
+    assert_eq!(row.outcome, "in_progress");
+    assert_eq!(row.action, "moderation.ban");
+    assert_eq!(row.guild_id, GUILD);
+    assert_eq!(row.actor_id, ACTOR);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET_A));
+    assert_eq!(row.idempotency_key, key);
+    assert_eq!(row.reason, "Member moderation did not complete");
+    let metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+    assert_eq!(
+        metadata,
+        json!({"stage": "discord", "request_id": request_id})
+    );
+}
+
+fn assert_in_progress_claim_audit(row: &AuditRow, request_id: &str, key: &str) {
+    assert_eq!(row.request_id, format!("{request_id}:in_progress"));
+    assert_eq!(row.outcome, "in_progress");
+    assert_eq!(row.action, "moderation.ban");
+    assert_eq!(row.guild_id, GUILD);
+    assert_eq!(row.actor_id, ACTOR);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET_A));
+    assert_eq!(row.idempotency_key, key);
+    assert_eq!(row.reason, "Member moderation did not complete");
+    let metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+    assert_eq!(
+        metadata,
+        json!({"stage": "claim", "request_id": request_id})
+    );
+}
+
+fn assert_ban_success_audit(row: &AuditRow, request_id: &str, key: &str, generation: i64) {
+    assert_eq!(row.request_id, request_id);
+    assert_eq!(row.outcome, "banned");
+    assert_eq!(row.action, "moderation.ban");
+    assert_eq!(row.guild_id, GUILD);
+    assert_eq!(row.actor_id, ACTOR);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET_A));
+    assert_eq!(row.idempotency_key, key);
+    assert_eq!(row.reason, "spam");
+    let metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+    assert_eq!(
+        metadata,
+        json!({"duration_seconds": null, "ban_attempt_generation": generation})
+    );
+}
+
 #[tokio::test]
 async fn mutation_429_releases_member_claim_for_same_key_retry() {
     let mock = MockRest::start(
@@ -132,6 +196,11 @@ async fn mutation_429_releases_member_claim_for_same_key_retry() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::RateLimited);
+    // The released 429 attempt leaves one bound failed/discord row under the
+    // suffixed id, so it can never mask the retry's success row.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_failed_discord_audit(&audits[0], "req-429", "key-429-valid");
     // A rate-limited mutation proves no effect: the same key must be a real
     // second attempt, not a replay and not a fenced `InProgress`.
     let retry = exec
@@ -149,7 +218,12 @@ async fn mutation_429_releases_member_claim_for_same_key_retry() {
     assert_eq!(retry.outcome, "banned");
     assert!(!retry.replayed);
     assert_eq!(mock.requests().len(), 2);
-    assert_eq!(store.audits().len(), 1);
+    // The failed row survives untouched and the accepted retry adds its plain
+    // success row with a fresh ban generation (the 429 attempt was rejected).
+    let audits = store.audits();
+    assert_eq!(audits.len(), 2);
+    assert_failed_discord_audit(&audits[0], "req-429", "key-429-valid");
+    assert_ban_success_audit(&audits[1], "req-429", "key-429-valid", 2);
     mock.shutdown().await;
 }
 
@@ -241,6 +315,12 @@ async fn mutation_5xx_stays_fenced() {
         .code,
         ErrorCode::DiscordUnavailable
     );
+    assert_eq!(mock.requests().len(), 1);
+    // The uncertain 503 leaves one bound in_progress/discord row under the
+    // suffixed id.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_in_progress_discord_audit(&audits[0], "req-5xx", "key-5xx-valid");
     // Uncertain effect: same-key retry refuses, never a second PUT, and no
     // completion was recorded.
     assert_eq!(
@@ -259,7 +339,18 @@ async fn mutation_5xx_stays_fenced() {
         ErrorCode::InProgress
     );
     assert_eq!(mock.requests().len(), 1);
-    assert!(store.audits().is_empty());
+    // The retry's in-flight claim audits under the same suffixed id and is
+    // deduplicated, so the original discord observation survives untouched.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_in_progress_discord_audit(&audits[0], "req-5xx", "key-5xx-valid");
+    assert!(
+        store
+            .audits()
+            .iter()
+            .all(|row| row.outcome == "in_progress"),
+        "no success or completion row"
+    );
     mock.shutdown().await;
 }
 
@@ -289,6 +380,12 @@ async fn mutation_timeout_stays_fenced() {
         .code,
         ErrorCode::UpstreamTimeout
     );
+    assert_eq!(mock.requests().len(), 1);
+    // The uncertain timeout leaves one bound in_progress/discord row under the
+    // suffixed id.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_in_progress_discord_audit(&audits[0], "req-timeout", "key-timeout");
     assert_eq!(
         exec.execute(
             &req,
@@ -305,7 +402,18 @@ async fn mutation_timeout_stays_fenced() {
         ErrorCode::InProgress
     );
     assert_eq!(mock.requests().len(), 1);
-    assert!(store.audits().is_empty());
+    // The retry's in-flight claim audits under the same suffixed id and is
+    // deduplicated, so the original discord observation survives untouched.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_in_progress_discord_audit(&audits[0], "req-timeout", "key-timeout");
+    assert!(
+        store
+            .audits()
+            .iter()
+            .all(|row| row.outcome == "in_progress"),
+        "no success or completion row"
+    );
     mock.shutdown().await;
 }
 
@@ -350,6 +458,9 @@ async fn cancelled_mutation_stays_fenced() {
     .unwrap();
     attempt.abort();
     let _ = attempt.await;
+    // Dropping the in-flight PUT writes no discord observation: the claim
+    // stays in flight with an empty ledger until the retry's refusal audits.
+    assert!(store.audits().is_empty());
     let req = ban_request();
     assert_eq!(
         exec.execute(
@@ -367,7 +478,18 @@ async fn cancelled_mutation_stays_fenced() {
         ErrorCode::InProgress
     );
     assert_eq!(mock.requests().len(), 1);
-    assert!(store.audits().is_empty());
+    // The aborted attempt never reached its discord audit, so the in-flight
+    // refusal is the single bound in_progress/claim row under the suffixed id.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_in_progress_claim_audit(&audits[0], "req-cancel", "key-cancel");
+    assert!(
+        store
+            .audits()
+            .iter()
+            .all(|row| row.outcome == "in_progress"),
+        "no success or completion row"
+    );
     mock.shutdown().await;
 }
 
@@ -398,6 +520,12 @@ async fn unexpected_status_stays_fenced() {
             ErrorCode::DiscordUnavailable,
             "status {status}"
         );
+        assert_eq!(mock.requests().len(), 1, "status {status}");
+        // Each ambiguous status leaves one bound in_progress/discord row under
+        // the suffixed id.
+        let audits = store.audits();
+        assert_eq!(audits.len(), 1, "status {status}");
+        assert_in_progress_discord_audit(&audits[0], "req-ambiguous", "key-ambiguous");
         assert_eq!(
             exec.execute(
                 &req,
@@ -415,7 +543,18 @@ async fn unexpected_status_stays_fenced() {
             "status {status}"
         );
         assert_eq!(mock.requests().len(), 1, "status {status}");
-        assert!(store.audits().is_empty(), "status {status}");
+        // The retry's in-flight claim audits under the same suffixed id and is
+        // deduplicated, so the original discord observation survives untouched.
+        let audits = store.audits();
+        assert_eq!(audits.len(), 1, "status {status}");
+        assert_in_progress_discord_audit(&audits[0], "req-ambiguous", "key-ambiguous");
+        assert!(
+            store
+                .audits()
+                .iter()
+                .all(|row| row.outcome == "in_progress"),
+            "status {status}: no success or completion row"
+        );
         mock.shutdown().await;
     }
 }

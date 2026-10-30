@@ -1,4 +1,4 @@
-"""Execute the release verdict offline; never tag, publish or dispatch a workflow."""
+"""Execute the release verdict offline; never publish or dispatch a workflow."""
 
 import os
 from pathlib import Path
@@ -9,7 +9,6 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 JOB_RESULTS = {
-    "tag": "TAG_RESULT",
     "sbom-target": "SBOM_TARGET_RESULT",
     "release-sbom": "RELEASE_SBOM_RESULT",
     "attach-sbom": "ATTACH_SBOM_RESULT",
@@ -28,7 +27,6 @@ class ReleaseVerdictExecutionTests(unittest.TestCase):
         # Do not inherit dispatch inputs, job results or credentials from the host.
         env = {
             "PATH": os.defpath,
-            "DISPATCH_SHA": "",
             "DRY_RUN": "false",
             "RELEASE_TAG": "",
             **inputs,
@@ -43,11 +41,10 @@ class ReleaseVerdictExecutionTests(unittest.TestCase):
         # Inverting the dry-run comparison must not turn an empty dispatch green.
         for dry_run in ("false", ""):
             with self.subTest(dry_run=dry_run):
-                proc = self.run_verdict({"DRY_RUN": dry_run}, ("skipped",) * 4)
+                proc = self.run_verdict({"DRY_RUN": dry_run}, ("skipped",) * 3)
                 output = proc.stdout + proc.stderr
                 self.assertEqual(proc.returncode, 1, output)
                 self.assertIn("::error::empty dispatch:", output)
-                self.assertIn("sha is empty", output)
                 self.assertIn("dry_run is false", output)
                 self.assertIn("release_tag is empty", output)
                 for job in JOB_RESULTS:
@@ -56,13 +53,12 @@ class ReleaseVerdictExecutionTests(unittest.TestCase):
 
     def test_selected_dispatches_keep_designed_skips_green(self):
         cases = (
-            ("sha", {"DISPATCH_SHA": "a" * 40}, ("success",) * 4),
-            ("rollback", {"DISPATCH_SHA": "a" * 40},
-             ("success", "skipped", "skipped", "skipped")),
+            ("digest", {"RELEASE_TAG": "v2026.10.21"},
+             ("success", "success", "success")),
             ("dry-run", {"DRY_RUN": "true"},
-             ("skipped", "success", "success", "skipped")),
+             ("success", "success", "skipped")),
             ("repair", {"RELEASE_TAG": "v1.2.3"},
-             ("skipped", "success", "success", "success")),
+             ("success", "success", "success")),
         )
         for label, inputs, results in cases:
             with self.subTest(label=label):
@@ -78,9 +74,9 @@ class ReleaseVerdictExecutionTests(unittest.TestCase):
         for index, job in enumerate(JOB_RESULTS):
             for result in ("failure", "cancelled"):
                 with self.subTest(job=job, result=result):
-                    results = ["success"] * 4
+                    results = ["success"] * 3
                     results[index] = result
-                    proc = self.run_verdict({"DISPATCH_SHA": "a" * 40}, results)
+                    proc = self.run_verdict({"RELEASE_TAG": "v2026.10.21"}, results)
                     output = proc.stdout + proc.stderr
                     self.assertEqual(proc.returncode, 1, output)
                     self.assertIn(f"::error::{job}: result='{result}'", output)

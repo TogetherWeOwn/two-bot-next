@@ -1,76 +1,33 @@
 name: release
 
-# Release on production promote (replaces the release-please release PR).
-# deploy-production dispatches this after a successful production deploy with
-# the exact deployed SHA, as its own run, so the deploy run (the production
-# rollback path) never waits for the tag + SBOM chain. The `tag` job tags that commit vX.Y.Z and publishes a
-# GitHub Release whose notes come from the Conventional Commit subjects since
-# the previous tag (.github/scripts/release-on-promote.cjs). Bump rules and
-# note sections stay in release-please-config.json, so versions continue the
-# existing tag line. No release PR: nothing new needs CI or review, nothing
-# goes stale, and main never needs a freeze (docs/releases.md).
-# Dispatch inputs: `sha` tags and publishes a deployed commit (deploy-production,
-# or a manual repair); `dry_run` / `release_tag` keep the SBOM dry-run and
-# repair paths. Every job but `verdict` is input-guarded, so an all-default
-# dispatch would skip everything and read green with nothing published: the
-# `verdict` job fails that run closed, naming the skipped jobs and why, while
-# the sha, dry_run and release_tag dispatches behave exactly as before.
+# SBOM chain for the daily digest releases (docs/releases.md). The
+# daily-digest workflow dispatches this with the digest tag it just cut, as
+# its own run, so the digest run never waits for the SBOM chain. No tagging
+# happens here: per-promote vX.Y.Z tagging is retired, and versions come from
+# the digest tags alone.
+# Dispatch inputs: `release_tag` attaches SBOM assets to a digest release (or
+# repairs a pre-digest vX.Y.Z release); `dry_run` keeps the SBOM dry-run path.
 on:
   workflow_dispatch:
     inputs:
-      sha:
-        description: Full 40-hex commit on main that is live in production (tags and publishes it)
-        type: string
-        default: ''
       dry_run:
-        description: Generate and scan SBOMs without tagging or asset publication
+        description: Generate and scan SBOMs without asset publication
         type: boolean
         default: false
       release_tag:
-        description: Existing vX.Y.Z release to repair SBOM assets (skip tagging)
+        description: Digest release to attach SBOM assets (vYYYY.MM.DD, or vX.Y.Z for pre-digest repair)
         type: string
         default: ''
 
 permissions: {}
 
-jobs:
-  tag:
-    name: tag-release
-    permissions:
-      contents: write # Create the tag and its GitHub Release.
-    # The dry_run/release_tag dispatch paths skip tagging; the SBOM jobs below
-    # still consume inputs.dry_run, inputs.release_tag and this job's outputs.
-    if: inputs.sha != '' && inputs.dry_run != true && inputs.release_tag == ''
-    # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tag') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 10
-    # One release at a time; a queued promote waits instead of racing the tag.
-    concurrency:
-      group: release
-      cancel-in-progress: false
-    outputs:
-      released: ${{ steps.release.outputs.released }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          # Full history and tags: the version and notes come from the commits
-          # since the previous vX.Y.Z tag.
-          fetch-depth: 0
-          fetch-tags: true
-          persist-credentials: false
-      - name: Tag the deployed commit and publish its release
-        id: release
-        env:
-          RELEASE_SHA: ${{ inputs.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: node .github/scripts/release-on-promote.cjs
+concurrency:
+  group: release
+  cancel-in-progress: false
 
+jobs:
   sbom-target:
-    needs: tag
-    if: ${{ !cancelled() && (inputs.dry_run == true || inputs.release_tag != '' || needs.tag.outputs.released == 'true') }}
+    if: ${{ !cancelled() && (inputs.dry_run == true || inputs.release_tag != '') }}
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sbom-target') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
@@ -87,7 +44,7 @@ jobs:
         id: target
         env:
           DRY_RUN: ${{ inputs.dry_run }}
-          RELEASE_TAG: ${{ inputs.release_tag || needs.tag.outputs.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: python3 scripts/release-sbom-target.py
@@ -131,7 +88,7 @@ jobs:
 
   verdict:
     name: release verdict (fail closed on empty dispatch)
-    needs: [tag, sbom-target, release-sbom, attach-sbom]
+    needs: [sbom-target, release-sbom, attach-sbom]
     # A skipped or failed dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on `check` in check.yml.
@@ -142,10 +99,8 @@ jobs:
     steps:
       - name: Fail closed when the dispatch selected no release path
         env:
-          DISPATCH_SHA: ${{ inputs.sha }}
           DRY_RUN: ${{ inputs.dry_run }}
           RELEASE_TAG: ${{ inputs.release_tag }}
-          TAG_RESULT: ${{ needs.tag.result }}
           SBOM_TARGET_RESULT: ${{ needs.sbom-target.result }}
           RELEASE_SBOM_RESULT: ${{ needs.release-sbom.result }}
           ATTACH_SBOM_RESULT: ${{ needs.attach-sbom.result }}
@@ -155,7 +110,6 @@ jobs:
           import sys
 
           results = {
-              "tag": os.environ.get("TAG_RESULT", ""),
               "sbom-target": os.environ.get("SBOM_TARGET_RESULT", ""),
               "release-sbom": os.environ.get("RELEASE_SBOM_RESULT", ""),
               "attach-sbom": os.environ.get("ATTACH_SBOM_RESULT", ""),
@@ -165,21 +119,20 @@ jobs:
           # An all-default dispatch selects no release path: every job skips
           # and the run would read green with nothing published. Fail closed
           # and name what was skipped and why.
-          if (os.environ.get("DISPATCH_SHA", "") == ""
-                  and os.environ.get("DRY_RUN", "") != "true"
+          if (os.environ.get("DRY_RUN", "") != "true"
                   and os.environ.get("RELEASE_TAG", "") == ""):
               skipped = sorted(name for name, result in results.items()
                                if result == "skipped")
               failures.append(
-                  "empty dispatch: sha is empty, dry_run is false and release_tag is "
+                  "empty dispatch: dry_run is false and release_tag is "
                   "empty, so no release path was selected; skipped: "
                   + (", ".join(skipped) if skipped else "none")
-                  + " (tag needs sha, sbom-target needs dry_run, release_tag or a "
-                  "fresh tag, release-sbom needs sbom-target, attach-sbom needs a tag)")
+                  + " (sbom-target needs dry_run or release_tag, "
+                  "release-sbom needs sbom-target, attach-sbom needs a tag)")
 
           # Real dispatches behave as before: any failed or cancelled
           # dependency fails the run, while designed skips (the dry-run
-          # tag/attach, the repair tag) stay green.
+          # attach) stay green.
           for job_name, result in results.items():
               if result in ("failure", "cancelled"):
                   failures.append(f"{job_name}: result={result!r}")

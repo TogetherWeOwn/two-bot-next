@@ -57,6 +57,13 @@ pub const STICKY_DEBOUNCE_DEFAULT_SECONDS: i64 = 5;
 /// limit. Builders advertise it via `max_length`; `crate::rsvp` refuses
 /// longer IDs before any record operation.
 pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
+/// `/rsvp` + `/rsvp-attendance` `event-id` bound (UTF-16 units, the same
+/// shared bound as occurrences): the event id itself or a pasted
+/// `https://discord.com/events/` link, optionally `<...>`-wrapped. The
+/// longest such link (20-digit guild + 20-digit event) is 68 units, far under
+/// the bound; builders advertise it via `max_length`, and anything longer
+/// refuses as an invalid id before any lookup or write.
+pub const EVENT_REFERENCE_MAX_CHARS: usize = 128;
 /// Maximum user-supplied resource ID or prefix accepted by an admin command.
 pub const MAX_RESOURCE_ID_CHARS: usize = 128;
 
@@ -96,6 +103,11 @@ pub struct CommandOption {
     pub max_value: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_length: Option<u32>,
+    /// Declared `min_length` for a string option. Discord publishes and
+    /// enforces it; the model must preserve it rather than guess it, so
+    /// confirmed-publication help can explain it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub choices: Vec<CommandChoice>,
     /// Allowed Discord channel type integers for a channel picker.
@@ -118,6 +130,7 @@ impl CommandOption {
             min_value: None,
             max_value: None,
             max_length: None,
+            min_length: None,
             choices: Vec::new(),
             channel_types: Vec::new(),
             options: Vec::new(),
@@ -156,6 +169,12 @@ impl CommandOption {
     #[must_use]
     pub fn max_length(mut self, max: u32) -> Self {
         self.max_length = Some(max);
+        self
+    }
+
+    #[must_use]
+    pub fn min_length(mut self, min: u32) -> Self {
+        self.min_length = Some(min);
         self
     }
 
@@ -212,6 +231,11 @@ pub struct CommandDefinition {
     pub default_member_permissions: Option<String>,
     /// `false` in legacy (`setDMPermission(false)`): guild-only, no DMs.
     pub dm_permission: bool,
+    /// Static usage examples rendered by confirmed-publication help detail.
+    /// Never serialized or published to Discord: the wire shape carries no
+    /// per-command prose, so help examples live only in the definition.
+    #[serde(skip)]
+    pub examples: Vec<String>,
 }
 
 impl CommandDefinition {
@@ -225,6 +249,7 @@ impl CommandDefinition {
             options: Vec::new(),
             default_member_permissions: None,
             dm_permission: false,
+            examples: Vec::new(),
         }
     }
 
@@ -239,12 +264,21 @@ impl CommandDefinition {
         self.options = options;
         self
     }
+
+    #[must_use]
+    pub fn examples(mut self, examples: Vec<String>) -> Self {
+        self.examples = examples;
+        self
+    }
 }
 
 // Verified against the legacy tree's discord.js (`PermissionFlagsBits`):
 // BanMembers=4, KickMembers=2, ModerateMembers=2^40, ManageMessages=8192,
-// ManageChannels=16, ManageGuild=32, ManageEvents=2^33.
+// ManageChannels=16, ManageGuild=32, ManageEvents=2^33,
+// Administrator=8, CreateInstantInvite=1.
+pub const PERM_CREATE_INSTANT_INVITE: u64 = 1;
 pub const PERM_BAN_MEMBERS: u64 = 4;
+pub const PERM_ADMINISTRATOR: u64 = 8;
 pub const PERM_KICK_MEMBERS: u64 = 2;
 pub const PERM_MODERATE_MEMBERS: u64 = 1099511627776;
 pub const PERM_MANAGE_MESSAGES: u64 = 8192;
@@ -255,7 +289,10 @@ pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 /// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
 /// plus the Next-only `/help` discovery surface — legacy has no help command,
 /// see the `help` row in the registry golden exceptions — plus the Next-only
-/// `/privacy` member self-serve for analytics privacy and deletion requests).
+/// `/privacy` member self-serve for analytics privacy and deletion requests,
+/// the Next-only `/reopen` self-service picker recovery,
+/// `/welcome-preview` read-only admin rendering, and
+/// `/game-mix` private staff aggregate read).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -263,7 +300,27 @@ pub fn core_commands() -> Vec<CommandDefinition> {
             CommandOption::new("member", "Show another member.", CommandOptionType::User),
         ]),
         CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
-        CommandDefinition::new("help", HELP_DESCRIPTION),
+        CommandDefinition::new("help", HELP_DESCRIPTION)
+            .options(vec![
+                CommandOption::new(
+                    "command",
+                    "Command name (case-insensitive; optional leading /)",
+                    CommandOptionType::String,
+                )
+                .max_length(32),
+                CommandOption::new(
+                    "subcommand",
+                    "Subcommand path, space-separated (requires command)",
+                    CommandOptionType::String,
+                )
+                .max_length(96),
+            ])
+            .examples(vec![
+                "/help".to_owned(),
+                "/help command:rank".to_owned(),
+                "/help command:privacy".to_owned(),
+                "/help command:privacy subcommand:deletion-status".to_owned(),
+            ]),
         CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
             CommandOption::new(
                 "opt-out",
@@ -314,6 +371,72 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                 .max_length(128),
             ]),
         ]),
+        CommandDefinition::new("reopen", REOPEN_DESCRIPTION).options(vec![
+            CommandOption::new("kind", "Which picker to reopen.", CommandOptionType::String)
+                .required()
+                .choices(vec![
+                    CommandChoice {
+                        name: "Games".to_owned(),
+                        value: "games".to_owned(),
+                    },
+                    CommandChoice {
+                        name: "Session".to_owned(),
+                        value: "session".to_owned(),
+                    },
+                ]),
+        ]),
+        CommandDefinition::new(
+            "welcome-preview",
+            "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+        )
+        .permissions(PERM_MANAGE_GUILD),
+        // Optional browse selectors only: every call stays scoped to the
+        // invoking guild; there is deliberately no guild, member or
+        // live-guild override. The page ceiling mirrors
+        // `game_activity::GAME_MIX_MAX_PAGE` (pinned there for the runtime).
+        CommandDefinition::new(
+            "game-mix",
+            "Show this server's aggregate game activity.",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "page",
+                "Page of saved games to show (10 per page). Default: 1.",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, crate::game_activity::GAME_MIX_MAX_PAGE),
+            CommandOption::new(
+                "sort",
+                "Order games by play time or in-voice time. Default: play.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "Play time".to_owned(),
+                    value: "play".to_owned(),
+                },
+                CommandChoice {
+                    name: "In-voice time".to_owned(),
+                    value: "voice".to_owned(),
+                },
+            ]),
+            CommandOption::new(
+                "format",
+                "Show raw JSON or a readable summary. Default: JSON.",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "JSON".to_owned(),
+                    value: "json".to_owned(),
+                },
+                CommandChoice {
+                    name: "Summary".to_owned(),
+                    value: "summary".to_owned(),
+                },
+            ]),
+        ]),
     ]
 }
 
@@ -323,6 +446,10 @@ pub const HELP_DESCRIPTION: &str = "Show this server's live commands, grouped by
 /// Member self-serve privacy description, shared by the registry fixtures.
 pub const PRIVACY_DESCRIPTION: &str =
     "Manage your analytics privacy and deletion requests for this server.";
+
+/// Self-service picker-recovery description, shared by the registry fixtures.
+pub const REOPEN_DESCRIPTION: &str =
+    "Reopen your games or session picker in a private menu; games includes a no-change preview.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -451,8 +578,10 @@ mod tests {
                 .chain(crate::feature_commands::automation_commands()).collect::<Vec<_>>();
             for (command, option, min, max, required) in [
                 ("tempban", "duration_seconds", 60, Some(31_536_000), true),
+                ("tempban-list", "page", 1, Some(10_000), false),
                 ("timeout", "duration_seconds", 60, Some(2_419_200), true),
                 ("purge", "count", 1, Some(100), true),
+                ("purge-preview", "count", 1, Some(100), true),
                 ("slowmode", "seconds", 0, Some(21_600), true),
                 ("schedule", "in-minutes", 1, Some(525_600), false),
                 ("schedule", "every-minutes", 60, Some(525_600), false),
@@ -473,9 +602,24 @@ mod tests {
                 }
             }
             for definition in crate::moderation::moderation_commands() {
-                let reason = definition.options.iter().find(|o| o.name == "reason").unwrap();
-                prop_assert_eq!(reason.required, Some(true));
-                prop_assert_eq!(reason.max_length, Some(512));
+                // Read-only inspection commands take no audit reason: there
+                // is nothing to audit. Every mutating moderation command
+                // still requires one.
+                if !matches!(
+                    definition.name.as_str(),
+                    "purge-preview"
+                        | "channel-inspect"
+                        | "tempban-list"
+                        | "moderation-recent"
+                ) {
+                    let reason = definition
+                        .options
+                        .iter()
+                        .find(|o| o.name == "reason")
+                        .expect("mutating moderation commands require a reason option");
+                    prop_assert_eq!(reason.required, Some(true));
+                    prop_assert_eq!(reason.max_length, Some(512));
+                }
                 prop_assert!(!definition.dm_permission);
             }
         }
@@ -510,10 +654,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            // 4 core (rank, leaderboard, help, privacy) plus the generated
-            // builtins; the duplicated slice adds no new names.
-            if builtin_count + 4 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 4)));
+            // 7 core (rank, leaderboard, help, privacy, reopen, welcome-preview,
+            // game-mix) plus generated builtins; duplicates add no new names.
+            if builtin_count + 7 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 7)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -528,57 +672,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn core_commands_match_legacy_names() {
-        let core = core_commands();
-        assert_eq!(core.len(), 4);
-        assert_eq!(core[0].name, "rank");
-        assert_eq!(core[1].name, "leaderboard");
-        assert_eq!(core[2].name, "help");
-        assert_eq!(core[3].name, "privacy");
-        // Guild-only, DM off (legacy `setDMPermission(false)`).
-        assert!(core.iter().all(|c| !c.dm_permission));
-        // `rank` has one optional `member` user option; `leaderboard` and the
-        // Next-only `help` take none; `help` is open to everyone.
-        assert_eq!(core[0].options.len(), 1);
-        assert_eq!(core[0].options[0].kind, 6);
-        assert!(core[0].options[0].required.is_none());
-        assert!(core[1].options.is_empty());
-        assert!(core[2].options.is_empty());
-        assert_eq!(core[2].description, HELP_DESCRIPTION);
-        assert!(core[2].default_member_permissions.is_none());
-        // The Next-only `privacy` self-serve carries analytics and deletion
-        // subcommands, is open to everyone, and takes no target-user option.
-        assert_eq!(core[3].description, PRIVACY_DESCRIPTION);
-        assert!(core[3].default_member_permissions.is_none());
-        assert_eq!(core[3].options.len(), 6);
-        let mut subcommands: Vec<&str> = core[3].options.iter().map(|o| o.name.as_str()).collect();
-        subcommands.sort_unstable();
-        assert_eq!(
-            subcommands,
-            [
-                "delete",
-                "deletion-receipt",
-                "deletion-status",
-                "opt-in",
-                "opt-out",
-                "status"
-            ]
-        );
-        for option in &core[3].options {
-            assert_eq!(option.kind, CommandOptionType::SubCommand.as_u8());
-            assert!(option.required.is_none());
-            if matches!(option.name.as_str(), "deletion-status" | "deletion-receipt") {
-                assert_eq!(option.options.len(), 1);
-                assert_eq!(option.options[0].name, "request-id");
-                assert_eq!(option.options[0].kind, CommandOptionType::String.as_u8());
-                assert_eq!(option.options[0].required, Some(true));
-                assert_eq!(option.options[0].max_length, Some(128));
-            } else {
-                assert!(option.options.is_empty());
-            }
-        }
-    }
+    include!("commands_registry_acceptance.rs");
 
     #[test]
     fn merge_orders_core_first_then_features_then_custom() {
@@ -595,7 +689,17 @@ mod tests {
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "rsvp", "faq"]
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview",
+                "game-mix",
+                "rsvp",
+                "faq"
+            ]
         );
     }
 
@@ -609,8 +713,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 5); // rank, leaderboard, help, privacy, attendance×1
-        assert_eq!(merged[4].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 8); // seven core plus attendance once
+        assert_eq!(merged[7].description, "Record a verified attendee");
     }
 
     #[test]
@@ -639,13 +743,25 @@ mod tests {
         ];
         let merged = merge_commands(&[], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "faq"]);
+        assert_eq!(
+            names,
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview",
+                "game-mix",
+                "faq"
+            ]
+        );
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        // 4 core + 97 fillers = 101: one past the ceiling.
-        let extra: Vec<CommandDefinition> = (0..97)
+        // 7 core + 94 fillers = 101: one past the ceiling.
+        let extra: Vec<CommandDefinition> = (0..94)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");

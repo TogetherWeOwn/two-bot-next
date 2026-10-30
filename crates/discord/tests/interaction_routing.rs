@@ -1,16 +1,16 @@
-//! TOG-10075 acceptance: the interaction router routes every parity §1 row
+//! Acceptance: the interaction router routes every parity and Next-only row
 //! to its registered handler (stub) or the refusal path, components route by
 //! prefix, and publish sends the complete merged set once.
 //!
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 29 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 44 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
 //!    `twilight_http` bulk-set endpoint against the mock Discord double in
-//!    `common`: one request, all 30 names, guild-only, permission bits as
+//!    `common`: one request, all 44 names, guild-only, permission bits as
 //!    decimal strings. The REST executor ([TOG-10076]) owns the production
 //!    call; this proves the payload it will send.
 //!
@@ -275,10 +275,26 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
         .collect();
-    assert_eq!(restricted.len(), 23);
+    // 23 legacy restricted rows plus management-only command-inspect,
+    // command-disable, command-enable, giveaway and welcome-preview, plus
+    // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect, game-mix,
+    // tempban-list and moderation-recent. Discord defaults never
+    // replace any runtime permission gate.
+    assert_eq!(
+        restricted.len(),
+        38,
+        "23 legacy restricted rows plus fifteen Next-only management commands"
+    );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
-            for permissions in [None, Some(0), Some(!row.required_permissions)] {
+            // game-mix alone accepts Administrator as an alternative, so its
+            // hostile complement must lack both staff bits to remain denied.
+            let missing_bits = if row.command == "game-mix" {
+                !(32 | 8)
+            } else {
+                !row.required_permissions
+            };
+            for permissions in [None, Some(0), Some(missing_bits)] {
                 // Discord delivered a real ApplicationCommand despite the picker
                 // defaults; bot permissions must not authorize the invoker.
                 let mut interaction = slash(row.command, permissions);
@@ -345,9 +361,14 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         // The slash helper builds member permissions via
         // Permissions::from_bits_truncate, so unknown high bits never reach
         // the audit path; pin the truncated decimal, not the raw !bits.
+        let missing_bits = if row.command == "game-mix" {
+            !(32 | 8)
+        } else {
+            !row.required_permissions
+        };
         assert_eq!(
             events[2]["actor_permissions"],
-            Permissions::from_bits_truncate(!row.required_permissions)
+            Permissions::from_bits_truncate(missing_bits)
                 .bits()
                 .to_string()
         );
@@ -358,11 +379,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 48);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 29);
+    assert_eq!(commands.len(), 45);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -404,8 +425,12 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("leaderboard", HandlerId::Leaderboard),
         ("help", HandlerId::Help),
         ("privacy", HandlerId::Privacy),
+        ("reopen", HandlerId::Reopen),
+        ("welcome-preview", HandlerId::WelcomePreview),
+        ("game-mix", HandlerId::GameMix),
         ("ban", HandlerId::Moderation(ModerationAction::Ban)),
         ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
+        ("tempban-list", HandlerId::TempbanList),
         ("kick", HandlerId::Moderation(ModerationAction::Kick)),
         ("timeout", HandlerId::Moderation(ModerationAction::Timeout)),
         ("warn", HandlerId::Moderation(ModerationAction::Warn)),
@@ -419,10 +444,15 @@ fn every_section1_row_routes_to_its_registered_handler() {
             HandlerId::Moderation(ModerationAction::Lockdown),
         ),
         ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
+        ("purge-preview", HandlerId::PurgePreview),
+        ("channel-inspect", HandlerId::ChannelInspect),
         ("attendance", HandlerId::ScorecardAttendance),
         ("command", HandlerId::AutomationAdmin),
         ("command-remove", HandlerId::AutomationAdmin),
         ("command-list", HandlerId::AutomationAdmin),
+        ("command-inspect", HandlerId::AutomationAdmin),
+        ("command-disable", HandlerId::AutomationAdmin),
+        ("command-enable", HandlerId::AutomationAdmin),
         ("schedule", HandlerId::AutomationAdmin),
         ("schedule-remove", HandlerId::AutomationAdmin),
         ("schedule-list", HandlerId::AutomationAdmin),
@@ -432,11 +462,19 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("rsvp-attendance", HandlerId::RsvpAttendance),
         ("lfg", HandlerId::Lfg),
         ("lfg-close", HandlerId::LfgClose),
+        ("lfg-edit", HandlerId::LfgEdit),
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
+        ("feed-pause", HandlerId::FeedPause),
+        ("feed-resume", HandlerId::FeedResume),
         ("feed-list", HandlerId::FeedList),
+        ("feed-inspect", HandlerId::FeedInspect),
     ];
-    assert_eq!(cases.len(), 29, "all 29 handler-owned builtins covered");
+    assert_eq!(
+        cases.len(),
+        42,
+        "all handlers except giveaway and lfg-list covered (each has its own test)"
+    );
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
@@ -452,6 +490,43 @@ fn every_section1_row_routes_to_its_registered_handler() {
             "/{name} has its registered stub",
         );
     }
+    // Next-only `/lfg-list`: name-based so the baseline still compiles before
+    // the production `HandlerId::LfgList` arm lands. Resolves the handler from
+    // the publish registry when available instead of naming the enum.
+    let defs = router.publish_set(&[]).expect("publish set assembles");
+    let lfg_list = defs
+        .iter()
+        .find(|d| d.name == "lfg-list")
+        .expect("lfg-list is published after lfg-close and lfg-edit");
+    assert_eq!(
+        lfg_list.description.as_str(),
+        "List open game posts in this channel"
+    );
+    assert!(
+        matches!(
+            slash_outcome(&router, "lfg-list"),
+            SlashOutcome::Handled { .. }
+        ),
+        "/lfg-list must route to its handler"
+    );
+}
+
+/// The Next-only `/giveaway` timed entry routes to its registered handler.
+/// No direct `HandlerId::Giveaway` reference: the variant does not exist at
+/// baseline, so the pin matches the handler's `Debug` name. This compiles on
+/// the pre-slice router and fails behaviorally (`Unknown`) until the
+/// giveaway slice registers its handler.
+#[test]
+fn giveaway_routes_to_its_registered_handler() {
+    let router = InteractionRouter::new(all_on());
+    let SlashOutcome::Handled { handler } = slash_outcome(&router, "giveaway") else {
+        panic!("/giveaway must route to its handler");
+    };
+    assert_eq!(
+        format!("{handler:?}"),
+        "Giveaway",
+        "/giveaway routes to its handler"
+    );
 }
 
 #[test]
@@ -1057,7 +1132,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 30 names, no partial view.
+    // endpoint: one request, all 46 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1068,8 +1143,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        30,
-        "4 core + 16 slice-2 + 9 moderation + 1 custom"
+        46,
+        "7 core + 25 feature + 9 moderation mutations + 4 reads + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1101,26 +1176,51 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 30, "no partial view");
+    assert_eq!(names.len(), 46, "no partial view");
+    assert_eq!(
+        names.iter().filter(|name| **name == "tempban-list").count(),
+        1
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == "moderation-recent")
+            .count(),
+        1
+    );
     for expected in [
         "rank",
         "leaderboard",
         "help",
         "privacy",
+        "reopen",
+        "welcome-preview",
+        "game-mix",
         "attendance",
         "command",
+        "command-inspect",
+        "command-disable",
+        "command-enable",
         "schedule-list",
         "sticky-remove",
+        "giveaway",
         "rsvp",
         "rsvp-attendance",
         "lfg",
         "lfg-close",
+        "lfg-edit",
+        "lfg-list",
         "feed-add",
         "feed-list",
+        "feed-pause",
+        "feed-resume",
+        "feed-inspect",
         "ban",
         "purge",
         "lockdown",
         "unlock",
+        "purge-preview",
+        "channel-inspect",
         "faq",
     ] {
         assert!(names.contains(&expected), "{expected} published");

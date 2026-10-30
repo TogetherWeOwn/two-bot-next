@@ -82,6 +82,110 @@ async fn migrated_schema_requires_every_member_column_and_detects_a_new_migratio
 }
 
 #[tokio::test]
+async fn holder_id_only_fixture_refuses_both_modes_without_data_or_audit_changes() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO admin_api_tokens
+         (token_id, secret_hash, scopes, guild_ids, issued_at, expires_at, holder_id, holder_kind)
+         VALUES ('adm_0000000000000001', repeat('0', 64), '{read}', ARRAY[1545644954272137297]::bigint[],
+                 '2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z', $1, 'human')",
+    )
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert!(schema_gaps(&mut conn).await.unwrap().is_empty());
+    drop(conn);
+    let counts = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    assert!(counts.iter().any(|count| count.rows > 0));
+    assert_eq!(audit_count(db.pool()).await, 0);
+    sqlx::query(
+        "INSERT INTO member_erasure_audit (actor, erased_at)
+         VALUES ('fixture-prior-receipt', '2026-10-01T00:00:00Z')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // No other identity alias or unsettled replay guard can mask holder_id.
+    sqlx::query(
+        "CREATE TABLE privacy_holder_tripwire (guild_id TEXT, holder_id TEXT, payload TEXT)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO privacy_holder_tripwire VALUES ($1, $2, 'must survive refusal')")
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert_eq!(
+        schema_gaps(&mut conn).await.unwrap(),
+        vec!["uncovered identity: privacy_holder_tripwire.holder_id".to_owned()]
+    );
+    drop(conn);
+    let mut before = Vec::new();
+    for table in plan()
+        .tables
+        .iter()
+        .map(|entry| entry.table.as_str())
+        .chain([
+            "privacy_holder_tripwire",
+            "admin_api_tokens",
+            "member_erasure_audit",
+        ])
+    {
+        before.push((table.to_owned(), snapshot(db.pool(), table).await));
+    }
+    for mode in [ErasureMode::DryRun, ErasureMode::Execute { actor: ACTOR }] {
+        let error = erase_member(db.pool(), GUILD, USER, mode)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, sqlx::Error::InvalidArgument(ref message)
+                if message == "erasure schema coverage incomplete"),
+            "the holder-only schema gap must be the refusal reason: {error}"
+        );
+        for (table, rows) in &before {
+            assert_eq!(snapshot(db.pool(), table).await, *rows, "{table} changed");
+        }
+        assert_eq!(audit_count(db.pool()).await, 1);
+    }
+    sqlx::query("DROP TABLE privacy_holder_tripwire")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert!(schema_gaps(&mut conn).await.unwrap().is_empty());
+    drop(conn);
+    assert_eq!(
+        erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+            .await
+            .unwrap(),
+        counts
+    );
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR }
+        )
+        .await
+        .unwrap(),
+        counts
+    );
+    assert_eq!(snapshot(db.pool(), "admin_api_tokens").await.len(), 1);
+    assert_eq!(audit_count(db.pool()).await, 2);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
     let Some(db) = database().await else { return };
     seed(db.pool()).await;
@@ -460,6 +564,64 @@ async fn nested_inviter_session_keys_and_owned_children_are_included() {
     assert_eq!(snapshot(db.pool(), "events").await.len(), 3);
     assert_eq!(snapshot(db.pool(), "community_facts").await.len(), 3);
     assert_eq!(snapshot(db.pool(), "lfg_signups").await.len(), 3);
+    db.close().await.unwrap();
+}
+
+/// A recorded host check-in names the checked-in member in the audit row's
+/// `target_key` while the acting host stays the `actor_id`, so member
+/// erasure must match the target key too: erasing the checked-in member
+/// removes the row even though its actor (the host) differs.
+#[tokio::test]
+async fn checkin_audit_target_key_namesake_is_erased() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    // On-behalf host check-in of USER: actor OTHER, member USER in the
+    // target key, seeded through the same constructor the handler uses.
+    let audit = two_bot_core::RsvpAudit::for_checkin(
+        "checkin:erase-target",
+        GUILD,
+        OTHER,
+        "1546451670500642999:2026-09-30",
+        USER,
+        "2026-10-01T00:00:00.000Z",
+    );
+    assert!(
+        two_bot_core::write_audit(db.pool(), &audit).await.unwrap(),
+        "check-in audit row seeds"
+    );
+    let before = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    assert_eq!(
+        before
+            .iter()
+            .find(|row| row.table == "announcements_audit_log")
+            .unwrap()
+            .rows,
+        2
+    );
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR }
+        )
+        .await
+        .unwrap(),
+        before
+    );
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM announcements_audit_log WHERE guild_id = $1")
+            .bind(GUILD)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        [format!("{GUILD}:{OTHER}")],
+        "only the other member's row survives"
+    );
     db.close().await.unwrap();
 }
 
@@ -877,5 +1039,105 @@ async fn member_snowflake_idempotency_key_is_erased_from_audit_but_retained_for_
         ChannelClaim::Mismatch,
         "erasure must retain the member-key fence"
     );
+    db.close().await.unwrap();
+}
+
+/// Giveaway ids repeat across guilds, so the child predicates must scope on
+/// the child row's own guild: erasing USER in GUILD deletes the colliding
+/// A rows, the creator-owned rows, and the reroll round naming USER only in
+/// `reroll_kind`, while the same giveaway id in the other guild and
+/// unrelated members' rows survive. (Composite foreign keys bind every
+/// child row to a live `giveaways` parent, so parentless orphans are
+/// impossible; the `user_id` predicate branch still matches each entrant
+/// row directly.)
+#[tokio::test]
+async fn giveaway_erasure_is_guild_scoped_and_covers_reroll_kind() {
+    const OTHER_GUILD: &str = "1545644954272137298";
+    let Some(db) = database().await else { return };
+    sqlx::raw_sql(include_str!(
+        "fixtures/member_erasure_giveaway_collision.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+    assert_eq!(rows("giveaway_entries"), 2);
+    assert_eq!(rows("giveaway_draws"), 3);
+    assert_eq!(rows("giveaways"), 1);
+    assert!(
+        dry.iter()
+            .filter(|row| !row.table.starts_with("giveaway"))
+            .all(|row| row.rows == 0),
+        "only giveaway tables seed rows"
+    );
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap(),
+        dry
+    );
+    let entries: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT guild_id, giveaway_id, user_id FROM giveaway_entries
+         ORDER BY guild_id, giveaway_id, user_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        entries,
+        vec![
+            (GUILD.to_owned(), "gw-v".to_owned(), OTHER.to_owned()),
+            (
+                OTHER_GUILD.to_owned(),
+                "gw-collide".to_owned(),
+                USER.to_owned()
+            ),
+        ]
+    );
+    let draws: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT guild_id, giveaway_id, draw_no FROM giveaway_draws
+         ORDER BY guild_id, giveaway_id, draw_no",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        draws,
+        vec![
+            (GUILD.to_owned(), "gw-v".to_owned(), 0),
+            (OTHER_GUILD.to_owned(), "gw-collide".to_owned(), 0),
+        ]
+    );
+    let definitions: Vec<(String, String)> =
+        sqlx::query_as("SELECT guild_id, id FROM giveaways ORDER BY guild_id, id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        definitions,
+        vec![
+            (GUILD.to_owned(), "gw-collide".to_owned()),
+            (GUILD.to_owned(), "gw-reroll".to_owned()),
+            (GUILD.to_owned(), "gw-v".to_owned()),
+            (OTHER_GUILD.to_owned(), "gw-collide".to_owned()),
+        ]
+    );
+    assert!(
+        erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.rows == 0),
+        "a second run reports zero"
+    );
+    assert_eq!(audit_count(db.pool()).await, 1);
     db.close().await.unwrap();
 }

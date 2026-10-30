@@ -11,6 +11,7 @@
 // which the production workflow sets only when its `takeover` dispatch input
 // is true (B4 cutover execution). Production activation (GO) stays separate.
 import { isDirectInvocation } from "./is-direct-invocation.mjs";
+import { parseOwnershipResponse } from "./ownership-control-response.mjs";
 
 class ControlError extends Error {}
 
@@ -152,14 +153,23 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
       const reason = await refusalReason(response);
       throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`, response.status, reason);
     }
-    let state;
+    let raw;
     try {
-      state = await response.json();
+      raw = await response.json();
     } catch {
       throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
     }
-    if (!state || typeof state !== "object" || !state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
-      throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
+    const state = parseOwnershipResponse(raw);
+    if (!state) {
+      // A pinned read waits through propagation: a malformed 200 may be a
+      // transitional answer from a mid-deploy version, so it shares the
+      // mismatch retry budget. An unpinned read has no version to wait for
+      // and refuses at once with the fixed text. Takeover never retries
+      // either: its policy stays 5xx-only.
+      if (expectedDeploymentId !== undefined) {
+        throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
+      }
+      throw new ControlError("Invalid ownership control response");
     }
     return state;
   };
