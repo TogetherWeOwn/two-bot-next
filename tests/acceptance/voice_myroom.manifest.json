@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "purpose": "Protected test-only review correction for owned-room discovery: observed ACL privacy, context-free refusal diagnostics, fail-closed imports, rollback cleanup and existing custom-command compatibility",
-  "baseCommit": "74389d2845e762db8a502da9890f3f98a64f8f46",
+  "baseCommit": "8a467ef5ad72fac87561dc74f1818f3b9c3037bc",
   "originalFeatureBase": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
   "branch": "feat/myroom-owned-rooms",
   "protectedFiles": [
@@ -51,6 +51,37 @@
       "sha256": "15154d350c86314e46d9cd9529cadfc1e24109f1354d0b688e86df44b766b082",
       "tests": 11,
       "change": "Adds real signed receiver import, no-growth update, idempotent replay and 34-row refusal using only a guarded disposable database fixture."
+    },
+    {
+      "path": "crates/core/tests/automation_transfer_hostile.rs",
+      "sha256": "d42ec7930e5cd67ec7d7f32694f6bfa0d3c550fcb28a0ac3550a155cb2a9a24a",
+      "change": "Only oversized_entry_lists_fail_bounded changes: its budget follows 67 published definitions and independently requires 33 custom slots. Exact-bound, one-over, zero-budget and all hostile-input assertions remain."
+    }
+  ],
+  "protectedTestRegions": [
+    {
+      "path": "crates/core/src/automation_transfer.rs",
+      "function": "union_capacity_fails_the_whole_diff",
+      "cfgTestModuleLine": 395,
+      "startLine": 641,
+      "endLine": 706,
+      "sha256": "735a8954abcdec0a1274c7c0f0b78d57bd124b3d4b22a0014542e2c272d54a60",
+      "baselineStartLine": 641,
+      "baselineEndLine": 663,
+      "unchangedOutsideRegionSha256": "4f9b8e1c6cb1b3ba95c33ce38d4b74418dea1f1401c7fcc714e2294170bb8c07",
+      "change": "Pins legal 33-row creation, same-content convergence and no-growth updates, then whole-diff refusal of a genuine 34-row catalog and a union of 33 updates plus one new row."
+    },
+    {
+      "path": "crates/core/src/custom_commands.rs",
+      "function": "write_reservations_cover_the_maximal_publish_set_and_capacity",
+      "cfgTestModuleLine": 1135,
+      "startLine": 1419,
+      "endLine": 1480,
+      "sha256": "19bd0c344d3dfad0b0bafdde47ca5af738a7762b0fcaeb58f719a79d3e4be62c",
+      "baselineStartLine": 1419,
+      "baselineEndLine": 1468,
+      "unchangedOutsideRegionSha256": "5a26505e6fefa7b7c72ba26aaf08ca4578b9d5250c800587e9f61a8a735b02e9",
+      "change": "Preserves fresh assistant-name refusal and reservation coverage; independently proves 67+33=100, admission of the 33rd row and same-name maintenance, and true 34-row admission/publication overflow."
     }
   ],
   "commands": {
@@ -61,12 +92,43 @@
     "customCatalog": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_toggle_acceptance -- --nocapture --test-threads=1",
     "gateway": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot command_runtime_tests::custom_command_toggle_acceptance:: -- --nocapture --test-threads=1",
     "internalImport": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot internal_action_http::tests::automations::import_33_row_backup_updates_and_replays_but_34_rows_never_write -- --nocapture --test-threads=1",
+    "capacityPlanner": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib automation_transfer::tests::union_capacity_fails_the_whole_diff -- --nocapture",
+    "capacityReservation": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib custom_commands::tests::write_reservations_cover_the_maximal_publish_set_and_capacity -- --nocapture",
+    "capacityHostile": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test automation_transfer_hostile -- --nocapture",
+    "capacityCoreSweep": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib --test automation_transfer_hostile -- --nocapture",
     "referencePrerequisite": "python3 scripts/generate_command_reference.py --controller",
     "format": "cargo fmt --all -- --check"
   },
   "expectedBaseline": {
     "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
-    "observedRustResults": null,
+    "observedRustResults": {
+      "head": "be41a183baf7104579b785987413d79bababa632",
+      "runUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41065128592",
+      "runConclusion": "cancelled",
+      "rustJob": {
+        "url": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41065128592/job/124094298352",
+        "passed": 1234,
+        "failed": 6,
+        "ignored": 0
+      },
+      "nextestJob": {
+        "url": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41065128592/job/124094298586",
+        "testsRun": 5641,
+        "passed": 5634,
+        "failed": 7,
+        "skipped": 496
+      },
+      "observedFailures": [
+        "myroom_command_roles_forged_confirm_revalidates_before_any_write",
+        "myroom_command_roles_preview_and_forged_confirm_refuse_in_planning",
+        "myroom_command_roles_preview_refuses_without_write",
+        "myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitted_accounting",
+        "myroom_partial_public_delete_refusal_reports_observed_open_acl_without_retiring_retry",
+        "myroom_unknown_overwrites_are_unavailable_through_facade_and_handler",
+        "import_33_row_backup_updates_and_replays_but_34_rows_never_write"
+      ],
+      "note": "The selected jobs emitted these observed summaries and assertion failures before implementation fixes. The run-level cancellation does not turn those failures into compile errors or GREEN. This is baseline evidence, not verification of the source-fix or corrected-test head."
+    },
     "expectedRed": [
       "myroom_partial_public_delete_refusal_reports_observed_open_acl_without_retiring_retry",
       "myroom_unknown_overwrites_are_unavailable_through_facade_and_handler",
@@ -92,10 +154,10 @@
       "voice_on_retains_myroom_precedence_and_collision_safety",
       "toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice_sink"
     ],
-    "note": "These are expected assertion/control classifications, not observed compile or test results. Cargo admission refused exit 75 before compilation; neither RED nor GREEN has been observed."
+    "note": "The expected lists are historical predictions, not extra observed failures. Observed predecessor baseline summaries are recorded separately above: six Rust-job and seven nextest assertion failures. No source-fix-head or corrected-test-head GREEN is established by that evidence."
   },
   "boundaries": {
-    "source": "No production source, configuration, dependency, workflow, budget, generated pin or documentation changes; no main sync. All edits are test files or this test manifest on the exact feature base.",
+    "source": "Relative to exact source-fix head 8a467ef5ad72fac87561dc74f1818f3b9c3037bc, changes are confined to the two named cfg(test) functions, one hostile-parser test function and this manifest. All bytes outside those function regions, including production implementation and unrelated tests, are byte-identical. The original eight protected files remain byte-identical. No main sync, new hook, workflow, dependency, budget, generated pin, configuration or documentation change.",
     "externalServices": "No database, live Discord, staging or production mutation during authoring. Database-backed cases require the repository-guarded disposable TestDatabase service; HTTP effects use existing local doubles.",
     "runtime": "Real parsing, role/access gates, actor command dispatch, service/transaction/import/replay paths and response rendering; command-only actors exclude unrelated timer maintenance.",
     "readOnly": "Current owner versus original creator, one ephemeral reply, poisoned room-store reads, durable and runtime room/privacy snapshots, queue, create claims, overwrite writes and effect traces remain pinned."
@@ -132,35 +194,37 @@
       }
     ],
     "focusedRustNotRun": "Generated-reference prerequisite refused exit 75; the focused Rust command was not started.",
-    "previousHeadNativeCompile": {
-      "head": "74389d2845e762db8a502da9890f3f98a64f8f46",
-      "jobUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41061347830/job/124081722265",
-      "error": "E0308: expected &str, found String",
-      "location": "crates/bot/src/voice_myroom_acceptance_tests.rs:768:39",
-      "reviewedFailedJobs": 7,
-      "distinctCompilerErrors": 1,
-      "classification": "Real test-source compile error, not an assertion RED or a flake. Every compiler diagnostic in the reviewed failed-job logs identifies this same call."
+    "preImplementationBaseline": "expectedBaseline.observedRustResults",
+    "sourceFixHeadCI": {
+      "head": "8a467ef5ad72fac87561dc74f1818f3b9c3037bc",
+      "runUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41068436880",
+      "stateAtSnapshot": "in_progress",
+      "completedFailedJobs": [
+        "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41068436880/job/124106701874",
+        "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41068436880/job/124106702673"
+      ],
+      "limit": "The provider CLI refused logs while the run was in progress. Failed test names, counts, additional compiler/oracle issues and the final conclusion were not observed; no wait, rerun or polling was performed."
     },
-    "rustCompiled": false,
-    "observedRed": false,
-    "observedGreen": false
+    "correctedHeadRustCompiled": false,
+    "baselineAssertionRedObserved": true,
+    "correctedHeadGreenObserved": false
   },
   "limitations": [
-    "No corrected-head Rust compile or assertion result is observed. Local command-reference generation refused admission with exit 75, so focused Rust tests were not started. The predecessor's native jobs failed compilation with E0308 at the corrected call; that failure is not assertion RED. No passing controls are claimed.",
+    "The earlier be41a183b baseline is now observed to compile and record assertion RED plus passing controls, as detailed above. No post-oracle-correction compile or GREEN is observed: local reference generation refused admission with exit 75 and the core targets were not started. Source-fix head 8a467ef5a had two failed Rust jobs at its bounded CI snapshot, but logs and their failure causes were unavailable while that run remained in progress.",
     "The deterministic lifecycle case proves the actor-dispatch ordering boundary, not single-read-guard atomicity inside the synchronous lookup. The one-guard requirement remains in force for Builder implementation and independent review.",
     "The real VoiceResponder is exercised, but the RoomHttp completion clamp/wire adapter is not. Its loopback constructor is private to the Discord crate and no existing downstream seam is exported. No production hook was added; a bounded responder input makes the existing clamp an identity, but that is reasoning, not an observed transport traversal.",
     "Previous-image compatibility uses a frozen strict command validator and the runtime policy JSON shape, not a compiled previous image or production database."
   ],
   "handoff": [
-    "Keep the one existing feature PR; never merge this intentionally failing test-only delta by itself or open a companion test PR.",
+    "Keep the one existing feature PR. Do not land this test correction separately or open a companion test PR.",
     "Consume the immutable handoff commit and preserve the protected paths byte-for-byte; return oracle/compile corrections to the test author.",
     "Builder owns the source fixes, any author-coordinated older inline-test assumptions, required rollback documentation, exact-head green checks, independent review and auto-merge.",
-    "The cache refusal is not RED proof. Record actual baseline assertion/control results when compilation is admitted; this handoff does not waive any test, CI, review or shipping requirement."
+    "Native pre-implementation assertion RED and passing controls are recorded; local cache refusal is not additional RED proof. Verify corrected-head GREEN when compilation is admitted. This handoff does not waive any test, CI, review or shipping requirement."
   ],
   "revision": {
-    "version": 4,
-    "supersedes": "74389d2845e762db8a502da9890f3f98a64f8f46",
-    "baseCommit": "74389d2845e762db8a502da9890f3f98a64f8f46",
-    "reason": "Compile-only correction: borrow the String returned by response_text when calling complete_private_rows(&text, &ids), whose parameter is &str. The only Rust edit is the added borrow at line 768; every assertion and all other protected test files are byte-identical to the predecessor. All round-4 contracts, limitations and no-companion-PR requirements remain unchanged."
+    "version": 5,
+    "supersedes": "be41a183baf7104579b785987413d79bababa632",
+    "baseCommit": "8a467ef5ad72fac87561dc74f1818f3b9c3037bc",
+    "reason": "Author-owned correction of three stale 32-row capacity assumptions: only 67 definitions publish while the assistant name remains reserved. Pins 33 legal rows and genuine 34-row whole-diff/admission/publication overflow, retaining no-growth, hostile-input, fresh-name and all prior safety controls. Two source files change solely inside the exact cfg(test) regions recorded above; every production byte and the original eight protected files remain byte-identical to the source-fix base."
   }
 }

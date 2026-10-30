@@ -1437,10 +1437,9 @@ mod tests {
         let reserved = reserved_command_names();
         let definitions = router.publish_set(&[]).unwrap();
         let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
-        // `templateassistant` is unpublished until its slice lands, but the name
-        // stays squatted: reservations cover the publish set plus exactly that
-        // one held name (which keeps holding its guild slot in the capacity
-        // math below, so the slot count does not churn when it republishes).
+        // `templateassistant` is unpublished until its slice lands. Its name
+        // stays reserved, but it consumes no publication slot: 67 published
+        // definitions leave room for all 33 legal custom commands.
         assert!(published.is_subset(&reserved));
         assert_eq!(reserved.len(), published.len() + 1);
         assert!(reserved.contains("templateassistant"));
@@ -1449,7 +1448,10 @@ mod tests {
             validate_put_input(&put_input("templateassistant"), &reserved),
             Err(CommandError::ReservedName("templateassistant".to_owned()))
         );
-        let capacity = max_custom_commands(reserved.len());
+        assert_eq!(published.len(), 67);
+        assert_eq!(published_builtin_count(), 67);
+        let capacity = 33;
+        assert_eq!(max_custom_commands(published.len()), capacity);
         let custom: Vec<_> = (0..capacity)
             .map(|index| CustomCommand {
                 name: format!("custom-{index}"),
@@ -1457,14 +1459,24 @@ mod tests {
                 enabled: true,
             })
             .collect();
+        assert_eq!(router.publish_set(&custom).unwrap().len(), 100);
+        assert_eq!(check_capacity(32, true, published.len()), Ok(()));
+        assert_eq!(check_capacity(33, false, published.len()), Ok(()));
         assert_eq!(
-            router.publish_set(&custom).unwrap().len(),
-            published.len() + capacity
+            check_capacity(33, true, published.len()),
+            Err(CommandError::OverCapacity(33))
         );
-        assert_eq!(
-            check_capacity(capacity, true, reserved.len()),
-            Err(CommandError::OverCapacity(capacity))
-        );
+        let mut overflowing = custom;
+        overflowing.push(CustomCommand {
+            name: "custom-overflow".to_owned(),
+            description: "One too many".to_owned(),
+            enabled: true,
+        });
+        assert_eq!(overflowing.len(), 34);
+        assert!(matches!(
+            router.publish_set(&overflowing),
+            Err(crate::commands::RegistryError::TotalLimit(101))
+        ));
     }
 
     #[test]

@@ -641,8 +641,13 @@ mod tests {
     #[test]
     fn union_capacity_fails_the_whole_diff() {
         let builtins = builtins();
-        let max = max_custom_commands(builtins.len());
-        let desired: Vec<PutCommandInput> = (0..=max)
+        // 67 published definitions leave 33 slots. The held assistant name
+        // remains reserved, but it must not reduce a legal catalog to 32.
+        let max = 33;
+        assert_eq!(crate::custom_commands::published_builtin_count(), 67);
+        assert_eq!(max_custom_commands(67), max);
+        assert_eq!(max_import_entries(), max);
+        let desired: Vec<PutCommandInput> = (0..max)
             .map(|i| PutCommandInput {
                 name: format!("fresh-{i}"),
                 description: "Fresh".to_owned(),
@@ -650,15 +655,53 @@ mod tests {
                 text_trigger: None,
             })
             .collect();
-        let parsed = ParsedImport {
+        let mut parsed = ParsedImport {
             entries: desired,
             translation_conflicts: Vec::new(),
             invalid_entries: 0,
             overwrite: true,
         };
+        let legal = diff_import(&[], &parsed, &builtins, true).expect("all 33 rows fit");
+        assert_eq!(legal.to_create.len(), 33);
+        assert!(legal.to_update.is_empty());
+        assert!(legal.rejected.is_empty());
+        let existing: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|input| {
+                let mut row = stored(&input.name, &input.template, input.text_trigger.as_deref());
+                row.description = input.description.clone();
+                row
+            })
+            .collect();
+        let same = diff_import(&existing, &parsed, &builtins, true).expect("no-growth convergence");
+        assert_eq!(same.unchanged.len(), 33);
+        assert!(same.to_create.is_empty());
+        assert!(same.to_update.is_empty());
+        assert!(same.rejected.is_empty());
+        for input in &mut parsed.entries {
+            input.template = "updated".to_owned();
+        }
+        let updates =
+            diff_import(&existing, &parsed, &builtins, true).expect("33 no-growth updates");
+        assert_eq!(updates.to_update.len(), 33);
+        assert!(updates.to_create.is_empty());
+        assert!(updates.rejected.is_empty());
+        parsed.entries.push(PutCommandInput {
+            name: "fresh-overflow".to_owned(),
+            description: "One too many".to_owned(),
+            template: "t".to_owned(),
+            text_trigger: None,
+        });
+        assert_eq!(parsed.entries.len(), 34);
         assert_eq!(
             diff_import(&[], &parsed, &builtins, true),
-            Err(CommandError::OverCapacity(max))
+            Err(CommandError::OverCapacity(33))
+        );
+        assert_eq!(
+            diff_import(&existing, &parsed, &builtins, true),
+            Err(CommandError::OverCapacity(33)),
+            "one new row refuses the whole diff, including all 33 updates"
         );
     }
 }
