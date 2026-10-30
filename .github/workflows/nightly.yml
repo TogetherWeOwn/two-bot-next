@@ -139,19 +139,16 @@ jobs:
       - name: Job-container prerequisites (job-private loopback forward)
         run: |
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
-          # Keep the package lists off the job-container overlay.
-          rm -rf /var/lib/apt/lists/*
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for _ in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
       - name: Guarded fixture routing and doc references (offline)
         run: |
-          # The partition acceptance suite parses the workflow contract.
-          python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/pyyaml" 'PyYAML==6.0.3'
-          PYTHONPATH="$RUNNER_TEMP/pyyaml" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+          # The partition acceptance suite parses this workflow contract; it
+          # runs in the `check` job, which already provides PyYAML.
           test -f scripts/ci/test_nightly_partition_acceptance.py
-          PYTHONPATH="$RUNNER_TEMP/pyyaml" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_nightly_partition_acceptance.py' -v
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
