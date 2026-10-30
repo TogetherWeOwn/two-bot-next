@@ -64,7 +64,11 @@ FUZZ_BUILD = "cargo +nightly-2026-10-01 fuzz build"
 
 _RUN_RE = re.compile(r"^(?P<prefix>[ ]*(?:-[ ]+)?)run:[ ]*(?P<value>.*)$")
 _BLOCK_SCALAR_RE = re.compile(r"^[|>][+-]?[0-9]*$")
-_SKIP_RE = re.compile(r"--skip(?:\s+|=)[\"']?[A-Za-z0-9_-]+")
+# A quoted skip value must be consumed with its closing quote: stripping only
+# the opening quote leaves an unbalanced segment, which fails `shlex.split` and
+# would hide a genuine `--ignored` run behind the compile-only fail-closed path.
+_SKIP_RE = re.compile(
+    r"--skip(?:\s+|=)(?:\"[^\"]*\"|'[^']*'|[A-Za-z0-9_-]+)")
 _TEST_ARG_RE = re.compile(r"--test(?:\s+|=)[\"']?([A-Za-z0-9_-]+)")
 _BLANKET_RE = re.compile(r"--test(?:\s+|=)[\"']?\*")
 _LOOP_RE = re.compile(
@@ -249,42 +253,84 @@ def executable_block_text(body):
     return "\n".join(kept)
 
 
-def _compile_only(segment):
-    # Cargo flags end at `--`; libtest filters and comments must not suppress a run.
+def _cargo_flags(segment):
+    """Cargo argument words for a segment, or ``None`` when it cannot be parsed.
+
+    Cargo flags end at the libtest separator ``--``; libtest filters after it
+    are not Cargo flags. Wrappers such as ``env --`` put their own ``--`` ahead
+    of the invocation, so the split starts at the ``cargo``/``llvm-cov`` token
+    instead of at the first ``--`` in the line.
+    """
     try:
         words = shlex.split(segment)
     except ValueError:
-        return True  # An unparseable command cannot prove execution.
-    cargo_words = words[:words.index("--")] if "--" in words else words
-    return "--no-run" in cargo_words
+        return None
+    for index, word in enumerate(words):
+        if word.rsplit("/", 1)[-1] in ("cargo", "llvm-cov"):
+            tail = words[index:]
+            break
+    else:
+        tail = words
+    return tail[:tail.index("--")] if "--" in tail else tail
+
+
+def _compile_only(segment):
+    # An unparseable command cannot prove execution either.
+    flags = _cargo_flags(segment)
+    return flags is None or "--no-run" in flags
 
 
 def routed_targets(*workflow_texts):
     """Return (executably routed target names, executable texts per workflow)."""
-    routed = set()
+    routed, _built, executable_texts = _scan_targets(*workflow_texts)
+    return routed, executable_texts
+
+
+def built_targets(*workflow_texts):
+    """Return ``--test`` targets a Cargo ``--no-run`` build names.
+
+    A build is ownership for an ordinary target but never execution credit for
+    an ``#[ignore]``d one, which only an executed ``--test`` run can own.
+    """
+    return _scan_targets(*workflow_texts)[1]
+
+
+def _scan_targets(*workflow_texts):
+    """Return (executed targets, build-only targets, executable texts)."""
+    executed = set()
+    built = set()
     executable_texts = []
     for text in workflow_texts:
         blocks = [executable_block_text(body) for body in extract_run_blocks(text)]
         executable_texts.append("\n".join(blocks))
         for block in blocks:
             for segment in block.splitlines():
-                if _compile_only(segment):
+                flags = _cargo_flags(segment)
+                if flags is None:
                     continue
+                destination = built if "--no-run" in flags else executed
                 for arg in _TEST_ARG_RE.finditer(segment):
                     if _INVOCATION_RE.search(segment[:arg.start()]):
-                        routed.add(arg.group(1))
+                        destination.add(arg.group(1))
             for loop in _LOOP_RE.finditer(block):
                 var = re.escape(loop.group("var"))
-                runs_loop_var = any(
-                    (arg := re.search(
+                loop_targets = set()
+                for line in loop.group("body").splitlines():
+                    flags = _cargo_flags(line)
+                    if flags is None:
+                        continue
+                    arg = re.search(
                         r"--test(?:\s+|=)[\"']?\$(?:\{%s\}|%s\b)" % (var, var),
-                        line)) and _INVOCATION_RE.search(line[:arg.start()])
-                    for line in loop.group("body").splitlines() if not _compile_only(line))
-                if runs_loop_var:
-                    routed.update(
-                        token.strip("\"'")
-                        for token in loop.group("list").split())
-    return routed, executable_texts
+                        line)
+                    if arg and _INVOCATION_RE.search(line[:arg.start()]):
+                        loop_targets.add("--no-run" in flags)
+                if True in loop_targets and False not in loop_targets:
+                    built.update(token.strip("\"'")
+                                 for token in loop.group("list").split())
+                elif False in loop_targets:
+                    executed.update(token.strip("\"'")
+                                    for token in loop.group("list").split())
+    return executed, built, executable_texts
 
 
 def _jobs(text):
@@ -526,6 +572,30 @@ def _contains_stmt(body, source):
     return any(_same_ast(node, expected) for node in body)
 
 
+def _is_process_exit(node):
+    """True for a call that ends the process instead of continuing dispatch.
+
+    ``sys.exit(0)``, ``exit(0)``, ``quit(0)`` and ``os._exit(0)`` all terminate
+    the runner as surely as ``return``/``raise``; a successful status is not
+    live routing. Recognition is by callee shape only, so the wrapped and
+    conditional spellings match the same node kinds.
+    """
+    if not isinstance(node, (ast.Call,)):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return (func.attr == "_exit" and
+                isinstance(func.value, ast.Name) and func.value.id == "os") or \
+               (func.attr == "exit" and
+                isinstance(func.value, ast.Name) and func.value.id == "sys")
+    return isinstance(func, ast.Name) and func.id in ("exit", "quit")
+
+
+def _is_exit_node(node):
+    return (isinstance(node, (ast.Return, ast.Raise)) or
+            (isinstance(node, ast.Expr) and _is_process_exit(node.value)))
+
+
 def _has_unrecognized_exit(body, allowed=()):
     """Fail closed on exits nested in any unrecognized statement.
 
@@ -535,7 +605,7 @@ def _has_unrecognized_exit(body, allowed=()):
     """
     allowed_nodes = [_stmt(source) for source in allowed]
     return any(
-        any(isinstance(child, (ast.Return, ast.Raise)) for child in ast.walk(node))
+        any(_is_exit_node(child) for child in ast.walk(node))
         for node in body
         if not any(_same_ast(node, accepted) for accepted in allowed_nodes)
     )
@@ -724,7 +794,7 @@ def check(root=ROOT):
         nightly_yml = (root / ".github/workflows/nightly.yml").read_text()
     except OSError as exc:
         return [f"workflows unreadable: {exc}"]
-    routed, executable_texts = routed_targets(check_yml, nightly_yml)
+    routed, built, executable_texts = _scan_targets(check_yml, nightly_yml)
     # Lane-presence markers must be executable `run:` text, not a mention
     # elsewhere in the workflow YAML (comment, step/job name, env value,
     # echo/printf print). Reuse the same executable texts the routing
@@ -747,7 +817,10 @@ def check(root=ROOT):
             continue
         if name in routed:
             continue
-        if not has_ignored and (blanket_routed or discovery):
+        if not has_ignored and (name in built or blanket_routed or discovery):
+            # An ordinary target is owned by a `--no-run` build too; an
+            # `#[ignore]`d one is owned only by an executed run, so a build
+            # must not rescue it.
             continue
         if has_ignored and owners:
             try:

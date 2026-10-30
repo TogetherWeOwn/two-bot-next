@@ -254,15 +254,26 @@ jobs:
             echo "::warning::sccache unavailable; compiling without cache. Compiler and test failures remain fatal."
           fi
 
-      # Restore-only: the warm `check` entry in check.yml owns the registry
-      # write, so this step never saves. sccache is the only shared-cache
-      # writer left, and only on push to main or workflow_dispatch (R2 or
-      # GitHub cache; local disk everywhere else per the backend step above).
+      # Restore-only: the `rust-tests-unit-bin` worker in check.yml owns the
+      # write, so this step never saves. This lane compiles the same
+      # `--workspace --lib --bins` graph as that partition, so restoring its
+      # entry is the only hit that is actually produced: the former `check`
+      # key has no writer left (the lint job writes `lint`). sccache remains
+      # the only shared-cache writer, and only on push to main or
+      # workflow_dispatch (R2 or GitHub cache; local disk everywhere else per
+      # the backend step above).
       - name: Restore cargo registry cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        # The pinned action hashes RUST-prefixed environment into the restore
+        # prefix, and the producing worker compiles without a compiler
+        # wrapper. sccache is a caching passthrough that emits the same
+        # artifacts, so declaring it empty here matches the entry this step
+        # restores; the compile steps below still run wrapped.
+        env:
+          RUSTC_WRAPPER: ''
         with:
           prefix-key: ${{ runner.os }}-cargo
-          shared-key: check
+          shared-key: rust-tests-unit-bin
           save-if: false
 
       - name: Install pinned cargo-nextest
