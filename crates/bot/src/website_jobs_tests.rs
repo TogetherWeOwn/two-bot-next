@@ -1380,12 +1380,91 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn rank_diagnostic_capture_reproduces_collision_and_detects_same_case_leaks() {
+    use tracing::Instrument as _;
+
+    let capture = tracing_capture::global();
+    let case = "rank-diagnostic-control";
+    let sibling = "rank-diagnostic-control-sibling";
+    let probe_id = u64::MAX.to_string();
+    let probe_name = "rank-capture-private-role-<script>sentinel</script>";
+    let mine = async {
+        // Reproduce the old short-id oracle failure without any role data.
+        tracing::debug!(target: "sqlx::query", elapsed = "7.79999ms", "synthetic query timing");
+        tokio::task::yield_now().await;
+        tracing::warn!("Legend missing matches=0");
+    }
+    .instrument(tracing::info_span!("rank_diagnostic", capture_case = case));
+    let poison = async {
+        tracing::warn!(role_id = %probe_id, role_name = probe_name, "Legend missing matches=0; sibling role sentinel capture_case={case}");
+        tokio::task::yield_now().await;
+    }
+    .instrument(tracing::info_span!(
+        "rank_diagnostic",
+        capture_case = sibling
+    ));
+    tokio::join!(mine, poison);
+    tracing::warn!(role_name = probe_name, "unattributed role sentinel");
+
+    let logs = capture.text_for_case(Some(case));
+    assert!(
+        logs.contains("79999"),
+        "the old numeric probe collides with timing alone"
+    );
+    assert!(logs.contains("Legend missing matches=0"));
+    for private in [probe_id.as_str(), probe_name] {
+        assert!(
+            !logs.contains(private),
+            "sibling diagnostics must not contaminate this tick"
+        );
+        assert!(capture.text_for_case(Some(sibling)).contains(private));
+    }
+    assert!(capture
+        .text_for_case(Some("rank-diagnostic-absent"))
+        .is_empty());
+
+    // Positive privacy control: attribution must retain a leak from this tick,
+    // including a dependency target, not just the expected application warning.
+    async {
+        tokio::task::yield_now().await;
+        tracing::debug!(target: "synthetic_dependency", role_id = %probe_id, role_name = probe_name, "same-case role sentinel");
+    }
+    .instrument(tracing::info_span!("rank_diagnostic", capture_case = case))
+    .await;
+    let logs = capture.text_for_case(Some(case));
+    for private in [probe_id.as_str(), probe_name] {
+        assert!(
+            logs.contains(private),
+            "same-case leaks must remain detectable"
+        );
+    }
+
+    let multiline = "rank-diagnostic-multiline";
+    async {
+        tokio::task::yield_now().await;
+        tracing::debug!(target: "synthetic_dependency", "{} {}\ncontinued dependency diagnostic", probe_id, probe_name);
+    }
+    .instrument(tracing::info_span!("rank_diagnostic", capture_case = multiline))
+    .await;
+    let logs = capture.text_for_case(Some(multiline));
+    assert!(logs.contains("\ncontinued dependency diagnostic"));
+    for private in [probe_id.as_str(), probe_name] {
+        assert!(
+            logs.contains(private),
+            "multiline leaks must remain detectable"
+        );
+    }
+}
+
 /// A ladder missing the top rung refuses with `Configuration`, writes
 /// nothing, sends no Discord write, and names the failing rung by its fixed
-/// label. Uses the process-wide capture: a scoped capture can miss the tick's
-/// warn when sibling tests run on other threads.
+/// label. Attribute the global capture to the exercised tick, including its
+/// dependency diagnostics, without including fixture setup or sibling tests.
 #[tokio::test]
 async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
+    use tracing::Instrument as _;
+
     let capture = tracing_capture::global();
     let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
         assert!(
@@ -1406,10 +1485,10 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
         sqlx::query("INSERT INTO members (guild_id, member_id, joined_at, is_bot) VALUES ($1,$2,$3::timestamptz,FALSE)")
             .bind(guild).bind((9100 + index).to_string()).bind(start).execute(&pool).await.unwrap();
     }
-    // Distinctive fixture ids plus injection text: none may reach the log.
-    // Note: the probe id is a short numeric id so `snowflake()` parses it
-    // while the snowflake gate (only 17-20 digit literals) stays clean.
-    let probe_id = "79999";
+    // A full-width, parseable synthetic snowflake avoids the old five-digit
+    // probe's collision with ordinary dependency timings. Keep strict
+    // substring checks for both the complete id and the hostile role name.
+    let probe_id = u64::MAX.to_string();
     let probe_name = "ladder-probe-evil-<script>alert(1)</script>";
     let members = json!([member(1000, false, &["11"])]);
     let roles = json!({"roles": [
@@ -1428,11 +1507,11 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     )
     .await;
     let observation = Mutex::new(());
-    // Mark the capture point just before the tick: earlier text includes sqlx
-    // migration statements that mention rung-like words, so starting here
-    // proves the warning names the failing rung.
-    let start = capture.text().len();
-    let outcome = tick(Kind::Rank, &pool, &executor(&mock), guild, &observation).await;
+    let case = "rank-tick-missing-rung";
+    let outcome = tick(Kind::Rank, &pool, &executor(&mock), guild, &observation)
+        .instrument(tracing::info_span!("rank_diagnostic", capture_case = case))
+        .await;
+    let logs = capture.text_for_case(Some(case));
     assert_eq!(outcome, Err(ErrorClass::Configuration));
     for query in [
         "SELECT count(*) FROM rank_snapshots WHERE guild_id=$1",
@@ -1456,13 +1535,16 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
         .close()
         .await
         .expect("drop disposable test database");
-    let logs = capture.text().split_off(start);
     assert!(
         logs.contains("Legend missing matches=0"),
         "missing exact rung diagnostic in logs"
     );
-    for leaked in [probe_id, probe_name] {
-        assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
+    for leaked in [probe_id.as_str(), probe_name] {
+        let record = logs.lines().find(|line| line.contains(leaked));
+        assert!(
+            !logs.contains(leaked),
+            "logs leaked synthetic {leaked:?}: {record:?}"
+        );
     }
 }
 
