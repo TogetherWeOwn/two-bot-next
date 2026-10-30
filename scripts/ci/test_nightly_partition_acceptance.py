@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline acceptance contracts for the nightly partition runner and workflow."""
+"""Offline nightly acceptance; --real-cargo opts into the bounded-pool regression."""
 
 import ast
 from collections import Counter
@@ -206,7 +206,7 @@ def record(event):
         stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 record({"event": "command", "args": args})
-if not args or args[0] != "test":
+if not args or args[0] not in ("test", "build"):
     print("unexpected Cargo command: " + repr(args), file=sys.stderr)
     sys.exit(97)
 
@@ -217,15 +217,12 @@ if "--" in cargo:
 
 is_doc = "--doc" in cargo
 is_list = "--list" in harness
-is_compile = "--no-run" in cargo
+is_compile = args[0] == "build" or "--no-run" in cargo
 phase = "compile" if is_compile else "list" if is_list else "doc" if is_doc else "test"
 # Listing a test target compiles it too, even without a separate --no-run call.
 if fixture.get("fail_phase") == phase or fixture.get("fail_compile"):
     print("fixture failure in " + ("compile" if fixture.get("fail_compile") else phase), file=sys.stderr)
     sys.exit(23)
-if is_compile:
-    sys.exit(0)
-
 filters, skips = [], []
 index = 0
 while index < len(harness):
@@ -249,7 +246,7 @@ exact_filters = set(filters) if "--exact" in harness else None
 
 def selected(test, *, listing=False):
     name = test["name"]
-    if any(skip in name for skip in skips):
+    if any(name == skip if exact_filters is not None else skip in name for skip in skips):
         return False
     if filters and (name not in exact_filters if exact_filters is not None else not any(item in name for item in filters)):
         return False
@@ -257,13 +254,41 @@ def selected(test, *, listing=False):
         return False
     return listing or not test.get("ignored") or "--include-ignored" in harness or "--ignored" in harness
 
-targets = fixture["doctests"] if is_doc else list(fixture["targets"])
-selectors = {"--lib": {"lib"}, "--bins": {"bin"}, "--tests": {"lib", "bin", "integration"}, "--examples": {"example"}}
-chosen_kinds = set().union(*(kinds for flag, kinds in selectors.items() if flag in cargo))
-if chosen_kinds:
-    targets = [target for target in targets if target["kind"] in chosen_kinds]
-if not is_doc and not chosen_kinds and "--all-targets" not in cargo:
-    targets += fixture["doctests"]
+# Cargo's --tests selects every manifest test=true target, including examples.
+# Default examples have test=false: default `cargo test` compiles them normally
+# but --examples/--all-targets override that and build them with test harnesses.
+selectors = {"--lib": "lib", "--bins": "bin", "--examples": "example"}
+singular = {"--bin": "bin", "--test": "integration", "--example": "example"}
+explicit = any(flag in cargo for flag in (*selectors, *singular, "--tests", "--all-targets"))
+
+def manifest_test(target):
+    return target.get("test", target["kind"] != "example")
+
+def chosen(target):
+    if not explicit:
+        return target["kind"] in ("lib", "bin") if args[0] == "build" else manifest_test(target)
+    if "--all-targets" in cargo or "--tests" in cargo and manifest_test(target):
+        return True
+    if any(flag in cargo and target["kind"] == kind for flag, kind in selectors.items()):
+        return True
+    return any(flag in cargo and target["kind"] == kind and
+               cargo[cargo.index(flag) + 1] == target.get("name", target["id"].split(":")[-1])
+               for flag, kind in singular.items())
+
+targets = fixture["doctests"] if is_doc else [target for target in fixture["targets"] if chosen(target)]
+normal_examples = [] if is_doc or explicit or args[0] != "test" else [
+    target for target in fixture["targets"] if target["kind"] == "example" and not manifest_test(target)
+]
+for target in normal_examples + ([] if is_doc else targets):
+    harness_build = args[0] == "test" and target not in normal_examples
+    record({"event": "compile", "target": target["id"], "harness": harness_build})
+    if not harness_build and target.get("normal_compile_error"):
+        print(target["normal_compile_error"] + ": ordinary example build failed", file=sys.stderr)
+        sys.exit(101)
+if is_compile:
+    sys.exit(0)
+if not is_doc and not explicit:
+    targets = targets + fixture["doctests"]
 if fixture.get("reverse_inventory"):
     targets = list(reversed(targets))
 
@@ -317,11 +342,24 @@ def fixture():
                 ],
             },
             {"id": "alpha:bin", "kind": "bin", "tests": [{"name": "binary::smoke"}, {"name": "suite::shared"}]},
-            {"id": "beta:integration", "kind": "integration", "tests": [{"name": "integration::smoke"}, {"name": "suite::shared"}]},
-            {"id": "beta:example", "kind": "example", "tests": [{"name": "example::smoke"}]},
+            {"id": "beta:integration", "kind": "integration", "tests": [
+                {"name": "integration::smoke"}, {"name": "suite::shared"},
+                {"name": "property_no_operation_sequence_creates_a_cycle"},
+            ]},
+            {"id": "beta:example", "kind": "example", "test": True, "tests": [{"name": "example::smoke"}]},
         ],
         "doctests": [{"id": "alpha:doc", "kind": "doc", "tests": [{"name": "src/lib.rs - usage (line 12)"}]}],
     }
+
+
+def example_fixture():
+    data = fixture()
+    data["targets"] += [
+        {"id": "beta:normal-example", "kind": "example", "tests": [{"name": "ordinary_example::must_not_run"}]},
+        {"id": "beta:disabled-example", "kind": "example", "test": False,
+         "tests": [{"name": "disabled_example::must_not_run"}]},
+    ]
+    return data
 
 
 def large_fixture(*, size=None, width=256):
@@ -334,7 +372,6 @@ def large_fixture(*, size=None, width=256):
         "id": "alpha:lib", "kind": "lib",
         "tests": [{"name": f"batch::{index:05d}_" + "x" * width} for index in range(size)],
     }]
-    data["doctests"] = []
     return data
 
 
@@ -386,7 +423,8 @@ class CargoFixture(unittest.TestCase):
 
     def assert_complete(self, data, outputs, *, skips=()):
         expected = Counter((target["id"], test["name"]) for target in data["targets"] for test in target["tests"]
-                           if not any(skip in test["name"] for skip in skips))
+                           if target.get("test", target["kind"] != "example")
+                           and not any(skip in test["name"] for skip in skips))
         observed = Counter()
         for events in outputs.values():
             observed.update(self.executions(events))
@@ -402,6 +440,33 @@ class RunnerAcceptance(CargoFixture):
         for partition, events in outputs.items():
             self.assertTrue(self.executions(events), f"partition {partition} silently succeeded empty")
         self.assert_complete(data, outputs)
+
+    def test_default_examples_are_compiled_normally_without_becoming_tests(self):
+        data = example_fixture()
+        result, events = self.run_partition(data, 0, count=1)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        normal_builds = Counter(event["target"] for event in events
+                                if event["event"] == "compile" and not event["harness"])
+        for target in ("beta:normal-example", "beta:disabled-example"):
+            with self.subTest(target=target):
+                self.assertGreater(normal_builds[target], 0, "default example executable compilation was lost")
+                self.assertFalse(any(key[0] == target for key in self.executions(events)),
+                                 "ordinary examples must not be forced into --test execution")
+        self.assert_complete(data, {0: events})
+
+    def test_manifest_test_true_example_stays_eligible(self):
+        outputs = self.run_sweep(fixture())
+        self.assertEqual(sum(self.executions(events)[("beta:example", "example::smoke")]
+                             for events in outputs.values()), 1,
+                         "excluding ordinary examples must not lose manifest test=true example tests")
+
+    def test_normal_example_build_failure_is_not_hidden_by_test_harness(self):
+        data = example_fixture()
+        data["targets"][-2]["normal_compile_error"] = "E0580"
+        result, events = self.run_partition(data, 0, count=1)
+        self.assertNotEqual(result.returncode, 0, "--test hid an invalid ordinary example main signature")
+        self.assertIn("E0580", result.stdout + result.stderr)
+        self.assertFalse(any(key[0] == "beta:normal-example" for key in self.executions(events)))
 
     def test_partition_ownership_is_deterministic_across_order_and_process_hash_seed(self):
         data = fixture()
@@ -428,7 +493,8 @@ class RunnerAcceptance(CargoFixture):
                     args = event["args"]
                     cargo = args[:args.index("--")] if "--" in args else args
                     for flag in CARGO_FLAGS:
-                        self.assertIn(flag, cargo)
+                        if flag != "--no-fail-fast" or cargo[0] == "test":
+                            self.assertIn(flag, cargo)
                     self.assertFalse(set(cargo) & {"-p", "--package", "--exclude"}, "per-package invocations change the feature graph")
                 elif event["event"] == "batch":
                     args = event["args"]
@@ -453,6 +519,22 @@ class RunnerAcceptance(CargoFixture):
             for event in events:
                 if event["event"] == "batch" and not event["doc"]:
                     self.assertFalse(any(skip in name for skip in skips for name in event["filters"]))
+
+    def test_discovery_substring_skip_excludes_new_qualified_guarded_names(self):
+        data = fixture()
+        data["targets"][0]["tests"] += [
+            {"name": "channel_moderation_store::new_guarded_case", "ignored": True},
+            {"name": "wrapper::channel_moderation_store::new_guarded_case::later", "ignored": True},
+            {"name": "channel_moderation_store_like::ordinary_case"},
+            {"name": "channel_moderation_store_like::ordinary_case_extended"},
+        ]
+        outputs = self.run_sweep(data, extra=("--skip", "channel_moderation_store::"))
+        self.assert_complete(data, outputs, skips=("channel_moderation_store::",))
+        for events in outputs.values():
+            for event in events:
+                if event["event"] == "batch" and not event["doc"]:
+                    self.assertFalse(any("channel_moderation_store::" in name for name in event["filters"]),
+                                     "discovery must remove guarded substrings before --exact execution")
 
     def test_doctests_with_spaces_retain_their_original_selection_once(self):
         outputs = self.run_sweep(fixture())
@@ -551,6 +633,26 @@ class RunnerAcceptance(CargoFixture):
             self.assertNotEqual(result.returncode, 0, "a later successful batch masked the failure")
             self.assertIn("fixture test batch failed", result.stdout + result.stderr)
             self.assertGreater(sum(event["event"] == "batch" for event in events), 1)
+            outputs[partition] = events
+        self.assert_complete(data, outputs)
+
+    def test_doctests_run_once_even_after_an_ordinary_batch_failure(self):
+        data = large_fixture() | {
+            "fail_first_batch": True,
+            "failing_tests": ["src/lib.rs - usage (line 12)"],
+        }
+        outputs = {}
+        for partition in PARTITIONS:
+            result, events = self.run_partition(data, partition)
+            self.assertNotEqual(result.returncode, 0, "a successful later batch masked earlier failures")
+            ordinary_batches = [event for event in events if event["event"] == "batch" and not event["doc"]]
+            self.assertGreater(len(ordinary_batches), 1, "later ordinary batches must run after the failed batch")
+            doc_batches = [event for event in events if event["event"] == "batch" and event["doc"]]
+            self.assertEqual(len(doc_batches), 1 if partition == 0 else 0,
+                             "an ordinary failure must not suppress partition 0's doctest pass")
+            expected_docs = Counter({("alpha:doc", "src/lib.rs - usage (line 12)"): 1}) if partition == 0 else Counter()
+            self.assertEqual(self.executions(events, doc=True), expected_docs)
+            self.assertIn("fixture test batch failed", result.stdout + result.stderr)
             outputs[partition] = events
         self.assert_complete(data, outputs)
 
@@ -689,7 +791,7 @@ class WorkflowAcceptance(CargoFixture):
         self.assertEqual(postgres["env"], {"POSTGRES_USER": "agent_test", "POSTGRES_DB": "agent_test", "POSTGRES_HOST_AUTH_METHOD": "trust"})
         self.assertFalse(postgres.get("volumes"), "each matrix leg needs its own disposable database")
 
-    def test_workflow_broad_command_excludes_every_original_guarded_name(self):
+    def test_workflow_broad_command_preserves_the_complete_original_skip_contract(self):
         data = fixture()
         data["targets"][0]["tests"] += [
             {"name": prefix + name + suffix, "ignored": True}
@@ -703,6 +805,22 @@ class WorkflowAcceptance(CargoFixture):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             outputs[index] = events
         self.assert_complete(data, outputs, skips=ORIGINAL_SKIPS)
+        self.assertEqual(sum(self.executions(events)[("beta:integration", "property_no_operation_sequence_creates_a_cycle")]
+                             for events in outputs.values()), 1, "an ordinary property test must not be newly skipped")
+        for events in outputs.values():
+            discoveries = [event for event in events if event["event"] == "command" and "--list" in event["args"]]
+            self.assertTrue(discoveries, "the skip contract must be exercised by actual inventory commands")
+            for event in discoveries:
+                args = event["args"]
+                harness = iter(args[args.index("--") + 1:])
+                skips = []
+                for argument in harness:
+                    if argument == "--skip":
+                        skips.append(next(harness))
+                    elif argument.startswith("--skip="):
+                        skips.append(argument.split("=", 1)[1])
+                self.assertCountEqual(skips, ORIGINAL_SKIPS,
+                                      "broad discovery may neither add nor remove original skip filters")
         for key, expected in {
             "TWO_TEST_DATABASE_URL": "postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly",
             "MEMBER_TESTDB": "agent-testdb", "TEST_DATABASE_URL": "postgresql://agent_test@agent-testdb:5432/postgres",
@@ -889,5 +1007,79 @@ class WorkflowAcceptance(CargoFixture):
             self.assertTrue(failed, "missing acceptance file was silently accepted as zero tests")
 
 
+def real_cargo_suite():
+    """Explicit integration mode: every compilation uses the existing bounded pool."""
+    class RealCargoExamples(unittest.TestCase):
+        def test_original_default_example_selection_and_normal_build_errors(self):
+            wrapper = ROOT / "scripts/cargo_cache.py"
+            with tempfile.TemporaryDirectory(prefix="nightly-real-cargo-",
+                                             dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as directory:
+                temporary = Path(directory)
+                (temporary / "Cargo.toml").write_text(
+                    '[workspace]\n[package]\nname = "nightly-example-acceptance"\nversion = "0.0.0"\nedition = "2024"\n'
+                    '[lib]\npath = "lib.rs"\n'
+                    '[[example]]\nname = "ordinary"\npath = "ordinary.rs"\n'
+                    '[[example]]\nname = "eligible"\npath = "eligible.rs"\ntest = true\n')
+                (temporary / "Cargo.lock").write_text(
+                    'version = 4\n[[package]]\nname = "nightly-example-acceptance"\nversion = "0.0.0"\n')
+                (temporary / "rust-toolchain.toml").write_bytes((ROOT / "rust-toolchain.toml").read_bytes())
+                (temporary / "lib.rs").write_text('#[test]\nfn unit() {}\n')
+                ordinary = temporary / "ordinary.rs"
+                ordinary.write_text(
+                    'fn main() { panic!("ORDINARY_MAIN_MUST_NOT_RUN"); }\n'
+                    '#[test]\nfn ordinary_test() { panic!("ORDINARY_TEST_MUST_NOT_RUN"); }\n')
+                (temporary / "eligible.rs").write_text(
+                    'fn main() { panic!("ELIGIBLE_MAIN_MUST_NOT_RUN"); }\n'
+                    '#[test]\nfn eligible_test() { println!("ELIGIBLE_EXAMPLE_TEST_RAN"); }\n')
+                refused = temporary / "pool-refused"
+                cargo = temporary / "pooled-cargo"
+                cargo.write_text(
+                    f'#!{sys.executable}\nimport pathlib, subprocess, sys\n'
+                    f'result = subprocess.run([{sys.executable!r}, {str(wrapper)!r}, "run", "--", *sys.argv[1:]])\n'
+                    f'if result.returncode == 75: pathlib.Path({str(refused)!r}).touch()\n'
+                    'sys.exit(result.returncode)\n')
+                cargo.chmod(0o755)
+                arguments = ["test", *CARGO_FLAGS, "--manifest-path", "Cargo.toml", "--",
+                             "--include-ignored", "--test-threads=1", "--nocapture"]
+                original = [str(cargo), *arguments]
+                partitioned = [sys.executable, str(RUNNER), "--index", "0", "--count", "1", "--", *original]
+
+                def run(command):
+                    print("real-Cargo command:", shlex.join(command), flush=True)
+                    result = subprocess.run(command, cwd=temporary, env=os.environ.copy(),
+                                            text=True, capture_output=True, timeout=180)
+                    output = result.stdout + result.stderr
+                    print("real-Cargo exit:", result.returncode, flush=True)
+                    print(output, flush=True)
+                    # Refusal is an unverified real-Cargo result, never a skip,
+                    # a direct-Cargo fallback, or another admission attempt.
+                    if refused.exists():
+                        self.fail("bounded Cargo pool refused admission; no compilation claim:\n" + output)
+                    return result, output
+
+                baseline, output = run(original)
+                self.assertEqual(baseline.returncode, 0, output)
+                self.assertIn("ELIGIBLE_EXAMPLE_TEST_RAN", output)
+                self.assertNotIn("ORDINARY_TEST_MUST_NOT_RUN", output)
+                result, output = run(partitioned)
+                with self.subTest(example="valid default selection"):
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertEqual(output.count("ELIGIBLE_EXAMPLE_TEST_RAN"), 1, output)
+                    self.assertNotIn("ORDINARY_TEST_MUST_NOT_RUN", output)
+
+                ordinary.write_text('fn main(_argument: i32) {}\n')
+                baseline, output = run(original)
+                self.assertNotEqual(baseline.returncode, 0, "fixture must fail ordinary example compilation")
+                self.assertIn("E0580", output)
+                result, output = run(partitioned)
+                with self.subTest(example="invalid ordinary main signature"):
+                    self.assertNotEqual(result.returncode, 0, "test harness hid an ordinary example compile error")
+                    self.assertIn("E0580", output)
+
+    return unittest.defaultTestLoader.loadTestsFromTestCase(RealCargoExamples)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--real-cargo"]:
+        raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(real_cargo_suite()).wasSuccessful())
     unittest.main()
