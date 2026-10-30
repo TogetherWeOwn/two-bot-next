@@ -403,10 +403,10 @@ pub use raid::{
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
 };
 pub use router::{
-    ComponentHandler, ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter,
-    RouterGates, RouterRefusal, SlashContext, SlashOutcome, SurfaceFlags,
-    ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX,
-    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
+    live_gate_announcements_slash, ComponentHandler, ComponentOutcome, HandlerId,
+    InteractionHandler, InteractionRouter, RouterGates, RouterRefusal, SlashContext, SlashOutcome,
+    SurfaceFlags, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY,
+    LFG_PREFIX, MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
     SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX, TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
 };
 pub use rsvp::{
