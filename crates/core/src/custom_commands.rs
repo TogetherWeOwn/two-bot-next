@@ -214,6 +214,13 @@ pub struct PutCommandInput {
     pub text_trigger: Option<String>,
 }
 
+/// Management-only clone: both names are normalized and validated by the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneCommandInput {
+    pub source: String,
+    pub destination: String,
+}
+
 /// Custom-command validation refusal (legacy `validateCommandInput` throws +
 /// `CommandCapacityError`, as member-facing messages; `AutomationsDisabled`
 /// is the `enabled: false` handler refusal).

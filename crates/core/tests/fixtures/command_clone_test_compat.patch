@@ -1,0 +1,840 @@
+diff --git a/crates/bot/src/commands_cli.rs b/crates/bot/src/commands_cli.rs
+index 28bd0745140dcdf61ab3ee082c8e145ae8030211..e67de3075882ef676cb537424df65ef90c90c750 100644
+--- a/crates/bot/src/commands_cli.rs
++++ b/crates/bot/src/commands_cli.rs
+@@ -591,9 +591,9 @@ mod tests {
+         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
+         assert_eq!(
+             all_on.len(),
+-            // 45 all-gate builtins: 7 core + 1 scorecard + 12 automation
++            // 46 all-gate builtins: 7 core + 1 scorecard + 13 automation
+             // + 12 announcements + 9 moderation mutations + 4 private reads.
+-            45
++            46
+         );
+         assert!(
+             all_on.iter().any(|def| def.name == "reopen"),
+@@ -637,7 +637,7 @@ mod tests {
+         );
+         env.insert("TWO_VOICE".into(), "1".into());
+         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
+-        assert_eq!(with_voice.len(), 66);
++        assert_eq!(with_voice.len(), 67);
+         assert!(
+             with_voice.iter().any(|def| def.name == "tempban-list"),
+             "tempban-list survives the voice registry"
+diff --git a/crates/core/src/feature_commands.rs b/crates/core/src/feature_commands.rs
+index d907f9ed9986349fa6767fd1ecd1aec6e5997034..db8edd6bc5a85caa2df8674a51a83d83ce538c33 100644
+--- a/crates/core/src/feature_commands.rs
++++ b/crates/core/src/feature_commands.rs
+@@ -742,7 +742,7 @@ mod tests {
+
+     #[test]
+     fn slice2_names_match_legacy_in_order() {
+-        assert_eq!(automation_commands().len(), 12);
++        assert_eq!(automation_commands().len(), 13);
+         assert_eq!(
+             names(&feature_commands()),
+             [
+@@ -751,6 +751,7 @@ mod tests {
+                 "command-remove",
+                 "command-list",
+                 "command-inspect",
++                "command-clone",
+                 "command-disable",
+                 "command-enable",
+                 "schedule",
+@@ -778,8 +779,8 @@ mod tests {
+     #[test]
+     fn no_collision_with_leveling_core_or_within_slice() {
+         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
+-        // 7 core + 1 scorecard + 12 automation + 12 announcements.
+-        assert_eq!(merged.len(), 32);
++        // 7 core + 1 scorecard + 13 automation + 12 announcements.
++        assert_eq!(merged.len(), 33);
+         assert_eq!(
+             &names(&merged)[..8],
+             [
+@@ -814,6 +815,7 @@ mod tests {
+             "command-remove",
+             "command-list",
+             "command-inspect",
++            "command-clone",
+             "command-disable",
+             "command-enable",
+             "schedule",
+@@ -864,6 +866,8 @@ mod tests {
+             ("command-remove", 0, 32),
+             ("command-inspect", 0, 32),
+             ("command-inspect", 2, 500),
++            ("command-clone", 0, 32),
++            ("command-clone", 1, 32),
+             ("command-disable", 0, 32),
+             ("command-enable", 0, 32),
+             ("schedule", 0, 2000),
+@@ -1130,21 +1134,22 @@ mod tests {
+         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
+         assert_eq!(json[0]["options"][0]["max_length"], 128);
+         // Saved-response inspection publishes after `command-list`, the
+-        // pause/resume lifecycle immediately after inspection, and giveaway
+-        // after sticky-remove; all three shift the announcement slice later.
++        // clone immediately after inspection, then pause/resume, and giveaway
++        // after sticky-remove; none replaces an existing command.
+         assert_eq!(json[4]["name"], "command-inspect");
+         assert_eq!(json[4]["options"][2]["max_length"], 500);
+-        assert_eq!(json[5]["name"], "command-disable");
+-        assert_eq!(json[5]["default_member_permissions"], "32");
+-        assert_eq!(json[5]["options"].as_array().expect("options").len(), 1);
+-        assert_eq!(json[6]["name"], "command-enable");
++        assert_eq!(json[5]["name"], "command-clone");
++        assert_eq!(json[6]["name"], "command-disable");
+         assert_eq!(json[6]["default_member_permissions"], "32");
+         assert_eq!(json[6]["options"].as_array().expect("options").len(), 1);
+-        assert_eq!(json[12]["name"], "giveaway");
+-        assert_eq!(json[12]["default_member_permissions"], "32");
+-        assert_eq!(json[14]["name"], "rsvp-attendance");
+-        assert!(json[14].get("default_member_permissions").is_none());
+-        assert_eq!(json[14]["options"][0]["name"], "event-id");
++        assert_eq!(json[7]["name"], "command-enable");
++        assert_eq!(json[7]["default_member_permissions"], "32");
++        assert_eq!(json[7]["options"].as_array().expect("options").len(), 1);
++        assert_eq!(json[13]["name"], "giveaway");
++        assert_eq!(json[13]["default_member_permissions"], "32");
++        assert_eq!(json[15]["name"], "rsvp-attendance");
++        assert!(json[15].get("default_member_permissions").is_none());
++        assert_eq!(json[15]["options"][0]["name"], "event-id");
+     }
+
+     #[test]
+diff --git a/crates/core/src/help.rs b/crates/core/src/help.rs
+index e56d87674f29b3ea08263ebe3ae637e24acc292e..5ec2772d4f09527182a44b2d30d7a998a1867fc4 100644
+--- a/crates/core/src/help.rs
++++ b/crates/core/src/help.rs
+@@ -907,12 +907,12 @@ mod tests {
+                 "{token} appears exactly once"
+             );
+         }
+-        // 45 non-voice commands (7 core + 25 feature + 9 moderation + 4 reads),
+-        // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
++        // 46 non-voice commands (7 core + 26 feature + 9 moderation + 4 reads),
++        // including inspection, clone, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
+         // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 21 additional voice commands (voice
+         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
+         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
+-        assert!(text.contains("**Server commands** (66 live)"));
++        assert!(text.contains("**Server commands** (67 live)"));
+         assert!(
+             !text.contains("**Custom**"),
+             "every published name is grouped"
+@@ -1039,12 +1039,12 @@ mod tests {
+             .iter()
+             .flat_map(|g| g.commands.iter().copied())
+             .collect();
+-        // 45 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
++        // 46 non-voice names, including inspection, clone, reopen, welcome-preview, pause/resume,
+         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
+         // and moderation-recent, plus
+         // 21 additional voice names (voice `kick` shares the Kick group).
+         // `/templateassistant` stays out until its slice lands.
+-        assert_eq!(grouped.len(), 66);
++        assert_eq!(grouped.len(), 67);
+         for name in [
+             "rank",
+             "leaderboard",
+@@ -1058,6 +1058,7 @@ mod tests {
+             "command-disable",
+             "command-enable",
+             "command-inspect",
++            "command-clone",
+             "schedule-list",
+             "sticky-remove",
+             "rsvp",
+diff --git a/crates/core/src/moderation.rs b/crates/core/src/moderation.rs
+index 3ea3d4d4628b1684e3fba09aba67a24559018b24..e559bb98a987ce4b80a0ba97b63b101bf268a405 100644
+--- a/crates/core/src/moderation.rs
++++ b/crates/core/src/moderation.rs
+@@ -662,8 +662,8 @@ mod tests {
+     fn full_registry_merges_without_collision() {
+         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
+             .expect("slices 1-3 merge cleanly");
+-        // 7 core + 25 slice-2 + 9 moderation mutations + 4 private reads.
+-        assert_eq!(merged.len(), 45);
++        // 7 core + 26 slice-2 + 9 moderation mutations + 4 private reads.
++        assert_eq!(merged.len(), 46);
+         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
+         assert_eq!(
+             &names[..8],
+@@ -696,11 +696,11 @@ mod tests {
+             );
+         }
+         assert_eq!(
+-            &names[32..38],
++            &names[33..39],
+             ["ban", "tempban", "tempban-list", "kick", "timeout", "warn"]
+         );
+         assert_eq!(
+-            &names[38..],
++            &names[39..],
+             [
+                 "purge",
+                 "slowmode",
+diff --git a/crates/core/src/router.rs b/crates/core/src/router.rs
+index 7d4c25e0d256e70c06d841bcd9942a356af39d7e..980e6e3246ce43c827fdf1838dbff1c469abaf29 100644
+--- a/crates/core/src/router.rs
++++ b/crates/core/src/router.rs
+@@ -1042,6 +1042,7 @@ mod tests {
+             ("command-remove", HandlerId::AutomationAdmin),
+             ("command-list", HandlerId::AutomationAdmin),
+             ("command-inspect", HandlerId::AutomationAdmin),
++            ("command-clone", HandlerId::AutomationAdmin),
+             ("command-disable", HandlerId::AutomationAdmin),
+             ("command-enable", HandlerId::AutomationAdmin),
+             ("schedule", HandlerId::AutomationAdmin),
+@@ -1063,7 +1064,7 @@ mod tests {
+             ("feed-list", HandlerId::FeedList),
+             ("feed-inspect", HandlerId::FeedInspect),
+         ];
+-        assert_eq!(cases.len(), 45, "all 45 handler-owned builtins covered");
++        assert_eq!(cases.len(), 46, "all 46 handler-owned builtins covered");
+         for (name, handler) in cases {
+             assert_eq!(
+                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+@@ -1679,9 +1680,9 @@ mod tests {
+         }];
+         let set = r.publish_set(&custom).expect("full set assembles");
+         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
+-        // 7 core + 1 scorecard + 12 automation + 12 announcements + 9 moderation
+-        // + 4 reads + 1 custom = 46, in publish order, guild-only throughout.
+-        assert_eq!(set.len(), 46);
++        // 7 core + 1 scorecard + 13 automation + 12 announcements + 9 moderation
++        // + 4 reads + 1 custom = 47, in publish order, guild-only throughout.
++        assert_eq!(set.len(), 47);
+         assert_eq!(
+             &names[..8],
+             [
+@@ -1696,13 +1697,15 @@ mod tests {
+             ]
+         );
+         assert_eq!(names[11], "command-inspect");
+-        assert_eq!(&names[18..21], ["sticky-remove", "giveaway", "rsvp"]);
++        assert_eq!(names[12], "command-clone");
++        assert_eq!(&names[13..15], ["command-disable", "command-enable"]);
++        assert_eq!(&names[19..22], ["sticky-remove", "giveaway", "rsvp"]);
+         assert!(names.contains(&"rsvp-attendance"));
+         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
+-        assert_eq!(names[24], "lfg-edit");
+-        assert_eq!(names[25], "lfg-list");
++        assert_eq!(names[25], "lfg-edit");
++        assert_eq!(names[26], "lfg-list");
+         assert_eq!(
+-            &names[26..32],
++            &names[27..33],
+             [
+                 "feed-add",
+                 "feed-remove",
+@@ -1713,7 +1716,7 @@ mod tests {
+             ]
+         );
+         assert_eq!(
+-            &names[32..42],
++            &names[33..43],
+             [
+                 "ban",
+                 "tempban",
+@@ -1728,10 +1731,10 @@ mod tests {
+             ]
+         );
+         assert_eq!(
+-            &names[42..45],
++            &names[43..46],
+             ["purge-preview", "channel-inspect", "moderation-recent"]
+         );
+-        assert_eq!(names[45], "faq");
++        assert_eq!(names[46], "faq");
+         assert!(set.iter().all(|c| !c.dm_permission));
+     }
+
+@@ -1744,6 +1747,7 @@ mod tests {
+             "command-remove",
+             "command-list",
+             "command-inspect",
++            "command-clone",
+             "command-disable",
+             "command-enable",
+             "schedule",
+@@ -2049,7 +2053,7 @@ mod tests {
+     fn voice_set_publishes_after_moderation_only_while_gated() {
+         let off = published(all_on());
+         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
+-        assert_eq!(off.len(), 45);
++        assert_eq!(off.len(), 46);
+         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
+             assert!(
+                 !off_names.contains(name),
+@@ -2059,16 +2063,16 @@ mod tests {
+
+         let on = published(voice_on());
+         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
+-        // 45 builtins keep their order; the 21 voice names that survive
++        // 46 builtins keep their order; the 21 voice names that survive
+         // first-wins follow in voice order. `kick` is already moderation's.
+-        assert_eq!(on.len(), 66);
+-        assert_eq!(on_names[..45], off_names[..]);
++        assert_eq!(on.len(), 67);
++        assert_eq!(on_names[..46], off_names[..]);
+         let expected: Vec<_> = VOICE_NAMES
+             .iter()
+             .copied()
+             .filter(|name| *name != "kick")
+             .collect();
+-        assert_eq!(on_names[45..], expected[..]);
++        assert_eq!(on_names[46..], expected[..]);
+         assert!(!on_names.contains(&"templateassistant"));
+         assert!(on.iter().all(|c| !c.dm_permission));
+     }
+@@ -2129,13 +2133,13 @@ mod tests {
+                 "voice={voice} assistant={assistant}"
+             );
+         }
+-        // Both gates on is the full voice set without the assistant: 45
++        // Both gates on is the full voice set without the assistant: 46
+         // builtins plus the 21 surviving voice names.
+         let both = published(RouterGates {
+             voice_assistant: true,
+             ..voice_on()
+         });
+-        assert_eq!(both.len(), 66);
++        assert_eq!(both.len(), 67);
+     }
+
+     #[test]
+diff --git a/crates/core/src/rsvp.rs b/crates/core/src/rsvp.rs
+index 899f1f2c8ab1c9158c15ecee0fe05b48ba7ef8d8..b677cda449bdbf298b9c6469a77f8d32b04fc60d 100644
+--- a/crates/core/src/rsvp.rs
++++ b/crates/core/src/rsvp.rs
+@@ -1201,9 +1201,9 @@ mod tests {
+         // `rsvp-attendance`. First-wins merge must publish each exactly once.
+         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
+             .expect("slices merge cleanly");
+-        // 7 core + 25 feature commands, including pause/resume, lfg-edit and feed-inspect,
++        // 7 core + 26 feature commands, including clone, pause/resume, lfg-edit and feed-inspect,
+         // + 9 mutations + 4 reads: nothing deduped away.
+-        assert_eq!(merged.len(), 45);
++        assert_eq!(merged.len(), 46);
+         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
+         for name in [
+             "attendance",
+diff --git a/crates/core/tests/authz_matrix.rs b/crates/core/tests/authz_matrix.rs
+index 3a9c106b18ed71abaa4cfb5a4698e0d5a1d5c97e..4ebebb948958de489a96de70e6e7b243035ce8ca 100644
+--- a/crates/core/tests/authz_matrix.rs
++++ b/crates/core/tests/authz_matrix.rs
+@@ -146,8 +146,8 @@ fn role_x_route_matrix_matches_expected_status() {
+             checked += 1;
+         }
+     }
+-    // 45 routes x 10 roles: a silently emptied fixture must not pass.
+-    assert_eq!(checked, 450, "matrix size drifted");
++    // 46 routes x 10 roles: a silently emptied fixture must not pass.
++    assert_eq!(checked, 460, "matrix size drifted");
+ }
+
+ #[test]
+diff --git a/crates/core/tests/command_permissions.rs b/crates/core/tests/command_permissions.rs
+index 1b2c8c3adbe6a22908185d91d4265b9fb52c0a2a..543c440c1894b62e9c15d07875c3e44220bfb2bc 100644
+--- a/crates/core/tests/command_permissions.rs
++++ b/crates/core/tests/command_permissions.rs
+@@ -102,27 +102,27 @@ fn documented_legacy_rows_equal_parity_section1() {
+     // `/command-disable` and `/command-enable` (rows 40 and 41),
+     // `/welcome-preview` (42), `/game-mix` (43), feed pause/resume (44/45),
+     // `/tempban-list` saved expiry inspection (46), and the staff ledger
+-    // read `/moderation-recent` (47).
++    // read `/moderation-recent` (47), plus `/command-clone` (48).
+     // No Next-only row appears in the legacy §1 table above;
+     // the registry-equality test below covers every published builtin instead.
+-    // 48 entries: 47 contiguous parity rows plus the `/lfg-edit` companion
++    // 49 entries: 48 contiguous parity rows plus the `/lfg-edit` companion
+     // sharing LFG row 26.
+-    assert_eq!(COMMAND_PERMISSIONS.len(), 48);
++    assert_eq!(COMMAND_PERMISSIONS.len(), 49);
+     assert_eq!(
+         COMMAND_PERMISSIONS
+             .iter()
+             .map(|row| row.command)
+             .collect::<HashSet<_>>()
+             .len(),
+-        48
++        49
+     );
+     assert_eq!(
+         COMMAND_PERMISSIONS
+             .iter()
+             .map(|row| row.parity_row)
+             .collect::<HashSet<_>>(),
+-        (1..=47).collect::<HashSet<_>>(),
+-        "parity rows are contiguous 1..=47"
++        (1..=48).collect::<HashSet<_>>(),
++        "parity rows are contiguous 1..=48"
+     );
+     for (name, parity_row, required_permissions) in
+         [("command-inspect", 33, 1 << 5), ("lfg-list", 38, 1 << 33)]
+@@ -184,6 +184,11 @@ fn documented_legacy_rows_equal_parity_section1() {
+     assert_eq!(preview.required_permissions, PERM_MANAGE_GUILD);
+     assert_eq!(preview.surface, CommandSurface::BuiltinSlash);
+     assert_eq!(preview.policy_hook, None);
++    let clone = command_permission("command-clone").expect("clone has a permission row");
++    assert_eq!(clone.parity_row, 48);
++    assert_eq!(clone.required_permissions, 32, "ManageGuild bit");
++    assert_eq!(clone.surface, CommandSurface::BuiltinSlash);
++    assert_eq!(clone.policy_hook, None);
+ }
+
+ #[test]
+@@ -249,7 +254,7 @@ fn permission_table_equals_the_complete_published_registry() {
+         .iter()
+         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
+         .collect();
+-    assert_eq!(builtins.len(), 45);
++    assert_eq!(builtins.len(), 46);
+     assert_eq!(published.len(), builtins.len() + 1);
+     for row in builtins {
+         let definition = published
+@@ -383,7 +388,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
+             other => panic!("{name} is published or retained but does not route: {other:?}"),
+         }
+     }
+-    assert_eq!(routed, 45, "every retained builtin routes");
++    assert_eq!(routed, 46, "every retained builtin routes");
+ }
+
+ #[test]
+diff --git a/crates/core/tests/e2e_matrix_coverage.rs b/crates/core/tests/e2e_matrix_coverage.rs
+index 374ea1f4681fabefc3eb63017fba13f3d758abd3..d3b52f8f8b1a300244d7d9b9106a977ff7930965 100644
+--- a/crates/core/tests/e2e_matrix_coverage.rs
++++ b/crates/core/tests/e2e_matrix_coverage.rs
+@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
+         matrix_names, published_names,
+         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
+     );
+-    assert_eq!(matrix.len(), 45, "contract covers the 45 built-in commands");
++    assert_eq!(matrix.len(), 46, "contract covers the 46 built-in commands");
+ }
+
+ #[test]
+@@ -106,6 +106,7 @@ fn matrix_gates_and_permissions_match_the_registry() {
+             "command-remove",
+             "command-list",
+             "command-inspect",
++            "command-clone",
+             "command-disable",
+             "command-enable",
+             "schedule",
+diff --git a/crates/core/tests/fixtures/authz_matrix.json b/crates/core/tests/fixtures/authz_matrix.json
+index ac410937d112bc7a91c60253b7c4d41e99eee2db..0038256620d7b9a4560b685ba728f0c3e8607250 100644
+--- a/crates/core/tests/fixtures/authz_matrix.json
++++ b/crates/core/tests/fixtures/authz_matrix.json
+@@ -45,6 +45,7 @@
+     {"name": "command-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+     {"name": "command-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+     {"name": "command-inspect", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
++    {"name": "command-clone", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+     {"name": "command-disable", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+     {"name": "command-enable", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+     {"name": "schedule", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+diff --git a/crates/core/tests/fixtures/smoke_surface_inventory.json b/crates/core/tests/fixtures/smoke_surface_inventory.json
+index 07a21556b92857f3293a03ad64ebdca7b6e679db..08e9a18bf2b7a97e750536994f536e522059eacd 100644
+--- a/crates/core/tests/fixtures/smoke_surface_inventory.json
++++ b/crates/core/tests/fixtures/smoke_surface_inventory.json
+@@ -1,6 +1,6 @@
+ {
+   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
+-  "count": 44,
++  "count": 45,
+   "dm_permission_all_false": true,
+   "commands": [
+     {
+@@ -462,6 +462,39 @@
+       "expected_response": null,
+       "deferral_reason": "Read-only but needs a named DB-backed custom row to inspect, which the no-DB offline rule excludes; covered by the disposable-database acceptance instead."
+     },
++    {
++      "name": "command-clone",
++      "description": "Clone a saved custom command under a new name",
++      "family": "automations",
++      "gate": "automations",
++      "default_member_permissions": "32",
++      "dm_permission": false,
++      "options": [
++        {
++          "name": "source",
++          "description": "Saved source command name, a-z 0-9 _ -",
++          "type": "string",
++          "required": true,
++          "min_value": null,
++          "max_value": null,
++          "max_length": 32,
++          "choices": []
++        },
++        {
++          "name": "destination",
++          "description": "New absent destination name, a-z 0-9 _ -",
++          "type": "string",
++          "required": true,
++          "min_value": null,
++          "max_value": null,
++          "max_length": 32,
++          "choices": []
++        }
++      ],
++      "smoke": "deferred",
++      "expected_response": null,
++      "deferral_reason": "State-mutating create-only copy into a new saved row; pinned by the disposable-database acceptance rather than the live smoke five."
++    },
+     {
+       "name": "command-disable",
+       "description": "Pause a saved custom command without deleting it",
+diff --git a/crates/core/tests/fixtures/staging_published_commands.json b/crates/core/tests/fixtures/staging_published_commands.json
+index 91ca4256fbad9c1fcfa94f06b215497cabd10e7d..66b9cff6bfc03f4a65bf13386cb4cc10e49a1525 100644
+--- a/crates/core/tests/fixtures/staging_published_commands.json
++++ b/crates/core/tests/fixtures/staging_published_commands.json
+@@ -19,6 +19,7 @@
+     "command-remove",
+     "command-list",
+     "command-inspect",
++    "command-clone",
+     "command-disable",
+     "command-enable",
+     "schedule",
+@@ -68,6 +69,7 @@
+     "command-remove",
+     "command-list",
+     "command-inspect",
++    "command-clone",
+     "command-disable",
+     "command-enable",
+     "schedule",
+@@ -103,7 +105,7 @@
+     "faq"
+   ],
+   "voice": {
+-    "_comment": "Voice set published beside the 44 builtins when TWO_VOICE=1 (RouterGates::voice), in publish order after moderation, default_member_permissions as Discord decimal bitfields (null = no default gate). The voice vote-kick `kick` is the 17th voice definition but loses first-wins to moderation /kick, so it is listed under shadowed_by_first_wins instead. /templateassistant stays unpublished in every gate state until its slice lands with a handler; the `assistant` section below keeps its name and intended default gate so the slice re-activates against the same shape. The drift tests (staging_publish_manifest.rs) fail if InteractionRouter::publish_set differs; regenerate from publish_set output, never hand-edit names. Live publish read-back stays on the staging cards.",
++    "_comment": "Voice set published beside the 46 compiled builtins (45 saved names plus the compiled-only lfg-edit companion) when TWO_VOICE=1 (RouterGates::voice), in publish order after moderation, default_member_permissions as Discord decimal bitfields (null = no default gate). The voice vote-kick `kick` is the 17th voice definition but loses first-wins to moderation /kick, so it is listed under shadowed_by_first_wins instead. /templateassistant stays unpublished in every gate state until its slice lands with a handler; the `assistant` section below keeps its name and intended default gate so the slice re-activates against the same shape. The drift tests (staging_publish_manifest.rs) fail if InteractionRouter::publish_set differs; regenerate from publish_set output, never hand-edit names. Live publish read-back stays on the staging cards.",
+     "gates": {
+       "voice": true,
+       "voice_assistant": true
+diff --git a/crates/core/tests/handled_published_contract_acceptance.rs b/crates/core/tests/handled_published_contract_acceptance.rs
+index 682f73c23c62eb418b0e62bf0b54f7d44fbb79ec..ad1c60c1a50bfaa3e02106f4a75baac742ed3dc0 100644
+--- a/crates/core/tests/handled_published_contract_acceptance.rs
++++ b/crates/core/tests/handled_published_contract_acceptance.rs
+@@ -135,7 +135,7 @@ fn help_lists_only_handled_commands() {
+     );
+ }
+
+-/// Registry compatibility: all 43 parity and Next-only builtins below plus the
++/// Registry compatibility: all 44 parity and Next-only builtins below plus the
+ /// separate lfg-list discovery case route to their handlers;
+ /// welcome-preview is covered independently; templateassistant stays unpublished.
+ #[test]
+@@ -172,6 +172,7 @@ fn parity_builtins_route_to_their_handlers() {
+         ("command-remove", HandlerId::AutomationAdmin),
+         ("command-list", HandlerId::AutomationAdmin),
+         ("command-inspect", HandlerId::AutomationAdmin),
++        ("command-clone", HandlerId::AutomationAdmin),
+         ("command-disable", HandlerId::AutomationAdmin),
+         ("command-enable", HandlerId::AutomationAdmin),
+         ("schedule", HandlerId::AutomationAdmin),
+@@ -194,7 +195,7 @@ fn parity_builtins_route_to_their_handlers() {
+     ];
+     assert_eq!(
+         cases.len(),
+-        43,
++        44,
+         "all builtins except the separate lfg-list and welcome-preview cases covered"
+     );
+     for (name, handler) in cases {
+@@ -259,14 +260,14 @@ fn e2e_matrix_still_matches_the_publish_set() {
+         matrix_names, published_names,
+         "matrix drift: the fix must not change the parity publish set"
+     );
+-    assert_eq!(matrix.len(), 45, "contract covers the 45 built-in commands");
++    assert_eq!(matrix.len(), 46, "contract covers the 46 built-in commands");
+     assert_eq!(
+         matrix
+             .iter()
+             .filter(|row| row.command != "welcome-preview")
+             .count(),
+-        44,
+-        "contract covers the 44 non-preview built-in commands"
++        45,
++        "contract covers the 45 non-preview built-in commands"
+     );
+     assert!(
+         matrix
+diff --git a/crates/core/tests/smoke_surface_inventory.rs b/crates/core/tests/smoke_surface_inventory.rs
+index 875fdcf2913c468b8afd7afe76459368d64fe74f..2da68ed5ba2dc6ad49a02a524c07b8ae3ac628c6 100644
+--- a/crates/core/tests/smoke_surface_inventory.rs
++++ b/crates/core/tests/smoke_surface_inventory.rs
+@@ -5,7 +5,7 @@
+ //! `fixtures/smoke_surface_inventory.json` exactly, in publish order. The
+ //! fixture additionally marks the five smoke-covered commands (one per
+ //! routing family, matching `crates/discord/tests/top5_reply_fixtures.rs`)
+-//! versus the 39 saved deferrals (40 with the compiled-only LFG edit).
++//! versus the 40 saved deferrals (41 with the compiled-only LFG edit).
+ //!
+ //! Offline only: no staging guild, no live Discord, no network, no database.
+
+@@ -34,18 +34,18 @@ fn fixture() -> Value {
+     let mut fixture: Value =
+         serde_json::from_str(include_str!("fixtures/smoke_surface_inventory.json"))
+             .expect("smoke surface inventory fixture parses");
+-    // Preserve the saved publication inventory (44 rows including
++    // Preserve the saved publication inventory (45 rows including clone,
+     // welcome-preview, feed pause/resume, tempban-list and moderation-recent);
+     // extend only the compiled registry oracle with the
+     // lfg-edit companion. No smoke coverage or deployment is claimed for edit.
+     assert_eq!(
+-        fixture["count"], 44,
++        fixture["count"], 45,
+         "saved inventory retains the feed pair and both staff reads"
+     );
+     let rows = fixture["commands"]
+         .as_array_mut()
+         .expect("saved command rows");
+-    assert_eq!(rows.len(), 44);
++    assert_eq!(rows.len(), 45);
+     assert!(rows.iter().all(|row| row["name"] != "lfg-edit"));
+     let after_close = rows
+         .iter()
+@@ -73,7 +73,7 @@ fn fixture() -> Value {
+         "expected_response": null,
+         "deferral_reason": "Compiled-only metadata companion; live publication and smoke remain unapproved."
+     }));
+-    fixture["count"] = serde_json::json!(45);
++    fixture["count"] = serde_json::json!(46);
+     fixture
+ }
+
+@@ -93,14 +93,14 @@ fn option_type_name(kind: u8) -> &'static str {
+ fn inventory_matches_registry_output_in_publish_order() {
+     let published = all_on_router().publish_set(&[]).expect("publish set");
+     let fixture = fixture();
+-    assert_eq!(fixture["count"], 45, "45 built-ins");
++    assert_eq!(fixture["count"], 46, "46 built-ins");
+     assert_eq!(
+         fixture["dm_permission_all_false"], true,
+         "fixture claims guild-only"
+     );
+     let rows = fixture["commands"].as_array().expect("command rows");
+     assert_eq!(published.len(), rows.len(), "registry row count matches");
+-    assert_eq!(published.len(), 45, "45 built-ins in the registry");
++    assert_eq!(published.len(), 46, "46 built-ins in the registry");
+
+     for (definition, row) in published.iter().zip(rows.iter()) {
+         let name = row["name"].as_str().expect("row name");
+@@ -246,8 +246,8 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
+     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
+     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
+     assert_eq!(covered.len(), 5, "exactly the top five");
+-    assert_eq!(deferred.len(), 40, "every non-smoke row deferred");
+-    assert_eq!(covered.len() + deferred.len(), 45, "every row marked");
++    assert_eq!(deferred.len(), 41, "every non-smoke row deferred");
++    assert_eq!(covered.len() + deferred.len(), 46, "every row marked");
+
+     let mut covered_names: Vec<&str> = covered
+         .iter()
+diff --git a/crates/core/tests/staging_publish_manifest.rs b/crates/core/tests/staging_publish_manifest.rs
+index e1a72767ed5f4a5d6c52ffe34d05a3fde4702644..8caaf81f57f56eb6ad293bdf37ceff9d7a5e8fd6 100644
+--- a/crates/core/tests/staging_publish_manifest.rs
++++ b/crates/core/tests/staging_publish_manifest.rs
+@@ -120,8 +120,8 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
+         enabled: true,
+     };
+     let names = published_names(&router, &[faq]);
+-    // 45 all-on builtins minus 12 automation-gated commands, including
+-    // command-inspect, pause/resume and giveaway; announcements-gated lfg-edit and
++    // 46 all-on builtins minus 13 automation-gated commands, including
++    // command-inspect, clone, pause/resume and giveaway; announcements-gated lfg-edit and
+     // feed-inspect still publish, and read-only current-channel discovery
+     // lfg-list stays published. welcome-preview is core-always and survives too.
+     // The stored dynamic row stays unpublished:
+@@ -161,6 +161,7 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
+         "command-remove",
+         "command-list",
+         "command-inspect",
++        "command-clone",
+         "command-disable",
+         "command-enable",
+         "schedule",
+diff --git a/crates/core/tests/support/registry_parity.rs b/crates/core/tests/support/registry_parity.rs
+index c1f379332a1b994130437a7bf072ea11dc7e9eae..1503187b9992f92bd94de3c51ae303717da0a1d3 100644
+--- a/crates/core/tests/support/registry_parity.rs
++++ b/crates/core/tests/support/registry_parity.rs
+@@ -45,6 +45,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
+     ("reopen", "docs/parity.md §1 reopen"),
+     ("feed-inspect", "docs/parity.md §1 feed-inspect"),
+     ("command-inspect", "docs/parity.md §1 command-inspect"),
++    ("command-clone", "docs/parity.md §1 command-clone"),
+     ("game-mix", "docs/parity.md §1 game-mix"),
+     ("lfg-edit", "docs/parity.md §1 #26 Next-only companion"),
+     ("command-disable", "docs/parity.md §1 command-disable"),
+@@ -366,6 +367,22 @@ pub fn expected_registry() -> Value {
+         .expect("legacy command-list remains published")
+         + 1;
+     commands.insert(after_list, inspect);
++    // Next-only create-only clone: no trigger, overwrite or enable options.
++    commands.insert(
++        after_list + 1,
++        json!({
++            "name": "command-clone",
++            "description": "Clone a saved custom command under a new name",
++            "dm_permission": false,
++            "default_member_permissions": "32",
++            "options": [
++                {"name": "source", "description": "Saved source command name, a-z 0-9 _ -",
++                 "type": 3, "required": true, "max_length": 32},
++                {"name": "destination", "description": "New absent destination name, a-z 0-9 _ -",
++                 "type": 3, "required": true, "max_length": 32}
++            ]
++        }),
++    );
+     // Next-only metadata and increase-only seat editing reuse LFG's parity row,
+     // never the frozen legacy snapshot. Pin the wire shape independently of production.
+     assert!(commands.iter().all(|command| command["name"] != "lfg-edit"));
+@@ -396,11 +413,11 @@ pub fn expected_registry() -> Value {
+     // Saved-response lifecycle is intentionally independent of replacement.
+     for (offset, name, description) in [
+         (
+-            1,
++            2,
+             "command-disable",
+             "Pause a saved custom command without deleting it",
+         ),
+-        (2, "command-enable", "Resume a saved custom command"),
++        (3, "command-enable", "Resume a saved custom command"),
+     ] {
+         commands.insert(
+             after_list + offset,
+@@ -435,8 +452,8 @@ pub fn expected_registry() -> Value {
+         + 1;
+     commands.insert(after_edit, lfg_list);
+     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
+-    // publish position (index 19, immediately after sticky-remove, with
+-    // game-mix, welcome-preview, pause/resume and inspection inserts above)
++    // publish position (index 20, immediately after sticky-remove, with
++    // game-mix, welcome-preview, clone, pause/resume and inspection inserts above)
+     // as the exact published definition, so parity pins its shape too.
+     let giveaway = serde_json::to_value(
+         CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
+@@ -575,7 +592,7 @@ pub fn expected_registry() -> Value {
+             ]),
+     )
+     .expect("giveaway serializes");
+-    commands.insert(19, giveaway);
++    commands.insert(20, giveaway);
+     // Next-only feed lifecycle pair. These independent literals pin the whole
+     // publication contract; never manufacture them from production shapes.
+     // The feed-remove lookup stays dynamic so the giveaway insert above does
+diff --git a/crates/discord/tests/interaction_routing.rs b/crates/discord/tests/interaction_routing.rs
+index 59c58c09f29b6e6d40fec6c1fd6807e4396b4a44..ecf12c12d48e143b767a6e48b0c606a941744f82 100644
+--- a/crates/discord/tests/interaction_routing.rs
++++ b/crates/discord/tests/interaction_routing.rs
+@@ -5,7 +5,7 @@
+ //! Two layers, mirroring `funnel_replay.rs`:
+ //!
+ //! 1. `route_*` — in-memory twilight `Interaction`s through
+-//!    [`route_interaction`]: all 44 builtins, gates-off refusals, permission
++//!    [`route_interaction`]: all 46 builtins, gates-off refusals, permission
+ //!    refusals, custom rows, unknown names/ids, modal submits, and the
+ //!    refusal-response wire shape.
+ //! 2. `publish_*` — the router's complete set through the real
+@@ -276,14 +276,14 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
+         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
+         .collect();
+     // 23 legacy restricted rows plus management-only command-inspect,
+-    // command-disable, command-enable, giveaway and welcome-preview, plus
++    // command-clone, command-disable, command-enable, giveaway and welcome-preview, plus
+     // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect, game-mix,
+     // tempban-list and moderation-recent. Discord defaults never
+     // replace any runtime permission gate.
+     assert_eq!(
+         restricted.len(),
+-        38,
+-        "23 legacy restricted rows plus fifteen Next-only management commands"
++        39,
++        "23 legacy restricted rows plus sixteen Next-only management commands"
+     );
+     tracing::subscriber::with_default(audit.clone(), || {
+         for row in &restricted {
+@@ -379,11 +379,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
+ fn twilight_publication_permissions_equal_the_runtime_matrix() {
+     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
+
+-    assert_eq!(COMMAND_PERMISSIONS.len(), 48);
++    assert_eq!(COMMAND_PERMISSIONS.len(), 49);
+     let router = InteractionRouter::new(all_on());
+     let defs = router.publish_set(&[]).unwrap();
+     let commands = publish_commands(&defs);
+-    assert_eq!(commands.len(), 45);
++    assert_eq!(commands.len(), 46);
+     for command in commands {
+         let row = command_permission(&command.name).unwrap();
+         assert_eq!(
+@@ -446,11 +446,13 @@ fn every_section1_row_routes_to_its_registered_handler() {
+         ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
+         ("purge-preview", HandlerId::PurgePreview),
+         ("channel-inspect", HandlerId::ChannelInspect),
++        ("moderation-recent", HandlerId::ModerationRecent),
+         ("attendance", HandlerId::ScorecardAttendance),
+         ("command", HandlerId::AutomationAdmin),
+         ("command-remove", HandlerId::AutomationAdmin),
+         ("command-list", HandlerId::AutomationAdmin),
+         ("command-inspect", HandlerId::AutomationAdmin),
++        ("command-clone", HandlerId::AutomationAdmin),
+         ("command-disable", HandlerId::AutomationAdmin),
+         ("command-enable", HandlerId::AutomationAdmin),
+         ("schedule", HandlerId::AutomationAdmin),
+@@ -472,7 +474,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
+     ];
+     assert_eq!(
+         cases.len(),
+-        42,
++        44,
+         "all handlers except giveaway and lfg-list covered (each has its own test)"
+     );
+     for (_, id) in cases {
+@@ -1132,7 +1134,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
+ #[tokio::test]
+ async fn publish_sends_the_complete_merged_set_once() {
+     // Publish-once against the mock double through the real bulk-set
+-    // endpoint: one request, all 46 names, no partial view.
++    // endpoint: one request, all 47 names, no partial view.
+     let router = InteractionRouter::new(all_on());
+     let defs = router
+         .publish_set(&[CustomCommand {
+@@ -1143,8 +1145,8 @@ async fn publish_sends_the_complete_merged_set_once() {
+         .expect("full set assembles");
+     assert_eq!(
+         defs.len(),
+-        46,
+-        "7 core + 25 feature + 9 moderation mutations + 4 reads + 1 custom"
++        47,
++        "7 core + 26 feature + 9 moderation mutations + 4 reads + 1 custom"
+     );
+     let commands = publish_commands(&defs);
+
+@@ -1176,7 +1178,7 @@ async fn publish_sends_the_complete_merged_set_once() {
+         .iter()
+         .map(|c| c["name"].as_str().expect("command has a name"))
+         .collect();
+-    assert_eq!(names.len(), 46, "no partial view");
++    assert_eq!(names.len(), 47, "no partial view");
+     assert_eq!(
+         names.iter().filter(|name| **name == "tempban-list").count(),
+         1
+@@ -1199,6 +1201,7 @@ async fn publish_sends_the_complete_merged_set_once() {
+         "attendance",
+         "command",
+         "command-inspect",
++        "command-clone",
+         "command-disable",
+         "command-enable",
+         "schedule-list",
