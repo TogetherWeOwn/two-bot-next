@@ -173,16 +173,13 @@ pub(super) fn bot_access_grant(
     }
 }
 
-fn owner_gate_refusal(error: OwnershipError, command: PrivacyCommand) -> String {
+fn owner_gate_refusal(error: OwnershipError, name: &str) -> String {
     match error {
         OwnershipError::NotOwner => {
-            format!(
-                "Only the room owner or an admin can use /{}.",
-                command.name()
-            )
+            format!("Only the room owner or an admin can use /{name}.")
         }
         OwnershipError::ActorNotInRoom => {
-            format!("You need to be in the room to use /{}.", command.name())
+            format!("You need to be in the room to use /{name}.")
         }
         _ => "Something's off with this room's membership data — leave and rejoin, then try again."
             .to_owned(),
@@ -282,6 +279,53 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         Ok(state)
     }
 
+    /// The caller's current tracked room, gated on owner-or-admin: the
+    /// channel, the room and the bot's permissions on it, or the ephemeral
+    /// refusal text. Shared by every owner command named `name`.
+    pub(super) fn owned_room(
+        &self,
+        actor_id: Snowflake,
+        is_admin: bool,
+        name: &str,
+    ) -> Result<(Snowflake, VoiceRoom, Option<Permissions>), String> {
+        let (channel, room, members, bot_permissions) = {
+            let live = self.live.read_state();
+            if !live.ready {
+                return Err(WARMING.to_owned());
+            }
+            let Some(channel) = live
+                .members
+                .get(&actor_id)
+                .and_then(|member| member.channel_id)
+            else {
+                return Err(format!("You need to be in a voice room to use /{name}."));
+            };
+            let Some(room) = self.rooms.get(&channel).cloned() else {
+                return Err("That voice channel isn't a temporary room I manage.".to_owned());
+            };
+            (
+                channel,
+                room,
+                live.ownership_snapshot(channel),
+                live.permissions(self.live.guild_id, channel),
+            )
+        };
+        let ownership = RoomOwnership {
+            owner_id: room.owner_id,
+            original_creator_id: room.original_creator_id,
+        };
+        require_room_owner(
+            ownership,
+            &members,
+            RoomActor {
+                member_id: actor_id,
+                is_admin,
+            },
+        )
+        .map_err(|error| owner_gate_refusal(error, name))?;
+        Ok((channel, room, bot_permissions))
+    }
+
     /// `/private` and `/public`, serialized in the guild actor. Resolves the
     /// caller's current room, gates on owner-or-admin, and queues the
     /// @everyone Connect write; the state change follows that write. Returns
@@ -298,42 +342,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if self.halted {
             return PAUSED.to_owned();
         }
-        let (channel, room, members, bot_permissions) = {
-            let live = self.live.read_state();
-            if !live.ready {
-                return WARMING.to_owned();
-            }
-            let Some(channel) = live
-                .members
-                .get(&actor_id)
-                .and_then(|member| member.channel_id)
-            else {
-                return format!("You need to be in a voice room to use /{}.", command.name());
+        let (channel, room, bot_permissions) =
+            match self.owned_room(actor_id, is_admin, command.name()) {
+                Ok(found) => found,
+                Err(refusal) => return refusal,
             };
-            let Some(room) = self.rooms.get(&channel).cloned() else {
-                return "That voice channel isn't a temporary room I manage.".to_owned();
-            };
-            (
-                channel,
-                room,
-                live.ownership_snapshot(channel),
-                live.permissions(self.live.guild_id, channel),
-            )
-        };
-        let ownership = RoomOwnership {
-            owner_id: room.owner_id,
-            original_creator_id: room.original_creator_id,
-        };
-        if let Err(error) = require_room_owner(
-            ownership,
-            &members,
-            RoomActor {
-                member_id: actor_id,
-                is_admin,
-            },
-        ) {
-            return owner_gate_refusal(error, command);
-        }
         let Ok(state) = self.privacy_state(&room, actor_id, actor_display) else {
             return "This room's privacy settings look corrupt. Ask an admin to check /setup."
                 .to_owned();
