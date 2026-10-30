@@ -375,7 +375,8 @@ def native_git_executable():
             resolved = Path(candidate).resolve()
             with resolved.open("rb") as executable:
                 if executable.read(2) != b"#!":
-                    return str(resolved)
+                    # Keep the git alias: the validated target may have another name.
+                    return str(Path(candidate).absolute())
     return None
 
 
@@ -459,24 +460,40 @@ class HardGateGitIsolationControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="path-only-native-git-") as directory:
             root = Path(directory)
             system = root / "system-bin"
-            profile = root / "profile-bin"
             shim = root / "provider-bin"
-            for binary_directory in (system, profile, shim):
+            for binary_directory in (system, shim):
                 binary_directory.mkdir()
-            (profile / "git").symlink_to(native_git)
             marker = root / "provider-wrapper-executed"
             wrapper = shim / "git"
             wrapper.write_text("#!/bin/sh\nprintf invoked >> " + shlex.quote(str(marker)) + "\nexit 0\n")
             wrapper.chmod(0o755)
             ordinary = os.environ.get("PATH", "")
-            for prefix in (str(profile), str(shim) + os.pathsep + str(profile)):
-                with patch.object(os, "defpath", str(system)), patch.dict(
-                        os.environ, {"PATH": prefix + os.pathsep + ordinary}):
-                    self.assertIsNone(shutil.which("git", path=os.defpath))
-                    for hostile in ("clean", "signing", "hook-abort", "hook-rewrite"):
-                        with self.subTest(path=prefix, hostile=hostile):
-                            self.check_native_fixture(hostile)
-                self.assertFalse(marker.exists(), "provider wrapper was accepted as native Git")
+            for basename in ("git", "git-real"):
+                native_directory = root / ("native-bin-" + basename)
+                profile = root / ("profile-bin-" + basename)
+                native_directory.mkdir()
+                profile.mkdir()
+                target = native_directory / basename
+                shutil.copy2(Path(native_git).resolve(), target)
+                alias = profile / "git"
+                alias.symlink_to(target)
+                version = subprocess.run(
+                    [str(alias), "--version"], cwd=root,
+                    env={"PATH": os.defpath, "HOME": str(root),
+                         "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(version.returncode, 0, version.stderr)
+                self.assertIn("git version ", version.stdout)
+                if basename != "git":
+                    self.assertFalse((native_directory / "git").exists())
+                for prefix in (str(profile), str(shim) + os.pathsep + str(profile)):
+                    with patch.object(os, "defpath", str(system)), patch.dict(
+                            os.environ, {"PATH": prefix + os.pathsep + ordinary}):
+                        self.assertIsNone(shutil.which("git", path=os.defpath))
+                        for hostile in ("clean", "signing", "hook-abort", "hook-rewrite"):
+                            with self.subTest(target=basename, path=prefix, hostile=hostile):
+                                self.check_native_fixture(hostile)
+                    self.assertFalse(marker.exists(), "provider wrapper was accepted as native Git")
             with patch.object(os, "defpath", str(system)), patch.dict(
                     os.environ, {"PATH": str(shim)}):
                 with self.assertRaisesRegex(AssertionError, "native local Git is required"):
