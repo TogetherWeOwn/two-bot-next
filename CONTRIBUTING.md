@@ -75,7 +75,11 @@ prepare/verify guards and isolated replays. Stable `rust tests` and
 `ignored db (runtime)` jobs require every worker result and exactly one successful
 receipt per partition. Rust receipts also preserve the original **combined**
 property-test execution budget below 30 seconds; compiling all integrations in
-one timing-only worker would reintroduce the critical path.
+one timing-only worker would reintroduce the critical path. The cold runtime
+`other` worker first compiles the exact `alive` test target without running it,
+under a 10-minute preparation bound. Its subsequent inventory and execution
+still share one 60-second deadline. Preparation failure stops the partition;
+compile-only commands never earn ignored-test execution credit.
 
 Coverage splits both ignored and nonignored sweeps by package before assigning
 29 legs to eight runners: 14 sweep owners and 15 dedicated replays. The ignored

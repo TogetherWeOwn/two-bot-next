@@ -2569,6 +2569,13 @@ jobs:
       - name: Generate command reference before runtime test compilation
         run: python3 scripts/generate_command_reference.py
 
+      # The former serial lane built this target in earlier suites. Prepare the
+      # cold worker explicitly; the runner still bounds inventory + execution to 60s.
+      - name: Compile cold runtime smoke
+        if: matrix.partition == 'other'
+        timeout-minutes: 10
+        run: cargo test -p two-bot --locked --test alive --no-run
+
       - name: Run selected test partition
         id: run_partition
         env:

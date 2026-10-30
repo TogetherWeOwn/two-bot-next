@@ -42,6 +42,7 @@ finals and ci-ok dependencies must be connected. Other shapes need an explicit
 import argparse
 import ast
 import re
+import shlex
 import textwrap
 import sys
 import tomllib
@@ -248,6 +249,16 @@ def executable_block_text(body):
     return "\n".join(kept)
 
 
+def _compile_only(segment):
+    # Cargo flags end at `--`; libtest filters and comments must not suppress a run.
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return True  # An unparseable command cannot prove execution.
+    cargo_words = words[:words.index("--")] if "--" in words else words
+    return "--no-run" in cargo_words
+
+
 def routed_targets(*workflow_texts):
     """Return (executably routed target names, executable texts per workflow)."""
     routed = set()
@@ -257,6 +268,8 @@ def routed_targets(*workflow_texts):
         executable_texts.append("\n".join(blocks))
         for block in blocks:
             for segment in block.splitlines():
+                if _compile_only(segment):
+                    continue
                 for arg in _TEST_ARG_RE.finditer(segment):
                     if _INVOCATION_RE.search(segment[:arg.start()]):
                         routed.add(arg.group(1))
@@ -266,7 +279,7 @@ def routed_targets(*workflow_texts):
                     (arg := re.search(
                         r"--test(?:\s+|=)[\"']?\$(?:\{%s\}|%s\b)" % (var, var),
                         line)) and _INVOCATION_RE.search(line[:arg.start()])
-                    for line in loop.group("body").splitlines())
+                    for line in loop.group("body").splitlines() if not _compile_only(line))
                 if runs_loop_var:
                     routed.update(
                         token.strip("\"'")
