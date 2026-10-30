@@ -632,5 +632,93 @@ class OwnershipAndDiscoveryTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+def insert_at_function_start(runner_text, function, snippet):
+    lines = runner_text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.startswith(f"def {function}("):
+            return "".join(lines[:index + 1]) + snippet + "".join(lines[index + 1:])
+    raise AssertionError(f"runner fixture lost def {function}()")
+
+
+class ConditionalEarlyExitRejectedTests(unittest.TestCase):
+    """A nested unconditional exit before Cargo must earn no runner credit.
+
+    The scanner already rejects a bare top-level ``return`` in ``execute``.
+    The same exit wrapped in a constant condition, a loop or a ``try``
+    block executes just as surely before any Cargo command runs, so it
+    must lose the same discovery, unit/doc and ignored-target credit.
+    These controls exercise the real scanner on a rewritten runner; they
+    do not count source substrings in the fixture.
+    """
+
+    def assert_no_runner_credit(self, errors):
+        assert_orphaned(self, errors, "plain", False)
+        assert_orphaned(self, errors, "alive", True)
+        self.assertTrue(
+            any("workspace lib/bins unit run" in error for error in errors),
+            f"early exit kept the lib/bins marker: {errors}")
+        self.assertTrue(
+            any("workspace doc-test run" in error for error in errors),
+            f"early exit kept the doc marker: {errors}")
+
+    def check_rewritten_runner(self, runner_text):
+        files = dict(MYCRATE_PLAIN) | dict(BOT_ALIVE)
+        return check_fixture(
+            VALID_CHECK_YML, NIGHTLY_YML, files, runner_text=runner_text)
+
+    def test_intact_runner_still_routes_mixed_tree(self):
+        self.assertEqual(self.check_rewritten_runner(REAL_RUNNER_TEXT), [])
+
+    def test_direct_early_return_in_execute_is_rejected(self):
+        broken = insert_at_function_start(
+            REAL_RUNNER_TEXT, "execute", "    return 0.0\n")
+        self.assert_no_runner_credit(self.check_rewritten_runner(broken))
+
+    def test_conditional_early_exits_in_execute_do_not_route(self):
+        exits = {
+            "if_true": "    if True:\n        return 0.0\n",
+            "if_true_deeply_nested": (
+                "    if True:\n        if True:\n            return 0.0\n"),
+            "while_true": "    while True:\n        return 0.0\n",
+            "try_finally": (
+                "    try:\n        return 0.0\n"
+                "    finally:\n        pass\n"),
+            "if_true_raise": "    if True:\n        raise SystemExit(0)\n",
+        }
+        for kind, snippet in exits.items():
+            with self.subTest(kind=kind):
+                broken = insert_at_function_start(
+                    REAL_RUNNER_TEXT, "execute", snippet)
+                self.assert_no_runner_credit(
+                    self.check_rewritten_runner(broken))
+
+    def test_conditional_early_return_in_main_does_not_route(self):
+        # main() legitimately returns from its --list/--verify-receipts
+        # branches; an unconditional return ahead of lane dispatch is a
+        # different statement and must not hide behind those branches.
+        broken = insert_at_function_start(
+            REAL_RUNNER_TEXT, "main", "    if True:\n        return\n")
+        self.assert_no_runner_credit(self.check_rewritten_runner(broken))
+
+    def test_conditional_early_return_in_discovery_does_not_route(self):
+        # Insert after the metadata call: an exit at the very first
+        # statement is already caught by the scanner's first-statement
+        # pin, while one here still discards every discovered target.
+        anchor = "    graph = json.loads(proc.stdout)\n"
+        self.assertIn(anchor, REAL_RUNNER_TEXT)
+        exits = {
+            "if_true": "    if True:\n        return []\n",
+            "while_true": "    while True:\n        return []\n",
+        }
+        for kind, snippet in exits.items():
+            with self.subTest(kind=kind):
+                broken = REAL_RUNNER_TEXT.replace(anchor, snippet + anchor, 1)
+                self.assertIn('"cargo", "metadata"', broken)
+                errors = check_fixture(
+                    with_direct_markers(VALID_CHECK_YML), NIGHTLY_YML,
+                    dict(MYCRATE_PLAIN), runner_text=broken)
+                assert_orphaned(self, errors, "plain", False)
+
+
 if __name__ == "__main__":
     unittest.main()

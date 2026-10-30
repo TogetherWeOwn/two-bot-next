@@ -3874,6 +3874,118 @@ def scheduled_binding_audit_errors(workflows):
     return errors
 
 
+PUSH_ONLY_SAVE = "${{ github.event_name == 'push' }}"
+PARTITION_LANES = (
+    ("rust-tests", "rust-tests-partition", "rust-tests"),
+    ("ignored-db-runtime", "ignored-db-runtime-partition", "ignored-db-runtime"),
+)
+
+
+def rust_lane_cache_errors(jobs):
+    """Producer/consumer errors for explicit shared-key cargo caches.
+
+    Every restored explicit entry needs a continuing writer: exactly one
+    job saving that entry, and only on push. A restore-only lane whose
+    former writer moved to another key silently cold-builds forever, and
+    two writers (or one matrix job whose legs share one expanded key)
+    race on save. Receipt-only final aggregates build nothing and must
+    not restore a cache at all.
+    """
+    errors = []
+    entries = {}
+    for job_id, job in jobs.items():
+        for step in job.get("steps") or []:
+            if "Swatinem/rust-cache@" not in str(step.get("uses", "")):
+                continue
+            shared_key = (step.get("with") or {}).get("shared-key")
+            if shared_key is None:
+                continue
+            entries.setdefault(shared_key, []).append(
+                (job_id, (step.get("with") or {}).get("save-if")))
+    for shared_key, users in sorted(entries.items()):
+        for job_id, save_if in users:
+            if save_if not in ("false", PUSH_ONLY_SAVE):
+                errors.append(
+                    f"{job_id}: cargo cache {shared_key!r} save-if "
+                    f"{save_if!r} is neither restore-only nor push-only")
+        writers = [job_id for job_id, save_if in users
+                   if save_if == PUSH_ONLY_SAVE]
+        if not writers:
+            errors.append(
+                f"cargo cache {shared_key!r} is restored by "
+                f"{[job_id for job_id, _ in users]} but no job saves it on push")
+        elif len(writers) > 1:
+            errors.append(
+                f"cargo cache {shared_key!r} has concurrent writers {writers}")
+        for job_id in writers:
+            matrix = (jobs.get(job_id, {}).get("strategy") or {}).get("matrix")
+            if matrix is not None and "${{ matrix." not in shared_key:
+                errors.append(
+                    f"{job_id}: matrix legs race on one expanded cargo "
+                    f"cache key {shared_key!r}")
+    for aggregate in ("rust-tests", "ignored-db-runtime"):
+        for step in jobs.get(aggregate, {}).get("steps") or []:
+            if "Swatinem/rust-cache@" in str(step.get("uses", "")):
+                errors.append(
+                    f"{aggregate}: receipt-only final aggregate restores "
+                    "a cargo cache")
+    return errors
+
+
+def partition_receipt_upload_errors(jobs):
+    """Retry-safety errors for deterministic partition receipt uploads.
+
+    Receipt names are deterministic per lane/partition within a run, so
+    a permitted job retry re-uploads under the same name: without
+    ``overwrite: true`` the retry collides with the artifact the failed
+    attempt already uploaded. The upload must stay unique per partition
+    and fail when the receipt file is missing, and the final aggregate's
+    download pattern must still consume exactly those uploads.
+    """
+    errors = []
+    for lane, worker_id, aggregate_id in PARTITION_LANES:
+        worker = jobs.get(worker_id, {})
+        uploads = [step for step in worker.get("steps") or []
+                   if step.get("name") == "Upload successful test partition receipt"]
+        if len(uploads) != 1:
+            errors.append(f"{worker_id}: expected one receipt upload step")
+            continue
+        upload = uploads[0]
+        if "actions/upload-artifact@" not in str(upload.get("uses", "")):
+            errors.append(f"{worker_id}: receipt upload is not upload-artifact")
+        expected_name = f"test-partition-{lane}-" "${{ matrix.partition }}"
+        expected_path = ("${{ runner.temp }}/test-partition-receipts/"
+                         f"{lane}-" "${{ matrix.partition }}.json")
+        with_inputs = upload.get("with") or {}
+        if with_inputs.get("name") != expected_name:
+            errors.append(
+                f"{worker_id}: receipt artifact name "
+                f"{with_inputs.get('name')!r} is not unique per partition")
+        if with_inputs.get("path") != expected_path:
+            errors.append(
+                f"{worker_id}: receipt path {with_inputs.get('path')!r} "
+                "does not name this partition's receipt")
+        if with_inputs.get("if-no-files-found") != "error":
+            errors.append(
+                f"{worker_id}: missing receipt file is not fatal")
+        if with_inputs.get("overwrite") != "true":
+            errors.append(
+                f"{worker_id}: receipt upload is not retry-safe "
+                "(overwrite is not true)")
+        aggregate = jobs.get(aggregate_id, {})
+        downloads = [step for step in aggregate.get("steps") or []
+                     if step.get("name") == "Download successful partition receipts"]
+        if len(downloads) != 1:
+            errors.append(f"{aggregate_id}: expected one receipt download step")
+            continue
+        pattern = (downloads[0].get("with") or {}).get("pattern", "")
+        if not expected_name.startswith(str(pattern).removesuffix("*")):
+            errors.append(
+                f"{aggregate_id}: download pattern {pattern!r} does not "
+                f"consume {worker_id} receipt uploads")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
@@ -4095,26 +4207,29 @@ class WorkflowTests(unittest.TestCase):
     def test_rust_lane_cargo_cache_entries_are_pinned(self):
         # The partitioned lanes own per-partition entries: each
         # rust-tests worker writes its own `rust-tests-<partition>`
-        # entry on pushes to main, and each runtime worker restores its
-        # own `ignored-db-runtime-<partition>` entry without saving. The
+        # entry on pushes to main, and each runtime worker writes its
+        # own `ignored-db-runtime-<partition>` entry the same way. The
         # coverage shards build a unique instrumented graph under
         # `target/llvm-cov-target` that no other lane produces, so each shard
         # owns a separate writable `coverage-shard-N` entry: restore-only
         # would cold-build the instrumented dependencies on every run after a
-        # cache rotation. The stores lane stays restore-only on the shared
-        # `check` entry. Two writers must never share one entry (no
-        # concurrent save race).
+        # cache rotation. The stores lane owns a unique writable
+        # `ignored-db-stores` entry: its former shared `check` writer now
+        # saves the lint/per-partition keys, so a restore-only `check`
+        # entry (like a restore-only runtime entry) would be an orphan
+        # with no continuing producer. Two writers must never share one
+        # entry (no concurrent save race), and no lane saves on a PR.
         jobs = self.workflows["check.yml"]["jobs"]
         # (shared-key, save-if); BaseLoader keeps scalars as strings.
         expected = {
-            "check": ("lint", "${{ github.event_name == 'push' }}"),
+            "check": ("lint", PUSH_ONLY_SAVE),
             "rust-tests-partition": ("rust-tests-${{ matrix.partition }}",
-                                     "${{ github.event_name == 'push' }}"),
+                                     PUSH_ONLY_SAVE),
             "coverage-shard": ("coverage-shard-${{ matrix.shard_index }}",
-                               "${{ github.event_name == 'push' }}"),
-            "ignored-db-stores": ("check", "false"),
+                               PUSH_ONLY_SAVE),
+            "ignored-db-stores": ("ignored-db-stores", PUSH_ONLY_SAVE),
             "ignored-db-runtime-partition": ("ignored-db-runtime-${{ matrix.partition }}",
-                                              "false"),
+                                              PUSH_ONLY_SAVE),
         }
         writers = []
         for job_id, (shared_key, save_if) in expected.items():
@@ -4142,6 +4257,54 @@ class WorkflowTests(unittest.TestCase):
                 names = [step.get("name")
                          for step in jobs[aggregate]["steps"]]
                 self.assertNotIn("Restore cargo cache", names)
+        # Producer/consumer relation, not just the strings above: every
+        # restored explicit entry has exactly one continuing on-push
+        # writer and matrix legs never share one expanded key.
+        self.assertEqual(rust_lane_cache_errors(jobs), [])
+
+    def test_rust_lane_cache_missing_or_racing_producer_is_rejected(self):
+        jobs = self.workflows["check.yml"]["jobs"]
+        self.assertEqual(rust_lane_cache_errors(jobs), [])
+
+        def cache_step(mutated, job_id):
+            return next(
+                step for step in mutated[job_id]["steps"]
+                if step.get("name") == "Restore cargo cache")
+
+        def orphan_stores(mutated):
+            cache = cache_step(mutated, "ignored-db-stores")
+            cache["with"]["shared-key"] = "check"
+            cache["with"]["save-if"] = "false"
+
+        def duplicate_writer(mutated):
+            cache_step(mutated, "ignored-db-stores")["with"]["shared-key"] = "lint"
+
+        def matrix_race(mutated):
+            cache = cache_step(mutated, "ignored-db-runtime-partition")
+            cache["with"]["shared-key"] = "ignored-db-runtime"
+
+        def aggregate_cache(mutated):
+            mutated["rust-tests"]["steps"].append(
+                deepcopy(cache_step(mutated, "ignored-db-stores")))
+
+        mutations = {
+            "stores producer removed": lambda m: cache_step(
+                m, "ignored-db-stores")["with"].__setitem__("save-if", "false"),
+            "runtime producer removed": lambda m: cache_step(
+                m, "ignored-db-runtime-partition")["with"].__setitem__(
+                    "save-if", "false"),
+            "stores restores an orphaned key": orphan_stores,
+            "second writer on one entry": duplicate_writer,
+            "saves on pull requests": lambda m: cache_step(
+                m, "ignored-db-stores")["with"].__setitem__("save-if", "true"),
+            "matrix legs share one expanded key": matrix_race,
+            "cache on a receipt-only aggregate": aggregate_cache,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                changed = deepcopy(jobs)
+                mutate(changed)
+                self.assertTrue(rust_lane_cache_errors(changed), label)
 
     def test_partition_workers_and_aggregates_are_strict(self):
         # The lanes run partitioned: the planner emits per-lane matrices,
@@ -4198,7 +4361,14 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(upload["with"]["name"],
                                  f"test-partition-{lane}-"
                                  "${{ matrix.partition }}")
+                self.assertEqual(upload["with"]["path"],
+                                 "${{ runner.temp }}/test-partition-receipts/"
+                                 f"{lane}-" "${{ matrix.partition }}.json")
                 self.assertEqual(upload["with"]["if-no-files-found"], "error")
+                # The name is deterministic within a run: a job retry
+                # after a failed post-suite step re-uploads under it, so
+                # the retry must overwrite instead of colliding.
+                self.assertEqual(upload["with"].get("overwrite"), "true")
                 aggregate = jobs[aggregate_id]
                 self.assertEqual(aggregate.get("permissions"), {"contents": "read"})
                 self.assertIn("job-inputs", aggregate.get("needs", []))
@@ -4226,6 +4396,35 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(verify.get("env", {}).get("CI_TEST_LANE"), lane)
                 self.assertIn("run-test-partition.py", verify["run"])
                 self.assertIn('--lane "$CI_TEST_LANE" --verify-receipts', verify["run"])
+
+    def test_partition_receipt_upload_mutations_are_rejected(self):
+        jobs = self.workflows["check.yml"]["jobs"]
+        self.assertEqual(partition_receipt_upload_errors(jobs), [])
+        for lane, worker_id, _aggregate_id in PARTITION_LANES:
+            def upload_step(mutated, worker_id=worker_id):
+                return next(
+                    step for step in mutated[worker_id]["steps"]
+                    if step.get("name") == "Upload successful test partition receipt")
+
+            mutations = {
+                "overwrite removed": lambda m: upload_step(m)["with"].pop(
+                    "overwrite", None),
+                "overwrite disabled": lambda m: upload_step(m)["with"]
+                    .__setitem__("overwrite", "false"),
+                "name shared by every partition": lambda m: upload_step(m)["with"]
+                    .__setitem__("name", f"test-partition-{lane}"),
+                "missing receipt only warns": lambda m: upload_step(m)["with"]
+                    .__setitem__("if-no-files-found", "warn"),
+                "uploads another partition's receipt": lambda m: upload_step(m)["with"]
+                    .__setitem__("path", "${{ runner.temp }}/test-partition-receipts/"
+                                         f"{lane}-other.json"),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(lane=lane, label=label):
+                    changed = deepcopy(jobs)
+                    mutate(changed)
+                    self.assertTrue(
+                        partition_receipt_upload_errors(changed), label)
 
     def test_rust_test_container_pins_disposable_database_service_address(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests-partition"]

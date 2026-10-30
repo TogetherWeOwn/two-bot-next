@@ -8,6 +8,10 @@ Small execution interface for the two formerly monolithic test lanes:
   target/selector discovery algorithms are intentionally unspecified.
 * The same CLI with --partition ID executes exactly that partition. Missing,
   empty, unknown or repeated selections fail before executing tests.
+* A timeboxed command keeps one total deadline across its inventory
+  (--list compile/probe) and execution: time spent probing reduces the
+  execution allowance, an exhausted deadline or a subprocess timeout is
+  fatal with no success receipt, and non-timeboxed commands stay unbounded.
 * Worker steps have id: run_partition and literal env CI_TEST_LANE plus env
   CI_TEST_PARTITION: ${{ matrix.partition }} (job env is also accepted). Their
   real run: shell invokes the CLI. Matrices may be literal or fromJSON of a
@@ -25,13 +29,17 @@ No real compiler, database, network request, timing or LCOV-parity claim occurs.
 
 import importlib.util
 import json
+import os
 import re
 import shutil
 import shlex
+import subprocess
 import sys
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 from test_critical_path_support import (
     ROOT, Sandbox, assertions_message, ledger, metadata, resolved_env, run_coverage,
@@ -62,6 +70,14 @@ def evolving_inventory():
 def planner():
     spec = importlib.util.spec_from_file_location("critical_path_coverage_planner",
                                                  ROOT / "scripts/ci/plan-coverage-shards.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_runner():
+    spec = importlib.util.spec_from_file_location(
+        "critical_path_partition_runner", RUNNER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -485,6 +501,185 @@ class TestLanePartitionAcceptance(unittest.TestCase):
                 receipt = (self.sandbox.root / "test-partition-receipts"
                            / f"rust-tests-{partition}.json")
                 self.assertFalse(receipt.exists(), "preparation failure wrote a receipt")
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 10_000.0
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def monotonic(self):
+        return self.now
+
+    def monotonic_ns(self):
+        return int(self.now * 1_000_000_000)
+
+
+class _SubprocessRecorder:
+    """Records Cargo subprocess calls and advances a fake clock on probes."""
+
+    def __init__(self, *, inventory_advance=0.0, inventory_timeout=False,
+                 execution_timeout=False):
+        self.clock = _FakeClock()
+        self.calls = []
+        self._inventory_advance = inventory_advance
+        self._advanced = False
+        self._inventory_timeout = inventory_timeout
+        self._execution_timeout = execution_timeout
+
+    def run(self, argv, **kwargs):
+        argv = list(argv)
+        self.calls.append({
+            "argv": argv,
+            "timeout": kwargs.get("timeout"),
+            "env": kwargs.get("env") or {},
+        })
+        if "--list" in argv:
+            if not self._advanced:
+                self.clock.advance(self._inventory_advance)
+                self._advanced = True
+            if self._inventory_timeout:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="alive_fixture: test\n")
+        if self._execution_timeout and "alive" in argv:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return subprocess.CompletedProcess(argv, 0, stdout="")
+
+    def inventory_calls(self):
+        return [call for call in self.calls if "--list" in call["argv"]]
+
+    def execution_calls(self):
+        return [call for call in self.calls if "--list" not in call["argv"]]
+
+
+class PartitionRunnerTimeoutTests(unittest.TestCase):
+    """The 60-second `alive` bound covers inventory and execution together.
+
+    The old lane bound the whole compile/list/execute sequence; probing
+    the selected tests with `--list` compiles the same binary, so a
+    timeout that only starts at execution lets the probe hang unbounded
+    and then grants a second full budget. Deterministic only: a fake
+    clock and a subprocess recorder, never a real sleep or Cargo run.
+    """
+
+    def setUp(self):
+        self.runner = load_runner()
+
+    def patched(self, recorder):
+        clock = recorder.clock
+        return (
+            patch.object(self.runner.subprocess, "run", recorder.run),
+            patch.object(self.runner.time, "monotonic", clock.monotonic),
+            patch.object(self.runner.time, "monotonic_ns", clock.monotonic_ns),
+            patch.object(self.runner.time, "perf_counter", clock.monotonic),
+            patch.object(self.runner.time, "time", clock.monotonic),
+        )
+
+    def execute_other(self, recorder):
+        patches = self.patched(recorder)
+        for patched in patches:
+            patched.start()
+            self.addCleanup(patched.stop)
+        return self.runner.execute(self.runner.runtime_commands("other"))
+
+    def run_main_other(self, recorder, runner_temp):
+        receipt = (Path(runner_temp) / "test-partition-receipts"
+                   / "ignored-db-runtime-other.json")
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text("stale receipt from an earlier attempt\n")
+        argv = ["run-test-partition.py", "--lane", "ignored-db-runtime",
+                "--partition", "other"]
+        patches = self.patched(recorder) + (
+            patch.object(sys, "argv", argv),
+            patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}),
+        )
+        failure = None
+        for patched in patches:
+            patched.start()
+            self.addCleanup(patched.stop)
+        try:
+            self.runner.main()
+        except BaseException as exc:  # SystemExit is also a fatal outcome
+            failure = exc
+        return failure, receipt
+
+    def assert_fatal(self, failure):
+        self.assertIsNotNone(failure, "timeout path reported success")
+        if isinstance(failure, SystemExit):
+            self.assertNotEqual(failure.code, 0)
+
+    def test_alive_inventory_and_execution_share_one_deadline(self):
+        recorder = _SubprocessRecorder(inventory_advance=25.0)
+        seconds = self.execute_other(recorder)
+        self.assertEqual(seconds, 0.0)
+        inventory = [call for call in recorder.inventory_calls()
+                     if "alive" in call["argv"]]
+        self.assertTrue(inventory, "alive was never probed before execution")
+        probe = inventory[0]
+        self.assertEqual(
+            probe["argv"],
+            ["cargo", "test", "-p", "two-bot", "--locked", "--test", "alive",
+             "--", "--ignored", "--nocapture", "--list"])
+        self.assertIsNotNone(
+            probe["timeout"], "alive inventory probe ran without a timeout")
+        self.assertGreater(probe["timeout"], 0)
+        self.assertLessEqual(probe["timeout"], 60)
+        executions = recorder.execution_calls()
+        self.assertEqual(len(executions), 5)
+        alive = executions[0]
+        self.assertEqual(
+            alive["argv"],
+            ["cargo", "test", "-p", "two-bot", "--locked", "--test", "alive",
+             "--", "--ignored", "--nocapture"])
+        self.assertIsNotNone(alive["timeout"])
+        self.assertAlmostEqual(
+            alive["timeout"], 35.0, delta=1.0,
+            msg="execution kept a fresh 60 seconds after a 25-second probe "
+                "instead of the remainder of one total deadline")
+        # Non-timeboxed commands keep their unbounded shape and routing.
+        self.assertTrue(all(call["timeout"] is None
+                            for call in executions[1:]))
+        self.assertNotIn("TWO_TEST_DATABASE_URL", alive["env"])
+        self.assertTrue(
+            executions[1]["env"]["TWO_TEST_DATABASE_URL"].endswith(
+                "/two_bot_test_ci"),
+            "the restore_drill replay lost its disposable database")
+
+    def test_exhausted_alive_deadline_prevents_execution_and_receipt(self):
+        recorder = _SubprocessRecorder(inventory_advance=61.0)
+        with tempfile.TemporaryDirectory() as runner_temp:
+            failure, receipt = self.run_main_other(recorder, runner_temp)
+            self.assertFalse(receipt.exists(),
+                             "exhausted deadline left a success receipt")
+        self.assert_fatal(failure)
+        self.assertTrue(recorder.inventory_calls())
+        self.assertEqual(
+            recorder.execution_calls(), [],
+            "execution started after the total deadline was already spent")
+
+    def test_inventory_timeout_is_fatal_without_execution_or_receipt(self):
+        recorder = _SubprocessRecorder(inventory_timeout=True)
+        with tempfile.TemporaryDirectory() as runner_temp:
+            failure, receipt = self.run_main_other(recorder, runner_temp)
+            self.assertFalse(receipt.exists(),
+                             "inventory timeout left a success receipt")
+        self.assert_fatal(failure)
+        self.assertEqual(recorder.execution_calls(), [])
+
+    def test_execution_timeout_is_fatal_without_receipt_and_stops_lane(self):
+        recorder = _SubprocessRecorder(execution_timeout=True)
+        with tempfile.TemporaryDirectory() as runner_temp:
+            failure, receipt = self.run_main_other(recorder, runner_temp)
+            self.assertFalse(receipt.exists(),
+                             "execution timeout left a success receipt")
+        self.assert_fatal(failure)
+        executions = recorder.execution_calls()
+        self.assertEqual(len(executions), 1,
+                         "lane continued after the timed-out command")
+        self.assertIn("alive", executions[0]["argv"])
 
 
 if __name__ == "__main__":
