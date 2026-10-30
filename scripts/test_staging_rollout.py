@@ -1195,6 +1195,23 @@ class OrchestrationTests(OfflineTestCase):
                          {"TWO_DEPLOY_ENV": "staging",
                           rollout.VOICE_STALL_FAULT_VAR: "1",
                           rollout.UNPAIRED_FAULT_VAR: "1"})
+        # The injector is evaluated on keepalive ticks only, so an armed drill
+        # deploys with staging idle sleep off (keepalive back on); a plain
+        # deploy keeps the committed idle-sleep vars untouched.
+        idle = {"TWO_DEPLOY_ENV": "staging", rollout.KEEPALIVE_SWITCH_VAR: "0",
+                rollout.IDLE_SLEEP_AFTER_VAR: "15m"}
+        plain = cfg(staging_vars=dict(idle))
+        rollout.apply_remediation_fault_injection(plain, False, False)
+        self.assertEqual(plain["env"]["staging"]["vars"], idle)
+        for voice_stall, unpaired in ((True, False), (False, True), (True, True)):
+            with self.subTest(voice_stall=voice_stall, unpaired=unpaired):
+                armed = cfg(staging_vars=dict(idle), production_vars={"PRESERVED": "1"})
+                rollout.apply_remediation_fault_injection(armed, voice_stall, unpaired)
+                staging_vars = armed["env"]["staging"]["vars"]
+                self.assertNotIn(rollout.KEEPALIVE_SWITCH_VAR, staging_vars)
+                self.assertNotIn(rollout.IDLE_SLEEP_AFTER_VAR, staging_vars)
+                self.assertEqual(staging_vars["TWO_DEPLOY_ENV"], "staging")
+                self.assertEqual(armed["env"]["production"]["vars"], {"PRESERVED": "1"})
         # Enabled without the exact staging marker refuses.
         for staging_vars in (None, {}, {"TWO_DEPLOY_ENV": "production"}):
             with self.subTest(staging_vars=staging_vars):
@@ -2825,6 +2842,238 @@ class DeepNestingVerifyTests(OfflineTestCase):
         self.assertNotIn("Traceback", out)
         self.assertNotIn("[[[[[", out)
         self.assertFalse(Path(self.args.evidence).exists())
+
+
+class RemediationIdleOracleTests(unittest.TestCase):
+    """Independent oracle for the remediation-drill idle handling.
+
+    The helper-fence test above uses rollout constants for both fixture and
+    assertion; this oracle uses the real wrangler/wrangler.toml and independent
+    literal keys, and exercises the armed staging config through the actual
+    installed Wrangler resolution (unstable_readConfig, offline, no deploy).
+    Always-on is absence of both idle keys (keepalive on, sleepAfter 30m per
+    wrangler/test/staging-idle-sleep-config.test.ts), not invented values.
+    """
+
+    KEEPALIVE_KEY = "KEEPALIVE_ENABLED"
+    IDLE_AFTER_KEY = "IDLE_SLEEP_AFTER"
+    VOICE_FAULT_KEY = "TWO_VOICE_STALL_FAULT_INJECTION"
+    UNPAIRED_FAULT_KEY = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
+
+    def real_config(self):
+        root = Path(__file__).resolve().parent.parent
+        text = (root / "wrangler" / "wrangler.toml").read_text()
+        return tomllib.loads(text), text, root
+
+    def assert_armed_dict(self, armed):
+        staging_vars = armed["env"]["staging"]["vars"]
+        self.assertNotIn(self.KEEPALIVE_KEY, staging_vars)
+        self.assertNotIn(self.IDLE_AFTER_KEY, staging_vars)
+        self.assertEqual(staging_vars["TWO_DEPLOY_ENV"], "staging")
+        self.assertEqual(staging_vars["KEEPALIVE_SECONDS"], "60")
+        self.assertEqual(staging_vars["TWO_GUILD_NAME"], "TWO Staging")
+        prod_vars = armed["env"]["production"]["vars"]
+        self.assertEqual(prod_vars["TWO_GUILD_NAME"], "TogetherWeOwn")
+        self.assertEqual(prod_vars["KEEPALIVE_SECONDS"], "60")
+        self.assertNotIn(self.KEEPALIVE_KEY, prod_vars)
+        self.assertNotIn(self.IDLE_AFTER_KEY, prod_vars)
+        self.assertNotIn(self.VOICE_FAULT_KEY, prod_vars)
+        self.assertNotIn(self.UNPAIRED_FAULT_KEY, prod_vars)
+        top_vars = armed["vars"]
+        self.assertEqual(top_vars["KEEPALIVE_SECONDS"], "60")
+        self.assertNotIn(self.KEEPALIVE_KEY, top_vars)
+        self.assertNotIn(self.IDLE_AFTER_KEY, top_vars)
+
+    def test_armed_dict_uses_literals_and_preserves_real_vars(self):
+        config, _, _ = self.real_config()
+        self.assertEqual(config["env"]["staging"]["vars"][self.KEEPALIVE_KEY], "0")
+        self.assertEqual(config["env"]["staging"]["vars"][self.IDLE_AFTER_KEY], "15m")
+        for voice, unpaired in ((True, False), (False, True), (True, True)):
+            with self.subTest(voice=voice, unpaired=unpaired):
+                armed = copy.deepcopy(config)
+                rollout.apply_remediation_fault_injection(armed, voice, unpaired)
+                self.assert_armed_dict(armed)
+                staging_vars = armed["env"]["staging"]["vars"]
+                if voice:
+                    self.assertEqual(staging_vars[self.VOICE_FAULT_KEY], "1")
+                else:
+                    self.assertNotIn(self.VOICE_FAULT_KEY, staging_vars)
+                if unpaired:
+                    self.assertEqual(staging_vars[self.UNPAIRED_FAULT_KEY], "1")
+                else:
+                    self.assertNotIn(self.UNPAIRED_FAULT_KEY, staging_vars)
+
+    def resolve_via_wrangler(self, armed_dict, root):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "wrangler").mkdir()
+            config_path = base / "wrangler" / "wrangler.json"
+            config_path.write_text(json.dumps(armed_dict))
+            (base / "Dockerfile").write_text("FROM scratch\n")
+            code = (
+                "import { unstable_readConfig } from \"wrangler\";"
+                "const c=process.argv[1];"
+                "console.log(JSON.stringify({"
+                "s:unstable_readConfig({config:c,env:\"staging\"}).vars,"
+                "p:unstable_readConfig({config:c,env:\"production\"}).vars,"
+                "t:unstable_readConfig({config:c}).vars}));"
+            )
+            completed = subprocess.run(
+                ["node", "--input-type=module", "-e", code, str(config_path)],
+                cwd=str(root / "wrangler"),
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return json.loads(completed.stdout)
+
+    def test_armed_json_resolves_via_wrangler_to_always_on(self):
+        config, _, root = self.real_config()
+        armed = copy.deepcopy(config)
+        rollout.apply_remediation_fault_injection(armed, True, False)
+        resolved = self.resolve_via_wrangler(armed, root)
+        staging = resolved["s"]
+        self.assertNotIn(self.KEEPALIVE_KEY, staging)
+        self.assertNotIn(self.IDLE_AFTER_KEY, staging)
+        self.assertEqual(staging[self.VOICE_FAULT_KEY], "1")
+        self.assertEqual(staging["TWO_DEPLOY_ENV"], "staging")
+        self.assertEqual(staging, armed["env"]["staging"]["vars"])
+        self.assertEqual(resolved["p"], config["env"]["production"]["vars"])
+        self.assertEqual(resolved["t"], config["vars"])
+        with patch.object(rollout, "KEEPALIVE_SWITCH_VAR", "KEEPALIVE_ENABLEDD"):
+            mutant = copy.deepcopy(config)
+            rollout.apply_remediation_fault_injection(mutant, True, False)
+            mutant_resolved = self.resolve_via_wrangler(mutant, root)
+            self.assertIn(self.KEEPALIVE_KEY, mutant_resolved["s"])
+            self.assertEqual(mutant_resolved["s"][self.KEEPALIVE_KEY], "0")
+            with self.assertRaises(AssertionError):
+                self.assertNotIn(self.KEEPALIVE_KEY, mutant_resolved["s"])
+
+    def test_keepalive_switch_mutant_fails_literal_oracle(self):
+        # Mutant is in-memory only (patch); never a source write. Baseline
+        # removes the real literal key and passes; the mutant removes a
+        # misspelled key, leaving the real KEEPALIVE_ENABLED behind, so the
+        # literal oracle fails.
+        config, _, _ = self.real_config()
+        armed = copy.deepcopy(config)
+        rollout.apply_remediation_fault_injection(armed, True, False)
+        self.assert_armed_dict(armed)
+        with patch.object(rollout, "KEEPALIVE_SWITCH_VAR", "KEEPALIVE_ENABLEDD"):
+            mutant = copy.deepcopy(config)
+            rollout.apply_remediation_fault_injection(mutant, True, False)
+            staging_vars = mutant["env"]["staging"]["vars"]
+            self.assertIn(self.KEEPALIVE_KEY, staging_vars)
+            self.assertEqual(staging_vars[self.KEEPALIVE_KEY], "0")
+            with self.assertRaises(AssertionError):
+                self.assertNotIn(self.KEEPALIVE_KEY, staging_vars)
+            with self.assertRaises(AssertionError):
+                self.assert_armed_dict(mutant)
+
+
+class IdleDrillLifecycleTests(OfflineTestCase):
+    """Script-half arm wire + preservation (minimal, non-mirroring).
+
+    Arm (prepare with a remediation-drill flag) enables keepalive by removing
+    the staging idle-sleep vars so keepalive ticks evaluate the injector; while
+    armed, idle STOP is suppressed. Runtime covers persisted STOP/clear/reset/
+    rearm including non-renewing observer and explicit monitored-clear; this
+    class constrains only arm output and preservation with independent literals.
+    Config only, never automatic remediation execution; never production.
+    """
+
+    KEEPALIVE_KEY = "KEEPALIVE_ENABLED"
+    IDLE_AFTER_KEY = "IDLE_SLEEP_AFTER"
+    VOICE_FAULT_KEY = "TWO_VOICE_STALL_FAULT_INJECTION"
+    UNPAIRED_FAULT_KEY = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = Path(__file__).resolve().parent.parent
+        self.real_text = (self.repo / "wrangler" / "wrangler.toml").read_text()
+        self.clock = FakeClock()
+        self.enterContext(patch.dict(os.environ, ENVIRONMENT, clear=True))
+        self.enterContext(patch.object(rollout.time, "time", return_value=STARTED))
+        self.enterContext(patch.object(rollout.time, "monotonic", side_effect=self.clock.monotonic))
+        self.enterContext(patch.object(rollout.time, "sleep", side_effect=self.clock.sleep))
+        self.stdout = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.stderr = self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+        self.enterContext(patch.object(rollout, "docker_image", return_value=IMAGE))
+
+    def make_dir(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = root / "wrangler" / "wrangler.toml"
+        config.parent.mkdir()
+        config.write_text(self.real_text)
+        args = argparse.Namespace(
+            config=str(config), deploy_config=str(root / "deploy.json"),
+            receipt=str(root / "baseline.json"), output=str(root / "deploy.ndjson"),
+            evidence=str(root / "evidence.json"),
+        )
+        return root, args
+
+    def prepare(self, args, voice=False, unpaired=False):
+        args.inject_voice_stall = voice
+        args.inject_unpaired_disconnect = unpaired
+        client = FakeClient({APP_PATH: [[app(OLD_IMAGE)]], ROWS_PATH: [[old_row()]]})
+        rollout.prepare(args, client)
+        return json.loads(Path(args.deploy_config).read_text())
+
+    def assert_armed_staging(self, generated):
+        staging_vars = generated["env"]["staging"]["vars"]
+        self.assertNotIn(self.KEEPALIVE_KEY, staging_vars)
+        self.assertNotIn(self.IDLE_AFTER_KEY, staging_vars)
+        self.assertEqual(staging_vars["TWO_DEPLOY_ENV"], "staging")
+        self.assertEqual(staging_vars["KEEPALIVE_SECONDS"], "60")
+        self.assertEqual(staging_vars["TWO_GUILD_NAME"], "TWO Staging")
+
+    def assert_production_untouched(self, generated):
+        prod_vars = generated["env"]["production"]["vars"]
+        self.assertEqual(prod_vars["TWO_GUILD_NAME"], "TogetherWeOwn")
+        self.assertEqual(prod_vars["KEEPALIVE_SECONDS"], "60")
+        self.assertNotIn(self.KEEPALIVE_KEY, prod_vars)
+        self.assertNotIn(self.IDLE_AFTER_KEY, prod_vars)
+        self.assertNotIn(self.VOICE_FAULT_KEY, prod_vars)
+        self.assertNotIn(self.UNPAIRED_FAULT_KEY, prod_vars)
+
+    def test_arm_enables_keepalive_and_suppresses_stop(self):
+        _, args = self.make_dir()
+        for voice, unpaired, fault_key in (
+            (True, False, self.VOICE_FAULT_KEY),
+            (False, True, self.UNPAIRED_FAULT_KEY),
+        ):
+            with self.subTest(voice=voice, unpaired=unpaired):
+                generated = self.prepare(args, voice=voice, unpaired=unpaired)
+                self.assert_armed_staging(generated)
+                staging_vars = generated["env"]["staging"]["vars"]
+                self.assertEqual(staging_vars[fault_key], "1")
+                self.assert_production_untouched(generated)
+
+    def test_armed_fault_persists_in_deploy_config_across_deployment(self):
+        _, args = self.make_dir()
+        generated = self.prepare(args, voice=True, unpaired=False)
+        staging_vars = generated["env"]["staging"]["vars"]
+        self.assertEqual(staging_vars[self.VOICE_FAULT_KEY], "1")
+        self.assertNotIn(self.KEEPALIVE_KEY, staging_vars)
+        self.assertNotIn(self.IDLE_AFTER_KEY, staging_vars)
+        persisted = json.loads(Path(args.deploy_config).read_text())
+        self.assertEqual(persisted["env"]["staging"]["vars"][self.VOICE_FAULT_KEY], "1")
+        self.assertNotIn(self.KEEPALIVE_KEY, persisted["env"]["staging"]["vars"])
+
+    def test_rearm_works(self):
+        _, args = self.make_dir()
+        first = self.prepare(args, voice=True, unpaired=False)
+        self.assert_armed_staging(first)
+        second = self.prepare(args, voice=False, unpaired=True)
+        self.assert_armed_staging(second)
+        self.assertEqual(second["env"]["staging"]["vars"][self.UNPAIRED_FAULT_KEY], "1")
+
+    def test_no_production_change_and_no_source_mutation(self):
+        root, args = self.make_dir()
+        generated = self.prepare(args, voice=True, unpaired=True)
+        self.assert_production_untouched(generated)
+        top_vars = generated.get("vars", {})
+        self.assertNotIn(self.VOICE_FAULT_KEY, top_vars)
+        self.assertNotIn(self.UNPAIRED_FAULT_KEY, top_vars)
+        self.assertEqual((root / "wrangler" / "wrangler.toml").read_text(), self.real_text)
 
 
 if __name__ == "__main__":

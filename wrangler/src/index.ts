@@ -7,6 +7,8 @@
  * The keepalive below prevents that: every KEEPALIVE_SECONDS the DO wakes
  * itself via schedule() (never a raw alarm() override — the Container base
  * class owns alarm()), renews the activity timeout, and probes /readyz.
+ * Staging sets KEEPALIVE_ENABLED = "0" so its idle container sleeps instead;
+ * an inbound probe wakes it on demand (see sleepAfterFor below).
  * Inbound fetches to /health and /readyz are proxied to the container
  * (renewing activity implicitly); everything else 404s.
  *
@@ -167,6 +169,12 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
+  /** Staging-only: exactly "0" turns the keepalive off so an idle container
+   * sleeps. Anything else, absence included (production), keeps it on. */
+  KEEPALIVE_ENABLED?: string;
+  /** Staging-only idle window ("5m".."60m") used only while the keepalive is
+   * off; anything else falls back to DEFAULT_IDLE_SLEEP_AFTER. */
+  IDLE_SLEEP_AFTER?: string;
   /** Consecutive failed probes; default covers ~2 minutes of keepalive ticks. */
   UNREADY_ALERT_FAILURES?: string;
   /** Optional Worker secret; never forwarded to the container or logged. */
@@ -393,6 +401,28 @@ const KEEPALIVE_FORWARDING_CUTOFF_MS = 24_000;
 
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
+/** sleepAfter while the keepalive runs: belt and braces, so a missed tick or
+ * two never costs the gateway session. Unchanged by the idle-sleep switch. */
+export const KEEPALIVE_SLEEP_AFTER = "30m";
+/** Idle window when an environment turns the keepalive off (staging). It
+ * outlasts the post-deploy voice synthetic (a 10-minute job that sends no
+ * Worker traffic) after the last deploy-gate request, and a cold start plus
+ * gateway connect takes about two minutes, so shorter windows would thrash. */
+export const DEFAULT_IDLE_SLEEP_AFTER = "15m";
+const IDLE_SLEEP_AFTER_PATTERN = /^(?:[5-9]|[1-5][0-9]|60)m$/;
+
+/** Only an exact "0" turns the keepalive off; a typo keeps production safe. */
+export function keepaliveEnabled(env: Pick<Env, "KEEPALIVE_ENABLED">): boolean {
+  return env.KEEPALIVE_ENABLED !== "0";
+}
+
+/** The SDK sleepAfter for this environment. Must always parse: an invalid
+ * time expression would throw inside the SDK's constructor gate. */
+export function sleepAfterFor(env: Pick<Env, "KEEPALIVE_ENABLED" | "IDLE_SLEEP_AFTER">): string {
+  if (keepaliveEnabled(env)) return KEEPALIVE_SLEEP_AFTER;
+  const raw = env.IDLE_SLEEP_AFTER;
+  return typeof raw === "string" && IDLE_SLEEP_AFTER_PATTERN.test(raw) ? raw : DEFAULT_IDLE_SLEEP_AFTER;
+}
 const DEFAULT_UNREADY_SECONDS = 120;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
@@ -824,7 +854,10 @@ export class TwoBotContainer extends Container<Env> {
   override defaultPort = containerPort(this.env.BOT_PORT);
   // Belt and braces: the schedule() keepalive below is the primary guard;
   // a long sleepAfter means a missed tick or two never costs the session.
-  sleepAfter = "30m";
+  // With the keepalive off (staging idle sleep) only inbound requests renew
+  // activity, so the container stops after the shorter idle window and the
+  // next owned probe (/health, /readyz, ops reads) starts it again.
+  sleepAfter = sleepAfterFor(this.env);
   pingEndpoint = "health";
   // SDK auto-start (containerFetch -> startAndWaitForPorts) bypasses start().
   // Class defaults feed every startup path; explicit envVars replace them.
@@ -1403,6 +1436,11 @@ export class TwoBotContainer extends Container<Env> {
   /** One persisted chain, with ownership checked outside fail-open monitoring. */
   private async armKeepalive(): Promise<void> {
     const owner = await this.ownership.require(this.id());
+    if (!keepaliveEnabled(this.env)) {
+      // Idle sleep: never arm, and drain any chain an earlier version left.
+      this.deleteSchedules("keepalive");
+      return;
+    }
     if (this.keepaliveRunning) return;
     if (this.keepaliveArming) return this.keepaliveArming;
     // SDK 0.3.7 inserts a new row on every schedule() call. An old epoch's
@@ -1436,6 +1474,11 @@ export class TwoBotContainer extends Container<Env> {
   public async keepalive(payload: KeepalivePayload, schedule?: { taskId: string }): Promise<void> {
     // The SDK can pass undefined for rows deleted from its due-task snapshot.
     if (!schedule || this.keepaliveRunning) return;
+    if (!keepaliveEnabled(this.env)) {
+      // Idle sleep: a leftover tick neither probes, renews activity nor rearms.
+      this.deleteSchedules("keepalive");
+      return;
+    }
     this.keepaliveRunning = true;
     try {
       await this.owned(async () => {

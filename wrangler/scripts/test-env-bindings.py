@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location(
@@ -83,8 +84,47 @@ class AlertBindingTests(unittest.TestCase):
                 self.assertTrue(any("positive safe-integer string" in e for e in self.check_config(config)))
 
     def test_optional_handling_does_not_weaken_required_bindings(self):
-        config = BASE.replace('KEEPALIVE_SECONDS = "60"\nTWO_GUILD_NAME', "TWO_GUILD_NAME", 1)
-        self.assertTrue(any("missing vars ['KEEPALIVE_SECONDS']" in e for e in self.check_config(config)))
+        # Removal is scoped to [env.staging.vars] only: the old first-adjacency
+        # replace now hits production (staging has idle-sleep lines between
+        # KEEPALIVE_SECONDS and TWO_GUILD_NAME). Staging must report the
+        # literal missing key with a staging prefix while production and the
+        # top level retain it.
+        self.assertEqual(self.check_config(BASE), [])
+        prefix, rest = BASE.split("[env.staging.vars]", 1)
+        staging_body, suffix = rest.split("\n[", 1)
+        suffix = "\n[" + suffix
+        self.assertIn('KEEPALIVE_SECONDS = "60"', staging_body)
+        staging_body = staging_body.replace('KEEPALIVE_SECONDS = "60"\n', "", 1)
+        self.assertNotIn("KEEPALIVE_SECONDS", staging_body)
+        config = prefix + "[env.staging.vars]" + staging_body + suffix
+        prod_body = config.split("[env.production.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('KEEPALIVE_SECONDS = "60"', prod_body)
+        self.assertIn('KEEPALIVE_SECONDS = "60"', prefix)
+        errors = self.check_config(config)
+        staging_missing = [
+            e for e in errors
+            if "[env.staging]" in e and "missing vars ['KEEPALIVE_SECONDS']" in e
+        ]
+        self.assertEqual(len(staging_missing), 1, errors)
+        prod_missing = [e for e in errors if "[env.production]" in e and "missing vars" in e]
+        self.assertEqual(prod_missing, [], errors)
+
+    def test_staging_missing_vars_suppression_is_detected(self):
+        # Control for the staging-scoped required-bindings test: patch the
+        # checker to suppress only staging missing-vars diagnostics, run the
+        # existing oracle, and assert it raises. Mutant is in-memory only via
+        # patch; no source writes. Proves the oracle itself detects suppression,
+        # not just that filtering changes an array.
+        real_check = checker.check
+
+        def suppress_staging_missing(path):
+            errors = real_check(path)
+            return [e for e in errors if not ("[env.staging]" in e and "missing vars" in e)]
+
+        with patch.object(checker, "check", side_effect=suppress_staging_missing):
+            with self.assertRaises(AssertionError):
+                self.test_optional_handling_does_not_weaken_required_bindings()
+        self.test_optional_handling_does_not_weaken_required_bindings()
 
     def test_ingress_is_staging_only_and_deployed_dark(self):
         staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
@@ -242,6 +282,41 @@ class AlertBindingTests(unittest.TestCase):
                         errors,
                     )
         self.assertEqual(self.check_config(BASE), [])
+
+    def test_idle_sleep_is_staging_only(self):
+        # Staging idle sleep: production keeps the always-on keepalive, so
+        # neither switch may appear at the top level (required everywhere)
+        # or in the production vars table.
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('KEEPALIVE_ENABLED = "0"', staging)
+        self.assertIn('IDLE_SLEEP_AFTER = "15m"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for key, value in [("KEEPALIVE_ENABLED", '"0"'), ("IDLE_SLEEP_AFTER", '"15m"')]:
+            for section in ["vars", "env.production.vars"]:
+                with self.subTest(key=key, section=section):
+                    config = BASE.replace(f"[{section}]", f"[{section}]\n{key} = {value}", 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(any(f"{key} is staging-only" in e for e in errors), errors)
+        # Absent from staging is fine: the keepalive simply stays on (rollback).
+        rollback = BASE.replace('KEEPALIVE_ENABLED = "0"\n', "").replace('IDLE_SLEEP_AFTER = "15m"\n', "")
+        self.assertEqual(self.check_config(rollback), [])
+
+    def test_idle_sleep_values_are_exact(self):
+        for value in ['"1"', '"false"', '"off"', '""', '"0 "', "0", "false"]:
+            with self.subTest(value=value):
+                config = BASE.replace('KEEPALIVE_ENABLED = "0"', f"KEEPALIVE_ENABLED = {value}")
+                self.assertTrue(any('KEEPALIVE_ENABLED must be exactly "0"' in e for e in self.check_config(config)))
+        for value in ['"4m"', '"61m"', '"1h"', '"900s"', '"15"', '""', '"015m"', "15"]:
+            with self.subTest(value=value):
+                config = BASE.replace('IDLE_SLEEP_AFTER = "15m"', f"IDLE_SLEEP_AFTER = {value}")
+                self.assertTrue(any("IDLE_SLEEP_AFTER must be" in e for e in self.check_config(config)))
+        for value in ['"5m"', '"60m"']:
+            with self.subTest(value=value):
+                config = BASE.replace('IDLE_SLEEP_AFTER = "15m"', f"IDLE_SLEEP_AFTER = {value}")
+                self.assertEqual(self.check_config(config), [])
+        # The idle window means nothing while the keepalive runs.
+        orphan = BASE.replace('KEEPALIVE_ENABLED = "0"\n', "")
+        self.assertTrue(any("IDLE_SLEEP_AFTER needs KEEPALIVE_ENABLED" in e for e in self.check_config(orphan)))
 
     def test_dashboard_secrets_are_never_toml_vars(self):
         # TOG-22861: the dashboard service-token pair gates human access; a

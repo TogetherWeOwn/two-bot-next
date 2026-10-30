@@ -17,6 +17,7 @@ Usage: python3 scripts/check-env-bindings.py [wrangler.toml]
 Exit 1 lists the missing keys per environment.
 """
 
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -124,6 +125,15 @@ OPS_KILLSWITCH_ENVS = {"staging"}
 DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
 DEPLOY_ENV_ENVS = {"staging"}
 GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+# Staging idle sleep (owner decision 2026-10-27): exactly "0" turns the
+# always-on keepalive off so an idle staging container stops after
+# IDLE_SLEEP_AFTER (whole minutes, 5-60). Production keeps the keepalive: a
+# top-level var would be required in every environment, so both are denied
+# there too, and production must never carry them.
+KEEPALIVE_SWITCH_VAR = "KEEPALIVE_ENABLED"
+IDLE_SLEEP_AFTER_VAR = "IDLE_SLEEP_AFTER"
+IDLE_SLEEP_ENVS = {"staging"}
+IDLE_SLEEP_AFTER_PATTERN = re.compile(r"(?:[5-9]|[1-5][0-9]|60)m")
 # Remediation-drill fence (staging fault injector): the same generated-only
 # rule as the rollback-drill switch above. Either switch committed anywhere —
 # staging included — fails; only the generated per-deploy staging config from
@@ -253,6 +263,20 @@ def _collect_errors(cfg: dict) -> list[str]:
                 f"{prefix}: {DEPLOY_ENV_VAR} is staging-only "
                 "(top-level vars are required in every env; production must never carry the staging fence marker)"
             )
+        for key in (KEEPALIVE_SWITCH_VAR, IDLE_SLEEP_AFTER_VAR):
+            if key in variables and env_name not in IDLE_SLEEP_ENVS:
+                errors.append(
+                    f"{prefix}: {key} is staging-only "
+                    "(top-level vars are required in every env; production keeps the keepalive on)"
+                )
+        if variables.get(KEEPALIVE_SWITCH_VAR, "0") != "0":
+            errors.append(f'{prefix}: {KEEPALIVE_SWITCH_VAR} must be exactly "0" or absent')
+        if IDLE_SLEEP_AFTER_VAR in variables:
+            idle = variables[IDLE_SLEEP_AFTER_VAR]
+            if not isinstance(idle, str) or not IDLE_SLEEP_AFTER_PATTERN.fullmatch(idle):
+                errors.append(f'{prefix}: {IDLE_SLEEP_AFTER_VAR} must be whole minutes "5m" to "60m"')
+            if variables.get(KEEPALIVE_SWITCH_VAR) != "0":
+                errors.append(f'{prefix}: {IDLE_SLEEP_AFTER_VAR} needs {KEEPALIVE_SWITCH_VAR} = "0"')
         if variables.get(DEPLOY_ENV_VAR, "staging") != "staging":
             errors.append(f'{prefix}: {DEPLOY_ENV_VAR} must be exactly "staging" or absent')
         if GATEWAY_FAIL_INJECTION_VAR in variables:
