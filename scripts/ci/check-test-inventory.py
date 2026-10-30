@@ -286,17 +286,13 @@ def routed_targets(*workflow_texts):
     return routed, executable_texts
 
 
-def built_targets(*workflow_texts):
-    """Return ``--test`` targets a Cargo ``--no-run`` build names.
-
-    A build is ownership for an ordinary target but never execution credit for
-    an ``#[ignore]``d one, which only an executed ``--test`` run can own.
-    """
-    return _scan_targets(*workflow_texts)[1]
-
-
 def _scan_targets(*workflow_texts):
-    """Return (executed targets, build-only targets, executable texts)."""
+    """Return (executed targets, build-only targets, executable texts).
+
+    A ``--no-run`` build is ownership for an ordinary target but never
+    execution credit for an ``#[ignore]``d one, which only an executed
+    ``--test`` run can own.
+    """
     executed = set()
     built = set()
     executable_texts = []
