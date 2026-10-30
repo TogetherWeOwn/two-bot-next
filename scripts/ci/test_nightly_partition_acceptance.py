@@ -3,6 +3,7 @@
 
 import ast
 from collections import Counter
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -1007,6 +1009,88 @@ class WorkflowAcceptance(CargoFixture):
             self.assertTrue(failed, "missing acceptance file was silently accepted as zero tests")
 
 
+class RealCargoHarnessAcceptance(unittest.TestCase):
+    def exercise_real_suite_offline(self, *, refuse=False):
+        # Replace only build admission and Cargo, not the harness or real runner.
+        with tempfile.TemporaryDirectory(prefix="nightly-harness-acceptance-") as directory:
+            temporary = Path(directory)
+            root = temporary / "repo"
+            (root / "scripts").mkdir(parents=True)
+            (root / "rust-toolchain.toml").write_bytes((ROOT / "rust-toolchain.toml").read_bytes())
+            real_bin = temporary / "original-path"
+            real_bin.mkdir()
+            cargo = real_bin / "cargo"
+            fake = FAKE_CARGO.replace(
+                'args = sys.argv[1:]',
+                'if "fn main(_argument: i32)" in Path("ordinary.rs").read_text():\n'
+                '    fixture["targets"][-1]["normal_compile_error"] = "E0580"\n'
+                'args = sys.argv[1:]')
+            fake = fake.replace(
+                '            record(event)\n',
+                '            record(event)\n'
+                '            if test["name"] == "eligible_test":\n'
+                '                print("ELIGIBLE_EXAMPLE_TEST_RAN")\n'
+                '                if os.environ.get("NIGHTLY_EXAMPLE_MARKER"):\n'
+                '                    with Path(os.environ["NIGHTLY_EXAMPLE_MARKER"]).open("a") as marker:\n'
+                '                        marker.write("eligible\\n")\n')
+            cargo.write_text(fake)
+            cargo.chmod(0o755)
+            wrapper = root / "scripts/cargo_cache.py"
+            wrapper.write_text(
+                f'#!{sys.executable}\nimport json, os, pathlib, subprocess, sys\n'
+                'with pathlib.Path(os.environ["NIGHTLY_POOL_LEDGER"]).open("a") as log:\n'
+                '    log.write(json.dumps({"args": sys.argv[1:], "path": os.environ["PATH"]}) + "\\n")\n'
+                'if sys.argv[1:3] != ["run", "--"]: sys.exit(97)\n'
+                'if os.environ["NIGHTLY_POOL_REFUSE"] == "1":\n'
+                '    print("fixture bounded pool refused admission", file=sys.stderr)\n'
+                '    sys.exit(75)\n'
+                f'if os.environ["PATH"].split(os.pathsep)[0] != {str(real_bin)!r}: sys.exit(96)\n'
+                'sys.exit(subprocess.run(["cargo", *sys.argv[3:]]).returncode)\n')
+            inventory = temporary / "fixture.json"
+            inventory.write_text(json.dumps({
+                "targets": [
+                    {"id": "fixture:lib", "kind": "lib", "tests": [{"name": "unit"}]},
+                    {"id": "fixture:eligible", "kind": "example", "test": True,
+                     "tests": [{"name": "eligible_test"}]},
+                    {"id": "fixture:ordinary", "kind": "example", "tests": [{"name": "ordinary_test"}]},
+                ], "doctests": [],
+            }))
+            ledger = temporary / "cargo.jsonl"
+            pool_ledger = temporary / "pool.jsonl"
+            environment = {
+                "PATH": str(real_bin) + os.pathsep + os.environ["PATH"],
+                "NIGHTLY_FIXTURE": str(inventory), "NIGHTLY_LEDGER": str(ledger),
+                "NIGHTLY_POOL_LEDGER": str(pool_ledger), "NIGHTLY_POOL_REFUSE": "1" if refuse else "0",
+            }
+            output = io.StringIO()
+            with patch.dict(globals(), {"ROOT": root}), patch.dict(os.environ, environment):
+                with patch("sys.stdout", output):
+                    result = unittest.TextTestRunner(stream=output, verbosity=2).run(real_cargo_suite())
+            events = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+            admissions = [json.loads(line) for line in pool_ledger.read_text().splitlines()] if pool_ledger.exists() else []
+            return result, output.getvalue(), events, admissions
+
+    def test_real_cargo_harness_uses_the_supported_interface_without_compiling(self):
+        result, output, events, admissions = self.exercise_real_suite_offline()
+        self.assertTrue(result.wasSuccessful(), output)
+        commands = [event for event in events if event["event"] == "command"]
+        self.assertEqual(len(admissions), len(commands), "every Cargo call must pass through bounded admission")
+        self.assertGreater(len(admissions), 4, "exercise baseline, partitioned execution and both invalid-example paths")
+        executions = Counter(event["name"] for event in events if event["event"] == "execute")
+        self.assertEqual(executions, Counter({"unit": 2, "eligible_test": 2}), output)
+        self.assertIn("E0580", output)
+        self.assertNotIn("expected the unchanged nightly cargo test command", output)
+
+    def test_real_cargo_harness_stops_after_one_refused_admission(self):
+        result, output, events, admissions = self.exercise_real_suite_offline(refuse=True)
+        self.assertFalse(result.wasSuccessful(), "pool refusal must not become a green integration test")
+        self.assertEqual(len(result.failures), 1, output)
+        self.assertEqual(len(result.errors), 0, output)
+        self.assertIn("bounded Cargo pool refused admission", output)
+        self.assertEqual(len(admissions), 1, "refusal must not trigger retries or a fallback")
+        self.assertFalse(events, "no compiler may run after refused admission")
+
+
 def real_cargo_suite():
     """Explicit integration mode: every compilation uses the existing bounded pool."""
     class RealCargoExamples(unittest.TestCase):
@@ -1030,23 +1114,34 @@ def real_cargo_suite():
                     '#[test]\nfn ordinary_test() { panic!("ORDINARY_TEST_MUST_NOT_RUN"); }\n')
                 (temporary / "eligible.rs").write_text(
                     'fn main() { panic!("ELIGIBLE_MAIN_MUST_NOT_RUN"); }\n'
-                    '#[test]\nfn eligible_test() { println!("ELIGIBLE_EXAMPLE_TEST_RAN"); }\n')
+                    '#[test]\nfn eligible_test() {\n'
+                    '    use std::io::Write;\n'
+                    '    let path = std::env::var("NIGHTLY_EXAMPLE_MARKER").expect("fixture marker path");\n'
+                    '    let mut marker = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();\n'
+                    '    writeln!(marker, "eligible").unwrap();\n'
+                    '}\n')
                 refused = temporary / "pool-refused"
-                cargo = temporary / "pooled-cargo"
+                marker = temporary / "example-executions"
+                cargo = temporary / "bin/cargo"
+                cargo.parent.mkdir()
+                # Admission must resolve Cargo on the original PATH, not recurse into this shim.
                 cargo.write_text(
-                    f'#!{sys.executable}\nimport pathlib, subprocess, sys\n'
-                    f'result = subprocess.run([{sys.executable!r}, {str(wrapper)!r}, "run", "--", *sys.argv[1:]])\n'
+                    f'#!{sys.executable}\nimport os, pathlib, subprocess, sys\n'
+                    'environment = os.environ.copy()\n'
+                    f'environment["PATH"] = {os.environ["PATH"]!r}\n'
+                    f'result = subprocess.run([{sys.executable!r}, {str(wrapper)!r}, "run", "--", *sys.argv[1:]], env=environment)\n'
                     f'if result.returncode == 75: pathlib.Path({str(refused)!r}).touch()\n'
                     'sys.exit(result.returncode)\n')
                 cargo.chmod(0o755)
-                arguments = ["test", *CARGO_FLAGS, "--manifest-path", "Cargo.toml", "--",
-                             "--include-ignored", "--test-threads=1", "--nocapture"]
-                original = [str(cargo), *arguments]
+                environment = os.environ.copy()
+                environment["PATH"] = str(cargo.parent) + os.pathsep + environment["PATH"]
+                environment["NIGHTLY_EXAMPLE_MARKER"] = str(marker)
+                original = ["cargo", "test", *CARGO_FLAGS, "--", "--include-ignored", "--test-threads=1"]
                 partitioned = [sys.executable, str(RUNNER), "--index", "0", "--count", "1", "--", *original]
 
                 def run(command):
                     print("real-Cargo command:", shlex.join(command), flush=True)
-                    result = subprocess.run(command, cwd=temporary, env=os.environ.copy(),
+                    result = subprocess.run(command, cwd=temporary, env=environment,
                                             text=True, capture_output=True, timeout=180)
                     output = result.stdout + result.stderr
                     print("real-Cargo exit:", result.returncode, flush=True)
@@ -1059,12 +1154,13 @@ def real_cargo_suite():
 
                 baseline, output = run(original)
                 self.assertEqual(baseline.returncode, 0, output)
-                self.assertIn("ELIGIBLE_EXAMPLE_TEST_RAN", output)
+                self.assertTrue(marker.is_file(), "manifest test=true example did not execute")
+                self.assertEqual(marker.read_text().splitlines(), ["eligible"], output)
                 self.assertNotIn("ORDINARY_TEST_MUST_NOT_RUN", output)
                 result, output = run(partitioned)
                 with self.subTest(example="valid default selection"):
                     self.assertEqual(result.returncode, 0, output)
-                    self.assertEqual(output.count("ELIGIBLE_EXAMPLE_TEST_RAN"), 1, output)
+                    self.assertEqual(marker.read_text().splitlines(), ["eligible", "eligible"], output)
                     self.assertNotIn("ORDINARY_TEST_MUST_NOT_RUN", output)
 
                 ordinary.write_text('fn main(_argument: i32) {}\n')
