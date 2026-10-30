@@ -102,10 +102,12 @@ all-feature, ignored-test selection with its existing skip filters. Each unique
 libtest name belongs to `sha256(name)[:8] % 4` (big-endian), including equal names
 across different targets. Exact positive filters prevent prefix-sharing names
 from leaking into or being lost between partitions. Libraries, binaries,
-integration tests and examples retain one thread; batches bound command-line
-size. Inventory, compile and test failures are fatal, and empty partitions are
-not success. Doctests use the original filters once on partition 0 because
-rustdoc splits whitespace in names. All guarded-URL replays, backup roundtrip,
+integration tests and manifest `test = true` examples retain one thread; batches
+bound command-line size. Partition 0 first compiles the original default targets
+with `cargo test --no-run`, preserving ordinary example executable checks without
+running those examples as tests. Inventory, compile and test failures are fatal,
+and empty partitions are not success. Doctests use the original filters once on
+partition 0 because rustdoc splits whitespace in names. All guarded-URL replays, backup roundtrip,
 backup publication and `cargo doc -D warnings` also run once on partition 0.
 The matrix does not fail fast, and `sweep-result` requires all four successful
 legs; skipped, cancelled and failed legs cannot satisfy it.

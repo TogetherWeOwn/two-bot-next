@@ -59,9 +59,14 @@ def run_partition(command, index, count):
     separator = command.index("--")
     cargo = command[:separator]
     harness = command[separator + 1:]
+    # Compile the original default targets once, including ordinary examples.
+    # Forcing --examples into test mode hides invalid ordinary main signatures.
+    if index == 0:
+        subprocess.run(cargo + ["--no-run"], check=True)
+    # --tests retains manifest test=true examples without executing normal ones.
     # The caller retains workspace/all-feature/locked/no-fail-fast and serial
     # ignored-test flags. Only target selection and exact filters are added.
-    tests = cargo + ["--lib", "--bins", "--tests", "--examples", "--"] + harness
+    tests = cargo + ["--lib", "--bins", "--tests", "--"] + harness
     start = time.monotonic()
     probe = subprocess.run(tests + ["--list", "--format", "terse"],
                            check=True, stdout=subprocess.PIPE, text=True)
