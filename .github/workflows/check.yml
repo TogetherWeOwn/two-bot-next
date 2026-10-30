@@ -3401,8 +3401,8 @@ jobs:
         if: needs.job-inputs.outputs.worker != 'false'
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: wrangler/package-lock.json
+          # A throttled optional cache restore must not consume the job deadline.
+          package-manager-cache: false
       - name: Audit Worker dependencies (high/critical gate)
         if: needs.job-inputs.outputs.worker != 'false'
         run: npm audit --audit-level=high --include=dev --json
