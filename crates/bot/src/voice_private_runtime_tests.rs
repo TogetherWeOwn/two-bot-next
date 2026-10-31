@@ -1294,13 +1294,13 @@ async fn myroom_private_state_requires_the_guild_everyone_deny() {
             Permissions::CONNECT,
         )],
     );
-    let worker = GuildRoomWorker::load(live.clone(), store.clone(), http.clone())
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
         .await
         .unwrap();
     assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![(ROOM, false)]));
-    // The matching everyone deny is what makes the room private.
+    // The matching everyone deny is what makes the room private. The worker
+    // shares the same live state, so the second read sees the update.
     set_room_overwrites(&live, bot_and_everyone_overwrites(true));
-    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![(ROOM, true)]));
 }
 
