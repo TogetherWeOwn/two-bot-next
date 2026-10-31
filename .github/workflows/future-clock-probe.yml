@@ -19,6 +19,12 @@ jobs:
     if: github.head_ref == 'test/fixture-relative-clocks'
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    # +0d is the control: the same harness at today's clock. Only failures
+    # unique to +365d are clock-sensitive.
+    strategy:
+      fail-fast: false
+      matrix:
+        offset: ['+0d', '+365d']
     permissions:
       contents: read
     env:
@@ -34,7 +40,7 @@ jobs:
       TWO_DATABASE_TLS: local-only
       # A shared offset, not an absolute start: '@' restarts each process's clock
       # at launch, skewing the test binaries against the long-running Postgres.
-      FAKE_AT: '+365d'
+      FAKE_AT: ${{ matrix.offset }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,7 +92,7 @@ jobs:
 
       # Cargo/rustc hang under libfaketime, so run each built test binary
       # directly (cwd and CARGO_MANIFEST_DIR as cargo test sets them).
-      - name: Run suite at 2027-10-31
+      - name: Run suite at offset ${{ matrix.offset }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
