@@ -141,8 +141,9 @@ cargo test --workspace --locked
 
 Generate `docs/generated/commands.md` before compiling workspace tests or
 all-targets Clippy: one test embeds the generated Markdown at compile time.
-On the persistent controller use `python3 scripts/generate_command_reference.py --controller`,
-which builds only the generator through bounded Cargo admission. The output is
+On the persistent controller use `python3 scripts/generate_command_reference.py --controller`
+(or set `TWO_CARGO_CONTROLLER=1`), which builds only the generator through bounded
+Cargo admission. Nothing else selects controller mode: elsewhere it runs plain `cargo`. The output is
 ignored; never commit generated registry rows. The authored
 [command-reference landing page](docs/commands.md) links to same-head CI artifacts.
 Normal reference-doc tests compare bytes without writing. Missing or stale output
@@ -190,6 +191,30 @@ shared guard refuses loopback URLs even with CI flags set. Do not
 use `DATABASE_URL`, application credentials, credential fallbacks, or libpq
 `PG*` connection variables. A configured connection/setup failure must fail the
 test, not skip it.
+
+#### One-command local harness
+
+`python3 scripts/local_testdb.py test` mirrors the CI `rust-tests` job with Docker:
+it starts the same digest-pinned Postgres as `agent-testdb:5432` (trust auth,
+tmpfs data, bounded WAL) on a private network, creates the same bootstrap
+databases, and runs the job's test steps with the same step-scoped environment
+in a runner built from the job's `rust:bookworm` image. The guard accepts only
+the literal `agent-testdb` host, so Cargo runs inside that runner rather than on
+the host. It prints per-step exit codes and pass/fail/ignored totals.
+
+```sh
+python3 scripts/local_testdb.py test                  # up + rust-tests steps + summary
+python3 scripts/local_testdb.py exec -- cargo test -p two-bot-core --features db --locked
+python3 scripts/local_testdb.py env                   # the exported test environment
+python3 scripts/local_testdb.py down [--volumes]      # --volumes also drops the target cache
+```
+
+Each checkout gets its own network, database, runner and Cargo target volume.
+The Cargo registry and rustup toolchain live in a shared `two-localtest-cache`
+volume. `scripts/ci/test_local_testdb.py` fails when `check.yml` and the
+harness drift apart.
+
+#### Manual setup
 
 Create one empty bootstrap database `two_bot_test_local` on the disposable
 service, owned by its documented `agent_test` principal (empty password, with
