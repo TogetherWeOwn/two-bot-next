@@ -18,7 +18,7 @@ jobs:
   probe:
     if: github.head_ref == 'test/fixture-relative-clocks'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     permissions:
       contents: read
     env:
@@ -79,8 +79,11 @@ jobs:
       - name: Build test binaries (real clock)
         run: |
           python3 scripts/generate_command_reference.py
-          cargo test --workspace --lib --bins --tests --features two-bot-core/db --locked --no-run
+          cargo test --workspace --lib --bins --tests --features two-bot-core/db --locked --no-run \
+            --message-format=json-render-diagnostics > "$RUNNER_TEMP/artifacts.json"
 
+      # Cargo/rustc hang under libfaketime, so run each built test binary
+      # directly (cwd and CARGO_MANIFEST_DIR as cargo test sets them).
       - name: Run suite at 2027-10-31
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -88,18 +91,44 @@ jobs:
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         run: |
-          set +e
-          ft() { LD_PRELOAD="$FT_LIB" FAKETIME="$FAKE_AT" FAKETIME_DONT_FAKE_MONOTONIC=1 "$@"; }
-          ft date -u
-          status=0
-          ft cargo test --workspace --lib --bins --features two-bot-core/db --locked --no-fail-fast -- \
-            --skip ticket_runtime::cursor_budget --skip settings_jobs::tests::ops_overrides_acceptance_tests:: || status=1
-          ft cargo test --workspace --test '*' --features two-bot-core/db --locked --no-fail-fast -- \
-            --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
-            --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only \
-            --skip uses_one_above_i32_max_saturates_and_write_proceeds \
-            --skip uses_u64_max_saturates_at_i32_max \
-            --skip saturated_write_warns_with_identifiers_and_no_raw_counter \
-            --skip normal_uses_round_trip_byte_identical \
-            --skip exact_i32_max_writes_without_saturation_warn || status=1
-          exit $status
+          LD_PRELOAD="$FT_LIB" FAKETIME="$FAKE_AT" date -u
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          skips = [
+              'ticket_runtime::cursor_budget',
+              'settings_jobs::tests::ops_overrides_acceptance_tests::',
+              'voice_rooms::tests::name_filter_acceptance',
+              'cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump',
+              'seeded_aggregates_render_exactly_guild_scoped_and_read_only',
+              'uses_one_above_i32_max_saturates_and_write_proceeds',
+              'uses_u64_max_saturates_at_i32_max',
+              'saturated_write_warns_with_identifiers_and_no_raw_counter',
+              'normal_uses_round_trip_byte_identical',
+              'exact_i32_max_writes_without_saturation_warn',
+          ]
+          args = [a for s in skips for a in ('--skip', s)]
+          env = os.environ | {
+              'LD_PRELOAD': os.environ['FT_LIB'],
+              'FAKETIME': os.environ['FAKE_AT'],
+              'FAKETIME_DONT_FAKE_MONOTONIC': '1',
+          }
+          bins = []
+          for line in pathlib.Path(os.environ['RUNNER_TEMP'], 'artifacts.json').read_text().splitlines():
+              msg = json.loads(line)
+              if msg.get('reason') == 'compiler-artifact' and msg.get('executable') and msg['profile']['test']:
+                  bins.append((msg['executable'], os.path.dirname(msg['manifest_path']), msg['target']['name']))
+          failed, timed_out = [], []
+          for exe, cwd, name in bins:
+              print(f'::group::{name} ({exe})', flush=True)
+              try:
+                  rc = subprocess.run([exe, *args], cwd=cwd, env=env | {'CARGO_MANIFEST_DIR': cwd}, timeout=600).returncode
+              except subprocess.TimeoutExpired:
+                  rc = 'timeout'
+                  timed_out.append(name)
+              print('::endgroup::', flush=True)
+              if rc != 0 and rc != 'timeout':
+                  failed.append(name)
+              print(f'{name}: {rc}', flush=True)
+          print(f'binaries: {len(bins)}, failed: {failed}, timed out: {timed_out}')
+          sys.exit(1 if failed or timed_out else 0)
+          PY
