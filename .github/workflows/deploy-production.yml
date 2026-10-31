@@ -1224,6 +1224,52 @@ jobs:
                   )
           print(f"recheck: {'skipped: ' + skip if skip else 'passed'} {sha}")
 
+  # A successful guard can deliberately promote nothing. Expose that decision
+  # as a named job/check and a receipt: run conclusion alone is not deployment
+  # evidence. This has no environment, secrets, checkout or deployment authority.
+  promotion-skipped:
+    name: production promotion skipped (${{ needs.guard.outputs.skip || needs.recheck.outputs.skip }})
+    needs: [guard, recheck]
+    if: always() && needs.guard.result == 'success' && (needs.guard.outputs.skip != '' || (needs.recheck.result == 'success' && needs.recheck.outputs.skip != ''))
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'promotion-skipped') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      outcome: ${{ steps.report.outputs.outcome }}
+      reason: ${{ steps.report.outputs.reason }}
+    steps:
+      - name: Report no deployment
+        id: report
+        env:
+          SHA: ${{ needs.guard.outputs.sha }}
+          REASON: ${{ needs.guard.outputs.skip || needs.recheck.outputs.skip }}
+          RECEIPT: ${{ runner.temp }}/production-promotion-skipped.json
+        shell: python3 {0}
+        run: |
+          import json, os
+
+          reason, sha = os.environ["REASON"], os.environ["SHA"]
+          receipt = {"outcome": "skipped", "reason": reason, "sha": sha,
+                     "run_id": os.environ["GITHUB_RUN_ID"],
+                     "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"]}
+          with open(os.environ["RECEIPT"], "w", encoding="utf-8") as out:
+              json.dump(receipt, out)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"outcome=skipped\nreason={reason}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"### No production deployment\n\n- Outcome: `skipped`\n"
+                            f"- Reason: `{reason}`\n- Target SHA: `{sha}`\n"
+                            "- A successful workflow conclusion is not a deployment receipt.\n")
+          print(f"::warning::Production promotion skipped: {reason}; nothing deployed ({sha})")
+      - name: Upload skipped promotion receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-promotion-skipped-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-promotion-skipped.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
     needs: [guard, soak, recheck, schema-gate, roles-gate]

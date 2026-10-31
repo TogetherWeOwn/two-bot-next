@@ -1,12 +1,15 @@
 """Offline workflow policy fixtures; never dispatch, deploy or probe staging."""
 
+import ast
 from copy import deepcopy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -47,7 +50,7 @@ JOB_INVENTORY = {
                   # like the Rust lanes.
                   "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
-                              "production"},
+                              "promotion-skipped", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
                            "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
@@ -3931,6 +3934,325 @@ def workflow_policy_errors(workflows):
                         or any(marker in text for marker in DEPLOY_MARKERS)):
                     errors.append(f"{name}:{job_id}: deployment/probe alternative outside approved deploy workflows")
     return errors
+
+
+class ProductionPromotionSkipTests(unittest.TestCase):
+    SHA = "0123456789abcdef0123456789abcdef01234567"
+    GUARD_REASONS = (
+        "staging-not-green", "staging-pending", "ci-not-green", "ci-not-push",
+        "ci-pending", "live", "older-than-live", "held until 2999-01-01T00:00:00+00:00",
+    )
+    RECHECK_REASONS = (
+        "live", "older-than-live", "operator-dispatch-active", "dispatch-check-unreadable",
+        "held until 2999-01-01T00:00:00+00:00",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "production_guard_acceptance", ROOT / "scripts/test-deploy-production.py")
+        cls.producers = importlib.util.module_from_spec(spec)
+        with patch.object(sys, "path", [str(ROOT / "scripts"), *sys.path]):
+            spec.loader.exec_module(cls.producers)
+
+    def setUp(self):
+        self.workflow = load_workflows()["deploy-production.yml"]
+        reporters = [(name, job) for name, job in self.workflow["jobs"].items()
+                     if job.get("name", "").startswith("production promotion skipped (")]
+        self.assertEqual(len(reporters), 1, "expose exactly one named production promotion skipped check")
+        self.job_id, self.job = reporters[0]
+
+    def context(self, guard_skip="", recheck_skip="", guard_result="success",
+                recheck_result="skipped", attempt="3", target_sha=SHA, run_id="901",
+                workflow_cancelled=False, guard_outputs=None, recheck_outputs=None):
+        context = {
+            "needs.guard.result": guard_result, "needs.recheck.result": recheck_result,
+            # Keep expected identity independent of the job's output mappings.
+            "expected.sha": target_sha, "workflow.cancelled": workflow_cancelled,
+            "github.sha": "f" * 40, "github.run_id": run_id, "github.run_attempt": attempt,
+            "github.repository": "TogetherWeOwn/two-bot-next",
+        }
+        producers = (
+            ("guard", {"sha": target_sha, "skip": guard_skip} if guard_outputs is None else guard_outputs,
+             ("sha", "skip")),
+            ("recheck", {"skip": recheck_skip} if recheck_outputs is None else recheck_outputs, ("skip",)),
+        )
+        for name, emitted, keys in producers:
+            job = self.workflow["jobs"][name]
+            # The fixture represents outputs of the actual producer step,
+            # never outputs injected straight into the dependent job.
+            step_id = job["steps"][0]["id"]
+            source = {**context, **{f"steps.{step_id}.outputs.{key}": value
+                                   for key, value in emitted.items()}}
+            for key in keys:
+                self.assertIn(key, job["outputs"])
+                context[f"needs.{name}.outputs.{key}"] = self.render(job["outputs"][key], source)
+        return context
+
+    def expression(self, text, context):
+        text = text.strip().removeprefix("${{").removesuffix("}}").strip()
+        text = re.sub(r"\b(?:needs|github|steps|runner)\.[\w.-]+",
+                      lambda match: repr(context.get(match[0], "")), text)
+        statuses = {
+            "always": True, "cancelled": context.get("workflow.cancelled", False),
+            "success": context.get("status.success", True) and not context.get("workflow.cancelled", False),
+            "failure": context.get("status.failure", False),
+        }
+        for name, result in statuses.items():
+            text = re.sub(rf"\b{name}\s*\(\s*\)", repr(result), text)
+        text = re.sub(r"\btrue\b", "True", text)
+        text = re.sub(r"\bfalse\b", "False", text)
+        text = text.replace("&&", " and ").replace("||", " or ")
+        text = re.sub(r"!(?!=)", " not ", text).strip()
+        tree = ast.parse(text, mode="eval")
+        allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not,
+                   ast.Compare, ast.Eq, ast.NotEq, ast.Constant)
+        self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)), text)
+        return eval(compile(tree, "<workflow expression>", "eval"), {"__builtins__": {}})
+
+    def render(self, text, context):
+        return re.sub(r"\$\{\{(.*?)\}\}",
+                      lambda match: str(self.expression(match[1], context)), str(text))
+
+    def job_runs(self, context):
+        condition = self.job.get("if", "success()")
+        # GitHub implicitly adds success() unless a status function overrides
+        # it. Early deferrals have skipped dependencies, not successful ones.
+        needs = self.job.get("needs", [])
+        needs = [needs] if isinstance(needs, str) else needs
+        results = [context.get(f"needs.{name}.result", "skipped") for name in needs]
+        context = {**context, "status.success": all(result == "success" for result in results),
+                   "status.failure": "failure" in results}
+        if not re.search(r"\b(?:always|cancelled|success|failure)\s*\(", condition):
+            if not context["status.success"] or context["workflow.cancelled"]:
+                return False
+        return bool(self.expression(condition, context))
+
+    def upload_step(self):
+        uploads = [step for step in self.job["steps"]
+                   if step.get("uses", "").startswith("actions/upload-artifact@")]
+        self.assertEqual(len(uploads), 1, "the skip receipt must be uploaded")
+        return uploads[0]
+
+    def report(self, context, reason):
+        self.assertTrue(self.job_runs(context))
+        self.assertEqual(self.render(self.job["name"], context), f"production promotion skipped ({reason})")
+        outputs = self.job.get("outputs", {})
+        self.assertIn("outcome", outputs)
+        self.assertIn("reason", outputs)
+        match = re.fullmatch(r"\$\{\{\s*steps\.([\w-]+)\.outputs\.outcome\s*\}\}", outputs["outcome"])
+        self.assertIsNotNone(match, "outcome must forward the real reporting step output")
+        report_id = match[1]
+        reports = [step for step in self.job["steps"] if step.get("id") == report_id]
+        self.assertEqual(len(reports), 1)
+        step = reports[0]
+        upload = self.upload_step()
+        self.assertLess(self.job["steps"].index(step), self.job["steps"].index(upload),
+                        "the reporting step must create the receipt before upload")
+        self.assertTrue(self.expression(step.get("if", "success()"), context),
+                        "the reporting step must execute for this skip reason")
+        self.assertIn("run", step)
+        self.assertNotIn("${{", step["run"], "workflow values must enter scripts through env")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            root = Path(tmp)
+            context = {**context, "runner.temp": str(root)}
+            output, summary = root / "output", root / "summary"
+            output.touch()
+            summary.touch()
+            env = {
+                "PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_RUN_ID": context["github.run_id"],
+                "GITHUB_RUN_ATTEMPT": context["github.run_attempt"],
+                "GITHUB_SHA": context["github.sha"], "GITHUB_REPOSITORY": context["github.repository"],
+            }
+            for bindings in (self.job.get("env", {}), step.get("env", {})):
+                env.update({key: self.render(value, context) for key, value in bindings.items()})
+            script = root / "report-script"
+            script.write_text(step["run"])
+            shell = step.get("shell", "bash --noprofile --norc -e -o pipefail {0}")
+            command = [part.replace("{0}", str(script)) for part in shlex.split(shell)]
+            result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            emitted = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            context = {**context, **{f"steps.{report_id}.outputs.{key}": value
+                                    for key, value in emitted.items()}}
+            self.assertEqual(self.render(outputs["outcome"], context), "skipped")
+            self.assertEqual(self.render(outputs["reason"], context), reason)
+            self.assertRegex(result.stdout + result.stderr, r"::warning(?:\s[^\n]*?)?::")
+            self.assertIn(reason, result.stdout + result.stderr)
+            text = summary.read_text()
+            self.assertIn(reason, text)
+            self.assertIn(context["expected.sha"], text)
+            self.assertIn("skip", text.lower())
+            self.assertTrue(self.expression(upload.get("if", "true"), context))
+            receipt_path = root / self.render(upload["with"]["path"], context)
+            self.assertTrue(receipt_path.resolve().is_relative_to(root.resolve()))
+            self.assertTrue(receipt_path.is_file(), "the required upload must point at the emitted JSON receipt")
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["outcome"], "skipped")
+            self.assertEqual(receipt["reason"], reason)
+            self.assertIn("sha", receipt)
+            self.assertEqual(receipt["sha"], context["expected.sha"])
+            self.assertEqual(str(receipt["run_id"]), context["github.run_id"])
+            self.assertEqual(str(receipt["run_attempt"]), context["github.run_attempt"])
+            artifact_name = self.render(upload["with"]["name"], context)
+            self.assertEqual(artifact_name, "production-promotion-skipped-"
+                             f"{context['github.run_id']}-{context['github.run_attempt']}")
+            return artifact_name, receipt
+
+    def test_guard_job_outputs_bind_the_real_producer_sha_and_skip(self):
+        producer = self.producers.GuardBehaviourTests()
+        pending = self.producers.workflow_run(status="in_progress", conclusion=None)
+        cases = (
+            ({"event": "workflow_run", "sha": "", "run_sha": self.SHA,
+              "run_conclusion": "success", "run_path": ".github/workflows/deploy-staging.yml",
+              "run_event": "push", "ci-runs": {"total_count": 1, "workflow_runs": [pending]},
+              "ci-run": pending}, self.SHA, "ci-pending"),
+            ({"event": "workflow_run", "sha": "", "run_sha": "d" * 40,
+              "run_conclusion": "success", "run_path": ".github/workflows/check.yml",
+              "run_event": "push"}, "d" * 40, "staging-pending"),
+            ({"event": "schedule", "sha": "", "hold": "2999-01-01T00:00:00Z"},
+             self.SHA, "held until 2999-01-01T00:00:00+00:00"),
+        )
+        for inputs, target, reason in cases:
+            with self.subTest(reason=reason):
+                code, emitted, _, _, stdout = producer.guard(**inputs)
+                self.assertEqual(code, 0, stdout)
+                self.assertEqual((emitted["sha"], emitted["skip"]), (target, reason))
+                context = self.context(target_sha=target, guard_outputs=emitted)
+                self.assertEqual(context["needs.guard.outputs.sha"], target)
+                self.assertEqual(context["needs.guard.outputs.skip"], reason)
+                self.report(context, reason)
+
+    def test_failed_recheck_retains_output_but_cannot_report_a_successful_skip(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            output = Path(tmp) / "recheck-output"
+            result = subprocess.run(
+                [sys.executable, "-c", self.producers.RECHECK],
+                env={"GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next", "SHA": self.SHA,
+                     "HOLD_UNTIL": "2999-01-01T00:00:00Z", "GITHUB_OUTPUT": str(output),
+                     # This is a directory: the real producer fails after writing its skip output.
+                     "GITHUB_STEP_SUMMARY": tmp},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("IsADirectoryError", result.stderr)
+            emitted = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(emitted, {"skip": "held until 2999-01-01T00:00:00+00:00"})
+            context = self.context(recheck_result="failure", recheck_outputs=emitted)
+            self.assertEqual(context["needs.recheck.outputs.skip"], emitted["skip"])
+            self.assertFalse(self.job_runs(context), "a failed recheck is not a successful skip")
+
+    def test_workflow_cancellation_without_a_reason_is_not_a_skip(self):
+        for cancelled in (False, True):
+            for recheck in ("success", "skipped", "failure", "cancelled"):
+                with self.subTest(workflow_cancelled=cancelled, recheck=recheck):
+                    context = self.context(recheck_result=recheck, workflow_cancelled=cancelled)
+                    self.assertFalse(self.job_runs(context))
+
+    def test_workflow_cancellation_is_separate_from_reason_bearing_producers(self):
+        for cancelled in (False, True):
+            with self.subTest(workflow_cancelled=cancelled):
+                self.assertTrue(self.job_runs(self.context(guard_skip="ci-pending",
+                                                          workflow_cancelled=cancelled)))
+                self.assertTrue(self.job_runs(self.context(recheck_skip="live", recheck_result="success",
+                                                          workflow_cancelled=cancelled)))
+
+    def test_receipt_identity_varies_with_target_and_run_id(self):
+        for target, run_id, attempt, expected_name in (
+            ("a" * 40, "2048", "12", "production-promotion-skipped-2048-12"),
+            ("b" * 40, "99902", "8", "production-promotion-skipped-99902-8"),
+        ):
+            with self.subTest(target=target, run_id=run_id, attempt=attempt):
+                name, receipt = self.report(self.context(guard_skip="ci-pending", target_sha=target,
+                                                        run_id=run_id, attempt=attempt), "ci-pending")
+                self.assertEqual(name, expected_name)
+                self.assertEqual(receipt["sha"], target)
+                self.assertEqual(str(receipt["run_id"]), run_id)
+                self.assertEqual(str(receipt["run_attempt"]), attempt)
+
+    def test_both_completed_notifications_remain_main_only(self):
+        self.assertEqual(self.workflow["on"]["workflow_run"], {
+            "workflows": ["deploy-staging", "check"], "types": ["completed"], "branches": ["main"],
+        })
+
+    def test_early_skips_run_even_when_recheck_was_skipped(self):
+        needs = self.job.get("needs", [])
+        needs = [needs] if isinstance(needs, str) else needs
+        self.assertTrue({"guard", "recheck"}.issubset(needs))
+        for reason in self.GUARD_REASONS:
+            with self.subTest(reason=reason):
+                context = self.context(guard_skip=reason)
+                self.assertTrue(self.job_runs(context))
+                self.assertEqual(self.render(self.job["name"], context),
+                                 f"production promotion skipped ({reason})")
+
+    def test_late_skips_name_the_recheck_reason(self):
+        for reason in self.RECHECK_REASONS:
+            with self.subTest(reason=reason):
+                context = self.context(recheck_skip=reason, recheck_result="success")
+                self.assertTrue(self.job_runs(context))
+                self.assertEqual(self.render(self.job["name"], context),
+                                 f"production promotion skipped ({reason})")
+
+    def test_failures_and_reasonless_runs_are_not_successful_skip_checks(self):
+        for guard, recheck, early, late in (
+            ("success", "success", "", ""), ("success", "skipped", "", ""),
+            ("failure", "skipped", "ci-pending", ""),
+            ("cancelled", "skipped", "ci-pending", ""), ("skipped", "skipped", "", ""),
+            ("success", "failure", "", ""), ("success", "cancelled", "", ""),
+            ("success", "failure", "", "held until 2999-01-01T00:00:00+00:00"),
+            ("success", "cancelled", "", "held until 2999-01-01T00:00:00+00:00"),
+        ):
+            with self.subTest(guard=guard, recheck=recheck, early=early, late=late):
+                self.assertFalse(self.job_runs(self.context(early, late, guard, recheck)))
+
+    def test_reporter_has_no_environment_credentials_checkout_or_grants(self):
+        self.assertEqual(self.job.get("permissions"), {})
+        for field in ("environment", "secrets", "uses", "container", "services", "concurrency"):
+            self.assertNotIn(field, self.job)
+        self.assertTrue(runner_allowed(self.job_id, self.job["runs-on"]))
+        self.assertNotIn("continue-on-error", self.job)
+        serialized = json.dumps(self.job).lower()
+        for credential in ("secrets.", "github.token", "github_token", "gh_token", "credentials:"):
+            self.assertNotIn(credential, serialized)
+        for step in self.job["steps"]:
+            self.assertNotIn("continue-on-error", step)
+            if "uses" in step:
+                self.assertRegex(step["uses"], r"^actions/upload-artifact@[0-9a-f]{40}(?:\s|$)")
+            else:
+                self.assertIn("run", step)
+
+    def test_reporting_cannot_gate_or_replace_real_deployment(self):
+        self.assertEqual(production_errors(self.workflow), [])
+        for name in ("guard", "schema-gate", "roles-gate", "soak", "recheck", "production"):
+            needs = self.workflow["jobs"][name].get("needs", [])
+            needs = [needs] if isinstance(needs, str) else needs
+            self.assertNotIn(self.job_id, needs)
+
+    def test_upload_is_required_and_distinguishes_run_attempts(self):
+        upload = self.upload_step()
+        self.assertEqual(upload["with"].get("if-no-files-found"), "error")
+        self.assertNotIn("continue-on-error", upload)
+        names = [self.render(upload["with"]["name"], self.context(attempt=attempt))
+                 for attempt in ("3", "4")]
+        self.assertNotEqual(*names)
+        self.assertEqual(names, ["production-promotion-skipped-901-3", "production-promotion-skipped-901-4"])
+
+    def test_guard_reasons_execute_the_reporter_and_upload_real_receipts(self):
+        for reason in self.GUARD_REASONS:
+            with self.subTest(reason=reason):
+                self.report(self.context(guard_skip=reason), reason)
+
+    def test_recheck_reasons_execute_the_reporter_and_upload_real_receipts(self):
+        for reason in self.RECHECK_REASONS:
+            with self.subTest(reason=reason):
+                self.report(self.context(recheck_skip=reason, recheck_result="success"), reason)
+
+    def test_rerun_receipt_uses_its_attempt_and_guarded_target_not_workflow_head(self):
+        first = self.report(self.context(guard_skip="ci-pending", attempt="3"), "ci-pending")
+        second = self.report(self.context(guard_skip="ci-pending", attempt="4"), "ci-pending")
+        self.assertNotEqual(first[0], second[0])
+        self.assertNotEqual(first[1]["run_attempt"], second[1]["run_attempt"])
 
 
 class WorkflowTests(unittest.TestCase):
@@ -8787,6 +9109,9 @@ class WorkflowTests(unittest.TestCase):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
                         expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
+                        # No checkout or API access: only report and upload a receipt.
+                        expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the
                         # production Deployments fallback, and dispatches the

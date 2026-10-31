@@ -254,6 +254,26 @@ while deploying nothing:
   staging run cannot downgrade production (intentional downgrades stay an
   explicit operator rollback, which also serves the older container image).
 
+A skipped promotion also runs the **`production promotion skipped (<reason>)`**
+job, emits a warning, and uploads the JSON artifact
+`production-promotion-skipped-<run_id>-<run_attempt>`. Its receipt contains
+`outcome: "skipped"`, `reason`, the target `sha`, `run_id` and `run_attempt`;
+the job exposes `outcome` and `reason` outputs too. Watchers must inspect this
+named job/check (or its receipt), not count successful workflow runs as
+successful deploys. For example, the jobs API for a run shows a completed
+`production promotion skipped (staging-pending)` check when CI finished first;
+that is a deferral, not a rollout. Alert on repeated deferrals without a newer
+verified production revision; `live` and `older-than-live` are intentional
+no-ops. These markers do not waive gates or turn a failed gate green. An actual
+rollout still needs the successful `production` job, immutable promotion
+evidence and a matching live `/readyz` revision.
+
+Both completion triggers are necessary: removing `check` loses the wake when
+staging finishes first; removing `deploy-staging` loses it when CI finishes
+first. A `ci-pending` or `staging-pending` run alone does not establish a
+promotion deadlock. Inspect the later completion's run and its gates before
+changing trigger routing. No staging-poll retry loop is needed.
+
 Otherwise the `soak` job sleeps the remainder of 30 minutes past the
 staging-green time, recomputed there from the staging-green timestamp the
 guard reports (an unreadable timestamp soaks the full window). The soak runs
