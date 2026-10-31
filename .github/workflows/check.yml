@@ -108,7 +108,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     env:
       CARGO_TERM_COLOR: always
       # Disk hygiene (same pins as the test lanes): smaller binaries, no incremental artifacts.
@@ -392,7 +392,7 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -407,8 +407,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -583,7 +583,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
@@ -711,7 +711,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # The installer retries only checksum-rotation failures, so a
         # transient download failure (`Network is unreachable` syncing the
@@ -732,8 +732,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -994,7 +994,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
         # The installer retries only checksum-rotation failures, so a
         # transient download failure fails the job before planning runs.
         # Continue so the next step can retry the same pin; it fails closed below.
@@ -1011,8 +1011,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -1079,7 +1079,7 @@ jobs:
     # rides separately in `rust-tests`, so the three fail independently.
     timeout-minutes: 45
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
@@ -1217,7 +1217,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # The installer retries only checksum-rotation failures, so a
         # transient download failure (`Network is unreachable` syncing the
@@ -1238,8 +1238,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -1806,7 +1806,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     env:
       # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
       CARGO_TERM_COLOR: always
@@ -1924,7 +1924,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -1939,8 +1939,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -2281,7 +2281,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     env:
       # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
       CARGO_TERM_COLOR: always
@@ -2399,7 +2399,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -2414,8 +2414,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -2712,7 +2712,7 @@ jobs:
     # Each job container has a private service network; never publish a fixed
     # host port on the shared self-hosted runner Docker host.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     services:
       agent-testdb:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
@@ -2734,7 +2734,7 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -2749,8 +2749,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -2811,7 +2811,7 @@ jobs:
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     services:
       agent-testdb:
         image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
@@ -2833,7 +2833,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -2847,8 +2847,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3094,7 +3094,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     services:
       agent-testdb:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
@@ -3115,7 +3115,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -3130,8 +3130,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3181,7 +3181,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
     services:
@@ -3202,7 +3202,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -3217,8 +3217,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3249,7 +3249,7 @@ jobs:
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     services:
       agent-testdb:
         image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
@@ -3272,7 +3272,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -3286,8 +3286,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3344,7 +3344,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'fuzz-compile') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
     env:
       CARGO_TERM_COLOR: always
       CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
@@ -3381,7 +3381,7 @@ jobs:
       # feeds_http, self_role_custom_id, and helix_subscription_listing seeds.
       # Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
-      # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
+      # toolchain from the repo-root rust-toolchain.toml (stable 1.99.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
       # stable and fails on `-Zsanitizer`. The `+toolchain` form bypasses it.
       - name: Compile-only fuzz build (no execution)

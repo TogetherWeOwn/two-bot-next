@@ -26,7 +26,7 @@ class ChannelCiTests(unittest.TestCase):
         self.assertNotIn("runs-on: ubuntu-latest", workflow)
         self.assertIn("!github.event.repository.private", workflow)
         self.assertNotIn("        ports:", workflow)
-        self.assertIn("    container:\n      image: rust:1.98-trixie@sha256:", workflow)
+        self.assertIn("    container:\n      image: rust:1.99-trixie@sha256:", workflow)
         prepare = step(workflow, "Prepare isolated test databases")
         self.assertNotIn("docker exec", prepare)
         self.assertNotIn("/etc/hosts", prepare)
