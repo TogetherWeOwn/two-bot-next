@@ -38,29 +38,39 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install libfaketime and psql
+      # Debian's 0.9.10 package hangs Postgres 18 at startup; build a pinned
+      # upstream commit instead (runner and Postgres image alike).
+      - name: Build libfaketime and install psql
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends faketime libfaketime postgresql-client >/dev/null
-          ls /usr/lib/x86_64-linux-gnu/faketime/
+          sudo apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+          git clone -q https://github.com/wolfcw/libfaketime "$RUNNER_TEMP/libfaketime"
+          git -C "$RUNNER_TEMP/libfaketime" checkout -q 9da91d97cc2b5bc08bcf420a34c9788d5946786c
+          make -s -C "$RUNNER_TEMP/libfaketime/src" libfaketimeMT.so.1
+          echo "FT_LIB=$RUNNER_TEMP/libfaketime/src/libfaketimeMT.so.1" >> "$GITHUB_ENV"
 
       - name: Start faketime'd Postgres as agent-testdb
         run: |
           cat > /tmp/pg.Dockerfile <<'EOF'
+          FROM postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722 AS build
+          RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential git ca-certificates >/dev/null \
+           && git clone -q https://github.com/wolfcw/libfaketime /src && cd /src && git checkout -q 9da91d97cc2b5bc08bcf420a34c9788d5946786c \
+           && make -s -C src libfaketimeMT.so.1
           FROM postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
-          RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends libfaketime && rm -rf /var/lib/apt/lists/*
+          COPY --from=build /src/src/libfaketimeMT.so.1 /usr/local/lib/libfaketimeMT.so.1
           EOF
           docker build -q -t pg-faketime -f /tmp/pg.Dockerfile /tmp
           docker network create probe
           docker run -d --name agent-testdb --network probe -p 127.0.0.1:5432:5432 \
             --tmpfs /var/lib/postgresql:rw,size=2147483648 \
             -e POSTGRES_USER=agent_test -e POSTGRES_DB=agent_test -e POSTGRES_HOST_AUTH_METHOD=trust \
-            -e LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketimeMT.so.1 \
+            -e LD_PRELOAD=/usr/local/lib/libfaketimeMT.so.1 \
             -e FAKETIME="$FAKE_AT" -e FAKETIME_DONT_FAKE_MONOTONIC=1 \
             pg-faketime
           ip="$(docker inspect -f '{{(index .NetworkSettings.Networks "probe").IPAddress}}' agent-testdb)"
           echo "$ip agent-testdb" | sudo tee -a /etc/hosts
           for i in $(seq 1 60); do pg_isready -q -h agent-testdb -U agent_test -d agent_test && break; sleep 1; done
+          docker logs agent-testdb 2>&1 | tail -5
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -At -c 'SELECT now()'
           for db in two_bot_test_ci two_next_backup_ci two_next_backup_publication_ci; do
             createdb -h agent-testdb -U agent_test "$db"
@@ -79,8 +89,7 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         run: |
           set +e
-          export FAKETIME_DONT_FAKE_MONOTONIC=1
-          ft() { faketime -m -f "$FAKE_AT" "$@"; }
+          ft() { LD_PRELOAD="$FT_LIB" FAKETIME="$FAKE_AT" FAKETIME_DONT_FAKE_MONOTONIC=1 "$@"; }
           ft date -u
           status=0
           ft cargo test --workspace --lib --bins --features two-bot-core/db --locked --no-fail-fast -- \
