@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Post one Discord ops-channel alert for a failed synthetic probe (stdlib only).
+"""File one `incident` GitHub issue for a failed synthetic probe (stdlib only).
 
-Reuses the Worker alert pattern (`wrangler/src/index.ts` postWebhookText):
-the message starts `two-bot-next ALERT synthetic-user-flow:<env>`, names the
-failing checks, links the observability runbook, and carries the container
-build revision plus the GitHub run link. The destination boundary is
-Discord-only: anything but a discord.com webhook URL refuses before any
-request. The webhook URL arrives only via $SYNTHETIC_ALERT_WEBHOOK_URL and
-is never printed, logged, or echoed; failures report the HTTP status only.
+The issue title names `synthetic-user-flow:<env>`; the body names the failing
+checks, links the observability runbook, and carries the container build
+revision plus the GitHub run link. Delivery goes through
+scripts/incident_issue.py with the workflow GITHUB_TOKEN (issues: write):
+ALERT opens the one issue for the env (or comments on the one already open)
+and RECOVERY comments then closes it. Paperclip turns each open `incident`
+issue into an agent task. Failures report fixed vocabulary only and fail
+the step, so an alert is never silently dropped.
 
-Usage (called only from the synthetic-user-flow workflow alert step):
-  SYNTHETIC_ALERT_WEBHOOK_URL=<webhook> RUN_ID=<run> GIT_SHA=<sha> \\
+Usage (called only from the synthetic-user-flow workflow decide/post steps):
+  GITHUB_TOKEN=<token> RUN_ID=<run> GIT_SHA=<sha> \\
       python3 scripts/synthetic_alert.py --env staging --evidence FILE
 """
 
@@ -19,21 +20,17 @@ import json
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 
+import incident_issue
 from synthetic_alert_history import HistoryError, _loads_bounded, previous_probe_outcomes, transition
 
 RUNBOOK_URL = ("https://github.com/TogetherWeOwn/two-bot-next"
                "/blob/main/docs/runbook-observability.md")
-# Same Discord-only destination boundary as wrangler/src/index.ts.
-WEBHOOK = re.compile(r"https://discord\.com(?::443)?/api/webhooks/[0-9]+/[A-Za-z0-9_-]+")
-TIMEOUT_SECONDS = 6
 MAX_CONTENT = 1900
 
 
 class AlertError(Exception):
-    """A fixed-vocabulary alert failure (never carries the webhook URL)."""
+    """A fixed-vocabulary alert failure (never carries a token or remote data)."""
 
 
 class DuplicateKeyError(ValueError):
@@ -53,13 +50,6 @@ def _reject_duplicate_keys(pairs):
             raise DuplicateKeyError("duplicate JSON object key")
         seen.add(key)
     return dict(pairs)
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Turn every redirect into an HTTPError without contacting its target."""
-
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        return None
 
 
 def load_evidence(path):
@@ -86,7 +76,7 @@ def summarize(evidence):
         return "probe failed"
     # Evidence-derived names pass through printable(), like the revision
     # fields below: a crafted check name with control characters is dropped
-    # (fail-closed to "probe failed") instead of reaching Discord content.
+    # (fail-closed to "probe failed") instead of reaching the issue text.
     failed = [c for c in checks
               if isinstance(c, dict) and c.get("verdict") == "fail"
               and isinstance(c.get("check"), str)
@@ -113,40 +103,46 @@ def build_content(env, evidence, git_sha, run_link, event="alert"):
 
 
 def run_link():
-    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    repo = os.environ.get("GITHUB_REPOSITORY", "TogetherWeOwn/two-bot-next")
-    run_id = os.environ.get("RUN_ID") or os.environ.get("GITHUB_RUN_ID", "unknown")
-    return f"{server}/{repo}/actions/runs/{run_id}"
+    return incident_issue.run_link()
 
 
-def post(webhook_url, content):
-    if not WEBHOOK.fullmatch(webhook_url or ""):
-        raise AlertError("refusing: not a Discord webhook URL")
-    payload = json.dumps({"content": content,
-                          "allowed_mentions": {"parse": [], "replied_user": False}}).encode()
-    request = urllib.request.Request(
-        webhook_url, data=payload, method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "two-bot-next-synthetic-alert/1"})
-    # urllib's default redirect handler can turn a redirected POST into a GET.
-    # Reject redirects at the opener so only the allowlisted URL is contacted.
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPHandler(),
-        urllib.request.HTTPSHandler(),
-        urllib.request.HTTPErrorProcessor(),
-        _NoRedirectHandler(),
-    )
+def incident_key(environment):
+    return f"synthetic-user-flow:{environment}"
+
+
+def post(env, environment, event, content):
+    """Deliver one decided event to the `incident` issue sink.
+
+    ALERT opens the env's issue (or comments on the open one); RECOVERY
+    comments and closes it. Returns a short receipt such as "opened #12".
+    """
+    key = incident_key(environment)
     try:
-        with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            status = response.status
-            response.read(1 << 10)
-    except urllib.error.HTTPError as error:
-        if error.code in (301, 302, 303, 307, 308):
-            raise AlertError(f"alert delivery refused redirect with status {error.code}")
-        raise AlertError(f"alert delivery failed with status {error.code}")
-    except (OSError, ValueError):
-        raise AlertError("alert delivery failed (transport)")
-    if not 200 <= status < 300:
-        raise AlertError(f"alert delivery failed with status {status}")
+        if event == "alert":
+            body = (f"{content}\n\nNext: follow the runbook and fix the cause. "
+                    "The first healthy scheduled probe comments and closes this issue.")
+            action, number = incident_issue.open_incident(env, key, f"{key} is failing", body)
+        else:
+            action, number = incident_issue.close_incident(env, key, content)
+    except incident_issue.IncidentError as error:
+        raise AlertError(str(error)) from None
+    return f"{action} #{number}" if number else action
+
+
+def open_issue_without_incident(env, environment):
+    """Whether an `incident` issue is open for a probe whose history is closed.
+
+    A force_fail dispatch is not scheduled history, so its issue would never
+    see a recovery transition; a healthy scheduled sample closes it instead.
+    An unreadable issue list is a warning, never a red healthy run: the next
+    healthy sample retries.
+    """
+    try:
+        return incident_issue.find_open(env, incident_key(environment)) is not None
+    except incident_issue.IncidentError as error:
+        print(f"synthetic_alert: warning: {error}; open incident issue not reconciled",
+              file=sys.stderr)
+        return False
 
 
 def _decide(env, environment):
@@ -171,7 +167,10 @@ def _decide(env, environment):
               file=sys.stderr)
         return "alert", False
     force_fail = env.get("FORCE_FAIL") == "true"
-    return transition(current, previous, force_fail), True
+    event = transition(current, previous, force_fail)
+    if event is None and current == "success" and open_issue_without_incident(env, environment):
+        event = "recovery"
+    return event, True
 
 
 def decide_event(env, environment):
@@ -218,10 +217,6 @@ def post_event(env, environment, evidence_path, event):
     if event not in ("alert", "recovery"):
         print("synthetic_alert: no alert transition", file=sys.stderr)
         return 0
-    webhook_url = env.get("SYNTHETIC_ALERT_WEBHOOK_URL")
-    if not webhook_url:
-        print("synthetic_alert: SYNTHETIC_ALERT_WEBHOOK_URL is not set", file=sys.stderr)
-        return 1
     try:
         evidence = load_evidence(evidence_path)
     except AlertError as error:
@@ -232,28 +227,28 @@ def post_event(env, environment, evidence_path, event):
                             run_link(), event)
     print(content)
     try:
-        post(webhook_url, content)
+        receipt = post(env, environment, event, content)
     except AlertError as error:
         print(f"synthetic_alert: {error}", file=sys.stderr)
         return 1
-    print(f"synthetic_alert: delivered {event} for {environment}", file=sys.stderr)
+    print(f"synthetic_alert: delivered {event} for {environment}: {receipt}", file=sys.stderr)
     return 0
 
 
-def webhook_validity(webhook_url):
-    """Validity label for the dry-run plan; never echoes the URL itself."""
-    if not webhook_url:
+def sink_readiness(env):
+    """Readiness label for the dry-run plan; never echoes the token."""
+    if not env.get("GITHUB_TOKEN") or not env.get("GITHUB_REPOSITORY"):
         return "missing"
-    return "valid" if WEBHOOK.fullmatch(webhook_url) else "invalid"
+    return "ready"
 
 
 def dry_run_plan(environment, evidence_path):
-    """Print the delivery plan without posting or contacting Discord.
+    """Print the delivery plan without writing any issue.
 
     Runs the same decide step as the live path (the read-only GitHub
     history read is included, fail-open as live) so the planned event
-    matches what a live run would deliver, then reports the webhook shape
-    before any send. A missing webhook or a missing probe sample is a plan
+    matches what a live run would deliver, then reports the sink readiness
+    before any write. A missing token or a missing probe sample is a plan
     line, never a failure: a preview is not a delivery. Refused evidence
     (for example duplicate JSON keys) fails closed with the same clean
     refusal as the live post path, never a traceback.
@@ -279,7 +274,7 @@ def dry_run_plan(environment, evidence_path):
     print(f"env: {environment}")
     print(f"evidence: {summary}")
     print(f"event: {event or 'none'}")
-    print(f"webhook: {webhook_validity(env.get('SYNTHETIC_ALERT_WEBHOOK_URL'))}")
+    print(f"sink: incident issue {incident_key(environment)} ({sink_readiness(env)})")
     if event in ("alert", "recovery"):
         content = build_content(environment, evidence,
                                 env.get("GIT_SHA") or env.get("GITHUB_SHA"),
@@ -318,7 +313,7 @@ def main(argv=None):
     if args.dry_run:
         return dry_run_plan(args.env, args.evidence)
     if args.decide_only:
-        # Decide step: compute the transition, never post, never need webhook.
+        # Decide step: compute the transition, never post.
         # A missing/skipped probe is not a sample: write the empty event that
         # keeps the post step skipped, then fail the step so a zero-sample
         # run never reads as a healthy pass.

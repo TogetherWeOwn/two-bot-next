@@ -3595,6 +3595,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_build_identity_acceptance.py -v
       - name: Verify passive production probe duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
+      - name: Verify incident issue sink (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_incident_issue.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
       - name: Verify synthetic history admission boundaries (offline fixtures)
