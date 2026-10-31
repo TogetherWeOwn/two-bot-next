@@ -109,7 +109,7 @@ class DigestExecutionTest(unittest.TestCase):
         self.assertTrue(self.alerts(result, outputs))
         self.assertEqual(outputs["released"], "false")
 
-    def test_failed_publication_reaches_workflow_alert_and_poster(self):
+    def test_failed_publication_reaches_workflow_alert_and_incident_issue(self):
         result, outputs, _ = self.run_digest(FAIL_CREATE="true")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outputs.get("prod_changed"), "true")
@@ -118,14 +118,16 @@ class DigestExecutionTest(unittest.TestCase):
         # Use the workflow's alert env bindings, not a second set of test names.
         context = {"needs.digest.outputs.live_sha": self.sha,
                    "needs.digest.outputs.prev_tag": outputs["prev_tag"],
-                   "github.run_id": "1", "secrets.SYNTHETIC_ALERT_WEBHOOK_URL": "fixture"}
+                   "github.run_id": "1", "secrets.GITHUB_TOKEN": "fixture"}
         env = {}
         for key, value in WORKFLOW["jobs"]["alert"]["steps"][-1]["env"].items():
             env[key] = context[value.removeprefix("${{").removesuffix("}}").strip()]
-        with patch.dict(os.environ, env), patch.object(ALERT, "post") as posted:
+        with patch.dict(os.environ, env), \
+                patch.object(ALERT.incident_issue, "open_incident", return_value=("opened", 3)) as opened:
             self.assertEqual(ALERT.main(["--live-sha", env["LIVE_SHA"], "--prev-tag", env["PREV_TAG"]]), 0)
-        posted.assert_called_once()
-        self.assertIn(self.sha[:7], posted.call_args.args[1])
+        opened.assert_called_once()
+        self.assertEqual(opened.call_args.args[1], "daily-digest")
+        self.assertIn(self.sha[:7], opened.call_args.args[3])
         self.assertFalse(self.alerts(result, outputs, cancelled=True))
         self.assertFalse(self.alerts(result, outputs, dry_run=True))
 
