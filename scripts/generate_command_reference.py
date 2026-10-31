@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Explicitly generate the ignored command reference, never tracked configuration.
 
-Run before workspace tests or all-targets Clippy. Use --controller for bounded
-Cargo admission; Paperclip runs select it automatically. Successful stdout is
+Run before workspace tests or all-targets Clippy. Use --controller (or
+TWO_CARGO_CONTROLLER=1) for bounded Cargo admission on the persistent
+controller; nothing selects it implicitly. Successful stdout is
 command_reference.v1 JSON. Generation and the read-only reference_docs check
 are separate operations: this command does not replace that check.
 """
@@ -66,7 +67,9 @@ def main(argv=None):
     parser.add_argument("--verify-lifecycle", action="store_true",
                         help="also run independent real-binary mutation tests in an isolated fixture")
     args = parser.parse_args(argv)
-    controller = args.controller or bool(os.environ.get("PAPERCLIP_RUN_ID"))
+    # Explicit opt-in only: other agent runtimes also set PAPERCLIP_RUN_ID but
+    # have no bounded cache pool, so that variable must not select controller mode.
+    controller = args.controller or os.environ.get("TWO_CARGO_CONTROLLER") == "1"
     cargo = ([sys.executable, str(ROOT / "scripts/cargo_cache.py"), "run", "--"]
              if controller else ["cargo"])
     executable, status = build_executable(
