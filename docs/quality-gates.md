@@ -47,7 +47,9 @@ lint-only `check` lane.
   verification remain mandatory. Cache statistics are advisory and unavailable
   on this fallback path, not a zero-percent hit-rate measurement.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
-  includes advisories) runs on every PR, not only Rust-selected ones.
+  includes advisories) runs on every PR, not only Rust-selected ones. It
+  passes `--workspace` so the graph covers every member crate, not only the
+  root package.
 - Request-path unwrap (HARD): the local `sgconfig.yml` runs the request-path
   `.unwrap()` rules (`no-unwrap-request-paths` for direct calls plus
   `no-unwrap-request-paths-in-macros` for `unwrap` inside macro token trees,
