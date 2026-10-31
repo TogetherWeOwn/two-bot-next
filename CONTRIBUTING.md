@@ -57,9 +57,14 @@ exact head commit. Never bypass or weaken a check.
 
 Who merges (owner decision 2026-10-31): the agent that did the work merges a PR
 once every required check is green and each review finding is fixed or answered
-with evidence. A merge to `main` deploys production, so it also needs the
-owner's approval through `request_confirmation` on the card. So does every other
-production deploy, such as a manual dispatch or promotion.
+with evidence. A merge to `main` that touches a path outside the
+`paths-ignore` list in `deploy-staging.yml` starts `deploy-staging`, and
+`deploy-production` then promotes that commit on its own once staging and
+`ci-ok` are green. That merge therefore needs the owner's approval through
+`request_confirmation` on the card first, and the approval covers the automatic
+promotion that follows. A merge that only touches ignored paths (root `*.md`,
+`docs/**` and the rest of that list) starts no deploy and needs no owner
+approval. A manual production dispatch or rollback needs its own approval.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
