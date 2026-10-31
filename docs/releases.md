@@ -32,8 +32,9 @@ deployed commit) and compares it to the last digest tag's target:
   any later production move. Never a second tag for one day.
 - A cut or repair is owed but fails before publication: the script records
   `prod_changed=true` and `released=false` before note rendering/publishing.
-  The `alert` job consumes those outputs even on failure and posts one Discord
-  ops-channel alert through the synthetic-alert line. Success overwrites
+  The `alert` job consumes those outputs even on failure and opens (or comments
+  on) the one `daily-digest` GitHub issue labelled `incident`; the agent who
+  cuts the missing tag closes it. Success overwrites
   `released=true`; quiet days, rollbacks, dry runs and SBOM-only failures do
   not raise a missing-digest alert. Failures before the revision/digest state
   can be established remain red without claiming a production change.

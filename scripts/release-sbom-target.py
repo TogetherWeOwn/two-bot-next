@@ -20,6 +20,29 @@ SOURCE_OVER_CAP = "SBOM source file exceeds the byte cap"
 SOURCE_MISSING = "SBOM source file is missing or unreadable"
 # Real gh responses are under 1 KiB; the 2 MiB fixture must refuse.
 RESPONSE_CAP = 1 << 20
+# Real ref responses nest two levels deep.
+MAX_DEPTH = 32
+
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+
+
+def _json_depth_exceeds(text, limit):
+    """Lexical nesting pre-scan, run before json.loads.
+
+    The decoder's own RecursionError is no longer a reliable bound: newer
+    CPython sizes it from the real C stack and decodes 10,000 levels.
+    """
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif token in "]}":
+            depth -= 1
+    return False
 
 
 def require_env(name):
@@ -52,6 +75,8 @@ def _reject_non_finite_float(text):
 def parse_response(raw):
     if len(raw.encode("utf-8")) > RESPONSE_CAP:
         raise ValueError(OVER_CAP)
+    if _json_depth_exceeds(raw, MAX_DEPTH):
+        raise ValueError(TOO_DEEP)
     try:
         return json.loads(
             raw,

@@ -4,6 +4,7 @@
 import http.client
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,9 +16,13 @@ PROBE_STEPS = {
     "prod": "Run the passive production probe",
 }
 ALERT_STEPS = {
-    "staging": "Alert the ops channel on incident transition",
-    "prod": "Alert the ops channel on incident transition",
+    "staging": "File or close the incident issue on transition",
+    "prod": "File or close the incident issue on transition",
 }
+# The post step's name before alerts moved from Discord to incident issues.
+# Older runs in the reconstruction window still carry it; it is the same
+# delivery signal, so both names read as the post step (at most one per job).
+LEGACY_ALERT_STEP = "Alert the ops channel on incident transition"
 # Decide step (writes event to GITHUB_OUTPUT, never posts). The post step
 # above is the only delivery signal: success means delivered, failure means
 # undelivered, skipped/None means no-op and must not move incident state.
@@ -56,6 +61,32 @@ JOB_NAMES = {
 RUNS_PAGE_SIZE = 15
 MAX_HISTORY_RUNS = 200
 MAX_RESPONSE_BYTES = 1 << 20
+
+
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
 
 
 class HistoryError(Exception):
@@ -293,7 +324,7 @@ def _get(path, token):
         raise HistoryError("could not read recent synthetic workflow history "
                            "(response exceeds the size cap)")
     try:
-        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, RecursionError) as error:
         raise HistoryError("could not read recent synthetic workflow history ("
                            + error.__class__.__name__ + ")") from None
@@ -324,6 +355,10 @@ def _run_outcome(repo, run, environment, token):
     steps = job["steps"]
     probe = _unique_match(steps, PROBE_STEPS[environment])
     alert = _unique_match(steps, ALERT_STEPS[environment])
+    legacy = _unique_match(steps, LEGACY_ALERT_STEP)
+    if alert is not None and legacy is not None:
+        _refuse_history()
+    alert = alert or legacy
     decide = _unique_match(steps, DECIDE_STEPS[environment])
     outcome = probe.get("conclusion") if probe else None
     if outcome in ("success", "failure"):

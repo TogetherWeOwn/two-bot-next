@@ -18,8 +18,8 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
+import incident_issue
 import rollback_proof as proof
-import synthetic_alert
 
 # Independent oracle: never derive fixtures or negative cases from the code
 # under test. Deleting any guard entry must fail this contract and its cases.
@@ -256,13 +256,13 @@ class RollbackProofTests(unittest.TestCase):
                     patch.object(proof, "gh", return_value={"workflow_runs": [good]}), \
                     patch.object(proof, "artifact_files", return_value={"proof.json": evidence}) as artifacts, \
                     patch.object(proof, "check_freshness", wraps=lambda: proof_check(now=NOW)), \
-                    patch.object(synthetic_alert, "post") as post, \
+                    patch.object(incident_issue, "open_incident") as opened, \
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
                 self.assertEqual(proof.main(["watch"]), 1)
                 self.assertEqual(json.loads(stderr.getvalue())["code"], "daily_proof_evidence_invalid")
                 artifacts.assert_called_once_with(123, "staging-rollback-proof")
-                self.assertEqual(post.call_count, 1)
-                self.assertIn("daily_proof_evidence_invalid", post.call_args.args[1])
+                self.assertEqual(opened.call_count, 1)
+                self.assertIn("daily_proof_evidence_invalid", opened.call_args.args[3])
 
     def test_freshness_exact_age_boundaries(self):
         for delta, passes in ((timedelta(0), True), (timedelta(hours=30), True),
@@ -280,28 +280,42 @@ class RollbackProofTests(unittest.TestCase):
                     with self.assertRaisesRegex(proof.ProofError, "daily_proof_stale"):
                         proof.check_freshness(now=NOW)
 
-    def test_watch_posts_only_on_a_finding_and_delivery_failure_is_red(self):
+    def test_watch_files_only_on_a_finding_closes_on_pass_and_delivery_failure_is_red(self):
         for error in (None, proof.ProofError("daily_proof_missing"), ValueError("private-body")):
-            with patch.dict(os.environ, dict(ENV, SYNTHETIC_ALERT_WEBHOOK_URL="synthetic-destination")), \
+            with patch.dict(os.environ, ENV), \
                     patch.object(proof, "check_freshness", side_effect=error, return_value={"verdict": "pass"}), \
-                    patch.object(synthetic_alert, "post") as post, \
-                    patch.object(synthetic_alert, "run_link", return_value="https://example.test/run/123"), \
+                    patch.object(incident_issue, "open_incident") as opened, \
+                    patch.object(incident_issue, "close_incident") as closed, \
+                    patch.object(incident_issue, "run_link", return_value="https://example.test/run/123"), \
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
                 code = proof.main(["watch"])
             self.assertEqual(code, 0 if error is None else 1)
             if error is None:
-                post.assert_not_called()
+                opened.assert_not_called()
+                closed.assert_called_once()
+                self.assertEqual(closed.call_args.args[1], "staging-rollback-proof")
             else:
                 finding = "daily_proof_missing" if isinstance(error, proof.ProofError) else "daily_proof_unreadable"
-                post.assert_called_once_with("synthetic-destination", self.alert_text(finding))
+                opened.assert_called_once_with(os.environ, "staging-rollback-proof",
+                                               "staging rollback proof failed", self.alert_text(finding))
+                closed.assert_not_called()
             self.assertNotIn("private-body", stderr.getvalue())
-        with patch.dict(os.environ, dict(ENV, SYNTHETIC_ALERT_WEBHOOK_URL="synthetic-destination")), \
-                patch.object(synthetic_alert, "post", side_effect=synthetic_alert.AlertError("private-body")) as post, \
+        with patch.dict(os.environ, ENV), \
+                patch.object(incident_issue, "open_incident",
+                             side_effect=incident_issue.IncidentError("private-body")) as opened, \
                 redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(proof.main(["alert"]), 1)
-        self.assertEqual(post.call_count, 1)
+        self.assertEqual(opened.call_count, 1)
         self.assertEqual(json.loads(stderr.getvalue())["code"], "alert_delivery_failed")
         self.assertNotIn("private-body", stderr.getvalue())
+        # A passing watch that cannot close the issue is red, never silent.
+        with patch.dict(os.environ, ENV), \
+                patch.object(proof, "check_freshness", return_value={"verdict": "pass"}), \
+                patch.object(incident_issue, "close_incident",
+                             side_effect=incident_issue.IncidentError("private-body")), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(proof.main(["watch"]), 1)
+        self.assertEqual(json.loads(stderr.getvalue())["code"], "incident_close_failed")
 
     @staticmethod
     def alert_text(code):
@@ -310,12 +324,13 @@ class RollbackProofTests(unittest.TestCase):
                 "Runbook: https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/production-deploy.md#daily-staging-proof "
                 "| logs https://example.test/run/123")
 
-    def test_alert_command_sends_exactly_one_notification(self):
-        with patch.dict(os.environ, dict(ENV, SYNTHETIC_ALERT_WEBHOOK_URL="synthetic-destination")), \
-                patch.object(synthetic_alert, "post") as post, \
-                patch.object(synthetic_alert, "run_link", return_value="https://example.test/run/123"):
+    def test_alert_command_files_exactly_one_incident(self):
+        with patch.dict(os.environ, ENV), \
+                patch.object(incident_issue, "open_incident") as opened, \
+                patch.object(incident_issue, "run_link", return_value="https://example.test/run/123"):
             self.assertEqual(proof.main(["alert"]), 0)
-        post.assert_called_once_with("synthetic-destination", self.alert_text("daily_proof_failed"))
+        opened.assert_called_once_with(os.environ, "staging-rollback-proof",
+                                       "staging rollback proof failed", self.alert_text("daily_proof_failed"))
 
     def test_dry_run_has_no_effects_and_missing_evidence_refuses_before_dispatch(self):
         with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()):

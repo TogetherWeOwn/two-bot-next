@@ -467,12 +467,12 @@ child can acquire the staging deploy lane. The optional manual Worker-only
 drill still holds `deploy-staging` while it runs and now uploads its separate
 evidence artifact; it does not count as the daily automatic proof.
 
-A failed wrapper posts one finding through the existing `synthetic-alerts`
-Discord line. Independently, the **06:23 UTC** `daily-digest` workflow's
+A failed wrapper opens (or comments on) the one `staging-rollback-proof`
+GitHub issue labelled `incident`; Paperclip turns it into an agent task. Independently, the **06:23 UTC** `daily-digest` workflow's
 `rollback-proof-watch` job checks the newest scheduled drill and its artifact,
 even if the digest fails. Missing, failed, cancelled, stuck, unreadable or
 older-than-30-hour proof alerts and fails the watcher. An older successful proof
-cannot hide a newer failed one. Healthy checks post nothing. This independent
+cannot hide a newer failed one. A healthy check comments on and closes any open issue. This independent
 schedule catches a missed drill trigger; an outage of GitHub Actions itself is
 outside these two scheduled checks.
 

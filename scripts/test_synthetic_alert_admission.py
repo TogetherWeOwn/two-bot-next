@@ -5,6 +5,7 @@ import io
 import json
 import os
 import unittest
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
@@ -15,7 +16,7 @@ import synthetic_alert_history as history
 
 class AdmissionBoundaryTests(unittest.TestCase):
     def setUp(self):
-        for obj, name in ((alert, "post"), (alert.urllib.request, "build_opener")):
+        for obj, name in ((alert, "post"), (urllib.request, "build_opener")):
             guard = mock.patch.object(obj, name, side_effect=AssertionError("network forbidden"))
             guard.start()
             self.addCleanup(guard.stop)

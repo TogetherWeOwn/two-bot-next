@@ -6,7 +6,8 @@
 2026-03-10's returned workflow_run_id (never a search for the latest run).
 The child MUST fail its error-rate gate and successfully restore both snapshot
 members. A green child is a failure of the drill. `watch` is read-only except
-for one Discord finding through the existing synthetic-alerts binding.
+for its `incident` GitHub issue: a finding opens (or comments on) the one
+`staging-rollback-proof` issue, and a passing watch closes it.
 """
 
 import argparse
@@ -236,17 +237,33 @@ def check_freshness(*, now=None):
     return {"verdict": "pass", "proof_run_id": run["id"], "child_run_id": evidence["child_run_id"]}
 
 
-def alert(code):
+INCIDENT_KEY = "staging-rollback-proof"
+
+
+def incident_client():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    client = importlib.import_module("synthetic_alert")
+    return importlib.import_module("incident_issue")
+
+
+def alert(code):
+    client = incident_client()
     content = (f"two-bot-next ALERT staging rollback proof: {code}. "
                "Inspect the daily staging drill and its child run before retrying; never drill production. "
                f"Runbook: https://github.com/{REPO}/blob/main/docs/production-deploy.md#daily-staging-proof "
                f"| logs {client.run_link()}")
     try:
-        client.post(os.environ.get("SYNTHETIC_ALERT_WEBHOOK_URL"), content)
-    except client.AlertError:
+        client.open_incident(os.environ, INCIDENT_KEY, "staging rollback proof failed", content)
+    except client.IncidentError:
         raise ProofError("alert_delivery_failed") from None
+
+
+def resolve():
+    client = incident_client()
+    try:
+        client.close_incident(os.environ, INCIDENT_KEY,
+                              f"Daily staging rollback proof is green again. Watch run: {client.run_link()}")
+    except client.IncidentError:
+        raise ProofError("incident_close_failed") from None
 
 
 def main(argv=None):
@@ -275,6 +292,7 @@ def main(argv=None):
                 code = str(error) if isinstance(error, ProofError) else "daily_proof_unreadable"
                 alert(code)
                 raise ProofError(code) from None
+            resolve()
         print(json.dumps(evidence, sort_keys=True))
         return 0
     except (ProofError, ValueError, TypeError, KeyError, AttributeError, OSError) as error:
