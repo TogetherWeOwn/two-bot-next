@@ -200,16 +200,21 @@ tmpfs data, bounded WAL) on a private network, creates the same bootstrap
 databases, and runs the job's test steps with the same step-scoped environment
 in a runner built from the job's `rust:bookworm` image. The guard accepts only
 the literal `agent-testdb` host, so Cargo runs inside that runner rather than on
-the host. It prints per-step exit codes and pass/fail/ignored totals.
+the host. Unlike CI it adds `--no-fail-fast`, so one failing test binary does not
+hide the rest, and it prints per-step exit codes and pass/fail/ignored totals.
 
 ```sh
-python3 scripts/local_testdb.py test                  # up + rust-tests steps + summary
-python3 scripts/local_testdb.py exec -- cargo test -p two-bot-core --features db --locked
+python3 scripts/local_testdb.py test                  # fresh DB + rust-tests steps + summary
+python3 scripts/local_testdb.py exec [--fresh] -- cargo test -p two-bot-core --features db --locked
 python3 scripts/local_testdb.py env                   # the exported test environment
 python3 scripts/local_testdb.py down [--volumes]      # --volumes also drops the target cache
 ```
 
 Each checkout gets its own network, database, runner and Cargo target volume.
+`test` always starts on an empty database; `up`/`exec` reuse it unless `--fresh`
+is given. The database tmpfs defaults to 4 GiB (`TWO_LOCAL_TESTDB_TMPFS_GIB`), not
+CI's 1 GiB: a many-core host keeps more fixture databases alive at once, and a full
+tmpfs surfaces as `No space left on device` (SQLSTATE 53100) failures.
 The Cargo registry and rustup toolchain live in a shared `two-localtest-cache`
 volume. `scripts/ci/test_local_testdb.py` fails when `check.yml` and the
 harness drift apart.

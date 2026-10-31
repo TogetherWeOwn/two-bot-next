@@ -2,16 +2,16 @@
 """Run the DB-backed Rust suites locally against a disposable Postgres.
 
 Mirrors the `rust-tests` job in .github/workflows/check.yml: the same digest-
-pinned `postgres` service aliased `agent-testdb:5432` (trust auth, 1 GiB tmpfs,
+pinned `postgres` service aliased `agent-testdb:5432` (trust auth, tmpfs data,
 bounded WAL), the same bootstrap databases and test environment, and the same
 `rust:bookworm` job image. The test guard accepts only the literal host
 `agent-testdb`, so Cargo runs in a runner container on the same private Docker
 network rather than on the host. Nothing here touches staging, production or
 host Postgres, and no secret is read.
 
-  python3 scripts/local_testdb.py test            # up + full rust-tests sequence + summary
-  python3 scripts/local_testdb.py up              # start/prepare only (idempotent)
-  python3 scripts/local_testdb.py exec -- cargo test -p two-bot-core --features db --locked
+  python3 scripts/local_testdb.py test            # fresh DB + full rust-tests sequence + summary
+  python3 scripts/local_testdb.py up [--fresh]    # start/prepare only (idempotent)
+  python3 scripts/local_testdb.py exec [--fresh] -- cargo test -p two-bot-core --features db --locked
   python3 scripts/local_testdb.py env             # print the test environment
   python3 scripts/local_testdb.py down [--volumes]
 
@@ -38,6 +38,10 @@ BOOTSTRAP = "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
 ADMIN = "postgres://agent_test@agent-testdb:5432/agent_test"
 DATABASES = ("two_bot_test_ci", "two_next_backup_ci", "two_next_backup_publication_ci")
 WAL = (("max_wal_size", "128MB"), ("min_wal_size", "32MB"))
+# CI's 1 GiB tmpfs fits a CI runner's test parallelism. A many-core workstation
+# keeps more fixture databases alive at once and fills it (ENOSPC), so default
+# larger here. The tmpfs counts against the container memory cap.
+TMPFS_GIB = int(os.environ.get("TWO_LOCAL_TESTDB_TMPFS_GIB", "4"))
 
 # The rust-tests job env in check.yml. DB URLs are step-scoped there, as here.
 JOB_ENV = {
@@ -162,18 +166,23 @@ def toolchain():
     return match.group(1)
 
 
-def up():
+def up(fresh=False):
+    """Start or reuse the stack; fresh replaces the database like a new CI job."""
     postgres, rust = images()
+    if fresh:
+        docker("rm", "-f", DB, check=False, capture=True)
     if not exists("network", NETWORK):
         docker("network", "create", NETWORK, capture=True)
     if not running(DB):
         docker("rm", "-f", DB, check=False, capture=True)
-        # Same service shape as check.yml: trust auth, tmpfs PGDATA, 2 GiB cap.
+        # Same service shape as check.yml (trust auth, tmpfs PGDATA, memory cap),
+        # sized by TMPFS_GIB instead of CI's 1 GiB.
+        tmpfs, memory = TMPFS_GIB << 30, (TMPFS_GIB + 1) << 30
         docker("run", "-d", "--name", DB, "--network", NETWORK, "--network-alias", "agent-testdb",
                "-e", "POSTGRES_USER=agent_test", "-e", "POSTGRES_DB=agent_test",
                "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
-               "--tmpfs", "/var/lib/postgresql:rw,size=1073741824",
-               "--memory", "2147483648", "--memory-swap", "2147483648", postgres, capture=True)
+               "--tmpfs", f"/var/lib/postgresql:rw,size={tmpfs}",
+               "--memory", str(memory), "--memory-swap", str(memory), postgres, capture=True)
     if not running(RUNNER):
         docker("rm", "-f", RUNNER, check=False, capture=True)
         docker("run", "-d", "--name", RUNNER, "--network", NETWORK,
@@ -237,9 +246,14 @@ def run_step(env, command):
 
 
 def test():
-    up()
+    # Leftover fixture databases and WAL from an earlier run can exhaust the
+    # tmpfs, so every full run starts on an empty service as CI does.
+    up(fresh=True)
     rows = []
     for name, env, command in STEPS:
+        # CI stops at the first failing test binary; locally, report them all.
+        if command.startswith("cargo test "):
+            command = command.replace("cargo test ", "cargo test --no-fail-fast ", 1)
         print(f"\n==> {name}: {command}", flush=True)
         rows.append((name, *run_step(env, command)))
     print("\nstep                                      exit  passed  failed  ignored")
@@ -254,16 +268,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("up", help="start and prepare the disposable database and runner")
+    start = commands.add_parser("up", help="start and prepare the disposable database and runner")
+    start.add_argument("--fresh", action="store_true", help="replace the database with an empty one")
     commands.add_parser("test", help="up, then run the rust-tests sequence and summarize")
     commands.add_parser("env", help="print the test environment used inside the runner")
     run = commands.add_parser("exec", help="run a command in the runner with the test environment")
+    run.add_argument("--fresh", action="store_true", help="replace the database with an empty one")
     run.add_argument("argv", nargs=argparse.REMAINDER)
     stop = commands.add_parser("down", help="remove the containers and network")
     stop.add_argument("--volumes", action="store_true", help="also remove this checkout's target volume")
     args = parser.parse_args(argv)
     if args.command == "up":
-        up()
+        up(args.fresh)
     elif args.command == "test":
         return test()
     elif args.command == "env":
@@ -273,7 +289,7 @@ def main(argv=None):
         command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
         if not command:
             parser.error("exec needs a command after --")
-        up()
+        up(args.fresh)
         return runner_exec(command, env=dict(JOB_ENV, **INTEGRATION_ENV), check=False).returncode
     elif args.command == "down":
         down(args.volumes)
