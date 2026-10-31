@@ -62,10 +62,10 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        decode_configuration, export_configuration, validate_configuration,
-        validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory,
-        RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
-        VOICE_CONFIG_VERSION,
+        decode_configuration, export_configuration, validate_command_role_change,
+        validate_configuration, validate_time_zone_change, ChannelKind, ChannelReference,
+        GuildInventory, RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration,
+        MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, render_review_preview,
@@ -110,7 +110,7 @@ use two_bot_core::{
         OverwriteTarget as TextOverwriteTarget, TextChannelPlan, VoiceRoomFacts,
         DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
     },
-    voice_utilities::{invite_render, is_valid_invite_code, ping_render},
+    voice_utilities::{invite_render, is_valid_invite_code, myroom_render, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
@@ -3937,6 +3937,41 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         rooms
     }
 
+    /// The member's currently owned live rooms for `/myroom`, as channel
+    /// references in channel order. `None` unless live evidence is
+    /// authoritative (gateway connected, snapshot ready, worker not halted),
+    /// matching `kick_room_of`: a disconnected or just-loaded worker may
+    /// track rooms Discord no longer has, so it must not call them live.
+    /// Ownership is the current `owner_id`, never the original creator; a
+    /// channel absent from this one live snapshot (already deleted on
+    /// Discord) is excluded. Channel references only — no privacy label or
+    /// ACL classification is part of this read.
+    /// Pure in-memory read: no store, queue or Discord touch.
+    pub fn live_owned_rooms(&self, member: Snowflake) -> Option<Vec<Snowflake>> {
+        let live = self.live.read_state();
+        if !live.ready || self.halted {
+            return None;
+        }
+        let mut rooms: Vec<Snowflake> = self
+            .rooms
+            .iter()
+            .filter(|(channel, room)| {
+                room.owner_id == member && live.channels.contains_key(channel)
+            })
+            .map(|(channel, _)| *channel)
+            .collect();
+        rooms.sort_unstable();
+        Some(rooms)
+    }
+
+    /// Whether joining a creator channel could currently start a room: the
+    /// guild-wide creation switch is on and at least one creator channel is
+    /// live. `/myroom` shows the join guidance only when this is true, so an
+    /// empty reply never points at an unavailable path.
+    pub fn creation_available(&self) -> bool {
+        may_create_room(&self.access) && !self.live.read_state().creator_channels.is_empty()
+    }
+
     /// Replace the caps and cooldown used by the durable create admission
     /// (legacy defaults: 1 room per member, 40 per guild, 30 s cooldown).
     pub fn set_admission_config(&mut self, config: CreateAdmissionConfig) {
@@ -5915,10 +5950,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             }
                             Ok(CreateClaim::Refused(reason)) => {
                                 observe_voice_operation("create", "refused");
+                                // The recorded refusal stays context-free: it is an
+                                // operator diagnostic (`/setup`, logging notices) with
+                                // no per-member reply, so member room ids do not
+                                // belong in it or in its dedup key. Members find their
+                                // rooms with `/myroom`.
+                                let message = reason.user_message(&self.admission);
                                 self.record(LifecycleFailure::CreateRefused {
                                     creator_id: creator_channel_id,
                                     reason,
-                                    message: reason.user_message(&self.admission),
+                                    message,
                                 });
                                 creation.timing.finish("refused");
                                 self.creations.remove(&action.id);
@@ -7893,6 +7934,22 @@ enum ActorCommand {
         decision: JoinDecisionCommand,
         reply: oneshot::Sender<JoinReply>,
     },
+    /// Read-only `/myroom`: the member's currently owned live room channel
+    /// references plus whether room creation is open for guidance text.
+    /// Answered from live worker state only; never touches the store.
+    MyRooms {
+        member: Snowflake,
+        reply: oneshot::Sender<Option<MyRoomsReply>>,
+    },
+}
+
+/// One `/myroom` worker answer: owned live channel references in channel
+/// order plus whether room creation is open, so the empty reply's join
+/// guidance is shown only when a creator lobby could actually be joined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MyRoomsReply {
+    pub rooms: Vec<Snowflake>,
+    pub creation_available: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -8898,6 +8955,23 @@ where
             .await
             .ok()?
             .ok()
+    }
+
+    /// Read one member's currently owned live rooms (`/myroom`) from the
+    /// live worker. `None` when the guild has no live actor, when its inbox
+    /// already drained, when no answer arrived within `WORKER_ACK_WAIT`, or
+    /// when the worker's live evidence is not ready.
+    pub async fn run_myrooms(&self, guild: Snowflake, member: Snowflake) -> Option<MyRoomsReply> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::MyRooms { member, reply })
+            .ok()?;
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()?
     }
 
     /// Invalidate first: even an in-flight task cannot write after GuildDelete.
@@ -10436,6 +10510,12 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::JoinDecision { decision, reply } => {
             let _ = reply.send(worker.apply_join_decision(decision));
         }
+        ActorCommand::MyRooms { member, reply } => {
+            let _ = reply.send(worker.live_owned_rooms(member).map(|rooms| MyRoomsReply {
+                rooms,
+                creation_available: worker.creation_available(),
+            }));
+        }
     }
     accepted_join
 }
@@ -11764,6 +11844,7 @@ pub fn plan_import_preview(
     let (remaining, _) = skip_unknown_channels(&incoming, inventory);
     if let Err(error) = validate_configuration(&remaining, inventory)
         .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+        .and_then(|()| validate_command_role_change(current, &remaining))
     {
         return ImportDecision::Refuse {
             message: format!("Could not import that file: {error} Nothing was changed."),
@@ -11830,6 +11911,7 @@ pub fn plan_import_confirm(
     let (remaining, _) = skip_unknown_channels(candidate, inventory);
     if let Err(error) = validate_configuration(&remaining, inventory)
         .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+        .and_then(|()| validate_command_role_change(current, &remaining))
     {
         return ImportDecision::Refuse {
             message: format!(
@@ -12033,6 +12115,10 @@ pub enum VoiceCommand {
     },
     Ping,
     Invite,
+    /// Read-only `/myroom`: list the invoker's currently owned live rooms
+    /// with their runtime privacy. Answered from live worker state only; the
+    /// invoker never has to be in voice.
+    MyRoom,
     TextChannels {
         channel_id: Snowflake,
         request: TextChannelsRequest,
@@ -12362,6 +12448,7 @@ fn parse_voice_command_with_registry(
         }),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
+        "myroom" => Some(VoiceCommand::MyRoom),
         "textchannels" => {
             if let Some(field) = setup_shape_refusal("textchannels", &command.options) {
                 return Some(VoiceCommand::SetupShapeInvalid {
@@ -13008,6 +13095,7 @@ impl VoiceCommand {
             Self::Setup { .. } => "setup",
             Self::Ping => "ping",
             Self::Invite => "invite",
+            Self::MyRoom => "myroom",
             Self::TextChannels { .. } => "textchannels",
             Self::Position { .. } => "position",
             Self::Group { .. } => "group",
@@ -13740,6 +13828,15 @@ async fn execute_access<S: RoomPersistence>(
             access_required_role_ack(role)
         }
         AccessAction::Restrict { command, roles } => {
+            // `/myroom` is a real voice command but carries no per-command
+            // role policy: refuse truthfully without a write so a rollback
+            // image never meets a saved key it cannot decode. The guild-wide
+            // `required_role` gate still applies to it.
+            if command == "myroom" {
+                return format!(
+                    "/{command} cannot be restricted with /access, so nothing was changed."
+                );
+            }
             if !is_voice_command(&command) {
                 return format!("/{command} is not a voice-room command, so nothing was changed.");
             }
@@ -14007,6 +14104,30 @@ where
         }
         VoiceCommand::Invite => {
             reply(ephemeral_response(&invite_render(invite_code))).await;
+            true
+        }
+        VoiceCommand::MyRoom => {
+            let Some(actor_id) = invoker_member_id(interaction) else {
+                reply(ephemeral_response(
+                    "I couldn't tell who invoked /myroom — try again.",
+                ))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_myrooms(guild_id, actor_id)
+                .await
+                .map(|answer| myroom_render(&answer.rooms, answer.creation_available))
+                .unwrap_or_else(|| {
+                    // A known worker that never answered is a transient
+                    // failure, not a cold cache.
+                    if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY.to_owned()
+                    } else {
+                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    }
+                });
+            reply(ephemeral_response(&text)).await;
             true
         }
         VoiceCommand::Access(action) => {

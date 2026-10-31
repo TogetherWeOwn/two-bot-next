@@ -242,6 +242,35 @@ pub fn validate_time_zone_change(
     ))
 }
 
+/// Import-time rule for `settings.command_role_id`, the guild-wide role gate.
+///
+/// Config import writes `voice_guild_settings.command_role_id`, but every
+/// command gate reads `voice_access_controls.required_role_id` instead
+/// (`PgRoomStore::access_controls`), and `/import` Confirm only rewrites the
+/// former. An imported global role is therefore never enforced: a guild that
+/// sets one believes its commands are gated while a non-admin without the
+/// role still runs them, `/myroom` included.
+///
+/// Refuse the change instead of writing a value that cannot take effect. A
+/// value equal to the one already stored is accepted as is, so a guild whose
+/// earlier configuration carries one can still re-import its own export
+/// (the same escape hatch [`validate_time_zone_change`] uses). Clearing it to
+/// `null` is always allowed. Not part of [`validate_configuration`], which
+/// `/export` also runs, so an existing document stays exportable.
+pub fn validate_command_role_change(
+    previous: &VoiceConfiguration,
+    candidate: &VoiceConfiguration,
+) -> Result<(), VoiceConfigError> {
+    match candidate.settings.command_role_id.as_deref() {
+        None => Ok(()),
+        Some(role) if Some(role) == previous.settings.command_role_id.as_deref() => Ok(()),
+        Some(_) => Err(invalid(
+            "settings.command_role_id",
+            "cannot be imported: this guild-wide role is not enforced by any command gate; set the role gate with /access in Discord",
+        )),
+    }
+}
+
 /// Strict decode only: size cap, an object at the document and every nested
 /// DTO boundary (no positional arrays), no duplicate keys, no trailing data.
 /// It does not validate against an inventory, so callers that must report and
@@ -425,6 +454,9 @@ pub fn validate_configuration(
     let mut commands = BTreeSet::new();
     for (i, restriction) in settings.command_roles.iter().enumerate() {
         let path = format!("settings.command_roles[{i}]");
+        // Config import writes voice_command_roles, not the live access-policy
+        // store. Only names from the restrictable vocabulary (`VOICE_COMMANDS`)
+        // may be imported; `myroom` is not in it and refuses here.
         if !is_voice_command(&restriction.command) {
             return Err(invalid(
                 &format!("{path}.command"),

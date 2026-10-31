@@ -19,8 +19,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use super::custom_commands::reserved_command_names;
 use super::custom_commands::{
-    error_code, max_custom_commands, reserved_command_names, validate_put_input, CommandError,
+    error_code, max_custom_commands, published_builtin_count, validate_put_input, CommandError,
     PutCommandInput, StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
@@ -250,7 +252,7 @@ pub fn parse_import_document(
 /// command budget are refused before planning.
 #[must_use]
 pub fn max_import_entries() -> usize {
-    max_custom_commands(reserved_command_names().len())
+    max_custom_commands(published_builtin_count())
 }
 
 /// One dry-run rejection: the definition plus its stable reason code
@@ -290,8 +292,23 @@ pub fn diff_import(
 ) -> Result<ImportDiff, CommandError> {
     let mut valid = Vec::with_capacity(parsed.entries.len());
     let mut rejected: Vec<ImportRejection> = Vec::new();
+    // A pre-existing saved row keeps the same exemption PUT and toggle use:
+    // the additive voice surface must not strand a custom `myroom` that
+    // predates it. Reimporting its edited export converges instead of
+    // reporting `ReservedName`; a fresh, colliding name is still refused.
+    // Remove it once, not per entry: a maximal import is 100 rows.
+    let grandfathered = existing.iter().any(|row| row.name == "myroom");
+    let reserved: HashSet<String> = if grandfathered {
+        builtins
+            .iter()
+            .filter(|name| name.as_str() != "myroom")
+            .cloned()
+            .collect()
+    } else {
+        builtins.clone()
+    };
     for (index, entry) in parsed.entries.iter().enumerate() {
-        match validate_put_input(entry, builtins) {
+        match validate_put_input(entry, &reserved) {
             Ok(()) => valid.push((index, entry)),
             Err(err) => rejected.push(ImportRejection {
                 name: entry.name.clone(),
@@ -299,7 +316,7 @@ pub fn diff_import(
             }),
         }
     }
-    let max = max_custom_commands(builtins.len());
+    let max = max_import_entries();
     let mut union: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
     for (_, entry) in &valid {
         union.insert(entry.name.as_str());
@@ -432,6 +449,32 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&doc).expect("serializes")["schedules"],
             serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_grandfathered_myroom_export_reimports_but_a_fresh_one_stays_reserved() {
+        // A saved custom `myroom` predates the voice command of the same name.
+        // Reimporting its edited export must converge (PUT and toggle already
+        // exempt the existing row); a guild that has no such row must still
+        // refuse the colliding name.
+        let rows = vec![stored("myroom", "old {user}", Some("!myroom"))];
+        let mut body = serde_json::to_value(export_document(&rows)).expect("serializes");
+        body["commands"][0]["template"] = json!("new {user}");
+        let parsed = parse(&body);
+        assert_eq!(parsed.entries.len(), 1);
+        let diff = diff_import(&rows, &parsed, &builtins(), true).expect("diff plans");
+        assert!(diff.rejected.is_empty(), "{:?}", diff.rejected);
+        assert_eq!(diff.to_update, ["myroom"]);
+
+        // No stored row: the same entry is a fresh collision, still refused.
+        let fresh = diff_import(&[], &parsed, &builtins(), true).expect("diff plans");
+        assert!(fresh.to_create.is_empty());
+        assert_eq!(fresh.rejected.len(), 1);
+        assert_eq!(fresh.rejected[0].name, "myroom");
+        assert_eq!(
+            fresh.rejected[0].code,
+            error_code(&CommandError::ReservedName("myroom".to_owned()))
         );
     }
 
@@ -639,8 +682,13 @@ mod tests {
     #[test]
     fn union_capacity_fails_the_whole_diff() {
         let builtins = builtins();
-        let max = max_custom_commands(builtins.len());
-        let desired: Vec<PutCommandInput> = (0..=max)
+        // 67 published definitions leave 33 slots. The held assistant name
+        // remains reserved, but it must not reduce a legal catalog to 32.
+        let max = 33;
+        assert_eq!(crate::custom_commands::published_builtin_count(), 67);
+        assert_eq!(max_custom_commands(67), max);
+        assert_eq!(max_import_entries(), max);
+        let desired: Vec<PutCommandInput> = (0..max)
             .map(|i| PutCommandInput {
                 name: format!("fresh-{i}"),
                 description: "Fresh".to_owned(),
@@ -648,15 +696,53 @@ mod tests {
                 text_trigger: None,
             })
             .collect();
-        let parsed = ParsedImport {
+        let mut parsed = ParsedImport {
             entries: desired,
             translation_conflicts: Vec::new(),
             invalid_entries: 0,
             overwrite: true,
         };
+        let legal = diff_import(&[], &parsed, &builtins, true).expect("all 33 rows fit");
+        assert_eq!(legal.to_create.len(), 33);
+        assert!(legal.to_update.is_empty());
+        assert!(legal.rejected.is_empty());
+        let existing: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|input| {
+                let mut row = stored(&input.name, &input.template, input.text_trigger.as_deref());
+                row.description = input.description.clone();
+                row
+            })
+            .collect();
+        let same = diff_import(&existing, &parsed, &builtins, true).expect("no-growth convergence");
+        assert_eq!(same.unchanged.len(), 33);
+        assert!(same.to_create.is_empty());
+        assert!(same.to_update.is_empty());
+        assert!(same.rejected.is_empty());
+        for input in &mut parsed.entries {
+            input.template = "updated".to_owned();
+        }
+        let updates =
+            diff_import(&existing, &parsed, &builtins, true).expect("33 no-growth updates");
+        assert_eq!(updates.to_update.len(), 33);
+        assert!(updates.to_create.is_empty());
+        assert!(updates.rejected.is_empty());
+        parsed.entries.push(PutCommandInput {
+            name: "fresh-overflow".to_owned(),
+            description: "One too many".to_owned(),
+            template: "t".to_owned(),
+            text_trigger: None,
+        });
+        assert_eq!(parsed.entries.len(), 34);
         assert_eq!(
             diff_import(&[], &parsed, &builtins, true),
-            Err(CommandError::OverCapacity(max))
+            Err(CommandError::OverCapacity(33))
+        );
+        assert_eq!(
+            diff_import(&existing, &parsed, &builtins, true),
+            Err(CommandError::OverCapacity(33)),
+            "one new row refuses the whole diff, including all 33 updates"
         );
     }
 }

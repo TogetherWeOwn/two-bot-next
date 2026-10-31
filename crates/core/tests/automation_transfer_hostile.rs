@@ -267,8 +267,13 @@ fn oversized_entry_lists_fail_bounded() {
         parse_import_document(&json!([{"command": "faq", "response": "a"}]), 0),
         Err(ImportParseError::TooManyEntries { count: 1, max: 0 })
     );
-    // The budget is the guild command ceiling minus reservations.
-    assert_eq!(max, max_custom_commands(reserved_command_names().len()));
+    // Only published definitions consume slots; the unpublished assistant
+    // still reserves its name without taking the legal 33rd custom slot.
+    let published = two_bot_core::custom_commands::published_builtin_count();
+    assert_eq!(published, 67);
+    assert_eq!(max, 33, "67 published +33 custom =100");
+    assert_eq!(max, max_custom_commands(published));
+    assert!(reserved_command_names().contains("templateassistant"));
 }
 
 #[test]

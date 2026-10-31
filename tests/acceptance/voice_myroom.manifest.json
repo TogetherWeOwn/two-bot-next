@@ -1,0 +1,282 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only review correction for owned-room discovery: observed ACL privacy, context-free refusal diagnostics, fail-closed imports, rollback cleanup and existing custom-command compatibility",
+  "baseCommit": "3301618ab2be73b737fa2a2909ceb26152682b56",
+  "originalFeatureBase": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
+  "branch": "feat/myroom-owned-rooms",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/voice_myroom_acceptance_tests.rs",
+      "sha256": "4b4e675ac1607183390aaa55faac00b68cc792578700fd10bd202cc1f09db32f",
+      "tests": 16,
+      "change": "Room 501 now has an observed guild @everyone Connect deny. All original refusal, owner identity, ephemeral reply, poisoned-store and pre/post no-write assertions remain. Adds genuine partial-public failure, unknown ACL, controlled reconnect, deleted/disconnected controls and bounded long-response cases."
+    },
+    {
+      "path": "crates/core/tests/voice_myroom_acceptance.rs",
+      "sha256": "073154c4eb1897c172a63fcbdc39e8dc3285548231c72fb5b6dccaf08193031b",
+      "tests": 4,
+      "change": "Unchanged."
+    },
+    {
+      "path": "crates/bot/src/voice_rooms_tests.rs",
+      "sha256": "3904842472f8862cfb4ed26acc64029b568a1f2cfe80669cf499bb1e5f1f24f7",
+      "change": "Unchanged from the exact feature base; existing registrations, 45+22=67 publication pins and unrelated tests are preserved."
+    },
+    {
+      "path": "crates/core/tests/voice_config.rs",
+      "sha256": "899efb91fe9885f7dfd438fa1187a2e4b11da646e55bef3493a627a033920da7",
+      "tests": 25,
+      "change": "Author correction: runtime VOICE_COMMANDS still contains myroom, but the config-import supported subset excludes it. All original invalid-command controls remain; established commands still import."
+    },
+    {
+      "path": "crates/bot/src/voice_config_full_diff_acceptance_tests.rs",
+      "sha256": "751e6d733c4449bf6a1cf25967fd88098871681f87ceb07b75bbcab83b634200",
+      "tests": 31,
+      "change": "Adds codec/preview/real forged-Confirm refusal without saved success or writes, established-command controls, and real access restrict/unrestrict cleanup with a frozen previous-reader fixture. Existing full-diff oracles are unchanged."
+    },
+    {
+      "path": "crates/discord/tests/custom_command_toggle_acceptance.rs",
+      "sha256": "f028cb69dbb22aac0033036e3b3e96d8ef07cce6ebe0fb140be2c8d46bf70f63",
+      "tests": 24,
+      "change": "Author correction: legal stored capacity is independently 33 because only 67 definitions publish; the reservation-only assistant name does not consume a publication slot. The 34th-row overflow control remains strict. Adds parser/planner/service/publication coverage and grandfathered myroom maintenance, fresh-name reservation and voice-precedence controls. Existing faq reply checks retain the same named assertions through a shared helper. Teardown hygiene: capture voice-off results and the fresh-collision query before closing the owned database, then check the same predicates and expected values only after awaited explicit teardown."
+    },
+    {
+      "path": "crates/bot/src/custom_command_toggle_acceptance.rs",
+      "sha256": "f5a09c725e2653f48544441100f6d546f12503462ee5a7e619e2d513430b7b15",
+      "tests": 2,
+      "change": "Adds production gateway dispatch coverage for saved custom myroom with voice off and voice-sink precedence with voice on; existing toggle test is unchanged. Teardown hygiene: the two voice-off completion checks and no-publication check now run after awaited explicit database teardown, with unchanged predicates and expected values."
+    },
+    {
+      "path": "crates/bot/src/internal_action_http/tests/automations.rs",
+      "sha256": "15154d350c86314e46d9cd9529cadfc1e24109f1354d0b688e86df44b766b082",
+      "tests": 11,
+      "change": "Adds real signed receiver import, no-growth update, idempotent replay and 34-row refusal using only a guarded disposable database fixture."
+    },
+    {
+      "path": "crates/core/tests/automation_transfer_hostile.rs",
+      "sha256": "d42ec7930e5cd67ec7d7f32694f6bfa0d3c550fcb28a0ac3550a155cb2a9a24a",
+      "change": "Only oversized_entry_lists_fail_bounded changes: its budget follows 67 published definitions and independently requires 33 custom slots. Exact-bound, one-over, zero-budget and all hostile-input assertions remain."
+    }
+  ],
+  "protectedTestRegions": [
+    {
+      "path": "crates/core/src/automation_transfer.rs",
+      "function": "union_capacity_fails_the_whole_diff",
+      "cfgTestModuleLine": 410,
+      "startLine": 682,
+      "endLine": 747,
+      "sha256": "735a8954abcdec0a1274c7c0f0b78d57bd124b3d4b22a0014542e2c272d54a60",
+      "lineAnchorNote": "Current line anchors reflect intervening feature changes; the protected test bytes and SHA-256 are unchanged. Baseline spans and outside-region hash below remain historical revision-6 evidence, not a hash of the current production code.",
+      "baselineStartLine": 641,
+      "baselineEndLine": 706,
+      "unchangedOutsideRegionSha256": "4f9b8e1c6cb1b3ba95c33ce38d4b74418dea1f1401c7fcc714e2294170bb8c07",
+      "change": "Pins legal 33-row creation, same-content convergence and no-growth updates, then whole-diff refusal of a genuine 34-row catalog and a union of 33 updates plus one new row."
+    },
+    {
+      "path": "crates/core/src/custom_commands.rs",
+      "function": "write_reservations_cover_the_maximal_publish_set_and_capacity",
+      "cfgTestModuleLine": 1135,
+      "startLine": 1419,
+      "endLine": 1486,
+      "sha256": "ffa41f857045e0a66026191afdadbbb10b93bd34bec1797ffe3f43a9719d30dd",
+      "baselineStartLine": 1419,
+      "baselineEndLine": 1480,
+      "unchangedOutsideRegionSha256": "5a26505e6fefa7b7c72ba26aaf08ca4578b9d5250c800587e9f61a8a735b02e9",
+      "change": "Preserves fresh assistant-name refusal and reservation coverage; independently proves 67+33=100, admission of the 33rd row and same-name maintenance, and true 34-row admission/publication overflow."
+    }
+  ],
+  "commands": {
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::myroom_acceptance:: -- --nocapture --test-threads=1",
+    "configCodec": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_config command_roles_accept_only_restrictable_voice_commands -- --nocapture",
+    "configRuntime": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::full_diff_acceptance::myroom_ -- --nocapture --test-threads=1",
+    "discovery": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_myroom_acceptance -- --nocapture",
+    "customCatalog": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_toggle_acceptance -- --nocapture --test-threads=1",
+    "gateway": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot command_runtime_tests::custom_command_toggle_acceptance:: -- --nocapture --test-threads=1",
+    "internalImport": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot internal_action_http::tests::automations::import_33_row_backup_updates_and_replays_but_34_rows_never_write -- --nocapture --test-threads=1",
+    "capacityPlanner": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib automation_transfer::tests::union_capacity_fails_the_whole_diff -- --nocapture",
+    "capacityReservation": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib custom_commands::tests::write_reservations_cover_the_maximal_publish_set_and_capacity -- --nocapture",
+    "capacityHostile": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test automation_transfer_hostile -- --nocapture",
+    "capacityCoreSweep": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib --test automation_transfer_hostile -- --nocapture",
+    "referencePrerequisite": "python3 scripts/generate_command_reference.py --controller",
+    "format": "cargo fmt --all -- --check",
+    "unwrapGate": "python3 scripts/ci/check-unwrap-request-paths.py --base-ref origin/main --head-ref HEAD"
+  },
+  "expectedBaseline": {
+    "baseCommit": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
+    "observedRustResults": {
+      "head": "be41a183baf7104579b785987413d79bababa632",
+      "runUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41065128592",
+      "runConclusion": "cancelled",
+      "rustJob": {
+        "url": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41065128592/job/124094298352",
+        "passed": 1234,
+        "failed": 6,
+        "ignored": 0
+      },
+      "nextestJob": {
+        "url": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41065128592/job/124094298586",
+        "testsRun": 5641,
+        "passed": 5634,
+        "failed": 7,
+        "skipped": 496
+      },
+      "observedFailures": [
+        "myroom_command_roles_forged_confirm_revalidates_before_any_write",
+        "myroom_command_roles_preview_and_forged_confirm_refuse_in_planning",
+        "myroom_command_roles_preview_refuses_without_write",
+        "myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitted_accounting",
+        "myroom_partial_public_delete_refusal_reports_observed_open_acl_without_retiring_retry",
+        "myroom_unknown_overwrites_are_unavailable_through_facade_and_handler",
+        "import_33_row_backup_updates_and_replays_but_34_rows_never_write"
+      ],
+      "note": "The selected jobs emitted these observed summaries and assertion failures before implementation fixes. The run-level cancellation does not turn those failures into compile errors or GREEN. This is baseline evidence, not verification of the source-fix or corrected-test head."
+    },
+    "expectedRed": [
+      "myroom_partial_public_delete_refusal_reports_observed_open_acl_without_retiring_retry",
+      "myroom_unknown_overwrites_are_unavailable_through_facade_and_handler",
+      "myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitted_accounting",
+      "command_roles_accept_only_restrictable_voice_commands",
+      "myroom_command_roles_preview_and_forged_confirm_refuse_in_planning",
+      "myroom_command_roles_preview_refuses_without_write",
+      "myroom_command_roles_forged_confirm_revalidates_before_any_write",
+      "custom_catalog_33_row_export_parses_and_diffs_without_growth",
+      "custom_catalog_service_import_33_succeeds_and_34_overflows_with_bulk_updates",
+      "toggle_at_capacity_can_resume_existing_definition_but_cannot_add_another",
+      "grandfathered_myroom_publishes_dispatches_edits_and_toggles_with_voice_off",
+      "import_33_row_backup_updates_and_replays_but_34_rows_never_write"
+    ],
+    "expectedAddedControls": [
+      "myroom_queued_read_disconnects_before_dispatch_then_reconnect_uses_new_acl",
+      "control_myroom_deleted_channel_is_omitted_without_reconciling_away_the_owned_row",
+      "control_myroom_explicit_empty_overwrites_are_known_public_evidence",
+      "control_myroom_disconnected_actor_never_claims_live_rooms",
+      "myroom_access_restriction_previous_reader_compat_sequence",
+      "all_enabled_publication_67_plus_33_equals_100_with_voice_off_and_on",
+      "myroom_router_precedence_off_runs_custom_and_on_yields_to_voice_sink",
+      "voice_on_retains_myroom_precedence_and_collision_safety",
+      "toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice_sink"
+    ],
+    "note": "The expected lists are historical predictions, not extra observed failures. Observed predecessor baseline summaries are recorded separately above: six Rust-job and seven nextest assertion failures. No source-fix-head or corrected-test-head GREEN is established by that evidence."
+  },
+  "boundaries": {
+    "source": "Relative to exact delivered head 3301618ab2be73b737fa2a2909ceb26152682b56, only two existing voice-off test functions and this manifest change. Captured observations are checked after awaited explicit database teardown; all 20 assertion macros retain their predicates and expected values, with the same fresh-collision query captured before teardown and a contextual expect in place of unwrap. All other bytes of both test files, seven other protected files and both inline protected regions are unchanged. No production, main sync, gate/rule, hook, workflow, dependency, budget, generated pin, configuration or documentation change.",
+    "externalServices": "No database, live Discord, staging or production mutation during authoring. Database-backed cases require the repository-guarded disposable TestDatabase service; HTTP effects use existing local doubles.",
+    "runtime": "Real parsing, role/access gates, actor command dispatch, service/transaction/import/replay paths and response rendering; command-only actors exclude unrelated timer maintenance.",
+    "readOnly": "Current owner versus original creator, one ephemeral reply, poisoned room-store reads, durable and runtime room/privacy snapshots, queue, create claims, overwrite writes and effect traces remain pinned."
+  },
+  "contract": {
+    "cap": "Recorded UserCap and the four non-cap operator diagnostics remain byte-identical and context-free, with or without known owned rooms. No member-specific room IDs enter diagnostic dedup keys or notices.",
+    "privacy": "Observed known @everyone Connect ACL determines the listed state. An accepted Connect-open overwrite followed by refused Join deletion must list public while persisted private=true and retry bookkeeping remain unchanged. Unknown overwrites yield unavailable, not public; explicitly empty overwrites remain known public evidence.",
+    "singleSnapshot": "Ready, presence and ACL facts must come from one live read guard. The deterministic test covers queued-read disconnect/reconnect ordering and new-generation ACL results; it does not reproduce an intrafunction interleaving between synchronous guard acquisitions.",
+    "configImport": "Reject myroom command_roles entries in codec/import, preview and Confirm, including empty role lists, until that distinct policy store can enforce them. Runtime /access restrict and the runtime allowlist continue to support myroom.",
+    "rollback": "Before reverting to the prior strict reader, use /access show and /access unrestrict command:myroom in every affected guild and read back the runtime store. Cleanup removes only myroom; unrelated established restrictions remain old-reader compatible. Config export/import is not runtime-store clearance evidence.",
+    "capacity": "33 noncolliding custom rows remain exportable/importable and manageable without growth. Voice off/on publication remains 45+33=78 and 67+33=100. Held assistant metadata reserves its name, not another publication slot. 34-row genuine overflow is refused with no partial transaction writes; internal import and replay use the same bound.",
+    "legacyCustom": "With automations on and voice off, saved pre-upgrade custom myroom continues to publish, dispatch, edit and pause/resume. With voice on, the voice slash handler wins. Fresh names remain safe and other saved customs remain usable.",
+    "responseBound": "61 private rooms with 19-digit IDs produce a completion input of at most 2000 scalars with complete rows and explicit omitted-room accounting, or an inspectable bounded complete UTF-8 room-list attachment. Exactly one private response and no room mutations remain required."
+  },
+  "authorVerification": {
+    "teardownHygieneCorrection": {
+      "baseCommit": "3301618ab2be73b737fa2a2909ceb26152682b56",
+      "orderingBefore": {
+        "exit": 1,
+        "violations": 10
+      },
+      "orderingAfter": {
+        "exit": 0,
+        "violations": 0,
+        "botAssertionMacrosPreserved": 9,
+        "discordAssertionMacrosPreserved": 11,
+        "unrelatedTestBytesUnchanged": true
+      },
+      "orderingLimit": "Static source-order and assertion-inventory verification, not a Rust execution or an injected-panic database-lifecycle test. The verifier and logs are delivered with the author handoff.",
+      "referencePrerequisite": {
+        "command": "python3 scripts/generate_command_reference.py --controller",
+        "exit": 75,
+        "reason": "no idle, below-budget slot; no per-worktree fallback",
+        "additionalFinding": "pool_provisioning_mismatch",
+        "bashTimeoutMs": 600000
+      },
+      "focusedRustExecuted": false,
+      "focusedRustLimit": "The generated-reference prerequisite refused admission; neither edited Rust test was started. No new-head Rust GREEN or CI/review verdict is claimed."
+    },
+    "passed": [
+      "cargo fmt --all -- --check",
+      "git diff --check",
+      "python3 scripts/check-secret-debug.py --test",
+      "python3 scripts/check-secret-debug.py",
+      "python3 scripts/test-docker-deps.py",
+      "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_cargo_cache.py -v",
+      "python3 scripts/check_soak_checklist.py",
+      "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_soak_checklist.py -v",
+      "python3 tests/voice_templates/validate.py",
+      "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/voice_templates -p test_*.py -v",
+      "python3 scripts/ci/check-test-inventory.py"
+    ],
+    "refused": [
+      {
+        "command": "python3 scripts/generate_command_reference.py --controller",
+        "exit": 75,
+        "reason": "no idle, below-budget slot; no per-worktree fallback"
+      }
+    ],
+    "focusedRustNotRun": "Generated-reference prerequisite refused exit 75; the focused Rust command was not started.",
+    "preImplementationBaseline": "expectedBaseline.observedRustResults",
+    "sourceFixHeadCI": {
+      "head": "8a467ef5ad72fac87561dc74f1818f3b9c3037bc",
+      "runUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41068436880",
+      "stateAtSnapshot": "in_progress",
+      "completedFailedJobs": [
+        "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41068436880/job/124106701874",
+        "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41068436880/job/124106702673"
+      ],
+      "limit": "The provider CLI refused logs while the run was in progress. Failed test names, counts, additional compiler/oracle issues and the final conclusion were not observed; no wait, rerun or polling was performed."
+    },
+    "functionalGreenPredecessor": {
+      "head": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
+      "runUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41073032768",
+      "nextestJobUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41073032768/job/124122221543",
+      "nextestProviderConclusion": "success",
+      "reportedMetrics": {
+        "testsRun": 5641,
+        "passed": 5641,
+        "failed": 0,
+        "skipped": 496,
+        "myroomCasesPassed": 31,
+        "failBracketLines": 0
+      },
+      "metricsLimit": "The successful job state and exact head were independently verified. Counts and myroom metrics come from the handoff report: raw CLI logs could not be fetched while the overall run was in progress. This is predecessor functional GREEN, not all-required-checks GREEN or verification of the new correction."
+    },
+    "hardGateBefore": {
+      "head": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
+      "command": "python3 scripts/ci/check-unwrap-request-paths.py --base-ref origin/main --head-ref HEAD",
+      "exit": 1,
+      "addedFindings": 1,
+      "location": "crates/core/src/custom_commands.rs:1462",
+      "reason": "The pre-existing unwrap was reflowed onto an added diff line inside the inline test module. The HARD gate includes inline tests.",
+      "nativeCheckJobUrl": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41073032768/job/124122221254",
+      "nativeCheckProviderConclusion": "failure"
+    },
+    "gateCorrection": "Replace only the protected publication assertion's unwrap with a contextual expect, preserving its expected 100 and every other control. The checker, rules and exclusions are unchanged; post-commit gate evidence is recorded on the task.",
+    "correctedHeadRustCompiled": false,
+    "baselineAssertionRedObserved": true,
+    "correctedHeadGreenObserved": false
+  },
+  "limitations": [
+    "Predecessor 4e6f84f85 has a provider-verified successful nextest job, with 5641 passing tests and 31 myroom passes reported in the handoff. Its remaining unwrap HARD-gate failure was reproduced locally. The expect-only correction's Rust compile and full required-checks GREEN are not observed: local reference generation again refused admission with exit 75, so focused Rust tests were not started. Raw predecessor native logs were unavailable through the CLI while the overall run remained in progress.",
+    "The deterministic lifecycle case proves the actor-dispatch ordering boundary, not single-read-guard atomicity inside the synchronous lookup. The one-guard requirement remains in force for Builder implementation and independent review.",
+    "The real VoiceResponder is exercised, but the RoomHttp completion clamp/wire adapter is not. Its loopback constructor is private to the Discord crate and no existing downstream seam is exported. No production hook was added; a bounded responder input makes the existing clamp an identity, but that is reasoning, not an observed transport traversal.",
+    "Previous-image compatibility uses a frozen strict command validator and the runtime policy JSON shape, not a compiled previous image or production database."
+  ],
+  "handoff": [
+    "Keep the one existing feature PR. Do not land this test correction separately or open a companion test PR.",
+    "Consume the immutable handoff commit and preserve the protected paths byte-for-byte; return oracle/compile corrections to the test author.",
+    "Builder owns the source fixes, any author-coordinated older inline-test assumptions, required rollback documentation, exact-head green checks, independent review and auto-merge.",
+    "Native pre-implementation assertion RED and passing controls are recorded; local cache refusal is not additional RED proof. Verify corrected-head GREEN when compilation is admitted. This handoff does not waive any test, CI, review or shipping requirement."
+  ],
+  "revision": {
+    "version": 7,
+    "supersedes": "99ce504420707ed2ddbea4c0dd70a2dcf52a637f",
+    "baseCommit": "3301618ab2be73b737fa2a2909ceb26152682b56",
+    "reason": "Teardown hygiene only: move the existing gateway voice-off completion/publication checks and Discord voice-off catalog/dispatch/collision checks after awaited explicit disposable-database teardown. Capture observations before teardown and preserve every predicate and expected value, including empty fresh-collision rows, with a contextual expect. Refresh only the two changed protected-file hashes; seven other files and both inline regions remain unchanged. The intervening feature-branch test-fixture correction is preserved without editing it; no production or gate/rule change."
+  }
+}

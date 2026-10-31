@@ -228,10 +228,21 @@ impl CustomCommandRuntime {
             .iter()
             .map(StoredCommand::registry_entry)
             .collect::<Vec<_>>();
-        let defs = self
+        let (defs, withheld) = self
             .router
-            .publish_set(&custom)
+            .publish_set_capacity_deferred(&custom)
             .map_err(|_| CustomCommandError::Publication)?;
+        if let Some(builtin) = withheld {
+            // Bounded, non-member-specific administrative notice: the guild's
+            // stored catalog still fits without the optional new builtin, so
+            // publication defers only it instead of failing the sync. The
+            // next serialized registry sync re-evaluates and re-admits it
+            // once capacity allows.
+            tracing::warn!(
+                builtin,
+                "guild command registry at Discord's 100-command ceiling; optional builtin withheld this publication (custom commands preserved)"
+            );
+        }
         self.executor
             .publish_guild_commands(self.application_id, guild, &publish_commands(&defs))
             .await

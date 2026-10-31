@@ -301,3 +301,165 @@ async fn toggle_acceptance_gateway_dispatch_pauses_and_resumes_the_saved_respons
         );
     }
 }
+
+fn custom_invocation(id: u64, name: &str) -> Interaction {
+    let mut input = from_member(
+        slash(name, Some(CHANNEL), Vec::new()),
+        88,
+        Permissions::empty(),
+    );
+    input.id = Id::new(id);
+    input.token = format!("gateway-myroom-{id}");
+    if let Some(InteractionData::ApplicationCommand(data)) = input.data.as_mut() {
+        data.id = Id::new(command_id(name));
+    }
+    input
+}
+
+fn custom_completion(requests: &[RestRequest], id: u64) -> String {
+    let selected: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.contains(&format!("gateway-myroom-{id}")))
+        .collect();
+    assert_eq!(
+        selected.len(),
+        2,
+        "one public defer and one completion for custom run {id}: {selected:?}"
+    );
+    assert_eq!(selected[0].method, "POST");
+    let ack: Value = serde_json::from_slice(&selected[0].body).expect("ack JSON");
+    assert_eq!(ack["type"], 5);
+    assert!(
+        ack["data"]["flags"].is_null(),
+        "custom runs defer publicly, not ephemerally"
+    );
+    assert_eq!(selected[1].method, "PATCH");
+    let reply: Value = serde_json::from_slice(&selected[1].body).expect("reply JSON");
+    assert_eq!(reply["allowed_mentions"]["parse"], json!([]));
+    reply["content"]
+        .as_str()
+        .expect("rendered saved response")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice_sink() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit disposable bootstrap");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("guarded migrated test DB");
+    for (name, template) in [
+        ("myroom", "Legacy {username} in {server}"),
+        ("freshsafe", "Fresh {username}"),
+    ] {
+        custom_command_store::put_command(
+            db.pool(),
+            &StoredCommand {
+                guild_id: GUILD_S.to_owned(),
+                name: name.to_owned(),
+                description: "Saved response".to_owned(),
+                template: template.to_owned(),
+                text_trigger: Some(format!("!{name}")),
+                enabled: true,
+            },
+            "66",
+            "67",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+        )
+        .await
+        .expect("grandfathered row bypasses write validation");
+    }
+    let config = || {
+        crate::gateway_commands::GatewayCommandConfig::from_map_for_activation(
+            GUILD,
+            &HashMap::from([
+                ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+                ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+                ("TWO_AUTOMOD".to_owned(), "0".to_owned()),
+            ]),
+            false,
+        )
+        .expect("explicit command/acceptance gates")
+    };
+    let (mock_off, origin_off) = MockRest::start_script(vec![
+        RestResponse::status(204),
+        RestResponse::status(200),
+        RestResponse::status(204),
+        RestResponse::status(200),
+    ])
+    .await;
+    let runtime_off = CommandRuntime::new(
+        db.pool().clone(),
+        executor_at(origin_off),
+        router_with_commands(gates(true, false)),
+        GUILD,
+        true,
+    );
+    let guard_off = runtime_off.dispatch_guard();
+    runtime_off.initialize_custom_commands_for_test(config());
+    assert!(runtime_off.dispatch(&interaction_event(custom_invocation(8201, "myroom"))));
+    settle(&runtime_off).await;
+    assert!(runtime_off.dispatch(&interaction_event(custom_invocation(8202, "freshsafe"))));
+    settle(&runtime_off).await;
+    let off_requests = mock_off.requests();
+    drop(guard_off);
+    drop(runtime_off);
+    mock_off.shutdown().await;
+    let on_gates = RouterGates {
+        voice: true,
+        ..gates(true, false)
+    };
+    let (mock_on, origin_on) =
+        MockRest::start_script(vec![RestResponse::status(204), RestResponse::status(200)]).await;
+    let runtime_on = CommandRuntime::new(
+        db.pool().clone(),
+        executor_at(origin_on),
+        router_with_commands(on_gates),
+        GUILD,
+        true,
+    );
+    let guard_on = runtime_on.dispatch_guard();
+    runtime_on.initialize_custom_commands_for_test(config());
+    assert!(
+        runtime_on.dispatch(&interaction_event(custom_invocation(8203, "myroom"))),
+        "on claims myroom for the voice sink"
+    );
+    assert!(runtime_on.dispatch(&interaction_event(custom_invocation(8204, "freshsafe"))));
+    settle(&runtime_on).await;
+    let on_requests = mock_on.requests();
+    drop(guard_on);
+    drop(runtime_on);
+    mock_on.shutdown().await;
+    db.close()
+        .await
+        .expect("explicit teardown before behavioral assertions");
+    // Voice-off observations assert after teardown so a failure cannot leave
+    // the disposable database behind (CONTRIBUTING.md: never rely on
+    // panic/runtime-shutdown cleanup).
+    assert_eq!(
+        custom_completion(&off_requests, 8201),
+        "Legacy member in Test guild",
+        "off runs the grandfathered myroom row"
+    );
+    assert_eq!(
+        custom_completion(&off_requests, 8202),
+        "Fresh member",
+        "fresh names run off"
+    );
+    assert!(
+        !off_requests.iter().any(|request| request.method == "PUT"),
+        "custom runs never publish"
+    );
+    assert!(
+        !on_requests
+            .iter()
+            .any(|request| request.path.contains("gateway-myroom-8203")),
+        "on yields myroom with no custom REST"
+    );
+    assert_eq!(
+        custom_completion(&on_requests, 8204),
+        "Fresh member",
+        "fresh names still run on"
+    );
+}

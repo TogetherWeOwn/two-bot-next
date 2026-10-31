@@ -13,8 +13,9 @@
 
 use twilight_model::channel::{Channel, ChannelType};
 use two_bot_core::voice_config::{
-    decode_configuration, validate_configuration, validate_time_zone_change, ChannelKind,
-    ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
+    decode_configuration, validate_command_role_change, validate_configuration,
+    validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory, VoiceConfigError,
+    VoiceConfiguration, MAX_IMPORT_BYTES,
 };
 use two_bot_core::voice_config_diff::{
     diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
@@ -82,6 +83,7 @@ pub fn plan_apply(
     let (remaining, skipped) = skip_unknown_channels(&incoming, inventory);
     if let Err(error) = validate_configuration(&remaining, inventory)
         .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+        .and_then(|()| validate_command_role_change(current, &remaining))
     {
         return ApplyPlan::Refuse {
             message: format!("{error} nothing was changed"),
