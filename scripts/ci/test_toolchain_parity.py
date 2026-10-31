@@ -688,6 +688,108 @@ class ToolchainParityTests(unittest.TestCase):
             "1.99-trixie@sha256:" + "b" * 64,
             ("disagree", "sha256:aaaaaaaaaaaa", "sha256:bbbbbbbbbbbb"))
 
+    def assert_docker_contract(self, source, expected=()):
+        # Keep scope independent of the scanner and fixture inventories. Only
+        # file-specific diagnostics count: unrelated workflow failures do not.
+        for name in ("Dockerfile", "crates/voice-probe/Dockerfile"):
+            with self.subTest(dockerfile=name):
+                with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                    root = make_fixture_root(scratch)
+                    self.assertEqual(toolchain_parity_errors(root), [])
+                    (root / name).write_bytes(source.encode("utf-8"))
+                    errors = toolchain_parity_errors(root)
+                    self.assertIsInstance(errors, list)
+                    if not expected:
+                        self.assertEqual(errors, [])
+                    else:
+                        self.assertTrue(errors, f"{name}: expected explicit rejection")
+                        for error in errors:
+                            self.assertIsInstance(error, str)
+                            self.assertTrue(error.startswith(f"{name}: "), errors)
+                            self.assertTrue(all(term in error for term in expected), errors)
+
+    def test_even_escape_run_preserves_later_unpinned_stage(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)):
+                source = first + "RUN printf '%s' " + chr(92) * 2 + "\n"
+                source += "FROM rust:1.99-trixie AS extra\n"
+                self.assert_docker_contract(source.replace("\n", newline), ("stage 1", "digest"))
+
+    def test_even_escape_run_preserves_later_wrong_tag(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        source = first + "RUN printf '%s' " + chr(92) * 2 + "\n"
+        source += f"FROM rust:1.98-trixie@sha256:{PINNED_DIGEST} AS extra\n"
+        self.assert_docker_contract(source, ("stage 1", "expected rust:1.99-trixie", "got rust:1.98-trixie"))
+
+    def test_variable_builder_is_not_supplied_by_from_looking_run_data(self):
+        source = "ARG BASE\nFROM ${BASE} AS builder\n"
+        source += "RUN printf '%s' \"" + chr(92) + "\n"
+        source += f"FROM rust:1.99-trixie@sha256:{PINNED_DIGEST} AS decoy\"\n"
+        self.assert_docker_contract(source, ("unsupported", "variable-backed image reference"))
+
+    def test_from_looking_run_data_does_not_create_a_stage(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        for reference in ("1.99-trixie", f"1.98-trixie@sha256:{'b' * 64}"):
+            with self.subTest(reference=reference):
+                source = first + "RUN printf '%s' \"" + chr(92) + "\n"
+                source += f"FROM rust:{reference} AS decoy\"\n"
+                self.assert_docker_contract(source)
+
+    def test_inactive_escape_comment_is_ordinary_comment(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        self.assert_docker_contract(first + "# escape=`\n")
+
+    def test_active_backtick_escape_directive_is_explicitly_refused(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        self.assert_docker_contract("# escape=`\n" + first, ("unsupported", "escape"))
+
+    def test_first_line_bom_is_explicitly_refused(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        self.assert_docker_contract(chr(0xfeff) + first, ("unsupported", "byte order mark"))
+
+    def test_noncanonical_separators_are_explicitly_refused(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        for separator in ("\x0b", "\x0c"):
+            with self.subTest(separator=repr(separator)):
+                source = first + f"FROM{separator}rust:1.99-trixie AS extra\n"
+                self.assert_docker_contract(source, ("unsupported", "separator"))
+
+    def test_split_from_keyword_is_explicitly_refused(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        source = first + "FROM" + chr(92) + "\n rust:1.99-trixie AS extra\n"
+        self.assert_docker_contract(source, ("unsupported", "FROM continuation"))
+
+    def test_canonical_rust_image_prefixes_pass_and_still_check_later_stages(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        for prefix in ("", "docker.io/library/", "library/"):
+            with self.subTest(prefix=prefix):
+                pinned = first.replace("rust:", prefix + "rust:")
+                self.assert_docker_contract(pinned)
+                self.assert_docker_contract(
+                    first + f"FROM {prefix}rust:1.99-trixie AS extra\n", ("stage 1", "digest"))
+                self.assert_docker_contract(
+                    first + f"FROM {prefix}rust:1.98-trixie@sha256:{PINNED_DIGEST} AS extra\n",
+                    ("stage 1", "expected rust:1.99-trixie", "got rust:1.98-trixie"))
+
+    def test_heredoc_content_is_explicitly_refused(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        for instruction in ("RUN <<EOF\nprintf ok\nEOF\n",
+                            "RUN <<'EOF'\nFROM rust:1.99-trixie AS decoy\nEOF\n"):
+            with self.subTest(instruction=instruction):
+                self.assert_docker_contract(first + instruction, ("unsupported", "heredoc"))
+
+    def test_supported_ordinary_instruction_continuations_pass(self):
+        first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
+        for instruction, argument in (("RUN printf '%s'", "ok"),
+                                      ("LABEL purpose=fixture", "continuation=ok"),
+                                      ("HEALTHCHECK CMD printf", "ok")):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(instruction=instruction, newline=repr(newline)):
+                    source = "# ordinary comment\n\n" + first
+                    source += instruction + " " + chr(92) + "\n# continued comment\n\n " + argument + "\n"
+                    self.assert_docker_contract(source.replace("\n", newline))
+
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
             root = make_fixture_root(scratch, channel="1.99")
