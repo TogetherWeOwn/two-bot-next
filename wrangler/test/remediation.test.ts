@@ -359,12 +359,12 @@ test("a fractional production clock survives the storage round-trip and still re
   assert.equal(refire.state.scopes["voice-stall"].suppressed, true);
 });
 
-// TOG-45425: the deaf voice actor (`two_bot_voice_live_not_ready_seconds`
-// past its bound) pages but no remediation existed for it, so the signal the
-// host voice-stall-watch timer used to act on had no in-contract recovery.
-// It gets its own scope: `voice_live_not_ready` and `voice_creator_map_stale`
-// are different faults, and sharing one guard would let either burn the
-// other's cooldown window and failure count.
+// The deaf voice actor (`two_bot_voice_live_not_ready_seconds` past its bound)
+// pages but no remediation existed for it, so the signal the host voice-stall
+// timer used to act on had no in-contract recovery. It gets its own scope:
+// `voice_live_not_ready` and `voice_creator_map_stale` are different faults,
+// and sharing one guard would let either burn the other's cooldown window and
+// failure count.
 const DEAF = ["voice_live_not_ready"];
 
 test("a deaf voice actor owns its own scope, so the creator-map trigger cannot consume its window", () => {
