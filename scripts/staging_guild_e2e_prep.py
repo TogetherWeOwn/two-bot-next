@@ -68,6 +68,32 @@ MOCK_TRANSPORT = "mock-local-fixtures"
 BODY_CAP = 64 << 10
 
 
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 class PrepError(Exception):
     """A check's one-line failure reason (fixed vocabulary only)."""
 
@@ -138,7 +164,7 @@ def get_json(fetch_fn, url):
     if len(body) > BODY_CAP:
         raise PrepError("interactions endpoint answered over the body cap")
     try:
-        return json.loads(body)
+        return _loads_bounded(body)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise PrepError("interactions endpoint answered 200 with invalid JSON")
 

@@ -22,7 +22,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from synthetic_alert_history import HistoryError, previous_probe_outcomes, transition
+from synthetic_alert_history import HistoryError, _loads_bounded, previous_probe_outcomes, transition
 
 RUNBOOK_URL = ("https://github.com/TogetherWeOwn/two-bot-next"
                "/blob/main/docs/runbook-observability.md")
@@ -65,7 +65,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def load_evidence(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            value = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+            value = _loads_bounded(handle.read(), object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise AlertError("evidence refused: duplicate JSON object key") from None
     except (OSError, ValueError, RecursionError):

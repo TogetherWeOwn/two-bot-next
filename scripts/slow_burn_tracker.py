@@ -75,6 +75,32 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_JSON_BYTES = 1024 * 1024
 
 
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 def _load_cache_json(path):
     """Read a bounded cache; missing, oversized or malformed data rebuilds."""
     try:
@@ -82,7 +108,7 @@ def _load_cache_json(path):
             raw = stream.read(MAX_JSON_BYTES + 1)
         if len(raw) > MAX_JSON_BYTES:
             return None
-        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(raw, object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError, UnicodeError, RecursionError):
         return None
 
@@ -92,7 +118,7 @@ def _intake_json(raw, message):
     try:
         if len(raw.encode("utf-8") if isinstance(raw, str) else raw) > MAX_JSON_BYTES:
             raise TrackError(message)
-        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(raw, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, UnicodeError, RecursionError):
         raise TrackError(message) from None
 
