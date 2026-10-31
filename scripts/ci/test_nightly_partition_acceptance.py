@@ -489,6 +489,41 @@ class RunnerAcceptance(CargoFixture):
         for partition in PARTITIONS:
             self.assertEqual(self.executions(first[partition]), self.executions(second[partition]))
 
+    def test_partition_owners_match_fixed_sha256_first_eight_byte_big_endian_vectors(self):
+        # Fixed UTF-8 SHA-256 vectors, independent of the runner's owner helper.
+        # Columns are target, name, owner modulo 4, owner modulo 5. The second
+        # modulus also distinguishes eight-byte truncation from shorter hashes.
+        vectors = (
+            ("alpha:lib", "suite::case", 0, 4),
+            ("alpha:lib", "suite::case_extended", 2, 0),
+            ("alpha:lib", "suite::shared", 3, 4),
+            ("alpha:bin", "suite::shared", 3, 4),
+            ("beta:integration", "suite::shared", 3, 4),
+            ("alpha:lib", "suite::ignored", 3, 3),
+            ("alpha:lib", "suite::café", 3, 0),
+            ("alpha:lib", "suite::東京", 0, 0),
+            ("alpha:bin", "binary::smoke", 3, 2),
+            ("beta:integration", "integration::smoke", 3, 2),
+            ("beta:example", "example::smoke", 0, 1),
+            ("beta:integration", "property_no_operation_sequence_creates_a_cycle", 2, 1),
+        )
+        names = {name for _, name, _, _ in vectors}
+        for count, column in ((4, 2), (5, 3)):
+            with self.subTest(count=count):
+                data, outputs = fixture(), {}
+                for partition in range(count):
+                    result, events = self.run_partition(data, partition, count=count)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    outputs[partition] = events
+                observed = Counter()
+                for partition, events in outputs.items():
+                    for (target, name), calls in self.executions(events).items():
+                        if name in names:
+                            observed[(partition, target, name)] += calls
+                self.assertEqual(observed, Counter({(row[column], row[0], row[1]): 1 for row in vectors}),
+                                 "owner must use the first eight SHA-256 bytes as a big-endian integer")
+                self.assert_complete(data, outputs)
+
     def test_inventory_added_after_the_first_run_is_not_lost(self):
         data = fixture()
         self.run_sweep(data)
@@ -825,6 +860,7 @@ class WorkflowAcceptance(CargoFixture):
             {"name": prefix + name + suffix, "ignored": True}
             for name in ORIGINAL_SKIPS for prefix, suffix in (("", ""), ("wrapper::", "::later"))
         ]
+        data["doctests"][0]["tests"].append({"name": "src/voice_template.rs - voice_template (line 12)"})
         broad = self.step("Full workspace sweep including ignored tests")
         outputs = {}
         for index in PARTITIONS:
@@ -835,10 +871,17 @@ class WorkflowAcceptance(CargoFixture):
         self.assert_complete(data, outputs, skips=ORIGINAL_SKIPS)
         self.assertEqual(sum(self.executions(events)[("beta:integration", "property_no_operation_sequence_creates_a_cycle")]
                              for events in outputs.values()), 1, "an ordinary property test must not be newly skipped")
-        for events in outputs.values():
+        self.assertEqual(self.executions(outputs[0], doc=True), Counter({
+            ("alpha:doc", "src/lib.rs - usage (line 12)"): 1,
+            ("alpha:doc", "src/voice_template.rs - voice_template (line 12)"): 1,
+        }), "doctests must retain ordinary sentinels as well as their original skip filters")
+        for partition, events in outputs.items():
             discoveries = [event for event in events if event["event"] == "command" and "--list" in event["args"]]
             self.assertTrue(discoveries, "the skip contract must be exercised by actual inventory commands")
-            for event in discoveries:
+            doctests = [event for event in events if event["event"] == "command" and "--doc" in event["args"]]
+            self.assertEqual(len(doctests), 1 if partition == 0 else 0,
+                             "the original doctest invocation must run exactly once on partition 0")
+            for event in discoveries + doctests:
                 args = event["args"]
                 harness = iter(args[args.index("--") + 1:])
                 skips = []
@@ -848,7 +891,7 @@ class WorkflowAcceptance(CargoFixture):
                     elif argument.startswith("--skip="):
                         skips.append(argument.split("=", 1)[1])
                 self.assertCountEqual(skips, ORIGINAL_SKIPS,
-                                      "broad discovery may neither add nor remove original skip filters")
+                                      "discovery and doctests may neither add nor remove original skip filters")
         for key, expected in {
             "TWO_TEST_DATABASE_URL": "postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly",
             "MEMBER_TESTDB": "agent-testdb", "TEST_DATABASE_URL": "postgresql://agent_test@agent-testdb:5432/postgres",
