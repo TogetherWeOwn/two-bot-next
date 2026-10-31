@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use sqlx::ConnectOptions;
 use tokio::sync::Notify;
@@ -10,6 +12,17 @@ use two_bot_core::{
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{RoomChannelAttributes, RoomHttpError};
+
+#[path = "retention.rs"]
+mod retention;
+
+// Canonical synthetic guild for the cold-resume voice fixture. Guild `100`
+// is rejected by retention identity validation (`cutover/src/lib.rs`
+// `is_snowflake` requires 17-20 digits), so the available-create cancel
+// would fail before SQL and break reconciliation. All fixture member and
+// channel identities remain synthetic.
+const VOICE_GUILD: &str = "444444444444444444";
+const VOICE_GUILD_ID: u64 = 444444444444444444;
 
 #[derive(Clone, Default)]
 struct DeleteOnly(Arc<AtomicU64>);
@@ -106,6 +119,10 @@ impl VoiceEventSink for RecordingVoice {
     fn disconnect(&self) {
         self.disconnects.fetch_add(1, Ordering::Relaxed);
         self.runtime.disconnect();
+    }
+    fn disconnect_from_drop(&self) {
+        self.disconnects.fetch_add(1, Ordering::Relaxed);
+        self.runtime.disconnect_from_drop();
     }
     fn needs_bootstrap(&self, cache: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
@@ -383,12 +400,13 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
                         } else {
                             release_ready.notified().await;
                             let mut packet = ready(&gateway_url, "voice-session");
-                            packet["d"]["guilds"] = json!([{"id":"100","unavailable":true}]);
+                            packet["d"]["guilds"] = json!([{"id":VOICE_GUILD,"unavailable":true}]);
                             ws.send(Message::text(packet.to_string())).await.unwrap();
-                            let mut guild: Value = serde_json::from_str(include_str!(
-                                "../../tests/fixtures/voice_guild.json"
-                            ))
-                            .unwrap();
+                            // Rewrite guild/everyone-role references only; all fixture member and
+                            // channel identities remain synthetic. Retention requires a snowflake.
+                            let fixture = include_str!("../../tests/fixtures/voice_guild.json")
+                                .replace("\"100\"", &format!("\"{VOICE_GUILD}\""));
+                            let mut guild: Value = serde_json::from_str(&fixture).unwrap();
                             let allowed = Permissions::VIEW_CHANNEL
                                 | Permissions::CONNECT
                                 | Permissions::MANAGE_CHANNELS
@@ -396,7 +414,7 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
                                 | Permissions::MANAGE_ROLES;
                             guild["roles"][0]["permissions"] = json!(allowed.bits().to_string());
                             guild["channels"].as_array_mut().unwrap().push(json!({
-                                "id":"700","guild_id":"100","type":2,"name":"tracked room","parent_id":"400","permission_overwrites":[]
+                                "id":"700","guild_id":VOICE_GUILD,"type":2,"name":"tracked room","parent_id":"400","permission_overwrites":[]
                             }));
                             ws.send(Message::text(
                                 json!({"op":0,"s":2,"t":"GUILD_CREATE","d":guild}).to_string(),
@@ -431,13 +449,13 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         .unwrap();
     let rooms = PgRoomStore::new(db.pool.clone());
     rooms
-        .add_creator(&CreatorChannel::new(100, 200))
+        .add_creator(&CreatorChannel::new(VOICE_GUILD_ID, 200))
         .await
         .unwrap();
     rooms
         .add_room(&VoiceRoom::from_spec(
             NewRoomSpec {
-                guild_id: 100,
+                guild_id: VOICE_GUILD_ID,
                 creator_channel_id: 200,
                 owner_id: 300,
                 seed: 7,
@@ -497,11 +515,16 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
     assert_eq!(voice.leaves.load(Ordering::Relaxed), 1);
     assert_eq!(*state.read().await, GatewayState::Armed);
     assert!(pipeline.cache().current_user().is_none());
-    assert!(voice.runtime.worker_status(100).await.is_none());
+    assert!(voice.runtime.worker_status(VOICE_GUILD_ID).await.is_none());
     assert!(voice.disconnects.load(Ordering::Relaxed) >= 1);
     release.notify_one();
     tokio::time::timeout(Duration::from_secs(20), async {
-        while !rooms.rooms_in_guild(100).await.unwrap().is_empty() {
+        while !rooms
+            .rooms_in_guild(VOICE_GUILD_ID)
+            .await
+            .unwrap()
+            .is_empty()
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -512,7 +535,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
     assert_eq!(
         voice
             .runtime
-            .worker_status(100)
+            .worker_status(VOICE_GUILD_ID)
             .await
             .unwrap()
             .tracked_rooms,

@@ -25,12 +25,21 @@ Two record-specific rules live here, not in the schema:
   rule (which suffixes are allowed); it only orders the instants it can
   parse as timezone-aware datetimes.
 * public-safety scan: no internal tracker IDs (`TOG-`, `PAP-`) and no
-  high-confidence secret markers in any string value. This repo is public.
-* input limits: a record or schema may nest at most `MAX_NESTING_DEPTH`
+  high-confidence secret markers in any string value or object key. Key
+  hits are reported at redacted paths, never echoing the key. This repo
+  is public.
+* input limits: a record or schema may hold at most `MAX_DOCUMENT_BYTES`
+  UTF-8 bytes; larger files are refused with a fixed message before any
+  decoding or parsing, so no read is unbounded. A record or schema may
+  nest at most `MAX_NESTING_DEPTH`
   container levels (the root container is level 1). Deeper input, and input
   the decoder refuses (recursion overflow or an oversized integer literal),
   is refused with a fixed message. Bytes that are not UTF-8 are refused with
   their byte offset. No diagnostic echoes raw bytes or values.
+* condition subset: `if` conditions support `properties` with `const`
+  only, the subset the checked-in schema uses. Any other `if` operator
+  is refused with a loud validation error instead of being silently
+  treated as satisfied.
 
 Timestamp policy for fields named `*_utc` (`window.start_utc`,
 `window.end_utc`, `commands[].started_utc`, `deployment.first_readyz_utc`):
@@ -111,6 +120,12 @@ MAX_NESTING_DEPTH = 32
 NESTING_MESSAGE = f"nesting depth exceeds the {MAX_NESTING_DEPTH}-level budget"
 DECODER_DIGITS_MESSAGE = "integer literal exceeds the decoder digit limit"
 
+# Bounds every document read before decoding: the loader issues one bounded
+# read of at most MAX_DOCUMENT_BYTES + 1 (the extra byte witnesses EOF) and
+# refuses larger input before UTF-8 decoding or JSON parsing.
+MAX_DOCUMENT_BYTES = 1024 * 1024
+BYTE_LIMIT_MESSAGE = "document exceeds byte limit"
+
 
 class DuplicateKeyError(ValueError):
     """A JSON object has repeated keys; diagnostics never include its values."""
@@ -122,6 +137,10 @@ class DecoderLimitError(ValueError):
 
 class InvalidUtf8Error(ValueError):
     """Input bytes are not UTF-8; reports the byte offset, never the bytes."""
+
+
+class DocumentTooLargeError(ValueError):
+    """Input exceeds the byte budget; fixed message, never echoes content."""
 
 
 class _ObjectPairs(list):
@@ -192,8 +211,15 @@ def load_json(text):
 
 
 def load_document(path):
+    # One bounded read: even a file that was small at stat time can grow,
+    # so a post-read length check is too late. The size refusal wins over
+    # decoding and parsing, and counts encoded bytes, not characters.
+    with Path(path).open("rb") as handle:
+        data = handle.read(MAX_DOCUMENT_BYTES + 1)
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise DocumentTooLargeError(BYTE_LIMIT_MESSAGE)
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise InvalidUtf8Error(f"invalid UTF-8 at byte offset {exc.start}") from None
     return load_json(text)
@@ -202,12 +228,12 @@ def load_document(path):
 def check_format(value, fmt, path, errors):
     if fmt == "date-time":
         if not isinstance(value, str) or not DATETIME_RE.match(value):
-            errors.append(f"{path}: not a UTC ISO-8601 date-time: {value!r}")
+            errors.append(f"{path}: not a UTC ISO-8601 date-time")
             return
         try:
             datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            errors.append(f"{path}: invalid calendar date-time: {value!r}")
+            errors.append(f"{path}: invalid calendar date-time")
             return
         if is_utc_field(path):
             check_utc_suffix(value, path, errors)
@@ -218,30 +244,73 @@ def check_utc_suffix(value, path, errors):
 
     Accepts `Z` and explicit zero offsets; negative zero normalizes to
     UTC. Rejects naive timestamps and nonzero offsets with field-level
-    diagnostics. Callers must run the public-safety scan first, so echoing
-    the offending value here cannot leak a secret-shaped string.
+    diagnostics that never include the rejected value.
     """
     if value.endswith("Z"):
         return
     match = UTC_OFFSET_RE.search(value)
     if match is None:
         errors.append(
-            f"{path}: naive timestamp without timezone: {value!r}; "
+            f"{path}: naive timestamp without timezone; "
             "*_utc fields require Z or an explicit zero offset (+00:00)"
         )
         return
     if match.group(2) != "00" or match.group(3) != "00":
         errors.append(
-            f"{path}: non-UTC offset {match.group(0)!r} in {value!r}; "
+            f"{path}: non-UTC offset; "
             "*_utc fields require Z or an explicit zero offset (+00:00)"
         )
 
 
-def condition_holds(instance, condition):
-    """Evaluate the small `if` subschemas this schema file uses."""
+def condition_holds(instance, condition, path, errors):
+    """Evaluate the small `if` subschemas this schema file uses.
+
+    Supports `properties` with `const` only. Any other `if` operator is
+    an unsupported condition: record a loud validation error naming the
+    operator (never its value) and treat the condition as not holding,
+    so `then` is skipped but validation still fails.
+    """
     if not isinstance(condition, dict):
+        errors.append(
+            f"{path}: unsupported condition in if "
+            "(supported: an object of properties conditions)"
+        )
         return False
+    supported = True
+    for key in condition:
+        if key != "properties":
+            errors.append(
+                f"{path}: unsupported condition {safe_key(key)!r} in if "
+                "(supported: properties)"
+            )
+            supported = False
     props = condition.get("properties", {})
+    if not isinstance(props, dict):
+        errors.append(
+            f"{path}: unsupported condition in if.properties "
+            "(supported: an object of const conditions)"
+        )
+        return False
+    for key, subschema in props.items():
+        if not isinstance(subschema, dict):
+            errors.append(
+                f"{path}: unsupported condition in "
+                f"if.properties.{safe_key(key)} "
+                "(supported: an object with const)"
+            )
+            supported = False
+            continue
+        unknown = [op for op in subschema if op != "const"]
+        for operator in unknown:
+            errors.append(
+                f"{path}: unsupported condition operator "
+                f"{safe_key(operator)!r} in "
+                f"if.properties.{safe_key(key)} (supported: const)"
+            )
+        if unknown:
+            supported = False
+    if not supported:
+        return False
     if not isinstance(instance, dict):
         return False
     for key, subschema in props.items():
@@ -273,7 +342,10 @@ def check_instance(instance, schema, path, errors):
     if "const" in schema and instance != schema["const"]:
         errors.append(f"{path}: must equal {schema['const']!r}")
     if "enum" in schema and instance not in schema["enum"]:
-        errors.append(f"{path}: {instance!r} not one of {schema['enum']!r}")
+        errors.append(
+            f"{path}: invalid enum value not one of {schema['enum']!r}; "
+            "must be one of the allowed values"
+        )
     if isinstance(instance, str):
         if "minLength" in schema and len(instance) < schema["minLength"]:
             errors.append(
@@ -281,7 +353,8 @@ def check_instance(instance, schema, path, errors):
             )
         if "pattern" in schema and not re.search(schema["pattern"], instance):
             errors.append(
-                f"{path}: {instance!r} does not match {schema['pattern']!r}"
+                f"{path}: string does not match required pattern "
+                f"{schema['pattern']!r}"
             )
     if isinstance(instance, (int, float)) and not isinstance(instance, bool):
         if "minimum" in schema and instance < schema["minimum"]:
@@ -308,10 +381,12 @@ def check_instance(instance, schema, path, errors):
     if "format" in schema:
         check_format(instance, schema["format"], path, errors)
     for subschema in schema.get("allOf", []):
-        cond = subschema.get("if")
+        if "if" not in subschema:
+            continue
+        cond = subschema["if"]
         then = subschema.get("then")
-        if isinstance(cond, dict) and isinstance(then, dict):
-            if condition_holds(instance, cond):
+        if condition_holds(instance, cond, path, errors):
+            if isinstance(then, dict):
                 check_instance(instance, then, path, errors)
 
 
@@ -326,6 +401,14 @@ def scan_public_safety(value, path, errors):
                 break
     elif isinstance(value, dict):
         for key, item in value.items():
+            if isinstance(key, str):
+                for marker in SECRET_MARKERS:
+                    if marker.search(key):
+                        errors.append(
+                            f"{child_path(path, key)}: public-safety "
+                            f"scan hit {marker.pattern!r}"
+                        )
+                        break
             scan_public_safety(item, child_path(path, key), errors)
     elif isinstance(value, list):
         for index, item in enumerate(value):
@@ -500,6 +583,7 @@ LOAD_ERRORS = (
     json.JSONDecodeError,
     DuplicateKeyError,
     DecoderLimitError,
+    DocumentTooLargeError,
     InvalidUtf8Error,
 )
 

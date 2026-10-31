@@ -25,8 +25,11 @@ Job map (each a pure function of the changed paths):
 
 Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
 - Rust tests read a pinned doc set by content (parity/cutover/commands/
-  configuration/voice-rooms plus the soak/parity JSON): those docs select
-  ``rust``. staging-soak/backup/preflight/runbook are existence-only inputs
+  configuration/voice-rooms plus the soak/parity JSON, plus
+  privacy/database-roles/rollback-delta/backup by the voice owner-grant
+  journal regression, plus community-jobs/README by the exclusion
+  live-keys acceptance): those docs select
+  ``rust``. staging-soak/preflight/runbook are existence-only inputs
   to the preconditions binary (is_file, never content), so a content edit
   cannot break Rust and they fall through to the worker rule below; any
   deletion forces all jobs via the deletion rule. Every other doc has no
@@ -54,6 +57,18 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git diffs answer in well under a
+# second; 30s bounds the stall without touching valid runs. Both diff calls
+# below share this one value.
+GIT_TIMEOUT_SECONDS = 30
+
+
+class JobInputsError(RuntimeError):
+    """A change diff timed out or never spawned; jobs cannot skip."""
+
 
 RUST = "rust"
 WORKER = "worker"
@@ -125,9 +140,17 @@ WORKER_PREFIX = "wrangler/"
 # fixture validator, staging-e2e-command-matrix by the matrix coverage test,
 # soak/parity by the checklist and baseline guards, smoke-run-record and
 # smoke-expected-responses by the smoke surface inventory link test (and
-# smoke-surface-inventory for the same family of smoke content reads).
+# smoke-surface-inventory for the same family of smoke content reads),
+# privacy/database-roles/rollback-delta/backup by the voice owner-grant
+# journal documentation regression
+# (crates/core/tests/voice_owner_grants_docs.rs), tickets by the ticket
+# component admission acceptance suite (include_str! in
+# crates/bot/src/ticket_component_admission_acceptance_tests.rs),
+# community-jobs by the exclusion live-keys acceptance (offline verification
+# commands in crates/core/tests/community_exclusion_live_keys_acceptance.rs;
+# its README index control lives in RUST_WORKER_DOCS below).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
-# (staging-soak/backup/preflight: the preconditions binary checks is_file,
+# (staging-soak/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
 # through to the worker-only docs rule below; their absence is covered by
 # the deletion rule in selection().
@@ -135,6 +158,7 @@ RUST_DOCS = frozenset({
     "docs/parity.md",
     "docs/cutover.md",
     "docs/commands.md",
+    "docs/generated/commands.md",
     "docs/configuration.md",
     "docs/voice-rooms.md",
     "docs/voice-conditions-core.md",
@@ -144,19 +168,30 @@ RUST_DOCS = frozenset({
     "docs/smoke-expected-responses.md",
     "docs/smoke-run-record.md",
     "docs/smoke-surface-inventory.md",
+    "docs/privacy.md",
+    "docs/database-roles.md",
+    "docs/rollback-delta.md",
+    "docs/backup.md",
+    "docs/tickets.md",
+    "docs/community-jobs.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
     "docs/parity-baseline.json",
 })
 # Docs read by both Rust and worker code: docs/metrics.md is pinned by Rust
-# and worker tests, and startup-diagnostics.md is embedded by the Rust gateway
-# failure test and read by the worker docs listing assertion. Edits select both.
+# and worker tests, startup-diagnostics.md is embedded by the Rust gateway
+# failure test and read by the worker docs listing assertion, and README.md
+# is pinned by the exclusion live-keys index-discoverability control
+# (crates/core/tests/community_exclusion_live_keys_acceptance.rs) while the
+# worker docs listing assertion owns its directory shape. Edits select both.
 RUST_WORKER_DOCS = frozenset({
     "docs/metrics.md",
     "docs/startup-diagnostics.md",
+    "docs/README.md",
 })
 WORKER_DOCS = frozenset({
+    "docs/internal-actions-receiver.md",  # receiver-docs.test.ts observes the shipped contract
     "docs/runbook.md",
     "docs/container-readiness.md",
 })
@@ -168,6 +203,7 @@ DOCS_PREFIX = "docs/"
 WORKER_WORKFLOWS = frozenset({
     ".github/workflows/supply-chain.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/daily-digest.yml",
     ".github/workflows/deploy-production.yml",
     ".github/workflows/deploy-staging.yml",
 })
@@ -207,7 +243,6 @@ RUST_WORKER_EXACT = frozenset({
 # ``supply`` (CI standard rule 6, TOG-14881). They select no test job.
 IMAGE_ONLY_EXACT = frozenset({
     "Dockerfile",
-    "Dockerfile.distroless",
     ".dockerignore",
 })
 
@@ -333,6 +368,9 @@ VOICE_EXACT = frozenset({
     "scripts/job-inputs.py",
     "scripts/staging_voice_synthetic.py",
     "scripts/test_staging_voice_synthetic.py",
+    "scripts/test_staging_voice_synthetic_dry_run_acceptance.py",
+    "scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py",
+    "scripts/test_staging_voice_synthetic_owned_room_acceptance.py",
     "wrangler/src/container-env.ts",
 })
 
@@ -382,7 +420,20 @@ def git_diff_names(base_ref, head_ref, root=ROOT, diff_filter=None):
     if diff_filter is not None:
         command.append(f"--diff-filter={diff_filter}")
     command.append(f"{base_ref}..{head_ref}")
-    output = subprocess.run(command, capture_output=True, text=True, check=True)
+    try:
+        output = subprocess.run(
+            command, capture_output=True, text=True, check=True,
+            timeout=GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise JobInputsError(
+            f"job-inputs: git diff timeout after {GIT_TIMEOUT_SECONDS}s; "
+            "next: re-run the selector; if the stall repeats, inspect the "
+            "git invocation and runner state") from error
+    except OSError as error:
+        raise JobInputsError(
+            f"job-inputs: git diff spawn failed ({error}); "
+            "next: re-run the selector on a runner with git "
+            "installed") from error
     return [line for line in output.stdout.splitlines() if line.strip()]
 
 
@@ -407,7 +458,12 @@ def main(argv=None):
     except subprocess.CalledProcessError as exc:
         # Undecidable diff (shallow clone, missing ref): fail closed.
         print(f"job-inputs: git diff failed ({exc.returncode}); "
-              "selecting full jobs", flush=True)
+              "selecting full jobs; next: verify the refs exist and "
+              "re-run the selector", flush=True)
+        return 2
+    except JobInputsError as exc:
+        # Undecidable diff (stalled or unspawnable git): fail closed.
+        print(f"{exc}; selecting full jobs", flush=True)
         return 2
     jobs = selection(changed, deleted)
     jobs[VOICE] = voice_selected(changed, deleted)

@@ -2,8 +2,8 @@
 //!
 //! `docs/cutover.md` notes that the forward upsert is not a rollback delta
 //! exporter: rollback needs the full captured Next delta measured from the
-//! `T_f` baseline. This module supplies the read-only measurement. A reverse
-//! import stays out of scope.
+//! `T_f` baseline. This module supplies the read-only measurement. The reverse
+//! import lives in [`crate::rollback_import`] (`rollback-delta import`).
 //!
 //! For every bot-owned table the report counts rows inserted or updated after
 //! `T_f`, using that table's timestamp column(s). Timestamp storage is mixed
@@ -11,7 +11,9 @@
 //! UTC text in the store chain), so every recency predicate casts to
 //! `timestamptz`: the cast is a no-op on real timestamps and parses the
 //! canonical text format. A table with no usable timestamp column is reported
-//! as `unmeasurable` with a reason, never silently skipped; a table absent
+//! as `unmeasurable` with a reason and a rollback disposition
+//! (`accept-with-reason` or `manual-reconcile-required`, see
+//! `docs/rollback-delta.md`), never silently skipped; a table absent
 //! from the database is reported as `missing`.
 //!
 //! All reads run inside one `REPEATABLE READ, READ ONLY` transaction (see
@@ -31,6 +33,14 @@ pub const REPORT_VERSION: u32 = 1;
 /// spill the whole database into a file.
 pub const MAX_EXPORT_ROWS_PER_TABLE: u64 = 50_000;
 
+/// Rollback disposition for an `unmeasurable` table, recorded in the delta
+/// report so a rollback decision never meets an unmeasurable table with no
+/// named handling. See `docs/rollback-delta.md` for the semantics.
+pub const DISPOSITION_ACCEPT_WITH_REASON: &str = "accept-with-reason";
+/// Rollback disposition for an `unmeasurable` table that needs an explicit
+/// manual reconciliation step. See `docs/rollback-delta.md` for the semantics.
+pub const DISPOSITION_MANUAL_RECONCILE_REQUIRED: &str = "manual-reconcile-required";
+
 /// How a table's recency is measured.
 #[derive(Debug, Clone, Copy)]
 pub enum TableMeasure {
@@ -38,8 +48,11 @@ pub enum TableMeasure {
     /// plain comparison; several use `GREATEST` over null-tolerant casts, so
     /// projection tables (e.g. `members`) catch updates to any column.
     Columns(&'static [&'static str]),
-    /// No usable timestamp column; the reason names the gap.
-    Unmeasurable(&'static str),
+    /// No usable timestamp column: `.0` names the gap (reason) and `.1`
+    /// names its rollback handling (`accept-with-reason` or
+    /// `manual-reconcile-required`). Tuple form (not a struct variant) so
+    /// `matches!(m, TableMeasure::Unmeasurable(..))` keeps compiling.
+    Unmeasurable(&'static str, &'static str),
 }
 
 /// One bot-owned table and how its Next-window delta is measured.
@@ -56,24 +69,39 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
+    // Admin API token registry (0456/0457): issuance plus the revocation and
+    // last-use lifecycle writes; expires_at is a future deadline, not a
+    // write time, so it stays out of the measure.
+    TableSpec { table: "admin_api_tokens", measure: TableMeasure::Columns(&["issued_at", "revoked_at", "last_used_at"]) },
     TableSpec { table: "announcements_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
     TableSpec { table: "automation_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
+    // Pending-publication marker (0468): requested_at is stamped once at the
+    // first failed publication and the row is deleted on the next confirmed
+    // one, so it is the row's only write time.
+    TableSpec { table: "automation_command_registry_resync", measure: TableMeasure::Columns(&["requested_at"]) },
     TableSpec { table: "automation_commands", measure: TableMeasure::Columns(&["updated_at"]) },
     // Flag flips (matched/mutation_started/counted/released) happen inside the
     // claim's lifetime, so a delta claim shows up via claimed_at/completed_at.
     TableSpec { table: "automod_delivery_claims", measure: TableMeasure::Columns(&["claimed_at", "completed_at"]) },
     TableSpec { table: "automod_processed_messages", measure: TableMeasure::Columns(&["processed_at"]) },
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "backfill_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
+    // History rows may be inserted long after their Discord send time during
+    // catch-up; sent_at is source time, not the row's write time.
+    TableSpec {
+        table: "backfill_history_messages",
+        measure: TableMeasure::Unmeasurable("sent_at records message time, not when catch-up inserted the row", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
+    },
+    TableSpec { table: "backfill_history_counts", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "community_scorecard_alerts", measure: TableMeasure::Columns(&["created_at"]) },
     // Retry reservation (TOG-11145): next_attempt_at is a BIGINT epoch-ms
     // backoff deadline, not a write time, and has no timestamptz cast.
     TableSpec {
         table: "community_scorecard_attempts",
-        measure: TableMeasure::Unmeasurable(
-            "no timestamp column; next_attempt_at is an epoch-ms retry deadline, and a completed week is visible via community_scorecard_runs.generated_at",
-        ),
+        measure: TableMeasure::Unmeasurable("no timestamp column; next_attempt_at is an epoch-ms retry deadline, and a completed week is visible via community_scorecard_runs.generated_at", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "community_scorecard_runs", measure: TableMeasure::Columns(&["generated_at"]) },
     TableSpec { table: "community_stream_heartbeats", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -84,21 +112,35 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
     // Append-only event-store capture (0427 voice + 0428 presence + 0429 thread
     // lifecycle + 0430 message/reaction + 0431 stage/interaction/audit + 0432
-    // member deltas): `event_time` is the gateway event time and `received_at`
+    // member deltas + 0439 invite/scheduled-event): `event_time` is the gateway event time and `received_at`
     // the capture time (same shape as events.recorded_at), both written once
     // per row; the maximum across both is the row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
+    // Event voice idempotency rows (0455): the claim stamps created_at once;
+    // bind/clear/orphan transitions rewrite updated_at without touching
+    // created_at, so the maximum across both is the row's last write.
+    TableSpec { table: "event_voice_channels", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
+    // Event voice presence spans (0455): the join stamps joined_at once; the
+    // leave rewrites left_at from NULL without touching joined_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "event_voice_presence", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
     TableSpec {
         table: "gateway_onboarding_jobs",
-        measure: TableMeasure::Unmeasurable(
-            "transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state",
-        ),
+        measure: TableMeasure::Unmeasurable("transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Timed-entry giveaways (0460/0461): every definition mutation stamps
+    // updated_at (create, claim, release, status, draw, announce), so its
+    // maximum is the row's last write. Entries and draws are insert-only;
+    // their insert stamps are the last write.
+    TableSpec { table: "giveaways", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "giveaway_entries", measure: TableMeasure::Columns(&["entered_at"]) },
+    TableSpec { table: "giveaway_draws", measure: TableMeasure::Columns(&["drawn_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
     TableSpec { table: "guild_analytics_settings", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -107,9 +149,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "guild_settings_audit", measure: TableMeasure::Columns(&["at"]) },
     TableSpec {
         table: "guild_settings_revision",
-        measure: TableMeasure::Unmeasurable(
-            "monotonic revision counter with no timestamp column; changes are visible via guild_settings.updated_at",
-        ),
+        measure: TableMeasure::Unmeasurable("monotonic revision counter with no timestamp column; changes are visible via guild_settings.updated_at", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "internal_action_log", measure: TableMeasure::Columns(&["created_at"]) },
     // One row per clock domain, rewritten on every burn; observed_at is the
@@ -129,9 +169,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "level_import_runs", measure: TableMeasure::Columns(&["imported_at"]) },
     TableSpec {
         table: "level_role_rewards",
-        measure: TableMeasure::Unmeasurable(
-            "no timestamp column; configuration is replaced wholesale (see replace_role_rewards)",
-        ),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see replace_role_rewards)", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
     },
     TableSpec {
         table: "lfg_posts",
@@ -139,15 +177,20 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     },
     TableSpec {
         table: "lfg_roles",
-        measure: TableMeasure::Unmeasurable(
-            "no timestamp column; child rows are created and updated with the parent lfg_posts row",
-        ),
+        measure: TableMeasure::Unmeasurable("no timestamp column; child rows are created and updated with the parent lfg_posts row", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "lfg_signups", measure: TableMeasure::Columns(&["joined_at"]) },
+    TableSpec { table: "member_catchup_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "member_catchup_members", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_erasure_audit", measure: TableMeasure::Columns(&["erased_at"]) },
     TableSpec { table: "member_exclusions", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_levels", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_ranks", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Seasonal projection (migrations 0100/0101): award upserts move
+    // updated_at and reset the decayed_weeks watermark; decay rewrites
+    // seasonal_xp/decayed_weeks but leaves an occurred_at-stamped decay row
+    // in xp_awards, mirroring the member_levels lifetime path.
+    TableSpec { table: "member_season_xp", measure: TableMeasure::Columns(&["updated_at"]) },
     // Pure projection: any milestone/activity write must move the maximum.
     TableSpec {
         table: "members",
@@ -165,9 +208,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "moderation_audit", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec {
         table: "moderation_channel_executions",
-        measure: TableMeasure::Unmeasurable(
-            "no timestamp column; the execution fence row is written with its parent moderation_idempotency claim (measured via claimed_at)",
-        ),
+        measure: TableMeasure::Unmeasurable("no timestamp column; the execution fence row is written with its parent moderation_idempotency claim (measured via claimed_at)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "moderation_idempotency", measure: TableMeasure::Columns(&["claimed_at"]) },
     TableSpec { table: "moderation_lockdowns", measure: TableMeasure::Columns(&["locked_at"]) },
@@ -180,27 +221,36 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "privacy_opt_outs", measure: TableMeasure::Columns(&["opted_out_at"]) },
     TableSpec {
         table: "rank_ladder",
-        measure: TableMeasure::Unmeasurable("seed reference data with no timestamp column"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; rows are rewritten with each rank snapshot (measured via rank_snapshots.snapshot_at in the same transaction, see WebsiteStore::write_rank_snapshot)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "rank_snapshots", measure: TableMeasure::Columns(&["snapshot_at"]) },
-    // Retention deletion ledger (0435): request creation stamps requested_at,
+    TableSpec { table: "rollback_journal", measure: TableMeasure::Columns(&["recorded_at"]) },
+    TableSpec { table: "rollback_watermarks", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Retention deletion ledger (0438): request creation stamps requested_at,
     // completion rewrites completed_at without touching requested_at, so the
     // maximum across both is the row's last write (same shape as tickets).
     TableSpec {
         table: "retention_deletion_requests",
         measure: TableMeasure::Columns(&["requested_at", "completed_at"]),
     },
-    // Retention guild-purge queue (0435): insert-once per guild, stamped on
+    // Retention guild-purge queue (0438): insert-once per guild, stamped on
     // enqueue; a purge deletes the row, so only enqueues are measurable.
     TableSpec { table: "retention_guild_purge_queue", measure: TableMeasure::Columns(&["enqueued_at"]) },
     TableSpec { table: "scheduled_events", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Epoch-claim guard for the scheduled-event mirror (0450/0451): every
+    // winning fetch rewrites epoch inside the swap transaction, so its
+    // maximum is the row's last write.
+    TableSpec { table: "scheduled_events_claim", measure: TableMeasure::Columns(&["epoch"]) },
+    // Delete tombstones for the scheduled-event mirror (0452/0453): every
+    // delete writes deleted_at and every re-delete refreshes it forward, so
+    // its maximum is the row's last write (purges and cap trims only remove
+    // rows, like any other deletion).
+    TableSpec { table: "scheduled_events_tombstone", measure: TableMeasure::Columns(&["deleted_at"]) },
     TableSpec { table: "scheduled_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "self_role_audit", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec {
         table: "self_role_exchange_baselines",
-        measure: TableMeasure::Unmeasurable(
-            "no timestamp column; the baseline row is written with its event's exchange lifecycle (measured via self_role_exchanges.created_at)",
-        ),
+        measure: TableMeasure::Unmeasurable("no timestamp column; baseline rows are pinned/retired in place by the legacy-journal path without touching self_role_exchanges (see pin_legacy_exchange, retire_exchange_evidence); accepted with a per-event baseline dump comparison as alternate evidence", DISPOSITION_ACCEPT_WITH_REASON),
     },
     // Ticket creation, settlement and retirement each rewrite a different
     // column without touching the others, so the maximum is the row's last write.
@@ -209,7 +259,15 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
     },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
+    TableSpec { table: "starboard_config", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "starboard_starrers", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec { table: "starboard_posts", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Claim/start/stamp/takeover transitions rewrite claimed_at,
+    // send_started_at and delivered_at without touching the others, so the
+    // maximum across all three is the row's last write (same shape as
+    // tickets). Migrations 0440/0443.
+    TableSpec { table: "stream_live_claims", measure: TableMeasure::Columns(&["claimed_at", "send_started_at", "delivered_at"]) },
     TableSpec { table: "ticket_transcripts", measure: TableMeasure::Columns(&["created_at"]) },
     // Status/close transitions rewrite these columns without touching
     // created_at, so the maximum across all three is the row's last write.
@@ -219,9 +277,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     },
     TableSpec {
         table: "voice_creators",
-        measure: TableMeasure::Unmeasurable(
-            "no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)",
-        ),
+        measure: TableMeasure::Unmeasurable("no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     // V3 block list (0416): one row per blocked member, stamped on insert; an
     // unblock deletes the row, so only additions are measurable.
@@ -249,66 +305,72 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // PgVoiceConfigStore::apply, so none carries a write timestamp.
     TableSpec {
         table: "voice_channel_templates",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_game_aliases",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_random_lists",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_random_list_choices",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_logging",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_logging_mention_members",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_logging_mention_roles",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_guild_settings",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_command_roles",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_command_role_members",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_logging_settings",
-        measure: TableMeasure::Unmeasurable(
-            "mutable per-guild settings row with no timestamp column; no member IDs",
-        ),
+        measure: TableMeasure::Unmeasurable("mutable per-guild settings row with no timestamp column; no member IDs", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
         table: "voice_access_controls",
-        measure: TableMeasure::Unmeasurable(
-            "mutable per-guild settings row with no timestamp column; no member IDs",
-        ),
+        measure: TableMeasure::Unmeasurable("mutable per-guild settings row with no timestamp column; no member IDs", DISPOSITION_ACCEPT_WITH_REASON),
     },
     // Append-only vote-kick audit rows (migration 0417); `occurred_at` is the
     // event time, written once per row.
     TableSpec { table: "voice_vote_kick_audit", measure: TableMeasure::Columns(&["occurred_at"]) },
     TableSpec {
         table: "web_contract_meta",
-        measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column"),
+        measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
     },
     TableSpec { table: "xp_awards", measure: TableMeasure::Columns(&["occurred_at"]) },
     TableSpec { table: "xp_cooldowns", measure: TableMeasure::Columns(&["last_awarded_at"]) },
 ];
+
+/// Tables the exporter emits only as parents of exported rows, never via a
+/// timestamp predicate. `lfg_roles` has no timestamp column, but an exported
+/// post-freeze `lfg_posts` row is unusable without its roles: `lfg_signups`
+/// references `(lfg_id, role_key)`, so the signup insert aborts the whole
+/// transaction on the missing parent. [`export_delta`] therefore emits the
+/// roles of every exported post alongside the measured rows; [`crate::rollback_import`]
+/// accepts these tables even though [`report`] still lists them as
+/// `unmeasurable` (no timestamp column to measure).
+pub const PARENT_JOINED_TABLES: &[&str] = &["lfg_roles"];
 
 /// Feed tables predate the role-matrix assertion; they are measured here and
 /// the coverage test names them explicitly so a future matrix addition cannot
@@ -426,6 +488,11 @@ pub struct TableDelta {
     pub count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Present only on `unmeasurable` entries: `accept-with-reason` or
+    /// `manual-reconcile-required`. Absent (not null) on `measured` and
+    /// `missing` entries so those entries stay byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
 }
 
 /// The JSON summary: one entry per spec table, never silently skipped.
@@ -458,6 +525,7 @@ async fn count_table(
             columns: None,
             count: None,
             reason: Some("table not present in this database".to_owned()),
+            disposition: None,
         });
     }
     let predicate = recency_predicate(spec)?;
@@ -475,10 +543,11 @@ async fn count_table(
             TableMeasure::Columns(columns) => {
                 Some(columns.iter().map(|c| (*c).to_owned()).collect())
             }
-            TableMeasure::Unmeasurable(_) => None,
+            TableMeasure::Unmeasurable(..) => None,
         },
         count: Some(count),
         reason: None,
+        disposition: None,
     })
 }
 
@@ -502,12 +571,13 @@ async fn report_at(
     let mut tables = Vec::with_capacity(TABLE_SPECS.len());
     for spec in TABLE_SPECS {
         match spec.measure {
-            TableMeasure::Unmeasurable(reason) => tables.push(TableDelta {
+            TableMeasure::Unmeasurable(reason, disposition) => tables.push(TableDelta {
                 table: spec.table.to_owned(),
                 status: "unmeasurable".to_owned(),
                 columns: None,
                 count: None,
                 reason: Some(reason.to_owned()),
+                disposition: Some(disposition.to_owned()),
             }),
             TableMeasure::Columns(_) => tables.push(count_table(&mut tx, spec, since).await?),
         }
@@ -522,8 +592,10 @@ async fn report_at(
 }
 
 /// Export every measured post-`T_f` row as NDJSON (`{"table": ..., "row": ...}`
-/// per line) into the caller's read-only snapshot. Refuses when any table
-/// exceeds [`MAX_EXPORT_ROWS_PER_TABLE`] rather than silently truncating.
+/// per line) into the caller's read-only snapshot, plus the [`PARENT_JOINED_TABLES`]
+/// rows of every exported `lfg_posts` row (parent join, not a timestamp
+/// predicate). Refuses when any table exceeds [`MAX_EXPORT_ROWS_PER_TABLE`]
+/// rather than silently truncating.
 pub async fn export_delta(
     pool: &PgPool,
     since: &str,
@@ -537,6 +609,7 @@ pub async fn export_delta(
             other => DeltaError::Usage(other.to_string()),
         })?;
     let mut exported: u64 = 0;
+    let mut exported_post_ids: Vec<String> = Vec::new();
     for spec in TABLE_SPECS {
         let TableMeasure::Columns(_) = spec.measure else {
             continue;
@@ -567,9 +640,50 @@ pub async fn export_delta(
             .fetch_all(&mut *tx)
             .await?;
         for row in rows {
-            let line = serde_json::json!({"table": spec.table, "row": serde_json::from_str::<serde_json::Value>(&row).unwrap_or(serde_json::Value::Null)}).to_string();
+            let value: serde_json::Value =
+                serde_json::from_str(&row).unwrap_or(serde_json::Value::Null);
+            if spec.table == "lfg_posts" {
+                if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+                    exported_post_ids.push(id.to_owned());
+                }
+            }
+            let line = serde_json::json!({"table": spec.table, "row": value}).to_string();
             writer(line)?;
             exported += 1;
+        }
+    }
+    // Parent join: the roles of every exported post round-trip with the post
+    // and its signups, so the `(lfg_id, role_key)` FK never aborts the import
+    // on a missing parent. Roles carry no timestamp, hence no recency
+    // predicate: membership in this set is by exported post id.
+    if !exported_post_ids.is_empty() {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass('lfg_roles') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM lfg_roles WHERE lfg_id = ANY($1)")
+                    .bind(&exported_post_ids)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if count as u64 > MAX_EXPORT_ROWS_PER_TABLE {
+                return Err(DeltaError::ExportCap("lfg_roles".to_owned()));
+            }
+            if count > 0 {
+                let rows: Vec<String> = sqlx::query_scalar(
+                    "SELECT to_jsonb(t.*)::text FROM lfg_roles t WHERE lfg_id = ANY($1)",
+                )
+                .bind(&exported_post_ids)
+                .fetch_all(&mut *tx)
+                .await?;
+                for row in rows {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&row).unwrap_or(serde_json::Value::Null);
+                    let line = serde_json::json!({"table": "lfg_roles", "row": value}).to_string();
+                    writer(line)?;
+                    exported += 1;
+                }
+            }
         }
     }
     tx.rollback().await?;
@@ -674,10 +788,39 @@ mod tests {
         );
         assert!(recency_predicate(&TableSpec {
             table: "rank_ladder",
-            measure: TableMeasure::Unmeasurable("seed data"),
+            measure: TableMeasure::Unmeasurable("seed data", DISPOSITION_ACCEPT_WITH_REASON),
         })
         .is_err());
         assert!(quote("guild_settings; DROP TABLE x").is_err());
         assert!(quote("at").is_ok());
+    }
+
+    #[test]
+    fn every_unmeasurable_table_carries_a_known_disposition() {
+        let mut saw_accept = false;
+        let mut saw_manual = false;
+        for spec in TABLE_SPECS {
+            let TableMeasure::Unmeasurable(reason, disposition) = spec.measure else {
+                continue;
+            };
+            assert!(
+                !reason.is_empty(),
+                "table {} has an empty reason",
+                spec.table
+            );
+            assert!(
+                [
+                    DISPOSITION_ACCEPT_WITH_REASON,
+                    DISPOSITION_MANUAL_RECONCILE_REQUIRED
+                ]
+                .contains(&disposition),
+                "table {} has unknown disposition {disposition}",
+                spec.table
+            );
+            saw_accept |= disposition == DISPOSITION_ACCEPT_WITH_REASON;
+            saw_manual |= disposition == DISPOSITION_MANUAL_RECONCILE_REQUIRED;
+        }
+        assert!(saw_accept, "lost every accept-with-reason table");
+        assert!(saw_manual, "lost every manual-reconcile-required table");
     }
 }

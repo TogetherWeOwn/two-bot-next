@@ -132,6 +132,8 @@ async fn report(
 
 async fn cli(host: &str, source: &str, target: &str, expected: i32) -> TestResult {
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_legacy_verify"))
+        .env_clear()
+        .env("TWO_DATABASE_TLS", "local-only")
         .args([
             "--source-url-env",
             "VERIFY_SOURCE_URL",

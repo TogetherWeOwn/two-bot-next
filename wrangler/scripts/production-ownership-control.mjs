@@ -10,7 +10,16 @@
 // the singleton: a fenced/pristine record needs OWNERSHIP_RELEASE_FENCE=true,
 // which the production workflow sets only when its `takeover` dispatch input
 // is true (B4 cutover execution). Production activation (GO) stays separate.
+import { isDirectInvocation } from "./is-direct-invocation.mjs";
+import { parseOwnershipResponse } from "./ownership-control-response.mjs";
+
 class ControlError extends Error {}
+
+// A request that never produced a Worker verdict: timeout, transport, or an
+// unparseable answer. Fixed vocabulary only, with attempts and elapsed time;
+// provider and JSON text are untrusted and never printed. Status retries
+// these inside its propagation budget; takeover keeps its 5xx-only policy.
+class TransientFailure extends ControlError {}
 
 class HttpFailure extends ControlError {
   constructor(message, status, reason) {
@@ -114,7 +123,7 @@ function validDeploymentId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 }
 
-export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000, statusAttempts = 34, statusRetryDelayMs = 10000 }, send = fetch, wait = sleep) {
+export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000, statusAttempts = 34, statusRetryDelayMs = 10000, statusWindowMs = 330000 }, send = fetch, wait = sleep, now = Date.now) {
   const origin = checkOrigin(url, productionUrl, stagingUrl);
   if (!token || token.length < 32) throw new ControlError("OWNERSHIP_CONTROL_TOKEN is missing or invalid; stop before deployment");
   if (!["preflight", "status", "takeover", "fence"].includes(action)) throw new ControlError("Unknown action");
@@ -124,18 +133,42 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
   }
   const endpoint = new URL("/internal/ownership", origin);
   const headers = { authorization: `Bearer ${token}` };
-  const started = Date.now();
-  const elapsedSeconds = () => Math.round((Date.now() - started) / 1000);
+  const started = now();
+  const elapsedSeconds = () => Math.round((now() - started) / 1000);
   let attempts = 0;
   const read = async (init) => {
     // Never follow redirects carrying the control secret to another origin.
-    const response = await send(endpoint, { ...init, headers, redirect: "error", signal: AbortSignal.timeout(15000) });
+    let response;
+    try {
+      response = await send(endpoint, { ...init, headers, redirect: "error", signal: AbortSignal.timeout(15000) });
+    } catch (error) {
+      // Timeout vs transport is the only provider detail admitted, as one
+      // fixed word: the thrown text itself is untrusted and never printed.
+      // AbortSignal.timeout rejects with TimeoutError; a manual abort
+      // would reject with AbortError. Both mean the request never ran.
+      const kind = error?.name === "TimeoutError" || error?.name === "AbortError" ? "timeout" : "failed";
+      throw new TransientFailure(`Ownership control request ${kind} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
+    }
     if (!response.ok) {
       const reason = await refusalReason(response);
       throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`, response.status, reason);
     }
-    const state = await response.json();
-    if (!state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
+    let raw;
+    try {
+      raw = await response.json();
+    } catch {
+      throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
+    }
+    const state = parseOwnershipResponse(raw);
+    if (!state) {
+      // A pinned read waits through propagation: a malformed 200 may be a
+      // transitional answer from a mid-deploy version, so it shares the
+      // mismatch retry budget. An unpinned read has no version to wait for
+      // and refuses at once with the fixed text. Takeover never retries
+      // either: its policy stays 5xx-only.
+      if (expectedDeploymentId !== undefined) {
+        throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
+      }
       throw new ControlError("Invalid ownership control response");
     }
     return state;
@@ -201,8 +234,13 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     // about 300 s), and the edge can still route to the old version: the read
     // answers 503 deployment_mismatch, or a 200 naming the old deployment.
     // Both are propagation, not a NO-GO, so the P2 read waits for the new
-    // version (34 reads, 10 s apart, the takeover window) before refusing.
-    // Every other refusal stops at once.
+    // version before refusing. A transient request failure (timeout,
+    // transport, unparseable answer) waits the same budget: this read is
+    // side-effect-free, so a single blip must not fail the deploy. The
+    // budget is attempts AND wall time: the rollback path reads status
+    // through a subprocess capped at 420 s, so the loop must end inside
+    // this smaller window instead of accumulating 15 s reads plus 10 s
+    // waits past it. Every other refusal stops at once.
     for (let attempt = 1; ; attempt++) {
       attempts = attempt;
       try {
@@ -211,7 +249,8 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
         const propagating = expectedDeploymentId !== undefined && (
           (error instanceof HttpFailure && error.status === 503 && error.reason === "deployment_mismatch") ||
           (!(error instanceof HttpFailure) && /^Production deployment mismatch/.test(error.message)));
-        if (!propagating || attempt >= statusAttempts) throw error;
+        if ((!propagating && !(error instanceof TransientFailure)) || attempt >= statusAttempts ||
+            now() - started + statusRetryDelayMs > statusWindowMs) throw error;
         await wait(statusRetryDelayMs);
       }
     }
@@ -223,7 +262,7 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
       return await once(first);
     } catch (error) {
       if (!retryableTakeoverFailure(error) || attempt >= takeoverAttempts ||
-          Date.now() - started + takeoverRetryDelayMs > takeoverWindowMs) {
+          now() - started + takeoverRetryDelayMs > takeoverWindowMs) {
         throw withEarlierRefusal(error, earlier, `attempts=${attempts} elapsed=${elapsedSeconds()}s`);
       }
       earlier = error;
@@ -233,7 +272,7 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
   }
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   const [action, epoch] = process.argv.slice(2);
   try {
     const result = await control({

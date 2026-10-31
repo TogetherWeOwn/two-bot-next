@@ -96,11 +96,35 @@ export const FORWARDED_FLAGS = [
   // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Event voice channels (per-event create + after-party handoff): required
+  // category id. Non-secret runtime flag; the bot fails closed (inactive,
+  // TBD `no_category`) until a usable category exists.
+  "TWO_EVENT_VOICE_CATEGORY_ID",
+  // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
+  // attaches the Lavalink voice-update forwarder. Staging vars only, same
+  // treatment as TWO_VOICE; the node password travels as its own Container
+  // secret, never through this flag allowlist.
+  "TWO_MUSIC",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
   // through this flag allowlist.
   "TWO_ASSISTANT_ENDPOINT",
   "TWO_ASSISTANT_MODEL",
+  // Retention scheduler mode (retention_jobs.rs MODE_SETTING): exact
+  // `dry-run`/`execute`/`off`, missing defaults to dry run. Non-secret
+  // runtime flag read from the process environment.
+  "TWO_RETENTION_MODE",
+  // Game-activity aggregate expiry horizon in days
+  // (game_activity_store.rs AGGREGATE_RETENTION_DAYS_SETTING): read on the
+  // retention cadence, defaulting to 90 when unset. Non-secret runtime flag
+  // read from the process environment.
+  "TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS",
+  // Deployment-environment marker (server.rs drill fence): committed only
+  // in [env.staging.vars] as exactly "staging" (check-env-bindings.py
+  // denies it top-level and in production), so the container can refuse
+  // the gateway-readiness failure injection anywhere else. The injection
+  // switch itself is NOT forwarded here (see NOT_FORWARDED).
+  "TWO_DEPLOY_ENV",
 ] as const;
 
 export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];
@@ -249,6 +273,14 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 
 /** Every other `TWO_*` name in crates/, with why it stays out of the Container. */
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
+  TWO_GATEWAY_READINESS_FAIL_INJECTION: "staging rollback-drill switch; reaches the Container only through an explicit containerEnvVars line while TWO_DEPLOY_ENV is exactly \"staging\" (index.ts), never this flag allowlist, and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_VOICE_STALL_FAULT_INJECTION: "staging remediation-drill switch; Worker-only trigger input for the fault injector (staging-fault.ts), never forwarded to the Container, and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_GATEWAY_UNPAIRED_FAULT_INJECTION: "staging remediation-drill switch; Worker-only trigger input for the fault injector (staging-fault.ts), never forwarded to the Container, and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_EVENTSUB: "EventSub gate; the Worker reads it for the public ingress and forwards exactly \"1\" alongside the secret on explicit containerEnvVars lines for the private receiver only while both are set, never this flag allowlist",
+  TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID: "go-live delivery destination channel; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded and the delivery gate is exactly \"1\", never this flag allowlist",
+  TWO_EVENTSUB_DELIVERY: "go-live delivery gate; reaches the Container only as exactly \"1\" on an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
+  TWO_EVENTSUB_INVITE_URL: "go-live delivery invite URL; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded and the delivery gate is exactly \"1\", never this flag allowlist",
+  TWO_EVENTSUB_RELOAD_KEY: "EventSub no-restart rotation HMAC key; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
@@ -257,9 +289,17 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
+  "TWO_ASSISTANT_API_KEY": SECRET,
+  TWO_ASSISTANT_TOKEN: "unapproved credential-name decoy used only by the acceptance battery; never a binding",
+  TWO_ASSISTANT_SECRET: "unapproved credential-name decoy used only by the acceptance battery; never a binding",
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
+  TWO_TWITCH_BROADCASTERS: "reconcile broadcaster allowlist; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
+  TWO_TWITCH_CALLBACK_URL: "reconcile callback URL; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
+  TWO_TWITCH_CLIENT_ID: "Twitch Helix credential secret; reaches the Container only through its own explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
+  TWO_TWITCH_CLIENT_SECRET: "Twitch Helix credential secret; reaches the Container only through its own explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
+  TWO_TWITCH_WEBHOOK_SECRET: SECRET,
   TWO_DB_POOL_MAX: "cutover CLI pool size, not read by the Container runtime",
   TWO_DATABASE_TLS: "cutover/operator CLI TLS policy for database_tls::enforce (default required); not read by the Container runtime",
   TWO_ERASURE_ACTOR: "erase-member operator CLI audit actor, set per invocation; not read by the Container runtime",
@@ -276,6 +316,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_GUILD_CONFIG_UPLOAD_CMD: BACKUP,
   TWO_RESTORE_DRILL_BOOTSTRAP_URL: BACKUP,
   TWO_RESTORE_DRILL_EVIDENCE_DIR: BACKUP,
+  TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S: BACKUP,
   TWO_ANTI_NUKE_SNAPSHOT_PATH: "filesystem write path; Container disk is ephemeral",
   TWO_HEALTH_BIND_HOST: BIND,
   TWO_HEALTH_PORT: BIND,
@@ -288,6 +329,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_REDIRECT_FALLBACK_CODE: REDIRECT,
   TWO_REDIRECT_TRUSTED_PROXIES: REDIRECT,
   TWO_INTERNAL_ACTIONS: RECEIVER_CONFIG,
+  TWO_EVENTSUB_BIND: RECEIVER_BIND,
   TWO_INTERNAL_ALLOW_ADD_MEMBER: CAPABILITY,
   TWO_INTERNAL_ALLOW_AUTOMATIONS: CAPABILITY,
   TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE: CAPABILITY,
@@ -306,6 +348,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_STAGING_RESTART_CONTAINMENT: LEGACY,
   TWO_STAGING_RESTART_SYNTHETIC_ACTORS: LEGACY,
   TWO_TEST_DATABASE_URL: TEST,
+  TWO_TEST_LIVE_EXCLUSIONS_CHILD: TEST,
   TWO_BOT_TEST_DATABASE_URL: TEST,
   TWO_GATEWAY_TEST_DATABASE_URL: TEST,
   TWO_ROLES_TEST_DATABASE_URL: TEST,
@@ -324,6 +367,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_INTERNAL_FUTURE_GATE: TEST,
   TWO_INTERNAL_NEW_GATE: TEST,
   TWO_INTERNALISED_GREETING: TEST,
+  // Deliberate unknown-key fixtures in settings_map_hostile.rs, not runtime inputs.
+  TWO_ASSISTANT_ENDPOINTS: TEST,
+  TWO_OWEN_USER_IDS: TEST,
   TWO_NEW_GATE: TEST,
   TWO_NEVER_EXISTED: TEST,
   TWO_SOMETHING_NEW: TEST,
@@ -331,6 +377,20 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_TOTALLY_MADE_UP: TEST,
   TWO_TYPO_KEYS: TEST,
   TWO_UNKNOWN: TEST,
+  TWO_TUNING_LOG_TEST_CHILD: TEST,
+  TWO_TEST_VOICE_OVERFLOW_METRICS_CHILD: TEST,
+  TWO_QUERY_OBSERVER_CALLSITE_CHILD: TEST,
+  // Store-only guild setting: the invite responder resolves it from the live
+  // settings snapshot, never from the process environment, so there is
+  // nothing to forward.
+  TWO_GUILD_INVITE_CODE: "store-only guild setting; read from the live settings snapshot, never from the process environment",
+  // /ops override enforcement (Slice 0a): the Rust settings poll GETs this
+  // URL on every tick for the DO ops record. URL-shaped values are never
+  // flags (the allowlist test rejects `_URL`), so it travels only here.
+  TWO_OPS_CONFIG_URL: "ops-record fetch URL; reaches the Container only through an explicit containerEnvVars line when the Operator sets it, never this flag allowlist",
+  // Bearer the container sends on that fetch: the ops control token's value,
+  // forwarded only while the fetch URL is set, on its own secret line.
+  TWO_OPS_CONFIG_TOKEN: SECRET,
 };
 
 /**

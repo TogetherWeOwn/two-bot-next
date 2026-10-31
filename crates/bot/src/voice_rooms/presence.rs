@@ -36,7 +36,8 @@ pub(super) fn facts(presence: &Presence) -> MemberPresence {
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// An occupant's game or stream changed. Forget the room's last rendered
-    /// signature so the next template-name tick re-renders it (through the
+    /// signature so the next template-name tick re-renders it — the creator
+    /// template or the room's `/name` override alike (through the
     /// rename coalescer, within Discord's rename budget).
     pub(super) fn room_facts_changed(&mut self, room: Snowflake, _now_ms: u64) {
         if self.rooms.contains_key(&room) {

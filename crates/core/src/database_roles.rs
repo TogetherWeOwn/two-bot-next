@@ -147,12 +147,20 @@ mod tests {
         // Enumerate the migrations directory so a new CREATE without a matrix
         // row fails CI. No database connection is needed. Our 0130 custom
         // commands migration is covered automatically: the file lives in-tree.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .expect("migrations directory")
-            .map(|entry| entry.expect("migration entry").path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
-            .collect();
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let migration_dirs = [
+            manifest.join("../cutover/migrations"),
+            manifest.join("../store/migrations"),
+        ];
+        let mut paths = Vec::new();
+        for dir in migration_dirs {
+            paths.extend(
+                std::fs::read_dir(&dir)
+                    .expect("migrations directory")
+                    .map(|entry| entry.expect("migration entry").path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql")),
+            );
+        }
         paths.sort();
         assert!(!paths.is_empty(), "no migrations found");
         for path in paths {
@@ -215,11 +223,29 @@ mod tests {
                 }
             }
         }
-        for line in include_str!("../../../sql/web_v1.sql").lines() {
-            if let Some(rest) = line.strip_prefix("CREATE OR REPLACE VIEW web_v1.") {
-                let name = rest.split_whitespace().next().unwrap();
-                assert!(MATRIX.contains(&format!("'web_v1', '{name}', 'view'")));
-            }
+        fn contract_views(sql: &str) -> Vec<String> {
+            let mut views: Vec<String> = sql
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("CREATE OR REPLACE VIEW web_v1.")
+                        .map(|rest| rest.split_whitespace().next().unwrap().to_owned())
+                })
+                .collect();
+            views.sort();
+            views
+        }
+        // Two appliers ship the contract: the core applier applies
+        // `sql/web_v1.sql`, the store applier embeds
+        // `crates/store/sql/web_v1.sql` (`Store::connect`). A view reverted
+        // in one copy only must fail here, with no database.
+        let root_views = contract_views(include_str!("../../../sql/web_v1.sql"));
+        let store_views = contract_views(include_str!("../../store/sql/web_v1.sql"));
+        assert_eq!(
+            store_views, root_views,
+            "store-embedded web_v1 copy drifted from sql/web_v1.sql"
+        );
+        for name in &root_views {
+            assert!(MATRIX.contains(&format!("'web_v1', '{name}', 'view'")));
         }
     }
 }

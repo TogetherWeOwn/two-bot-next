@@ -1228,7 +1228,7 @@ fn commands_require_enabled_configured_guild_and_manage_guild() {
     assert_eq!(feed_list_text(&[]), "No feed relays configured.");
     assert_eq!(
         feed_list_text(&[feed]),
-        "`feed-1` rss → <#channel-1> https://example.org/feed.xml"
+        "`feed-1` rss enabled → <#channel-1> https://example.org/feed.xml"
     );
 }
 
@@ -1284,4 +1284,313 @@ fn feed_add_rejects_long_sources_and_nonstandard_ports() {
             "accepted {source}"
         );
     }
+}
+
+#[test]
+fn feed_list_at_capacity_keeps_same_host_sources_distinguishable() {
+    // Paperclip Review 4/5 on #1167: at the 25-relay cap the uniform ~11-unit
+    // budget collapsed every same-kind row to an identical prefix
+    // (`https://w…`), so all ids were visible but unmappable to a source.
+    // The capacity path now middle-elides the scheme-stripped source, keeping
+    // the distinguishing tail (`channel_id=UC…` / path).
+    let feeds: Vec<FeedRelay> = (1..=25)
+        .map(|index| FeedRelay {
+            id: format!("{index:032x}"),
+            guild_id: "guild-1".into(),
+            channel_id: "1234567890123456789".into(),
+            kind: FeedKind::Youtube,
+            source: format!("https://www.youtube.com/feeds/videos.xml?channel_id=UC{index:022}"),
+            enabled: true,
+            last_checked_at: None,
+            created_by: "actor".into(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    let text = feed_list_text(&feeds);
+
+    assert!(
+        text.encode_utf16().count() <= 2000,
+        "response exceeds the 2,000 UTF-16 unit limit: {text}"
+    );
+    for feed in &feeds {
+        assert!(
+            text.contains(&format!("`{}`", feed.id)),
+            "relay {} discoverable at capacity: {text}",
+            feed.id
+        );
+    }
+    // Every row's displayed source snippet must differ: same channel for all
+    // relays forces the source text to be the distinguisher.
+    let snippets: Vec<&str> = text
+        .lines()
+        .map(|line| line.rsplit(' ').next().expect("row has a source"))
+        .collect();
+    assert_eq!(snippets.len(), 25, "all rows listed: {text}");
+    let distinct: std::collections::HashSet<&&str> = snippets.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        25,
+        "same-host sources stay pairwise distinct at capacity: {text}"
+    );
+}
+
+#[test]
+fn feed_list_id_only_fallback_stays_bounded() {
+    // Defensive path: legacy-restored rows beyond the 25-relay cap (or
+    // pathological max-length ids) cannot fit even as id-only rows. The
+    // fallback emits the fitting exact-id prefix, bounded to 2,000 units.
+    let feeds: Vec<FeedRelay> = (1..=60)
+        .map(|index| FeedRelay {
+            id: format!("{index:032x}"),
+            guild_id: "guild-1".into(),
+            channel_id: "1234567890123456789".into(),
+            kind: FeedKind::Rss,
+            source: format!("https://example.org/{}/feed-{index}", "a".repeat(300)),
+            enabled: true,
+            last_checked_at: None,
+            created_by: "actor".into(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    let text = feed_list_text(&feeds);
+
+    assert!(
+        text.encode_utf16().count() <= 2000,
+        "fallback exceeds the 2,000 UTF-16 unit limit: {text}"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines.len() < feeds.len(),
+        "over-capacity fallback bounds rows: {text}"
+    );
+    assert!(!lines.is_empty(), "fallback keeps at least one id: {text}");
+    for line in &lines {
+        assert!(
+            line.starts_with('`') && line.ends_with('`') && !line.contains(' '),
+            "fallback rows are exact ids, never partial: {line}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paged feed-list replies (builder coverage for the composed reply seam;
+// whole-row packing itself is pinned by feed_list_pages_acceptance.rs)
+// ---------------------------------------------------------------------------
+
+fn page_relay(index: usize, source: String) -> FeedRelay {
+    FeedRelay {
+        id: format!("{index:032x}"),
+        guild_id: "guild-1".into(),
+        channel_id: "123456789012345678".into(),
+        kind: FeedKind::Rss,
+        source,
+        enabled: !index.is_multiple_of(5),
+        last_checked_at: None,
+        created_by: "actor".into(),
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+fn middle_relays(count: usize) -> Vec<FeedRelay> {
+    (1..=count)
+        .map(|index| {
+            page_relay(
+                index,
+                format!("https://example.org/news/section-{index:02}/updates?format=rss"),
+            )
+        })
+        .collect()
+}
+
+fn page_ids(reply: &str) -> Vec<&str> {
+    reply
+        .lines()
+        .filter_map(|line| line.strip_prefix('`')?.split_once('`').map(|(id, _)| id))
+        .collect()
+}
+
+#[test]
+fn feed_list_page_short_list_keeps_legacy_rows_with_attempt_and_inspect_hint() {
+    let feeds = middle_relays(3);
+    let reply = feed_list_page(&feeds, 1);
+    // Rows keep their exact legacy frame (id, kind, channel, full source)
+    // plus the shared last-attempt phrase; the reply ends with the inspect
+    // hint and no `Page n of total` footer.
+    let mut lines = reply.lines();
+    for feed in &feeds {
+        let frame = format!(
+            "`{}` rss enabled → <#{}> {}",
+            feed.id, feed.channel_id, feed.source
+        );
+        let line = lines.next().expect("one line per relay");
+        assert!(
+            line.starts_with(&frame),
+            "row keeps its legacy frame: {line}"
+        );
+        assert!(
+            line[frame.len()..].to_ascii_lowercase().contains("attempt"),
+            "row carries the attempt phrase: {line}"
+        );
+    }
+    assert_eq!(lines.next(), Some(FEED_LIST_INSPECT_HINT));
+    assert_eq!(lines.next(), None, "no trailing lines: {reply}");
+    assert!(
+        !reply.contains("Page "),
+        "single page carries no footer: {reply}"
+    );
+    assert!(
+        reply.encode_utf16().count() <= 2000,
+        "short reply stays bounded: {reply}"
+    );
+}
+
+#[test]
+fn feed_list_page_capacity_replies_fit_with_navigation_and_exact_once_ids() {
+    let feeds = middle_relays(25);
+    let first = feed_list_page(&feeds, 1);
+    let total: usize = first
+        .split("Page 1 of ")
+        .nth(1)
+        .expect("first reply announces its total")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("numeric total");
+    assert!(
+        (2..=25).contains(&total),
+        "capacity pages whole rows: {first}"
+    );
+    let mut seen = Vec::new();
+    for page in 1..=total as i64 {
+        let reply = feed_list_page(&feeds, page);
+        assert!(
+            reply.encode_utf16().count() <= 2000,
+            "reply {page} exceeds the limit: {reply}"
+        );
+        assert!(
+            reply.contains(&format!("Page {page} of {total}")),
+            "reply {page} identifies its page: {reply}"
+        );
+        assert!(
+            reply.contains("/feed-list") && reply.contains("page"),
+            "reply {page} gives usable navigation: {reply}"
+        );
+        seen.extend(page_ids(&reply).into_iter().map(str::to_owned));
+    }
+    let expected: Vec<String> = feeds.iter().map(|feed| feed.id.clone()).collect();
+    assert_eq!(seen, expected, "every id appears once, in stable order");
+}
+
+#[test]
+fn feed_list_page_empty_first_page_keeps_legacy_text_and_later_page_refuses() {
+    assert_eq!(feed_list_page(&[], 1), "No feed relays configured.");
+    let refusal = feed_list_page(&[], 2);
+    assert_ne!(refusal, "No feed relays configured.");
+    assert!(
+        refusal.to_ascii_lowercase().contains("page") && refusal.contains("/feed-list"),
+        "empty later page refuses actionably: {refusal}"
+    );
+}
+
+#[test]
+fn feed_list_page_refusals_are_short_actionable_and_row_free() {
+    let feeds = middle_relays(3);
+    let mut refusals: Vec<String> = [0, -1, 2, i64::MAX]
+        .into_iter()
+        .map(|page| feed_list_page(&feeds, page))
+        .collect();
+    refusals.push(feed_list_page_invalid_text().to_owned());
+    refusals.push(feed_list_page_underflow_text().to_owned());
+    for refusal in &refusals {
+        assert!(
+            refusal.encode_utf16().count() <= 300,
+            "refusal is short: {refusal}"
+        );
+        assert!(
+            refusal.to_ascii_lowercase().contains("page") && refusal.contains("/feed-list"),
+            "refusal explains how to retry: {refusal}"
+        );
+        assert!(
+            !refusal.lines().any(|line| line.starts_with('`')),
+            "refusal lists no rows: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn feed_list_page_single_row_over_budget_truncates_source_explicitly() {
+    let feeds = vec![page_relay(
+        1,
+        format!("https://example.org/{}?format=rss", "a".repeat(2000)),
+    )];
+    let pages = FeedRelay::list_pages(&feeds, 150);
+    assert_eq!(pages.len(), 1);
+    let row = &pages[0];
+    assert!(row.encode_utf16().count() <= 150, "row fits: {row}");
+    assert!(row.contains('…'), "truncation is explicit: {row}");
+    assert!(row.contains("example.org"), "useful context kept: {row}");
+    assert!(
+        row.contains("`00000000000000000000000000000001`"),
+        "exact id kept: {row}"
+    );
+    assert!(
+        row.contains("rss") && row.contains("<#123456789012345678>"),
+        "kind and channel kept: {row}"
+    );
+}
+
+#[test]
+fn feed_list_page_frame_over_budget_keeps_id_reachable() {
+    let feeds = vec![page_relay(1, "https://example.org/feed.xml".into())];
+    let pages = FeedRelay::list_pages(&feeds, 40);
+    assert_eq!(pages.len(), 1);
+    assert!(
+        pages[0].encode_utf16().count() <= 40,
+        "row fits: {row}",
+        row = pages[0]
+    );
+    assert!(
+        pages[0].contains("`00000000000000000000000000000001`"),
+        "id stays reachable: {row}",
+        row = pages[0]
+    );
+}
+
+#[test]
+fn feed_list_page_frame_inflated_rows_converge_with_ids_reachable() {
+    // Restored/legacy rows carry unbounded channel ids: a frame wider than
+    // the multi-page budget collapses to id-only rows, which must converge
+    // (not oscillate the page-count guess forever) with every id reachable.
+    let feeds: Vec<FeedRelay> = ["a", "b"]
+        .into_iter()
+        .map(|id| FeedRelay {
+            id: id.into(),
+            guild_id: "guild-1".into(),
+            channel_id: "7".repeat(1930),
+            kind: FeedKind::Rss,
+            source: "https://example.org/feed.xml".into(),
+            enabled: true,
+            last_checked_at: None,
+            created_by: "actor".into(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    let reply = feed_list_page(&feeds, 1);
+    assert!(
+        reply.encode_utf16().count() <= 2000,
+        "reply fits the limit: {reply}"
+    );
+    for id in ["`a`", "`b`"] {
+        assert!(reply.contains(id), "id {id} stays reachable: {reply}");
+    }
+    let refusal = feed_list_page(&feeds, 2);
+    assert!(
+        refusal.contains("1 to 1"),
+        "converged total is one page: {refusal}"
+    );
 }

@@ -95,6 +95,7 @@ class World:
         self.t = 1_800_000_000.0
         self.calls = []
         self.deploys = []
+        self.messages = []
         self.fail_control = {}
         self.raise_on_api = {}  # path prefix -> error to raise
 
@@ -244,11 +245,12 @@ def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None):
     (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
     deploy_path = str(Path(directory) / "staging-container-deploy.json")
 
-    def deploy(config_path):
+    def deploy(config_path, message_sha):
         config = json.loads(Path(config_path).read_text())
         image = config["env"]["staging"]["containers"][0]["image"]
         world.tick(2)
         world.deploys.append(image)
+        world.messages.append(message_sha)
         if world.refuse_deploy:
             return 1
         world.serving_image = image
@@ -329,6 +331,9 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(failures, [])
         # Both legs deployed through the full-container path with different images.
         self.assertEqual(world.deploys, [BACKOUT_IMAGE, PRE_IMAGE])
+        # Each leg stamps the deployed version with the SHA its image reports:
+        # drill leg with the backout pin's SHA, restore leg with the baseline's.
+        self.assertEqual(world.messages, [BACKOUT_SHA, PRE_SHA])
         drill, restore = instance.evidence["drill"], instance.evidence["restore"]
         self.assertEqual(drill["intended_image"], BACKOUT_IMAGE)
         self.assertEqual(drill["running_image"], BACKOUT_IMAGE)
@@ -631,6 +636,24 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail, "status=409 codes=10220")
         self.assertNotIn(SENTINEL, repr(caught.exception.detail))
 
+    def test_deeply_nested_error_envelope_keeps_401_codes_none(self):
+        depth = 10000
+        deep_object = b'{"a":' * depth + b"0" + b"}" * depth
+        deep_array = b"[" * depth + b"]" * depth
+        for nested in (deep_object, deep_array):
+            with self.subTest(length=len(nested)):
+                envelope = b'{"probe": ' + nested + b', "errors": []}'
+                self.assertLessEqual(len(envelope), container_drill.rollout.MAX_BODY)
+                client = container_drill.ContainerDrillClient(ACCOUNT, SENTINEL)
+                error = HTTPError("https://api.cloudflare.com", 401, "Unauthorized",
+                                  {}, io.BytesIO(envelope))
+                client.opener = MagicMock()
+                client.opener.open.side_effect = error
+                with self.assertRaises(GateError) as caught:
+                    client.api("/workers/scripts/two-bot-next-staging/deployments")
+                self.assertEqual(str(caught.exception), "api_http_failure")
+                self.assertEqual(caught.exception.detail, "status=401 codes=none")
+
     def test_api_sends_bearer_to_the_account_path_only(self):
         client = container_drill.ContainerDrillClient(ACCOUNT, SENTINEL)
         response = MagicMock()
@@ -740,14 +763,194 @@ class WranglerEnvTests(unittest.TestCase):
                                                  job_env)
         with patch.object(container_drill.subprocess, "run",
                           return_value=MagicMock(returncode=0)) as run:
-            self.assertEqual(deploy("staging-deploy.json"), 0)
+            self.assertEqual(deploy("staging-deploy.json", "f" * 40), 0)
         args, kwargs = run.call_args
         self.assertEqual(args[0], ["node_modules/.bin/wrangler", "deploy", "--config",
-                                   "staging-deploy.json", "--env", "staging"])
+                                   "staging-deploy.json", "--env", "staging",
+                                   "--message", "f" * 40])
         self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "HOME": "/home/runner",
                                          "CLOUDFLARE_API_TOKEN": "c" * 40,
                                          "CLOUDFLARE_ACCOUNT_ID": ACCOUNT})
         self.assertNotIn(SENTINEL, repr(kwargs))
+
+
+class LagToleranceTests(unittest.TestCase):
+    def test_wait_ready_probes_during_active_lag(self):
+        # Run-7 diagnosis: the platform steady state is the lag shape, so
+        # wait_ready must probe it like verify() does instead of demanding
+        # strict converged() with probes=0.
+        world = World()
+        lag_row = rollout_row(world, "r-lag", BACKOUT_IMAGE)
+        lag_row["health"] = {"instances": {"active": 0, "healthy": 1,
+                                           "failed": 0, "starting": 0,
+                                           "scheduling": 0}}
+        world.rollouts = [lag_row]
+        world.serving_image = BACKOUT_IMAGE
+        world.history = [BACKOUT_WORKER, PRE]
+        world.ready_polls = 0
+        logs = []
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1",
+            ("x", lambda p: 0, "y"),
+            now=lambda: world.t, sleep=world.tick, log=logs.append)
+        instance.evidence["rollout_ids_before"] = []
+        moment, counts, timeline = instance.wait_ready(
+            BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE,
+            world.t)
+        self.assertGreaterEqual(counts["probes"], 1)
+        self.assertTrue(any(entry[2] and entry[3] for entry in timeline))
+
+    def test_failed_wait_preserves_timeline_and_last_observation(self):
+        # A ready_timeout must keep the wait timeline plus the last
+        # observation in the leg evidence, so probes=0 separates a missing
+        # rollout from an unconverged one.
+        world = World()
+        world.never_converge = True
+        world.ready_polls = 0
+        instance, failures, _ = run_drill(world)
+        self.assertTrue(failures[0].startswith("drill:ready_timeout"))
+        leg = instance.evidence["drill"]
+        self.assertIn("wait_timeline", leg)
+        self.assertIn("last_observation", leg)
+        self.assertTrue(len(leg["wait_timeline"]) > 0)
+        # Secret-safe: ISO times, integers and booleans only.
+        blob = json.dumps(leg)
+        self.assertNotIn(SENTINEL, blob)
+        self.assertIn("probes=", leg["last_observation"])
+        self.assertIn("pinned=", leg["last_observation"])
+
+    def test_stale_budget_matches_rollout_verify(self):
+        # Run-8: drill used 3 stale polls while verify() allows 12, so a
+        # trailing listing failed as drift with probes=0. Single-sourced now.
+        self.assertEqual(container_drill.STALE_IMAGE_POLLS,
+                         container_drill.rollout.APPLICATION_IMAGE_STALE_POLLS)
+
+    def test_wait_tolerates_listing_lag_beyond_old_budget(self):
+        # Run-8: backout rollout accepted active_lag/converged while the
+        # application listing trailed for 5 polls (> old budget 3). The wait
+        # must survive the lag then probe the exact version once converged.
+        world = World()
+        world.rollouts = [rollout_row(world, "r-new", BACKOUT_IMAGE)]
+        world.serving_image = PRE_IMAGE  # stale listing
+        world.history = [BACKOUT_WORKER, PRE]
+        world.ready_polls = 0
+        calls = [0]
+
+        def sleep_with_lag(seconds):
+            calls[0] += 1
+            world.tick(seconds)
+            if calls[0] == 5:
+                world.serving_image = BACKOUT_IMAGE
+
+        logs = []
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1",
+            ("x", lambda p: 0, "y"),
+            now=lambda: world.t, sleep=sleep_with_lag, log=logs.append)
+        instance.evidence["rollout_ids_before"] = []
+        _moment, counts, timeline = instance.wait_ready(
+            BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE,
+            world.t)
+        self.assertGreaterEqual(counts["probes"], 1)
+        self.assertTrue(any(entry[2] and entry[3] for entry in timeline))
+
+    def test_drill_leg_refuses_drifted_live_listing(self):
+        world = World()
+        old = rollout_row(world, "r-old", PRE_IMAGE)
+        world.tick(10)
+        new = rollout_row(world, "r-new", BACKOUT_IMAGE)
+        world.rollouts = [old, new]
+        world.serving_image = PRE_IMAGE
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1",
+            ("unused", lambda p: 0, "unused"),
+            now=lambda: world.t, sleep=world.tick, log=lambda message: None)
+        with patch.object(instance, "deploy_image",
+                          side_effect=AssertionError("unexpected deploy")) as deploy:
+            with self.assertRaises(GateError) as caught:
+                instance.leg("drill", pin(), container_drill.validate_attestation(
+                    COVERING_ATTESTATION))
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        deploy.assert_not_called()
+        self.assertEqual(world.deploys, [])
+        self.assertEqual([call[0] for call in world.calls], ["status", "fence"])
+
+    def test_restore_refuses_unproven_serving_image(self):
+        for scenario in ("no_completed_rollouts", "malformed_listing"):
+            with self.subTest(scenario=scenario):
+                world = World()
+                if scenario == "no_completed_rollouts":
+                    world.rollouts = []
+                else:
+                    world.serving_image = "not-an-image-digest"
+                instance = container_drill.Drill(
+                    FakeClient(world), make_control(world), URL, "1",
+                    ("unused", lambda p: 0, "unused"),
+                    now=lambda: world.t, sleep=world.tick, log=lambda message: None)
+                restore_pin = pin(source_sha=PRE_SHA, build_id=PRE_BUILD,
+                                  image=PRE_IMAGE, worker_version=PRE)
+                with patch.object(instance, "deploy_image",
+                                  side_effect=AssertionError("unexpected deploy")) as deploy:
+                    with self.assertRaises(GateError) as caught:
+                        instance.leg("restore", restore_pin,
+                                     container_drill.validate_attestation(
+                                         COVERING_ATTESTATION))
+                self.assertEqual(str(caught.exception), "serving_image_unproven")
+                deploy.assert_not_called()
+                self.assertEqual(world.deploys, [])
+                self.assertEqual([call[0] for call in world.calls], ["status", "fence"])
+
+    def test_restore_deploys_when_live_listing_drifted(self):
+        # Run-8: backout left listing drifted (newest rollout BACKOUT, listing
+        # PRE). The restore leg must deploy the baseline then verify, not fail
+        # closed before any change and leave staging on the backout image.
+        world = World()
+        old = rollout_row(world, "r-old", PRE_IMAGE)
+        world.tick(10)
+        new = rollout_row(world, "r-new", BACKOUT_IMAGE)
+        world.rollouts = [old, new]
+        world.serving_image = PRE_IMAGE  # drifted: newest is BACKOUT
+        world.history = [PRE, BACKOUT_WORKER]
+        world.ready_polls = 0
+        with self.assertRaises(GateError) as caught:
+            container_drill.serving_image(FakeClient(world),
+                                          {"id": "app1", "configuration":
+                                           {"image": world.serving_image}})
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        directory = tempfile.mkdtemp()
+        wrangler_dir = Path(directory) / "wrangler"
+        wrangler_dir.mkdir()
+        (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
+        deploy_path = str(Path(directory) / "staging-container-deploy.json")
+
+        def deploy(config_path, message_sha):
+            config = json.loads(Path(config_path).read_text())
+            image = config["env"]["staging"]["containers"][0]["image"]
+            world.tick(2)
+            world.deploys.append(image)
+            world.messages.append(message_sha)
+            world.serving_image = image
+            world.rollouts.append(rollout_row(world, f"r-{len(world.rollouts)}",
+                                              image))
+            return 0
+
+        logs = []
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1",
+            (deploy_path, deploy, str(wrangler_dir)),
+            now=lambda: world.t, sleep=world.tick, log=logs.append)
+        instance.evidence["rollout_ids_before"] = ["r-old", "r-new"]
+        restore_pin = {"source_sha": PRE_SHA, "build_id": PRE_BUILD,
+                       "image": PRE_IMAGE, "worker_version": PRE,
+                       "rollout_id": "live-baseline", "review_ref": "live-baseline",
+                       "staging_run_id": "123456",
+                       "compatibility_note": "live-baseline"}
+        leg = instance.leg("restore", restore_pin,
+                           container_drill.validate_attestation(
+                               COVERING_ATTESTATION))
+        self.assertEqual(world.deploys, [PRE_IMAGE])
+        self.assertEqual(leg["running_image"], PRE_IMAGE)
+        self.assertEqual(world.serving_image, PRE_IMAGE)
 
 
 class MainTests(unittest.TestCase):
@@ -784,10 +987,11 @@ class MainTests(unittest.TestCase):
             env = {**env, "GITHUB_STEP_SUMMARY": str(summary)}
 
             def deploy_factory(wrangler_bin, directory, environ):
-                def deploy(config_path):
+                def deploy(config_path, message_sha):
                     config = json.loads(Path(config_path).read_text())
                     world.deploys.append(
                         config["env"]["staging"]["containers"][0]["image"])
+                    world.messages.append(message_sha)
                     world.tick(2)
                     world.serving_image = config["env"]["staging"]["containers"][0]["image"]
                     world.rollouts.append(rollout_row(
@@ -836,6 +1040,73 @@ class MainTests(unittest.TestCase):
                 self.assertIsNone(evidence)
                 self.assertNotIn(SENTINEL, output)
                 self.assertIn("refused before any change", output)
+
+
+class DryRunPlanPinTests(unittest.TestCase):
+    """Builder pins: --dry-run binds the restore leg to the live baseline."""
+
+    def environ(self):
+        return {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                "GITHUB_RUN_ID": "123456", "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                "CLOUDFLARE_API_TOKEN": "t" * 40}
+
+    def args(self, directory):
+        base = {"backout_source_sha": BACKOUT_SHA, "backout_build_id": BACKOUT_BUILD,
+                "backout_image": BACKOUT_IMAGE,
+                "backout_worker_version": BACKOUT_WORKER,
+                "backout_rollout_id": "r-backout",
+                "backout_review_ref": "PR-612:ci-ok",
+                "backout_staging_run_id": "37243860909",
+                "compatibility_note": "schema-0417+DO-unchanged",
+                "session_attestation": COVERING_ATTESTATION,
+                "evidence": str(Path(directory) / "evidence.json"),
+                "deploy_config": str(Path(directory) / "deploy.json")}
+        argv = []
+        for key, value in base.items():
+            argv += [f"--{key.replace('_', '-')}", value]
+        return [*argv, "--dry-run"]
+
+    def dry_run(self):
+        world = World()
+        with tempfile.TemporaryDirectory() as directory:
+            wrangler_dir = Path(directory) / "wrangler"
+            wrangler_dir.mkdir()
+            (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
+
+            def deploy_factory(wrangler_bin, directory, environ):
+                def deploy(config_path, message_sha):
+                    world.deploys.append((config_path, message_sha))
+                    return 0
+                return deploy
+
+            output = io.StringIO()
+            with patch("builtins.print",
+                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")):
+                code = container_drill.main(
+                    self.args(directory), environ=self.environ(),
+                    make_control=lambda token, url, actor: make_control(world),
+                    client_factory=lambda account, token: FakeClient(world),
+                    deploy_factory=deploy_factory)
+        return code, output.getvalue(), world
+
+    def test_plan_pins_baseline_and_numbered_leg_order(self):
+        code, out, world = self.dry_run()
+        self.assertEqual(code, 0)
+        self.assertIn(f"baseline image: {PRE_IMAGE}", out)
+        self.assertIn(f"baseline worker_version: {PRE}", out)
+        lines = out.splitlines()
+        drill_lines = [line for line in lines if line.startswith("1. drill")]
+        restore_lines = [line for line in lines if line.startswith("2. restore")]
+        self.assertEqual(len(drill_lines), 1)
+        self.assertEqual(len(restore_lines), 1)
+        self.assertIn(BACKOUT_IMAGE, drill_lines[0])
+        self.assertIn(PRE_IMAGE, restore_lines[0])
+        self.assertIn(PRE, restore_lines[0])
+        self.assertLess(out.index("1. drill"), out.index("2. restore"))
+        self.assertEqual(world.deploys, [])
+        mutating = [call for call in world.calls
+                    if call[0] in ("fence", "deployment-takeover")]
+        self.assertEqual(mutating, [])
 
 
 if __name__ == "__main__":

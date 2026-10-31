@@ -115,16 +115,18 @@ pool (`staging_migrate::verify_target` plus `connect` in
 production targets: pins the expected host and database, enforces the
 `TWO_DATABASE_TLS` policy before SQLx parses the binding, applies the
 effective TLS mode, and sets a 10 s acquire timeout on the pool without adding
-a statement timeout to plan or apply connections).
+a statement timeout to plan or apply connections), and both legacy cutover
+binaries (`legacy_copy` via `Options::connections` in
+`crates/cutover/src/legacy_copy/options.rs`, `legacy_verify` via
+`connection_options` in `crates/cutover/src/bin/legacy_verify.rs`: validate
+both operator URLs, enforce the `TWO_DATABASE_TLS` policy before SQLx parses
+either one, then apply the effective TLS mode to both option sets).
+`legacy_copy --plan` stays offline: it prints the mapping inventory before
+connection construction and never reaches the fence. All refusals are fixed
+strings with no URL, host or credential.
 
-Known gaps (not yet fenced): the
-`legacy_copy` binary (`crates/cutover/src/bin/legacy_copy.rs`) builds its
-source/target pools with raw `PgPoolOptions::connect_with` from operator URLs
-without calling `database_tls::enforce`/`apply`; and the `legacy_verify`
-binary (`crates/cutover/src/bin/legacy_verify.rs`) builds its source/target
-`PgConnectOptions` via `connection_options` from operator URLs without calling
-`database_tls::enforce`/`apply`. Their
-refusals already use fixed strings with no URL, host or credential.
+Known gaps: none remaining in the cutover surface. The last unfenced paths
+were the two legacy cutover binaries, fenced above.
 
 F6 stays open until the deployment card records a non-secret TLS receipt.
 
@@ -159,6 +161,13 @@ F6 stays open until the deployment card records a non-secret TLS receipt.
   `run_refuses_plaintext_remote_binding_before_connect` (the `run` entry
   refuses under either policy, so the test holds regardless of the ambient
   `TWO_DATABASE_TLS` setting).
+- Both legacy binaries pin the fence at the process boundary in
+  `crates/cutover/tests/legacy_tls_fence.rs`: a policy-refused URL fails with
+  the fixed string and exit code 2 before any socket (dial-discriminating spy
+  proof), the URL sslmode reaches the socket unchanged under `local-only`,
+  `--plan` stays offline, and the disposable-Postgres case refuses the real
+  endpoints under the default policy while verifying green with the explicit
+  opt-in.
 - DB suites and CLIs pass `LocalOnly` explicitly (`connect_with_tls` /
   `connect_pool_with_tls` / `open_pool_with_tls`, or
   `TWO_DATABASE_TLS=local-only` on `env_clear()` subprocesses). The CI `check`

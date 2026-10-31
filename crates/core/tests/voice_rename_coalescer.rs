@@ -212,6 +212,28 @@ fn names_over_100_scalars_are_refused_and_errors_echo_nothing() {
     assert!(!message.contains('é'));
 }
 
+// ---- display pins ----
+
+#[test]
+fn rename_error_display_strings_are_pinned() {
+    assert_eq!(
+        RenameError::InvalidChannelId.to_string(),
+        "channel id must be nonzero"
+    );
+    assert_eq!(
+        RenameError::EmptyName.to_string(),
+        "channel name cannot be empty"
+    );
+    assert_eq!(
+        RenameError::NameTooLong {
+            chars: 101,
+            max: 100
+        }
+        .to_string(),
+        "channel name is 101 characters long; the maximum is 100"
+    );
+}
+
 #[test]
 fn refusals_leave_existing_entries_unchanged() {
     let mut coalescer = RenameCoalescer::new();

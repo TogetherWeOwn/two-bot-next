@@ -13,11 +13,13 @@
 use std::collections::HashMap;
 use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;
-use two_bot_cutover::cli::{open_db, Args, ScanReport};
+use two_bot_cutover::cli::{
+    open_db, parse_env_guild, scan_page_hint, Args, ScanReport, DB_POOL_HELP, MAX_SCAN_PAGES,
+};
 use two_bot_cutover::{
-    find_early_messages, fold_messages, is_conversation_channel, iso_to_millis, record_earliest,
-    touch_activity, FunnelWrite, MemberMessages, RestClient, ScannedMessage,
-    DEFAULT_ARCHIVED_THREAD_PAGES, FORUM_CHANNEL_TYPES, THREAD_CHANNEL_TYPES,
+    find_early_messages, fold_messages, is_conversation_channel, record_earliest, touch_activity,
+    FunnelWrite, MemberMessages, RestClient, ScannedMessage, DEFAULT_ARCHIVED_THREAD_PAGES,
+    FORUM_CHANNEL_TYPES, THREAD_CHANNEL_TYPES,
 };
 
 const MESSAGE_RUNGS: [&str; 3] = ["first_message", "second_message", "third_message"];
@@ -26,12 +28,25 @@ const MESSAGE_RUNGS: [&str; 3] = ["first_message", "second_message", "third_mess
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = Args::parse(&argv);
+    if args.has("help") {
+        println!(
+            "Usage: backfill-messages [--dry-run] [--max-pages=N] [--since <RFC3339>] [--discord-base <url>] [--allow-live-guild]\n\
+             --max-pages: integer 1..={MAX_SCAN_PAGES} (default 60).\n\
+             --since: optional RFC3339 lower bound; malformed values refuse.\n\
+             Env: DISCORD_TOKEN (or DISCORD_BOT_TOKEN), DISCORD_GUILD_ID, TWO_DATABASE_URL.\n\
+             {DB_POOL_HELP}"
+        );
+        return;
+    }
     let dry_run = args.has("dry-run");
-    let max_pages: usize = args
-        .get("max-pages")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-    let since_ms = args.get("since").and_then(iso_to_millis);
+    let max_pages = args.max_pages(60).unwrap_or_else(|error| {
+        eprintln!("input error: {error}");
+        std::process::exit(2);
+    });
+    let since_ms = args.since_millis().unwrap_or_else(|error| {
+        eprintln!("input error: {error}");
+        std::process::exit(2);
+    });
 
     let token = std::env::var("DISCORD_TOKEN")
         .or_else(|_| std::env::var("DISCORD_BOT_TOKEN"))
@@ -49,10 +64,11 @@ async fn main() {
         std::process::exit(2);
     }
     let guild_id = std::env::var("DISCORD_GUILD_ID").unwrap_or_default();
-    if guild_id.is_empty() {
-        eprintln!("Missing DISCORD_GUILD_ID.");
-        std::process::exit(2);
-    }
+    let guild: Id<twilight_model::id::marker::GuildMarker> =
+        Id::new(parse_env_guild(&guild_id).unwrap_or_else(|error| {
+            eprintln!("input error: {error}");
+            std::process::exit(2);
+        }));
     if guild_id == two_bot_cutover::LIVE_GUILD_ID && !args.has("allow-live-guild") {
         eprintln!(
             "Refusing live guild {}. Use --allow-live-guild only for an owner-approved rollout.",
@@ -69,7 +85,6 @@ async fn main() {
             std::process::exit(1);
         });
     let db = open_db(&args, false).await;
-    let guild: Id<twilight_model::id::marker::GuildMarker> = Id::new(guild_id.parse().unwrap_or(0));
 
     println!(
         "\nTWO message backfill{}",
@@ -81,11 +96,13 @@ async fn main() {
     );
     println!("  guild {guild_id}   max {max_pages} pages/channel\n");
 
-    let channels = rest
-        .guild_channels(guild)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_default();
+    let channels = match rest.guild_channels(guild).await {
+        Ok(Some(channels)) => channels,
+        Ok(None) | Err(_) => {
+            eprintln!("Guild-channel discovery unavailable; backfill stopped.");
+            std::process::exit(1);
+        }
+    };
     let cat_name: HashMap<String, String> = channels
         .iter()
         .filter(|c| c.kind == ChannelType::GuildCategory)
@@ -108,11 +125,16 @@ async fn main() {
 
     // Forum posts live in threads, and threads are separate channels.
     let mut thread_ids: Vec<String> = Vec::new();
-    if let Ok(Some(active)) = rest.active_threads(guild).await {
-        for t in &active.threads {
-            if THREAD_CHANNEL_TYPES.contains(&channel_type_code(&t.kind)) {
-                thread_ids.push(t.id.get().to_string());
-            }
+    let active = match rest.active_threads(guild).await {
+        Ok(Some(active)) => active,
+        Ok(None) | Err(_) => {
+            eprintln!("Active-thread discovery unavailable; backfill stopped.");
+            std::process::exit(1);
+        }
+    };
+    for t in &active.threads {
+        if THREAD_CHANNEL_TYPES.contains(&channel_type_code(&t.kind)) {
+            thread_ids.push(t.id.get().to_string());
         }
     }
     let mut archived_truncated: Vec<String> = Vec::new();
@@ -305,7 +327,7 @@ async fn main() {
         println!(
             "\n  INCOMPLETE: hit the {max_pages}-page cap on {} channel(s).\n  A capped scan sees a subset of each member's posts, so the milestones we\n  recorded are at or LATER than the true ones - never earlier. AM7 can\n  therefore miss a member here, but it cannot wrongly admit one, and a\n  deeper re-run only moves the milestones towards the truth.\n  Re-run with --max-pages={}.\n  {}",
             summary.truncated.len(),
-            max_pages * 4,
+            scan_page_hint(max_pages),
             summary.truncated.join(", ")
         );
     }

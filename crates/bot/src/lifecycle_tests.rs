@@ -468,6 +468,7 @@ async fn stalled_http_drain_does_not_bypass_website_job_join() {
     let job = crate::jobs::Job {
         name: "pending",
         cadence: Duration::from_secs(1),
+        cadence_source: None,
         startup_jitter: Duration::ZERO,
         timeout: Duration::from_secs(300),
         action: Arc::new({
@@ -554,6 +555,7 @@ async fn gateway_failure_joins_pending_website_job_before_returning() {
     let job = crate::jobs::Job {
         name: "pending",
         cadence: Duration::from_secs(1),
+        cadence_source: None,
         startup_jitter: Duration::ZERO,
         timeout: Duration::from_secs(300),
         action: Arc::new({
@@ -662,10 +664,15 @@ async fn failure_class_is_served_on_readyz_for_the_whole_linger_then_the_task_en
     let mut publish = tokio::spawn({
         let state = state.clone();
         async move {
+            let failed = crate::gateway_failure::step_failure(
+                FailureClass::CheckpointLoadFailed,
+                "checkpoint_load",
+                sqlx::Error::InvalidArgument("lifecycle test".into()),
+            );
             crate::publish_gateway_failure(
                 &state.gateway,
                 &state.failure,
-                FailureClass::CheckpointLoadFailed,
+                &failed,
                 stopping,
                 linger,
             )
@@ -677,7 +684,7 @@ async fn failure_class_is_served_on_readyz_for_the_whole_linger_then_the_task_en
     let body = readyz_body(&state).await;
     assert_eq!(
         body["gateway_failure"],
-        serde_json::json!({"phase": "durable_gateway", "class": "checkpoint_load_failed"})
+        serde_json::json!({"phase": "durable_gateway", "class": "checkpoint_load_failed", "failed_step": "checkpoint_load", "error_code": "none"})
     );
     assert_eq!(
         body["components"][1],
@@ -686,7 +693,9 @@ async fn failure_class_is_served_on_readyz_for_the_whole_linger_then_the_task_en
     assert_eq!(
         state.failure.get(),
         Some(GatewayFailure::durable_gateway(
-            FailureClass::CheckpointLoadFailed
+            FailureClass::CheckpointLoadFailed,
+            "checkpoint_load",
+            "none",
         ))
     );
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -701,10 +710,15 @@ async fn shutdown_cuts_the_failure_linger_short() {
     let publish = tokio::spawn({
         let state = state.clone();
         async move {
+            let failed = crate::gateway_failure::step_failure(
+                FailureClass::GatewayRuntimeFailed,
+                "gateway_run",
+                sqlx::Error::InvalidArgument("lifecycle test".into()),
+            );
             crate::publish_gateway_failure(
                 &state.gateway,
                 &state.failure,
-                FailureClass::GatewayRuntimeFailed,
+                &failed,
                 stopping,
                 Duration::from_secs(3600),
             )
@@ -725,10 +739,15 @@ async fn an_already_draining_gateway_is_not_reverted_to_starting() {
     use crate::gateway_failure::FailureClass;
     let state = server::SharedState::new(Arc::new(RwLock::new(GatewayState::Draining)), None);
     let (_shutdown, stopping) = watch::channel(false);
+    let failed = crate::gateway_failure::step_failure(
+        FailureClass::GatewayRuntimeFailed,
+        "gateway_run",
+        sqlx::Error::InvalidArgument("lifecycle test".into()),
+    );
     crate::publish_gateway_failure(
         &state.gateway,
         &state.failure,
-        FailureClass::GatewayRuntimeFailed,
+        &failed,
         stopping,
         Duration::ZERO,
     )
@@ -745,10 +764,15 @@ async fn supervisor_still_exits_with_an_error_after_a_lingering_failure() {
     let task = tokio::spawn({
         let state = state.clone();
         async move {
+            let failed = crate::gateway_failure::step_failure(
+                FailureClass::AutomodConfigInvalid,
+                "automod_config",
+                sqlx::Error::InvalidArgument("lifecycle test".into()),
+            );
             crate::publish_gateway_failure(
                 &state.gateway,
                 &state.failure,
-                FailureClass::AutomodConfigInvalid,
+                &failed,
                 stopping,
                 Duration::from_secs(15),
             )
@@ -783,4 +807,32 @@ async fn supervisor_still_exits_with_an_error_after_a_lingering_failure() {
         .unwrap();
     assert!(result.is_err(), "the process must still exit nonzero");
     assert_eq!(*state.gateway.read().await, GatewayState::Draining);
+}
+
+#[tokio::test]
+async fn serve_jobs_fails_fast_on_an_unregistered_name() {
+    let job = crate::jobs::Job {
+        name: "ghost",
+        cadence: Duration::from_secs(1),
+        cadence_source: None,
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(30),
+        action: Arc::new(|| Box::pin(async { Ok(()) })),
+    };
+    let status = crate::jobs::statuses(&["good"], false);
+    let (shutdown, stopping) = watch::channel(false);
+    // Never-resolving HTTP: the registration check must fire before any drain.
+    let http = std::future::pending::<std::io::Result<()>>();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::website_jobs::serve_jobs(vec![job], status, shutdown, http),
+    )
+    .await
+    .expect("registration fails fast, without draining HTTP")
+    .expect_err("an unregistered name fails at spawn");
+    assert_eq!(error.to_string(), "unregistered job: ghost");
+    assert!(
+        *stopping.borrow(),
+        "registration failure must latch shutdown before returning to the reconcile owner"
+    );
 }

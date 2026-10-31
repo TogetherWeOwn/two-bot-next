@@ -15,10 +15,10 @@ use two_bot_core::{
         delivery_action, parse_xml_feed_report, poll_candidates, DeliveryAction, DeliveryClaim,
         FeedItem, FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
     },
-    feeds_connector::fetch_feed,
+    feeds_connector::{fetch_feed, record_feed_fetch},
     feeds_store::{self as store, FeedAudit},
     funnel::now_millis_for_test,
-    FeatureGates,
+    metrics, FeatureGates,
 };
 use two_bot_discord::{ActionExecutor, DiscordError};
 
@@ -127,12 +127,23 @@ struct PublicFeedFetch;
 impl FeedFetch for PublicFeedFetch {
     fn fetch(&self, feed: FeedRelay) -> FetchFuture {
         Box::pin(async move {
-            let fetched = fetch_feed(&feed.source)
-                .await
-                .map_err(|_| ErrorClass::Feed)?;
+            let fetched = fetch_public_feed(metrics::global(), &feed.source).await?;
             parse_fetched(fetched, &feed)
         })
     }
+}
+
+/// Production fetch with metric recording, split from [`PublicFeedFetch`] so
+/// hermetic tests can pass a runtime-local registry: exactly one outcome
+/// sample plus (on failure) one error-class sample per call, never per-feed,
+/// so no source URL reaches a label.
+async fn fetch_public_feed(
+    metrics: &metrics::Metrics,
+    source: &str,
+) -> Result<two_bot_core::feeds_connector::FetchedFeed, ErrorClass> {
+    let result = fetch_feed(source).await;
+    record_feed_fetch(metrics, &result);
+    result.map_err(|_| ErrorClass::Feed)
 }
 
 fn parse_fetched(
@@ -157,7 +168,7 @@ fn parse_fetched(
 struct ScheduleRun(Arc<Mutex<FeedPollSchedule>>);
 impl Drop for ScheduleRun {
     fn drop(&mut self) {
-        self.0.lock().expect("feed schedule").finish();
+        two_bot_core::metrics::recover_drop_poison(self.0.lock(), "schedule_run").finish();
     }
 }
 
@@ -172,6 +183,7 @@ pub(crate) fn scheduled_job(seconds: u64, action: JobAction) -> Result<Job, Erro
     Ok(Job {
         name: NAME,
         cadence: Duration::from_secs(seconds),
+        cadence_source: None,
         startup_jitter: Duration::ZERO,
         timeout: JOB_TIMEOUT,
         action: Arc::new(move || {
@@ -224,37 +236,85 @@ pub(crate) fn live_poll_seconds(guild: &str, fallback: u64) -> u64 {
     live_poll_seconds_with(guild, fallback, crate::settings_jobs::live().as_ref())
 }
 
-/// Live-aware job: the supervisor still wakes on the boot value, while the
-/// non-overlapping schedule gate re-reads the live interval before every
-/// tick. A stored change takes effect no earlier than the previously
-/// scheduled slot, and the effective interval is the stored value rounded up
-/// to a multiple of the boot cadence; only a restart re-baselines the
-/// supervisor cadence (dynamic-cadence follow-up).
+/// The announcements gate key served from the live settings snapshot. Job
+/// existence stays boot-gated (registration and the live-identity fence read
+/// the boot value); each tick re-checks the live value, so storing `0` parks
+/// a boot-enabled poller within one poll while enabling from a boot-off
+/// deployment needs a restart (no job exists to tick).
+pub(crate) const ANNOUNCEMENTS_KEY: &str = "TWO_ANNOUNCEMENTS";
+
+/// Effective announcements gate: the live snapshot wins over the boot value,
+/// an absent row falls back to boot, and any rendering other than exactly
+/// `"1"` reads off (fail-closed, like `FeatureGates::from_map`). Pure for
+/// tests via `live`.
+pub(crate) fn live_announcements_with(
+    guild: &str,
+    boot_on: bool,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> bool {
+    let Some(live) = live else {
+        return boot_on;
+    };
+    let Some(value) = live.get(guild, ANNOUNCEMENTS_KEY) else {
+        return boot_on;
+    };
+    two_bot_core::settings::to_env_string(&value).is_some_and(|rendered| rendered == "1")
+}
+
+/// Production reader: the poller-published snapshot, if any.
+pub(crate) fn live_announcements_on(guild: &str, boot_on: bool) -> bool {
+    live_announcements_with(guild, boot_on, crate::settings_jobs::live().as_ref())
+}
+
+/// Live-aware job: the supervisor's own cadence follows the live interval,
+/// and the non-overlapping schedule gate re-reads the same interval before
+/// every tick. A stored change reschedules the next run to last-run + new
+/// interval on both layers (see `jobs::Job::cadence_source` and
+/// `FeedPollSchedule::set_interval_seconds`), so a decrease below the boot
+/// cadence no longer waits for the pending boot-cadence slot and the
+/// effective interval is the stored value, never rounded to a boot multiple.
 pub(crate) fn scheduled_job_live(
     seconds: u64,
     action: JobAction,
     guild: String,
 ) -> Result<Job, ErrorClass> {
+    let interval: Arc<dyn Fn() -> u64 + Send + Sync> =
+        Arc::new(move || live_poll_seconds(&guild, seconds));
+    scheduled_job_dynamic(seconds, action, interval)
+}
+
+/// [`scheduled_job_live`] over an injectable interval reader, for tests.
+/// `seconds` is the boot value: it validates the job and seeds the cadence
+/// until the reader's first value is taken at construction.
+pub(crate) fn scheduled_job_dynamic(
+    seconds: u64,
+    action: JobAction,
+    interval: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> Result<Job, ErrorClass> {
+    // Validate the boot value even when a live value is already published:
+    // a misconfigured boot interval must refuse registration like before.
+    FeedPollSchedule::new(seconds).map_err(|_| ErrorClass::Configuration)?;
+    let initial = interval();
     let schedule = Arc::new(Mutex::new(
-        FeedPollSchedule::new(live_poll_seconds(&guild, seconds))
-            .map_err(|_| ErrorClass::Configuration)?,
+        FeedPollSchedule::new(initial).map_err(|_| ErrorClass::Configuration)?,
     ));
     let origin = tokio::time::Instant::now();
+    let gate_interval = interval.clone();
     Ok(Job {
         name: NAME,
-        cadence: Duration::from_secs(seconds),
+        cadence: Duration::from_secs(initial),
+        cadence_source: Some(Arc::new(move || Duration::from_secs(interval()))),
         startup_jitter: Duration::ZERO,
         timeout: JOB_TIMEOUT,
         action: Arc::new(move || {
             let action = action.clone();
             let schedule = schedule.clone();
-            let guild = guild.clone();
+            let interval = gate_interval.clone();
             let now = origin.elapsed().as_millis().min(i64::MAX as u128) as i64;
             Box::pin(async move {
                 {
                     let mut schedule = schedule.lock().expect("feed schedule");
-                    let live_seconds = live_poll_seconds(&guild, seconds);
-                    schedule.set_interval_seconds(live_seconds);
+                    schedule.set_interval_seconds(interval());
                     if !schedule.begin(now) {
                         return Ok(());
                     }
@@ -268,9 +328,11 @@ pub(crate) fn scheduled_job_live(
 
 /// The feed poller, or `None` while `TWO_ANNOUNCEMENTS` is off or the boot
 /// identity does not permit announcements (the live-identity fence, TOG-15758).
-/// The poll interval reads the live settings snapshot (TOG-19027): the boot
-/// value sets the supervisor cadence, the per-tick schedule gate re-reads the
-/// stored value so a changed interval applies without a restart.
+/// The poll interval reads the live settings snapshot (TOG-19027): the
+/// supervisor cadence and the per-tick schedule gate both follow the stored
+/// value, so a changed interval reschedules the next run without a restart.
+/// Each tick also re-checks the announcements gate against the live snapshot,
+/// so storing `0` parks a boot-enabled poller within one poll.
 pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = match FeatureGates::from_env() {
         Ok(gates) => gates,
@@ -324,7 +386,36 @@ fn register_gated(gates: FeatureGates, action: JobAction, guild: String) -> Opti
     if !gates.announcements {
         return None;
     }
-    scheduled_job_live(gates.feed_poll_seconds, action, guild).ok()
+    let gate_guild = guild.clone();
+    register_gated_with(
+        gates.feed_poll_seconds,
+        action,
+        guild,
+        Arc::new(move || live_announcements_on(&gate_guild, true)),
+    )
+}
+
+/// [`register_gated`] over an injectable per-tick gate, for tests. The
+/// production gate reads the live announcements snapshot store-first over the
+/// boot value; a closed gate skips the tick without error (like the schedule
+/// gate below it), silently so a parked poller does not log every interval.
+fn register_gated_with(
+    feed_poll_seconds: u64,
+    action: JobAction,
+    guild: String,
+    gate: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Option<Job> {
+    let gated: JobAction = Arc::new(move || {
+        let inner = action.clone();
+        let gate = gate.clone();
+        Box::pin(async move {
+            if !gate() {
+                return Ok(());
+            }
+            inner().await
+        })
+    });
+    scheduled_job_live(feed_poll_seconds, gated, guild).ok()
 }
 
 #[derive(Default)]
@@ -343,6 +434,20 @@ async fn poll_relay(
     feed: &FeedRelay,
     fetch: &dyn FeedFetch,
 ) -> Result<(), ErrorClass> {
+    // A paused or removed relay stays silent even when this pass polled a
+    // stale enabled snapshot: re-read live lifecycle state before any fetch,
+    // recovery, high-water or audit write. Claim admission revalidates too,
+    // so a fetch admitted before a racing pause still cannot post after it.
+    let live: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
+            .bind(&feed.guild_id)
+            .bind(&feed.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+    if live != Some(true) {
+        return Ok(());
+    }
     let mut error = None;
     let mut stats = PollStats::default();
     let mut recovery = RecoveryBudget {
@@ -675,3 +780,7 @@ async fn audit(
 #[cfg(test)]
 #[path = "feed_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "feed_jobs_poison_acceptance.rs"]
+mod schedule_poison_acceptance;

@@ -1,7 +1,12 @@
 //! SQLx migration runner with an explicit staging/production target.
 //!
-//! Applies this crate's embedded migrations through the same SQLx migrator the
-//! gateway used before it went DML-only, with ledger `public._sqlx_migrations`.
+//! Applies two independent chains, each with its own ledger: this crate's
+//! embedded migrations (ledger `public._sqlx_migrations`) and the store
+//! migrations from [`two_bot_store`] (ledger `public._two_bot_migrations`,
+//! the chain the DML-only gateway needs at boot but nothing applied). Each
+//! chain is planned, applied and verified separately with its own pending
+//! list and plan-binding hash, so a drifted store ledger refuses exactly
+//! like a drifted cutover ledger.
 //! Every pooled connection runs `SET ROLE` in `after_connect` and verifies
 //! `current_user`: plan connections assume the read-only [`READ_ONLY_ROLE`]
 //! group (physically incapable of DDL), while apply connections assume the
@@ -19,7 +24,7 @@
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -27,10 +32,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha384};
 use sqlx::{
     migrate::Migrator,
-    postgres::{PgConnectOptions, PgConnection, PgPoolOptions},
+    postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgRow},
     Executor, PgPool, Row,
 };
 use two_bot_core::database_tls::{self, TlsPolicy};
+
+use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
@@ -82,6 +89,50 @@ const AUDIT_MEMBERSHIP_SQL: &str = "SELECT e.login, (r.oid IS NOT NULL) AS login
      GROUP BY e.login, r.oid ORDER BY e.login";
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// Which migration chain a ledger operation targets. Each chain has its own
+/// embedded source and its own bookkeeping table; the two never share rows,
+/// so a same-version number in the other chain can never trip a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chain {
+    Cutover,
+    Store,
+}
+
+impl Chain {
+    /// Bookkeeping table for this chain. The store table name is the store
+    /// crate's own constant, so the runner can never drift from the runtime.
+    pub fn table(self) -> &'static str {
+        match self {
+            Self::Cutover => "_sqlx_migrations",
+            Self::Store => two_bot_store::TABLE_NAME,
+        }
+    }
+
+    /// Embedded migrations for this chain. The store set is cloned out of the
+    /// store crate (the single source of truth) and pointed at its own
+    /// ledger; the bot-range guard mirrors `two_bot_store::migrate` so an
+    /// out-of-range store version refuses here too, before any DDL.
+    pub fn migrator(self) -> Result<Migrator, String> {
+        match self {
+            Self::Cutover => Ok(Migrator::with_migrations(
+                MIGRATOR.iter().cloned().collect(),
+            )),
+            Self::Store => {
+                if two_bot_store::MIGRATOR
+                    .iter()
+                    .any(|m| !(1..=999).contains(&m.version))
+                {
+                    return Err("store migrations must use versions 0001-0999".to_owned());
+                }
+                let mut migrator =
+                    Migrator::with_migrations(two_bot_store::MIGRATOR.iter().cloned().collect());
+                migrator.dangerous_set_table_name(two_bot_store::TABLE_NAME);
+                Ok(migrator)
+            }
+        }
+    }
+}
 
 /// Explicit migration target. The CLI requires `--target staging|production`;
 /// there is no default. Staging keeps its bindings and production-substring
@@ -141,6 +192,22 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, RunError> {
     Err(RunError::Refused(message.into()))
 }
 
+fn with_cutover_evidence(
+    error: RunError,
+    cutover_after: &[LedgerRow],
+    cutover_applied: usize,
+) -> RunError {
+    match error {
+        RunError::Failed(message, evidence) => {
+            let mut evidence = evidence.as_object().cloned().unwrap_or_default();
+            evidence.insert("ledger_after".to_owned(), ledger_json(cutover_after));
+            evidence.insert("applied_count".to_owned(), json!(cutover_applied));
+            RunError::Failed(message, Value::Object(evidence))
+        }
+        RunError::Refused(message) => RunError::Refused(message),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Request {
     pub url: Option<String>,
@@ -148,11 +215,13 @@ pub struct Request {
     pub source_sha: String,
     pub expected_host: String,
     pub expected_database: String,
-    /// Pinned PlanetScale branch id (non-secret workflow input). Empty means
-    /// no pin (Neon and test hosts). Required when the pinned host is a
-    /// `*.psdb.cloud` endpoint: PlanetScale routes by the username's
-    /// `{role}.{branch_id}` suffix while every branch shares `postgres` as
-    /// the database name, so host+database alone cannot fix the branch.
+    /// Pinned PlanetScale branch id (non-secret workflow input:
+    /// `--staging-branch-id` on staging, `--production-branch-id` on
+    /// production). Empty means no pin (Neon and test hosts). Required when
+    /// the pinned host is a `*.psdb.cloud` endpoint: PlanetScale routes by
+    /// the username's `{role}.{branch_id}` suffix while every branch shares
+    /// `postgres` as the database name, so host+database alone cannot fix
+    /// the branch.
     pub expected_branch_id: String,
     pub recovery_evidence_ref: String,
     pub acl_plan_ref: String,
@@ -160,10 +229,18 @@ pub struct Request {
     /// Raw `expected_pending` workflow input (ascending, comma-separated
     /// versions). Required for apply; ignored for plan.
     pub expected_pending: Option<String>,
+    /// Raw `expected_store_pending` workflow input for the store chain
+    /// (own ledger, own pending list). Required for apply; ignored for plan.
+    pub expected_store_pending: Option<String>,
     /// Plan-bound apply identity: the SHA-256 of the plan job's uploaded
     /// `staging-migrate-manifest.json` and the run that produced it. Both are
     /// required for apply; both are ignored for plan.
     pub plan_manifest_sha256: Option<String>,
+    /// The store chain's own binding hash, computed over the same source SHA
+    /// plus the store pending list and store migration table. Required for
+    /// apply; ignored for plan. The cutover hash above is unchanged, so
+    /// existing claim-script projections keep matching byte-for-byte.
+    pub store_plan_manifest_sha256: Option<String>,
     pub plan_run_id: Option<String>,
     /// Provenance anchor (TOG-15157): path to the producing plan run's
     /// downloaded `staging-migrate-manifest.json` (the workflow fetches it
@@ -236,7 +313,10 @@ fn check_binding_shape(
             .next()
             .is_some_and(|suffix| suffix.eq_ignore_ascii_case(want));
         if !matches {
-            return refuse("binding branch does not match the pinned staging branch");
+            return refuse(format!(
+                "binding branch does not match the pinned {} branch",
+                req.target.as_str()
+            ));
         }
     }
     Ok(())
@@ -320,6 +400,33 @@ pub fn check_plan_binding(
     Ok(computed)
 }
 
+/// Store chain plan binding, checked before any DDL.
+///
+/// Mirrors [`check_plan_binding`] over the store pending list and store
+/// migration table, bound to `store_plan_manifest_sha256`. The cutover hash
+/// is untouched, so existing claim-script projections keep matching.
+pub fn check_store_binding(
+    req: &Request,
+    pending: &[i64],
+    migrator: &Migrator,
+) -> Result<String, RunError> {
+    let computed = manifest_hash(&req.source_sha, pending, migrator);
+    if req.apply {
+        let want = req
+            .store_plan_manifest_sha256
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if computed != want {
+            return refuse(
+                "store_plan_manifest_sha256 does not match the computed store plan manifest",
+            );
+        }
+    }
+    Ok(computed)
+}
+
 /// Provenance of the bound hash, checked after manifest computation but
 /// before any DDL (TOG-15157 gap 2).
 ///
@@ -334,7 +441,27 @@ pub fn check_plan_binding(
 /// refuse: verification that is impossible is verification that failed.
 /// For plan the check is a no-op (plan produces the manifest; it binds
 /// nothing).
-pub fn check_plan_provenance(req: &Request, computed_hash: &str) -> Result<(), RunError> {
+fn produced_hash(artifact: &Value, run_id: &str, field: &str) -> Result<String, RunError> {
+    let produced = artifact
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if produced.is_empty() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} carries no \
+             {field}; the bound hash is unproven, refusing"
+        ));
+    }
+    Ok(produced)
+}
+
+pub fn check_plan_provenance(
+    req: &Request,
+    computed_hash: &str,
+    computed_store_hash: &str,
+) -> Result<(), RunError> {
     if !req.apply {
         return Ok(());
     }
@@ -346,34 +473,43 @@ pub fn check_plan_provenance(req: &Request, computed_hash: &str) -> Result<(), R
              downloaded staging-migrate-manifest.json",
         );
     }
-    let bytes = std::fs::read(path).map_err(|_| {
-        RunError::Refused(format!(
-            "cannot read the manifest the workflow fetched from producing plan_run_id {run_id} \
-             at {path}; plan_run_id verification is impossible, refusing"
-        ))
-    })?;
+    let bytes = match read_bytes_capped(path) {
+        Ok(bytes) => bytes,
+        Err(IntakeReadError::OverCap) => {
+            return refuse(format!(
+                "the manifest the workflow fetched from producing plan_run_id {run_id} \
+                 at {path} exceeds {INTAKE_CAP_LABEL}; plan_manifest_sha256 provenance is \
+                 unprovable, refusing"
+            ));
+        }
+        Err(IntakeReadError::Unreadable(_)) => {
+            return refuse(format!(
+                "cannot read the manifest the workflow fetched from producing plan_run_id {run_id} \
+                 at {path}; plan_run_id verification is impossible, refusing"
+            ));
+        }
+    };
     let artifact: Value = serde_json::from_slice(&bytes).map_err(|_| {
         RunError::Refused(format!(
             "the manifest fetched from producing plan_run_id {run_id} at {path} is not valid \
              JSON; plan_manifest_sha256 provenance is unprovable, refusing"
         ))
     })?;
-    let produced = artifact
-        .get("plan_manifest_sha256")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if produced.is_empty() {
-        return refuse(format!(
-            "the manifest fetched from producing plan_run_id {run_id} carries no \
-             plan_manifest_sha256; the bound hash is unproven, refusing"
-        ));
-    }
+    let produced = produced_hash(&artifact, run_id, "plan_manifest_sha256")?;
     if produced != computed_hash.trim().to_ascii_lowercase() {
         return refuse(format!(
             "the manifest fetched from producing plan_run_id {run_id} does not match \
              plan_manifest_sha256; apply is not bound to that plan run, refusing"
+        ));
+    }
+    // The store chain binds through the same producing manifest: its embedded
+    // store hash must equal the recomputed store projection, or the apply is
+    // not bound to that plan run's store chain.
+    let produced_store = produced_hash(&artifact, run_id, "store_plan_manifest_sha256")?;
+    if produced_store != computed_store_hash.trim().to_ascii_lowercase() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} does not match \
+             store_plan_manifest_sha256; apply is not bound to that plan run, refusing"
         ));
     }
     Ok(())
@@ -448,17 +584,27 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
     // PlanetScale branch pin: every branch shares `postgres` as the database
     // name and routes by the username's `{role}.{branch_id}` suffix, so the
     // host+database pin alone cannot fix the branch. A `*.psdb.cloud` pin
-    // requires the non-secret branch id; other hosts accept an empty pin.
-    // (Production takes no branch pin yet; its fail-closed refusal lives
-    // after the pooled-shape check below so pooled bindings keep the pooled
-    // refusal in both gates, mirroring `verify_target`.)
+    // requires the non-secret branch id (`--staging-branch-id` on staging,
+    // `--production-branch-id` on production); other hosts accept an empty
+    // pin. The missing-pin refusal lives after the pooled-shape check above
+    // so pooled bindings keep the pooled refusal in both gates, mirroring
+    // `verify_target`; the production refusal must not name
+    // `--staging-branch-id`, which the production target rejects.
     let branch = req.expected_branch_id.trim();
     if !branch.is_empty() && !branch_id_valid(branch) {
-        return refuse("staging branch id is not a bare branch pin");
+        return refuse(format!(
+            "{} branch id is not a bare branch pin",
+            req.target.as_str()
+        ));
     }
-    if branch.is_empty() && req.target == Target::Staging && is_planetscale_host(&req.expected_host)
-    {
-        return refuse("PlanetScale hosts require --staging-branch-id");
+    if branch.is_empty() && is_planetscale_host(&req.expected_host) {
+        return match req.target {
+            Target::Staging => refuse("PlanetScale hosts require --staging-branch-id"),
+            Target::Production => refuse(
+                "production PlanetScale dispatch needs a production branch pin \
+                 (--production-branch-id)",
+            ),
+        };
     }
     match &req.expected_pending {
         Some(raw) => {
@@ -466,6 +612,15 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
         }
         None if req.apply => {
             return refuse("apply requires expected_pending from the reviewed plan");
+        }
+        None => {}
+    }
+    match &req.expected_store_pending {
+        Some(raw) => {
+            parse_expected_pending(raw).map_err(RunError::Refused)?;
+        }
+        None if req.apply => {
+            return refuse("apply requires expected_store_pending from the reviewed plan");
         }
         None => {}
     }
@@ -491,6 +646,20 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             );
         }
         _ => {}
+    }
+    // The store chain binds separately: its hash covers the same source SHA
+    // plus the store pending list and store migration table.
+    match &req.store_plan_manifest_sha256 {
+        Some(hash) => {
+            let hash = hash.trim().to_ascii_lowercase();
+            if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return refuse("store_plan_manifest_sha256 must be a 64-char lowercase hex digest");
+            }
+        }
+        None if req.apply => {
+            return refuse("apply requires store_plan_manifest_sha256 from the reviewed plan");
+        }
+        None => {}
     }
     // Provenance anchor: apply must also name the producing run's downloaded
     // manifest so `run_on_pool` can prove the bound hash came from that run.
@@ -531,20 +700,6 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
         if let Ok(options) = two_bot_core::database_url::connect_options(url) {
             check_binding_shape(req, &options)?;
         }
-    }
-    // The production target takes no branch pin yet, so a production dispatch
-    // aimed at a `*.psdb.cloud` host fails closed here until the production
-    // branch-pin follow-up lands. After the pooled-shape check so pooled
-    // bindings keep the pooled refusal, mirroring `verify_target`; the
-    // message must not name `--staging-branch-id`, which production rejects.
-    if req.target == Target::Production
-        && req.expected_branch_id.trim().is_empty()
-        && is_planetscale_host(&req.expected_host)
-    {
-        return refuse(
-            "production PlanetScale dispatch needs a production branch pin, \
-             which is not supported yet; refusing",
-        );
     }
     Ok(())
 }
@@ -637,15 +792,14 @@ fn verify_target(req: &Request, tls: TlsPolicy) -> Result<PgConnectOptions, RunE
     }
     // Fail-closed PlanetScale pin: a `*.psdb.cloud` binding without a pinned
     // branch id refuses even when host+database match, so a dispatch that
-    // forgets the branch pin cannot reach an unpinned branch. Production
-    // takes no branch pin yet and fails closed here until the production
-    // branch-pin follow-up lands; its refusal must not name
-    // `--staging-branch-id`, which the production target rejects.
+    // forgets the branch pin cannot reach an unpinned branch. The production
+    // refusal must not name `--staging-branch-id`, which the production
+    // target rejects.
     if req.expected_branch_id.trim().is_empty() && is_planetscale_host(&host) {
         if req.target == Target::Production {
             return refuse(
-                "production PlanetScale dispatch needs a production branch pin, \
-                 which is not supported yet; refusing",
+                "production PlanetScale dispatch needs a production branch pin \
+                 (--production-branch-id)",
             );
         }
         return refuse("PlanetScale hosts require --staging-branch-id");
@@ -729,6 +883,17 @@ async fn refuse_migrator_member_plan_login(conn: &mut PgConnection) -> Result<()
     Ok(())
 }
 
+fn ledger_rows(rows: &[PgRow]) -> Vec<LedgerRow> {
+    rows.iter()
+        .map(|r| LedgerRow {
+            version: r.get("version"),
+            description: r.get("description"),
+            success: r.get("success"),
+            checksum_hex: r.get("checksum"),
+        })
+        .collect()
+}
+
 async fn read_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Error> {
     let exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
@@ -743,15 +908,52 @@ async fn read_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Er
     )
     .fetch_all(&mut *conn)
     .await?;
-    Ok(rows
-        .iter()
-        .map(|r| LedgerRow {
-            version: r.get("version"),
-            description: r.get("description"),
-            success: r.get("success"),
-            checksum_hex: r.get("checksum"),
-        })
-        .collect())
+    Ok(ledger_rows(&rows))
+}
+
+/// Read the store chain's own ledger. Mirrors [`read_ledger`] with the store
+/// table literal; the two queries stay separate fixed strings so no table
+/// name is ever interpolated from input.
+async fn read_store_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Error> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public._two_bot_migrations') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT version, description, success, encode(checksum, 'hex') AS checksum \
+         FROM public._two_bot_migrations ORDER BY version",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(ledger_rows(&rows))
+}
+
+/// `Err` with the terminal failure kind when no attempt could read, so the
+/// caller records [`LEDGER_UNKNOWN`] instead of an empty ledger. Reads one
+/// chain's ledger; the chain selects which fixed query runs.
+async fn read_ledger_after_run(
+    pool: &PgPool,
+    chain: Chain,
+) -> Result<Vec<LedgerRow>, ReadAfterApply> {
+    retry_transient(
+        move || async move {
+            let mut conn = pool
+                .acquire()
+                .await
+                .map_err(|_| ReadAfterApply::PoolAcquireFailed)?;
+            match chain {
+                Chain::Cutover => read_ledger(&mut conn).await,
+                Chain::Store => read_store_ledger(&mut conn).await,
+            }
+            .map_err(|_| ReadAfterApply::LedgerQueryFailed)
+        },
+        POST_APPLY_READ_ATTEMPTS,
+        Duration::from_secs(POST_APPLY_READ_RETRY_DELAY_SECS),
+    )
+    .await
 }
 
 fn ledger_json(rows: &[LedgerRow]) -> Value {
@@ -769,11 +971,56 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
 /// empty list: `[]` reads as "nothing applied".
 const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
 
-/// `None` when no connection or the read fails, so the caller records
-/// [`LEDGER_UNKNOWN`] instead of an empty ledger.
-async fn read_ledger_after_run(pool: &PgPool) -> Option<Vec<LedgerRow>> {
-    let mut conn = pool.acquire().await.ok()?;
-    read_ledger(&mut conn).await.ok()
+/// Post-apply ledger read attempts: the pre-apply read uses the identical
+/// query as the identical role, so a post-apply read failure is transient
+/// connection state (a pool checkout timing out against a saturated
+/// database), not grants or migration content. Retry briefly before reporting
+/// the ledger unreadable; a permanently unreadable ledger still fails closed.
+pub const POST_APPLY_READ_ATTEMPTS: u32 = 5;
+pub const POST_APPLY_READ_RETRY_DELAY_SECS: u64 = 2;
+
+/// Why the post-apply ledger read failed. Fixed strings only; never a URL,
+/// host, login or error body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAfterApply {
+    PoolAcquireFailed,
+    LedgerQueryFailed,
+}
+
+impl ReadAfterApply {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolAcquireFailed => "pool_acquire_failed",
+            Self::LedgerQueryFailed => "ledger_query_failed",
+        }
+    }
+}
+
+/// Run a fallible post-apply read `attempts` times (at least once), sleeping
+/// `delay` between attempts. Returns the first success or the terminal
+/// failure kind.
+async fn retry_transient<F, Fut, T>(
+    mut op: F,
+    attempts: u32,
+    delay: Duration,
+) -> Result<T, ReadAfterApply>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ReadAfterApply>>,
+{
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(kind) => {
+                if attempt + 1 == attempts {
+                    return Err(kind);
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    unreachable!("attempts is at least 1");
 }
 
 fn ledger_or_unknown(rows: Option<&[LedgerRow]>) -> Value {
@@ -838,6 +1085,27 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     } else {
         json!({"successful_rows": 0, "max_version": Value::Null, "failed_rows": 0})
     };
+    // The store chain's own ledger, same readout: a missing table reports
+    // null/zero so a pre-bootstrap plan still prints.
+    let store_owner: Option<String> = sqlx::query_scalar(
+        "SELECT r.rolname::text FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+         WHERE c.relnamespace = 'public'::regnamespace AND c.relname = '_two_bot_migrations'",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| "audit store ledger owner read failed")?;
+    let store_counts = if store_owner.is_some() {
+        let row: (i64, Option<i64>, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE success), max(version) FILTER (WHERE success), \
+             count(*) FILTER (WHERE NOT success) FROM public._two_bot_migrations",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "audit store ledger counts read failed")?;
+        json!({"successful_rows": row.0, "max_version": row.1, "failed_rows": row.2})
+    } else {
+        json!({"successful_rows": 0, "max_version": Value::Null, "failed_rows": 0})
+    };
     let memberships: Vec<(String, bool, Vec<String>, bool, bool)> =
         sqlx::query_as(AUDIT_MEMBERSHIP_SQL)
             .fetch_all(&mut *tx)
@@ -848,6 +1116,29 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| "audit verify read failed")?;
+    // Connection pressure: staging once refused all logins at 25/25
+    // connections with no prior signal. Both counters are readable by any
+    // login and live in pg_catalog, so they survive the search_path pin.
+    // Count real client backends from pg_stat_database: every login can
+    // read numbackends in full, while pg_stat_activity.backend_type is NULL
+    // for other roles' sessions unless the reader holds pg_read_all_stats
+    // (the plan login does not), which would hide exactly the sessions that
+    // saturate the database. Aux processes are not backends and never
+    // appear in numbackends.
+    let connections_used: i64 = sqlx::query_scalar(CONNECTION_COUNT_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "audit connection count read failed")?;
+    let max_connections: i64 =
+        sqlx::query_scalar("SELECT current_setting('max_connections')::bigint")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| "audit max_connections read failed")?;
+    let reserved_connections: i64 =
+        sqlx::query_scalar("SELECT current_setting('superuser_reserved_connections')::bigint")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| "audit reserved_connections read failed")?;
     tx.rollback().await.map_err(|_| "audit rollback failed")?;
     let mut membership_entries = Vec::with_capacity(memberships.len());
     for (login, exists, member_of, of_migrator, of_ro) in &memberships {
@@ -862,11 +1153,161 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     Ok(json!({
         "ledger_owner": owner,
         "ledger_counts": counts,
+        "store_ledger_owner": store_owner,
+        "store_ledger_counts": store_counts,
         "memberships": membership_entries,
         "verify_findings": findings,
         "matrix_sha256": hex::encode(Sha256::digest(AUDIT_MATRIX.as_bytes())),
         "verify_sha256": hex::encode(Sha256::digest(AUDIT_VERIFY.as_bytes())),
+        "connection_usage": {
+            "used": connections_used,
+            "max_connections": max_connections,
+            "reserved_connections": reserved_connections,
+            "effective_max_connections": effective_max_connections(max_connections, reserved_connections),
+            "pct_full": connections_used as f64 / effective_max_connections(max_connections, reserved_connections).max(1) as f64 * 100.0,
+        },
     }))
+}
+
+/// Client-backend count from `pg_stat_database`: aux processes (walwriter,
+/// checkpointer, background writer, autovacuum and replication launchers)
+/// are not backends, so `numbackends` excludes them without the
+/// `backend_type` filter — whose value is NULL for other roles' sessions
+/// unless the reader holds `pg_read_all_stats`, which the plan login does
+/// not. Every login reads this in full, so the 80% warning can fire when
+/// the runtime role's sessions saturate the database.
+pub const CONNECTION_COUNT_SQL: &str =
+    "SELECT coalesce(sum(numbackends), 0)::bigint FROM pg_stat_database";
+
+/// Non-superuser login ceiling: `max_connections` minus
+/// `superuser_reserved_connections`. Degenerate inputs floor at 1 so the
+/// warning ratio never divides by zero.
+pub fn effective_max_connections(max_connections: i64, reserved_connections: i64) -> i64 {
+    (max_connections.saturating_sub(reserved_connections.max(0))).max(1)
+}
+
+/// Warn threshold for staging connection pressure: staging once refused all
+/// logins at 25/25 connections with no prior signal. Strictly above 80%
+/// warns; degenerate inputs never warn. The line is a GitHub workflow
+/// annotation, so the plan run surfaces it without failing the plan manifest
+/// the apply binds to.
+pub const CONNECTION_WARN_PCT: f64 = 80.0;
+
+/// `Some` annotation line when `used` exceeds [`CONNECTION_WARN_PCT`] of
+/// `max`, else `None`. Counts only; never a URL, host or login.
+pub fn connection_warning(used: i64, max: i64) -> Option<String> {
+    if max <= 0 || used < 0 {
+        return None;
+    }
+    let pct = used as f64 / max as f64 * 100.0;
+    if pct > CONNECTION_WARN_PCT {
+        Some(format!(
+            "::warning::staging database connections above 80% of max_connections: \
+             {used}/{max} ({pct:.1}%)"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Read the plan audit's `connection_usage` back into [`connection_warning`].
+/// Prefers the non-superuser `effective_max_connections` ceiling when present
+/// (older manifests carry only `max_connections`). A failed or field-less
+/// readout warns about nothing.
+fn connection_warning_from_audit(audit: &Value) -> Option<String> {
+    let usage = audit.get("connection_usage")?;
+    let used = usage.get("used")?.as_i64()?;
+    let max = usage.get("max_connections")?.as_i64()?;
+    let reserved = usage.get("reserved_connections").and_then(Value::as_i64);
+    let ceiling = reserved
+        .map(|r| effective_max_connections(max, r))
+        .unwrap_or(max);
+    connection_warning(used, ceiling)
+}
+
+/// Shared prefix between the role-check producer (`connect`) and the
+/// `Protocol` matcher below: rewording one side rewords both, so the
+/// `role-verify` branch cannot silently stop matching.
+const ROLE_NOT_ACTIVE_PREFIX: &str = "expected role ";
+
+/// Bounded, non-secret cause class for a `connect` failure.
+///
+/// `connect` refuses before any DDL with one fixed message; without the cause
+/// every failure reads identically, forcing host forensics to guess transient
+/// connection loss from real membership loss. The cause carries only the error
+/// kind and, for database errors, the 5-character SQLSTATE code (fixed server
+/// vocabulary, e.g. `42501`): never the message, severity, statement, URL,
+/// host or login. Fail-closed is unchanged: the caller still refuses, only
+/// with a triageable `[cause=...]` suffix.
+///
+/// Reachability through the pool path: sqlx retries `after_connect` failures,
+/// refused ports and transient database errors until the acquire deadline,
+/// then returns only `PoolTimedOut` (sqlx-core 0.9.0 `pool/inner.rs`). `connect`
+/// therefore records the last `after_connect` cause (`set-role-denied`,
+/// `role-verify`) in a shared slot and prefers it over `pool-timeout`; a dead
+/// host or an exhausted server still refuses as `pool-timeout`, while startup
+/// auth (`28xxx`), TCP timeouts and other immediate errors classify directly.
+fn connect_cause(error: &sqlx::Error) -> String {
+    match error {
+        sqlx::Error::Database(db) => {
+            let code = db.code().map(|c| c.into_owned()).unwrap_or_default();
+            match code.as_str() {
+                // `insufficient_privilege` from `SET ROLE`: the login is not a
+                // member of the role. Real binding/membership loss.
+                "42501" => "set-role-denied:42501".to_owned(),
+                // Authentication failures: wrong or rotated credential, not a
+                // network or membership event.
+                "28000" | "28P01" => format!("auth:{code}"),
+                _ if db.is_transient_in_connect_phase() => {
+                    format!("connect-transient:{code}")
+                }
+                _ if !code.is_empty() => format!("database:{code}"),
+                _ => "database:unknown".to_owned(),
+            }
+        }
+        sqlx::Error::Io(io) => match io.kind() {
+            std::io::ErrorKind::TimedOut => "connect-timeout".to_owned(),
+            std::io::ErrorKind::ConnectionRefused => "connect-refused".to_owned(),
+            std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected => "connect-reset".to_owned(),
+            std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::AddrInUse
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable => "connect-unreachable".to_owned(),
+            std::io::ErrorKind::PermissionDenied => "connect-permission".to_owned(),
+            _ => "io-error".to_owned(),
+        },
+        // Pool checkout timed out (bounded acquire timeout): the host accepted
+        // connections but none became available. Transient, and distinct from
+        // a TCP connect timeout.
+        sqlx::Error::PoolTimedOut => "pool-timeout".to_owned(),
+        sqlx::Error::PoolClosed => "pool-closed".to_owned(),
+        sqlx::Error::Tls(_) => "tls".to_owned(),
+        // Our own post-connect check (`current_user != role`): `SET ROLE`
+        // succeeded syntactically but the role is not active. Real, fail-closed.
+        sqlx::Error::Protocol(message) if message.starts_with(ROLE_NOT_ACTIVE_PREFIX) => {
+            "role-verify".to_owned()
+        }
+        _ => "connect-error".to_owned(),
+    }
+}
+
+/// Fail-closed refusal for `connect`, with the triageable cause suffix.
+/// `role` is one of the two fixed group constants, never input.
+fn connect_refusal(role: &str, error: &sqlx::Error) -> RunError {
+    connect_refusal_with_cause(role, &connect_cause(error))
+}
+
+/// [`connect_refusal`] for a cause captured earlier (the `after_connect` slot):
+/// same fixed message, same fail-closed shape, no error text.
+fn connect_refusal_with_cause(role: &str, cause: &str) -> RunError {
+    RunError::Refused(format!(
+        "could not connect and SET ROLE {role} (missing binding or membership) [cause={cause}]"
+    ))
 }
 
 async fn connect(
@@ -874,37 +1315,60 @@ async fn connect(
     role: &'static str,
     verified: Arc<AtomicUsize>,
 ) -> Result<PgPool, RunError> {
+    // sqlx retries `after_connect` failures until the acquire deadline, then
+    // surfaces only `PoolTimedOut`: without this slot a real `SET ROLE`
+    // denial (42501) and a dead host refuse identically. The slot keeps the
+    // last `after_connect` cause so the refusal below reports what failed.
+    let after_connect_cause: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&after_connect_cause);
     PgPoolOptions::new()
         .max_connections(TARGET_POOL_MAX)
         // Bound pool checkout, not the duration of migration statements.
         .acquire_timeout(Duration::from_secs(TARGET_ACQUIRE_TIMEOUT_SECS))
         .after_connect(move |conn, _meta| {
             let verified = Arc::clone(&verified);
+            let slot = Arc::clone(&slot);
             Box::pin(async move {
-                // Per-connection: a separate psql SET ROLE cannot activate this.
-                // `role` is one of the two fixed group constants, never input.
-                sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
-                    .execute(&mut *conn)
-                    .await?;
-                conn.execute("SET search_path = public").await?;
-                let current: String = sqlx::query_scalar("SELECT current_user::text")
-                    .fetch_one(&mut *conn)
-                    .await?;
-                if current != role {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "expected role {role} is not active"
-                    )));
+                let outcome: Result<(), sqlx::Error> = async {
+                    // Per-connection: a separate psql SET ROLE cannot activate this.
+                    // `role` is one of the two fixed group constants, never input.
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    conn.execute("SET search_path = public").await?;
+                    let current: String = sqlx::query_scalar("SELECT current_user::text")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    if current != role {
+                        return Err(sqlx::Error::Protocol(format!(
+                            "{ROLE_NOT_ACTIVE_PREFIX}{role} is not active"
+                        )));
+                    }
+                    verified.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
                 }
-                verified.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                .await;
+                if let Err(error) = &outcome {
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some(connect_cause(error));
+                    }
+                }
+                outcome
             })
         })
         .connect_with(options)
         .await
-        .map_err(|_| {
-            RunError::Refused(format!(
-                "could not connect and SET ROLE {role} (missing binding or membership)"
-            ))
+        .map_err(|error| {
+            // Prefer the recorded `after_connect` cause: `PoolTimedOut` after
+            // a refused `SET ROLE` means membership loss, not a slow host.
+            if matches!(error, sqlx::Error::PoolTimedOut) {
+                if let Ok(guard) = after_connect_cause.lock() {
+                    if let Some(recorded) = guard.as_deref() {
+                        return connect_refusal_with_cause(role, recorded);
+                    }
+                }
+            }
+            connect_refusal(role, &error)
         })
 }
 
@@ -922,28 +1386,114 @@ pub async fn run(req: &Request) -> Result<Value, RunError> {
     result
 }
 
+/// Apply one chain's pending migrations and verify its ledger. Runs only
+/// when `pending` is non-empty; returns the post-apply ledger and the
+/// applied count. Every failure carries that chain's ledger evidence under
+/// that chain's keys, so cutover and store evidence never mix.
+async fn apply_chain(
+    pool: &PgPool,
+    chain: Chain,
+    migrator: &Migrator,
+    before: &[LedgerRow],
+) -> Result<(Vec<LedgerRow>, usize), RunError> {
+    let failed = |m: &str| RunError::Failed(m.to_owned(), Value::Null);
+    // Evidence key per chain; the owner queries below stay separate fixed
+    // literals (one per chain) so no table name is interpolated from input.
+    let ledger_key = match chain {
+        Chain::Cutover => "ledger_after",
+        Chain::Store => "ledger_store_after",
+    };
+    let outcome = migrator.run(pool).await;
+    let read_back = read_ledger_after_run(pool, chain).await;
+    if let Err(e) = outcome {
+        let mut evidence = serde_json::Map::with_capacity(2);
+        evidence.insert("error".to_owned(), json!(e.to_string()));
+        evidence.insert(
+            format!("{ledger_key}_failure"),
+            ledger_or_unknown(read_back.as_ref().ok().map(Vec::as_slice)),
+        );
+        return Err(RunError::Failed(
+            "migration execution failed".to_owned(),
+            Value::Object(evidence),
+        ));
+    }
+    let rows = match read_back {
+        Ok(rows) => rows,
+        Err(kind) => {
+            let mut evidence = serde_json::Map::with_capacity(2);
+            evidence.insert(ledger_key.to_owned(), json!(LEDGER_UNKNOWN));
+            evidence.insert(format!("{ledger_key}_error"), json!(kind.as_str()));
+            return Err(RunError::Failed(
+                "ledger unreadable after apply".to_owned(),
+                Value::Object(evidence),
+            ));
+        }
+    };
+    let applied = rows.len().saturating_sub(before.len());
+    let mut leftover_evidence = serde_json::Map::with_capacity(1);
+    leftover_evidence.insert(ledger_key.to_owned(), ledger_json(&rows));
+    let leftover = reconcile(&rows, migrator)
+        .map_err(|m| RunError::Failed(m, Value::Object(leftover_evidence.clone())))?;
+    if !leftover.is_empty() {
+        return Err(RunError::Failed(
+            "ledger incomplete after apply".to_owned(),
+            Value::Object(leftover_evidence),
+        ));
+    }
+    let owner: String = match chain {
+        Chain::Cutover => {
+            sqlx::query_scalar(
+                "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+                 WHERE oid = to_regclass('public._sqlx_migrations')",
+            )
+            .fetch_one(pool)
+            .await
+        }
+        Chain::Store => {
+            sqlx::query_scalar(
+                "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+                 WHERE oid = to_regclass('public._two_bot_migrations')",
+            )
+            .fetch_one(pool)
+            .await
+        }
+    }
+    .map_err(|_| failed("ledger owner check failed"))?;
+    if owner != MIGRATOR_ROLE {
+        return Err(failed("ledger is not owned by two_bot_migrator"));
+    }
+    Ok((rows, applied))
+}
+
 async fn run_on_pool(
     req: &Request,
     pool: &PgPool,
     verified: &AtomicUsize,
 ) -> Result<Value, RunError> {
     let failed = |m: &str| RunError::Failed(m.to_owned(), Value::Null);
+    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
+    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
     let mut conn = pool
         .acquire()
         .await
         .map_err(|_| failed("pool acquire failed"))?;
     // "RO only" is enforced, not just documented: a plan login that also holds
-    // the migrator group is refused before the ledger is read.
+    // the migrator group is refused before either ledger is read.
     if !req.apply {
         refuse_migrator_member_plan_login(&mut conn).await?;
     }
     let before = read_ledger(&mut conn)
         .await
         .map_err(|_| failed("ledger read failed"))?;
+    let store_before = read_store_ledger(&mut conn)
+        .await
+        .map_err(|_| failed("store ledger read failed"))?;
     drop(conn);
-    let pending = reconcile(&before, &MIGRATOR).map_err(RunError::Refused)?;
-    // Plan binding: apply runs only the exact pending list the reviewed plan
-    // showed. Validated in `validate_request`; compared here, before any DDL.
+    let pending = reconcile(&before, &cutover).map_err(RunError::Refused)?;
+    let store_pending = reconcile(&store_before, &store).map_err(RunError::Refused)?;
+    // Plan binding: apply runs only the exact pending lists the reviewed plan
+    // showed, one per chain. Validated in `validate_request`; compared here,
+    // before any DDL.
     let expected = match &req.expected_pending {
         Some(raw) => parse_expected_pending(raw).map_err(RunError::Refused)?,
         None => Vec::new(),
@@ -951,57 +1501,49 @@ async fn run_on_pool(
     if req.apply && expected != pending {
         return refuse("expected_pending does not match the computed pending list");
     }
-    let computed_hash = check_plan_binding(req, &pending, &MIGRATOR)?;
-    // Provenance follows exactness: the bound hash must additionally be the
-    // hash the named producing plan run uploaded. Both refuse before any DDL.
-    check_plan_provenance(req, &computed_hash)?;
+    let expected_store = match &req.expected_store_pending {
+        Some(raw) => parse_expected_pending(raw).map_err(RunError::Refused)?,
+        None => Vec::new(),
+    };
+    if req.apply && expected_store != store_pending {
+        return refuse("expected_store_pending does not match the computed store pending list");
+    }
+    let computed_hash = check_plan_binding(req, &pending, &cutover)?;
+    let computed_store_hash = check_store_binding(req, &store_pending, &store)?;
+    // Provenance follows exactness: each bound hash must additionally be the
+    // hash the named producing plan run uploaded. All refuse before any DDL.
+    check_plan_provenance(req, &computed_hash, &computed_store_hash)?;
 
     // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
-    // login is the migrator, not the read-only readout.
+    // login is the migrator, not the read-only readout. A saturated staging
+    // database warns on stderr (a workflow annotation) without failing the
+    // plan manifest the apply binds to.
     let audit = if req.apply {
         Value::Null
     } else {
-        read_audit(pool).await
+        let audit = read_audit(pool).await;
+        if let Some(line) = connection_warning_from_audit(&audit) {
+            eprintln!("{line}");
+        }
+        audit
     };
 
     let mut applied = 0usize;
     let mut after = before.clone();
-    if req.apply && !pending.is_empty() {
-        let outcome = MIGRATOR.run(pool).await;
-        let read_back = read_ledger_after_run(pool).await;
-        if let Err(e) = outcome {
-            let evidence = json!({"ledger_after_failure": ledger_or_unknown(read_back.as_deref()),
-                                  "error": e.to_string()});
-            return Err(RunError::Failed(
-                "migration execution failed".to_owned(),
-                evidence,
-            ));
+    let mut store_applied = 0usize;
+    let mut store_after = store_before.clone();
+    if req.apply {
+        if !pending.is_empty() {
+            let (rows, count) = apply_chain(pool, Chain::Cutover, &cutover, &before).await?;
+            after = rows;
+            applied = count;
         }
-        let Some(rows) = read_back else {
-            return Err(RunError::Failed(
-                "ledger unreadable after apply".to_owned(),
-                json!({"ledger_after": LEDGER_UNKNOWN}),
-            ));
-        };
-        after = rows;
-        applied = after.len().saturating_sub(before.len());
-        let leftover = reconcile(&after, &MIGRATOR)
-            .map_err(|m| RunError::Failed(m, json!({"ledger_after": ledger_json(&after)})))?;
-        if !leftover.is_empty() {
-            return Err(RunError::Failed(
-                "ledger incomplete after apply".to_owned(),
-                json!({"ledger_after": ledger_json(&after)}),
-            ));
-        }
-        let owner: String = sqlx::query_scalar(
-            "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
-             WHERE oid = to_regclass('public._sqlx_migrations')",
-        )
-        .fetch_one(pool)
-        .await
-        .map_err(|_| failed("ledger owner check failed"))?;
-        if owner != MIGRATOR_ROLE {
-            return Err(failed("ledger is not owned by two_bot_migrator"));
+        if !store_pending.is_empty() {
+            let (rows, count) = apply_chain(pool, Chain::Store, &store, &store_before)
+                .await
+                .map_err(|error| with_cutover_evidence(error, &after, applied))?;
+            store_after = rows;
+            store_applied = count;
         }
     }
     Ok(json!({
@@ -1017,21 +1559,28 @@ async fn run_on_pool(
         "acl_plan_ref": req.acl_plan_ref,
         "role": expected_role(req),
         "role_verified_connections": verified.load(Ordering::SeqCst),
-        "source_migrations": source_manifest(&MIGRATOR),
+        "source_migrations": source_manifest(&cutover),
         "ledger_before": ledger_json(&before),
         "ledger_after": ledger_json(&after),
         "pending_before": pending,
         "expected_pending": expected,
         "plan_manifest_sha256": computed_hash,
+        "source_store_migrations": source_manifest(&store),
+        "ledger_store_before": ledger_json(&store_before),
+        "ledger_store_after": ledger_json(&store_after),
+        "pending_store_before": store_pending,
+        "expected_store_pending": expected_store,
+        "store_plan_manifest_sha256": computed_store_hash,
         "plan_run_id": req.plan_run_id.clone().unwrap_or_default(),
         // True only for apply, and only because `check_plan_provenance`
-        // passed above: reaching this manifest means the bound hash was
+        // passed above: reaching this manifest means both bound hashes were
         // proven to come from the named producing plan run.
         "plan_provenance_verified": req.apply,
         "applied_count": applied,
-        // Plan-only readout (null for apply): ledger owner and counts,
+        "applied_store_count": store_applied,
+        // Plan-only readout (null for apply): ledger owners and counts,
         // four-login memberships and verifier findings from one READ ONLY
-        // transaction. Not part of `plan_manifest_sha256`.
+        // transaction. Not part of either plan hash.
         "audit": audit,
     }))
 }
@@ -1050,6 +1599,23 @@ mod tests {
                 checksum_hex: hex::encode(&m.checksum),
             })
             .collect()
+    }
+
+    #[test]
+    fn store_failure_retains_committed_cutover_evidence() {
+        let cutover = rows();
+        let failure = RunError::Failed(
+            "store migration failed".to_owned(),
+            json!({"error": "store failure", "ledger_store_after_failure": LEDGER_UNKNOWN}),
+        );
+
+        let RunError::Failed(_, evidence) = with_cutover_evidence(failure, &cutover, cutover.len())
+        else {
+            panic!("failure should stay a failure");
+        };
+        assert_eq!(evidence["ledger_after"], ledger_json(&cutover));
+        assert_eq!(evidence["applied_count"], cutover.len());
+        assert_eq!(evidence["ledger_store_after_failure"], LEDGER_UNKNOWN);
     }
 
     #[test]
@@ -1085,6 +1651,36 @@ mod tests {
         assert_eq!(
             fixture["plan_manifest_sha256"],
             manifest_hash(&"a".repeat(40), &pending, &migrator)
+        );
+        // The store half of the same fixture, pinned the same way: the
+        // Python claim projection must match this Rust projection byte for
+        // byte, so a drift in either breaks the test here, not in review.
+        let store_fixture = Migrator::with_migrations(vec![
+            Migration::new(
+                400,
+                "store first fixture".into(),
+                MigrationType::Simple,
+                "SELECT 3;".into_sql_str(),
+                false,
+            ),
+            Migration::new(
+                9_007_199_254_740_992,
+                "store fixture résumé".into(),
+                MigrationType::Simple,
+                "SELECT 4;".into_sql_str(),
+                false,
+            ),
+        ]);
+        let store_pending = [400, 9_007_199_254_740_992];
+        assert_eq!(
+            fixture["source_store_migrations"],
+            source_manifest(&store_fixture)
+        );
+        assert_eq!(fixture["pending_store_before"], json!(store_pending));
+        assert_eq!(fixture["expected_store_pending"], json!(store_pending));
+        assert_eq!(
+            fixture["store_plan_manifest_sha256"],
+            manifest_hash(&"a".repeat(40), &store_pending, &store_fixture)
         );
     }
 
@@ -1213,6 +1809,116 @@ mod tests {
     }
 
     #[test]
+    fn chains_have_distinct_ledgers_matching_the_runtimes() {
+        assert_eq!(Chain::Cutover.table(), "_sqlx_migrations");
+        assert_eq!(Chain::Store.table(), two_bot_store::TABLE_NAME);
+        assert_eq!(two_bot_store::TABLE_NAME, "_two_bot_migrations");
+        assert_ne!(Chain::Cutover.table(), Chain::Store.table());
+    }
+
+    #[test]
+    fn store_migrator_covers_the_foundation_without_leaving_bot_range() {
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let versions: Vec<i64> = store.iter().map(|m| m.version).collect();
+        assert!(!versions.is_empty(), "store chain must not be empty");
+        for version in 400..=405 {
+            assert!(
+                versions.contains(&version),
+                "store foundation {version} must be present"
+            );
+        }
+        assert!(
+            store.iter().all(|m| (1..=999).contains(&m.version)),
+            "every store version stays in bot range"
+        );
+        assert_eq!(
+            versions.len(),
+            two_bot_store::MIGRATOR.iter().count(),
+            "runner embeds the whole store chain"
+        );
+    }
+
+    #[test]
+    fn store_reconcile_mirrors_cutover_semantics() {
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let all: Vec<LedgerRow> = store
+            .iter()
+            .map(|m| LedgerRow {
+                version: m.version,
+                description: m.description.to_string(),
+                success: true,
+                checksum_hex: hex::encode(&m.checksum),
+            })
+            .collect();
+        assert_eq!(reconcile(&[], &store).unwrap().len(), all.len());
+        assert!(reconcile(&all, &store).unwrap().is_empty());
+        // A same-version number in the other chain's ledger is unknown here:
+        // ledgers never share rows.
+        let mut foreign = all.clone();
+        foreign.push(LedgerRow {
+            version: 1,
+            ..all[0].clone()
+        });
+        assert!(reconcile(&foreign, &store).unwrap_err().contains("unknown"));
+        let mut drift = all.clone();
+        drift[0].checksum_hex = "00".repeat(48);
+        assert!(reconcile(&drift, &store).unwrap_err().contains("drift"));
+        let mut failed = all.clone();
+        failed[0].success = false;
+        assert!(reconcile(&failed, &store)
+            .unwrap_err()
+            .contains("incomplete"));
+    }
+
+    #[test]
+    fn store_binding_accepts_its_own_hash_and_refuses_the_cutover_one() {
+        let sha = "a".repeat(40);
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let store_pending = reconcile(&[], &store).expect("empty store ledger");
+        let req = bound_apply(&pending_versions(), &sha);
+        // The fixture binds both chains, so the store binding accepts.
+        assert!(validate_request(&req).is_ok());
+        assert_eq!(
+            check_store_binding(&req, &store_pending, &store).unwrap(),
+            req.store_plan_manifest_sha256.clone().unwrap()
+        );
+        // A cutover hash presented as the store hash refuses: the chains
+        // bind separately.
+        let mut swapped = req.clone();
+        swapped.store_plan_manifest_sha256 = swapped.plan_manifest_sha256.clone();
+        assert!(validate_request(&swapped).is_ok());
+        assert!(matches!(
+            check_store_binding(&swapped, &store_pending, &store),
+            Err(RunError::Refused(_))
+        ));
+        // A store pending list from another source SHA refuses as well.
+        let mut replay = req.clone();
+        replay.source_sha = "b".repeat(40);
+        assert!(validate_request(&replay).is_ok());
+        assert!(matches!(
+            check_store_binding(&replay, &store_pending, &store),
+            Err(RunError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn apply_refuses_without_the_store_binding() {
+        let sha = "a".repeat(40);
+        let good = bound_apply(&pending_versions(), &sha);
+        for mutate in [
+            |r: &mut Request| r.expected_store_pending = None,
+            |r: &mut Request| r.store_plan_manifest_sha256 = None,
+            |r: &mut Request| {
+                r.store_plan_manifest_sha256 = Some("not-a-digest".to_owned());
+            },
+        ] {
+            let mut req = good.clone();
+            mutate(&mut req);
+            assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
+        }
+    }
+
+    #[test]
     fn expected_pending_parses_ascending() {
         assert_eq!(parse_expected_pending("").unwrap(), Vec::<i64>::new());
         assert_eq!(parse_expected_pending("  ").unwrap(), Vec::<i64>::new());
@@ -1237,10 +1943,15 @@ mod tests {
         reconcile(&[], &MIGRATOR).expect("empty ledger leaves every version pending")
     }
 
-    /// An apply request carrying the exact hash `check_plan_binding`
-    /// computes for its own source SHA, pending list and migration table.
+    /// An apply request carrying the exact hashes `check_plan_binding` and
+    /// `check_store_binding` compute for their own source SHA, pending lists
+    /// and migration tables.
     fn bound_apply(pending: &[i64], source_sha: &str) -> Request {
         let hash = manifest_hash(source_sha, pending, &MIGRATOR);
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let store_pending =
+            reconcile(&[], &store).expect("empty ledger leaves every store version pending");
+        let store_hash = manifest_hash(source_sha, &store_pending, &store);
         Request {
             url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
             target: Target::Staging,
@@ -1258,7 +1969,15 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(","),
             ),
+            expected_store_pending: Some(
+                store_pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
             plan_manifest_sha256: Some(hash),
+            store_plan_manifest_sha256: Some(store_hash),
             plan_run_id: Some("123456789".to_owned()),
             // Shape-valid only: `validate_request` checks presence, while
             // `check_plan_provenance` reads the file. Provenance tests below
@@ -1272,6 +1991,10 @@ mod tests {
     /// binding-host fence is covered separately.
     fn bound_production_apply(pending: &[i64], source_sha: &str) -> Request {
         let hash = manifest_hash(source_sha, pending, &MIGRATOR);
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let store_pending =
+            reconcile(&[], &store).expect("empty ledger leaves every store version pending");
+        let store_hash = manifest_hash(source_sha, &store_pending, &store);
         Request {
             url: Some("postgres://u@prod-host.invalid:5432/two_bot".to_owned()),
             target: Target::Production,
@@ -1289,7 +2012,15 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(","),
             ),
+            expected_store_pending: Some(
+                store_pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
             plan_manifest_sha256: Some(hash),
+            store_plan_manifest_sha256: Some(store_hash),
             plan_run_id: Some("123456789".to_owned()),
             plan_manifest_path: Some("producing-plan/production-migrate-manifest.json".to_owned()),
         }
@@ -1307,7 +2038,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         }
@@ -1325,7 +2058,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         }
@@ -1404,7 +2139,9 @@ mod tests {
         let plan = Request {
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
             ..good
@@ -1427,17 +2164,28 @@ mod tests {
         path
     }
 
-    /// A producing-run manifest artifact carrying `hash` in its embedded
-    /// `plan_manifest_sha256` field, as the plan job's `tee` would upload it.
-    fn producing_manifest(hash: &str) -> String {
+    /// A producing-run manifest artifact carrying `hash` and `store_hash` in
+    /// its embedded hash fields, as the plan job's `tee` would upload it.
+    fn producing_manifest(hash: &str, store_hash: &str) -> String {
         json!({
             "runner_version": RUNNER_VERSION,
             "mode": "plan",
             "source_sha": "a".repeat(40),
             "plan_manifest_sha256": hash,
+            "store_plan_manifest_sha256": store_hash,
             "plan_run_id": "",
         })
         .to_string()
+    }
+
+    /// The store projection hash for `sha` over an empty ledger, matching
+    /// what `bound_apply` binds.
+    fn store_hash_for(source_sha: &str) -> (Vec<i64>, Migrator, String) {
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let pending =
+            reconcile(&[], &store).expect("empty ledger leaves every store version pending");
+        let hash = manifest_hash(source_sha, &pending, &store);
+        (pending, store, hash)
     }
 
     #[test]
@@ -1445,14 +2193,15 @@ mod tests {
         let sha = "a".repeat(40);
         let pending = pending_versions();
         let hash = manifest_hash(&sha, &pending, &MIGRATOR);
-        let path = temp_manifest(&producing_manifest(&hash));
+        let (_, _, store_hash) = store_hash_for(&sha);
+        let path = temp_manifest(&producing_manifest(&hash, &store_hash));
         let req = Request {
             plan_manifest_path: Some(path.to_string_lossy().into_owned()),
             ..bound_apply(&pending, &sha)
         };
         assert!(validate_request(&req).is_ok());
         assert_eq!(check_plan_binding(&req, &pending, &MIGRATOR).unwrap(), hash);
-        assert!(check_plan_provenance(&req, &hash).is_ok());
+        assert!(check_plan_provenance(&req, &hash, &store_hash).is_ok());
         std::fs::remove_file(&path).ok();
     }
 
@@ -1461,17 +2210,18 @@ mod tests {
         let sha = "a".repeat(40);
         let pending = pending_versions();
         let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let (_, _, store_hash) = store_hash_for(&sha);
         // Same shape, different producing run: its manifest carries another
         // hash, so binding apply to this run id must refuse.
         let other = manifest_hash(&"b".repeat(40), &pending, &MIGRATOR);
         assert_ne!(other, hash);
-        let path = temp_manifest(&producing_manifest(&other));
+        let path = temp_manifest(&producing_manifest(&other, &store_hash));
         let req = Request {
             plan_manifest_path: Some(path.to_string_lossy().into_owned()),
             ..bound_apply(&pending, &sha)
         };
         assert!(validate_request(&req).is_ok());
-        let err = check_plan_provenance(&req, &hash).unwrap_err();
+        let err = check_plan_provenance(&req, &hash, &store_hash).unwrap_err();
         assert!(matches!(err, RunError::Refused(_)));
         let message = err.to_string();
         assert!(message.contains("plan_run_id"), "{message}");
@@ -1480,10 +2230,34 @@ mod tests {
     }
 
     #[test]
+    fn plan_provenance_refuses_a_store_hash_from_another_run() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let (_, _, store_hash) = store_hash_for(&sha);
+        // Cutover hash matches the producing run but the store hash is from
+        // another source SHA: the apply is not bound to that run's store
+        // chain and must refuse.
+        let (_, _, other_store) = store_hash_for(&"b".repeat(40));
+        assert_ne!(other_store, store_hash);
+        let path = temp_manifest(&producing_manifest(&hash, &other_store));
+        let req = Request {
+            plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+            ..bound_apply(&pending, &sha)
+        };
+        assert!(validate_request(&req).is_ok());
+        let err = check_plan_provenance(&req, &hash, &store_hash).unwrap_err();
+        assert!(matches!(err, RunError::Refused(_)));
+        assert!(err.to_string().contains("store_plan_manifest_sha256"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn plan_provenance_refuses_when_verification_is_impossible() {
         let sha = "a".repeat(40);
         let pending = pending_versions();
         let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let (_, _, store_hash) = store_hash_for(&sha);
         let good = bound_apply(&pending, &sha);
         // A wrong run id (or an expired artifact) leaves no manifest file:
         // the download step fails and, if the runner is ever reached without
@@ -1499,7 +2273,7 @@ mod tests {
         };
         assert!(validate_request(&missing).is_ok());
         assert!(matches!(
-            check_plan_provenance(&missing, &hash),
+            check_plan_provenance(&missing, &hash, &store_hash),
             Err(RunError::Refused(_))
         ));
         // Corrupt or field-less artifacts are equally unprovable.
@@ -1515,7 +2289,7 @@ mod tests {
                 ..good.clone()
             };
             assert!(matches!(
-                check_plan_provenance(&req, &hash),
+                check_plan_provenance(&req, &hash, &store_hash),
                 Err(RunError::Refused(_))
             ));
             std::fs::remove_file(&path).ok();
@@ -1524,12 +2298,14 @@ mod tests {
         let plan = Request {
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
             ..good
         };
-        assert!(check_plan_provenance(&plan, &hash).is_ok());
+        assert!(check_plan_provenance(&plan, &hash, &store_hash).is_ok());
     }
 
     #[test]
@@ -1545,7 +2321,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -1724,7 +2502,9 @@ mod tests {
         assert!(validate_request(&Request {
             apply: true,
             expected_pending: Some(String::new()),
+            expected_store_pending: Some(String::new()),
             plan_manifest_sha256: Some("ab".repeat(32)),
+            store_plan_manifest_sha256: Some("ab".repeat(32)),
             plan_run_id: Some("123456789".to_owned()),
             plan_manifest_path: Some("producing-plan/staging-migrate-manifest.json".to_owned()),
             ..ok.clone()
@@ -1759,7 +2539,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -1786,7 +2568,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -1834,7 +2618,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -2122,15 +2908,15 @@ mod tests {
     }
 
     #[test]
-    fn production_planetscale_refuses_without_a_production_pin() {
-        // Production takes no branch pin yet: even the direct PlanetScale
-        // endpoint refuses in both gates until the production branch-pin
-        // follow-up lands. The refusal must name the missing production
-        // pin and never `--staging-branch-id`, which production rejects.
+    fn production_planetscale_branch_pin_mirrors_staging() {
+        // A PlanetScale pin without the branch id refuses in both gates: the
+        // refusal must name the production pin and never
+        // `--staging-branch-id`, which production rejects.
         let mut req = production_plan();
         req.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+        req.expected_database = "postgres".to_owned();
         req.url = Some(
-            "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require"
+            "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/postgres?sslmode=require"
                 .to_owned(),
         );
         for gate in [
@@ -2147,6 +2933,60 @@ mod tests {
                 "production refusal must not name the staging pin, got: {err}"
             );
         }
+        // A direct endpoint with the matching `{role}.{branch_id}` username
+        // passes both gates.
+        let pinned = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@abc-useast1-1.horizon.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..req.clone()
+        };
+        assert!(validate_request(&pinned).is_ok());
+        assert!(verify_target(&pinned, TlsPolicy::Required).is_ok());
+        // Pooled shapes and a wrong branch refuse in both gates even when the
+        // pins match them.
+        for (url, branch) in [
+            (
+                "postgresql://migrator.cnfixture01@abc-useast1-1.horizon.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.cnfixture01%7Cread-bouncer@abc-useast1-1.horizon.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.otherbranch@abc-useast1-1.horizon.psdb.cloud:5432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+        ] {
+            let req = Request {
+                url: Some(url.to_owned()),
+                expected_branch_id: branch.to_owned(),
+                ..req.clone()
+            };
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "validate must refuse {url}"
+            );
+            assert!(
+                matches!(
+                    verify_target(&req, TlsPolicy::Required),
+                    Err(RunError::Refused(_))
+                ),
+                "verify must refuse {url}"
+            );
+        }
+        // A malformed pin refuses before any DDL. The message names the
+        // production pin shape, never the staging flag.
+        let bad = Request {
+            expected_branch_id: "not a branch!".to_owned(),
+            ..pinned.clone()
+        };
+        let err = validate_request(&bad).unwrap_err().to_string();
+        assert!(err.contains("production"), "{err}");
+        assert!(!err.contains("--staging-branch-id"), "{err}");
     }
 
     #[test]
@@ -2312,7 +3152,9 @@ mod tests {
                 acl_plan_ref: "TOG-2#doc".to_owned(),
                 apply: false,
                 expected_pending: None,
+                expected_store_pending: None,
                 plan_manifest_sha256: None,
+                store_plan_manifest_sha256: None,
                 plan_run_id: None,
                 plan_manifest_path: None,
             };
@@ -2347,7 +3189,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -2409,6 +3253,145 @@ mod tests {
         assert_eq!(TARGET_ACQUIRE_TIMEOUT_SECS, 10);
     }
 
+    /// Staging drift witness: run 38654195597 applied all 19 pending migrations, then the
+    /// post-apply ledger read failed on a transient pool acquire while the
+    /// saturated staging DB (25/25 connections) refused the new checkout. The
+    /// pre-apply read had used the identical query as the identical role, so
+    /// the failure was transient connection state, not grants or migration
+    /// content. The post-apply read must retry transient failures before
+    /// reporting the ledger unreadable.
+    #[tokio::test]
+    async fn post_apply_read_retries_transient_failures_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let result = retry_transient(
+            || {
+                let probe = Arc::clone(&probe);
+                async move {
+                    let n = probe.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(ReadAfterApply::PoolAcquireFailed)
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            },
+            5,
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(result, Ok(42u32));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A permanently unreadable ledger still reports unreadable (fail closed),
+    /// with the terminal failure kind preserved for evidence.
+    #[tokio::test]
+    async fn post_apply_read_returns_the_terminal_failure_kind() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let result = retry_transient(
+            || {
+                let probe = Arc::clone(&probe);
+                async move {
+                    probe.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, ReadAfterApply>(ReadAfterApply::LedgerQueryFailed)
+                }
+            },
+            3,
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(result, Err(ReadAfterApply::LedgerQueryFailed));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn post_apply_read_error_names_are_stable() {
+        assert_eq!(
+            ReadAfterApply::PoolAcquireFailed.as_str(),
+            "pool_acquire_failed"
+        );
+        assert_eq!(
+            ReadAfterApply::LedgerQueryFailed.as_str(),
+            "ledger_query_failed"
+        );
+    }
+
+    /// Staging drift witness: staging refused all logins at 25/25 connections. The plan
+    /// manifest must carry connection usage and warn strictly above 80%.
+    #[test]
+    fn connection_warning_fires_only_above_eighty_percent() {
+        assert_eq!(connection_warning(20, 25), None);
+        assert_eq!(connection_warning(80, 100), None);
+        assert_eq!(connection_warning(0, 0), None);
+        assert_eq!(connection_warning(5, 0), None);
+        for (used, max) in [(21, 25), (81, 100), (25, 25)] {
+            let line =
+                connection_warning(used, max).unwrap_or_else(|| panic!("{used}/{max} must warn"));
+            assert!(line.contains("80%"), "{line}");
+            assert!(line.contains("::warning::"), "{line}");
+        }
+    }
+
+    #[test]
+    fn connection_warning_from_audit_reads_usage_fields() {
+        let saturated = json!({"connection_usage": {"used": 21, "max_connections": 25}});
+        let line = connection_warning_from_audit(&saturated).expect("must warn");
+        assert!(line.contains("21/25"), "{line}");
+        assert_eq!(
+            connection_warning_from_audit(
+                &json!({"connection_usage": {"used": 20, "max_connections": 25}})
+            ),
+            None
+        );
+        // A failed audit readout warns about nothing.
+        assert_eq!(
+            connection_warning_from_audit(&json!({"error": "audit read failed"})),
+            None
+        );
+        assert_eq!(connection_warning_from_audit(&Value::Null), None);
+    }
+
+    #[test]
+    fn connection_count_uses_fully_readable_source() {
+        // `backend_type` is NULL for other roles' sessions unless the reader
+        // holds pg_read_all_stats, which the plan login does not; the count
+        // must come from pg_stat_database, readable in full by every login.
+        assert!(
+            CONNECTION_COUNT_SQL.contains("pg_stat_database"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+        assert!(
+            CONNECTION_COUNT_SQL.contains("numbackends"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+        assert!(
+            !CONNECTION_COUNT_SQL.contains("backend_type"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_subtracts_reserved() {
+        assert_eq!(effective_max_connections(25, 3), 22);
+        assert_eq!(effective_max_connections(25, 0), 25);
+        assert_eq!(effective_max_connections(1, 5), 1);
+        // Backwards-compatible: manifests without the reserved field warn on raw max.
+        assert_eq!(
+            connection_warning_from_audit(
+                &json!({"connection_usage": {"used": 20, "max_connections": 25}})
+            ),
+            None
+        );
+        // Same reading against the login ceiling (25 - 3 = 22) warns: 20/22 > 80%.
+        let line = connection_warning_from_audit(
+            &json!({"connection_usage": {"used": 20, "max_connections": 25, "reserved_connections": 3}}),
+        )
+        .expect("must warn on effective ceiling");
+        assert!(line.contains("20/22"), "{line}");
+    }
+
     /// The `run` entry refuses a plaintext remote binding before connecting
     /// under either TLS policy (unset means `Required`, which refuses the weak
     /// sslmode; `local-only` refuses the remote host), so no socket is opened
@@ -2429,7 +3412,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -2448,6 +3433,309 @@ mod tests {
         assert!(
             !debug.contains("fixture"),
             "refusal echoed the URL: {debug}"
+        );
+    }
+
+    /// Stand-in database error whose Display carries a fake secret: proves
+    /// the connect refusal never surfaces it.
+    #[derive(Debug)]
+    struct FakeConnectDbError {
+        code: Option<&'static str>,
+        transient: bool,
+    }
+
+    impl std::fmt::Display for FakeConnectDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake database error with postgres://secret@localhost/db")
+        }
+    }
+
+    impl std::error::Error for FakeConnectDbError {}
+
+    impl sqlx::error::DatabaseError for FakeConnectDbError {
+        fn message(&self) -> &str {
+            "fake"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn is_transient_in_connect_phase(&self) -> bool {
+            self.transient
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn connect_database(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeConnectDbError {
+            code: Some(code),
+            transient: false,
+        }))
+    }
+
+    fn connect_io(kind: std::io::ErrorKind) -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::new(kind, "simulated transport failure"))
+    }
+
+    /// A simulated connect timeout and a real `SET ROLE` denial (SQLSTATE
+    /// 42501) surface distinct cause strings, so the next recurrence is
+    /// triageable from the log line.
+    #[test]
+    fn connect_refusal_distinguishes_timeout_from_set_role_denial() {
+        let timeout = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "simulated connect timeout",
+        ));
+        let denied = connect_database("42501");
+
+        let timeout_cause = connect_cause(&timeout);
+        let denied_cause = connect_cause(&denied);
+        assert_eq!(timeout_cause, "connect-timeout", "timeout cause");
+        assert_eq!(denied_cause, "set-role-denied:42501", "denial cause");
+        assert_ne!(timeout_cause, denied_cause, "causes must differ");
+
+        for (error, cause) in [
+            (&timeout, timeout_cause.as_str()),
+            (&denied, denied_cause.as_str()),
+        ] {
+            let refusal = connect_refusal(READ_ONLY_ROLE, error);
+            assert!(
+                matches!(refusal, RunError::Refused(_)),
+                "connect failure must refuse, got cause {cause}"
+            );
+            let RunError::Refused(message) = refusal else {
+                continue;
+            };
+            assert!(
+                message.contains("could not connect and SET ROLE"),
+                "refusal must keep the historic prefix: {message}"
+            );
+            assert!(
+                message.contains(READ_ONLY_ROLE),
+                "refusal must name the role: {message}"
+            );
+            assert!(
+                message.contains(&format!("[cause={cause}]")),
+                "refusal must carry the cause: {message}"
+            );
+            assert!(
+                !message.contains("secret"),
+                "refusal leaked error detail: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_cause_covers_auth_refused_reset_and_pool_classes() {
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::ConnectionRefused)),
+            "connect-refused"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::ConnectionReset)),
+            "connect-reset"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::HostUnreachable)),
+            "connect-unreachable"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::PermissionDenied)),
+            "connect-permission"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::InvalidData)),
+            "io-error"
+        );
+        assert_eq!(connect_cause(&connect_database("28P01")), "auth:28P01");
+        assert_eq!(connect_cause(&connect_database("28000")), "auth:28000");
+        let transient = sqlx::Error::Database(Box::new(FakeConnectDbError {
+            code: Some("53300"),
+            transient: true,
+        }));
+        assert_eq!(connect_cause(&transient), "connect-transient:53300");
+        assert_eq!(connect_cause(&connect_database("XX000")), "database:XX000");
+        let codeless = sqlx::Error::Database(Box::new(FakeConnectDbError {
+            code: None,
+            transient: false,
+        }));
+        assert_eq!(connect_cause(&codeless), "database:unknown");
+        assert_eq!(connect_cause(&sqlx::Error::PoolTimedOut), "pool-timeout");
+        assert_eq!(connect_cause(&sqlx::Error::PoolClosed), "pool-closed");
+        let tls = sqlx::Error::Tls(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "simulated tls failure",
+        )));
+        assert_eq!(connect_cause(&tls), "tls");
+        assert_eq!(
+            connect_cause(&sqlx::Error::Protocol(
+                "expected role two_bot_migrator_ro is not active".to_owned()
+            )),
+            "role-verify"
+        );
+        assert_eq!(
+            connect_cause(&sqlx::Error::Protocol("garbage".to_owned())),
+            "connect-error"
+        );
+        assert_eq!(
+            connect_cause(&sqlx::Error::InvalidArgument("literal step".to_owned())),
+            "connect-error"
+        );
+        assert_eq!(connect_cause(&sqlx::Error::WorkerCrashed), "connect-error");
+    }
+
+    /// `connect()` through a real pool against a closed loopback port refuses
+    /// with the documented pool-deadline cause: sqlx retries the refused port
+    /// until the acquire deadline, so the pool path can only report
+    /// `pool-timeout` here. Fails if the `connect_refusal` wiring is reverted
+    /// to the fixed string (no `[cause=...]` suffix). Costs one acquire
+    /// deadline (~10 s): the production timeout, not test overhead.
+    #[tokio::test]
+    async fn connect_refuses_closed_port_with_pool_timeout_cause() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("loopback bind")
+            .local_addr()
+            .expect("loopback addr")
+            .port();
+        // Listener dropped here: the port is closed when `connect` dials it.
+        let options = PgConnectOptions::new_without_pgpass()
+            .host("127.0.0.1")
+            .port(port)
+            .username("staging_migrate_cause_probe")
+            .database("staging_migrate_cause_probe")
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+        let verified = Arc::new(AtomicUsize::new(0));
+        let outcome = connect(options, READ_ONLY_ROLE, Arc::clone(&verified)).await;
+        let error = outcome.expect_err("closed port must refuse");
+        assert!(
+            matches!(error, RunError::Refused(_)),
+            "closed port must refuse fail-closed, got {error:?}"
+        );
+        let RunError::Refused(message) = error else {
+            return;
+        };
+        assert!(
+            message.contains("[cause=pool-timeout]"),
+            "closed port must document the pool-deadline cause: {message}"
+        );
+        assert!(
+            message.contains("could not connect and SET ROLE"),
+            "refusal must keep the historic prefix: {message}"
+        );
+        assert_eq!(
+            verified.load(Ordering::SeqCst),
+            0,
+            "refused connections must not verify"
+        );
+    }
+
+    /// `connect()` as a login that is not a member of the role refuses with
+    /// `set-role-denied:42501`, not the pool-deadline cause: the
+    /// `after_connect` slot preserves the `SET ROLE` denial sqlx retries away.
+    /// Requires `TWO_TEST_DATABASE_URL` (agent-testdb or the CI service);
+    /// creates one login with a unique name and drops it before asserting, so
+    /// a red test does not leak the login. Costs one acquire deadline (~10 s):
+    /// the production retry budget a persistent denial always pays.
+    #[tokio::test]
+    async fn connect_records_set_role_denial_behind_pool_timeout() {
+        use sqlx::Connection as _;
+        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(raw) => raw,
+            Err(error) => {
+                assert!(
+                    matches!(error, std::env::VarError::NotPresent),
+                    "invalid test bootstrap configuration: {error}"
+                );
+                eprintln!("skipped: TWO_TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        two_bot_testsupport::guard_database_url(&raw).expect("test database only");
+        let admin_options: PgConnectOptions = raw
+            .parse()
+            .expect("TWO_TEST_DATABASE_URL parses as Postgres options");
+        let admin_options = admin_options.ssl_mode(sqlx::postgres::PgSslMode::Disable);
+        let mut admin = PgConnection::connect_with(&admin_options)
+            .await
+            .expect("agent-testdb admin connect");
+        // The denial must be a real 42501, so the groups exist (idempotent,
+        // shared with other suites) while the probe login holds nothing.
+        for group in [MIGRATOR_ROLE, READ_ONLY_ROLE] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DO $$ BEGIN CREATE ROLE {group} NOLOGIN; \
+                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            )))
+            .execute(&mut admin)
+            .await
+            .expect("shared test group exists");
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let login = format!("sm_cause_login_{}_{nonce}", std::process::id());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE ROLE {login} LOGIN")))
+            .execute(&mut admin)
+            .await
+            .expect("probe login created");
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&mut admin)
+            .await
+            .expect("current database");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT CONNECT ON DATABASE {database} TO {login}"
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("probe login can connect");
+        let probe_options = admin_options.username(&login);
+        let verified = Arc::new(AtomicUsize::new(0));
+        let outcome = connect(probe_options, READ_ONLY_ROLE, Arc::clone(&verified)).await;
+        // Cleanup before asserting, so a red test does not leak the login.
+        // The CONNECT grant blocks DROP ROLE (2BP01) until revoked.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "REVOKE CONNECT ON DATABASE {database} FROM {login}"
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("probe login connect revoked");
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {login}")))
+            .execute(&mut admin)
+            .await
+            .expect("probe login dropped");
+        admin.close().await.expect("admin close");
+        let error = outcome.expect_err("non-member SET ROLE must refuse");
+        assert!(
+            matches!(error, RunError::Refused(_)),
+            "non-member SET ROLE must refuse fail-closed, got {error:?}"
+        );
+        let RunError::Refused(message) = error else {
+            return;
+        };
+        assert!(
+            message.contains("[cause=set-role-denied:42501]"),
+            "non-member SET ROLE must surface the denial cause: {message}"
+        );
+        assert_eq!(
+            verified.load(Ordering::SeqCst),
+            0,
+            "denied connections must not verify"
         );
     }
 

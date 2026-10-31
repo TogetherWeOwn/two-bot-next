@@ -51,6 +51,13 @@ impl PrivacyCommand {
 /// then the @everyone entry.
 type ConnectWrites = (Option<PermissionOverwrite>, PermissionOverwrite);
 
+/// All writes and their evidence come from the same locked live read.
+struct ConnectPlan {
+    snapshot: OverwriteSnapshot,
+    bot_grant: Option<PermissionOverwrite>,
+    everyone: PermissionOverwrite,
+}
+
 const PAUSED: &str = "Voice rooms are paused: Discord refused the bot credential. \
                       Fix the token, then restart the bot.";
 const WARMING: &str = "The voice worker isn't warmed up yet — try again in a moment.";
@@ -233,16 +240,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     && overwrite.deny.contains(Permissions::CONNECT)
             })
         })
-    }
-
-    /// Record a written overwrite in the live snapshot, so the next decision
-    /// reads what Discord now holds without waiting for the gateway echo.
-    pub(super) fn note_overwrite(&self, room: Snowflake, overwrite: &PermissionOverwrite) {
-        let mut live = self.live.write_state();
-        if let Some(channel) = live.channels.get_mut(&room) {
-            let current = channel.permission_overwrites.take().unwrap_or_default();
-            channel.permission_overwrites = Some(with_overwrite(&current, overwrite));
-        }
     }
 
     /// The owner's display name as it may appear in the Join channel's name:
@@ -565,8 +562,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         };
         let result = match planned {
-            Ok((bot_grant, everyone)) => {
-                match self.write_overwrites(room, bot_grant, &everyone).await {
+            Ok(plan) => {
+                match self.write_overwrites(room, plan).await {
                     // The Join channel goes before the flag flips and the record is
                     // written: its id stays stored until the channel is gone, so a
                     // restart between the two steps can still delete it (`/public`
@@ -621,14 +618,29 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         &self,
         room: Snowflake,
         deny: bool,
-    ) -> Option<Result<ConnectWrites, RoomHttpError>> {
+    ) -> Option<Result<ConnectPlan, RoomHttpError>> {
         let live = self.live.read_state();
+        if !live.ready {
+            return Some(Err(RoomHttpError::Cancelled));
+        }
         let channel = live.channels.get(&room)?;
         let Some(bot) = live.bot.as_ref() else {
             return Some(Err(RoomHttpError::AccessDenied));
         };
-        let current = channel.permission_overwrites.clone().unwrap_or_default();
-        Some(self.plan_everyone_connect(&live, room, bot, &current, deny))
+        let Some(current) = channel.permission_overwrites.as_deref() else {
+            return Some(Err(RoomHttpError::Cancelled));
+        };
+        Some(
+            self.plan_everyone_connect(&live, room, bot, current, deny)
+                .map(|(bot_grant, everyone)| ConnectPlan {
+                    snapshot: OverwriteSnapshot {
+                        generation: live.generation,
+                        overwrites: current.to_vec(),
+                    },
+                    bot_grant,
+                    everyone,
+                }),
+        )
     }
 
     /// The writes `/private` or `/public` needs, planned from one live read:
@@ -656,23 +668,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// Bot grant first so it can never lose access between the two writes,
-    /// then @everyone. Each success is recorded in the live snapshot.
+    /// then @everyone. Advance only from the prior snapshot or our own echo;
+    /// stale evidence ends the sequence before any follow-up effect.
     async fn write_overwrites(
         &mut self,
         room: Snowflake,
-        bot_grant: Option<PermissionOverwrite>,
-        everyone: &PermissionOverwrite,
+        plan: ConnectPlan,
     ) -> Result<(), RoomHttpError> {
-        if let Some(grant) = bot_grant {
-            self.http
-                .put_overwrite(room, grant, self.live.room_guard(room))
-                .await?;
-            self.note_overwrite(room, &grant);
+        let OverwriteSnapshot {
+            generation,
+            mut overwrites,
+        } = plan.snapshot;
+        for overwrite in plan.bot_grant.into_iter().chain([plan.everyone]) {
+            let next = with_overwrite(&overwrites, &overwrite);
+            let guard = self
+                .live
+                .overwrite_guard(room, generation, overwrites.clone());
+            self.http.put_overwrite(room, overwrite, guard).await?;
+            if !self
+                .live
+                .advance_overwrites(room, generation, &overwrites, &next)
+            {
+                return Err(RoomHttpError::Cancelled);
+            }
+            overwrites = next;
         }
-        self.http
-            .put_overwrite(room, *everyone, self.live.room_guard(room))
-            .await?;
-        self.note_overwrite(room, everyone);
         Ok(())
     }
 

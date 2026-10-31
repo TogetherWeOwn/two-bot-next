@@ -1,18 +1,26 @@
 # Container scan and release SBOMs
 
-`check.yml` calls the same read-only `sbom.yml` used by releases. (The
+`check.yml` calls the same read-only `sbom.yml` used by releases, through
+the `supply-chain` job ([`check.yml`](../.github/workflows/check.yml),
+`supply-chain` job, `if: needs.job-inputs.outputs.supply != 'false'`). (The
 reusable SBOM workflow was renamed from `supply-chain.yml` because main's
 TOG-11810 fold uses that filename for the native pr-lint + gitleaks gate,
 which has no `workflow_call` trigger.) It
-builds the Dockerfile on `[self-hosted, two-selfhosted]`, without registry push or deployment,
+builds the Dockerfile on GitHub-hosted `ubuntu-latest` in this public
+repository (runner routing in [`sbom.yml`](../.github/workflows/sbom.yml)
+and the `check` note in `check.yml`: a public repo never takes the
+`[self-hosted, two-selfhosted]` label, which would queue forever), without
+registry push or deployment,
 then inventories the exact image and all packages in the workspace Cargo.lock
 (including workspace, optional and development dependencies). The Rust BOM is
 not a claim that every locked package is linked into the runtime executable.
 The image BOM inventories OS/image packages; Rust binaries are not reliably
 recoverable by image analysis, so the separate lockfile scan is intentional.
 
-Both gates run in the `image` job and use SHA-pinned Trivy Action 0.35.0 with
-Trivy v0.69.3. They fail on HIGH/CRITICAL in OS and library dependencies,
+Both gates run in the `image` job and use SHA-pinned Trivy Action 0.36.0 with
+Trivy v0.69.3 (see the `uses: aquasecurity/trivy-action@... # 0.36.0` pins
+and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). They
+fail on HIGH/CRITICAL in OS and library dependencies,
 **including unfixed findings**. A fresh vulnerability DB is downloaded by Trivy
 on every run. No shared cache is written or read: the BuildKit GitHub-Actions
 cache is disabled and every Trivy step sets `cache: false`, so a poisoned
@@ -20,9 +28,44 @@ cross-run DB or layer cache cannot make the gate pass. Scanner errors also
 fail; no `continue-on-error` or blanket `ignore-unfixed` is allowed. The
 `verify` job validates the handed-off BOMs and retains SBOMs and JSON findings
 in the `supply-chain` Actions artifact for 14 days, including on a
-vulnerability failure. The existing required `check` depends on this scan job
-and explicitly rejects failed, skipped or cancelled results, so scan failure
-cannot leave that merge check green.
+vulnerability failure. The required `ci-ok` aggregate (`check.yml`, `ci-ok`
+job) accepts a skipped `supply-chain` job only when the selector deselected
+it (`supply=false`); a selected job that failed, was cancelled, or skipped
+unexpectedly fails `ci-ok`, so scan failure cannot leave that merge check
+green.
+
+## Selection and `ci-ok` (selector is authoritative)
+
+The `supply` output of `scripts/job-inputs.py` (the `job-inputs` job in
+`check.yml`) decides whether the `supply-chain` job runs on a pull request.
+Push to `main`, the weekly schedule, manual dispatch, any undecidable diff
+(missing SHAs, classifier error) and any non-PR event fail closed to full
+jobs, so release-candidate and staging validation always get the scan.
+On PRs the scan is selected by Rust sources (`crates/`, `src/`), `sql/`,
+`.cargo/`, `tests/`, and `scripts/`. Each of those selects `rust`, except
+`tests/voice_templates/` coverage and validator-test assets (`coverage.json`,
+`test_validator.py`, plus docs-only `README.md`), which select no matrix job
+and are validated by the check job's always-on voice-template step;
+`corpus.json` and `validate.py` there still select `rust`, and `supply`
+follows `rust` because Rust changes alter the shipped binary the scan
+inventories. It is
+also selected by dependency manifests (`Cargo.toml`, `Cargo.lock`, `deny.toml`,
+`rust-toolchain.toml`, `migrations.lock`), the runtime image inputs
+(`Dockerfile`, `.dockerignore`, which select `supply` directly),
+`.github/workflows/**` (workflow edits revalidate everything), `deploy/`,
+and the selectors or their regression suites themselves; any other
+unrecognised path fails closed to full jobs. The only `.github/` files that
+select nothing are `CODEOWNERS`, `dependabot.yml` and the PR template.
+Docs-only and worker-UI-only PRs skip it. The full list lives in
+`scripts/job-inputs.py` (`classify()`/`selection()`), which is authoritative
+when this guide and the selector disagree.
+
+Not every Markdown change deselects the scan: docs whose content is read by
+PR-run code (for example `docs/parity.md`, `docs/cutover.md`,
+`docs/commands.md`, `docs/configuration.md`, `docs/voice-rooms.md`,
+`docs/metrics.md`, `docs/startup-diagnostics.md` and the other pinned inputs
+listed in `scripts/job-inputs.py`) select `rust` (and therefore `supply`) or
+`worker` as their readers require. Any deletion forces full jobs.
 
 No job both checks out the untrusted `inputs.ref` and executes a local script
 afterwards (CodeQL cache-poisoning gate). The `image` job runs the offline
@@ -130,18 +173,23 @@ and use the explicit repair input below. Publication isn't atomic with
 the tag; require the assets before treating the release as fully delivered.
 
 ```sh
-# Opening/updating a PR automatically runs check.yml's PR SBOM dry-run.
+# A PR the selector picks (see Selection above), plus every main push and
+# scheduled run, gets check.yml's SBOM dry-run. A deselected PR skips the
+# supply-chain job, so there is no supply-chain artifact to download.
 # The 40-minute job has contents: read, no deploy secrets and no publishing path.
 # No release workflow dispatch or pull_request_target is required.
-# Inspect the PR run's supply-chain artifact: two nonempty CycloneDX BOMs,
-# SHA256SUMS, source SHA/image ID, and both vulnerability reports.
+# On a selected run that completes the handoff and reaches and passes SBOM
+# inventory validation, inspect the supply-chain artifact: two nonempty
+# CycloneDX BOMs, SHA256SUMS, source SHA/image ID, and both vulnerability reports.
 gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 # Repair assets on an existing stable release; rebuilds its tag, not current main.
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
-The PR dry-run inventories the exact PR head SHA, validates lockfile coverage
-and Debian image components, and records checksums/provenance before scanning.
+On a selected PR, the dry-run inventories the exact PR head SHA and records
+source SHA and image ID before scanning; `verify` then validates lockfile
+coverage and Debian image components and records SHA256SUMS after the image
+vulnerability gates.
 Image tags include the Actions run ID and attempt. No shared cache exists:
 the image build uses no `cache-from`/`cache-to`, and Trivy caching is off
 (`cache: false`), so per-run state lives only under `runner.temp`.
@@ -204,5 +252,5 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-vulnerability-preflight.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py
 python3 scripts/test-docker-deps.py
-node scripts/test-release-on-promote.cjs
+node scripts/test-daily-digest.cjs
 ```

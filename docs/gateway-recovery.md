@@ -19,6 +19,36 @@ A crash before commit rolls the batch and checkpoint back together; a crash afte
 
 Open voice sessions are **never** restored. The existing pipeline drops them on READY and RESUMED (legacy `ShardReady`/`ShardResume`). This intentionally avoids outage-inflated durations. Twilight's channel/member cache is also cold after a process restart; this slice does not claim a fully restored cache or invite baseline. Facts, real leveling, REST side effects and invite fetching remain the existing S4/S6 seams; this transaction currently covers the S3 funnel, not arbitrary external side effects. Maintain one running shard owner per guild; overlapping independent deployments are not a supported recovery mechanism.
 
+### Voice accounting across lifecycle gaps
+
+A guild-unavailable frame (including an unavailable `GuildCreate`) or permanent
+`GuildDelete` discards that guild's measured starts and serial chains. A guild
+`ChannelDelete` discards starts in that channel and their associated chains;
+other channels and guilds keep their witnessed starts. READY/RESUMED still
+invalidate every guild. A lifecycle write barrier waits for complete in-flight
+voice/member effects before discarding state and updating the cache, so an
+older join cannot put its start back after invalidation.
+
+Invalidation writes no end/start rows, facts or XP. A returning guild roster
+updates cache occupancy, not measured starts. A later real boundary is either
+omitted (for example, server leave with no tracked start) or honestly unknown;
+only a newly observed join can begin a new measured interval. Mute-only frames,
+normal moves (end before start at one receipt time), and ordinary member leaves
+keep their existing semantics. No room-management or reward-rate policy changes.
+
+The offline `funnel_voice_lifecycle_acceptance` suite drives the real pipeline
+with explicit timestamps and recording facts/leveling hooks. Its cache-only
+control pins that the current Twilight resource configuration **retains** the
+old channel after guild-unavailable, permanent-removal and channel-delete frames;
+a subsequent null frame clears it. A returning available roster replaces the
+guild's voice-membership index but can leave absent members' old state objects;
+those objects cannot witness the old half of a fresh join/move. A missing index
+and real null frames retain the existing READY unknown-end behavior. This proves
+missing accounting invalidation, not an evicted-cache equal-null bug. Recordings prove funnel rows, facts and XP
+hook inputs, not persisted rewards, live gateway ordering or installed behavior.
+Internal pipeline unit tests additionally cover scoped chain retirement and an
+in-flight join overlapping deletion. Deployment/acceptance evidence is separate.
+
 ## RSVP interaction scheduling (S4)
 
 The shared executor resolves the current bot application and synchronizes the full guild command registry before polling the shard. This also covers a persisted-session boot that receives RESUMED without READY; failed registry sync prevents gateway readiness.
@@ -34,6 +64,22 @@ On a checkpoint error or timeout, readiness stays Starting and no new packets ar
 Dispatch-worker failures use the same path: a failed leveling drain, a dropped interaction completion, or an invalid onboarding job is recorded, plus a committed interaction job without an ingress ticket (whose message says `; checkpoint committed` since the commit already holds the durable job), as a typed `InvalidArgument` error naming its stage (`; checkpoint unchanged`), the worker stops, accepted RSVP drains in receipt order, and the cursor stays unchanged. The runner surfaces that typed error rather than a bare "dispatch worker failed". Detached onboarding acknowledgements hold a drop-guard permit, so a panicking acknowledgement releases its ingress slot instead of leaking it toward capacity exhaustion.
 
 These changes prevent scheduler-induced loss at backlog/deadline and recoverable checkpoint-error boundaries, not process-crash exactly-once delivery. RSVP store effects and Discord acknowledgements are not atomic with the gateway checkpoint, and no durable interaction inbox is introduced. A failed final edit never retries the already-executed command.
+
+### Voice action queue: no enforced production pending cap
+
+`ActionQueue::try_enqueue` is an opt-in API for future sheddable producers. It
+refuses new work once a guild has 1,024 pending urgent + deferred actions, while
+allowing a newer rename or respace to overwrite its same-kind pending entry
+without allocating another slot or counting a refusal.
+
+**That limit is not a production queue-memory bound.** All current production
+producers still use the always-admit `enqueue` path to preserve accepted user
+commands and room lifecycle writes. The actor inbox gate limits inbound bursts,
+not cumulative production under a stalled drain. Wiring producers that can
+safely handle refusal is future work; do not assume queue depth stops at 1,024
+or that a zero overflow counter proves the drain is healthy. Inspect
+`two_bot_voice_queue_pending` and `two_bot_voice_queue_oldest_age_seconds`
+with the actor/REST stall signals when investigating accumulation.
 
 ## Force-fresh IDENTIFY (first production boot)
 
@@ -60,6 +106,26 @@ Exit codes: 0 ok, 1 database failure (including a database without migration 032
 
 Residual window: the directive is consumed when the boot read commits. If the process dies before the discard and READY are committed, a restart within 15 minutes could RESUME the old checkpoint. After every armed boot, run the dry run; if the directive is consumed but no new READY checkpoint was recorded, arm again before the next start.
 
+## Reconnect timing entry points
+
+`crates/bot/src/gateway_backoff.rs` separates the live receive loop's timing
+choice from its timer effect:
+
+- `reconnect_spread(seed, attempt)` calculates the deterministic, non-growing
+  500 ms–1 s spread with no timer, network or database access.
+- `wait_reconnect_spread(seed, attempt)` awaits that delay and returns the
+  requested duration for logging. The receive loop in `gateway.rs` uses this
+  wrapper; Twilight still owns connection backoff.
+- `reconnect_delay(policy, attempt)` is the separate, bounded exponential
+  schedule for the test-only supervised runner, not the live receive loop.
+
+Before changing this boundary, run the pure `gateway_backoff::spread_tests`
+unit tests and the existing `reconnect_spread_runtime_acceptance` and
+`reconnect_adoption_guard` integration targets through the bounded cache.
+Together they check seeded draws and extreme attempts, the actual awaited
+500 ms–1 s timer, and receive-loop adoption. Keep exact-head CI and independent
+review as gates; this seam does not enable broader automation or retry authority.
+
 ## Verification (test containers only)
 
 On the persistent controller, compiling commands use the bounded cache wrapper
@@ -75,9 +141,10 @@ TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_te
 # Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-# Ephemeral CI only — on the persistent controller use the wrapper form below.
+# Persistent controller: bounded wrapper.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test gateway_force_identify_cli
+# Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   cargo test -p two-bot-cutover --locked --test gateway_force_identify_cli
 ```

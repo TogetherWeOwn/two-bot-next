@@ -153,6 +153,385 @@ pub struct GuildGameAggregate {
     pub session_count: u64,
 }
 
+/// Most per-game rows the operator report renders for one guild.
+pub const GAME_ACTIVITY_REPORT_MAX_ROWS: usize = 100;
+
+/// Rendering of an untitled game (`game: None`, stored as `''`).
+pub const GAME_ACTIVITY_UNTITLED_PLACEHOLDER: &str = "(untitled)";
+
+/// Unscoped invocation (no `--guild`): the report object shape with a null
+/// guild, no rows and a hint naming the flag, so the CLI exits 0 without
+/// opening a database (the `render_reengagement_unscoped` precedent).
+#[must_use]
+pub fn render_game_activity_unscoped() -> String {
+    let mut report = serde_json::json!({
+        "guild_id": serde_json::Value::Null,
+        "rows": [],
+        "truncated": false,
+        "hint": "no --guild given; pass --guild <ID> to report one guild",
+    })
+    .to_string();
+    report.push('\n');
+    report
+}
+
+/// Read-only aggregate operator report for one guild, as one JSON object:
+/// `{"guild_id", "rows", "truncated"}` plus a `"hint"` exactly when no row
+/// renders. Each row is exactly `{"game", "total_play_ms", "in_voice_ms",
+/// "session_count"}`; the aggregate carries no per-person key and the report
+/// must not invent one.
+///
+/// Rows for other guilds never render (defense in depth behind the
+/// guild-scoped store read). Ordering is deterministic and input-order
+/// independent: `total_play_ms` desc, `in_voice_ms` desc, then game title
+/// asc with the untitled row first among full ties. At most
+/// [`GAME_ACTIVITY_REPORT_MAX_ROWS`] rows render, with `"truncated": true`
+/// when bounded input was cut.
+#[must_use]
+pub fn render_game_activity_report(guild_id: &str, rows: &[GuildGameAggregate]) -> String {
+    let mut report =
+        game_activity_report_value(guild_id, rows, GAME_ACTIVITY_REPORT_MAX_ROWS).to_string();
+    report.push('\n');
+    report
+}
+
+fn game_activity_report_value(
+    guild_id: &str,
+    rows: &[GuildGameAggregate],
+    max_rows: usize,
+) -> serde_json::Value {
+    let mut scoped: Vec<&GuildGameAggregate> =
+        rows.iter().filter(|row| row.guild_id == guild_id).collect();
+    scoped.sort_by(|a, b| {
+        b.total_play_ms
+            .cmp(&a.total_play_ms)
+            .then_with(|| b.in_voice_ms.cmp(&a.in_voice_ms))
+            // `Option<&str>` order is `None` before any `Some`, then
+            // lexicographic: untitled first among full ties, titles asc.
+            .then_with(|| a.game.as_deref().cmp(&b.game.as_deref()))
+            .then_with(|| b.session_count.cmp(&a.session_count))
+    });
+    let truncated = scoped.len() > max_rows;
+    scoped.truncate(max_rows);
+    let rendered: Vec<serde_json::Value> = scoped
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "game": row.game.as_deref().unwrap_or(GAME_ACTIVITY_UNTITLED_PLACEHOLDER),
+                "total_play_ms": row.total_play_ms,
+                "in_voice_ms": row.in_voice_ms,
+                "session_count": row.session_count,
+            })
+        })
+        .collect();
+    let mut value = serde_json::json!({
+        "guild_id": guild_id,
+        "rows": rendered,
+        "truncated": truncated,
+    });
+    if scoped.is_empty() {
+        value["hint"] = serde_json::json!("no game activity recorded for this guild");
+    }
+    value
+}
+
+/// Private Discord view of the same aggregate shape and order as the CLI.
+/// Only labels are neutralized; numeric totals are never transformed.
+#[must_use]
+pub fn render_game_activity_discord_report(guild_id: u64, rows: &[GuildGameAggregate]) -> String {
+    let guild_id = guild_id.to_string();
+    let total = rows.iter().filter(|row| row.guild_id == guild_id).count();
+    let mut report = game_activity_report_value(&guild_id, rows, 10);
+    if let Some(rendered) = report["rows"].as_array_mut() {
+        for row in rendered {
+            if let Some(game) = row["game"].as_str() {
+                row["game"] = serde_json::json!(discord_label(game));
+            }
+        }
+    }
+    let note = if total > 10 {
+        format!(
+            "\nShowing the top 10 games; {} more games omitted.",
+            total - 10
+        )
+    } else {
+        String::new()
+    };
+    let content = format!("```json\n{report}\n```{note}");
+    if crate::message_safety::text_len(&content) <= crate::message_safety::CONTENT_LIMIT {
+        return content;
+    }
+    // Bound labels BEFORE serializing, never clip the finished JSON. Ten
+    // 24-unit labels (even all escaped quotes/backslashes), three 64-bit
+    // numbers per row, a u64 guild id and both notes fit below 2000 units.
+    if let Some(rendered) = report["rows"].as_array_mut() {
+        for row in rendered {
+            if let Some(game) = row["game"].as_str() {
+                if crate::message_safety::text_len(game) > 24 {
+                    row["game"] = serde_json::json!(format!(
+                        "{}…",
+                        crate::message_safety::truncate(game, 23)
+                    ));
+                }
+            }
+        }
+    }
+    report["truncated"] = serde_json::json!(true);
+    format!("```json\n{report}\n```{note}\nLong game names were shortened to fit Discord's limit.")
+}
+
+/// Rows per page in the selectable Discord browse view.
+pub const GAME_MIX_PAGE_ROWS: usize = 10;
+
+/// Highest selectable browse page. The published option and the runtime
+/// decoder share this bound, so an out-of-range selector is corrected
+/// before any storage read.
+pub const GAME_MIX_MAX_PAGE: i64 = 10_000;
+
+/// Which accumulated total orders the browse view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameMixBrowseSort {
+    /// Accumulated play time, highest first (the legacy order).
+    Play,
+    /// Overlapping in-voice time, highest first.
+    Voice,
+}
+
+impl GameMixBrowseSort {
+    fn label(self) -> &'static str {
+        match self {
+            GameMixBrowseSort::Play => "play",
+            GameMixBrowseSort::Voice => "voice",
+        }
+    }
+}
+
+/// How one browse page is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameMixBrowseFormat {
+    /// The CLI JSON row shape in one fenced block.
+    Json,
+    /// Readable lines with whole-second durations.
+    Summary,
+}
+
+/// Result of rendering one selectable browse page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameMixBrowseView {
+    /// Complete private reply text within Discord's content limit.
+    Page(String),
+    /// The requested page is past the saved games; the caller answers a
+    /// correction naming the real page bound, not an empty success.
+    OutOfRange {
+        /// Total saved games for the guild.
+        total: usize,
+        /// Pages available at [`GAME_MIX_PAGE_ROWS`] rows each (at least 1).
+        pages: usize,
+    },
+}
+
+fn discord_label(game: &str) -> String {
+    let single_line: String = game
+        .chars()
+        .map(|ch| match ch {
+            '<' => '＜',
+            '`' => '｀',
+            ch if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => ' ',
+            ch => ch,
+        })
+        .collect();
+    crate::message_safety::neutralize_mentions(&single_line)
+}
+
+fn sorted_scoped_rows<'a>(
+    guild_id: &str,
+    rows: &'a [GuildGameAggregate],
+    sort: GameMixBrowseSort,
+) -> Vec<&'a GuildGameAggregate> {
+    let mut scoped: Vec<&GuildGameAggregate> =
+        rows.iter().filter(|row| row.guild_id == guild_id).collect();
+    scoped.sort_by(|a, b| {
+        let (primary_a, primary_b, secondary_a, secondary_b) = match sort {
+            GameMixBrowseSort::Play => (
+                a.total_play_ms,
+                b.total_play_ms,
+                a.in_voice_ms,
+                b.in_voice_ms,
+            ),
+            GameMixBrowseSort::Voice => (
+                a.in_voice_ms,
+                b.in_voice_ms,
+                a.total_play_ms,
+                b.total_play_ms,
+            ),
+        };
+        primary_b
+            .cmp(&primary_a)
+            .then_with(|| secondary_b.cmp(&secondary_a))
+            // `Option<&str>` order is `None` before any `Some`, then
+            // lexicographic: untitled first among full ties, titles asc.
+            .then_with(|| a.game.as_deref().cmp(&b.game.as_deref()))
+            .then_with(|| b.session_count.cmp(&a.session_count))
+    });
+    scoped
+}
+
+fn shorten_label(label: &str, cap: Option<usize>) -> (String, bool) {
+    match cap {
+        Some(cap) if crate::message_safety::text_len(label) > cap => (
+            format!(
+                "{}…",
+                crate::message_safety::truncate(label, cap.saturating_sub(1))
+            ),
+            true,
+        ),
+        _ => (label.to_owned(), false),
+    }
+}
+
+/// Whole-second duration with explicit accumulated hours (never wraps at
+/// 24 hours). Sub-second remainders round down; the summary says so.
+fn format_duration_ms(ms: i64) -> String {
+    let seconds = ms.div_euclid(1_000);
+    let hours = seconds.div_euclid(3_600);
+    let minutes = seconds.rem_euclid(3_600) / 60;
+    let seconds = seconds.rem_euclid(60);
+    format!("{hours}h {minutes}m {seconds}s")
+}
+
+/// One selectable page of the private Discord browse view.
+///
+/// Every guild aggregate is reachable: pages are deterministic slices of
+/// one fully sorted snapshot (selected total desc, the other total desc,
+/// then game title asc), [`GAME_MIX_PAGE_ROWS`] rows each except the last.
+/// Labels are neutralized and, only when the complete reply would exceed
+/// Discord's limit, shortened before serialization with an explicit note;
+/// whole rows are never dropped to fit and JSON is never clipped.
+#[must_use]
+pub fn render_game_activity_discord_browse(
+    guild_id: u64,
+    rows: &[GuildGameAggregate],
+    page: usize,
+    sort: GameMixBrowseSort,
+    format: GameMixBrowseFormat,
+) -> GameMixBrowseView {
+    let guild_id = guild_id.to_string();
+    let scoped = sorted_scoped_rows(&guild_id, rows, sort);
+    let total = scoped.len();
+    let pages = total.div_ceil(GAME_MIX_PAGE_ROWS).max(1);
+    if page < 1 || page > pages {
+        return GameMixBrowseView::OutOfRange { total, pages };
+    }
+    let start = (page - 1) * GAME_MIX_PAGE_ROWS;
+    let page_rows: Vec<&GuildGameAggregate> = scoped
+        .iter()
+        .skip(start)
+        .take(GAME_MIX_PAGE_ROWS)
+        .copied()
+        .collect();
+    // Bound labels BEFORE serializing, shrinking the cap until the whole
+    // reply (header, rows, notes) fits; ten minimal rows always fit.
+    for cap in [None, Some(24), Some(16), Some(10), Some(6)] {
+        let content = browse_page_text(&guild_id, &page_rows, total, page, sort, format, cap);
+        if crate::message_safety::text_len(&content) <= crate::message_safety::CONTENT_LIMIT {
+            return GameMixBrowseView::Page(content);
+        }
+    }
+    GameMixBrowseView::Page(browse_page_text(
+        &guild_id,
+        &page_rows,
+        total,
+        page,
+        sort,
+        format,
+        Some(6),
+    ))
+}
+
+fn browse_page_text(
+    guild_id: &str,
+    page_rows: &[&GuildGameAggregate],
+    total: usize,
+    page: usize,
+    sort: GameMixBrowseSort,
+    format: GameMixBrowseFormat,
+    cap: Option<usize>,
+) -> String {
+    let pages = total.div_ceil(GAME_MIX_PAGE_ROWS).max(1);
+    let mut shortened = false;
+    let mut labels: Vec<String> = Vec::with_capacity(page_rows.len());
+    for row in page_rows {
+        let label = discord_label(
+            row.game
+                .as_deref()
+                .unwrap_or(GAME_ACTIVITY_UNTITLED_PLACEHOLDER),
+        );
+        let (label, was_shortened) = shorten_label(&label, cap);
+        shortened |= was_shortened;
+        labels.push(label);
+    }
+    let shortened_note = if shortened {
+        "\nLong game names were shortened to fit Discord's limit."
+    } else {
+        ""
+    };
+    match format {
+        GameMixBrowseFormat::Json => {
+            let rendered: Vec<serde_json::Value> = page_rows
+                .iter()
+                .zip(&labels)
+                .map(|(row, label)| {
+                    serde_json::json!({
+                        "game": label,
+                        "total_play_ms": row.total_play_ms,
+                        "in_voice_ms": row.in_voice_ms,
+                        "session_count": row.session_count,
+                    })
+                })
+                .collect();
+            let mut value = serde_json::json!({
+                "guild_id": guild_id,
+                "rows": rendered,
+                "truncated": shortened,
+            });
+            if total == 0 {
+                value["hint"] = serde_json::json!("no game activity recorded for this guild");
+            }
+            format!(
+                "Game activity page {page} of {pages}, sorted by {} time ({total} saved games).\n```json\n{value}\n```{shortened_note}",
+                sort.label()
+            )
+        }
+        GameMixBrowseFormat::Summary => {
+            let mut text = format!(
+                "Game activity summary — page {page} of {pages}, sorted by {} time ({total} saved games).",
+                sort.label()
+            );
+            if page_rows.is_empty() {
+                text.push_str("\nNo game activity recorded for this guild yet.");
+            }
+            for (row, label) in page_rows.iter().zip(&labels) {
+                // Inline-code the member-controlled label so Markdown in it
+                // (for example a masked link) renders inert; `discord_label`
+                // already mapped any backtick in it, so it cannot close this.
+                text.push_str(&format!(
+                    "\n- `{label}` — play {} · in voice {} · {} sessions",
+                    format_duration_ms(row.total_play_ms),
+                    format_duration_ms(row.in_voice_ms),
+                    row.session_count,
+                ));
+            }
+            text.push_str(
+                "\nPlay time is accumulated across everyone who played; in-voice time is \
+                 the part of that play spent in voice, so the two overlap. \
+                 Durations use whole seconds, rounded down.",
+            );
+            text.push_str(shortened_note);
+            text
+        }
+    }
+}
+
 fn bounded(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -221,7 +600,14 @@ struct OpenSession {
     ended_at_ms: i64,
 }
 
-fn session_game(delta: &PresenceDelta) -> Option<(String, bool)> {
+/// The game (and streaming flag) one delta asserts, if any.
+///
+/// Playing wins over Streaming; blank titles assert nothing. The gateway only
+/// sends presence on change, so the collector treats the result as the
+/// member's current state until the next delta (see its carry map), rather
+/// than as one poller tick.
+#[must_use]
+pub fn session_game(delta: &PresenceDelta) -> Option<(String, bool)> {
     for activity in &delta.activities {
         if activity.activity_type == ActivityType::Playing {
             if let Some(game) = bounded(&activity.name) {

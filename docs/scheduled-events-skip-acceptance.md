@@ -10,7 +10,10 @@ REST, timer, or SQL.
 
 Fetch → `normalize_events` (`None` = `ScheduledEventsSkip::InvalidResponse`,
 fetch failure = `DiscordReadFailed`) → swap via the store. Only a `Some`
-outcome replaces the snapshot.
+outcome replaces the snapshot. A swap whose `observed_at` predates the
+committed epoch rolls back with `ScheduledEventsSkip::StaleSnapshot` (pinned
+in `replace_events_stale_outcome.rs`); the tick logs the skip and keeps the
+newer snapshot.
 
 ## What the tests pin
 

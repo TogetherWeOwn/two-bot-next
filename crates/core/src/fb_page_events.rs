@@ -33,6 +33,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+use subtle::ConstantTimeEq as _;
+
 use crate::{EventStatus, ScheduledEvent};
 
 /// Where the automation is allowed to act.
@@ -109,6 +113,204 @@ pub enum ChallengeSignal {
 pub enum DriverError {
     Challenge(ChallengeSignal),
     Failed(String),
+}
+
+/// Facebook Page webhook front door: verification plus envelope parsing.
+///
+/// Meta delivers Page webhooks as two shapes against one receiver:
+/// - GET verification:
+///   `hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=<opaque>`;
+///   the receiver echoes `hub.challenge` only when the mode and token match.
+/// - POST delivery: JSON
+///   `{"object":"page","entry":[{...,"changes":[{"field":...}]}]}` with
+///   `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(app secret, raw body)>`.
+///
+/// These pure parsers hold that surface under hostile input: arbitrary bytes
+/// fail as bounded [`DriverError::Failed`] — never a panic, OOM, or hang.
+/// Every refusal message is a static string well under
+/// [`webhook::FB_WEBHOOK_ERROR_MAX`]; secrets and hostile bytes never appear in
+/// errors. A verified envelope with zero changes is `Ok` with no changes
+/// (acknowledge with 2xx, do nothing). Driver behavior, Discord mirroring,
+/// and notification wiring are out of scope for this slice.
+pub mod webhook {
+    use super::*;
+
+    /// Re-exported so the fuzz harness names the refusal type at its own path.
+    pub use super::DriverError;
+
+    /// Largest POST body the receiver may buffer (1 MiB). Typical
+    /// page-events bodies are a few KiB, but a full Meta batch of 1000
+    /// realistic feed changes is ~255 KiB, so the cap holds a complete
+    /// 1000-update batch with ~4x headroom while still bounding memory
+    /// before JSON parsing and the HMAC.
+    pub const FB_WEBHOOK_MAX_BODY_BYTES: usize = 1024 * 1024;
+    /// Longest `hub.challenge` the verifier echoes back.
+    pub const FB_WEBHOOK_CHALLENGE_MAX: usize = 256;
+    /// Longest page id accepted per entry.
+    pub const FB_WEBHOOK_ID_MAX: usize = 128;
+    /// Longest change `field` accepted per change.
+    pub const FB_WEBHOOK_FIELD_MAX: usize = 64;
+    /// Most entries accepted per envelope: sized to Meta's documented batch
+    /// of up to 1000 updates, so an authenticated delivery within the 1 MiB
+    /// body cap is never refused for its entry count; bodies beyond the cap
+    /// are still refused as too large.
+    pub const FB_WEBHOOK_MAX_ENTRIES: usize = 1000;
+    /// Most changes accepted per envelope, across all entries: sized to
+    /// Meta's documented batch of up to 1000 updates, within the same 1 MiB
+    /// body cap.
+    pub const FB_WEBHOOK_MAX_CHANGES: usize = 1000;
+    /// Upper bound every [`DriverError::Failed`] message from this module
+    /// stays under, so hostile input can never inflate an error.
+    pub const FB_WEBHOOK_ERROR_MAX: usize = 128;
+
+    const SIGNATURE_PREFIX: &str = "sha256=";
+    /// Hex characters in a SHA-256 delivery signature: 32 bytes, hex-encoded.
+    const SIGNATURE_HEX_LEN: usize = 64;
+
+    fn failed(message: &str) -> DriverError {
+        debug_assert!(
+            message.len() <= FB_WEBHOOK_ERROR_MAX,
+            "webhook refusal exceeds the error bound: {message:?}"
+        );
+        DriverError::Failed(message.to_owned())
+    }
+
+    /// Non-empty, byte-bounded, printable-ASCII token shape shared by the
+    /// challenge echo, page ids, and change fields.
+    fn bounded_token(value: &str, max: usize) -> bool {
+        !value.is_empty() && value.len() <= max && value.bytes().all(|b| b.is_ascii_graphic())
+    }
+
+    /// One accepted page change: which page object changed and which field.
+    /// The change `value` payload is intentionally not carried: the funnel
+    /// acts on the Discord mirror row, never on Meta-supplied content.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FbPageChange {
+        pub page_id: String,
+        pub field: String,
+    }
+
+    /// A verified page-events envelope: every accepted change, in order.
+    /// Empty means acknowledge with 2xx and do nothing.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FbPageEnvelope {
+        pub changes: Vec<FbPageChange>,
+    }
+
+    /// Verify a webhook GET challenge. Returns the `hub.challenge` string to
+    /// echo on success. The expected token is compared in constant time and
+    /// never appears in errors; an empty expected token refuses everything so
+    /// a misconfigured receiver cannot verify against nothing.
+    #[must_use = "echo the challenge on Ok or refuse the handshake"]
+    pub fn verify_challenge(
+        mode: &str,
+        verify_token: &str,
+        challenge: &str,
+        expected_token: &str,
+    ) -> Result<String, DriverError> {
+        if mode != "subscribe" {
+            return Err(failed("webhook challenge mode must be \"subscribe\""));
+        }
+        if expected_token.is_empty()
+            || !bool::from(expected_token.as_bytes().ct_eq(verify_token.as_bytes()))
+        {
+            return Err(failed("webhook challenge verification failed"));
+        }
+        if !bounded_token(challenge, FB_WEBHOOK_CHALLENGE_MAX) {
+            return Err(failed("webhook challenge is invalid"));
+        }
+        Ok(challenge.to_owned())
+    }
+
+    /// Verify a POST delivery signature before any JSON is parsed. Order: size
+    /// cap, then constant-time HMAC, so an unauthenticated sender learns
+    /// nothing and cannot force a large parse.
+    #[must_use = "parse the envelope only after the signature verifies"]
+    pub fn verify_signature(
+        app_secret: &str,
+        body: &[u8],
+        signature_header: &str,
+    ) -> Result<(), DriverError> {
+        if body.len() > FB_WEBHOOK_MAX_BODY_BYTES {
+            return Err(failed("webhook body too large"));
+        }
+        if app_secret.is_empty() {
+            return Err(failed("webhook signature mismatch"));
+        }
+        let provided = signature_header
+            .strip_prefix(SIGNATURE_PREFIX)
+            .filter(|hex_part| {
+                hex_part.len() == SIGNATURE_HEX_LEN
+                    && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .and_then(|hex_part| hex::decode(hex_part).ok())
+            .ok_or_else(|| failed("webhook signature mismatch"))?;
+        let mut mac = match <Hmac<Sha256>>::new_from_slice(app_secret.as_bytes()) {
+            Ok(mac) => mac,
+            Err(_) => return Err(failed("webhook signature mismatch")),
+        };
+        mac.update(body);
+        match mac.verify_slice(&provided) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(failed("webhook signature mismatch")),
+        }
+    }
+
+    /// Parse a POST delivery body into its accepted changes. Call
+    /// [`verify_signature`] first. Malformed envelopes fail as bounded
+    /// [`DriverError::Failed`]; entries and changes beyond
+    /// [`FB_WEBHOOK_MAX_ENTRIES`] / [`FB_WEBHOOK_MAX_CHANGES`] are refused
+    /// rather than truncated so a flood can never silently shrink. The caps
+    /// match Meta's documented batch of up to 1000 updates, so a correctly
+    /// signed delivery within [`FB_WEBHOOK_MAX_BODY_BYTES`] is never refused
+    /// for its entry/change count; bodies beyond the 1 MiB cap are refused
+    /// as too large (the receiver should acknowledge with 2xx plus an alert
+    /// rather than a redelivered non-2xx).
+    #[must_use = "handle the parsed changes or the refusal, never drop it"]
+    pub fn parse_envelope(body: &[u8]) -> Result<FbPageEnvelope, DriverError> {
+        if body.len() > FB_WEBHOOK_MAX_BODY_BYTES {
+            return Err(failed("webhook body too large"));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(body).map_err(|_| failed("webhook body is not valid JSON"))?;
+        if value.get("object").and_then(serde_json::Value::as_str) != Some("page") {
+            return Err(failed("webhook object must be \"page\""));
+        }
+        let entries = value
+            .get("entry")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| failed("webhook entry list is invalid"))?;
+        if entries.len() > FB_WEBHOOK_MAX_ENTRIES {
+            return Err(failed("webhook envelope too large"));
+        }
+        let mut changes = Vec::new();
+        for entry in entries {
+            let page_id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| bounded_token(id, FB_WEBHOOK_ID_MAX))
+                .ok_or_else(|| failed("webhook page id is invalid"))?;
+            let entry_changes = entry
+                .get("changes")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| failed("webhook change list is invalid"))?;
+            if changes.len().saturating_add(entry_changes.len()) > FB_WEBHOOK_MAX_CHANGES {
+                return Err(failed("webhook envelope too large"));
+            }
+            for change in entry_changes {
+                let field = change
+                    .get("field")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|field| bounded_token(field, FB_WEBHOOK_FIELD_MAX))
+                    .ok_or_else(|| failed("webhook change field is invalid"))?;
+                changes.push(FbPageChange {
+                    page_id: page_id.to_owned(),
+                    field: field.to_owned(),
+                });
+            }
+        }
+        Ok(FbPageEnvelope { changes })
+    }
 }
 
 /// Observable driver calls (test seam; the fake records these).
@@ -845,6 +1047,15 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Mutex,
     };
+
+    /// Runtime-built HMAC fixture key: derived bytes, never a string literal,
+    /// so the hard-coded-crypto query stays quiet while assertions stay
+    /// deterministic across runs.
+    fn fixture_secret() -> String {
+        let bytes: [u8; 32] =
+            std::array::from_fn(|index| (index as u8).wrapping_mul(37).wrapping_add(11));
+        hex::encode(bytes)
+    }
 
     #[test]
     fn change_kind_routes_cancelled_to_delete_without_map() {
@@ -2110,6 +2321,408 @@ mod tests {
         let rows = fake.rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, "deleted_noop_no_mapping");
+    }
+
+    #[test]
+    fn fb_challenge_accepts_subscribe_and_echoes() {
+        use webhook::{verify_challenge, FB_WEBHOOK_CHALLENGE_MAX};
+
+        assert_eq!(
+            verify_challenge("subscribe", "token-1", "123456789", "token-1"),
+            Ok("123456789".to_owned())
+        );
+        // Deterministic under repeat calls.
+        assert_eq!(
+            verify_challenge("subscribe", "token-1", "123456789", "token-1"),
+            verify_challenge("subscribe", "token-1", "123456789", "token-1")
+        );
+        let longest = "c".repeat(FB_WEBHOOK_CHALLENGE_MAX);
+        assert_eq!(
+            verify_challenge("subscribe", "token-1", &longest, "token-1"),
+            Ok(longest)
+        );
+    }
+
+    #[test]
+    fn fb_challenge_refuses_without_leaking_the_token() {
+        use webhook::verify_challenge;
+
+        const EXPECTED: &str = "fixture-fb-verify-token";
+        let overlong = "c".repeat(257);
+        for (mode, token, challenge) in [
+            ("unsubscribe", EXPECTED, "123456789"),
+            ("SUBSCRIBE", EXPECTED, "123456789"),
+            ("", EXPECTED, "123456789"),
+            ("subscribe", "wrong-token", "123456789"),
+            ("subscribe", "", "123456789"),
+            ("subscribe", EXPECTED, ""),
+            ("subscribe", EXPECTED, overlong.as_str()),
+            ("subscribe", EXPECTED, "has space"),
+            ("subscribe", EXPECTED, "new\nline"),
+        ] {
+            let first = verify_challenge(mode, token, challenge, EXPECTED);
+            assert_eq!(
+                first,
+                verify_challenge(mode, token, challenge, EXPECTED),
+                "challenge verdicts are deterministic"
+            );
+            let err = first.expect_err("hostile challenge input must fail");
+            let rendered = format!("{err:?}");
+            assert!(
+                !rendered.contains(EXPECTED),
+                "the expected token must never appear in errors: {rendered}"
+            );
+            assert!(
+                !rendered.contains(challenge) || challenge.is_empty(),
+                "hostile bytes must not be echoed: {rendered}"
+            );
+        }
+        // An empty expected token refuses everything: a misconfigured
+        // receiver cannot verify against nothing.
+        assert!(verify_challenge("subscribe", "", "123456789", "").is_err());
+        assert!(verify_challenge("subscribe", "anything", "123456789", "").is_err());
+    }
+
+    #[test]
+    fn fb_signature_round_trip_and_refusals() {
+        use webhook::{verify_signature, FB_WEBHOOK_MAX_BODY_BYTES};
+
+        fn sign(secret: &str, body: &[u8]) -> String {
+            use hmac::{Hmac, KeyInit, Mac};
+            use sha2::Sha256;
+            let mut mac =
+                <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("test HMAC key is valid");
+            mac.update(body);
+            format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+        }
+
+        // Runtime-built, never a literal: the hard-coded-crypto query only
+        // accepts derived test keys.
+        let secret = fixture_secret();
+        let secret = secret.as_str();
+        let empty = String::new();
+        let mut other_secret = secret.to_owned();
+        other_secret.push('x');
+        let body = br#"{"object":"page","entry":[]}"#;
+        let good = sign(secret, body);
+        assert_eq!(verify_signature(secret, body, &good), Ok(()));
+        assert_eq!(
+            verify_signature(secret, body, &good),
+            verify_signature(secret, body, &good),
+            "signature verdicts are deterministic"
+        );
+
+        // Tamper the final hex digit, keeping the shape well-formed.
+        let mut tampered = good.clone();
+        let last = tampered.pop().expect("test signature is non-empty");
+        tampered.push(if last == '0' { '1' } else { '0' });
+        assert!(verify_signature(secret, body, &tampered).is_err());
+
+        for bad in [
+            String::new(),
+            "sha256=".to_owned(),
+            "sha256=zz".to_owned(),
+            "md5=abcd".to_owned(),
+            good["sha256=".len()..].to_owned(),
+            sign(&other_secret, body),
+        ] {
+            assert!(
+                verify_signature(secret, body, &bad).is_err(),
+                "signature shape must fail: {bad:?}"
+            );
+        }
+        // The body is part of the signed message.
+        let mut other = body.to_vec();
+        other.push(b' ');
+        assert!(verify_signature(secret, &other, &good).is_err());
+        // Empty secret fails closed; oversize fails before hashing.
+        assert!(verify_signature(&empty, body, &good).is_err());
+        let big = vec![b'x'; FB_WEBHOOK_MAX_BODY_BYTES + 1];
+        assert!(verify_signature(secret, &big, &sign(secret, &big)).is_err());
+        // No secret material in any refusal.
+        for rendered in [
+            format!("{:?}", verify_signature(&empty, body, &good)),
+            format!("{:?}", verify_signature(secret, &big, &sign(secret, &big))),
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the app secret must never appear in errors: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn fb_envelope_accepts_page_changes_in_order() {
+        use webhook::{parse_envelope, FbPageChange, FbPageEnvelope};
+
+        let body = serde_json::json!({
+            "object": "page",
+            "entry": [
+                {"id": "111", "time": 1_760_000_000, "changes": [
+                    {"field": "feed", "value": {"item": "post"}},
+                    {"field": "photos", "value": {}},
+                ]},
+                {"id": "222", "time": 1_760_000_001, "changes": []},
+            ],
+        })
+        .to_string();
+        let first = parse_envelope(body.as_bytes()).expect("valid envelope parses");
+        assert_eq!(
+            first,
+            parse_envelope(body.as_bytes()).expect("parses twice")
+        );
+        assert_eq!(
+            first,
+            FbPageEnvelope {
+                changes: vec![
+                    FbPageChange {
+                        page_id: "111".to_owned(),
+                        field: "feed".to_owned(),
+                    },
+                    FbPageChange {
+                        page_id: "111".to_owned(),
+                        field: "photos".to_owned(),
+                    },
+                ],
+            }
+        );
+        // Zero changes acknowledge with 2xx and do nothing.
+        let empty = serde_json::json!({"object": "page", "entry": []}).to_string();
+        assert_eq!(
+            parse_envelope(empty.as_bytes())
+                .expect("empty envelope parses")
+                .changes,
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn fb_envelope_rejects_hostile_shapes() {
+        use webhook::{
+            parse_envelope, FB_WEBHOOK_MAX_BODY_BYTES, FB_WEBHOOK_MAX_CHANGES,
+            FB_WEBHOOK_MAX_ENTRIES,
+        };
+
+        let overlong_field = "f".repeat(65);
+        let overlong_id = "1".repeat(129);
+        let hostile: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"not json".to_vec(),
+            b"{}".to_vec(),
+            b"[]".to_vec(),
+            b"null".to_vec(),
+            serde_json::json!({"object": "user", "entry": []}).to_string().into_bytes(),
+            serde_json::json!({"object": 7, "entry": []}).to_string().into_bytes(),
+            serde_json::json!({"object": "page"}).to_string().into_bytes(),
+            serde_json::json!({"object": "page", "entry": {}}).to_string().into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"id": "1"}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"changes": []}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"id": "", "changes": []}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"id": "has space", "changes": []}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"id": overlong_id, "changes": []}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"id": "1", "changes": {}}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"id": "1", "changes": [{"value": 1}]}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page", "entry": [{"id": "1", "changes": [{"field": ""}]}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"object": "page",
+                "entry": [{"id": "1", "changes": [{"field": overlong_field}]}]})
+            .to_string()
+            .into_bytes(),
+            serde_json::json!({"object": "page", "entry": ["nope"]})
+                .to_string()
+                .into_bytes(),
+        ];
+        for body in &hostile {
+            let first = parse_envelope(body);
+            assert_eq!(
+                first,
+                parse_envelope(body),
+                "envelope verdicts are deterministic"
+            );
+            assert!(
+                first.is_err(),
+                "hostile envelope must fail: {}",
+                String::from_utf8_lossy(&body[..body.len().min(120)])
+            );
+        }
+        // Floods beyond Meta's documented 1000-update batch are refused,
+        // never silently truncated; a full 1000-update batch parses.
+        let many_entries: Vec<_> = (0..FB_WEBHOOK_MAX_ENTRIES + 1)
+            .map(|i| serde_json::json!({"id": i.to_string(), "changes": []}))
+            .collect();
+        let flooded = serde_json::json!({"object": "page", "entry": many_entries}).to_string();
+        assert!(parse_envelope(flooded.as_bytes()).is_err());
+        let many_changes: Vec<_> = (0..FB_WEBHOOK_MAX_CHANGES + 1)
+            .map(|_| serde_json::json!({"field": "feed"}))
+            .collect();
+        let flooded = serde_json::json!({"object": "page",
+            "entry": [{"id": "1", "changes": many_changes}]})
+        .to_string();
+        assert!(parse_envelope(flooded.as_bytes()).is_err());
+        let full_entries: Vec<_> = (0..FB_WEBHOOK_MAX_ENTRIES)
+            .map(|i| serde_json::json!({"id": i.to_string(), "changes": []}))
+            .collect();
+        let full = serde_json::json!({"object": "page", "entry": full_entries}).to_string();
+        assert!(parse_envelope(full.as_bytes()).is_ok());
+        let full_changes: Vec<_> = (0..FB_WEBHOOK_MAX_CHANGES)
+            .map(|_| serde_json::json!({"field": "feed"}))
+            .collect();
+        let full = serde_json::json!({"object": "page",
+            "entry": [{"id": "1", "changes": full_changes}]})
+        .to_string();
+        let parsed = parse_envelope(full.as_bytes()).expect("1000-change batch parses");
+        assert_eq!(parsed.changes.len(), FB_WEBHOOK_MAX_CHANGES);
+        // A full 1000-update batch of realistic Page feed changes (~260 B
+        // each, ~255 KiB per 1000) parses well under the 1 MiB body cap. It
+        // would have been refused by the old 64 KiB cap, which held only
+        // ~250 such changes; this pins the sizing the review asked for.
+        let realistic_changes: Vec<_> = (0..FB_WEBHOOK_MAX_CHANGES)
+            .map(|i| {
+                serde_json::json!({
+                    "field": "feed",
+                    "value": {
+                        "from": {"id": "1234567890", "name": "Test Page"},
+                        "item": "post",
+                        "post_id": format!("1234567890_{i:010}"),
+                        "verb": "add",
+                        "created_time": 1_760_000_000,
+                        "message": "Hello world, this is a test post with enough content to reach a realistic delivery size.",
+                    },
+                })
+            })
+            .collect();
+        let realistic = serde_json::json!({"object": "page",
+            "entry": [{"id": "1234567890", "time": 1_760_000_000, "changes": realistic_changes}]})
+        .to_string();
+        assert!(
+            realistic.len() > 64 * 1024,
+            "realistic batch must exceed the old 64 KiB cap: {} bytes",
+            realistic.len()
+        );
+        assert!(
+            realistic.len() < FB_WEBHOOK_MAX_BODY_BYTES,
+            "realistic batch must fit the 1 MiB cap: {} bytes",
+            realistic.len()
+        );
+        let parsed =
+            parse_envelope(realistic.as_bytes()).expect("realistic 1000-change batch parses");
+        assert_eq!(parsed.changes.len(), FB_WEBHOOK_MAX_CHANGES);
+        // Invalid UTF-8 never panics the JSON parser.
+        assert!(parse_envelope(&[0xff, 0xfe, 0x00]).is_err());
+    }
+
+    #[test]
+    fn fb_front_door_errors_stay_bounded() {
+        use webhook::{parse_envelope, verify_challenge, verify_signature, FB_WEBHOOK_ERROR_MAX};
+
+        let hostile_bodies: Vec<Vec<u8>> = vec![
+            vec![0u8; 1024],
+            vec![b'"'; 512],
+            b"{".repeat(512),
+            b"\n\r\t ".repeat(128),
+            "é".repeat(256).into_bytes(),
+        ];
+        for body in &hostile_bodies {
+            for outcome in [
+                verify_challenge(
+                    &String::from_utf8_lossy(&body[..body.len().min(64)]),
+                    &String::from_utf8_lossy(&body[..body.len().min(64)]),
+                    &String::from_utf8_lossy(&body[..body.len().min(300)]),
+                    "fixture-fb-verify-token",
+                )
+                .map(|_| ())
+                .map_err(|err| format!("{err:?}")),
+                verify_signature(&fixture_secret(), body, "sha256=00")
+                    .map_err(|err| format!("{err:?}")),
+                parse_envelope(body)
+                    .map(|_| ())
+                    .map_err(|err| format!("{err:?}")),
+            ] {
+                if let Err(rendered) = outcome {
+                    assert!(
+                        rendered.len() <= FB_WEBHOOK_ERROR_MAX + 64,
+                        "refusal stays bounded: {rendered:?}"
+                    );
+                    assert!(
+                        !rendered.contains("fixture-fb-verify-token"),
+                        "no secret in errors: {rendered:?}"
+                    );
+                    assert!(
+                        !rendered.contains(fixture_secret().as_str()),
+                        "no secret in errors: {rendered:?}"
+                    );
+                }
+            }
+        }
+        // The static refusal strings themselves sit under the bound.
+        for err in [
+            verify_challenge("nope", "nope", "x", "fixture-fb-verify-token").unwrap_err(),
+            verify_signature(&fixture_secret()[..1], b"x", "nope").unwrap_err(),
+            parse_envelope(b"nope").unwrap_err(),
+        ] {
+            let DriverError::Failed(message) = &err else {
+                panic!("front-door refusals are Failed, never Challenge: {err:?}");
+            };
+            assert!(
+                message.len() <= FB_WEBHOOK_ERROR_MAX,
+                "static refusal exceeds the bound: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fb_hostile_known_urls_never_panic_and_stay_deterministic() {
+        // Arbitrary bytes at the change classifier: hostile `known_url`
+        // strings route by the one empty-URL rule, never panic, and repeat
+        // calls agree. `Cancelled` always deletes regardless of the map.
+        let huge = "x".repeat(4096);
+        let wide = "é".repeat(512);
+        let hostile = [
+            "",
+            " ",
+            "\n",
+            "https://www.facebook.com/events/1234567890",
+            huge.as_str(),
+            wide.as_str(),
+            "\u{0}",
+            "javascript:alert(1)",
+        ];
+        for url in hostile {
+            let scheduled = change_kind_for(EventStatus::Scheduled, Some(url));
+            assert_eq!(
+                scheduled,
+                change_kind_for(EventStatus::Scheduled, Some(url))
+            );
+            assert_eq!(
+                scheduled,
+                if url.is_empty() {
+                    ChangeKind::Created
+                } else {
+                    ChangeKind::Updated
+                },
+                "one empty-URL rule for hostile input: {url:?}"
+            );
+            assert_eq!(
+                change_kind_for(EventStatus::Cancelled, Some(url)),
+                ChangeKind::Cancelled,
+                "cancelled always deletes: {url:?}"
+            );
+        }
     }
 
     #[test]

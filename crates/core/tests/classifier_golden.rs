@@ -109,6 +109,8 @@ fn window_and_live_invite_attribution_match_legacy() {
                         uses: inv["uses"].as_u64().unwrap(),
                         inviter_id: None,
                         channel_id: None,
+                        max_uses: 0,
+                        temporary: false,
                     })
                     .collect();
                 let growth = invite_growth(&counters(&scenario["prevUses"]), &current);

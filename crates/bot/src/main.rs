@@ -11,7 +11,14 @@ mod admission_test_support;
 mod audit_gateway;
 mod audit_runtime;
 mod automod_gateway;
+#[cfg(test)]
+mod backfill_error_chain_acceptance_tests;
+mod backfill_retention_chains;
 mod backup_cli;
+#[cfg(test)]
+mod backup_cli_pool_open_tests;
+#[cfg(test)]
+mod backup_stable_error_codes_acceptance_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -21,10 +28,15 @@ mod command_runtime;
 #[cfg(test)]
 mod command_runtime_tests;
 mod commands_cli;
+mod community_classifier;
 mod community_jobs;
 mod containment_runtime;
 #[cfg(test)]
+mod containment_runtime_evidence_tests;
+#[cfg(test)]
 mod containment_runtime_tests;
+#[cfg(test)]
+mod custom_command_lookup_outage_acceptance_tests;
 mod database_roles_cli;
 mod db_log;
 #[cfg(test)]
@@ -32,15 +44,37 @@ mod db_log;
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
 mod dispatch;
+#[cfg(test)]
+mod drop_poison_test_serial;
+#[cfg(test)]
+mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;
+mod eventsub_delivery;
+mod eventsub_http;
+mod eventsub_reconcile;
+#[cfg(test)]
+mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
+#[cfg(test)]
+mod slow_burn_ticket_tests;
+// Supervised reconnect runner: test-only until the gateway loop adopts it,
+// so it lives in test builds instead of shipping dead code to the
+// container. The retry schedule itself lives in the library
+// (`two_bot::gateway_backoff`, re-exported here) and the gateway receive
+// loop already paces `Reconnect` failures on it.
+#[cfg(test)]
+#[path = "gateway_supervised.rs"]
+mod gateway_backoff;
 mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod giveaway_runtime;
+#[cfg(test)]
+mod hotpath_settings_test_support;
 mod interaction_admission;
 #[cfg(test)]
 mod interaction_composition_tests;
@@ -52,6 +86,13 @@ mod join_risk_runtime;
 #[cfg(test)]
 mod join_risk_runtime_tests;
 #[cfg(test)]
+mod join_risk_tuning_refusal_tests;
+mod lfg_jobs;
+#[cfg(test)]
+mod lfg_jobs_tests;
+#[cfg(test)]
+mod lfg_lifecycle_jobs_acceptance;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
@@ -60,22 +101,43 @@ mod member_cli;
 mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
+mod moderation_recent_command;
 mod moderation_release_cli;
+mod music_capture;
 #[cfg(test)]
 mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
+mod onboarding_preview_review_tests;
+#[cfg(test)]
+mod onboarding_queue_cause_forwarding_tests;
+#[cfg(test)]
 mod onboarding_tests;
+#[cfg(test)]
+mod onboarding_unknown_only_acceptance_tests;
+#[cfg(test)]
+mod onboarding_worker_failure_acceptance_tests;
+#[cfg(test)]
+mod ops_audit_acceptance_tests;
+mod ops_backfill;
 mod ops_http;
 mod preflight;
+mod privacy_command;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
 mod restore_drill;
+#[cfg(test)]
+mod retention_error_chain_acceptance_tests;
+mod retention_jobs;
+#[cfg(test)]
+mod retention_runtime_tests;
 mod schedule_runtime;
 mod scheduled_jobs;
 mod server;
 mod settings_jobs;
+#[cfg(test)]
+mod stale_control_expired_reply_acceptance_tests;
 // TOG-10292: boot composes the gated service below; fixture-only seams keep
 // the module-level allowance.
 #[allow(dead_code)]
@@ -85,13 +147,28 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+#[cfg(test)]
+mod ticket_component_admission_acceptance_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
+// Shared by the raid/containment tuning test modules; declared once so the
+// file is not loaded as two modules (clippy::duplicate_mod).
+#[cfg(test)]
+mod tuning_test_support;
 mod website_jobs;
+#[cfg(test)]
+mod website_roster_cap_acceptance_tests;
+#[cfg(test)]
+mod worker_supervision_acceptance_tests;
+#[cfg(test)]
+mod worker_supervision_builder_tests;
+#[cfg(test)]
+mod worker_supervision_review_tests;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use tracing::{info, Instrument};
@@ -152,6 +229,35 @@ async fn run(cli_args: &[String]) {
             );
             std::process::exit(1);
         });
+    let eventsub_config = two_bot_core::eventsub_receiver_config::EventsubReceiverConfig::from_env(
+    )
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    });
+    // Go-live delivery is a second, independent gate on the receiver: an
+    // enabled-but-invalid delivery config (including delivery without the
+    // receiver) refuses startup, never silently acks only.
+    let eventsub_delivery_config =
+        two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig::from_env().unwrap_or_else(
+            |_| {
+                tracing::error!(
+                    error_class = "receiver_config_invalid",
+                    "eventsub startup refused"
+                );
+                std::process::exit(1);
+            },
+        );
+    if eventsub_delivery_config.is_some() && eventsub_config.is_none() {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    }
     let config = Config::from_env().unwrap_or_else(|err| {
         if receiver_config.is_some() {
             tracing::error!(
@@ -253,7 +359,16 @@ async fn run(cli_args: &[String]) {
     let state = SharedState::new(
         Arc::clone(&gateway),
         store.as_ref().map(|s| s.pool().clone()),
-    );
+    )
+    .with_gateway_fail_injection(server::gateway_failure_injection_from_env());
+    if state.gateway_fail_injected {
+        // Staging rollback drill only (the fence refuses everywhere else):
+        // loud once at boot so the drill is unmistakable in the deploy logs.
+        tracing::warn!(
+            msg = "gateway_readiness_failure_injection_active",
+            "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill"
+        );
+    }
 
     // Disable guard: refuse to boot with moderation/automation disabled
     // while releases are still owed (pending tempban unbans, active
@@ -317,6 +432,66 @@ async fn run(cli_args: &[String]) {
         None => None,
     };
 
+    // Private EventSub listener: verified deliveries only. While delivery
+    // stays dark boot injects no dependencies and notifications are
+    // acknowledged without a send; with delivery enabled boot builds the
+    // production deps (bot pool ledger plus an admission-backed executor,
+    // the same send-admission construction as the command runtime) or
+    // refuses startup — see `eventsub_delivery`. The identity activation
+    // fence is evaluated first, like every other bot-identity posting job:
+    // a refused Announcements capability refuses startup rather than
+    // posting go-lives under an uncleared identity. Enabled failures never
+    // fall back; a bound listener that later fails stops the container.
+    let eventsub_receiver = match eventsub_config {
+        Some(eventsub_config) => {
+            let delivery = eventsub_delivery_config.map(|delivery_config| {
+                let refuse = |error_class: &'static str| -> ! {
+                    tracing::error!(error_class, "eventsub startup refused");
+                    std::process::exit(1);
+                };
+                let Some(db) = store.as_ref() else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let pool = db.pool().clone();
+                let Some(token) = config
+                    .discord_token
+                    .as_ref()
+                    .map(|secret| secret.expose().as_str())
+                    .filter(|token| !token.is_empty())
+                else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let proxy = std::env::var("DISCORD_API_BASE")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                // One-line delegation: the capability choice lives in the
+                // tested `go_live_delivery_permitted` helper so a swap to a
+                // live-cleared capability cannot slip past the delivery tests.
+                let announcements_permitted = activation.go_live_delivery_permitted();
+                eventsub_delivery::build_delivery_deps(
+                    pool,
+                    token,
+                    proxy,
+                    &delivery_config,
+                    announcements_permitted,
+                )
+                .unwrap_or_else(|error_class| refuse(error_class))
+            });
+            Some(
+                eventsub_http::bind_with_delivery(eventsub_config, delivery)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::error!(
+                            error_class = "receiver_bind_failed",
+                            "eventsub startup refused"
+                        );
+                        std::process::exit(1);
+                    }),
+            )
+        }
+        None => None,
+    };
+
     // ONE optional self-role service: gateway dispatch and the supervised
     // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
     // and failed identity reads leave the surface and the job unregistered.
@@ -345,6 +520,36 @@ async fn run(cli_args: &[String]) {
     let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
 
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
+
+    // M3.3 reconcile: once at startup plus a bounded interval while
+    // `TWO_EVENTSUB` is exactly `1`. The loop shares the bound receiver's
+    // live signing snapshot, so creates always carry the secret the
+    // receiver is verifying against (including after an armed refresh);
+    // a dark receiver means no snapshot and the task parks with an info
+    // log. Enabled-but-invalid configuration logs with an error class and
+    // never mutates. The handle is retained and joined after the
+    // supervisor drains below, never detached.
+    let webhook_secret = eventsub_receiver
+        .as_ref()
+        .map(|receiver| receiver.secret_snapshot());
+    let reconcile_task = eventsub_reconcile::spawn_if_enabled(shutdown.subscribe(), webhook_secret);
+    // Record when the shutdown watch latches so the reconcile join below
+    // shares the same `SHUTDOWN_TIMEOUT_SECONDS` budget instead of starting
+    // a second drain after the service drain has spent it.
+    let latch_mark: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+    let latch_mark_task = Arc::clone(&latch_mark);
+    let mut latch_rx = shutdown.subscribe();
+    let latch_observer = tokio::spawn(async move {
+        let _ = latch_rx.wait_for(|latched| *latched).await;
+        *latch_mark_task.lock().expect("latch mark") = Some(Instant::now());
+    });
+    // Supervisor handles for the supervised workers (raid, join-risk,
+    // containment), filled by the gateway task below and joined after the
+    // supervisor drains: retaining them here is what holds the process open
+    // for the worker drains instead of aborting them with the runtime.
+    let worker_supervisors: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
     let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
@@ -356,6 +561,12 @@ async fn run(cli_args: &[String]) {
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
+        // Cloned before the move: each supervised worker (raid, join-risk,
+        // containment) subscribes its own drain receiver below, and its
+        // supervisor handle is retained in the shared slot for the shutdown
+        // join after the supervisor drains.
+        let worker_shutdown = shutdown.clone();
+        let worker_supervisors_task = Arc::clone(&worker_supervisors);
         let gateway_span = logging::gateway_span(guild_id);
         let task = async move {
             // A panic is caught only to name it on /readyz; the task still ends
@@ -367,6 +578,7 @@ async fn run(cli_args: &[String]) {
                     let db = store.ok_or_else(|| {
                         step_failure(
                             FailureClass::StoreUnavailable,
+                            "store_unavailable",
                             sqlx::Error::InvalidArgument(
                                 "DATABASE_URL required for gateway checkpoint".into(),
                             ),
@@ -379,7 +591,11 @@ async fn run(cli_args: &[String]) {
                         two_bot_cutover::connect(&url, gateway::GATEWAY_POOL_MAX, true)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::GatewayPoolConnectFailed, error)
+                                step_failure(
+                                    FailureClass::GatewayPoolConnectFailed,
+                                    "gateway_pool_connect",
+                                    error,
+                                )
                             })?;
                     let pool = db.pool().clone();
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
@@ -387,12 +603,13 @@ async fn run(cli_args: &[String]) {
                         guild_id.to_string(),
                         0,
                     );
-                    let saved = gateway::load_boot_session(&store)
-                        .await
-                        .map_err(|error| step_failure(FailureClass::CheckpointLoadFailed, error))?;
+                    let saved = gateway::load_boot_session(&store).await.map_err(|error| {
+                        step_failure(FailureClass::CheckpointLoadFailed, "checkpoint_load", error)
+                    })?;
                     let gates = two_bot_core::OnboardingGates::from_env().map_err(|_| {
                         step_failure(
                             FailureClass::OnboardingGatesInvalid,
+                            "onboarding_gates",
                             sqlx::Error::InvalidArgument("invalid onboarding gates".into()),
                         )
                     })?;
@@ -423,18 +640,32 @@ async fn run(cli_args: &[String]) {
                         )
                     });
                     if let Some(runtime) = &runtime {
-                        let config = gateway_commands::GatewayCommandConfig::from_map(
-                            guild_id,
-                            &std::env::vars().collect(),
-                        )
-                        .map_err(|error| {
-                            step_failure(FailureClass::CustomCommandsInitFailed, error)
-                        })?;
+                        let vars: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let config =
+                            gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                                guild_id,
+                                &vars,
+                                activation.permitted(
+                                    two_bot_core::activation::LiveCapability::Moderation,
+                                ),
+                            )
+                            .map_err(|error| {
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_config",
+                                    error,
+                                )
+                            })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::CustomCommandsInitFailed, error)
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_init",
+                                    error,
+                                )
                             })?;
                     }
                     // Onboarding renders through that same executor: one shared
@@ -453,6 +684,7 @@ async fn run(cli_args: &[String]) {
                             .map_err(|_| {
                                 step_failure(
                                     FailureClass::OnboardingInitFailed,
+                                    "onboarding_init",
                                     sqlx::Error::InvalidArgument(
                                         "onboarding initialization failed".into(),
                                     ),
@@ -469,14 +701,26 @@ async fn run(cli_args: &[String]) {
                         build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::MilestonesLoadFailed, error)
+                                step_failure(
+                                    FailureClass::MilestonesLoadFailed,
+                                    "milestones_load",
+                                    error,
+                                )
                             })?,
                     );
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.
                     if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {
-                        pipeline.enable_community_facts(pool.clone());
+                        // A fresh pipeline cannot be poisoned yet, but the
+                        // refusal is typed so boot says so instead of panicking:
+                        // capture stays disabled, exactly like the flag being off.
+                        if let Err(error) = pipeline.enable_community_facts(pool.clone()) {
+                            tracing::warn!(
+                                reason = %error,
+                                "community facts arming refused; capture disabled"
+                            );
+                        }
                     }
                     // Join-burst watch is always on, as legacy raid watch was (TWO-56),
                     // and independent of the anti-nuke flags. It shares the command
@@ -492,31 +736,55 @@ async fn run(cli_args: &[String]) {
                         .map_err(|_| {
                             step_failure(
                                 FailureClass::RaidExecutorFailed,
+                                "raid_executor",
                                 sqlx::Error::InvalidArgument("raid REST executor failed".into()),
                             )
                         })?,
                     };
-                    let raid =
-                        raid_runtime::start_from_env(pool.clone(), raid_executor.clone(), guild_id);
+                    let (raid, raid_supervisor) = raid_runtime::start_from_env(
+                        pool.clone(),
+                        raid_executor.clone(),
+                        guild_id,
+                        worker_shutdown.subscribe(),
+                    );
+                    worker_supervisors_task
+                        .lock()
+                        .expect("worker supervisors")
+                        .push(raid_supervisor);
                     // Join-risk delivery (R2) shares the raid observer slot:
                     // the pipeline takes one observer, so risk chains behind
                     // the raid watch and both stay behind the funnel's join
                     // row. Without exact TWO_ANTI_NUKE=1 on the staging guild
                     // the chain is the raid watch alone.
-                    pipeline.set_join_observer(join_risk_runtime::chain_from_env(
+                    let (join_chain, risk_supervisor) = join_risk_runtime::chain_from_env(
                         pool.clone(),
                         raid_executor.clone(),
                         guild_id,
                         raid,
-                    ));
+                        worker_shutdown.subscribe(),
+                    );
+                    pipeline.set_join_observer(join_chain);
+                    if let Some(supervisor) = risk_supervisor {
+                        worker_supervisors_task
+                            .lock()
+                            .expect("worker supervisors")
+                            .push(supervisor);
+                    }
                     // Containment (R3) watches the audit-log entry slot, a
                     // separate observer from the join slot above. Without
                     // exact TWO_ANTI_NUKE=1 on the staging guild there is no
                     // observer at all; dry-run is the default and only an
                     // armed worker executes removals.
-                    if let Some(containment) =
-                        containment_runtime::start_from_env(pool.clone(), raid_executor, guild_id)
-                    {
+                    if let Some((containment, supervisor)) = containment_runtime::start_from_env(
+                        pool.clone(),
+                        raid_executor,
+                        guild_id,
+                        worker_shutdown.subscribe(),
+                    ) {
+                        worker_supervisors_task
+                            .lock()
+                            .expect("worker supervisors")
+                            .push(supervisor);
                         pipeline.set_audit_entry_observer(containment);
                     }
                     // Automod shares the command runtime's REST executor; it never
@@ -533,6 +801,7 @@ async fn run(cli_args: &[String]) {
                             tracing::error!(reason, "automod configuration rejected");
                             step_failure(
                                 FailureClass::AutomodConfigInvalid,
+                                "automod_config",
                                 sqlx::Error::InvalidArgument(reason.into()),
                             )
                         })?
@@ -552,6 +821,7 @@ async fn run(cli_args: &[String]) {
                                 .map_err(|_| {
                                     step_failure(
                                         FailureClass::AutomodExecutorFailed,
+                                        "automod_executor",
                                         sqlx::Error::InvalidArgument(
                                             "automod REST executor failed".into(),
                                         ),
@@ -577,13 +847,31 @@ async fn run(cli_args: &[String]) {
                             Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
+                    // Staging-only music voice-update capture (dry-run): wraps
+                    // the voice sink so VoiceServerUpdate/self VoiceStateUpdate
+                    // feed the Lavalink pairing without touching rooms. Inert
+                    // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
+                    let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
-                    let shard = build_shard(
-                        token,
-                        intents_from_env(&activation),
-                        saved.as_ref(),
-                        gateway_url.as_deref(),
+                    let intents = intents_from_env(&activation);
+                    // Voice-room game names need GUILD_PRESENCES; record
+                    // whether this boot requested it so a missing game
+                    // rename is diagnosable from logs alone (the flag may
+                    // be a secret binding whose value is never printed).
+                    info!(
+                        msg = "gateway_intents",
+                        voice_presences =
+                            intents.contains(twilight_model::gateway::Intents::GUILD_PRESENCES),
+                        "gateway intents resolved"
                     );
+                    // One intents value drives both the shard subscription
+                    // and the pipeline's length measurement: without
+                    // MESSAGE_CONTENT, Discord delivers content only for
+                    // bot mentions, so the pipeline must not measure it.
+                    pipeline.set_message_content_delivered(
+                        intents.contains(twilight_gateway::Intents::MESSAGE_CONTENT),
+                    );
+                    let shard = build_shard(token, intents, saved.as_ref(), gateway_url.as_deref());
                     info!(
                         msg = "gateway_connecting",
                         resume = saved.is_some(),
@@ -604,7 +892,9 @@ async fn run(cli_args: &[String]) {
                         },
                     )
                     .await
-                    .map_err(|error| step_failure(FailureClass::GatewayRuntimeFailed, error))
+                    .map_err(|error| {
+                        step_failure(FailureClass::GatewayRuntimeFailed, "gateway_run", error)
+                    })
                 })
                 .catch_unwind()
                 .await;
@@ -613,6 +903,7 @@ async fn run(cli_args: &[String]) {
                 Ok(Err(failed)) => Some(failed),
                 Err(_) => Some(step_failure(
                     FailureClass::GatewayTaskPanicked,
+                    "gateway_panic",
                     sqlx::Error::InvalidArgument("gateway task panicked".into()),
                 )),
             };
@@ -623,14 +914,8 @@ async fn run(cli_args: &[String]) {
                     // keepalive scrape sees the checkpoint counter; startup
                     // failures keep the short 15 s linger.
                     let linger = shutdown::failure_linger(failed.class);
-                    publish_gateway_failure(
-                        &state,
-                        &failure_slot,
-                        failed.class,
-                        linger_stop,
-                        linger,
-                    )
-                    .await;
+                    publish_gateway_failure(&state, &failure_slot, &failed, linger_stop, linger)
+                        .await;
                     Err(failed.error)
                 }
             }
@@ -655,12 +940,40 @@ async fn run(cli_args: &[String]) {
         self_roles,
         automod_slot,
         receiver,
+        eventsub_receiver,
         member,
     );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
+    // Both branches latch the shutdown watch before returning (the gateway
+    // supervisor sends it before its drain; the HTTP/job serve path sends
+    // it before joining its supervisor), so the reconcile task has been
+    // draining concurrently. Join it with what is left of the same shutdown
+    // deadline — never a fresh drain — rather than exiting over a possibly
+    // in-flight subscription mutation. The whole drain stays bounded by
+    // `SHUTDOWN_TIMEOUT_SECONDS`; a zero budget still reaps an
+    // already-finished task and only aborts one that outlived the deadline
+    // it already had concurrently.
+    latch_observer.abort();
+    let elapsed = latch_mark
+        .lock()
+        .expect("latch mark")
+        .map(|latched_at| latched_at.elapsed())
+        .unwrap_or_default();
+    eventsub_reconcile::join(reconcile_task, reconcile_join_budget(elapsed)).await;
+    // The supervised workers (raid, join-risk, containment) have been
+    // draining concurrently since the latch; join their retained supervisor
+    // handles with what is left of the same shutdown deadline so the process
+    // stays open for the drains instead of aborting them with the runtime.
+    // The lock is released before any await: only the handles move on.
+    let supervisors = worker_supervisors
+        .lock()
+        .expect("worker supervisors")
+        .drain(..)
+        .collect::<Vec<_>>();
+    join_worker_supervisors(supervisors, &latch_mark).await;
     if result.is_err() {
         tracing::error!(
             msg = "shutdown_failed",
@@ -732,7 +1045,8 @@ fn build_interaction_runtime(
             executor,
             0,
             two_bot_core::ClassifierConfig::from_env(),
-        ),
+        )
+        .with_classifier_provider(Arc::new(community_classifier::LiveClassifier)),
     ))
 }
 
@@ -748,23 +1062,36 @@ fn internal_receiver_prerequisites(config: &Config) -> Result<&str, &'static str
 /// Publish why the gateway task stopped, then keep serving `/readyz` for
 /// `linger` before the task returns (and the supervisor drains and exits). The
 /// Worker's 60 s keepalive and the rollout gate's 5 s poll can only report the
-/// class while the listener is still up. A shutdown request ends the linger at
-/// once, so SIGTERM never waits on it. Only the fixed class is logged or
-/// stored: SQLx errors can carry a connection URL.
+/// failure while the listener is still up. A shutdown request ends the linger
+/// at once, so SIGTERM never waits on it. The log line carries the failing
+/// step, the sanitized reason and the SQLSTATE alongside the fixed class, and
+/// `/readyz` serves the same step plus the SQLSTATE code — the class alone
+/// could not explain the prod crash loop; the raw SQLx error is never
+/// formatted, since it can carry a connection URL.
 async fn publish_gateway_failure(
     state: &RwLock<GatewayState>,
     slot: &FailureSlot,
-    class: FailureClass,
+    failed: &gateway_failure::StepFailure,
     stopping: tokio::sync::watch::Receiver<bool>,
     linger: std::time::Duration,
 ) {
+    let class = failed.class;
+    let reason = db_log::failure_reason(&failed.error);
+    let code = db_log::error_code(&failed.error);
     tracing::error!(
         msg = "gateway_failed",
         startup_phase = gateway_failure::FailurePhase::DurableGateway.as_str(),
         error_class = class.as_str(),
+        failed_step = failed.step,
+        reason = %reason,
+        error_code = code.as_deref().unwrap_or("none"),
         "durable gateway failed; checkpoint unchanged, readiness unavailable"
     );
-    slot.record(GatewayFailure::durable_gateway(class));
+    slot.record(GatewayFailure::durable_gateway(
+        class,
+        failed.step,
+        code.as_deref().unwrap_or("none"),
+    ));
     {
         let mut state = state.write().await;
         if *state != GatewayState::Draining {
@@ -804,6 +1131,62 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
         .ok_or("DATABASE_URL")?;
     let guild_id = config.guild_id.filter(|id| *id != 0).ok_or("GUILD_ID")?;
     Ok((token, url, guild_id))
+}
+
+/// Reconcile join budget sharing the service shutdown deadline.
+///
+/// The reconcile task drains concurrently with the gateway/HTTP drain, so by
+/// the time the supervisor returns it has already had `elapsed_since_latch`
+/// to stop. Waiting another full [`eventsub_reconcile::SHUTDOWN_DRAIN`] would
+/// stack a second drain after [`shutdown::deadline`] (up to ~70 s total).
+/// Instead wait at most what is left of the deadline, capped by
+/// `SHUTDOWN_DRAIN`. No floor: a zero budget still reaps an already-finished
+/// task immediately, and only a still-running task is aborted — the correct
+/// drain-exceeded outcome after it already had the full deadline concurrently.
+/// This keeps the fatal restart path fast instead of delaying `exit(1)`.
+fn reconcile_join_budget(elapsed_since_latch: Duration) -> Duration {
+    shutdown::deadline()
+        .saturating_sub(elapsed_since_latch)
+        .min(eventsub_reconcile::SHUTDOWN_DRAIN)
+}
+
+/// Join-or-abort retained worker-supervisor handles within what is left of
+/// the service shutdown deadline, after [`eventsub_reconcile::join`]. The
+/// elapsed time is re-read before each supervisor so the joins share one
+/// remaining budget instead of stacking a fresh drain per worker. A zero
+/// budget still reaps an already-finished supervisor and only aborts one
+/// that outlived the deadline it already had concurrently.
+async fn join_worker_supervisors(
+    supervisors: Vec<tokio::task::JoinHandle<()>>,
+    latch_mark: &std::sync::Mutex<Option<Instant>>,
+) {
+    for mut supervisor in supervisors {
+        let elapsed = latch_mark
+            .lock()
+            .expect("latch mark")
+            .map(|latched_at| latched_at.elapsed())
+            .unwrap_or_default();
+        let budget = shutdown::deadline().saturating_sub(elapsed);
+        match tokio::time::timeout(budget, &mut supervisor).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(
+                    panicked = error.is_panic(),
+                    "worker supervisor ended abnormally during shutdown join"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    event = "worker_supervisor",
+                    error_class = "worker_shutdown_join_exceeded",
+                    budget_ms = budget.as_millis() as u64,
+                    "worker supervisor did not finish within the remaining shutdown deadline; aborting it, so its worker drain is cut short"
+                );
+                supervisor.abort();
+                let _ = supervisor.await;
+            }
+        }
+    }
 }
 
 /// A configured gateway is essential: never leave a health-only zombie after
@@ -899,5 +1282,58 @@ async fn healthcheck() -> i32 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod reconcile_budget_tests {
+    use super::*;
+
+    /// The reconcile join shares the service shutdown deadline: supervisor
+    /// drain plus reconcile budget never exceeds the deadline, and the budget
+    /// never exceeds `SHUTDOWN_DRAIN`. Paused clock so the simulated drain
+    /// consumes virtual time deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_join_shares_the_shutdown_budget() {
+        let deadline = shutdown::deadline();
+        // Elapsed since latch that the supervisor could have consumed.
+        for consumed_secs in [0, 1, 5, 30, 34] {
+            let elapsed = Duration::from_secs(consumed_secs);
+            if elapsed > deadline {
+                continue;
+            }
+            let budget = reconcile_join_budget(elapsed);
+            assert!(
+                budget <= eventsub_reconcile::SHUTDOWN_DRAIN,
+                "budget {budget:?} exceeds SHUTDOWN_DRAIN for elapsed {elapsed:?}"
+            );
+            // Simulate the supervisor drain, then the reconcile join, on the
+            // paused clock: the total must stay within the deadline.
+            let start = tokio::time::Instant::now();
+            tokio::time::sleep(elapsed).await;
+            tokio::time::timeout(budget, std::future::pending::<()>())
+                .await
+                .expect_err("pending never completes within budget");
+            assert!(
+                start.elapsed() <= deadline,
+                "total {:?} exceeds deadline {deadline:?} for elapsed {elapsed:?}",
+                start.elapsed()
+            );
+            assert_eq!(
+                elapsed.saturating_add(budget),
+                deadline.min(elapsed.saturating_add(eventsub_reconcile::SHUTDOWN_DRAIN)),
+                "budget must be exactly the remaining deadline capped by SHUTDOWN_DRAIN"
+            );
+        }
+        // Past the deadline there is nothing left: immediate abort, which
+        // still reaps an already-finished task without delaying the restart.
+        assert_eq!(
+            reconcile_join_budget(deadline + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            reconcile_join_budget(Duration::from_secs(3_600)),
+            Duration::ZERO
+        );
     }
 }

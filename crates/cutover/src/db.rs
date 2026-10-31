@@ -19,6 +19,10 @@ use two_bot_core::database_tls::{self, TlsPolicy};
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
 /// Legacy statement timeout (`statementTimeoutMillis ?? 15_000`).
 pub const STATEMENT_TIMEOUT_MS: u64 = 15_000;
+/// Acquire bound for cutover pool opens: a hung database refuses within 10 s
+/// instead of hanging on the 30 s SQLx default. Voice inherits it through the
+/// shared `pool_options` constructor.
+pub const ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// Open the Postgres pool and apply pending migrations (unless skipped),
 /// under the `TWO_DATABASE_TLS` policy: unset means `required`.
@@ -39,7 +43,9 @@ fn tls_policy_from_env() -> Result<TlsPolicy, sqlx::Error> {
 }
 
 fn pool_options(pool_max: u32) -> PgPoolOptions {
-    PgPoolOptions::new().max_connections(pool_max)
+    PgPoolOptions::new()
+        .max_connections(pool_max)
+        .acquire_timeout(std::time::Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
 }
 
 fn voice_pool_options(pool_max: u32) -> PgPoolOptions {
@@ -140,7 +146,7 @@ mod pool_options_tests {
         );
         assert_eq!(
             options.get_acquire_timeout(),
-            PgPoolOptions::new().get_acquire_timeout()
+            std::time::Duration::from_secs(ACQUIRE_TIMEOUT_SECS)
         );
     }
 
@@ -210,7 +216,7 @@ mod pool_options_tests {
     }
 
     #[test]
-    fn nonvoice_pool_preserves_sqlx_defaults() {
+    fn nonvoice_pool_overrides_only_the_documented_acquire_bound() {
         let options = pool_options(DB_POOL_MAX_DEFAULT);
         let defaults = PgPoolOptions::new();
         assert_eq!(options.get_max_connections(), DB_POOL_MAX_DEFAULT);
@@ -222,7 +228,7 @@ mod pool_options_tests {
         assert_eq!(options.get_max_lifetime(), defaults.get_max_lifetime());
         assert_eq!(
             options.get_acquire_timeout(),
-            defaults.get_acquire_timeout()
+            std::time::Duration::from_secs(ACQUIRE_TIMEOUT_SECS)
         );
         assert_eq!(
             options.get_test_before_acquire(),
@@ -247,6 +253,13 @@ pub struct CutoverDb {
 }
 
 impl CutoverDb {
+    /// Wrap an already-open pool (gateway runtimes own their pool; the
+    /// privacy service borrows it for one call, no new connections).
+    #[must_use]
+    pub fn from_pool(pool: Pool<Postgres>) -> Self {
+        Self { pool }
+    }
+
     #[must_use]
     pub fn pool(&self) -> &Pool<Postgres> {
         &self.pool
@@ -1059,3 +1072,7 @@ mod reward_tests {
         result
     }
 }
+
+#[cfg(test)]
+#[path = "db_pool_timeout_acceptance_tests.rs"]
+mod pool_timeout_acceptance_tests;

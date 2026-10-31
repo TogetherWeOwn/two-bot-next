@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
-use two_bot_core::{EventType, FunnelEvent, FunnelStore, InviteSnapshotStore, InviteState};
+use two_bot_core::{
+    analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore, InviteSnapshotStore,
+    InviteState,
+};
 use two_bot_store::{migrate, PgFunnelStore, PgInviteSnapshots, DB_POOL_MAX};
 
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
@@ -131,6 +134,15 @@ async fn migrations_contract_and_checksum_guard() {
     .await
     .unwrap();
     assert_eq!(ranks, 5);
+    // Pins the store-embedded contract copy: Store::connect applies
+    // crates/store/sql/web_v1.sql, so a revert there must fail here.
+    let ladder: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {web}.rank_ladder"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(ladder, 5);
     // Corrupt only this test's ledger: a deployed checksum mismatch must fail.
     sqlx::query(
         "UPDATE _two_bot_migrations SET checksum = decode('00', 'hex') WHERE version = 400",
@@ -329,7 +341,12 @@ async fn insert_first_projection_rungs_and_rollback() {
         store.next_message_rung(123, 456, "2026-09-29T12:00:03.000Z"),
         None
     );
-    store.touch_activity(123, 456, "2026-09-29T11:00:00.000Z");
+    store.touch_activity(
+        123,
+        456,
+        "2026-09-29T11:00:00.000Z",
+        AnalyticsCategory::Activity,
+    );
     let recency: String = sqlx::query_scalar("SELECT to_char(last_active_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM members WHERE guild_id = '123' AND member_id = '456'")
         .fetch_one(&f.pool).await.unwrap();
     assert_eq!(recency, "2026-09-29T12:00:02.000Z");
@@ -375,6 +392,8 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
         uses: 5,
         inviter_id: Some(789),
         channel_id: Some(321),
+        max_uses: 0,
+        temporary: false,
     };
     snapshots.store_all(123, &[invite.clone()]);
     snapshots.store_all(124, &[invite.clone()]);
@@ -389,6 +408,8 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
             uses: 0,
             inviter_id: None,
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         },
     );
     assert_eq!(
@@ -513,6 +534,8 @@ async fn mock_gateway_join_records_funnel_and_persisted_attribution() {
         uses: 5,
         inviter_id: Some(789),
         channel_id: None,
+        max_uses: 0,
+        temporary: false,
     };
     pipeline.invite_source().push(123, vec![invite.clone()]);
     pipeline.prime_invite_snapshot(123);
@@ -569,7 +592,7 @@ async fn suppressed_pair_drops_funnel_writes_while_others_persist() {
             .inserted,
         "suppressed pair drops"
     );
-    store.touch_activity(123, 456, at);
+    store.touch_activity(123, 456, at, AnalyticsCategory::Activity);
     store.mark_bot(123, 456);
     let suppressed: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM members WHERE guild_id = '123' AND member_id = '456'",
@@ -598,6 +621,8 @@ async fn suppressed_pair_drops_funnel_writes_while_others_persist() {
             uses: 3,
             inviter_id: Some(456),
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         }],
     );
     let row: (i32, Option<String>) = sqlx::query_as(

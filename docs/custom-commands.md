@@ -37,7 +37,8 @@ The shared S4 interaction router and REST executor are now present on `main`.
 consumes their routing decisions and executes management/dynamic-slash handlers.
 It defers responses before transactional work, edits through the shared executor,
 suppresses mentions, audits writes/runs, and serializes mutation plus full-set
-publication. A publication failure reports a saved-but-not-synchronized result.
+publication. A publication failure reports a saved-but-pending result and
+persists a resync marker (see [Pending registry resync](#pending-registry-resync)).
 
 **Gateway composition is implemented and runtime-verified in hosted CI; it is
 not deployed.**
@@ -94,8 +95,22 @@ remaining gateway/accepted-prefix work:
 3. After a committed add/update or successful remove, consume
    `resync_registry` through the shared publisher. Rebuild from current DB
    rows plus **all** builtin definitions. An absent remove does not republish.
-   A publication failure must not be reported as a fully synchronized write.
-4. `/command-list` uses the sorted guild rows and `format_command_list`.
+   A publication failure must not be reported as a fully synchronized write:
+   it reports the saved-but-pending state and records the durable resync
+   marker described under [Pending registry resync](#pending-registry-resync).
+4. `/command-list` lists complete rows in name order, including disabled commands
+   and optional text triggers. It defaults to page 1; `/command-list page:2`
+   retrieves page 2. Each nonempty ephemeral reply identifies `Page N of M` and,
+   when there is another page, gives the next invocation. Rows plus navigation
+   fit Discord's 2,000 UTF-16-unit limit without truncating names, triggers or
+   on/off state. Page selection uses the existing quota-bounded guild snapshot,
+   not a new database pagination query. Missing `page` equals `page:1`; invalid,
+   duplicate, nonpositive or unavailable pages receive a short refusal pointing
+   to `/command-list page:1`, without writes or audit changes. Empty page 1
+   remains `No custom commands defined.`; empty page 2 is out of range.
+   Manage Server and automation gates still apply before page validation/store
+   access; mentions stay suppressed. This does not change quotas, registration
+   or the compiled-only commands CLI.
 5. Dynamic slash dispatch uses `adjudicate_run`; a known row while automations
    are off gets `AUTOMATIONS_DISABLED_REPLY`. Render inside the delivery/audit
    outcome path so both oversize output and REST failure leave a failed
@@ -110,6 +125,155 @@ remaining gateway/accepted-prefix work:
    removable. `deregister_set` deduplicates that DB-derived set. Keep the
    in-flight refusal gate active during deregistration and surface incomplete
    REST deletes instead of declaring disable complete.
+8. `/command-inspect name:<name>` shows one private ephemeral view of a saved
+   definition without running it: `view:summary` (the default) carries the
+   saved description, the saved enabled state, the text trigger, a separate
+   current text-trigger eligibility line and correction examples. The saved
+   state is only what is stored; eligibility reads the same effective
+   `TWO_TEXT_COMMANDS` gate and builtin trigger reservation as the text path.
+   It reports a missing trigger, a paused definition, the text-command gate
+   being off and a builtin-reserved trigger, each with a next action that uses
+   existing commands (`/command ... text-trigger:`, `/command-enable`, or an
+   operator configuration review). A row whose name is reserved (a
+   grandfathered voice/assistant name) cannot be replaced or resumed under that
+   name, so trigger-repair and pause remedies point at recreating it under a
+   different name or deleting it. Resume is offered only when the complete
+   stored definition passes the same validation as `/command-enable`; an
+   invalid saved template, description or trigger must be repaired with
+   `/command` first. If the gate is not available to the view it says unknown.
+   "Eligible" stays subject to normal per-message permission checks and automod and is neither a delivery promise nor evidence that the
+   slash-command registry is synchronized;
+   `view:template` shows the saved template as stored; `view:preview` renders
+   it with the invoking member/channel and explicit bounded sample arguments
+   (`arguments`, at most 500 UTF-16 units — the four-variable language ignores
+   them, so no `{args}`). Untrusted text is Markdown-escaped, views that cannot
+   fit carry an explicit truncation marker, and invalid saved templates refuse
+   with a `/command name:<name> template:` correction. Inspection never sends
+   to the channel, republishes the registry, touches cooldowns/claims, mutates
+   the definition or records a `command.run` fact; disabled rows stay
+   inspectable. Unknown, other-guild-only and deleted names share one truthful
+   miss pointing at `/command-list`; lookup outages reuse the fixed
+   availability reply below.
+
+   To check proposed text before saving or replacing a response, use
+   `/command-inspect draft:Hello {username}` instead of a saved `name`.
+   Pass exactly one of `name` or `draft`; missing input, both inputs, duplicate
+   options, unknown options and non-text values refuse before any lookup.
+   Drafts default to preview; explicit `view:preview` is equivalent, while
+   `view:summary` and `view:template` require saved-name mode. The proposed
+   template must be 1–2000 UTF-16 units and uses only `{user}`, `{username}`,
+   `{server}` and `{channel}` with the same single-pass invocation context as
+   saved previews. Optional `arguments` remain ignored — no `{args}` or
+   second interpolation pass. The private response starts **Draft preview —
+   not saved or published**. Markdown escaping and empty allowed mentions keep
+   hostile text inert; framing-only truncation is explicit, but invalid
+   placeholders and expanded output over 2000 units refuse with a correction.
+   Missing context is reported separately. Draft mode works without storage
+   and never reads/writes saved commands, republishes registration, sends to a
+   channel, records audit facts, matches triggers or consumes cooldowns/claims.
+   It cannot overwrite or enable anything. Saving later is a distinct
+   `/command name:<name> template:<text>` invocation with fresh checks; a
+   preview is not permission or a guarantee that the later save will succeed.
+9. `/command-disable name:<name>` pauses one saved definition and
+   `/command-enable name:<name>` resumes it, without deleting anything.
+   Both take exactly one text `name` (a forged type, a duplicate or any
+   extra option refuses before any store read); names lowercase before
+   lookup. Only the enabled flag and update metadata change, and only on a
+   real flip, which commits with one content-free `command.disable` /
+   `command.enable` audit fact inside the guild lifecycle lock. Missing
+   rows, current-state requests and validation refusals are zero-write:
+   no audit fact, no timestamp touch, no republish. Resuming revalidates
+   the stored row against the write rules (a reserved or invalid saved
+   definition refuses without reactivating); pausing needs no content
+   check. The flip commits before the one full-set publication, so a
+   prefix or slash invocation racing a stale picker reads the saved
+   state. A failed publication reports the saved-but-pending state and
+   records the same resync marker as a define; a repeated state never
+   claims the picker repaired, and no reply advises a restart, a delete
+   or repeating the toggle.
+
+## Pending registry resync
+
+A define, remove or toggle commits its saved definition (and its one audit
+fact) before the full registry is republished. If that publication fails —
+for example Discord refuses the replace-all PUT during an outage — the
+picker would otherwise stay stale until a restart. Instead, the failed
+publication records one durable marker row per guild in
+`automation_command_registry_resync` (migration `0468`, cutover chain):
+the guild id and the first failure time, nothing else. Recording is
+idempotent, so repeated failures keep exactly one pending row.
+
+The private confirmation names both halves of the outcome truthfully — the
+definition is saved, synchronization is pending and will resync
+automatically on the next publication — and never advises restarting the
+bot, deleting the definition or repeating the mutation (a repeated toggle
+is a no-op that does not republish). The last confirmed discovery snapshot
+does not advance.
+
+Recovery needs no new scheduler or retry API, and never replays the
+committed mutation: the next successful full-set publication — a later
+management publish, the READY/RESUMED registry sync, or the boot resync —
+rebuilds the complete set from the saved rows, advances the confirmed
+snapshot and deletes that guild's marker. One guild's recovery never
+clears another guild's pending row. The marker is best-effort recovery
+state around the publication outcome (recording or clearing it never masks
+that outcome), holds no member data, and is excluded from backups: a
+recovered process republishes the full set on boot anyway.
+
+## Slash-run audit replay
+
+A definitive pre-mutation defer refusal records a failed `command.run` fact
+with reason `delivery_failed`. An ambiguous defer (timeout, transport, 5xx or
+429) leaves no definitive run fact. Slash-run facts use
+`custom:run:<interaction_id>` and are first-write-wins: a duplicate preserves
+all original columns, including `created_at`, rather than turning the current
+delivery outcome into a storage error. Both refused-defer and completion writes
+use this rule; management and prefix audits are unchanged.
+
+This is audit deduplication, not an execution claim. Explicit re-entry still
+attempts the defer and returns that call's delivery outcome; it adds no automatic
+retry. If a later explicit call succeeds after a recorded refusal, the original
+failed fact remains unchanged. A first successful invocation records the same
+success fact as before.
+
+## Lookup outages and uncertain completion
+
+A failed definition lookup (timeout or SQL error) is not a definitive miss:
+unknown commands stay silent, but an outage cannot prove absence. When the
+surface is in scope (configured guild, automations on, non-builtin,
+non-management slash) the runtime owns the interaction with one bounded
+fixed-text ephemeral availability reply inside the existing receipt budget,
+without executing a cached or guessed definition:
+
+> Custom commands are temporarily unavailable. Please try again shortly.
+
+The copy is fixed and generic: no command name, error, or transport detail.
+A definitive absent/disabled command stays silent, as do all foreign/gated
+inputs — foreign app or guild, missing guild, builtin names, non-slash
+payloads, and a disabled automations gate even when the lookup itself fails.
+Management permission refusals still precede any lookup, and the gateway
+ownership keeps exactly one reply owner with no double fallback.
+
+Completion errors use the same uncertainty classification as the defer and
+prefix paths. A proven rejection (safe pre-mutation: Discord refused before
+any mutation) is `Delivery` and keeps its definitive failed `command.run`
+fact with reason `delivery_failed`. An uncertain completion — timeout,
+transport failure, 5xx, or 429, including an accepted edit whose response is
+lost — is `DeliveryUnknown`: exactly one PATCH, never an automatic resend,
+and no definitive failed fact, so a later explicit retry of the same
+interaction records only its own outcome. A successful completion delivers
+the rendered template and records `(ok, None)`; audit rows carry no template
+or rendered content. A render or context failure is definitive and local, so it still
+audits even when the fallback completion is uncertain.
+
+A saved template that no longer passes the definition-time rules (unknown
+placeholder, empty, or over the 2000 UTF-16-unit limit — for example after an
+import) is refused at both execution boundaries: slash completes with the
+fixed context-or-template unavailable text, prefix sends nothing, and the run
+audits `render_failed` without the template text. The definition is never
+disabled, deleted, or repaired automatically. To fix it, run
+`/command-inspect name:<name> view:preview` for the private refusal detail,
+then replace the template with `/command name:<name> template:<text>`.
 
 ## Explicit prefix acceptance and replay safety
 

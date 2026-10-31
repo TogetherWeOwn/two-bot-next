@@ -116,12 +116,57 @@ pub trait AuditMirror: Send + Sync {
 
     /// `GET /channels/{c}/messages`, newest-first; `before` is the previous
     /// page's floor id and `limit` is clamped to Discord's 1..=100 range.
+    /// Every successful page must satisfy [`validate_history_page`]: canonical
+    /// nonzero u64 message/author identities, unique strictly descending ids,
+    /// no more than the clamped limit, and every id strictly below `before`.
+    /// Reject the whole page as uncertain rather than filter or truncate it;
+    /// no row, marker, floor or exhaustion evidence is usable until it passes.
     fn channel_history(
         &self,
         channel_id: &str,
         before: Option<&str>,
         limit: u8,
     ) -> impl Future<Output = Result<Vec<MirrorMessage>, MirrorError>> + Send;
+}
+
+/// Validate a complete history page before using its markers or pagination
+/// evidence. Strict numeric descent also proves uniqueness and progress below
+/// the requested cursor. An empty/short page proves exhaustion only after this
+/// check; malformed evidence is never permission loss or proof of absence.
+/// Diagnostics are fixed metadata, never remote identities or content.
+pub fn validate_history_page(
+    page: &[MirrorMessage],
+    before: Option<&str>,
+    limit: u8,
+) -> Result<(), MirrorError> {
+    let invalid = || MirrorError::Uncertain("invalid mirror history page".to_owned());
+    if page.len() > usize::from(limit.clamp(1, HISTORY_PAGE_LIMIT)) {
+        return Err(invalid());
+    }
+    let mut previous = match before {
+        Some(cursor) => Some(history_identity(cursor).ok_or_else(invalid)?),
+        None => None,
+    };
+    for message in page {
+        let id = history_identity(&message.id).ok_or_else(invalid)?;
+        history_identity(&message.author_id).ok_or_else(invalid)?;
+        if previous.is_some_and(|upper| id >= upper) {
+            return Err(invalid());
+        }
+        previous = Some(id);
+    }
+    Ok(())
+}
+
+fn history_identity(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || value.len() > 20
+        || value.starts_with('0')
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
 }
 
 /// Verdict of the privacy/guild gate on a fetched channel document.
@@ -230,9 +275,9 @@ pub enum MirrorRecheckSkip {
     DiscordReadFailed,
 }
 
-/// Oldest message id on the page — the next page's `before` cursor, and the
-/// value compared against the boundary to know when a scan has passed below
-/// every id that could still match.
+/// Oldest message id on a page checked by [`validate_history_page`] — the
+/// next page's `before` cursor, and the value compared against the boundary
+/// to know when a scan has passed below every id that could still match.
 #[must_use]
 pub fn page_floor_id(page: &[MirrorMessage]) -> Option<String> {
     page.last().map(|message| message.id.clone())
@@ -377,6 +422,55 @@ mod tests {
             find_mirror_in_page(&page, ENTRY, BOT, Some("150")),
             Some("150".to_owned())
         );
+    }
+
+    #[test]
+    fn history_evidence_checks_cursor_even_when_empty() {
+        for cursor in ["", "0", "01", "+1", "1 ", "18446744073709551616"] {
+            assert!(matches!(
+                validate_history_page(&[], Some(cursor), 100),
+                Err(MirrorError::Uncertain(_))
+            ));
+        }
+        assert_eq!(validate_history_page(&[], Some("1"), 100), Ok(()));
+    }
+
+    #[test]
+    fn history_evidence_bounds_identities_and_uses_numeric_order() {
+        for identity in ["123456789012345678901", "９", "0", "00", "1.0"] {
+            for page in [vec![msg(identity, BOT, "")], vec![msg("10", identity, "")]] {
+                assert_eq!(
+                    validate_history_page(&page, None, 100),
+                    Err(MirrorError::Uncertain(
+                        "invalid mirror history page".to_owned()
+                    ))
+                );
+            }
+        }
+        assert_eq!(
+            validate_history_page(&[msg("10", BOT, ""), msg("9", BOT, "")], Some("11"), 2),
+            Ok(())
+        );
+        assert_eq!(
+            validate_history_page(&[msg("18446744073709551615", "1", "")], None, 1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn history_evidence_uses_the_wire_limit_clamp() {
+        assert_eq!(validate_history_page(&[msg("1", BOT, "")], None, 0), Ok(()));
+        assert!(validate_history_page(&[msg("2", BOT, ""), msg("1", BOT, "")], None, 0).is_err());
+        let full: Vec<_> = (1..=100)
+            .rev()
+            .map(|id| msg(&id.to_string(), BOT, ""))
+            .collect();
+        assert_eq!(validate_history_page(&full, None, u8::MAX), Ok(()));
+        let oversized: Vec<_> = (1..=101)
+            .rev()
+            .map(|id| msg(&id.to_string(), BOT, ""))
+            .collect();
+        assert!(validate_history_page(&oversized, None, u8::MAX).is_err());
     }
 
     #[test]

@@ -179,6 +179,9 @@ VALUES ('100000000000000001', '100000000000000020', 'create', FALSE, repeat('7',
 INSERT INTO member_levels (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
 VALUES ('100000000000000001', '100000000000000002', 9007199254740991,
         31, 60, 9007199254740900, '2026-08-01T10:00:00Z');
+-- Seasonal projection (0100): one quarter row mirroring the member above.
+INSERT INTO member_season_xp (guild_id, season_id, member_id, seasonal_xp, updated_at)
+VALUES ('100000000000000001', '2026-Q4', '100000000000000002', 91, '2026-08-01T10:00:00Z');
 -- Excluded: must be cleared by successful restore, preserved on failed restore.
 INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
 VALUES ('100000000000000001', '100000000000000002', 'message', '2026-08-01T10:00:00Z');
@@ -245,6 +248,39 @@ INSERT INTO scheduled_events
     (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
 VALUES ('100000000000000001', '100000000000000011', 'Backup event', '2026-08-02T18:00:00.000Z',
         '100000000000000003', E'Event | NULL\n雪', 'scheduled', '2026-08-01T10:00:00.000Z');
+INSERT INTO scheduled_events_claim (guild_id, epoch)
+VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', '2026-08-01T11:00:00.000Z');
+INSERT INTO scheduled_events_tombstone (guild_id, event_id, deleted_at)
+VALUES ('100000000000000001', '100000000000000012', '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', '100000000000000013', '2026-08-01T11:00:00.000Z');
+INSERT INTO giveaways
+    (guild_id, id, prize, channel_id, message_id, created_by, winners_count, ends_at,
+     status, requirements_json, max_entries, draw_nonce, created_at, updated_at)
+VALUES ('100000000000000001', '100000000000000021', 'Backup Nitro', '100000000000000003',
+        '100000000000000004', '100000000000000002', 1, '2026-08-02T18:00:00.000Z',
+        'drawn', '{"roles": [], "min_account_age_days": 0}', 1,
+        '0123456789abcdef0123456789abcdef', '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:00.000Z');
+INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at)
+VALUES ('100000000000000001', '100000000000000021', '100000000000000005', 1, '2026-08-01T11:00:00.000Z');
+INSERT INTO giveaway_draws
+    (guild_id, giveaway_id, draw_no, drawn_at, eligible_count, eligible_hash, seed,
+     winner_ids, reroll_kind)
+VALUES ('100000000000000001', '100000000000000021', 0, '2026-08-02T18:00:00.000Z', 1,
+        'eligible', 'seed', '["100000000000000005"]', NULL);
+-- Event voice pair (0455, v13): one claimed instance plus one closed and one
+-- open presence span, so the roundtrip covers the nullable lease/left_at.
+INSERT INTO event_voice_channels
+    (event_id, instance_starts_at, starts_at, ends_at, status, owner_tick_lease,
+     voice_channel_id, created_at, updated_at)
+VALUES ('100000000000000011', '2026-08-02T18:00:00.000Z', '2026-08-02T18:00:00.000Z',
+        '2026-08-02T20:00:00.000Z', 'creating', 'tick-seed', '100000000000000003',
+        '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:00.000Z');
+INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at, left_at)
+VALUES ('100000000000000011', '2026-08-02T18:00:00.000Z', '100000000000000002',
+        '2026-08-02T18:01:00.000Z', '2026-08-02T19:00:00.000Z'),
+       ('100000000000000011', '2026-08-02T18:00:00.000Z', '100000000000000004',
+        '2026-08-02T18:05:00.000Z', NULL);
 INSERT INTO counter_snapshots
     (guild_id, human_member_count, human_member_count_at, online_count, online_count_at)
 VALUES ('100000000000000001', 123, '2026-08-01T09:00:00.000Z', 13, '2026-08-01T09:01:00.000Z');
@@ -254,6 +290,22 @@ INSERT INTO presence_probe
     (guild_id, observed_at, approximate_presence_count, bot_floor, bot_floor_scan_truncated)
 VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z', 31, 3, TRUE),
        ('100000000000000001', '2026-08-01T10:01:00.000Z', 30, NULL, FALSE);
+-- Game-activity guild aggregates (0441/0442): one titled row, one untitled
+-- row (`''` game key), and one row in another guild. Guild keys only, so the
+-- roundtrip asserts archive coverage, not an empty seed.
+INSERT INTO game_activity_guild_aggregates
+    (guild_id, game, total_play_ms, in_voice_ms, session_count, updated_at)
+VALUES ('100000000000000001', 'Apex', 1800000, 60000, 1, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000001', '', 60000, 0, 1, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', 'Apex', 5940000, 0, 9, '2026-08-01T11:00:00.000Z');
+-- Assistant monthly-cap ledger (0446/0447): one row per guild keyed by the
+-- UTC month start (`month_key` 1785542400 is 2026-08-01 00:00 UTC), one
+-- part-used and one near-cap. Guild keys only, so the roundtrip asserts
+-- archive coverage, not an empty seed.
+INSERT INTO assistant_monthly_builds
+    (guild_id, month_key, build_count, updated_at)
+VALUES ('100000000000000001', 1785542400, 17, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', 1785542400, 199, '2026-08-01T11:00:00.000Z');
 
 INSERT INTO community_stream_heartbeats (guild_id, stream, covered_from, covered_through, updated_at)
 VALUES ('100000000000000001', 'event_attended', '2026-07-27T00:00:00.000Z',
@@ -297,6 +349,22 @@ VALUES (79, '100000000000000001', 'TWO_STICKY_ENABLED', NULL,
         '100000000000000002', '2026-08-01T10:00:00.123456Z'),
        (91, '100000000000000001', 'TWO_FEEDS_ENABLED', 'false', NULL,
         '100000000000000004', '2026-08-01T10:01:00Z');
+-- Admin API token registry (0456/0457): one live read token and one revoked
+-- read+moderate token. Hashes are hash-shaped seed data (md5 doubled to 64
+-- hex), never real secrets; the sha256 property is pinned by the slice-0
+-- acceptance suite, not the backup roundtrip.
+INSERT INTO admin_api_tokens
+    (token_id, secret_hash, scopes, guild_ids, label, issued_by,
+     holder_id, holder_kind, issued_at, expires_at, revoked_at, last_used_at)
+VALUES ('adm_1000000000000001', repeat(md5('backup:admin-api-tokens:1'), 2),
+        '{read}', '{100000000000000001}', 'backup reader', 'backup operator',
+        'fixture-human-reader', 'human',
+        '2026-08-01T10:00:00Z', '2026-10-30T10:00:00Z', NULL, NULL),
+       ('adm_1000000000000002', repeat(md5('backup:admin-api-tokens:2'), 2),
+        '{read,moderate}', '{100000000000000001,100000000000000002}',
+        'backup moderator', 'backup operator', 'fixture-ai-moderator', 'ai_agent',
+        '2026-08-01T10:00:00Z', '2026-10-30T10:00:00Z',
+        '2026-08-15T10:00:00Z', '2026-08-02T10:00:00Z');
 INSERT INTO audit_kill_switch (id, engaged_at, engaged_by)
 VALUES (1, '2026-08-01T10:00:00Z', '100000000000000002');
 
@@ -333,6 +401,11 @@ VALUES (repeat('3', 64), '2026-08-01T10:00:00.123456Z');
 INSERT INTO internal_event_keys (guild_id, event_key, event_id, created_at, updated_at)
 VALUES ('100000000000000001', 'backup:launch', '100000000000000002',
         '2026-08-01T10:00:00.123456Z', '2026-08-01T10:00:00.123456Z');
+INSERT INTO stream_live_claims
+    (dedup_key, broadcaster_id, started_at, channel_id, content, claimed_at, delivered_at, message_id)
+VALUES (repeat('a', 64), '123456', '2026-08-01T10:00:00Z', '100000000000000003',
+        'LIVE: backup is live on Twitch!', '2026-08-01T10:00:01Z', '2026-08-01T10:00:02Z',
+        '100000000000000006');
 
 INSERT INTO self_role_audit
     (event_id, guild_id, panel_id, member_id, source_id, option_key, role_id, source,
@@ -509,7 +582,7 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
--- Retention queues (0435): one queued guild purge plus one pending and one
+-- Retention queues (0438): one queued guild purge plus one pending and one
 -- completed user-deletion request, so the dump/restore round trip covers both
 -- the pending-NULL and completed-receipt shapes.
 INSERT INTO retention_guild_purge_queue (guild_id, enqueued_at)
@@ -595,3 +668,43 @@ VALUES ('THREAD_CREATE', '100000000000000001', '100000000000000060',
         NULL, '100000000000000002', '2026-08-03T10:01:00Z',
         'THREAD_MEMBER_UPDATE:100000000000000001:100000000000000060:2026-08-03T10:01:00Z:100000000000000002',
         NULL, NULL, NULL);
+-- Event-store S7 invite + scheduled-event capture (0439): one invite row
+-- with the code hash (never the raw code) plus the inviter id, and one
+-- scheduled-event lifecycle row with the status/entity-type enums. The hash
+-- below is hash-shaped seed data; the sha256 property itself is pinned by
+-- the S7 acceptance suite, not the backup roundtrip.
+INSERT INTO event_store (event_type, guild_id, channel_id, invite_code_hash,
+  inviter_id, event_time, received_at, dedup_key)
+VALUES ('INVITE_CREATE', '100000000000000001', '100000000000000033',
+        repeat(md5('backup:event-store:invite'), 2), '100000000000000002',
+        '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
+        'INVITE_CREATE:100000000000000001:100000000000000033:' ||
+          repeat(md5('backup:event-store:invite'), 2) ||
+          ':2026-08-03T10:00:00Z');
+INSERT INTO event_store (event_type, guild_id, channel_id, scheduled_event_id,
+  event_status, entity_type, event_time, received_at, dedup_key)
+VALUES ('GUILD_SCHEDULED_EVENT_CREATE', '100000000000000001',
+        '100000000000000033', '100000000000000065', 1, 2,
+        '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
+        'GUILD_SCHEDULED_EVENT_CREATE:100000000000000001:100000000000000065:2026-08-03T10:00:00Z');
+-- Starboard foundation (v11): one configured guild plus one default/off guild;
+-- two starrers on one message and one on another; one posted board row plus
+-- one pending (NULL board message) below-threshold row. BIGINT snowflakes, so
+-- the roundtrip asserts archive coverage with numeric ids, not an empty seed.
+INSERT INTO starboard_config
+    (guild_id, board_channel_id, threshold, emoji, excluded_channel_ids, updated_by)
+VALUES (100000000000000001, 100000000000000010, 5, '🌟',
+        ARRAY[100000000000000003]::bigint[], 'backup-operator'),
+       (100000000000000002, NULL, 3, '⭐', '{}'::bigint[], NULL);
+INSERT INTO starboard_starrers
+    (guild_id, source_channel_id, source_message_id, user_id)
+VALUES (100000000000000001, 100000000000000003, 100000000000000006, 100000000000000002),
+       (100000000000000001, 100000000000000003, 100000000000000006, 100000000000000004),
+       (100000000000000001, 100000000000000003, 100000000000000007, 100000000000000002);
+INSERT INTO starboard_posts
+    (guild_id, source_channel_id, source_message_id, board_channel_id,
+     board_message_id, star_count, state)
+VALUES (100000000000000001, 100000000000000003, 100000000000000006,
+        100000000000000010, 100000000000000020, 2, 'posted'),
+       (100000000000000001, 100000000000000003, 100000000000000007,
+        100000000000000010, NULL, 1, 'below_threshold');

@@ -6,8 +6,21 @@ Existing required reviewers, independent exact-source review, recovery/ACL
 checks and written CEO GO remain required. Production has its own mirror:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
 binds the same projection hash but requires the production workflow path,
-environment, `migration_target` and `PRODUCTION_HOST`/`PRODUCTION_DATABASE`
-pins; a staging claim never satisfies it and vice versa.
+environment, `migration_target` and
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE`/`PRODUCTION_BRANCH_ID` pins (a
+PlanetScale plan without the pinned branch id, or a request pin that does not
+match the plan, refuses); a staging claim never satisfies it and vice versa.
+Both gates require the explicit `migration_target` the producer emits
+(`staging` here, `production` there); a field-less or wrong-target manifest
+refuses with fixed vocabulary, and the marker sits outside the projection
+hash. The host denylists are intentionally mirror-image rather than
+identical: the staging gate refuses prod-like hosts and databases, while the
+production gate refuses staging-like hosts (staging label, Neon, test
+database, pooler). Each gate therefore refuses the other's label-bearing
+canonical test host; label-free targets such as identical PlanetScale hosts
+are distinguished by the explicit marker, workflow identity and pin match,
+not the denylist. The explicit-target acceptance tests pin both
+directions.
 
 ## Available before environment approval
 
@@ -47,8 +60,10 @@ The JSON object carries these fields, with no database URL or credentials:
 | `workflow_head_sha` | `github.sha`, the workflow run's full lowercase 40-hex revision |
 | `source_sha` | reviewed migration source, full lowercase 40-hex; can differ from workflow head |
 | `plan_manifest_sha256` | lowercase 64-hex Rust projection digest |
+| `store_plan_manifest_sha256` | lowercase 64-hex Rust store-chain projection digest |
 | `target` | object with bare non-secret `host` and `database` |
 | `expected_pending` | strictly ascending array of canonical positive i64 **decimal strings** |
+| `expected_store_pending` | strictly ascending array of canonical positive i64 **decimal strings** for the store chain |
 | `recovery_evidence_ref`, `acl_plan_ref` | bare evidence references, not credential-bearing URLs |
 
 The publisher compares the request's source, target, pending set and approval
@@ -82,6 +97,14 @@ Use `source_migrations[].sha384`, not `sha384_recomputed`. This is not JSON
 serialization, not a digest of the enclosing self-describing manifest, and not
 an upload-artifact ZIP digest. Target, role and approval references are outside
 this projection, so comparing the hash alone cannot verify them.
+
+The store chain (`crates/store/migrations/`, ledger
+`public._two_bot_migrations`) binds through a second projection of the exact
+same shape: `source_sha`, then `pending_store_before`, then **all up store
+source migrations** as `version:description:sha384`, each plus LF. The claim
+carries it as `store_plan_manifest_sha256` with `expected_store_pending`;
+the runner recomputes both projections and proves both against the producing
+run's manifest before any DDL. The cutover projection is unchanged.
 
 The shared synthetic vectors are:
 

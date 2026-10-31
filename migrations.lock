@@ -1,6 +1,14 @@
 {
   "version": 1,
   "migrations": {
+    "crates/store/migrations/0458_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
+    },
+    "crates/cutover/migrations/0459_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Mirror the starboard foundation in the deployed cutover migration chain."
+    },
     "crates/cutover/migrations/0001_funnel.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "45d9bc7e665ac79f43e4e43ac6a87fcbeb877c5396fb4dcb5ca3d81a738d5158"
@@ -8,6 +16,14 @@
     "crates/cutover/migrations/0002_leveling.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "e257889e79beb83896f686fecd2116ca653ce0ef9392c622618f720ccd9b712c"
+    },
+    "crates/cutover/migrations/0100_participation_rewards_antigaming.sql": {
+      "justification": "Add participation-rewards anti-gaming seasonal projection for TOG-22868; additive nullable-only migration.",
+      "sha256": "757fbef0724e5abf37b0b8a10434800e4c3748c0f10d0fa8653c37c6dca6a34f"
+    },
+    "crates/cutover/migrations/0101_seasonal_decay_watermark.sql": {
+      "justification": "Add seasonal-decay idempotency watermark for TOG-22868; additive column with backfill default.",
+      "sha256": "841a79fd528393f58fef6e5faf6b1d4f7a122aabe4cebf6a3aaed435729c1b98"
     },
     "crates/cutover/migrations/0110_moderation_member.sql": {
       "sha256": "5cac88b239c9a38ead5318f0d1f75bc0ffc1abeaf414d2d8e7bccf6a2da327a4",
@@ -60,6 +76,10 @@
     "crates/cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql": {
       "sha256": "d4f98434aa21dca034e64f3e0a766539450deaeb9fc4aff2fc1f7c7f48a11d6e",
       "justification": "Upgrade existing legacy scheduled queues to BIGINT and add claim/nonce columns for TOG-10081 without changing locked migration 0140 or row facts."
+    },
+    "crates/cutover/migrations/0142_scheduled_delivery_uncertainty.sql": {
+      "sha256": "941f5ec8e504cf16a426bdbc5d59a2ab94b89abf726c00b9310de73089f55f67",
+      "justification": "Fence possibly accepted scheduled occurrences durably and conservatively preserve pending legacy sends."
     },
     "crates/cutover/migrations/0150_sticky_messages.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
@@ -301,6 +321,14 @@
       "sha256": "18f81ad0a9f98008cb975ef469f1d52f5c10100b31b14bf63693bb2a4f731abc",
       "justification": "TOG-12415: S6 target DDL for the go.two.gg redirect store; legacy 0006 shape with timestamptz."
     },
+    "crates/store/migrations/0408_backfill_cursors.sql": {
+      "sha256": "5b51e4a320368ca9bc68834dfd4ade19e910aa46129b5e1940bec919fd3d067c",
+      "justification": "Resumable per-family backfill cursors so a crash resumes from the persisted cursor, never from zero; ids/cursors/timestamps only."
+    },
+    "crates/store/migrations/0409_backfill_history.sql": {
+      "sha256": "3ec60c7b6c7b98448125631d8857513eee0d23e9487334ebfac9ed0db0963f10",
+      "justification": "Channel-history metadata catch-up tables for message, channel and author ids plus timestamps only; no bodies, additive IF NOT EXISTS."
+    },
     "crates/cutover/migrations/0418_voice_join_grants.sql": {
       "sha256": "e0f7419d2526a36b822892b5206619f24684f3edfa0231ac43262c1116fcfb03",
       "justification": "Voice V3 approved Connect grants: durable voice_join_grants witness per approved room member, written before the Discord grant and retired only after revocation, so a restart cannot strand a Connect allow past /public."
@@ -332,6 +360,10 @@
     "crates/cutover/migrations/0425_internal_action_audit_resources.sql": {
       "sha256": "f5280fb02325d7f63a2f563f410f71bb7b79e228a4362537511ae687cab27980",
       "justification": "Audit resource witness for event intents: nullable resource_id/affected/outcome on internal_action_log copied from the completed receipt so a target-less event create still names its Discord event; additive, backout drops the columns."
+    },
+    "crates/cutover/migrations/0448_internal_action_stop_reason.sql": {
+      "sha256": "de10c43d5c2935c8bb0056df56137a431f5c5730600ab7e05c1d1f4578c3a57c",
+      "justification": "Durable purge stop reason for website channel-moderation receipts: nullable refused/rate_limited on internal_idempotency and its terminal audit so an outer replay of an early-stopped purge keeps its reason; additive, backout drops both columns. Numbered 0448 because the store chain owns 0446 and the cutover chain 0447; global migration numbers remain unique across both chains."
     },
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
@@ -369,9 +401,129 @@
       "sha256": "798f514afa6cc212a10aba9fb769ba56dd43a7dfcde31983a114421b81dabf7e",
       "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
     },
-    "crates/cutover/migrations/0435_retention_queues.sql": {
+    "crates/cutover/migrations/0435_backfill_cursors.sql": {
+      "sha256": "f6a7789c4c56fb6002b20f5a3f683913212a125385e62d0467d23b669e2a504d",
+      "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases. Renumbered 0433 to 0435 on the merge past main's 0433/0434 privacy opt-out."
+    },
+    "crates/cutover/migrations/0436_member_catchup.sql": {
+      "sha256": "272b679ab44fa9b84621e5c9fbb07e2b11455e18f29c8709c553b0f955ed771f",
+      "justification": "TOG-22941 member-list catch-up worker tables (member_catchup_members/cursors) plus the members-frontier checkpoint contract with backfill_cursors; ids/timestamps/enums only, IF NOT EXISTS, so catch-up writes work on migrated databases and progress reflects the worker. Renumbered 0434 to 0436 on the merge past main's 0433/0434 privacy opt-out."
+    },
+    "crates/cutover/migrations/0437_event_store_s1_core.sql": {
+      "sha256": "9e1c4d2f46f3a36e1e155de83a41a2bcd1d5c4dd2f68ab47dbdd304082e8a1ef",
+      "justification": "Event-store S1 append-only core: order-independent event_store table with MESSAGE_CREATE metadata columns (event_type, guild_id, channel_id, message_id, user_id, event_time, received_at, dedup_key) plus nullable convergence and the shared UNIQUE dedup index; ids+timestamps only, no body columns."
+    },
+    "crates/cutover/migrations/0438_retention_queues.sql": {
       "sha256": "7ab729b1c4340ab962ef0b8beba6aff3ecd1962e2fb0f002d5e1e75b5c351f56",
-      "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables. Renumbered from 0427 to 0435 after main claimed 0427 for event-store voice capture; the 0427 file never merged so no database has applied it under either number."
+      "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables. Renumbered from 0427 to 0437 and then 0438 after main claimed 0427 for event-store voice capture, 0435/0436 for backfill cursors and member catch-up, and 0437 for event-store S1 core; the 0427/0437 files never merged so no database has applied them under either number."
+    },
+    "crates/cutover/migrations/0439_event_store_invite_scheduled_event_capture.sql": {
+      "sha256": "ec8fa9475530ab759dafa3d2963e9465796daa7e05f8d500d001aa2a13721312",
+      "justification": "Event-store S7 invite + scheduled-event capture: order-independent event_store invite columns (invite_code_hash as hex sha256, never the raw code, plus inviter_id) and scheduled-event columns (scheduled_event_id plus event_status/entity_type integer enums) with nullable convergence and the shared UNIQUE dedup index; ids+hash+timestamps+enums only, no description/name/location/username columns. Renumbered to 0439 because the merged retention migration owns 0438; the S7 migration has not merged."
+    },
+    "crates/cutover/migrations/0440_stream_live_claims.sql": {
+      "sha256": "c34223b642a8c626281eef8fecef96f165a9d96be4acf510bff550f5d5e50c72",
+      "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence. Renumbered 0435 to 0438 on the merge past main's 0435/0436 backfill and 0437 event-store S1 core, then to 0439 after main added 0438 retention queues, then to 0440 after main added 0439 event-store S7 invite/scheduled-event capture."
+    },
+    "crates/cutover/migrations/0441_game_activity_guild_aggregates.sql": {
+      "sha256": "fb64d28a044ed67813fc4056aa964df52a15c3010405c2394c8da01feebb25db",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0440 to 0441 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0443_stream_live_send_started.sql": {
+      "sha256": "8b7d50d4c332178adb67ee88a0de6c9c071fd3aaceacb48c94e806209f229844",
+      "justification": "Stale-claim recovery fence for the Twitch go-live ledger: send_started_at marker committed before the first Discord POST plus a claim_token ownership fence (generated on claim, rotated on takeover, required to start/stamp/release) so atomic takeover reclaims only never-sent stale claims and ambiguous started/delivered rows stay fenced. Renumbered 0441 to 0443 after main claimed 0441/0442 for game-activity aggregates; never merged under 0441."
+    },
+    "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
+      "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0444_event_store_expiry_index.sql": {
+      "sha256": "44d0e0371d3536192ccf7e2ccec0c52e5066480392f18413f95b69a872b81750",
+      "justification": "Initial event_time/id index for bounded raw expiry, superseded by 0445's event-class index; built transactionally because concurrent index creation deadlocks parallel test migrators."
+    },
+    "crates/cutover/migrations/0445_event_store_expiry_class_index.sql": {
+      "sha256": "0d9633dc2763776ac633aff5f694d02ad6d5f0afb7b39d2b20d8ad8e0750c700",
+      "justification": "Replace the broad event-time index with a per-event-class index so capped expiry scans avoid non-expiring event-store families."
+    },
+    "crates/store/migrations/0446_assistant_monthly_builds.sql": {
+      "sha256": "947269d9cce4a695fb62743588da4a604cae90d330a706c629935425d8da5056",
+      "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; store chain copy, IF NOT EXISTS. Renumbered 0444 to 0446 after main claimed 0444/0445 for event-store expiry indexes; never merged under 0444."
+    },
+    "crates/cutover/migrations/0447_assistant_monthly_builds.sql": {
+      "sha256": "f5f5cdfc03f21d0a5329afc4924c92fc42a1aac97a25337dc48bf766542f4e39",
+      "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; cutover chain copy, IF NOT EXISTS. Numbered 0447 because the store chain owns 0446; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0449_self_role_ticket_acknowledgement.sql": {
+      "sha256": "0e39d7b88d4109475359640a38d066d8a2b31b168bc7f46a324bb4db3cb92c8c",
+      "justification": "Self-role ticket-row acknowledgement lifecycle: nullable settled_at/settled_as/superseded_by/outcome_class plus attempt_no defaulting to 1 on self_role_exchanges with closed-set checks, so ambiguous sends persist per send and pre-existing rows read back unsettled; additive IF NOT EXISTS, backout drops the five columns. Numbered 0449 because the cutover chain owns 0447/0448; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0450_scheduled_events_claim.sql": {
+      "sha256": "0023e4e828e6efe2b8939fc2a364de4f265baaed72be4680d4d1ab6e6442d09e",
+      "justification": "Per-guild epoch-claim gate for the scheduled-event mirror: new table scheduled_events_claim(guild_id PK, epoch TEXT); the swap claims observed_at before DELETE so strictly older fetches roll back instead of resurrecting deleted rows. Additive, IF NOT EXISTS; numbered 0450 because open work owns 0449; rollback drops the table."
+    },
+    "crates/store/migrations/0451_scheduled_events_claim.sql": {
+      "sha256": "7a76512da8e7033e41a655955db9a7e243e55d92bf2a747312f2809399b927b2",
+      "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0452_scheduled_events_tombstone.sql": {
+      "sha256": "2be34c33d7a002668ed9f51e41172f208ac59b2b9d713763bba9aa3ba8e06adb",
+      "justification": "Delete tombstones for the scheduled-event mirror: new table scheduled_events_tombstone(guild_id, event_id, deleted_at TEXT; PK(guild_id, event_id)); the swap records one row per DELETE-removed id so equal-stamp replays cannot resurrect removed rows. Additive, IF NOT EXISTS, no covering index (guild PK prefix serves the bounded per-guild scans); numbered 0452 as the next free global migration; rollback drops the table."
+    },
+    "crates/store/migrations/0453_scheduled_events_tombstone.sql": {
+      "sha256": "21775bde6ded22b7b0c8e025365b70ecab9bb1961a98b7d34eb26ab713dd6a1e",
+      "justification": "Store-chain copy of the scheduled_events_tombstone delete layer (cutover 0452): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
+      "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
+      "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
+    },
+    "crates/cutover/migrations/0455_event_voice_channels.sql": {
+      "sha256": "3495774bcc64661f8dd70e99f0159a54890a2bd19f40637623577a85b6997704",
+      "justification": "Event voice channel idempotency key plus presence spans: event_voice_channels keyed UNIQUE (event_id, instance_starts_at) with timestamptz starts/ends, lease plus UNIQUE channel binding, and event_voice_presence spans (natural PK, one open span per member via inline EXCLUDE). Additive, IF NOT EXISTS, constraints inline; numbered 0455 because the merged sticky delivery fence owns 0454; rollback drops the tables."
+    },
+    "crates/cutover/migrations/0456_admin_api_tokens.sql": {
+      "sha256": "3452a9adac7ee312a3f10f4150d34effff441e3fac32931a1e8bc08860ac4be2",
+      "justification": "Admin API scoped-token registry (slice 0): new table with shaped token id, 64-lowercase-hex secret_hash CHECK, closed-set scopes, non-empty guild_ids with NULL elements refused, ordered issued/expires bounds and nullable revoked/last_used; live-lookup index on (revoked_at, expires_at). Hardened before first merge; additive IF NOT EXISTS, no binary reads it yet; rollback drops the table. Numbered 0456 after main claimed 0452/0453 for tombstones and 0454 for sticky uncertainty during review; never merged or deployed under the old numbers. SQL body unchanged."
+    },
+    "crates/store/migrations/0457_admin_api_tokens.sql": {
+      "sha256": "622bcbc5cfc2561432290c293e15d30d89997435970088c6e4c01f37e20f962d",
+      "justification": "Store-chain mirror of cutover 0456, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0457 because cutover owns 0456; global migration numbers remain unique across both chains. Renumbered before first merge after main claimed 0454; SQL body unchanged."
+    },
+    "crates/cutover/migrations/0460_giveaways.sql": {
+      "sha256": "366727f74b8cd77d29de430063ad77def44edd9982e25352b2e5d108e0243314",
+      "justification": "Giveaways slice 1: additive IF NOT EXISTS definitions, entries and draws with composite foreign keys. Renumbered only the unmerged pair to cutover 0460/store 0461 after main claimed 0458/0459 for starboard. Never merged or deployed under earlier numbers; SQL body unchanged; only migration-number comments changed."
+    },
+    "crates/store/migrations/0461_giveaways.sql": {
+      "sha256": "5309afc33d9e77216a6aa2d53c077bc6a3917355f1d7541b0e32016cac4eda1d",
+      "justification": "Giveaways slice 1: additive IF NOT EXISTS definitions, entries and draws with composite foreign keys. Renumbered only the unmerged pair to cutover 0460/store 0461 after main claimed 0458/0459 for starboard. Never merged or deployed under earlier numbers; SQL body unchanged; only migration-number comments changed."
+    },
+    "crates/cutover/migrations/0464_admin_api_token_authority.sql": {
+      "sha256": "10adf3c188396efa6444ed6c41b5065c91f2356ec99196a2aef29cd4f80466ab",
+      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0460 to 0462 after main claimed 0460/0461 for giveaways, then cutover 0462 to 0464 after main claimed 0462 for the audit cursor. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints. Before first merge, remove the unsupported TEMPORARY prerequisite: create an empty same-server canonical CHECK reference in the registry schema using existing CREATE, then drop it within the file transaction; collisions refuse, failure rolls back, and no helper or new grant persists."
+    },
+    "crates/store/migrations/0463_admin_api_token_authority.sql": {
+      "sha256": "88610896bf299c958449eb02b9d91cfb6bc92f5cd627168c499916040a2c4722",
+      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0461 to 0463 after main claimed 0460/0461 for giveaways; sync mirror comment after cutover 0462 moved to 0464. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints. Before first merge, remove the unsupported TEMPORARY prerequisite: create an empty same-server canonical CHECK reference in the registry schema using existing CREATE, then drop it within the file transaction; collisions refuse, failure rolls back, and no helper or new grant persists."
+    },
+    "crates/cutover/migrations/0462_audit_reconcile_cursor.sql": {
+      "sha256": "5c0ddbb7a347f3cf0c23e3e5216fe30aa276d6dbe5747dbbaae358fec6d9ee02",
+      "justification": "Nullable durable audit reconciliation floor: checkpoint only fully inspected pages, resume across bounded claims without another POST, and preserve the original boundary and acceptance evidence. Additive IF NOT EXISTS; previous-binary rollback retains this column. Renumbered before first merge to 0462 because main owns 0458/0459 starboard and 0460/0461 giveaways; SQL bytes unchanged and no live migration performed."
+    },
+    "crates/store/migrations/0465_pause_resume_marker.sql": {
+      "sha256": "9bcdd51d56fcc640f31f12896a3a8f618f2e7321426a0a2e7503e4e527d598ac",
+      "justification": "Giveaways pause/resume: nullable paused_at marker so resume extends ends_at by the paused span; additive ADD COLUMN IF NOT EXISTS mirrored as cutover 0466. Neutral stem before first merge: the slice-1 acceptance scan bans ALTER in giveaway-named files."
+    },
+    "crates/cutover/migrations/0466_pause_resume_marker.sql": {
+      "sha256": "c8a89d2216fddc78613252613701d96b43f905e8433b5409ca71d4d387ec05ef",
+      "justification": "Cutover mirror of the store 0465 giveaway paused_at marker; additive ADD COLUMN IF NOT EXISTS so both chains cross-run in either order. Neutral stem before first merge: the slice-1 acceptance scan bans ALTER in giveaway-named files."
+    },
+    "crates/cutover/migrations/0467_lfg_close_refresh_retry.sql": {
+      "sha256": "e87c72b263549eacd4b56bad5aa66ca7c5c99351bf76509e2a0bac7c7f74a8e3",
+      "justification": "Persist the pending close-message edit atomically with LFG close transitions so the lifecycle worker can retry the exact saved message after failed edits and restarts; historical closed rows read back not pending."
+    },
+    "crates/cutover/migrations/0468_custom_command_registry_resync.sql": {
+      "sha256": "cb185447276adc89c206ad789c506a619403664dfde5a23bdf1544031f3d1777",
+      "justification": "Add the one-row-per-guild durable pending marker recorded when a committed custom-command mutation's registry publication fails, so the next successful full-set publication resyncs the picker without a bot restart or a mutation replay; runtime state only, cutover chain only."
     }
   }
 }

@@ -7,7 +7,9 @@
 
 pub mod action_outcomes;
 pub mod activation;
+pub mod analytics_family;
 pub mod anchor_event;
+pub mod assistant_transport;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
@@ -50,8 +52,15 @@ pub mod database_roles;
 pub mod database_tls;
 pub mod database_url;
 pub mod disable_preflight;
+pub mod duplicate_keys;
 pub mod e2e_matrix;
+pub mod error_chain;
+#[cfg(feature = "db")]
+pub mod event_reminder_store;
 pub mod events;
+pub mod eventsub_delivery_config;
+pub mod eventsub_receiver_config;
+pub mod eventsub_refresh;
 pub mod evidence;
 pub mod expected_joins;
 pub mod fb_page_events;
@@ -63,8 +72,13 @@ pub mod feeds_http;
 pub mod feeds_store;
 pub mod funnel;
 pub mod game_activity;
+#[cfg(feature = "db")]
+pub mod game_activity_store;
 pub mod gateway_funnel;
 pub mod gateway_session;
+pub mod giveaway;
+#[cfg(feature = "db")]
+pub mod giveaway_store;
 pub mod handlers;
 pub mod health;
 pub mod help;
@@ -84,6 +98,7 @@ pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
 pub mod lfg;
+pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
@@ -96,9 +111,15 @@ pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
+pub mod moderation_recent;
+#[cfg(feature = "db")]
+pub mod moderation_recent_store;
+pub mod music_voice;
 pub mod onboarding;
+pub mod onboarding_destination;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
+pub mod ops_fetch;
 pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
@@ -118,13 +139,19 @@ pub mod scheduled_events;
 #[cfg(feature = "db")]
 pub mod scheduled_store;
 pub mod secret;
+pub mod tempban_inventory;
 pub use secret::Secret;
 pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
 pub mod sticky;
 pub mod stream_funnel;
+pub mod stream_live;
+#[cfg(feature = "db")]
+pub mod stream_live_store;
 pub mod tickets;
+pub mod twitch_eventsub;
+pub mod twitch_helix;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
@@ -167,10 +194,11 @@ pub mod voice_vote_kick_audit;
 pub mod website_store;
 
 pub use action_outcomes::{
-    backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
-    parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
-    KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
-    MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+    backoff_ms, backoff_ms_jittered, classify_kick_status, clear_send_bit, jitter_seed,
+    lockdown_overwrite, pace_wait_ms, parse_retry_after_secs, retry_after_ms,
+    retry_after_ms_unclamped, set_send_bit, unlock_overwrite, ActionOutcome, KickOutcome,
+    KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_BACKFILL_RETRY_AFTER_MS,
+    MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
 };
 pub use automation_transfer::{
     diff_import, export_document, max_import_entries, parse_import_document, ExportDocument,
@@ -187,8 +215,8 @@ pub use channel_moderation::{
     message_created_ms, moderation_result_text, plan_lockdown, plan_purge, plan_unlock,
     require_channel_reason, validate_purge_count, validate_slowmode_seconds, BoundsError,
     ChannelModerationVerb, ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord,
-    LockdownSeed, MaskError, PurgePlan, UnlockError, UnlockPlan, LOCKDOWN_BITS, MAX_PURGE_COUNT,
-    MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, SEND_MESSAGES_BIT,
+    LockdownSeed, MaskError, PurgePlan, PurgeReport, PurgeStopReason, UnlockError, UnlockPlan,
+    LOCKDOWN_BITS, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, SEND_MESSAGES_BIT,
 };
 #[cfg(feature = "db")]
 pub use channel_moderation_store::{
@@ -251,11 +279,28 @@ pub use funnel::{
     format_iso_millis, idempotency_key, is_measurable_gate_clearing, now_iso, parse_iso_millis,
     EventType, FunnelEvent, Snowflake, MESSAGE_RUNGS,
 };
+pub use giveaway::{
+    adjudicate_eligibility, draw, draw_seed, eligible_hash, extend_deadline_ms, is_due,
+    mint_draw_nonce, parse_requirements, parse_reroll_kind, reroll_kind_single, resume_deadline_ms,
+    single_reroll_keep, single_reroll_pool, transition, validate_duration_seconds,
+    validate_new_giveaway, validate_prize, validate_winners_count, Eligibility, GiveawayError,
+    GiveawayEvent, GiveawayRequirements, GiveawayStatus, MemberStanding, NewGiveawayInput,
+    RerollKind, ValidatedGiveaway, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS, EXTEND_MAX_SECONDS,
+    EXTEND_MIN_SECONDS, FIRST_DRAW_NO, PRIZE_MAX_CHARS, PRIZE_MIN_CHARS, REQUIREMENT_MAX_AGE_DAYS,
+    REROLL_KIND_FULL, WINNERS_MAX, WINNERS_MIN,
+};
+#[cfg(feature = "db")]
+pub use giveaway_store::{
+    claim_due_giveaway, complete_draw, create_giveaway, delete_giveaway, get_draws, get_giveaway,
+    insert_draw, insert_reroll_draw, latest_draw_no, list_entries, mark_announced, mark_drawn,
+    release_claim, set_giveaway_status, upsert_entry, GiveawayDrawRow, GiveawayEntryRow,
+    GiveawayRow, NewDraw, NewGiveaway,
+};
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,
     JoinInput, LevelOutcome, LevelingHook, MemStore, MemberJoinFact, MessageFact, MessageInput,
-    NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow, VoiceEndedFact,
-    VoiceInput, VoiceStartedFact,
+    MessageShape, NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow,
+    VoiceEndedFact, VoiceInput, VoiceStartedFact,
 };
 pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
@@ -270,32 +315,33 @@ pub use inactivity::{
 pub use internal_actions::{
     assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
     build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
-    new_request_id, normalise_bind_host, parse_body_object, parse_keys, require_field_str,
-    require_reason, require_settings_key, require_snowflake, require_timestamp, sign,
-    signatures_match, utf16_len, valid_idempotency_key, valid_nonce_format, validate_announcement,
-    validate_event_input, validate_guild_add_member, validate_idempotency_key,
-    validate_moderation_numbers, validate_role_assign, within_skew, ActionError, AuthDecision,
-    AuthHeaders, BindError, BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace,
-    InternalFlags, KeyMapError, KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets,
-    ACTIONS_PATH, ADD_MEMBER_BUCKET, AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET,
-    IMPLEMENTED_ACTIONS, MAX_BODY_BYTES, MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS,
-    MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN, MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN,
-    MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY, NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS,
-    REQUEST_ID_LEN, SKEW_SECONDS,
+    is_request_id, new_request_id, normalise_bind_host, parse_body_object, parse_keys,
+    require_field_str, require_reason, require_settings_key, require_snowflake, require_timestamp,
+    sign, signatures_match, utf16_len, valid_idempotency_key, valid_nonce_format,
+    validate_announcement, validate_event_input, validate_guild_add_member,
+    validate_idempotency_key, validate_moderation_numbers, validate_role_assign, within_skew,
+    ActionError, AuthDecision, AuthHeaders, BindError, BucketDecision, BucketSpec, ErrorCode,
+    EventInput, EventPlace, InternalFlags, KeyMapError, KeyRing, KeySpecError, NonceCache,
+    SigningKey, TokenBuckets, ACTIONS_PATH, ADD_MEMBER_BUCKET, AUTH_FAILURE_MESSAGE,
+    CLAIM_STALE_SECONDS, DEFAULT_BUCKET, IMPLEMENTED_ACTIONS, MAX_BODY_BYTES,
+    MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS, MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN,
+    MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN, MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY,
+    NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS, REQUEST_ID_HEADER, REQUEST_ID_LEN, SKEW_SECONDS,
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
-    is_snapshot_stale, summarize_attribution_split, AttributionCategory, AttributionSplit,
-    DowntimeWindow, DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker,
-    JoinAttribution, MemSnapshots, INVITE_SNAPSHOT_STALENESS_BOUND_MS,
+    is_snapshot_stale, referral_counts, saturate_invite_uses, summarize_attribution_split,
+    AttributionCategory, AttributionSplit, DowntimeWindow, DowntimeWindowCount,
+    InviteSnapshotStore, InviteState, InviteTracker, JoinAttribution, MemSnapshots,
+    INVITE_SNAPSHOT_STALENESS_BOUND_MS, MAX_INVITE_USES,
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
-    award as award_leveling_xp, award_message as award_leveling_message,
-    award_voice as award_leveling_voice, current_award as current_leveling_award,
-    leaderboard as leveling_leaderboard, profile as leveling_profile,
-    replace_role_rewards as replace_leveling_role_rewards, role_rewards as leveling_role_rewards,
-    LevelingStoreError,
+    apply_seasonal_decay as apply_leveling_seasonal_decay, award as award_leveling_xp,
+    award_message as award_leveling_message, award_voice as award_leveling_voice,
+    current_award as current_leveling_award, leaderboard as leveling_leaderboard,
+    profile as leveling_profile, replace_role_rewards as replace_leveling_role_rewards,
+    role_rewards as leveling_role_rewards, LevelingStoreError,
 };
 pub use lfg::{
     adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
@@ -367,11 +413,13 @@ pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
     checkin_idempotency_key, checkin_metadata_json, checkin_occurrence_full_text,
     checkin_recorded_text, checkin_source, checkin_source_event_id, is_snowflake,
-    parse_attendance_occurrence, partition_rsvps, require_manage_events, rsvp_event_full_text,
-    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
-    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
-    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
-    AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    normalize_event_link, parse_attendance_occurrence, partition_rsvps, require_manage_events,
+    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text, rsvp_saved_text_for_transition,
+    rsvp_saved_text_for_transition_with_event, rsvp_saved_text_with_event, validate_event_id,
+    validate_occurrence_id, AttendanceClassification, AttendanceOccurrence, AttendanceProof,
+    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
+    ATTENDANCE_EVENT_TYPE, AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION,
+    CHECKIN_AUDIT_OUTCOME_RECORDED, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
     MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
 };
 pub use rsvp_conversion::{
@@ -381,17 +429,20 @@ pub use rsvp_conversion::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     compensate_checkin_write, compensate_rsvp_write, list_rsvps, prune_rsvp_history, put_rsvp,
-    record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+    put_rsvp_with_audit, record_checkin, record_checkin_with_audit, write_audit, CheckinWrite,
+    RsvpStoreError,
 };
 pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
-    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
-    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
-    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
-    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
-    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    neutralize_scheduled_body, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
+    parse_iso_ms, post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text,
+    schedule_confirm_text, schedule_list_line, schedule_list_page, schedule_list_page_indicator,
+    schedule_list_page_out_of_range_text, schedule_list_page_underflow_text, schedule_list_pages,
+    schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome, ScheduleError,
+    ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX, EVERY_MINUTES_MIN,
+    INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
     MAX_BODY_CHARS as SCHEDULED_MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS,
-    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    SCHEDULER_TICK_MS, SCHEDULE_LIST_MESSAGE_LIMIT, TICKER_BATCH_LIMIT,
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
@@ -399,9 +450,10 @@ pub use scheduled_events::{
 };
 #[cfg(feature = "db")]
 pub use scheduled_store::{
-    audit_scheduled, claim_due, complete_run, delete_scheduled, get_scheduled, list_scheduled,
-    put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled,
-    ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
+    audit_scheduled, begin_scheduled_delivery, claim_due, complete_run, delete_scheduled,
+    get_scheduled, list_scheduled, put_scheduled,
+    resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled, ScheduledAuditInput,
+    ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
 };
 pub use self_roles::{
     emoji_identity, event_order_for_event_id, event_order_from_snowflake,
@@ -410,8 +462,8 @@ pub use self_roles::{
     reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
     self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
     ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
-    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
-    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    PlanRejection, ResolvedRole, RoleOperation, SafeRefusal, SelfRoleConfigError, SelfRoleGates,
+    SelfRoleOption, SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
     SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{

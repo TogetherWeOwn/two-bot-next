@@ -86,18 +86,23 @@ pub async fn repeated_refusal_yields<S: MemberModerationStore>(
             1_700_003_600_000
         })
     };
-    assert!(sweep().run_due_unbans(GUILD).await.is_err());
-    assert_eq!(unbanned_users(&calls), ["refused"]);
+    // The refusal is recorded and the sweep continues past it: `later`
+    // lands on the same tick instead of stalling behind the refusal.
+    assert_eq!(sweep().run_due_unbans(GUILD).await.unwrap(), 1);
+    assert_eq!(unbanned_users(&calls), ["refused", "later"]);
     // A new arrival must not keep pushing this retry behind all fresh work.
     seed(&store, "newer", DUE).await;
-    assert!(sweep().run_due_unbans(GUILD).await.is_err());
-    assert_eq!(unbanned_users(&calls), ["refused", "later", "refused"]);
-    assert!(sweep().run_due_unbans(GUILD).await.is_err());
+    assert_eq!(sweep().run_due_unbans(GUILD).await.unwrap(), 1);
+    assert_eq!(
+        unbanned_users(&calls),
+        ["refused", "later", "refused", "newer"]
+    );
+    assert_eq!(sweep().run_due_unbans(GUILD).await.unwrap(), 0);
     assert_eq!(
         unbanned_users(&calls),
         ["refused", "later", "refused", "newer", "refused"]
     );
-    assert!(sweep().run_due_unbans(GUILD).await.is_err());
+    assert_eq!(sweep().run_due_unbans(GUILD).await.unwrap(), 0);
     assert_eq!(calls.call_count("unban"), 6, "one refused attempt per tick");
 }
 
@@ -118,8 +123,10 @@ pub async fn unknown_outcome_stays_fenced<S: MemberModerationStore>(
             1_700_003_600_000
         })
     };
-    assert!(sweep().run_due_unbans(GUILD).await.is_err());
+    // The timeout fences its row and the sweep continues: `later` lands
+    // on the same tick; the fenced row is never retried by the sweep.
     assert_eq!(sweep().run_due_unbans(GUILD).await.unwrap(), 1);
+    assert_eq!(sweep().run_due_unbans(GUILD).await.unwrap(), 0);
     assert_eq!(sweep().run_due_unbans(GUILD).await.unwrap(), 0);
     assert_eq!(unbanned_users(&calls), ["refused", "later"]);
 }

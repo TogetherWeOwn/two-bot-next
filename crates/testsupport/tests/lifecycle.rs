@@ -183,4 +183,51 @@ async fn databases_are_migrated_isolated_and_removed_even_after_setup_failure() 
     .await
     .expect("cancelled caller must not leak its database");
     witness.close().await.unwrap();
+
+    // Pin the setup CREATE delegate to the production 1s/2s backoff through
+    // the public path: a session parked on template1 fails every CREATE
+    // deterministically with 55006, and each attempt waits ~5s inside
+    // Postgres, so the retried create takes ~18s versus ~5s single-attempt.
+    // This stays a phase of the single lifecycle test so no concurrent
+    // fixture CREATE can observe the parked session.
+    let (head, _) = url
+        .rsplit_once('/')
+        .expect("bootstrap URL names a database");
+    let parked = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("{head}/template1"))
+        .await
+        .expect("park a session on template1");
+    let start = std::time::Instant::now();
+    let error = match TestDatabase::create(&url, &migrations).await {
+        Ok(fixture) => {
+            fixture.close().await.unwrap();
+            panic!("CREATE must fail while template1 is parked");
+        }
+        Err(error) => error,
+    };
+    let elapsed = start.elapsed();
+    let state = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .and_then(|failure| failure.as_database_error())
+        .and_then(|database| database.code());
+    assert_eq!(
+        state.as_deref(),
+        Some("55006"),
+        "expected deterministic 55006 while template1 is parked, got: {error:#}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(10),
+        "CREATE returned in {elapsed:?} without running the 1s/2s production retry backoff"
+    );
+    parked.close().await;
+    // Releasing template1 restores setup: the failure above was the parked
+    // session, not the fixture path.
+    TestDatabase::create(&url, &migrations)
+        .await
+        .expect("CREATE recovers after template1 is released")
+        .close()
+        .await
+        .unwrap();
 }

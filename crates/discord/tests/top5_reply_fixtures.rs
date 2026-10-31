@@ -225,6 +225,7 @@ fn open_commands_serve_members_without_special_bits() {
         ("rank", HandlerId::Rank),
         ("leaderboard", HandlerId::Leaderboard),
         ("help", HandlerId::Help),
+        ("privacy", HandlerId::Privacy),
         ("rsvp", HandlerId::Rsvp),
     ] {
         for permissions in [None, Some(0)] {
@@ -245,7 +246,7 @@ fn open_commands_serve_members_without_special_bits() {
 fn disabled_features_refuse_with_documented_copy() {
     let off = InteractionRouter::new(all_off());
     // Always-on core keeps routing while every feature is off.
-    for name in ["rank", "leaderboard", "help"] {
+    for name in ["rank", "leaderboard", "help", "privacy"] {
         assert!(
             matches!(slash_outcome(&off, name), SlashOutcome::Handled { .. }),
             "/{name} stays live while features are off",
@@ -378,7 +379,7 @@ fn guild_fence_holds_for_all_five_and_help() {
     let router = InteractionRouter::new(all_on());
     // Foreign and missing guilds are fenced everywhere except moderation,
     // which answers with its documented guild-restriction refusal.
-    for name in ["rank", "leaderboard", "help", "rsvp", "lfg"] {
+    for name in ["rank", "leaderboard", "help", "privacy", "rsvp", "lfg"] {
         for guild in [Some(FOREIGN_GUILD_ID), None] {
             let interaction = slash_in(name, Some(u64::MAX), guild);
             assert_eq!(

@@ -1,5 +1,8 @@
 //! SQLx persistence for feeds. Claims are fenced and guild-scoped; uncertain
 //! sends stay pending for nonce reconciliation rather than being blindly retried.
+//! Relay removal and delivery admission share one bounded guild/feed-scoped
+//! database fence, so a held send can never outlive a confirmed removal and
+//! removal can never cascade away unresolved send evidence.
 
 use crate::automation_quota::{lock_quota, AutomationQuota};
 use crate::feeds::{
@@ -19,12 +22,24 @@ pub enum FeedStoreError {
     Capacity(AutomationQuota),
 }
 
+/// An add either creates a relay or observes the exact saved tuple unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedAddOutcome {
+    Created,
+    Existing { id: String, enabled: bool },
+}
+
 /// Add is insert-only: an externally supplied id cannot hijack an existing
 /// relay, or change its source while retaining that source's delivery ledger.
-/// The guild's 25-definition cap includes disabled feeds, and is checked in
-/// the insert transaction under a guild-scoped capacity lock.
-pub async fn add_feed(pool: &Pool<Postgres>, feed: &FeedRelay) -> Result<(), FeedStoreError> {
-    crate::feeds::normalize_source(feed.kind, &feed.source)?;
+/// The guild's 25-definition cap includes disabled feeds, and is checked first
+/// in the insert transaction under a guild-scoped capacity lock. Only the
+/// guild/channel/kind/normalized-source uniqueness conflict is recoverable;
+/// unrelated unique violations and database failures remain errors.
+pub async fn add_feed(
+    pool: &Pool<Postgres>,
+    feed: &FeedRelay,
+) -> Result<FeedAddOutcome, FeedStoreError> {
+    let source = crate::feeds::normalize_source(feed.kind, &feed.source)?;
     let mut tx = pool.begin().await?;
     lock_quota(&mut tx, &feed.guild_id, AutomationQuota::Feeds).await?;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM feed_relays WHERE guild_id = $1")
@@ -34,17 +49,40 @@ pub async fn add_feed(pool: &Pool<Postgres>, feed: &FeedRelay) -> Result<(), Fee
     if count >= AutomationQuota::Feeds.limit() {
         return Err(FeedStoreError::Capacity(AutomationQuota::Feeds));
     }
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO feed_relays
          (id, guild_id, channel_id, kind, source, enabled, last_checked_at, created_by, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::bigint::double precision / 1000),
-                 $8, to_timestamp($9::bigint::double precision / 1000), to_timestamp($10::bigint::double precision / 1000))"
+                 $8, to_timestamp($9::bigint::double precision / 1000), to_timestamp($10::bigint::double precision / 1000))
+         ON CONFLICT (guild_id, channel_id, kind, source) DO NOTHING"
     )
     .bind(&feed.id).bind(&feed.guild_id).bind(&feed.channel_id).bind(feed.kind.as_str())
-    .bind(&feed.source).bind(feed.enabled).bind(feed.last_checked_at).bind(&feed.created_by)
-    .bind(feed.created_at).bind(feed.updated_at).execute(&mut *tx).await?;
+    .bind(&source).bind(feed.enabled).bind(feed.last_checked_at).bind(&feed.created_by)
+    .bind(feed.created_at).bind(feed.updated_at).execute(&mut *tx).await?.rows_affected();
+    let outcome = if inserted == 1 {
+        FeedAddOutcome::Created
+    } else {
+        // A separate READ COMMITTED statement sees a concurrently committed
+        // tuple. Never UPDATE it to obtain RETURNING data: even timestamps,
+        // paused state and the delivery ledger must remain untouched. A row
+        // removed before this read is an error, not invented recovery evidence.
+        let row = sqlx::query(
+            "SELECT id, enabled FROM feed_relays
+             WHERE guild_id = $1 AND channel_id = $2 AND kind = $3 AND source = $4",
+        )
+        .bind(&feed.guild_id)
+        .bind(&feed.channel_id)
+        .bind(feed.kind.as_str())
+        .bind(&source)
+        .fetch_one(&mut *tx)
+        .await?;
+        FeedAddOutcome::Existing {
+            id: row.try_get("id")?,
+            enabled: row.try_get("enabled")?,
+        }
+    };
     tx.commit().await?;
-    Ok(())
+    Ok(outcome)
 }
 
 pub async fn list_feeds(
@@ -85,16 +123,316 @@ pub async fn remove_feed(
     pool: &Pool<Postgres>,
     guild_id: &str,
     id: &str,
-) -> Result<bool, FeedStoreError> {
-    Ok(
-        sqlx::query("DELETE FROM feed_relays WHERE guild_id = $1 AND id = $2")
+) -> Result<FeedRemoval, FeedStoreError> {
+    match remove_feed_with_evidence(pool, guild_id, id).await? {
+        FeedRemovalEvidence::Removed => Ok(FeedRemoval::Removed),
+        FeedRemovalEvidence::Missing => Ok(FeedRemoval::Missing),
+        FeedRemovalEvidence::RecoveryRequired { .. } => Ok(FeedRemoval::RecoveryRequired),
+    }
+}
+
+/// Guild/relay-scoped removal carrying the fenced pending-evidence count.
+///
+/// Same fence, lock, audit and state semantics as [`remove_feed`]; the
+/// refusal additionally reports how many unresolved `pending` rows the
+/// fenced decision observed, so the runtime can render a snapshot without a
+/// second read. The projection is one bounded `count(*)`; no ledger rows,
+/// bodies, URLs, nonces or tokens leave the store.
+pub async fn remove_feed_with_evidence(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+) -> Result<FeedRemovalEvidence, FeedStoreError> {
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, id).await?;
+    // Under the fence: refuse while unresolved pending delivery evidence
+    // remains, so the `ON DELETE CASCADE` ledger can never delete
+    // uncertainty. Only settled or never-pending relays are deleted.
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM feed_deliveries d JOIN feed_relays f ON f.id = d.feed_id
+         WHERE d.feed_id = $1 AND f.guild_id = $2 AND d.state = 'pending'",
+    )
+    .bind(id)
+    .bind(guild_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending > 0 {
+        tx.rollback().await?;
+        let count = usize::try_from(pending).unwrap_or(usize::MAX);
+        return Ok(FeedRemovalEvidence::RecoveryRequired { pending: count });
+    }
+    let removed = sqlx::query("DELETE FROM feed_relays WHERE guild_id = $1 AND id = $2")
+        .bind(guild_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(if removed {
+        FeedRemovalEvidence::Removed
+    } else {
+        FeedRemovalEvidence::Missing
+    })
+}
+
+/// Outcome of an attempted relay removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedRemoval {
+    /// The relay existed, carried no unresolved pending delivery evidence,
+    /// and was deleted; its settled ledger cascades with it.
+    Removed,
+    /// No relay with that id exists in this guild; nothing was deleted.
+    Missing,
+    /// The relay exists but carries unresolved pending delivery evidence.
+    /// Relay and ledger are retained for nonce reconciliation; the member
+    /// waits for recovery instead of reposting or removing.
+    RecoveryRequired,
+}
+
+/// Outcome of an attempted relay removal with pending-evidence count.
+///
+/// Same variants as [`FeedRemoval`]; the refusal carries the guild/relay-
+/// scoped `pending` rows observed under the delivery fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedRemovalEvidence {
+    /// The relay existed, carried no unresolved pending delivery evidence,
+    /// and was deleted; its settled ledger cascades with it.
+    Removed,
+    /// No relay with that id exists in this guild; nothing was deleted.
+    Missing,
+    /// The relay exists but carries `pending` unresolved rows. Relay and
+    /// ledger are retained for nonce reconciliation; the member waits for
+    /// recovery instead of reposting or removing.
+    RecoveryRequired {
+        /// Unresolved `pending` rows for this guild/relay under the fence.
+        pending: usize,
+    },
+}
+
+/// Outcome of an attempted relay pause. Only the `enabled`/`updated_at`
+/// columns ever change: URL, destination, seen-item/high-water state and the
+/// delivery/nonce ledger are preserved verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedPauseOutcome {
+    /// The relay was enabled and is now paused.
+    Paused,
+    /// The relay was already paused; no columns changed.
+    AlreadyPaused,
+    /// No relay with that id exists in this guild; nothing changed.
+    Missing,
+    /// The relay stays enabled because unresolved pending delivery evidence
+    /// exists. Pausing would strand recovery behind disabled discovery
+    /// (`pending_deliveries` only reads enabled relays), so the member
+    /// retries after recovery settles. Already-admitted work is untouched.
+    RecoveryRequired,
+}
+
+/// Outcome of an attempted relay pause with pending-evidence count.
+///
+/// Same variants as [`FeedPauseOutcome`]; the enabled-to-paused refusal
+/// carries the guild/relay-scoped `pending` rows observed under the fence.
+/// Missing and already-paused return before the pending check, so restored
+/// paused+pending rows stay an idempotent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedPauseEvidence {
+    /// The relay was enabled and is now paused.
+    Paused,
+    /// The relay was already paused; no columns changed.
+    AlreadyPaused,
+    /// No relay with that id exists in this guild; nothing changed.
+    Missing,
+    /// The relay stays enabled because `pending` unresolved rows exist.
+    /// Pausing would strand recovery behind disabled discovery, so the
+    /// member retries after recovery settles. Already-admitted work is
+    /// untouched.
+    RecoveryRequired {
+        /// Unresolved `pending` rows for this guild/relay under the fence.
+        pending: usize,
+    },
+}
+
+/// Outcome of an attempted relay resume. Only the `enabled`/`updated_at`
+/// columns ever change.
+///
+/// Bounded catch-up policy: resume re-enables polling with the existing
+/// per-poll budget (`MAX_FEED_POSTS_PER_POLL` attempts); it never reposts an
+/// accepted nonce, never drains an unbounded backlog, and never rewrites
+/// seen-item/high-water or delivery history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedResumeOutcome {
+    /// The relay was paused and is now enabled.
+    Resumed,
+    /// The relay was already enabled; no columns changed.
+    AlreadyResumed,
+    /// No relay with that id exists in this guild; nothing changed.
+    Missing,
+}
+
+/// Pause one relay without deleting its history.
+///
+/// Serialized against delivery admission under the same per-relay fence as
+/// removal and fresh claims: either an in-flight claim lands first and this
+/// pause sees its pending row (refusal), or this pause commits first and
+/// later admission finds a disabled relay (no claim, no POST).
+/// Already-admitted work is never cancelled.
+pub async fn pause_feed(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    now_ms: i64,
+) -> Result<FeedPauseOutcome, FeedStoreError> {
+    match pause_feed_with_evidence(pool, guild_id, id, now_ms).await? {
+        FeedPauseEvidence::Paused => Ok(FeedPauseOutcome::Paused),
+        FeedPauseEvidence::AlreadyPaused => Ok(FeedPauseOutcome::AlreadyPaused),
+        FeedPauseEvidence::Missing => Ok(FeedPauseOutcome::Missing),
+        FeedPauseEvidence::RecoveryRequired { .. } => Ok(FeedPauseOutcome::RecoveryRequired),
+    }
+}
+
+/// Guild/relay-scoped pause carrying the fenced pending-evidence count.
+///
+/// Same fence, lock, audit and state semantics as [`pause_feed`]; only the
+/// enabled-to-paused refusal additionally reports how many unresolved
+/// `pending` rows the fenced decision observed. The projection is one
+/// bounded `count(*)`; no ledger content leaves the store.
+pub async fn pause_feed_with_evidence(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    now_ms: i64,
+) -> Result<FeedPauseEvidence, FeedStoreError> {
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, id).await?;
+    let current: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
             .bind(guild_id)
             .bind(id)
-            .execute(pool)
-            .await?
-            .rows_affected()
-            == 1,
-    )
+            .fetch_optional(&mut *tx)
+            .await?;
+    match current {
+        None => {
+            tx.rollback().await?;
+            Ok(FeedPauseEvidence::Missing)
+        }
+        Some(false) => {
+            tx.rollback().await?;
+            Ok(FeedPauseEvidence::AlreadyPaused)
+        }
+        Some(true) => {
+            // Only an enabled-to-paused transition can strand recovery.
+            // Missing/already-paused relays return above without changing
+            // pending evidence, including restored paused+pending state.
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM feed_deliveries d JOIN feed_relays f ON f.id = d.feed_id
+                 WHERE d.feed_id = $1 AND f.guild_id = $2 AND d.state = 'pending'",
+            )
+            .bind(id)
+            .bind(guild_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if pending > 0 {
+                tx.rollback().await?;
+                let count = usize::try_from(pending).unwrap_or(usize::MAX);
+                return Ok(FeedPauseEvidence::RecoveryRequired { pending: count });
+            }
+            sqlx::query(
+                "UPDATE feed_relays SET enabled = false,
+                 updated_at = to_timestamp($3::bigint::double precision / 1000)
+                 WHERE guild_id = $1 AND id = $2",
+            )
+            .bind(guild_id)
+            .bind(id)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(FeedPauseEvidence::Paused)
+        }
+    }
+}
+
+/// Resume one paused relay, preserving its seen-item/high-water and
+/// nonce/dedup history. Resume never refuses on pending evidence: pending
+/// recovery requires the enabled relay to stay discoverable.
+pub async fn resume_feed(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    now_ms: i64,
+) -> Result<FeedResumeOutcome, FeedStoreError> {
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, id).await?;
+    let current: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
+            .bind(guild_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match current {
+        None => {
+            tx.rollback().await?;
+            Ok(FeedResumeOutcome::Missing)
+        }
+        Some(true) => {
+            tx.rollback().await?;
+            Ok(FeedResumeOutcome::AlreadyResumed)
+        }
+        Some(false) => {
+            sqlx::query(
+                "UPDATE feed_relays SET enabled = true,
+                 updated_at = to_timestamp($3::bigint::double precision / 1000)
+                 WHERE guild_id = $1 AND id = $2",
+            )
+            .bind(guild_id)
+            .bind(id)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(FeedResumeOutcome::Resumed)
+        }
+    }
+}
+
+/// Serialize relay removal and pause/resume against delivery admission for
+/// one guild/feed.
+///
+/// Every side holds this transaction-scoped advisory lock only across short
+/// database statements — never across network IO. Removal's pending check
+/// plus delete run atomically under it; pause's pending check plus disable
+/// does too; a fresh claim's relay-existence revalidation runs under it as
+/// well. The lock orders them: either the claim lands first and removal or
+/// pause sees its pending row (refusal), or removal/pause commits first and
+/// admission finds no enabled relay (no claim, no POST). A held send can
+/// therefore never outlive a confirmed removal, removal can never cascade
+/// away a pending claim's recovery evidence, and no fresh post claim may
+/// begin after a successful pause. Takeover of an existing pending row and
+/// token-fenced settlement need no lock: a pending row already forces
+/// refusal, and settlement only flips such a row.
+///
+/// `lock_timeout`/`statement_timeout` mirror the cutover retention `SET
+/// LOCAL` precedent: a stuck holder fails this attempt fast as an isolated
+/// retryable store error instead of pinning a pooled connection.
+async fn lock_feed_delivery(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    guild_id: &str,
+    feed_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("feed-delivery:{guild_id}:{feed_id}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Single-statement conflict arbitration. The arbiter is intentionally
@@ -144,6 +482,12 @@ pub async fn claim_fresh_delivery(
     if token.is_empty() {
         return Err(FeedStoreError::EmptyClaimToken);
     }
+    // Admission shares the removal fence: the relay-existence revalidation
+    // in the INSERT below runs mutually excluded with removal's pending
+    // check plus delete, so a stale polled row can never claim (and POST)
+    // after removal has confirmed.
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, &post.feed_id).await?;
     let inserted = sqlx::query(
         "INSERT INTO feed_deliveries
          (feed_id, item_key, nonce, state, first_seen_at, claim_token, claimed_at)
@@ -159,9 +503,10 @@ pub async fn claim_fresh_delivery(
     .bind(now_ms)
     .bind(guild_id)
     .bind(&post.channel_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    tx.commit().await?;
     Ok((inserted == 1).then_some(DeliveryClaim::Fresh))
 }
 

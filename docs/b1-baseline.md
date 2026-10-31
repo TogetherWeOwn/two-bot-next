@@ -132,8 +132,8 @@ unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
 The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
-2026-10-01 calibration and is now 16 MiB; the 2026-10-10 measurements below
-explain the tighter tripwire.
+2026-10-01 calibration and is now 18 MiB (2026-10-24 recalibration below);
+the 2026-10-10 measurements record the tighter tripwire it replaced.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. The 2026-09-30
@@ -156,15 +156,58 @@ tripwire without wedging ordinary code changes. A later event-executors head
 measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
 42,288 bytes above the former ceiling. The internal-actions families (event
 executors plus channel-moderation union) measured 15,741,344 bytes (15.01 MiB).
-The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
+The then-current 16 MiB working tripwire left 1,006,288 bytes (0.96 MiB, 6.4%) above the
 event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
 
+On 2026-10-17 the 16 MiB ceiling was reached: main at `f2baa19` measured
+16,776,096 bytes (1,120 bytes of headroom), and the stream delivered-dedup
+expiry slice (PR #1079, `ac8fd66`) added 1,280 bytes with no new dependencies,
+measuring 16,777,376 bytes — 160 bytes over the ceiling on hosted CI and
+failing the check workflow on main twice, including a re-run of the failed
+jobs. The release profile is already minimal (opt-level=z, lto, strip), so
+the binary ceiling moves to 17 MiB; revisit if the binary approaches it. The
+112 MiB image ceiling is unchanged (42.43 MiB measured on the same builds).
+
+On 2026-10-17, the landed slices since the 16 MiB bump consumed its headroom:
+main at `89c859b1` measured 16,777,376 bytes (16.00 MiB), 160 bytes over the
+ceiling, so the gate trips on main itself. The PR-1093 merge_group against
+the same base measured the identical 16,777,376 bytes in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061090833),
+confirming the trip is main-red, not PR-introduced. The
+moderation-enforcement-outcomes
+head measured 16,778,152 bytes (16.00 MiB), 936 bytes over, with no new
+dependencies and the same minimal release profile. The budget is therefore
+rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;
+revisit if the binary approaches it. The 112 MiB image ceiling is unchanged.
+
+On 2026-10-24 the 17 MiB ceiling was nearly spent: main at `25377c8` measured
+17,806,608 bytes (16.98 MiB) in its [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40096683128),
+19,184 bytes of headroom. The feed pause/resume slice measured 17,831,440 bytes
+(17.01 MiB), 5,648 bytes over, in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40099776675/job/120889388251),
+about 24,800 bytes above main, from command, store and poller code with no new
+dependencies and the same minimal release profile (opt-level=z, lto, strip). The
+ceiling moves to 18 MiB, leaving about 1 MiB of headroom above the measured
+head; revisit if the binary approaches it. The 112 MiB image ceiling is
+unchanged (43.43 MiB measured on the same build).
+
+On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
+`cc07f31436` measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over the
+ceiling, in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
+The staff game-mix slice head (`6a412c6a86`) measured 17,862,000 bytes
+(17.03 MiB), 36,208 over, in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40040240318/job/120711266282),
+with no new dependencies and the same minimal release profile (opt-level=z,
+lto, strip). The budget is therefore rebumped to 18 MiB, leaving about 1 MiB
+of headroom above the measured heads; revisit if the binary approaches it.
+The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
+
 This branch's automation-only head separately measured 15,769,872 bytes
-(15.04 MiB) before the event-executor merge. This PR keeps the current-main
-16 MiB binary ceiling; the combined exact-head CI measurement is still
-required.
+(15.04 MiB) before the event-executor merge. The current binary ceiling is
+18 MiB following the 2026-10-24 calibration above; each combined exact-head
+CI measurement is still required.
 
 ### Docker history image measurement and immutable-ID pinning
 
@@ -202,7 +245,7 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The 112 MiB image ceiling is unchanged; the release-binary ceiling is 16 MiB
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 18 MiB
 (see the current calibration above). CI on this PR's exact head must still
 record the corrected image size and pass the runtime contract and both
 one-byte-budget negative checks; fixture success alone cannot establish
@@ -278,9 +321,9 @@ benchmark job passed; its separate broad sweep failed on database teardown
 statement timeouts and rustdoc bare URLs, so this is not a claim that all nightly
 jobs passed.
 
-The committed [baseline JSON](pipeline-benchmark-baseline.json) retains the first
-successful standalone report verbatim apart from added provenance. It is not
-an average, a synthetic envelope, or the faster repeat. Shared-runner latency
+The original baseline retained the first successful standalone report verbatim
+apart from added provenance, not an average, a synthetic envelope, or the faster
+repeat. It is superseded by the journaled baseline below. Shared-runner latency
 varied by about 6.5× at p50 and 9.8× at p99 between these runs; host contention
 is a hypothesis, not a proven attribution. Treat the 25% comparison as a coarse
 regression signal pending controlled-runner repeatability work, not a stable
@@ -314,6 +357,36 @@ connection, creates/migrates a unique disposable database, and verifies its drop
 before reporting success. See [the benchmark runbook](pipeline-benchmark.md)
 for the build command, configurable workload, controller cache restrictions,
 measurement definitions and non-required nightly integration.
+
+### Journaled gateway pipeline baseline
+
+The committed [baseline JSON](pipeline-benchmark-baseline.json) now retains the
+first hosted success-path measurement at source
+`8ea3f55f848472b6276162e4d1297bfec6fe2539`, measured 2026-10-21 in
+[run 39637827461](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39637827461).
+This uses GitHub-hosted `ubuntu-latest`, an ephemeral Rust job container and
+job-private Postgres 18.6, not the original self-hosted environment. All metrics
+and evidence come from that one report; there is no per-metric selection.
+
+- Peak RSS: **24.61328125 MiB**; handler p50/p99: **3,606.274 / 91,700.671 µs**.
+- Logical DB exchanges/event: **13.685555555555556**, computed as
+  `(11,417 completed statements + 900 BEGIN exchanges) / 900 measured events`.
+- Mock REST p50/p99: **1,124.991 / 1,550.907 µs**; replay: **29.972988155 s**;
+  total command including setup and verified teardown: **31.071836149 s**.
+- Same workload: 107 members, 10 channels, 600 messages, 300 voice updates,
+  30 REST calls, 900 commits and checkpoint 1017. Both migration chains applied;
+  **942 durable events = 942 journal rows = 942 distinct journaled events**.
+  The disposable database was dropped.
+
+The measurement passed, but the workflow failed its old-baseline comparator:
+`13.686 > 10.562 (25% tolerance)`. This is not a green workflow claim. Per-row
+atomic best-effort journaling deliberately adds savepoint, journal insert,
+watermark upsert and release statements. Retaining that design and refreshing
+the measured baseline are reviewed together in [PR #1554](https://github.com/TogetherWeOwn/two-bot-next/pull/1554).
+The 25% tolerance, strict 200 MiB RSS target and advisory p99 policy are unchanged.
+The old 8.45 figure is historical, not the current journaled pipeline budget.
+Latency across different runner environments is not a performance comparison;
+this synthetic report still proves neither real-guild soak nor production sizing.
 
 ## Reproduce
 

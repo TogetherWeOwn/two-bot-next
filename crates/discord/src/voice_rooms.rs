@@ -290,6 +290,27 @@ pub enum RoomHttpError {
     UnknownOutcome,
 }
 
+/// Accept only a channel matching the create request. A malformed or
+/// contradictory 2xx may still have created a channel: never turn it into
+/// proof of no effect, expose the body, or derive ownership from its id.
+fn creation_receipt(
+    body: &[u8],
+    guild_id: Snowflake,
+    kind: ChannelType,
+    parent_id: Option<Snowflake>,
+) -> Result<Channel, RoomHttpError> {
+    // Twilight's Id deserializer rejects missing, malformed and zero ids.
+    let channel: Channel =
+        serde_json::from_slice(body).map_err(|_| RoomHttpError::UnknownOutcome)?;
+    if channel.guild_id.map(Id::get) != Some(guild_id)
+        || channel.kind != kind
+        || channel.parent_id.map(Id::get) != parent_id
+    {
+        return Err(RoomHttpError::UnknownOutcome);
+    }
+    Ok(channel)
+}
+
 /// A message the bot posted: the channel it landed in and its id, so the same
 /// message can be edited later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -302,6 +323,86 @@ pub struct MessageRef {
 /// the call returns RateLimited so the action queue backs off tick-driven
 /// (visible in gauges) instead of sleeping silently inside the worker loop.
 const GLOBAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Upward spread for one sub-cap global-429 wait: the shared deadline plus
+/// up to this much, hard-capped at [`GLOBAL_BACKOFF_MAX`].
+const GLOBAL_BACKOFF_SPREAD: Duration = Duration::from_secs(5);
+
+/// Deterministic 64-bit mixer (splitmix64) for seeded jitter without a
+/// global RNG: the same `seed` always yields the same draw, on every
+/// platform, with no clock and no `rand` dependency.
+fn jitter_draw(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Total sleep for a sub-cap global-429 `wait` (the remaining shared-deadline
+/// wait, at most `GLOBAL_BACKOFF_MAX`): the deadline plus a deterministic
+/// upward spread in `[wait, (wait + GLOBAL_BACKOFF_SPREAD).min(GLOBAL_BACKOFF_MAX)]`,
+/// so guild actors sharing one global limit stop waking on the same instant.
+/// Never below `wait` (waking early only earns another 429) and never above
+/// the cap, so the cap and the `RateLimited` queue-handoff behavior hold by
+/// construction. A zero wait stays zero (no deadline, no sleep); at exactly
+/// the cap the spread window is empty and the sleep equals the wait. The same
+/// `seed` replays the same sleep, so tests pin ranges without a clock or RNG;
+/// production passes `two_bot_core::action_outcomes::jitter_seed()`.
+#[must_use]
+pub fn jitter_sub_cap_wait(wait: Duration, seed: u64) -> Duration {
+    if wait.is_zero() {
+        return Duration::ZERO;
+    }
+    let ceiling = wait
+        .saturating_add(GLOBAL_BACKOFF_SPREAD)
+        .min(GLOBAL_BACKOFF_MAX);
+    let window_nanos = ceiling.saturating_sub(wait).as_nanos();
+    // `span` is at least 1, so the remainder below never divides by zero.
+    let span = window_nanos.saturating_add(1).min(u128::from(u64::MAX)) as u64;
+    wait.saturating_add(Duration::from_nanos(jitter_draw(seed) % span))
+}
+
+#[cfg(test)]
+mod jitter_sub_cap_wait_tests {
+    use super::{jitter_sub_cap_wait, Duration, GLOBAL_BACKOFF_MAX, GLOBAL_BACKOFF_SPREAD};
+
+    #[test]
+    fn sub_cap_sleep_covers_the_deadline_with_bounded_spread() {
+        for secs in [1u64, 10, 25, 29] {
+            let wait = Duration::from_secs(secs);
+            let ceiling = (wait + GLOBAL_BACKOFF_SPREAD).min(GLOBAL_BACKOFF_MAX);
+            for seed in 0..8u64 {
+                let sleep = jitter_sub_cap_wait(wait, seed);
+                assert!(
+                    sleep >= wait && sleep <= ceiling,
+                    "wait {wait:?} seed {seed}: {sleep:?} outside [{wait:?}, {ceiling:?}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_and_capped_waits_are_unjittered() {
+        assert_eq!(jitter_sub_cap_wait(Duration::ZERO, 42), Duration::ZERO);
+        assert_eq!(
+            jitter_sub_cap_wait(GLOBAL_BACKOFF_MAX, 42),
+            GLOBAL_BACKOFF_MAX
+        );
+    }
+
+    #[test]
+    fn sub_cap_sleep_spreads_wake_times_across_seeds() {
+        use std::collections::HashSet;
+        // A 10 s shared wait wakes every guild actor on the same instant today.
+        let distinct: HashSet<Duration> = (0..32u64)
+            .map(|seed| jitter_sub_cap_wait(Duration::from_secs(10), seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct wake times across 32 seeds",
+            distinct.len()
+        );
+    }
+}
 
 /// In-flight voice REST attempts, for the in-flight-age gauge.
 #[derive(Debug, Default)]
@@ -332,9 +433,13 @@ impl InFlightRest {
 /// process-global gauge, which is last-writer-wins and flakes when another
 /// test's begin/drop lands between the publish and the read.
 fn oldest_age_secs(slots: &Arc<Mutex<InFlightRest>>) -> u64 {
+    // Silent recovery: the `InFlightGuard` drop body owns the poison
+    // counter emission, and this only observes a poisoned lock through
+    // that drop path (`begin` locks before publishing, so it never
+    // reaches here on a poisoned lock).
     slots
         .lock()
-        .expect("in-flight lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .live
         .values()
         .map(|started| started.elapsed().as_secs())
@@ -357,7 +462,9 @@ struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Some(slots) = self.slots.take() {
-            slots.lock().expect("in-flight lock").live.remove(&self.id);
+            two_bot_core::metrics::recover_drop_poison(slots.lock(), "in_flight_guard")
+                .live
+                .remove(&self.id);
             publish_rest_age(&slots);
         }
     }
@@ -372,6 +479,11 @@ pub struct RoomHttp {
     transport: HyperClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     authorization: HeaderValue,
     origin: String,
+    // Scheme/authority used for attachment downloads after the user URL has
+    // been validated against the CDN allowlist. Production is the Discord
+    // CDN itself, so the rewrite is the identity; tests point it at a
+    // loopback server, mirroring the `origin` seam for API requests.
+    cdn_origin: String,
     global_not_before: Arc<Mutex<Option<Instant>>>,
     unauthorized: Arc<AtomicBool>,
     in_flight: Arc<Mutex<InFlightRest>>,
@@ -423,6 +535,7 @@ impl RoomHttp {
             transport,
             authorization,
             origin,
+            cdn_origin: "https://cdn.discordapp.com".to_owned(),
             global_not_before: Arc::new(Mutex::new(None)),
             unauthorized: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(Mutex::new(InFlightRest::default())),
@@ -478,7 +591,10 @@ impl RoomHttp {
                     if wait > Duration::from_secs(1) {
                         tracing::info!(wait_secs = wait.as_secs(), "voice global backoff wait");
                     }
-                    tokio::time::sleep_until(until).await;
+                    // Spread the shared-deadline wake: every guild actor
+                    // sleeping until `until` wakes on the same instant today.
+                    let seed = two_bot_core::action_outcomes::jitter_seed();
+                    tokio::time::sleep(jitter_sub_cap_wait(wait, seed)).await;
                     if !still_valid() {
                         return Err(RoomHttpError::Cancelled);
                     }
@@ -486,10 +602,26 @@ impl RoomHttp {
                 _ => break,
             }
         }
+        // Attachment-bearing Twilight requests carry a multipart form, not a
+        // JSON body: send the built form with its declared boundary, the
+        // same conversion the upstream client performs. JSON-only requests
+        // keep the previous content type and body. Request-supplied headers
+        // still apply last, after this default.
+        let (content_type, body) = match request.form() {
+            Some(form) => {
+                let content_type = HeaderValue::from_bytes(&form.content_type())
+                    .map_err(|_| RoomHttpError::InvalidRequest)?;
+                (content_type, Bytes::from(form.clone().build()))
+            }
+            None => (
+                HeaderValue::from_static("application/json"),
+                Bytes::copy_from_slice(request.body().unwrap_or_default()),
+            ),
+        };
         let mut wire = Request::builder()
             .method(request.method().name())
             .uri(format!("{}/{}", self.origin, request.path()))
-            .header(CONTENT_TYPE, "application/json");
+            .header(CONTENT_TYPE, content_type);
         if bot_authenticated {
             wire = wire.header(AUTHORIZATION, self.authorization.clone());
         }
@@ -499,9 +631,7 @@ impl RoomHttp {
             }
         }
         let wire = wire
-            .body(Full::new(Bytes::copy_from_slice(
-                request.body().unwrap_or_default(),
-            )))
+            .body(Full::new(body))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
         // One adapter-visible REST attempt per wire send, shared with the
         // executor's accounting: template only, never IDs, tokens or bodies.
@@ -590,6 +720,31 @@ impl RoomHttp {
         Ok(())
     }
 
+    /// Read the original callback message without retaining the interaction
+    /// token. One bounded GET, no bot authentication or callback retry.
+    pub async fn interaction_message(
+        &self,
+        application: Id<ApplicationMarker>,
+        token: &str,
+    ) -> Result<MessageRef, RoomHttpError> {
+        let request = self
+            .http
+            .interaction(application)
+            .response(token)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send_request(request, || true, false).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| RoomHttpError::InvalidRequest)?;
+        let channel_id = value
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or(RoomHttpError::InvalidRequest)?;
+        parse_posted_message(channel_id, &body)
+    }
+
     /// Complete the deferred response, never a second initial response.
     /// `attachments` carries `/export` file bytes; `components` carries the
     /// `/import` Confirm/Cancel buttons. Both are omitted when empty, so a
@@ -622,8 +777,20 @@ impl RoomHttp {
     /// Download a Discord-hosted `/import` file, capped at `max_bytes`.
     /// Only the Discord CDN host is fetched, over HTTPS and without the bot
     /// credential: attachment URLs are signed and need no authorization.
-    /// Oversized bodies, non-2xx statuses and transport failures surface as
-    /// errors with no partial bytes.
+    ///
+    /// One ten-second elapsed-time budget covers the request, the status
+    /// check and collection of the whole body together, measured from the
+    /// start of the download; it is never restarted when headers arrive, so
+    /// a response that returns valid headers and then stalls or drips
+    /// chunks still fails at the deadline. The `max_bytes` cap bounds size
+    /// independently: a body of exactly `max_bytes` succeeds, one byte more
+    /// is refused. A deadline expiry, an oversized body, a non-2xx status
+    /// (redirects are classified, never followed) and transport failures
+    /// all surface as errors with no partial bytes. Failures never echo the
+    /// signed attachment URL. The request is marked `connection: close`:
+    /// a non-2xx body is deliberately never read, and this one-shot
+    /// download must not return a connection carrying that unread (and
+    /// possibly stalled) body to the shared pool for a later request.
     pub async fn download_attachment(
         &self,
         url: &str,
@@ -635,29 +802,45 @@ impl RoomHttp {
         {
             return Err(RoomHttpError::InvalidRequest);
         }
+        // The user URL is validated above exactly as supplied; only the
+        // transport target's scheme/authority come from `cdn_origin`
+        // (identity in production), preserving path and signed query.
+        let path_and_query = uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str);
+        let transport_uri: http::Uri =
+            format!("{}{path_and_query}", self.cdn_origin.trim_end_matches('/'))
+                .parse()
+                .map_err(|_| RoomHttpError::InvalidRequest)?;
         let request = Request::builder()
             .method("GET")
-            .uri(uri)
+            .uri(transport_uri)
+            .header(http::header::CONNECTION, "close")
             .body(Full::new(Bytes::new()))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
-        let response =
-            tokio::time::timeout(Duration::from_secs(10), self.transport.request(request))
+        let download = async {
+            let response = self
+                .transport
+                .request(request)
+                .await
+                .map_err(|_| RoomHttpError::UnknownOutcome)?;
+            let status = response.status().as_u16();
+            if !(200..300).contains(&status) {
+                return Err(classify_response(status, &[]));
+            }
+            let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
+                .collect()
                 .await
                 .map_err(|_| RoomHttpError::UnknownOutcome)?
-                .map_err(|_| RoomHttpError::UnknownOutcome)?;
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(classify_response(status, &[]));
-        }
-        let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
-            .collect()
+                .to_bytes();
+            if body.len() > max_bytes {
+                return Err(RoomHttpError::InvalidRequest);
+            }
+            Ok(body.to_vec())
+        };
+        tokio::time::timeout(Duration::from_secs(10), download)
             .await
             .map_err(|_| RoomHttpError::UnknownOutcome)?
-            .to_bytes();
-        if body.len() > max_bytes {
-            return Err(RoomHttpError::InvalidRequest);
-        }
-        Ok(body.to_vec())
     }
 
     pub async fn create_room(
@@ -698,7 +881,12 @@ impl RoomHttp {
         }
         let request = request.try_into_request().map_err(classify_http_error)?;
         let body = self.send(request, still_in_creator).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+        creation_receipt(
+            &body,
+            guild_id,
+            ChannelType::GuildVoice,
+            attributes.parent_id,
+        )
     }
 
     /// Discord's bulk `PATCH /guilds/{guild.id}/channels`: set each listed
@@ -836,9 +1024,9 @@ impl RoomHttp {
 
     /// Create a V9 companion text channel in the room's category, with the
     /// full overwrite set (including the bot's View allow) in the POST —
-    /// never patched afterwards. Single attempt: an unknown outcome must not
-    /// produce another POST (the worker adopts the channel from its live
-    /// snapshot when it can, and records the failure otherwise).
+    /// never patched afterwards. One POST per invocation; receipt validation
+    /// failures are uncertain outcomes. The worker's snapshot adoption and
+    /// later queue retries are separate from this adapter's single attempt.
     pub async fn create_companion(
         &self,
         plan: &TextChannelPlan,
@@ -857,7 +1045,12 @@ impl RoomHttp {
             .try_into_request()
             .map_err(classify_http_error)?;
         let body = self.send(request, still_managing).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+        creation_receipt(
+            &body,
+            plan.guild_id,
+            ChannelType::GuildText,
+            Some(plan.category_id),
+        )
     }
 
     /// Grant one occupant View on the companion (V9 join): a Member allow,
@@ -965,8 +1158,9 @@ impl RoomHttp {
 
     /// V3: create the Join voice channel next to a private room. No
     /// overwrites ride the POST, so it syncs to the category and the bot's own
-    /// access comes from the category rather than a new grant. Single attempt:
-    /// an unknown outcome must not produce another POST.
+    /// access comes from the category rather than a new grant. One POST per
+    /// invocation; invalid receipts are uncertain outcomes. This does not fence
+    /// the worker's separate retry/adoption path (see the creation-plan doc).
     pub async fn create_join_voice_channel(
         &self,
         guild_id: Snowflake,
@@ -990,7 +1184,7 @@ impl RoomHttp {
         }
         let request = request.try_into_request().map_err(classify_http_error)?;
         let body = self.send(request, still_valid).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+        creation_receipt(&body, guild_id, ChannelType::GuildVoice, parent_id)
     }
 
     /// Post an operator notice to a channel. Only the given role (if any) can
@@ -1244,6 +1438,10 @@ fn classify_response(status: u16, body: &[u8]) -> RoomHttpError {
 #[cfg(test)]
 #[path = "voice_rooms_http_tests.rs"]
 mod http_tests;
+
+#[cfg(test)]
+#[path = "voice_import_deadline_tests.rs"]
+mod voice_import_deadline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1656,3 +1854,7 @@ mod tests {
         publish_rest_age(&slots);
     }
 }
+
+#[cfg(test)]
+#[path = "voice_rooms_poison_acceptance.rs"]
+mod in_flight_poison_acceptance;

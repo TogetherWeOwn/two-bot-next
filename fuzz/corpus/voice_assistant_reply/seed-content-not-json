@@ -1,0 +1,1 @@
+{"choices": [{"finish_reason": "stop", "index": 0, "message": {"content": "Sure! Here are some ideas: ## rooms", "role": "assistant"}}], "id": "reply-1", "object": "chat.completion"}

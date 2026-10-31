@@ -95,6 +95,10 @@ pub enum TicketError {
     InvalidTransition,
     #[error("The ticket channel is unavailable")]
     MissingChannel,
+    #[error("This ticket cannot be closed until the bot's channel history access is restored")]
+    MissingHistoryAccess,
+    #[error("This ticket cannot be closed until the opener's channel access is restored")]
+    MissingOpenerAccess,
     #[error("This ticket close was already recovered or completed")]
     StaleClose,
 }
@@ -123,8 +127,14 @@ pub fn authorize(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenDecision {
-    Existing { channel_id: Option<String> },
-    Cooldown,
+    Existing {
+        status: TicketStatus,
+        channel_id: Option<String>,
+    },
+    Cooldown {
+        /// Mathematical deadline, not a display-rounded admission boundary.
+        next_try_at_ms: i128,
+    },
     Reserve,
 }
 
@@ -138,14 +148,18 @@ pub fn decide_open(
 ) -> OpenDecision {
     if let Some(ticket) = active {
         return OpenDecision::Existing {
+            status: ticket.status,
             channel_id: ticket.channel_id.clone(),
         };
     }
     let cooldown_ms = i64::try_from(cooldown_seconds.saturating_mul(1000)).unwrap_or(i64::MAX);
-    if last_created_at.is_some_and(|last| now.saturating_sub(last) < cooldown_ms) {
-        OpenDecision::Cooldown
-    } else {
-        OpenDecision::Reserve
+    match last_created_at {
+        Some(last) if now.saturating_sub(last) < cooldown_ms => OpenDecision::Cooldown {
+            // Widen only the projection: saturating the sum could display an
+            // already-eligible time while the unchanged predicate still refuses.
+            next_try_at_ms: i128::from(last) + i128::from(cooldown_ms),
+        },
+        _ => OpenDecision::Reserve,
     }
 }
 
@@ -604,22 +618,25 @@ mod tests {
             decide_open(None, None, 0, COOLDOWN_SECONDS),
             OpenDecision::Reserve
         );
-        assert_eq!(
+        assert!(matches!(
             decide_open(None, Some(0), 299_999, COOLDOWN_SECONDS),
-            OpenDecision::Cooldown
-        );
+            OpenDecision::Cooldown { .. }
+        ));
         assert_eq!(
             decide_open(None, Some(0), 300_000, COOLDOWN_SECONDS),
             OpenDecision::Reserve
         );
-        assert_eq!(
+        assert!(matches!(
             decide_open(None, Some(1), 0, COOLDOWN_SECONDS),
-            OpenDecision::Cooldown
-        );
-        assert_eq!(
+            OpenDecision::Cooldown { .. }
+        ));
+        assert!(matches!(
             decide_open(Some(&ticket()), Some(0), 1, COOLDOWN_SECONDS),
-            OpenDecision::Existing { channel_id: None }
-        );
+            OpenDecision::Existing {
+                channel_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -820,5 +837,42 @@ mod tests {
         assert!(is_unknown_channel(Some(10003)));
         assert!(!is_unknown_channel(Some(50013)));
         assert!(!is_unknown_channel(None));
+    }
+
+    #[test]
+    fn ticket_error_display_strings_are_pinned() {
+        // Member-visible via `Failure::reply`; pin exact text, not just the variant.
+        assert_eq!(
+            TicketError::WrongGuild.to_string(),
+            "Tickets are only available in the configured guild"
+        );
+        assert_eq!(
+            TicketError::StaffOnly.to_string(),
+            "Only staff can claim or close tickets"
+        );
+        assert_eq!(
+            TicketError::AlreadyClaimed.to_string(),
+            "This ticket is already claimed or not open"
+        );
+        assert_eq!(
+            TicketError::InvalidTransition.to_string(),
+            "Ticket state changed; reload it before continuing"
+        );
+        assert_eq!(
+            TicketError::MissingChannel.to_string(),
+            "The ticket channel is unavailable"
+        );
+        assert_eq!(
+            TicketError::MissingHistoryAccess.to_string(),
+            "This ticket cannot be closed until the bot's channel history access is restored"
+        );
+        assert_eq!(
+            TicketError::MissingOpenerAccess.to_string(),
+            "This ticket cannot be closed until the opener's channel access is restored"
+        );
+        assert_eq!(
+            TicketError::StaleClose.to_string(),
+            "This ticket close was already recovered or completed"
+        );
     }
 }

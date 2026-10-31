@@ -68,6 +68,17 @@ impl BootActivation {
         self.permitted(LiveCapability::RankHeal)
     }
 
+    /// Go-live delivery fence: posting go-lives writes to Discord under the
+    /// bot identity, so delivery refuses startup unless Announcements is
+    /// cleared for the boot identity. Boot calls this once when delivery is
+    /// enabled; keep the capability choice here so a swap to a live-cleared
+    /// capability (or a hardcoded `true`) cannot slip past the delivery
+    /// tests. Mirrors `rank_heal_permitted`.
+    #[must_use]
+    pub(crate) fn go_live_delivery_permitted(&self) -> bool {
+        self.permitted(LiveCapability::Announcements)
+    }
+
     #[must_use]
     pub(crate) fn application_id(&self) -> Option<u64> {
         self.application_id.as_deref()?.parse().ok()
@@ -215,6 +226,25 @@ mod tests {
             assert!(
                 !activation.rank_heal_permitted(),
                 "{label} must not heal rank ladders"
+            );
+        }
+    }
+
+    #[test]
+    fn go_live_delivery_is_staging_only() {
+        // Boot calls `go_live_delivery_permitted` once when delivery is
+        // enabled: staging posts, and every other identity (the live pair,
+        // cleared for self_roles only, plus unknown/mismatched/missing
+        // identities) refuses startup. Pinning the helper (not just the
+        // generic fence) fails if the capability choice widens to a
+        // live-cleared capability; the boot call site stays a one-line
+        // delegation to this helper.
+        assert!(staging().go_live_delivery_permitted());
+        assert!(!live().go_live_delivery_permitted());
+        for (label, activation) in refused() {
+            assert!(
+                !activation.go_live_delivery_permitted(),
+                "{label} must not post go-lives"
             );
         }
     }

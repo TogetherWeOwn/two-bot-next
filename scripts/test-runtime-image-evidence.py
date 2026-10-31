@@ -1,6 +1,7 @@
 """Offline contracts for shell-free, non-deploying runtime image inspection."""
 
 from datetime import datetime, timezone
+import contextlib
 import importlib.util
 import io
 import json
@@ -375,6 +376,94 @@ class EvidenceTests(unittest.TestCase):
         self.assertLess(step.index("sha256sum runtime-image-evidence.json"), step.index('exit "$status"'))
         self.assertEqual(workflow.count("ignore-unfixed: false"), 2)
         self.assertEqual(workflow.count("exit-code: '1'"), 2)
+
+
+class InspectShapeRegressionTests(unittest.TestCase):
+    """Review regressions: deep nesting and wrong-typed fields fail clean."""
+
+    def collect_with(self, stdout):
+        calls = []
+
+        def stub(*args, timeout=30):
+            calls.append(args)
+            if args[:2] == ("image", "inspect"):
+                return subprocess.CompletedProcess(args, 0, stdout, b"")
+            raise AssertionError(f"unexpected docker call: {args!r}")
+
+        with scratch() as temporary:
+            directory = Path(temporary)
+            (directory / "image-id.txt").write_text(IMAGE_ID + "\n")
+            (directory / "source-sha.txt").write_text(SOURCE_SHA + "\n")
+            with patch.object(evidence, "docker", stub):
+                report = evidence.collect("two-bot:fixture", directory)
+            written = json.loads((directory / "runtime-image-evidence.json").read_text())
+        self.assertEqual(written, report)
+        self.assertEqual(calls, [("image", "inspect", "two-bot:fixture")])
+        return report
+
+    def assert_unparseable(self, report, label):
+        self.assertIs(report["complete"], False, label)
+        self.assertNotIn("filesystem", report, label)
+        self.assertEqual(report["collection_error"], evidence.UNPARSEABLE_INSPECTION, label)
+
+    def test_deeply_nested_inspect_becomes_collection_error(self):
+        # 20000 open brackets raise RecursionError on CPython (the
+        # RecursionError/JSONDecodeError crossover sits near 8000-10000
+        # brackets); either way the contract is the collection_error path
+        # with the JSON file written, never a traceback.
+        self.assert_unparseable(self.collect_with(b"[" * 20000), "deep-nesting")
+
+    def test_deeply_nested_inspect_exits_clean(self):
+        calls = []
+
+        def stub(*args, timeout=30):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, b"[" * 20000, b"")
+
+        with scratch() as temporary:
+            directory = Path(temporary)
+            (directory / "image-id.txt").write_text(IMAGE_ID + "\n")
+            (directory / "source-sha.txt").write_text(SOURCE_SHA + "\n")
+            with patch.object(evidence, "docker", stub), \
+                    patch.object(sys, "argv", ["runtime-image-evidence.py", "two-bot:fixture", str(directory)]), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit) as caught:
+                evidence.main()
+            written = json.loads((directory / "runtime-image-evidence.json").read_text())
+        self.assertEqual(caught.exception.code, written["collection_error"])
+        self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
+        self.assertEqual(calls, [("image", "inspect", "two-bot:fixture")])
+
+    def test_wrong_typed_fields_become_collection_error(self):
+        def entry(**overrides):
+            body = {"Id": IMAGE_ID, "Architecture": "amd64", "Os": "linux", "Config": {
+                "User": "65532:65532", "Entrypoint": ["/home/nonroot/two-bot"], "Cmd": None}}
+            config = overrides.pop("Config", {})
+            body.update(overrides)
+            body["Config"].update(config)
+            return json.dumps([body]).encode()
+
+        cases = {
+            # A list Id must not take the identity-mismatch path: it is
+            # malformed output, so it becomes collection_error instead.
+            "id-list": entry(Id=[IMAGE_ID]),
+            "id-number": entry(Id=123),
+            "architecture-number": entry(Architecture=123),
+            "os-list": entry(Os=["linux"]),
+            "user-number": entry(Config={"User": 123}),
+            "entrypoint-string": entry(Config={"Entrypoint": "/home/nonroot/two-bot"}),
+            "cmd-string": entry(Config={"Cmd": "run"}),
+            # A non-string element is malformed too: the fields are string
+            # arrays per the image spec, so [123] must not land in a
+            # complete report.
+            "entrypoint-number-element": entry(
+                Config={"Entrypoint": ["/home/nonroot/two-bot", 123]}),
+            "cmd-number-element": entry(Config={"Cmd": [123]}),
+        }
+        for label, stdout in cases.items():
+            with self.subTest(label=label):
+                self.assert_unparseable(self.collect_with(stdout), label)
 
 
 if __name__ == "__main__":

@@ -11,17 +11,30 @@ use twilight_model::{
 use two_bot_core::{
     attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
     checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
-    compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
-    put_rsvp, record_checkin, require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text,
-    rsvp_saved_text, validate_event_id, validate_occurrence_id, write_audit, AttendanceProof,
-    CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter, RsvpAudit,
-    RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
+    compensate_rsvp_write, list_rsvps, normalize_event_link, now_iso, parse_attendance_occurrence,
+    partition_rsvps, put_rsvp_with_audit, record_checkin_with_audit, require_manage_events,
+    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text_for_transition,
+    rsvp_saved_text_for_transition_with_event, validate_event_id, validate_occurrence_id,
+    AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
+    RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
 };
 
 use crate::{
     executor::{ActionExecutor, DiscordError},
     interactions::{response_for_slash, route_interaction, RoutedInteraction},
 };
+
+/// Resolves attendance classification immediately before the fact write, not
+/// when an interaction is acknowledged. Static callers can pass their config.
+pub trait ClassifierProvider: std::fmt::Debug + Send + Sync {
+    fn config_for_guild(&self, guild_id: &str) -> ClassifierConfig;
+}
+
+impl ClassifierProvider for ClassifierConfig {
+    fn config_for_guild(&self, _guild_id: &str) -> ClassifierConfig {
+        self.clone()
+    }
+}
 
 /// Acknowledgement is separate from ordered effects: the gateway prepares
 /// queued commands immediately, then completes them in dispatch order. The
@@ -124,7 +137,7 @@ pub async fn complete_rsvp_interaction(
     prepared: PreparedRsvp,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
 ) -> Result<bool, DiscordError> {
     let Some((handler, interaction)) = prepared.deferred else {
         return Ok(prepared.handled);
@@ -148,7 +161,7 @@ pub async fn handle_rsvp_interaction(
     router: &InteractionRouter,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
     interaction: &Interaction,
 ) -> Result<bool, DiscordError> {
     let prepared = prepare_rsvp_interaction(router, executor, interaction.clone()).await?;
@@ -261,9 +274,19 @@ async fn execute(
     handler: HandlerId,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
     interaction: &Interaction,
 ) -> Result<String, String> {
+    // Fail closed: only the RSVP handlers execute here. A foreign handler id
+    // (an unregistered or sibling-slice id reaching this dispatcher) refuses
+    // with the existing invalid-payload string before any store or network
+    // work, never a panic.
+    if !matches!(
+        handler,
+        HandlerId::Rsvp | HandlerId::RsvpAttendance | HandlerId::ScorecardAttendance
+    ) {
+        return Err("Invalid command payload.".to_owned());
+    }
     let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
         return Err("Invalid command payload.".to_owned());
     };
@@ -271,30 +294,77 @@ async fn execute(
         .guild_id
         .ok_or("This command requires a guild.")?
         .to_string();
-    let string_option = |name: &str| -> Result<&str, String> {
-        data.options
-            .iter()
-            .find_map(|option| {
-                if option.name == name {
-                    if let CommandOptionValue::String(value) = &option.value {
-                        return Some(value.as_str());
-                    }
+    // Strict option decoding: exactly one option per name, at the expected
+    // type. A duplicated or mistyped option refuses with the existing
+    // missing/invalid text before any lookup or write — silently taking the
+    // first string match would let a forged duplicate smuggle a value past
+    // the member's visible picker state.
+    let single_option = |name: &str| -> Result<&CommandOptionValue, String> {
+        let mut found: Option<&CommandOptionValue> = None;
+        for option in &data.options {
+            if option.name == name {
+                if found.is_some() {
+                    return Err(format!("Missing or invalid {name} option."));
                 }
-                None
-            })
-            .ok_or_else(|| format!("Missing or invalid {name} option."))
+                found = Some(&option.value);
+            }
+        }
+        found.ok_or_else(|| format!("Missing or invalid {name} option."))
+    };
+    let string_option = |name: &str| -> Result<&str, String> {
+        match single_option(name)? {
+            CommandOptionValue::String(value) => Ok(value.as_str()),
+            _ => Err(format!("Missing or invalid {name} option.")),
+        }
     };
     match handler {
         HandlerId::Rsvp | HandlerId::RsvpAttendance => {
-            let event_id =
-                validate_event_id(string_option("event-id")?).map_err(|e| e.to_string())?;
+            // A pasted event link normalizes to its numeric id; anything else
+            // falls through to the existing id validation, which refuses
+            // malformed input with the legacy error before any lookup or write.
+            let raw_reference = string_option("event-id")?;
+            let (reference, pasted_link) = match normalize_event_link(raw_reference, &guild_id) {
+                Some(event_id) => (event_id, true),
+                None => (raw_reference.to_owned(), false),
+            };
+            let event_id = validate_event_id(&reference).map_err(|e| e.to_string())?;
             // Legacy totals read persisted responses even after cancellation or
             // deletion; only an RSVP mutation requires live-event validation.
             if handler == HandlerId::RsvpAttendance {
+                let actor_id = interaction
+                    .author_id()
+                    .ok_or("Missing command member.")?
+                    .to_string();
                 let rows = list_rsvps(pool, &guild_id, &event_id)
                     .await
                     .map_err(|_| "Unable to read RSVP totals.")?;
-                return Ok(attendance_totals_text(&partition_rsvps(&rows)));
+                // Reuse the same guild/event snapshot as the totals: no extra
+                // query, live lookup, write or write-budget admission.
+                let personal = match rows.iter().find(|row| {
+                    row.guild_id == guild_id && row.event_id == event_id && row.user_id == actor_id
+                }) {
+                    Some(row) => {
+                        let saved_at = time::OffsetDateTime::parse(
+                            &row.responded_at,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .map_err(|_| "Unable to read RSVP totals.")?;
+                        let status = match row.status {
+                            RsvpStatus::Going => "Going",
+                            RsvpStatus::Interested => "Interested",
+                            RsvpStatus::Declined => "Declined",
+                        };
+                        format!(
+                            "Your saved response: {status}\nSaved: <t:{}:f>",
+                            saved_at.unix_timestamp()
+                        )
+                    }
+                    None => "You have no saved response for this event.".to_owned(),
+                };
+                return Ok(format!(
+                    "Stored RSVPs for event `{event_id}`\n{}\n{personal}\nHistorical saved responses; live event availability is not checked.",
+                    attendance_totals_text(&partition_rsvps(&rows))
+                ));
             }
             let status = RsvpStatus::parse(string_option("status")?).map_err(|e| e.to_string())?;
             let actor_id = interaction
@@ -320,22 +390,29 @@ async fn execute(
                 status,
                 responded_at: now_iso(),
             };
-            let transition = put_rsvp(pool, &record).await.map_err(|err| match err {
-                RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
-                RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
-                // Occurrence capacity and retention floors cannot come
-                // out of an RSVP write; transport/parse failures stay
-                // generic. Every variant is mapped: a refused or failed
-                // write is never reported as saved.
-                RsvpStoreError::OccurrenceAtCapacity
-                | RsvpStoreError::CutoffTooRecent
-                | RsvpStoreError::Db(_)
-                | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
-            })?;
+            // The response and its required audit row commit in one
+            // transaction: a failed audit insert rolls the response back,
+            // so no partial write can survive this path.
             let audit_id = format!("rsvp:{}", interaction.id);
-            write_audit(pool, &RsvpAudit::for_rsvp(&audit_id, &record))
-                .await
-                .map_err(|_| "Unable to audit RSVP.")?;
+            let transition =
+                put_rsvp_with_audit(pool, &record, &RsvpAudit::for_rsvp(&audit_id, &record))
+                    .await
+                    .map_err(|err| match err {
+                        RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
+                        RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
+                        // A failed audit insert refuses with the pre-existing
+                        // audit text; response-step failures keep the
+                        // pre-existing save text.
+                        RsvpStoreError::AuditDb(_) => "Unable to audit RSVP.".to_owned(),
+                        // Occurrence capacity and retention floors cannot come
+                        // out of an RSVP write; transport/parse failures stay
+                        // generic. Every variant is mapped: a refused or failed
+                        // write is never reported as saved.
+                        RsvpStoreError::OccurrenceAtCapacity
+                        | RsvpStoreError::CutoffTooRecent
+                        | RsvpStoreError::Db(_)
+                        | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
+                    })?;
             // RA-03 race fence: the event or membership may have vanished
             // between the pre-write lookups and the commit. Re-read the same
             // evidence; on loss or lookup failure compensate (a first
@@ -369,7 +446,15 @@ async fn execute(
                 }
                 return Err(refusal);
             }
-            Ok(rsvp_saved_text(status))
+            // The copy comes from the committed transition alone (first,
+            // changed or saved again). Pasted links confirm with the stable
+            // numeric identity they normalized to; a first response with a raw
+            // id keeps the legacy sentence byte-identical.
+            Ok(if pasted_link {
+                rsvp_saved_text_for_transition_with_event(&transition, &record.event_id)
+            } else {
+                rsvp_saved_text_for_transition(&transition)
+            })
         }
         HandlerId::ScorecardAttendance => {
             // RA-02: Manage Events first, for every host check-in including
@@ -384,24 +469,22 @@ async fn execute(
                     .map_or(0, |p| p.bits()),
             )
             .map_err(|e| e.to_string())?;
-            let occurrence = validate_occurrence_id(string_option("event-occurrence")?)
-                .map_err(|e| e.to_string())?;
+            // A pasted event link normalizes to its bare numeric id; anything
+            // else falls through to the existing occurrence parsing, which
+            // refuses bare slugs and malformed input before any network or
+            // store work.
+            let raw_occurrence = string_option("event-occurrence")?;
+            let reference = normalize_event_link(raw_occurrence, &guild_id)
+                .unwrap_or_else(|| raw_occurrence.to_owned());
+            let occurrence = validate_occurrence_id(&reference).map_err(|e| e.to_string())?;
             // Trusted guild-scoped occurrence form (RA-02): a bare event id or
             // `{event_id}:{label}`. Bare slugs refuse here, before any network
             // or store work.
             let resolved = parse_attendance_occurrence(&occurrence).map_err(|e| e.to_string())?;
-            let member_id = data
-                .options
-                .iter()
-                .find_map(|option| {
-                    if option.name == "member" {
-                        if let CommandOptionValue::User(id) = option.value {
-                            return Some(id);
-                        }
-                    }
-                    None
-                })
-                .ok_or("Missing or invalid member option.")?;
+            let member_id = match single_option("member")? {
+                CommandOptionValue::User(id) => *id,
+                _ => return Err("Missing or invalid member option.".to_owned()),
+            };
             // Discord resolves the selected User; fail closed before any
             // network rather than looking up a forged id.
             let user_known = data
@@ -444,7 +527,8 @@ async fn execute(
                     Membership::Current => {}
                     Membership::Absent => {
                         return Err(
-                            "You must still belong to this server to record attendance.".to_owned()
+                            "You must still be a member of this server to record attendance."
+                                .to_owned(),
                         );
                     }
                     Membership::Unavailable => {
@@ -471,12 +555,17 @@ async fn execute(
             {
                 return Err("Unable to verify attendance member.".to_owned());
             }
-            let member_is_bot = live_user
-                .get("bot")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let member_is_bot = match live_user.get("bot") {
+                // Discord omits this optional field for humans, but a present
+                // non-boolean value cannot establish a classification.
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or("Unable to verify attendance member.")?,
+            };
+            let config = classifier.config_for_guild(&guild_id);
             let verdict = classify(
-                classifier,
+                &config,
                 &ClassifyInput {
                     guild_id: guild_id.clone(),
                     actor_id: member_id_str.clone(),
@@ -488,30 +577,48 @@ async fn execute(
                     is_test: false,
                 },
             );
-            let inserted = record_checkin(
+            // The attendance fact and its required audit row commit in one
+            // transaction: a failed audit insert rolls the fact back, so no
+            // partial write can survive this path. The audit id carries the
+            // interaction id (`checkin:<interaction id>`), reusing the RSVP
+            // idempotency pattern.
+            let occurred_at = now_iso();
+            let audit_id = format!("checkin:{}", interaction.id);
+            let (inserted, audit_inserted) = record_checkin_with_audit(
                 pool,
                 &CheckinWrite {
                     guild_id: guild_id.clone(),
                     event_occurrence_id: resolved.canonical_id.clone(),
                     member_id: member_id_str.clone(),
-                    occurred_at: now_iso(),
+                    occurred_at: occurred_at.clone(),
                     proof: AttendanceProof::HostCheckin,
                     classifier_version: verdict.classifier_version,
                     classification: verdict.classification,
                     matched_rule: verdict.matched_rule,
                 },
+                &RsvpAudit::for_checkin(
+                    &audit_id,
+                    &guild_id,
+                    &actor_id,
+                    &resolved.canonical_id,
+                    &member_id_str,
+                    &occurred_at,
+                ),
             )
             .await
             .map_err(|err| match err {
                 RsvpStoreError::OccurrenceAtCapacity => checkin_occurrence_full_text(),
-                // Event capacity, RSVP rate and retention floors cannot come
-                // out of a check-in write; transport failures stay generic.
+                // A failed audit insert refuses with the pre-existing
+                // unattributed text; fact-step failures keep it too. Event
+                // capacity, RSVP rate and retention floors cannot come out
+                // of a check-in write; transport failures stay generic.
                 // Every variant is mapped: a refused or failed write is never
                 // reported as recorded.
                 RsvpStoreError::EventAtCapacity
                 | RsvpStoreError::RsvpRateLimited
                 | RsvpStoreError::CutoffTooRecent
                 | RsvpStoreError::Db(_)
+                | RsvpStoreError::AuditDb(_)
                 | RsvpStoreError::UnknownStatus(_) => "Attendance was not recorded.".to_owned(),
             })?;
             if !inserted {
@@ -520,13 +627,24 @@ async fn execute(
                     &resolved.canonical_id,
                 ));
             }
+            // A retried audit id dedupes while the fact still records: name
+            // the collision at DEBUG instead of discarding the boolean. The
+            // fields carry only the audit id — never the interaction token.
+            if !audit_inserted {
+                tracing::debug!(
+                    msg = "checkin_audit_duplicate",
+                    audit_id = %audit_id,
+                );
+            }
             // RA-03 race fence: the anchor event or target membership may have
             // vanished between the pre-write RA-02 reads and the commit. The
-            // `record_checkin` transaction only bounds the occurrence count —
-            // it cannot see Discord-side removal — so re-read the same live
-            // evidence here; on loss or lookup failure compensate (delete
-            // exactly this attempt's fact) and refuse. Duplicates return above
-            // without revalidation: they wrote nothing.
+            // `record_checkin_with_audit` transaction only bounds the
+            // occurrence count — it cannot see Discord-side removal — so
+            // re-read the same live evidence here; on loss or lookup failure
+            // compensate (delete exactly this attempt's fact, plus its audit
+            // row only when this attempt inserted it — a deduped audit id
+            // belongs to the earlier attempt) and refuse. Duplicates return
+            // above without revalidation: they wrote nothing.
             if let Err(refusal) = revalidate_attendance(
                 executor,
                 &guild_id,
@@ -538,6 +656,7 @@ async fn execute(
                 if compensate_checkin_write(
                     pool,
                     &checkin_idempotency_key(&resolved.canonical_id, &member_id_str),
+                    audit_inserted.then_some(audit_id.as_str()),
                 )
                 .await
                 .is_err()
@@ -555,13 +674,50 @@ async fn execute(
                 &resolved.canonical_id,
             ))
         }
-        _ => unreachable!("only RSVP handlers execute here"),
+        _ => Err("Invalid command payload.".to_owned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreign_handler_id_fails_closed_without_writes_or_panic() {
+        // Real dispatcher (`execute`) with a foreign handler id: must refuse
+        // with the existing invalid-payload string, never panic. The pool is
+        // closed and the executor points at an unroutable loopback, so any
+        // store or network touch would fail differently — the refusal proves
+        // neither was reached.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        pool.close().await;
+        let executor = ActionExecutor::with_proxy(
+            "rsvp-foreign-handler-fixture".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("loopback executor");
+        let classifier = ClassifierConfig::default();
+        let interaction: Interaction = serde_json::from_value(serde_json::json!({
+            "application_id": "1111", "authorizing_integration_owners": {"0": "2222"},
+            "id": "100", "token": "synthetic-secret-token", "type": 2,
+            "version": 1, "guild_id": "2222",
+            "member": {"permissions": "0", "roles": [], "deaf": false, "mute": false,
+                "flags": 0, "user": {"id": "77", "username": "human", "discriminator": "0"}},
+            "data": {"id": "4444", "name": "rsvp", "type": 1, "options": []}
+        }))
+        .expect("wire interaction");
+        for handler in [HandlerId::Rank, HandlerId::Lfg] {
+            let err = execute(handler, &pool, &executor, &classifier, &interaction)
+                .await
+                .expect_err("foreign handler must refuse");
+            assert_eq!(
+                err, "Invalid command payload.",
+                "{handler:?} must fail closed"
+            );
+        }
+    }
 
     #[test]
     fn prepared_debug_names_the_handler_never_the_callback_token() {

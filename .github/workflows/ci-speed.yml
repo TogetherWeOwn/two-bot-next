@@ -1,0 +1,152 @@
+name: ci-speed
+
+# CI speed evidence (SDLC 2.3): paths-filter affected-only selection and the
+# minutes-per-merged-PR report. The shared nextest lane graduated to required
+# (check.yml `nextest` job, aggregated by `ci-ok`); this workflow keeps the
+# per-run comparison skeleton. Never a required check and never part of
+# ci-ok. No `paths:` filter on the trigger: that would skip the whole
+# workflow including the report job.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
+# empty; the least-privilege grant lives on each job instead.
+permissions: {}
+
+concurrency:
+  group: ci-speed-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: affected paths
+    permissions:
+      contents: read
+    # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
+    # CI_OVERFLOW_* switch for this named job, then the self-hosted pool.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'changes') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      worker: ${{ steps.filter.outputs.worker }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Affected-paths selection, logged by the note below. Informational
+      # only: the required lanes (nextest included) take their gating from
+      # the authoritative `job-inputs` selector in check.yml, not from
+      # these outputs.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'fuzz/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'deny.toml'
+              - 'migrations.lock'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'sql/**'
+              - '.config/nextest.toml'
+              - 'scripts/ci/flake_ledger.py'
+              - 'scripts/ci/test_flake_ledger.py'
+              # The nextest lane executes this generator before compilation
+              # (reusable-rust-nextest.yml), so its edits must select rust.
+              - 'scripts/generate_command_reference.py'
+              - '.github/workflows/reusable-rust-nextest.yml'
+              - '.github/workflows/ci-speed.yml'
+              # The required lane is called from check.yml (promotion): an edit
+              # there can change what it runs, so the
+              # affected-paths signal must select rust (job-inputs rule 4).
+              - '.github/workflows/check.yml'
+              # job-inputs marks content-read docs/configs as Rust-affecting;
+              # keep the advisory selector aligned without selecting all docs.
+              - 'docs/parity.md'
+              - 'docs/cutover.md'
+              - 'docs/commands.md'
+              - 'docs/generated/commands.md'
+              - 'docs/configuration.md'
+              - 'docs/voice-rooms.md'
+              - 'docs/voice-conditions-core.md'
+              - 'docs/soak-checklist.json'
+              - 'docs/soak-checklist.md'
+              - 'docs/staging-e2e-command-matrix.md'
+              - 'docs/smoke-expected-responses.md'
+              - 'docs/smoke-run-record.md'
+              - 'docs/smoke-surface-inventory.md'
+              - 'docs/privacy.md'
+              - 'docs/database-roles.md'
+              - 'docs/rollback-delta.md'
+              - 'docs/backup.md'
+              - 'docs/tickets.md'
+              - 'docs/community-jobs.md'
+              - 'docs/metrics.md'
+              - 'docs/startup-diagnostics.md'
+              - 'docs/README.md'
+              - 'wrangler/wrangler.toml'
+            worker:
+              - 'wrangler/**'
+            docs:
+              - 'docs/**'
+              - '*.md'
+            ci:
+              - '.github/**'
+              - 'scripts/**'
+
+      - name: Selection note (advisory only)
+        env:
+          SEL_RUST: ${{ steps.filter.outputs.rust }}
+          SEL_WORKER: ${{ steps.filter.outputs.worker }}
+          SEL_DOCS: ${{ steps.filter.outputs.docs }}
+          SEL_CI: ${{ steps.filter.outputs.ci }}
+        run: |
+          printf 'paths-filter: rust=%s worker=%s docs=%s ci=%s\n' \
+            "$SEL_RUST" "$SEL_WORKER" "$SEL_DOCS" "$SEL_CI"
+
+  report:
+    name: ci minutes report
+    permissions:
+      contents: read
+    needs: [changes]
+    # Always runs: the minutes skeleton is evidence even on Rust-untouched
+    # PRs. The required nextest lane now reports through check.yml.
+    if: always()
+    # Runner routing: see the note on `changes`.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'report') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Write minutes comparison skeleton
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: python3 scripts/ci/ci_minutes.py report --baseline docs/ci-speed-baseline.json --run-id "$RUN_ID" --sha "$SHA" --event "$EVENT" --output ci-minutes.json
+
+      - name: Upload minutes skeleton
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-minutes-${{ github.run_id }}
+          path: ci-minutes.json
+          if-no-files-found: error
+          retention-days: 14

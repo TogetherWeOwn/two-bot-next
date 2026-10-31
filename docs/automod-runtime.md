@@ -209,21 +209,23 @@ otherwise the loop is unchanged.
   unavailable, timed-out and uninspected (`Bypassed`) creates are rejected for
   automations as well as for XP/activity.
 - **Funnel-vs-trigger verdicts.** Each delivery gets one `WorkerVerdict`
-  (`crates/bot/src/automod_gateway.rs:269-272`): `funnel` is its single call
+  (`crates/bot/src/automod_gateway.rs:305-308`): `funnel` is its single call
   into the funnel and `trigger` is the verdict prefix triggers act on. A
   delivery automod did not inspect, or whose completion was not recorded, keeps
   its funnel disposition but its trigger verdict is capture-only
-  (`crates/bot/src/automod_gateway.rs:264-267`).
-  `verdict_of` (`crates/bot/src/automod_gateway.rs:274-283`) forces the trigger to `CaptureOnly` when the
+  (`crates/bot/src/automod_gateway.rs:300-303`).
+  `verdict_of` (`crates/bot/src/automod_gateway.rs:310-319`) forces the trigger to `CaptureOnly` when the
   outcome is `Bypassed` or `Retained(_)`, and otherwise copies the funnel. A
-  `process` timeout keeps raw capture only for both (`crates/bot/src/automod_gateway.rs:294-303`). The worker
+  `process` timeout keeps raw capture only for both (`crates/bot/src/automod_gateway.rs:330-339`). The worker
   hands the funnel disposition to
-  `handle_at_with_message_disposition` exactly once (`crates/bot/src/gateway.rs:699-710`) and fires the message hook
+  `handle_at_with_message_disposition` exactly once and fires the message hook
   only when `runs_text_automations` passes the trigger verdict — `None`
-  (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:307-311`,
-  `crates/bot/src/gateway.rs:56-70`, `crates/bot/src/gateway.rs:721-729`). The hook carries
+  (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:343-347`,
+  `crates/bot/src/gateway.rs:52-72`). The hook carries
   the trigger verdict into the trigger handler, where a missing verdict fails
-  closed (`crates/bot/src/command_runtime.rs:954-975`, `crates/bot/src/gateway_commands.rs:89-100`). Per outcome class
+  closed (`CommandRuntime::dispatch_with_verdict` in
+  `crates/bot/src/command_runtime.rs`, `acceptance_for_verdict`
+  at `crates/bot/src/gateway_commands.rs:100-116`). Per outcome class
   (`ActivationOutcome` in `crates/discord/src/automod_activation.rs:74-86`):
 
   | Outcome | `funnel` | `trigger` | Text automations run? |
@@ -279,9 +281,26 @@ Staging soak remains a separate gate; this change supplies no live approval.
   counted-claim reconciliation, preserved pre-count decision replay, five
   processed messages and a final violation count of five.
 
-Commands (existing Rust installation, target directory outside the synced tree):
+Commands below are verification recipes, not new execution evidence. On the
+persistent controller, use the
+[bounded build-cache wrapper](build-cache.md#local-builds) from the isolated
+worktree, with a 600000 ms Bash timeout or in the background. Refused or missing
+admission never permits direct compiling Cargo, an external target or another
+cache; follow the [Operator path](build-cache.md#operator-handoff-and-rollback-one-host-step).
+No current pool health is asserted. `cargo fmt` does not compile and may run directly.
 
 ```sh
+# Persistent controller only (fmt may run anywhere).
+python3 scripts/cargo_cache.py run -- test --offline --locked -p two-bot-core -p two-bot-discord --test automod_runtime --test automod_translation --test automod_activation
+python3 scripts/cargo_cache.py run -- test --offline --locked -p two-bot-core --features db --test automod_store --test automod_preserved_replay -- --ignored
+python3 scripts/cargo_cache.py run -- clippy --offline --locked -p two-bot-core -p two-bot-discord --features two-bot-core/db --lib --test automod_runtime --test automod_translation --test automod_activation --test automod_store --test automod_preserved_replay -- -D warnings
+cargo fmt --all -- --check
+```
+
+Ephemeral hosted CI retains its direct Cargo variants and the same filters:
+
+```sh
+# Ephemeral hosted CI only, not a controller fallback.
 cargo test --offline --locked -p two-bot-core -p two-bot-discord --test automod_runtime --test automod_translation --test automod_activation
 cargo test --offline --locked -p two-bot-core --features db --test automod_store --test automod_preserved_replay -- --ignored
 cargo clippy --offline --locked -p two-bot-core -p two-bot-discord --features two-bot-core/db --lib --test automod_runtime --test automod_translation --test automod_activation --test automod_store --test automod_preserved_replay -- -D warnings

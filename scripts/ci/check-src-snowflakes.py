@@ -113,12 +113,20 @@ def check(root, allowlist):
         if not entry.get("reason", "").strip():
             raise ValueError("each snowflake allowance needs a reason")
         path = entry["path"]
-        if not path.startswith("crates/") or "/src/" not in path or ".." in Path(path).parts:
+        parts = Path(path).parts
+        is_top_src = path.startswith("src/") and len(parts) >= 2
+        is_crate_src = path.startswith("crates/") and "/src/" in path
+        if ".." in parts or not (is_top_src or is_crate_src):
             raise ValueError(f"invalid source allowance path: {path}")
         expected[(path, entry["value"], entry["source"])] += 1
     seen = Counter()
     errors = []
-    for path in sorted((root / "crates").glob("*/src/**/*.rs")):
+    scan_paths = []
+    if (root / "crates").is_dir():
+        scan_paths.extend((root / "crates").glob("*/src/**/*.rs"))
+    if (root / "src").is_dir():
+        scan_paths.extend((root / "src").glob("**/*.rs"))
+    for path in sorted(scan_paths):
         relative = path.relative_to(root).as_posix()
         for line, value, source in occurrences(path.read_text()):
             key = (relative, value, source)

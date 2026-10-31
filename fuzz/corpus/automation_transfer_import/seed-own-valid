@@ -1,0 +1,1 @@
+{"version":1,"commands":[{"name":"faq","description":"MEE6 FAQ","template":"Read {server} rules","text_trigger":"!faq"},{"name":"welcome","description":"The welcome command","template":"hi {user}","text_trigger":null}],"overwrite":false}

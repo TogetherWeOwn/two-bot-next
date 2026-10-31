@@ -121,7 +121,7 @@ pub async fn last_bot_floor_at(
 
 #[cfg(test)]
 mod tests {
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use two_bot_testsupport::TestDatabase;
 
     use super::super::presence::{
         bot_floor_due, decide_probe_cycle, evaluate_trigger, BotFloorScan, TriggerOptions,
@@ -129,105 +129,29 @@ mod tests {
     };
     use super::*;
 
-    /// Only an absent URL skips the test. Configured setup failures are errors.
-    async fn test_pool(prefix: &str) -> Result<Option<(Pool<Postgres>, String)>, sqlx::Error> {
+    /// Only an absent URL skips the test. Configured setup failures are errors:
+    /// the shared guard refuses unsafe URLs before connecting, and migration
+    /// failures propagate instead of skipping.
+    async fn test_db() -> Option<TestDatabase> {
         let url = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(url) => url,
-            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotPresent) => return None,
             Err(_) => panic!("TWO_TEST_DATABASE_URL must be Unicode"),
         };
-        test_pool_with_url(prefix, &url).await.map(Some)
-    }
-
-    async fn test_pool_with_url(
-        prefix: &str,
-        url: &str,
-    ) -> Result<(Pool<Postgres>, String), sqlx::Error> {
-        let options: PgConnectOptions = url.parse()?;
-        // No DATABASE_URL or inherited credentials: tests accept only the
-        // approved agent container or the ephemeral Postgres service in
-        // GitHub Actions (see the `community-db` CI job).
-        let host = options.get_host();
-        assert!(
-            host == "agent-testdb"
-                || (host == "localhost"
-                    && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")),
-            "test-container-only URL"
-        );
-        assert_eq!(
-            options.get_username(),
-            "agent_test",
-            "test-container-only user"
-        );
-        // No shared fixed-name fixtures: each invocation owns its schema,
-        // including concurrent invocations of the same test in other processes.
-        static NEXT_SCHEMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let schema = format!(
-            "{prefix}_{}_{nonce}_{}",
-            std::process::id(),
-            NEXT_SCHEMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        assert!(is_test_schema_name(&schema), "safe unique test schema");
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options.clone())
-            .await?;
-        // SAFETY: only the guarded identifier interpolates; values bind.
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await?;
-        admin.close().await;
-        let pool = PgPoolOptions::new()
-            .max_connections(3)
-            .connect_with(options.options([("search_path", schema.as_str())]))
-            .await?;
-        // Execute the entire migration, including multi-statement DDL.
-        sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0310_presence_probe.sql"
-        ))
-        .execute(&pool)
-        .await?;
-        sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0390_legacy_copy_presence.sql"
-        ))
-        .execute(&pool)
-        .await?;
-        Ok((pool, schema))
-    }
-
-    /// Test-only schema names: lowercase identifier characters, so DDL
-    /// interpolation cannot break out of the identifier position.
-    fn is_test_schema_name(schema: &str) -> bool {
-        !schema.is_empty()
-            && schema.len() <= 63
-            && schema
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    }
-
-    async fn drop_schema(pool: &Pool<Postgres>, schema: &str) {
-        assert!(is_test_schema_name(schema));
-        // SAFETY: guarded by `is_test_schema_name` (see `test_pool`).
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-            .execute(pool)
-            .await
-            .expect("clean up owned test schema");
-        pool.close().await;
+        Some(
+            TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+                .await
+                .expect("test database setup"),
+        )
     }
 
     #[tokio::test]
     async fn probe_cycle_round_trips_through_postgres() {
-        let Some((pool, schema)) = test_pool("tog_10092_presence")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping presence_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         // A skipped decision writes nothing — the series reads as the times
         // we successfully looked.
         assert!(!record_reading(
@@ -284,18 +208,16 @@ mod tests {
             .await
             .expect("isolated")
             .is_empty());
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("clean up owned test database");
     }
 
     #[tokio::test]
     async fn truncated_scan_round_trips_and_delays_the_next_attempt() {
-        let Some((pool, schema)) = test_pool("tog_11146_presence")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping presence_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         let at = "2026-10-01T00:00:00.000Z";
         let now = super::super::funnel::parse_iso_millis(at).unwrap();
         let decision = decide_probe_cycle(Some(42), None, Some(BotFloorScan::Truncated), now);
@@ -341,7 +263,7 @@ mod tests {
             read_series(&pool, "guild-a").await.unwrap()[0].bot_floor,
             None
         );
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("clean up owned test database");
     }
 
     /// Legacy `test/unit.presenceprobecost.test.ts` "the trend window reads 15
@@ -349,13 +271,11 @@ mod tests {
     /// returns the window rows only, and the unbounded read still returns all.
     #[tokio::test]
     async fn windowed_series_read_returns_only_rows_inside_the_bound() {
-        let Some((pool, schema)) = test_pool("tog_15738_trend")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping presence_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         // Every 12th hour for two years from 2024-08-26: 1460 rows.
         let start = super::super::funnel::parse_iso_millis("2024-08-26T00:00:00.000Z")
             .expect("start parses");
@@ -407,18 +327,16 @@ mod tests {
                 1
             );
         }
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("clean up owned test database");
     }
 
     #[tokio::test]
     async fn stored_series_feeds_the_reopen_trigger() {
-        let Some((pool, schema)) = test_pool("tog_10092_trigger")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping presence_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         // Ten daily readings, every third day at the threshold: 4 qualifying
         // days in the window, so the trigger arms (web_v1 not live).
         for day in 0..10 {
@@ -447,6 +365,6 @@ mod tests {
         );
         assert_eq!(verdict.status, super::super::presence::TriggerStatus::Armed);
         assert_eq!(verdict.qualifying_days, 4);
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("clean up owned test database");
     }
 }

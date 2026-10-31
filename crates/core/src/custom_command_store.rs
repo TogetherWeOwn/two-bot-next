@@ -36,6 +36,33 @@ pub async fn audit<'c>(
     Ok(())
 }
 
+/// Append an immutable audit fact once. Concurrent/replayed slash outcomes
+/// retain the first row, including its timestamp; other SQL failures propagate.
+/// This deduplicates facts, not Discord execution or delivery attempts.
+pub async fn audit_once<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    record: &AuditRecord,
+    id: &str,
+    at_iso: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::timestamptz)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(id)
+    .bind(&record.guild_id)
+    .bind(&record.actor_id)
+    .bind(&record.action)
+    .bind(&record.target_key)
+    .bind(&record.outcome)
+    .bind(&record.reason)
+    .bind(at_iso)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Read one audit fact's `(outcome, reason)` by id. Replay paths use this to
 /// return the first result verbatim; `Ok(None)` means no such row (a receipt
 /// predating the summary row, or a rolled-back apply that never committed).
@@ -199,6 +226,32 @@ pub async fn put_command<'c>(
     Ok(())
 }
 
+/// Flip one definition's enabled flag, preserving every other column. The
+/// caller holds the guild lifecycle lock and audits the transition in the
+/// same transaction, so a failed audit rolls the flip back.
+pub async fn set_command_enabled<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+    name: &str,
+    enabled: bool,
+    updated_by: &str,
+    updated_at_iso: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE automation_commands
+         SET enabled = $3, updated_by = $4, updated_at = $5::text::timestamptz
+         WHERE guild_id = $1 AND name = $2",
+    )
+    .bind(guild_id)
+    .bind(name)
+    .bind(enabled)
+    .bind(updated_by)
+    .bind(updated_at_iso)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Delete one definition; true when a row went away.
 pub async fn delete_command<'c>(
     executor: impl Executor<'c, Database = Postgres>,
@@ -211,6 +264,59 @@ pub async fn delete_command<'c>(
         .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Record that one guild's saved definitions are not yet reflected in the
+/// published registry. One row per guild: a repeated publication failure
+/// keeps the first marker (and its timestamp) instead of stacking work.
+/// Call with the pool (autocommit) after the failed publication, never in
+/// the already-committed mutation's transaction.
+pub async fn mark_registry_resync_pending<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+    at_iso: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO automation_command_registry_resync (guild_id, requested_at)
+         VALUES ($1, $2::text::timestamptz)
+         ON CONFLICT (guild_id) DO NOTHING",
+    )
+    .bind(guild_id)
+    .bind(at_iso)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Drop one guild's pending-publication marker after a confirmed full-set
+/// publication. Clearing an absent marker is a no-op, and other guilds'
+/// markers are never touched.
+pub async fn clear_registry_resync_pending<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM automation_command_registry_resync WHERE guild_id = $1")
+        .bind(guild_id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// Whether one guild has a pending-publication marker. Reconnect handling
+/// consults this before republishing; callers treat an error as no pending
+/// work, so a store outage keeps reconnects publication-free instead of
+/// forcing redundant PUTs.
+pub async fn is_registry_resync_pending<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    guild_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let pending = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM automation_command_registry_resync WHERE guild_id = $1)",
+    )
+    .bind(guild_id)
+    .fetch_one(executor)
+    .await?;
+    Ok(pending)
 }
 
 /// Serialize a guild's capacity check + write inside the supplied transaction.

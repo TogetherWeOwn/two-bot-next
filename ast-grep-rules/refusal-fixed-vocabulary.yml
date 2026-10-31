@@ -1,0 +1,48 @@
+id: refusal-fixed-vocabulary
+language: python
+severity: error
+message: 'Refusal messages must stay fixed vocabulary: do not interpolate rejected keys, ports, URLs, values or response bytes into Refused/ReadFailed/require. Allowlisted fixed sites: ALL_CAPS constants, {label} call-site labels, the classify_failure sanitizer, type(...).__name__, "has a bad {key}" (allowlisted key names only), the require message relay, and the guild-fence SmokeError relay.'
+files:
+  - scripts/ci/staging_schema_gate.py
+  - scripts/ci/production_schema_gate.py
+  - scripts/ci/schema_gate_common.py
+  - scripts/staging_events_read.py
+rule:
+  all:
+    - any:
+        - pattern: Refused($MSG)
+        - pattern: ReadFailed($MSG)
+        - pattern: require($COND, $MSG)
+    # Trigger vocabulary, matched against the whole call. Bare-variable
+    # messages need two shapes: single-argument constructors match
+    # `Refused(<ident>`, while require's message is the second argument, so
+    # a trailing `, <ident>)` matches it. The offline pin in
+    # scripts/ci/test_refusal_fixed_vocabulary.py applies this same literal
+    # to the message argument only (`^[a-z_]...$` there), which is the
+    # precise gate: pinning one literal keeps both sides in one reviewed
+    # diff. Known ast-grep 0.50 limit, verified locally: `has` sees direct
+    # children only and never unifies an outer $MSG, so the YAML cannot
+    # exclude a computed require condition the way the pin does. A require
+    # with a computed condition and a fixed message (for example
+    # `require(str(port).isdigit(), "port must be numeric")`) still trips
+    # this rule locally; the pin stays green and decides CI. Do not add
+    # computed-condition shapes to the YAML valid fixtures: `ast-grep test`
+    # would fail on purpose.
+    - regex: '(\{|\.format\s*\(|%\s*[\w\(]|str\s*\(|repr\s*\(|ascii\s*\(|\.join\s*\(|\+|Refused\(\s*[a-z_]|ReadFailed\(\s*[a-z_]|,\s*[a-z_][A-Za-z0-9_]*\s*\)\s*$|^[a-z_][A-Za-z0-9_]*$)'
+  not:
+    any:
+      # Module constants (MEMBER_ENV, DB_ROLE, ...): fixed vocabulary by construction.
+      - regex: '\{[A-Z][A-Z0-9_]*\}'
+      # Call-site labels: parse_instant/verify_binding callers pass literals.
+      - regex: '\{label\}'
+      # classify_failure maps psql stderr to a fixed phrase; the raw bytes never reach the message.
+      - regex: 'classify_failure\('
+      # Exception class names are code, not input.
+      - regex: 'type\([A-Za-z_][A-Za-z0-9_]*\)\.__name__'
+      # Reached only after `if key not in URL_PARAMS` refuses, so key is one allowlisted name.
+      - regex: 'has a bad \{key\}'
+      # guild_fence raises fixed-vocabulary SmokeError literals only (pinned by test).
+      - regex: 'Refused\(str\(error\)\)'
+      # The require(condition, message) helper relays its message argument;
+      # the call sites are covered above, so the bare relay stays exempt.
+      - regex: 'Refused\(\s*message\s*\)'

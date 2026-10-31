@@ -1,7 +1,17 @@
 //! Containment runtime acceptance against the mock Discord double. The worker
 //! tests are ignored and run only on agent-testdb / the CI service container.
 
+#[path = "containment_tuning_refusal_acceptance_tests.rs"]
+mod tuning_refusal_acceptance;
+
+// Protected fail-open acceptance lives in its own file: a dropped
+// quarantine outcome must surface as outcome-unknown with a metric. The
+// implementation change must not edit the protected file.
+#[path = "fail_open_containment_acceptance_tests.rs"]
+mod fail_open_containment_acceptance;
+
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -168,15 +178,17 @@ fn containment_seconds_refuse_values_that_are_not_whole_positive_milliseconds() 
 
 #[test]
 fn containment_id_lists_split_commas_and_drop_empties() {
-    assert!(id_list(&vars(&[]), "TWO_ANTI_NUKE_TRUSTED_USER_IDS").is_empty());
+    assert!(id_list(&vars(&[]), "TWO_ANTI_NUKE_TRUSTED_USER_IDS")
+        .expect("empty list")
+        .is_empty());
+    let ids = ["1".repeat(18), "2".repeat(18), "3".repeat(18)];
+    let raw = format!(" {},{},, {} ", ids[0], ids[1], ids[2]);
     let list = id_list(
-        &vars(&[("TWO_ANTI_NUKE_TRUSTED_USER_IDS", " 1,2,, 3 ")]),
+        &vars(&[("TWO_ANTI_NUKE_TRUSTED_USER_IDS", &raw)]),
         "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
-    );
-    assert_eq!(
-        list,
-        ["1", "2", "3"].into_iter().map(str::to_owned).collect()
-    );
+    )
+    .expect("valid snowflakes");
+    assert_eq!(list, ids.into_iter().collect());
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +325,22 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
         .collect()
 }
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "tog10430_contain_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -320,11 +348,16 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
+        // PID + counter + nanos: wall-clock nanos can repeat across parallel
+        // tests on a coarse clock (run 39175965289 attempt 1: duplicate
+        // schema `tog10430_*` -> 23505). The counter keeps same-tick
+        // names distinct, the PID separates test binaries, and nanos keeps a
+        // leaked schema plus PID reuse from ever repeating a name.
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("tog10430_contain_{stamp}");
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = schema_name_at(nanos);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

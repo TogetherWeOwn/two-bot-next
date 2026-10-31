@@ -60,10 +60,34 @@ this slice.
    general parsing lists. Attach the games/session menu according to
    `PickerKind`; anchor attaches **nothing**, not even a footer. Build games
    with min 0/max 10 and current game-role defaults; session min 1/max 2.
+   A queued welcome re-reads `GET /guilds/{guild}/members/{member}` after the
+   postable-channel check and before `begin_prompt`. That read may narrow the
+   eligibility captured at dispatch, never widen it: the captured guild,
+   trigger, bot and pending filter still runs first and performs no member
+   read. HTTP 404, `pending: true` and `user.bot: true` are terminal skips
+   with no post and no prompt or route marker, so a later genuine gate-clear
+   can still send. A wrong user id, a missing user, a non-boolean `pending`
+   or `bot`, a missing or non-array `roles` field, a non-snowflake role id,
+   HTTP 403 or 5xx, and a timed-out read return before the prompt lock and
+   leave the durable job retryable. The worker claims no job until the shard
+   receives an authenticated dispatch (READY, RESUMED or a replay with a valid
+   session), proving Discord accepted the Hello-queued Resume or Identify. A
+   cooperative shutdown before authentication leaves jobs unclaimed and waits
+   for the ordered writer to drain. Games-menu defaults come from
+   that fresh role list, not the roles captured at dispatch. Omitted `pending`
+   and `bot` mean false. The read is the shared strict GET (only 404 is
+   absence) on its existing five-second moderation deadline, inside the
+   worker's ninety-second budget. This does not enable onboarding as a live
+   flow or claim deployment parity.
 5. Dispatch `two:onboarding:games` only outside session mode, and
    `two:onboarding:session` in session mode. Defer ephemerally. Execute game
-   add/remove-to-match effects; on role failure use `PICKER_ROLE_FAILURE_REPLY`
-   and write no successful selection/routing rows. On success, re-run
+   add/remove-to-match effects. If the first role write fails, use
+   `PICKER_ROLE_FAILURE_REPLY` and write no rows. If a later write fails after
+   earlier grants landed, commit one `game_roles_selected` row naming only the
+   applied grants (no `channel_routed`; a suppressed member persists nothing)
+   and reply with `game_partial_failure_reply`, which names applied vs pending
+   picks; the member's retry is a fresh whole-answer submission that converges.
+   On success, re-run
    `plan_game_selection` with **post-grant** visibility, then build the
    final linked reply with `game_picker_reply` before recording routing. `GamePickerOutcome.reply/routed`
    are provisional at the pre-write point, not an authoritative post-grant
@@ -87,6 +111,13 @@ The prompt guard prevents normal concurrent/redelivered successful sends; it is
 **not exactly-once across a process crash between Discord acceptance and the
 Postgres commit**. That cross-system ambiguity is inherited from legacy's
 send-then-record ordering. Do not record a failed send as success to hide it.
+
+The guard lasts one stay: a processed goodbye (any mode, including dry run,
+and whether or not a goodbye message is posted) deletes the member's
+`onboarding_prompted` row before anything public is posted, so a rejoin is
+welcomed again. A clear that fails retries before the goodbye post; the next
+welcome re-runs the full suppression gate, so an opted-out member is never
+re-welcomed.
 
 ## Runtime wiring checkpoint
 
@@ -182,12 +213,17 @@ partial role writes cannot safely be reconstructed from its gateway sequence.
 Interrupted receipt counts are operational evidence, not successful responses.
 Within a live process, uncertain callbacks attempt an error edit without role
 replay; post-defer errors/timeouts get one bounded honest error edit. A delivered
-error reply is terminal and writes no successful selection/routing rows.
+error reply is terminal. Success rows are committed before the reply is sent,
+so the reply only ever describes committed state; if the reply (or the
+processing deadline) then fails, those rows are retracted by their per-submission
+idempotency keys before the error edit, so a selection the member was told
+failed is never counted. The one deliberate exception is the partial game-role
+failure above, whose delivered reply describes the committed partial row.
 
 Anchor `onboarding_prompted` and `channel_routed` now commit together under the
 PromptGuard. Game selection/routing and session routing success rows are staged
-inside their processing transaction, which rolls back when the final response
-fails. Discord acceptance versus database commit remains a cross-system
+inside their processing transaction and committed before the final response; a
+failed final response retracts them (`retract_picker_rows`). Discord acceptance versus database commit remains a cross-system
 ambiguity: neither the queue nor these transactions claims exactly-once sends
 across a crash in that window. Session goodbyes are at-least-once across such a
 crash; the legacy welcome marker suppresses retries after its successful commit.
@@ -220,8 +256,10 @@ not for the reconciliation with main `8af9b23` (shared command runtime and outbo
 message safety). The complete reconciled head still requires exact-head green CI
 and independent review on the same review card. Database isolation alone does not
 establish Discord's three-second ACK budget.
-Local Rust compilation has no certified bounded admission in this workspace; use the existing authorized CI
-service containers, never a speculative local build or target-directory bypass.
+**Historical local-admission constraint at that checkpoint:** local Rust
+compilation had no certified bounded admission in that workspace; the instruction
+was to use existing authorized CI service containers, never a speculative local
+build or target-directory bypass. This is not a current pool-health assessment.
 Do not enable this checkpoint as a live onboarding flow or claim deployment
 parity.
 
@@ -234,16 +272,46 @@ Framework references:
 
 ## Verification
 
+These are runnable recipes, not new execution evidence for the checkpoint above.
+On the persistent controller, use the
+[bounded build-cache wrapper](build-cache.md#local-builds) from the isolated
+worktree, with a 600000 ms Bash timeout or in the background. If admission is
+refused or missing, stop and follow the
+[Operator path](build-cache.md#operator-handoff-and-rollback-one-host-step);
+never use direct compiling Cargo, another cache or a speculative target.
+`cargo fmt` does not compile and may run directly.
+
 ```sh
+# Persistent controller only (fmt may run anywhere).
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --locked
+python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test onboarding_wire --locked
+TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  python3 scripts/cargo_cache.py run -- test -p two-bot --locked onboarding_ -- --include-ignored
+```
+
+Ephemeral hosted CI keeps its direct Cargo variants and the same filters:
+
+```sh
+# Ephemeral hosted CI only, not a controller fallback.
 cargo test -p two-bot-core --locked
 cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
 cargo test -p two-bot-discord --test onboarding_wire --locked
-cargo test -p two-bot --locked onboarding_ -- --include-ignored
+TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  cargo test -p two-bot --locked onboarding_ -- --include-ignored
 ```
 
-The DB proof is opt-in and hardwired to
+The broad `onboarding_` filter also selects gateway onboarding recovery tests,
+which require the dedicated `TWO_GATEWAY_TEST_DATABASE_URL` shown above; the
+gateway guard restricts it to the disposable `agent_test` user/database on the
+test host (or CI loopback), never runtime `DATABASE_URL`. This variable does not
+override the hardwired endpoint in `onboarding_tests`.
+
+The core `onboarding_store` DB proof is opt-in and hardwired to
 `postgres://agent_test@agent-testdb:5432/postgres` with an empty password. It
 never reads `DATABASE_URL` or Discord credentials. Each run creates two unique
 schemas and installs `search_path` on **every** pooled connection. It verifies

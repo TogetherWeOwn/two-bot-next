@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -19,12 +19,12 @@ PARKED = (503, json.dumps({
     "components": [["process", "ready"], ["gateway", "down"],
                    ["database", "down"], ["token_invalid", "ready"]],
     "jobs": {"counter": {"parked": True, "running": False}},
-    "build_revision": "abc123", "build_id": "42",
+    "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
 }).encode())
 READY = (200, json.dumps({
     "components": [["process", "ready"], ["gateway", "ready"]],
     "jobs": {"counter": {"parked": False, "running": True}},
-    "build_revision": "abc123", "build_id": "42",
+    "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
 }).encode())
 FENCED = (503, json.dumps({"error": "ownership_fenced", "reason": "parked"}).encode())
 
@@ -94,12 +94,43 @@ class BaseUrlTest(unittest.TestCase):
         base = probe.normalize_base("http://[::1]:8080/")
         self.assertEqual(base, "http://[::1]:8080")
 
+    def test_unusable_host_refused_before_any_fetch(self):
+        # An overlong DNS label would raise UnicodeError inside getaddrinfo
+        # (a ValueError, not an OSError), escaping the fetch guards with a
+        # traceback; refuse it at admission with fixed vocabulary instead.
+        args = probe.parse_args(["--base-url", f"http://{'a' * 70}/"])
+        _, results = probe.run(args, fetch_fn=double({}))
+        self.assertFalse(results[0].ok)
+        self.assertIn("refusing", results[0].reason)
+        self.assertNotIn("a" * 16, results[0].reason)
+        self.assertEqual(results[0].code, "origin_bad_host")
+
+    def test_usable_edge_hosts_still_admitted(self):
+        for raw, host in ((f"http://{'a' * 63}/", 'a' * 63),
+                          ("http://under_score.example/", "under_score.example"),
+                          ("http://example./", "example."),
+                          ("http://PROBE.EXAMPLE/", "probe.example")):
+            with self.subTest(raw=raw):
+                self.assertEqual(probe.normalize_base(raw), f"http://{host}")
+
+    def test_transport_unicode_error_is_a_fixed_liveness_fail(self):
+        def failing_fetch(url):
+            raise UnicodeEncodeError("idna", "x" * 70, 0, 70, "label too long")
+
+        args = probe.parse_args(["--base-url", "http://h/"])
+        _, results = probe.run(args, fetch_fn=failing_fetch)
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertIn("did not respond", results[0].reason)
+        self.assertNotIn("Traceback", results[0].reason)
+        self.assertEqual(results[0].code, "liveness_no_response")
+
     def test_truthful_503_with_gateway_ready_stays_green(self):
         body = (503, json.dumps({
             "components": [["process", "ready"], ["gateway", "ready"],
                            ["database", "down"]],
             "jobs": {"counter": {"parked": True, "running": False}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -111,7 +142,7 @@ class BaseUrlTest(unittest.TestCase):
             "components": [["process", "ready"], ["gateway", "ready"],
                            ["database", "down"]],
             "jobs": {"counter": {"parked": True, "running": False}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/", "--expect-ready")
@@ -149,7 +180,7 @@ class LyingGateTest(unittest.TestCase):
         body = (200, json.dumps({
             "components": [["process", "ready"], ["gateway", "down"]],
             "jobs": {"counter": {"parked": True, "running": False}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -161,7 +192,7 @@ class LyingGateTest(unittest.TestCase):
         body = (503, json.dumps({
             "components": [["process", "ready"], ["gateway", "ready"]],
             "jobs": {"counter": {"parked": True, "running": False}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -172,7 +203,7 @@ class LyingGateTest(unittest.TestCase):
         body = (503, json.dumps({
             "components": [["process", "ready"], ["gateway", "bogus"]],
             "jobs": {"counter": {"parked": True, "running": False}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -216,7 +247,7 @@ class FenceTest(unittest.TestCase):
         body = (503, json.dumps({
             "components": [["process", "ready"], ["gateway", "down"]],
             "jobs": {"counter": {"parked": "yes"}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -229,7 +260,7 @@ class DuplicateComponentTest(unittest.TestCase):
         return (status, json.dumps({
             "components": [[name, value] for name, value in pairs],
             "jobs": {"counter": {"parked": True, "running": False}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
 
     def assert_rejected(self, pairs, status):
@@ -288,7 +319,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
     def test_top_level_components_down_then_ready_refused(self):
         raw = ('{"components": ' + self.DOWN_PAIR
                + ', "jobs": {"counter": {"parked": true, "running": false}}, '
-               + '"build_revision": "r", "build_id": "b", '
+               + '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1", '
                + '"components": ' + self.READY_PAIR + '}').encode()
         with self.assertRaises(probe.ProbeError) as ctx:
             probe.check_readyz_shape(200, raw)
@@ -298,7 +329,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
     def test_top_level_components_ready_then_down_refused(self):
         raw = ('{"components": ' + self.READY_PAIR
                + ', "jobs": {"counter": {"parked": true, "running": false}}, '
-               + '"build_revision": "r", "build_id": "b", '
+               + '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1", '
                + '"components": ' + self.DOWN_PAIR + '}').encode()
         with self.assertRaises(probe.ProbeError) as ctx:
             probe.check_readyz_shape(503, raw)
@@ -308,7 +339,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
     def test_top_level_components_identical_repeat_refused(self):
         raw = ('{"components": ' + self.READY_PAIR
                + ', "jobs": {"counter": {"parked": true, "running": false}}, '
-               + '"build_revision": "r", "build_id": "b", '
+               + '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1", '
                + '"components": ' + self.READY_PAIR + '}').encode()
         with self.assertRaises(probe.ProbeError) as ctx:
             probe.check_readyz_shape(200, raw)
@@ -318,7 +349,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
     def test_top_level_components_duplicate_fails_closed_end_to_end(self):
         raw = ('{"components": ' + self.DOWN_PAIR
                + ', "jobs": {"counter": {"parked": true, "running": false}}, '
-               + '"build_revision": "r", "build_id": "b", '
+               + '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1", '
                + '"components": ' + self.READY_PAIR + '}').encode()
         code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
                         "--base-url", "http://h/")
@@ -366,7 +397,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
         for jobs in (f'{{"counter": {fresh}, "counter": {parked}}}',
                      f'{{"counter": {parked}, "counter": {fresh}}}'):
             raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
-                   + ', "build_revision": "r", "build_id": "b"}').encode()
+                   + ', "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode()
             with self.subTest(jobs=jobs):
                 with self.assertRaises(probe.ProbeError) as ctx:
                     probe.check_readyz_shape(200, raw)
@@ -376,7 +407,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
     def test_nested_job_name_identical_repeat_refused(self):
         jobs = '{"counter": {"parked": true, "running": false}, "counter": {"parked": true, "running": false}}'
         raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
-               + ', "build_revision": "r", "build_id": "b"}').encode()
+               + ', "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode()
         with self.assertRaises(probe.ProbeError) as ctx:
             probe.check_readyz_shape(200, raw)
         self.assertEqual(str(ctx.exception),
@@ -388,7 +419,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
                       '{"parked": false, "parked": false, "running": true}'):
             raw = ('{"components": ' + self.READY_PAIR
                    + ', "jobs": {"counter": ' + entry + '}, '
-                   + '"build_revision": "r", "build_id": "b"}').encode()
+                   + '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode()
             with self.subTest(entry=entry):
                 with self.assertRaises(probe.ProbeError) as ctx:
                     probe.check_readyz_shape(200, raw)
@@ -398,7 +429,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
     def test_nested_job_duplicate_fails_readiness_before_job_grading(self):
         jobs = '{"counter": {"parked": false, "running": true}, "counter": {"parked": true, "running": false}}'
         raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
-               + ', "build_revision": "r", "build_id": "b"}').encode()
+               + ', "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode()
         code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
                         "--base-url", "http://h/")
         self.assertEqual(code, 1, out)
@@ -409,7 +440,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
         _, raw = (200, json.dumps({
             "components": [["process", "ready"], ["gateway", "ready"]],
             "jobs": {"counter": {"parked": False, "running": True}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         state, _ = probe.check_readyz_shape(200, raw)
         self.assertEqual(state["gateway"], "ready")
@@ -425,7 +456,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
         sentinel = "SENTINEL_dupkey_cutover_abc123"
         raw = ('{"components": ' + self.READY_PAIR
                + ', "jobs": {"counter": {"parked": true, "running": false}}, '
-               + '"build_revision": "r", "build_id": "b", '
+               + '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1", '
                + json.dumps(sentinel) + ': 1, ' + json.dumps(sentinel) + ': 2}').encode()
         with self.assertRaises(probe.ProbeError) as ctx:
             probe.check_readyz_shape(200, raw)
@@ -440,7 +471,7 @@ class DuplicateJsonKeysTest(unittest.TestCase):
     def test_duplicate_writes_no_receipt(self):
         raw = ('{"components": ' + self.DOWN_PAIR
                + ', "jobs": {"counter": {"parked": true, "running": false}}, '
-               + '"build_revision": "r", "build_id": "b", '
+               + '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1", '
                + '"components": ' + self.READY_PAIR + '}').encode()
         with mock.patch("builtins.open") as handle:
             code, _ = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
@@ -466,7 +497,7 @@ class UnknownComponentTest(unittest.TestCase):
         return (status, json.dumps({
             "components": [[name, value] for name, value in pairs],
             "jobs": {"counter": {"parked": True, "running": False}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
 
     def test_unknown_ready_refused(self):
@@ -506,7 +537,7 @@ class UnknownComponentTest(unittest.TestCase):
                 _, raw = (status, json.dumps({
                     "components": [[n, v] for n, v in pairs],
                     "jobs": {"counter": {"parked": True, "running": False}},
-                    "build_revision": "r", "build_id": "b",
+                    "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
                 }).encode())
                 state, _ = probe.check_readyz_shape(status, raw)
                 self.assertEqual(set(state), {n for n, _ in pairs})
@@ -541,6 +572,41 @@ class EvidenceTest(unittest.TestCase):
                           "--evidence", "receipt.json")
         self.assertEqual(code, 1)
         handle.assert_not_called()
+
+    def test_json_evidence_failure_is_fail_verdict_with_empty_stderr(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("builtins.open",
+                        side_effect=IsADirectoryError(21, "Is a directory")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--json",
+                               "--evidence", "receipt.json"],
+                              fetch_fn=double({"/health": HEALTH,
+                                               "/readyz": READY}))
+        self.assertEqual(code, 1)
+        self.assertEqual(err.getvalue(), "")
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["verdict"], "FAIL")
+        rows = {row["id"]: row for row in report["checks"]}
+        self.assertEqual(rows["evidence"]["verdict"], "FAIL")
+        self.assertEqual(rows["evidence"]["code"], "evidence_not_written")
+        self.assertIn("IsADirectoryError", rows["evidence"]["detail"])
+        self.assertTrue(all(row["verdict"] == "PASS"
+                            for row in report["checks"]
+                            if row["id"] != "evidence"))
+
+    def test_text_evidence_failure_keeps_notice_on_stdout(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("builtins.open",
+                        side_effect=PermissionError(13, "denied")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/",
+                               "--evidence", "receipt.json"],
+                              fetch_fn=double({"/health": HEALTH,
+                                               "/readyz": READY}))
+        self.assertEqual(code, 1)
+        self.assertIn("evidence not written (PermissionError)",
+                      out.getvalue())
+        self.assertEqual(err.getvalue(), "")
 
 
 class UserAgentTests(unittest.TestCase):
@@ -578,7 +644,7 @@ def readyz_with_jobs(jobs, status=200):
     payload = {
         "components": [["process", "ready"], ["gateway", "ready"]],
         "jobs": {},
-        "build_revision": "r", "build_id": "b",
+        "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
     }
     for name, spec in jobs.items():
         parked, age = spec[0], spec[1]
@@ -676,7 +742,7 @@ class CadenceTest(unittest.TestCase):
             "jobs": {"counter": {"parked": False, "running": True,
                                  "consecutive_failures": 0,
                                  "last_start": now_ms - 5_000}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -729,7 +795,7 @@ class CadenceTest(unittest.TestCase):
             "components": [["process", "ready"], ["gateway", "ready"]],
             "jobs": {"counter": {"parked": False, "running": True,
                                  "last_success": now_ms + 60_000}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -747,7 +813,7 @@ class CadenceTest(unittest.TestCase):
                                  "consecutive_failures": 3,
                                  "last_error_class": "database",
                                  "last_start": now_ms - 5_000}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -766,7 +832,7 @@ class CadenceTest(unittest.TestCase):
                                  "consecutive_failures": 3,
                                  "last_error_class": "database",
                                  "last_start": now_ms - 5_000}},
-            "build_revision": "r", "build_id": "b",
+            "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
         }).encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/", "--expect-ready")
@@ -790,7 +856,8 @@ class CadenceTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("PASS jobs-map:", out)
         self.assertIn("1 jobs fresh within cadence", out)
-        self.assertIn("2 ungraded (brand_new_job, feeds)", out)
+        self.assertIn("2 ungraded", out)
+        self.assertNotIn("brand_new_job", out)
         self.assertIn("1 not yet run", out)
         self.assertIn("1 parked", out)
         self.assertNotIn("4 jobs fresh", out)
@@ -808,7 +875,7 @@ class NonfiniteJobFieldTest(unittest.TestCase):
         return (200, (
             '{"components": [["process", "ready"], ["gateway", "ready"]],'
             '"jobs": {"counter": ' + counter_entry_raw + '},'
-            '"build_revision": "r", "build_id": "b"}').encode())
+            '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode())
 
     def assert_structured_fail(self, counter_entry_raw, field):
         body = self.raw_body(counter_entry_raw)
@@ -903,7 +970,7 @@ class NonfiniteJobFieldTest(unittest.TestCase):
             '{"components": [["process", "ready"], ["gateway", "ready"]],'
             '"jobs": {"feeds": {"parked": false, "running": true, '
             '"last_success": NaN}},'
-            '"build_revision": "r", "build_id": "b"}').encode())
+            '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
         self.assertEqual(code, 0, out)
@@ -914,7 +981,7 @@ class NonfiniteJobFieldTest(unittest.TestCase):
             '{"components": [["process", "ready"], ["gateway", "ready"]],'
             '"jobs": {"brand_new_job": {"parked": false, "running": true, '
             '"consecutive_failures": Infinity}},'
-            '"build_revision": "r", "build_id": "b"}').encode())
+            '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
         self.assertEqual(code, 0, out)
@@ -926,7 +993,7 @@ class NonfiniteJobFieldTest(unittest.TestCase):
             '["database", "down"]],'
             '"jobs": {"counter": {"parked": false, "running": true, '
             '"last_success": NaN}},'
-            '"build_revision": "r", "build_id": "b"}').encode())
+            '"build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}').encode())
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
         self.assertEqual(code, 0, out)
@@ -952,6 +1019,85 @@ class NonfiniteJobFieldTest(unittest.TestCase):
                 with self.assertRaisesRegex(probe.ProbeError,
                                             "nonfinite consecutive_failures"):
                     probe.consecutive_failures({"consecutive_failures": value})
+
+
+class HugeMagnitudeTest(unittest.TestCase):
+    """Absurd finite magnitudes are display-capped, never expanded digit
+    for digit: an in-cap body must stay within the 16 KiB machine bound."""
+
+    HUGE = 10 ** 4200
+
+    def test_helpers_cap_absurd_magnitudes_without_changing_grading(self):
+        now_ms = int(time.time() * 1000)
+        self.assertEqual(
+            probe._field_age_seconds({"last_success": -self.HUGE},
+                                     "last_success", now_ms),
+            probe.MAX_DISPLAY_AGE_SECONDS)
+        self.assertEqual(
+            probe.consecutive_failures(
+                {"consecutive_failures": self.HUGE}),
+            probe.MAX_DISPLAY_FAILURES)
+        # Realistic values flow through untouched.
+        self.assertEqual(
+            probe._field_age_seconds({"last_success": now_ms - 5000},
+                                     "last_success", now_ms), 5)
+        self.assertEqual(
+            probe.consecutive_failures({"consecutive_failures": 4}), 4)
+
+    def test_huge_remote_magnitudes_stay_within_output_bound(self):
+        jobs = {}
+        for index, name in enumerate(probe.JOB_CADENCE_SECONDS):
+            if index % 3 == 0:
+                jobs[name] = {"parked": False, "running": True,
+                              "last_success": -self.HUGE}
+            elif index % 3 == 1:
+                jobs[name] = {"parked": False, "running": True,
+                              "consecutive_failures": self.HUGE}
+            else:
+                jobs[name] = {"parked": False, "running": True,
+                              "last_start": -self.HUGE}
+        body = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": jobs,
+            "build_revision": "0123456789abcdef0123456789abcdef01234567",
+            "build_id": "700-1",
+        }).encode())
+        self.assertLessEqual(len(body[1]), probe.BODY_CAP)
+        for flags in (["--json"], []):
+            with self.subTest(flags=flags):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = probe.main(["--base-url", "http://h/", *flags],
+                                      fetch_fn=double({"/health": HEALTH,
+                                                       "/readyz": body}))
+                self.assertEqual(code, 1)
+                combined = out.getvalue() + err.getvalue()
+                self.assertLessEqual(len(combined.encode()), 16_384)
+                self.assertNotIn("Traceback", combined)
+
+
+class DecoderRecursionTest(unittest.TestCase):
+    """A decoder RecursionError becomes None (an ordinary failed check),
+    never a traceback escaping the verdict path."""
+
+    def test_decode_returns_none_when_decoder_recurses(self):
+        with mock.patch.object(probe, "decode_strict",
+                               side_effect=RecursionError("max depth")):
+            self.assertIsNone(probe.decode(b"[0]"))
+
+    def test_recursing_body_fails_a_check_without_traceback(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(probe, "decode_strict",
+                               side_effect=RecursionError("max depth")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--json"],
+                              fetch_fn=double({"/health": HEALTH,
+                                               "/readyz": READY}))
+        self.assertEqual(code, 1)
+        self.assertEqual(err.getvalue(), "")
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertNotIn("Traceback", out.getvalue())
 
 class FixedCadenceJobGradingTest(unittest.TestCase):
     """self_role_recovery (30 s cadence, 25 s timeout) and automod_expiry
@@ -1038,6 +1184,50 @@ class FixedCadenceJobGradingTest(unittest.TestCase):
         self.assertIn("1 jobs fresh within cadence", out)
 
 
+def counting_double():
+    inner = double({"/health": HEALTH, "/readyz": READY})
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        return inner(url)
+
+    fetch.calls = calls
+    return fetch
+
+
+class TimeoutCapBoundaryTests(unittest.TestCase):
+    """Pin the documented 60 s --timeout cap boundary in this suite.
+
+    The acceptance fixtures stop valid values at 30 and only refuse 1e9
+    over the cap, so a strict-< off-by-one or a raised cap would survive
+    there. These two cases sit exactly at the bound and just above it.
+    """
+
+    def test_timeout_cap_60_fetches_both_routes(self):
+        fetch = counting_double()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--timeout", "60"],
+                              fetch_fn=fetch)
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        self.assertEqual(len(fetch.calls), 2, "both routes must be fetched")
+
+    def test_timeout_just_over_cap_61_refuses_before_any_request(self):
+        fetch = counting_double()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--timeout", "61"],
+                              fetch_fn=fetch)
+        self.assertEqual(code, 2)
+        self.assertEqual(fetch.calls, [], "a refusal must attempt zero requests")
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("--timeout", combined)
+        self.assertIn("at most 60", combined)
+        self.assertNotIn("PASS", combined, "a refusal must not print check lines")
+        self.assertNotIn("FAIL", combined, "a refusal must not print check lines")
+
+
 class BodyCapRefusalTests(unittest.TestCase):
     """Oversized bodies are refused before JSON parsing (M4.42)."""
 
@@ -1081,7 +1271,7 @@ class BodyCapRefusalTests(unittest.TestCase):
         sentinel = "SENTINEL_BODY_readyz_oversize"
         payload = {"components": [["process", "ready"], ["gateway", "ready"]],
                    "jobs": {"counter": {"parked": True, "running": False}},
-                   "build_revision": "r", "build_id": "b", "note": sentinel}
+                   "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1", "note": sentinel}
         base = json.dumps(payload).encode()
         big = base + b" " * (probe.BODY_CAP + 1 - len(base))
         self.assertEqual(json.loads(big)["note"], sentinel)
@@ -1102,7 +1292,7 @@ class BodyCapRefusalTests(unittest.TestCase):
         # breakdown verdict computed from parsed JSON.
         payload = {"components": [["process", "ready"], ["gateway", "ready"]],
                    "jobs": {"counter": {"parked": True, "running": False}},
-                   "build_revision": "r", "build_id": "b"}
+                   "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1"}
         big = self.padded(payload, probe.BODY_CAP + 1)
         self.assertEqual(len(big), probe.BODY_CAP + 1)
         code, out = run(double({"/health": HEALTH, "/readyz": (503, big)}),

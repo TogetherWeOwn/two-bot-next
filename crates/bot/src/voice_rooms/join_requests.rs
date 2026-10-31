@@ -19,11 +19,23 @@
 //! carries no guild, so it could not be routed or role-gated.
 //!
 //! **Answer.** A click is authorized against the room's *current* owner, never
-//! the message it sits on, and against the request's current state. A stale
-//! button (answered, withdrawn, from before a restart) is answered with a
-//! refusal and changes nothing. Approve queues one write that gives the member
-//! a Connect allow on the room only and moves them in from the Join channel;
-//! Block persists through the privacy record; Deny writes nothing.
+//! the message it sits on, and against the request's current state. Approve
+//! first checks the member is still waiting in the Join channel: a gone member
+//! is withdrawn with a correction instead of a movement claim. Approve queues
+//! one write that gives the member a Connect allow on the room only and moves
+//! them in from the Join channel; Block persists through the privacy record;
+//! Deny writes nothing. When the move later finds nobody left, or Discord
+//! refuses it, the owner gets a follow-up naming what happened plus the
+//! rejoin recovery, on top of the `/setup` failure line.
+//!
+//! A stale button (answered, withdrawn, from before a restart) is answered
+//! with a refusal and changes nothing. The refusal is per side: the owner
+//! learns the request is gone and why, the requester learns to leave and
+//! rejoin to ask again, and anyone else keeps the owner-only refusal.
+//!
+//! **Leaving.** A member who leaves the Join channel undecided takes their
+//! request with them: the scan withdraws it and retires its prompt, and
+//! coming back raises a fresh request with a fresh id.
 //!
 //! **Restarts.** Pending requests and the posted prompts are runtime only.
 //! Each button binds the numeric core request id to a fresh 128-bit CSPRNG
@@ -32,9 +44,10 @@
 //! worker's buttons. Legacy buttons without an epoch are refused.
 //!
 //! Approved grants are durable (`voice_join_grants`): the intent is recorded
-//! before the Connect PUT, a refused grant retires its row so the member can
-//! ask again, and an unknown grant or revoke outcome keeps its row so a retry
-//! or a restart can still revoke. Worker load hydrates private rooms' grants
+//! before the Connect PUT. Only a fresh intent's definitive PUT refusal retires
+//! its row so the member can ask again. An existing witness or an unknown grant
+//! or revoke outcome keeps its row, even through later retry refusals, so a
+//! retry or a restart can still revoke. Worker load hydrates private rooms' grants
 //! and re-queues revocations for grants whose room is public or gone. The
 //! block list is durable and unaffected.
 
@@ -50,7 +63,7 @@ use super::{private_runtime::can_edit_overwrites, *};
 
 /// A public correlation nonce, not an authorization token. Ownership and the
 /// command gate are still checked on every click.
-type WorkerEpoch = [u8; 16];
+pub(super) type WorkerEpoch = [u8; 16];
 
 const PAUSED: &str = "Voice rooms are paused: Discord refused the bot credential. \
                       Fix the token, then restart the bot.";
@@ -58,6 +71,14 @@ const WARMING: &str = "The voice worker isn't warmed up yet — try again in a m
 const ROOM_GONE: &str = "That room no longer exists.";
 const NOT_OWNER: &str = "Only the room's current owner can answer join requests.";
 const NOT_PENDING: &str = "This join request is no longer pending.";
+/// A stale press by the requester: they can only ask again from the Join
+/// channel, so the copy says how.
+const REJOIN_COPY: &str =
+    "That join request is no longer pending \u{2014} leave the Join channel and rejoin to ask again.";
+/// A stale press for a request withdrawn without a leave (owner transfer,
+/// `/public`): no leave happened and no rejoin recovery applies, so the copy
+/// stays neutral on both sides.
+const WITHDRAWN_COPY: &str = "That join request is no longer pending \u{2014} it was withdrawn.";
 const CORRUPT: &str = "This room's privacy settings look corrupt. Ask an admin to check /setup.";
 const NEEDS_MANAGE_ROLES: &str = "I can't let anyone in: I need the Manage Roles permission on \
                                   this room. Ask an admin to check my permissions.";
@@ -72,6 +93,10 @@ pub(super) struct JoinRequests {
     pub(super) entries: HashMap<(Snowflake, Snowflake), u64>,
     /// The posted prompt for each request still waiting for an answer.
     pub(super) prompts: HashMap<(Snowflake, u64), MessageRef>,
+    /// How each recently answered or withdrawn request ended, so a stale
+    /// press can say why. Bounded per room; older reasons fall back to the
+    /// bare "no longer pending".
+    pub(super) resolved: HashMap<(Snowflake, u64), JoinResolution>,
 }
 
 impl JoinRequests {
@@ -80,8 +105,51 @@ impl JoinRequests {
             epoch: rand::random(),
             entries: HashMap::new(),
             prompts: HashMap::new(),
+            resolved: HashMap::new(),
         }
     }
+}
+
+/// How a request that is no longer pending ended, with the member it was
+/// for. Recorded on every answer and withdrawal; read only to word a stale
+/// press. `left` distinguishes a member who left the Join channel (scan and
+/// press-time paths) from a worker-retired request (owner transfer, `/public`),
+/// whose stale copy must not claim a leave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JoinResolution {
+    Answered {
+        decision: JoinDecision,
+        member: Snowflake,
+    },
+    Withdrawn {
+        member: Snowflake,
+        left: bool,
+    },
+}
+
+/// Why a press found no live request to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleBecause {
+    Answered(JoinDecision),
+    Withdrawn { member: Snowflake, left: bool },
+    Restarted { legacy: bool },
+    Unknown,
+}
+
+/// Which half of an approval dispatch failed: the grant PUT or the move in.
+/// Only a refused move is reported to the owner; a refused PUT unwinds the
+/// unlanded grant and the member simply asks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalWrite {
+    Grant,
+    Move,
+}
+
+/// What the post-grant move did: it ran, or nobody was left to move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinMoveOutcome {
+    Moved,
+    NobodyLeft,
 }
 
 /// One Approve / Deny / Block press, parsed from its component id.
@@ -125,6 +193,33 @@ pub(super) enum JoinReply {
     Decided(String),
 }
 
+/// Split a join button id into its codec core and worker epoch: `Some((core,
+/// epoch))` for a bare codec id (`epoch` is `None`) and for a runtime id with
+/// a valid 32-hex epoch suffix, `None` when the id has the epoch shape but the
+/// suffix is not valid lowercase hex. Shared by the sink's
+/// [`join_component_action`] and the stale-control ownership check, so the two
+/// can never disagree on what the sink claims.
+pub(super) fn split_runtime_join_id(custom_id: &str) -> Option<(&str, Option<WorkerEpoch>)> {
+    if custom_id.len() > two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS {
+        return None;
+    }
+    if custom_id.matches(':').count() == 5 {
+        let (core_id, encoded) = custom_id.rsplit_once(':')?;
+        if encoded.len() != 32
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let mut epoch = [0; 16];
+        hex::decode_to_slice(encoded, &mut epoch).ok()?;
+        Some((core_id, Some(epoch)))
+    } else {
+        Some((custom_id, None))
+    }
+}
+
 /// Parse a join-request button press. `None` for anything else, so other
 /// components (including other `two:voice:` ids) stay with their owners.
 pub(super) fn join_component_action(interaction: &Interaction) -> Option<JoinClick> {
@@ -135,24 +230,7 @@ pub(super) fn join_component_action(interaction: &Interaction) -> Option<JoinCli
     let InteractionData::MessageComponent(data) = interaction.data.as_ref()? else {
         return None;
     };
-    if data.custom_id.len() > two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS {
-        return None;
-    }
-    let (core_id, epoch) = if data.custom_id.matches(':').count() == 5 {
-        let (core_id, encoded) = data.custom_id.rsplit_once(':')?;
-        if encoded.len() != 32
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return None;
-        }
-        let mut epoch = [0; 16];
-        hex::decode_to_slice(encoded, &mut epoch).ok()?;
-        (core_id, Some(epoch))
-    } else {
-        (data.custom_id.as_str(), None)
-    };
+    let (core_id, epoch) = split_runtime_join_id(&data.custom_id)?;
     let (decision, room_id, request_id) = match parse_voice_custom_id(core_id)? {
         VoiceAction::JoinApprove {
             room_id,
@@ -258,6 +336,7 @@ where
         .run_join_decision(guild_id, JoinDecisionCommand { actor_id, click })
         .await
     {
+        None if runtime.has_actor(guild_id) => ephemeral_response(WORKER_LOST_REPLY),
         None => ephemeral_response(WARMING),
         Some(JoinReply::Refused(text)) => ephemeral_response(&text),
         Some(JoinReply::Decided(text)) => decided_response(&text),
@@ -272,8 +351,9 @@ where
     H: RoomWrites + Send + 'static,
 {
     /// Run one press through the guild actor. `None` when the guild has no
-    /// live actor yet or its inbox already drained.
-    async fn run_join_decision(
+    /// live actor yet, when its inbox already drained, or when no answer
+    /// arrived within `WORKER_ACK_WAIT`.
+    pub(super) async fn run_join_decision(
         &self,
         guild: Snowflake,
         decision: JoinDecisionCommand,
@@ -284,7 +364,10 @@ where
             .tx
             .send(ActorCommand::JoinDecision { decision, reply })
             .ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 }
 
@@ -338,10 +421,64 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // Members who left forget their entry, so coming back counts.
             self.join.entries.retain(|key, _| present.contains(key));
         }
+        // Anyone who left without an answer takes their request with them.
+        // This runs before new raises, so a member who left and came back
+        // between ticks asks again fresh instead of re-finding a dead request.
+        self.withdraw_left_join_requests(&joins);
         entrants.sort_unstable();
         for (room, join, member, transition) in entrants {
             self.join.entries.insert((join, member), transition);
             self.raise_join_request(room, join, member);
+        }
+    }
+
+    /// Withdraw every still-pending request whose member is no longer in the
+    /// room's Join channel, retiring its prompt. Coming back raises a fresh
+    /// request through the normal entry path.
+    fn withdraw_left_join_requests(&mut self, joins: &HashMap<Snowflake, Snowflake>) {
+        let mut left = Vec::new();
+        {
+            let live = self.live.read_state();
+            if !live.ready {
+                return;
+            }
+            for (join, room) in joins {
+                let Some(state) = self.privacy.get(room) else {
+                    continue;
+                };
+                if !state.private {
+                    continue;
+                }
+                for request in state.pending.values() {
+                    let member = request.member_id.0;
+                    let still_waiting = live
+                        .members
+                        .get(&member)
+                        .is_some_and(|presence| presence.channel_id == Some(*join));
+                    if !still_waiting {
+                        left.push((*room, member, request.id.0));
+                    }
+                }
+            }
+        }
+        left.sort_unstable();
+        for (room, member, request_id) in left {
+            let Some(state) = self.privacy.get(&room).cloned() else {
+                continue;
+            };
+            // Deny-as-owner is the core's only request removal and carries no
+            // effects; the worker records it as the withdrawal it was.
+            if let Ok(plan) =
+                state.decide(state.owner_id, RequestId(request_id), JoinDecision::Deny)
+            {
+                self.privacy.insert(room, plan.room);
+                self.record_join_resolution(
+                    room,
+                    request_id,
+                    JoinResolution::Withdrawn { member, left: true },
+                );
+                self.retire_join_prompt(room, request_id);
+            }
         }
     }
 
@@ -397,17 +534,72 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return JoinReply::Refused(ROOM_GONE.to_owned());
         }
         if click.epoch != Some(self.join.epoch) {
-            return JoinReply::Refused(NOT_PENDING.to_owned());
+            // Before any state change: an earlier worker's buttons stay dead,
+            // and each side learns why instead of the bare "no longer pending".
+            return self.refuse_stale_join(
+                click.room_id,
+                click.request_id,
+                actor_id,
+                StaleBecause::Restarted {
+                    legacy: click.epoch.is_none(),
+                },
+            );
         }
         self.join_owner_changed(click.room_id);
         let Some(state) = self.privacy.get(&click.room_id).cloned() else {
-            return JoinReply::Refused(NOT_PENDING.to_owned());
+            return self.refuse_stale_join(
+                click.room_id,
+                click.request_id,
+                actor_id,
+                StaleBecause::Unknown,
+            );
         };
-        let requester = state
+        let request = state
             .pending
             .values()
             .find(|request| request.id.0 == click.request_id)
-            .map(|request| request.member_id.0);
+            .copied();
+        let Some(request) = request else {
+            let because = match self.join.resolved.get(&(click.room_id, click.request_id)) {
+                Some(JoinResolution::Answered { decision, .. }) => {
+                    StaleBecause::Answered(*decision)
+                }
+                Some(JoinResolution::Withdrawn { member, left }) => StaleBecause::Withdrawn {
+                    member: *member,
+                    left: *left,
+                },
+                None => StaleBecause::Unknown,
+            };
+            return self.refuse_stale_join(click.room_id, click.request_id, actor_id, because);
+        };
+        let member = request.member_id.0;
+        if actor_id == state.owner_id.0
+            && click.decision == JoinDecision::Approve
+            && !self.member_in_join(click.room_id, member)
+        {
+            // They left before the owner answered: withdraw the request
+            // instead of claiming a move that cannot land.
+            match state.decide(
+                state.owner_id,
+                RequestId(click.request_id),
+                JoinDecision::Deny,
+            ) {
+                Ok(plan) => {
+                    self.privacy.insert(click.room_id, plan.room);
+                    self.record_join_resolution(
+                        click.room_id,
+                        click.request_id,
+                        JoinResolution::Withdrawn { member, left: true },
+                    );
+                    self.join.prompts.remove(&(click.room_id, click.request_id));
+                    return JoinReply::Decided(format!(
+                        "Not approved: <@{member}> already left the Join channel, so there is \
+                         no one to move. Ask them to rejoin to ask again."
+                    ));
+                }
+                Err(_) => return JoinReply::Refused(NOT_PENDING.to_owned()),
+            }
+        }
         let plan = match state.decide(
             MemberId(actor_id),
             RequestId(click.request_id),
@@ -419,9 +611,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return JoinReply::Refused(NOT_PENDING.to_owned());
             }
             Err(_) => return JoinReply::Refused(CORRUPT.to_owned()),
-        };
-        let Some(member) = requester else {
-            return JoinReply::Refused(NOT_PENDING.to_owned());
         };
         if click.decision == JoinDecision::Approve {
             if !can_edit_overwrites(bot_permissions) {
@@ -437,6 +626,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
         }
         self.privacy.insert(click.room_id, plan.room);
+        self.record_join_resolution(
+            click.room_id,
+            click.request_id,
+            JoinResolution::Answered {
+                decision: click.decision,
+                member,
+            },
+        );
         self.join.prompts.remove(&(click.room_id, click.request_id));
         match click.decision {
             JoinDecision::Approve => {
@@ -478,6 +675,132 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     && overwrite.deny.contains(Permissions::CONNECT)
             })
         })
+    }
+
+    /// Whether `member` currently sits in `room`'s Join channel.
+    fn member_in_join(&self, room: Snowflake, member: Snowflake) -> bool {
+        let Some(join) = self.join_channel_of(room) else {
+            return false;
+        };
+        self.live
+            .read_state()
+            .members
+            .get(&member)
+            .is_some_and(|state| state.channel_id == Some(join))
+    }
+
+    /// Remember how a request ended for later stale presses, keeping only
+    /// the 32 newest reasons per room.
+    fn record_join_resolution(
+        &mut self,
+        room: Snowflake,
+        request_id: u64,
+        resolution: JoinResolution,
+    ) {
+        self.join.resolved.insert((room, request_id), resolution);
+        let mut ids: Vec<u64> = self
+            .join
+            .resolved
+            .keys()
+            .filter_map(|(known, id)| (*known == room).then_some(*id))
+            .collect();
+        if ids.len() > 64 {
+            ids.sort_unstable();
+            for id in ids.iter().take(ids.len() - 32) {
+                self.join.resolved.remove(&(room, *id));
+            }
+        }
+    }
+
+    /// Refuse a press that found no live request, with copy per side: the
+    /// owner learns the request is gone and why, the requester learns to
+    /// leave and rejoin to ask again, and anyone else gets the standing
+    /// owner-only refusal. Changes nothing.
+    fn refuse_stale_join(
+        &self,
+        room: Snowflake,
+        request_id: u64,
+        actor_id: Snowflake,
+        because: StaleBecause,
+    ) -> JoinReply {
+        let owner = self.rooms.get(&room).map(|room| room.owner_id);
+        // After a restart the numeric counter starts over, so the stale id
+        // cannot name the requester: anyone still waiting for this room, or
+        // still sitting in its Join channel, is on the requester side.
+        let requester = if matches!(because, StaleBecause::Restarted { .. }) {
+            let waiting = self.privacy.get(&room).is_some_and(|state| {
+                state
+                    .pending
+                    .values()
+                    .any(|request| request.member_id.0 == actor_id)
+            }) || self.member_in_join(room, actor_id);
+            waiting.then_some(actor_id)
+        } else {
+            self.privacy
+                .get(&room)
+                .and_then(|state| {
+                    state
+                        .pending
+                        .values()
+                        .find(|request| request.id.0 == request_id)
+                        .map(|request| request.member_id.0)
+                })
+                .or_else(|| {
+                    self.join
+                        .resolved
+                        .get(&(room, request_id))
+                        .map(|resolution| match resolution {
+                            JoinResolution::Answered { member, .. }
+                            | JoinResolution::Withdrawn { member, .. } => *member,
+                        })
+                })
+        };
+        if Some(actor_id) == owner {
+            let text = match because {
+                StaleBecause::Answered(decision) => format!(
+                    "That join request is no longer pending \u{2014} it was already {}.",
+                    match decision {
+                        JoinDecision::Approve => "approved",
+                        JoinDecision::Deny => "denied",
+                        JoinDecision::Block => "blocked",
+                    }
+                ),
+                StaleBecause::Withdrawn { member, left } => {
+                    if left {
+                        format!(
+                            "That join request is no longer pending \u{2014} <@{member}> left the Join \
+                             channel, so it was withdrawn. Ask them to rejoin to ask again."
+                        )
+                    } else {
+                        WITHDRAWN_COPY.to_owned()
+                    }
+                }
+                StaleBecause::Restarted { legacy: true } => {
+                    "Those join buttons expired, so that request is no longer pending. If they \
+                     are still waiting, a fresh prompt with new buttons is on its way \u{2014} \
+                     answer that one."
+                        .to_owned()
+                }
+                StaleBecause::Restarted { legacy: false } => {
+                    "Those join buttons restarted with the bot, so that request is no longer \
+                     pending. If they are still waiting, a fresh prompt with new buttons is on \
+                     its way \u{2014} answer that one."
+                        .to_owned()
+                }
+                StaleBecause::Unknown => NOT_PENDING.to_owned(),
+            };
+            return JoinReply::Refused(text);
+        }
+        if Some(actor_id) == requester {
+            // A retired request (transfer, `/public`) leaves nothing to
+            // rejoin for: the member is either still waiting or the room is
+            // public now.
+            if matches!(because, StaleBecause::Withdrawn { left: false, .. }) {
+                return JoinReply::Refused(WITHDRAWN_COPY.to_owned());
+            }
+            return JoinReply::Refused(REJOIN_COPY.to_owned());
+        }
+        JoinReply::Refused(NOT_OWNER.to_owned())
     }
 
     /// The room has a new owner: requests raised to the previous owner are
@@ -529,6 +852,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                 }
                 PrivacyEffect::WithdrawRequest { request } => {
+                    // Retired by the worker (owner transfer, `/public`), not
+                    // by a leave: the stale copy must stay neutral.
+                    self.record_join_resolution(
+                        room,
+                        request.id.0,
+                        JoinResolution::Withdrawn {
+                            member: request.member_id.0,
+                            left: false,
+                        },
+                    );
                     self.retire_join_prompt(room, request.id.0);
                 }
                 _ => {}
@@ -553,6 +886,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// the scan remembered about its Join channel.
     pub(super) fn forget_join_requests(&mut self, room: Snowflake) {
         self.join.prompts.retain(|(channel, _), _| *channel != room);
+        self.join
+            .resolved
+            .retain(|(channel, _), _| *channel != room);
         if let Some(join) = self.join_channel_of(room) {
             self.join.entries.retain(|(channel, _), _| *channel != join);
         }
@@ -686,8 +1022,23 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let Some(state) = self.privacy.get(&room).cloned() else {
             return;
         };
+        let member = state
+            .pending
+            .values()
+            .find(|request| request.id.0 == request_id)
+            .map(|request| request.member_id.0);
         if let Ok(plan) = state.decide(state.owner_id, RequestId(request_id), JoinDecision::Deny) {
             self.privacy.insert(room, plan.room);
+            if let Some(member) = member {
+                self.record_join_resolution(
+                    room,
+                    request_id,
+                    JoinResolution::Answered {
+                        decision: JoinDecision::Deny,
+                        member,
+                    },
+                );
+            }
         }
     }
 
@@ -710,13 +1061,38 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
-        let existing = self
-            .live_overwrites(room)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|overwrite| {
-                overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
-            });
+        let Some(snapshot) = self.live.overwrite_snapshot(room) else {
+            // Rate limits do not consume attempts, so attempts == 0 does not
+            // prove the grant was unsent. Only the store can rule out a witness.
+            let grants = match self.store.join_grants(self.live.guild_id).await {
+                Ok(grants) => grants,
+                Err(error) => {
+                    self.join_grant_store_failed(action, room, error, now_ms, started);
+                    return;
+                }
+            };
+            if grants
+                .get(&room)
+                .is_some_and(|members| members.contains(&member))
+            {
+                // A witnessed PUT may already have landed: keep the claim and
+                // witness, and retry from fresh overwrite evidence.
+                self.mark_failed_observed(
+                    action,
+                    "join approval overwrite evidence unavailable".to_owned(),
+                    elapsed_ms(now_ms, started),
+                );
+            } else {
+                // No witness exists, so forget this unpersisted approval and
+                // let the member request access again once evidence returns.
+                self.unwind_grant(room, member);
+                self.queue.mark_succeeded(&action);
+            }
+            return;
+        };
+        let existing = snapshot.overwrites.iter().copied().find(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
+        });
         let (allow, deny) = existing
             .map_or((Permissions::empty(), Permissions::empty()), |entry| {
                 (entry.allow, entry.deny)
@@ -727,13 +1103,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
-        // Persist the approval's intent before granting Connect: a crash
-        // between this write and the PUT below must still leave enough state
-        // to revoke, while a grant Discord refuses is never claimed. The row
-        // is idempotent, so a retried intent is a no-op.
-        match self.persist_join_grant(room, member).await {
-            Ok(true) => {}
-            Ok(false) => {
+        // A pre-existing witness may cover an earlier ambiguous PUT. Only
+        // this call's fresh insert can be unwound by a definitive PUT refusal.
+        let mut retain_grant = match self.persist_join_grant(room, member).await {
+            Ok(JoinGrantIntent::Fresh) => false,
+            Ok(JoinGrantIntent::Retained) => true,
+            Ok(JoinGrantIntent::RoomMissing) => {
                 // The room row is gone: nothing can hold the grant.
                 self.unwind_grant(room, member);
                 self.queue.mark_succeeded(&action);
@@ -743,31 +1118,49 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 self.join_grant_store_failed(action, room, error, now_ms, started);
                 return;
             }
-        }
+        };
         let grant = PermissionOverwrite {
             allow: (allow | Permissions::CONNECT) & !Permissions::MANAGE_ROLES,
             deny,
             id: Id::new(member),
             kind: PermissionOverwriteType::Member,
         };
-        let mut grant_landed = false;
-        let result = match self
-            .http
-            .put_overwrite(room, grant, self.live.room_guard(room))
-            .await
-        {
+        let next = private_runtime::with_overwrite(&snapshot.overwrites, &grant);
+        let guard =
+            self.live
+                .overwrite_guard(room, snapshot.generation, snapshot.overwrites.clone());
+        let result = match self.http.put_overwrite(room, grant, guard).await {
             Ok(()) => {
-                grant_landed = true;
-                self.note_overwrite(room, &grant);
-                self.move_in_from_join(room, member).await
+                // Even if newer evidence prevents projection, the PUT landed:
+                // retain its durable witness, but do not move on stale evidence.
+                retain_grant = true;
+                if self.live.advance_overwrites(
+                    room,
+                    snapshot.generation,
+                    &snapshot.overwrites,
+                    &next,
+                ) {
+                    match self.move_in_from_join(room, member).await {
+                        Ok(JoinMoveOutcome::Moved) => Ok(()),
+                        Ok(JoinMoveOutcome::NobodyLeft) => {
+                            // The grant landed but they left before the move:
+                            // the press claimed movement, so say what happened.
+                            self.follow_up_join_left(room, member).await;
+                            Ok(())
+                        }
+                        Err(error) => Err((ApprovalWrite::Move, error)),
+                    }
+                } else {
+                    Err((ApprovalWrite::Grant, RoomHttpError::Cancelled))
+                }
             }
-            Err(error) => Err(error),
+            Err(error) => Err((ApprovalWrite::Grant, error)),
         };
         match result {
             Ok(()) => {
                 self.queue.mark_succeeded(&action);
             }
-            Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+            Err((_, RoomHttpError::RateLimited { retry_after_ms, .. })) => {
                 self.queue.mark_rate_limited(
                     self.live.guild_id,
                     retry_after_ms,
@@ -775,7 +1168,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     action,
                 );
             }
-            Err(RoomHttpError::UnknownOutcome) => {
+            Err((_, RoomHttpError::UnknownOutcome)) => {
                 // The grant is a whole-entry PUT and the move is idempotent.
                 self.mark_failed_observed(
                     action,
@@ -783,14 +1176,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     elapsed_ms(now_ms, started),
                 );
             }
-            Err(error) => {
-                // A grant that never landed is not claimed, so the member can
-                // ask again. One that landed stays recorded even when the
-                // move failed (a full room, say): they hold the access and
-                // `/public` must still take it back. An unknown outcome keeps
-                // its witness: the PUT may have landed, so a retry (or a
-                // restart) can still revoke safely.
-                if !grant_landed {
+            Err((write, error)) => {
+                // A fresh intent whose PUT was refused can be forgotten. A
+                // retained witness cannot: this refusal says nothing about an
+                // earlier attempt. A successful PUT also stays recorded when
+                // only the move failed, so `/public` can take the access back.
+                if !retain_grant {
                     match self.retire_join_grant(room, member).await {
                         Ok(()) => self.unwind_grant(room, member),
                         Err(store_error) => {
@@ -805,9 +1196,56 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     }
                 }
+                if write == ApprovalWrite::Move {
+                    // The press claimed movement and the grant stands: the
+                    // owner gets the refusal plus the recovery, on top of the
+                    // `/setup` failure line below.
+                    self.follow_up_join_move_refused(room, member).await;
+                }
                 self.complete_error(action, room, error);
             }
         }
+    }
+
+    /// Tell the owner an approved member kept their access but left before
+    /// the move. Best-effort: the approval itself already succeeded.
+    async fn follow_up_join_left(&self, room: Snowflake, member: Snowflake) {
+        let Some(owner) = self.rooms.get(&room).map(|room| room.owner_id) else {
+            return;
+        };
+        let _ = self
+            .http
+            .send_component_message(
+                room,
+                &format!(
+                    "Approved <@{member}> keeps their access, but they already left the Join \
+                     channel, so I could not move them in. Ask them to rejoin if they still \
+                     want in."
+                ),
+                Some(owner),
+                &[],
+            )
+            .await;
+    }
+
+    /// Tell the owner Discord refused the move. Best-effort: the grant and
+    /// the `/setup` failure line already record the rest.
+    async fn follow_up_join_move_refused(&self, room: Snowflake, member: Snowflake) {
+        let Some(owner) = self.rooms.get(&room).map(|room| room.owner_id) else {
+            return;
+        };
+        let _ = self
+            .http
+            .send_component_message(
+                room,
+                &format!(
+                    "I couldn't move <@{member}> into this room \u{2014} Discord refused the \
+                     move. They keep their access; ask them to rejoin to try again."
+                ),
+                Some(owner),
+                &[],
+            )
+            .await;
     }
 
     /// Move the member into the room, but only out of this room's Join
@@ -816,9 +1254,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         &mut self,
         room: Snowflake,
         member: Snowflake,
-    ) -> Result<(), RoomHttpError> {
+    ) -> Result<JoinMoveOutcome, RoomHttpError> {
         let Some(join) = self.join_channel_of(room) else {
-            return Ok(());
+            return Ok(JoinMoveOutcome::NobodyLeft);
         };
         let in_join = self
             .live
@@ -827,7 +1265,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .get(&member)
             .is_some_and(|state| state.channel_id == Some(join));
         if !in_join {
-            return Ok(());
+            return Ok(JoinMoveOutcome::NobodyLeft);
         }
         match self
             .http
@@ -839,11 +1277,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             )
             .await
         {
+            Ok(()) => Ok(JoinMoveOutcome::Moved),
             // Left the Join channel since the grant landed, or is not in voice
             // at all: they hold the access and can connect themselves.
-            Ok(())
-            | Err(RoomHttpError::Cancelled | RoomHttpError::NotFound)
-            | Err(RoomHttpError::Rejected { code: 40032, .. }) => Ok(()),
+            Err(RoomHttpError::Cancelled | RoomHttpError::NotFound)
+            | Err(RoomHttpError::Rejected { code: 40032, .. }) => Ok(JoinMoveOutcome::NobodyLeft),
             Err(error) => Err(error),
         }
     }
@@ -855,19 +1293,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
-    /// Record the approval's intent before the grant PUT. `Ok(false)` means
-    /// the room has no database row, so the grant would outlive its room.
+    /// Record the approval's intent before the grant PUT, retaining the
+    /// distinction between a fresh intent and an earlier access obligation.
     async fn persist_join_grant(
         &mut self,
         room: Snowflake,
         member: Snowflake,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.store
             .save_join_grant(self.live.guild_id, room, member)
             .await
     }
 
-    /// Retire the witness after a successful revoke (or a refused grant).
+    /// Retire the witness after a safe revoke (or a fresh intent's refused PUT).
     /// Idempotent: retiring an absent grant is success.
     async fn retire_join_grant(
         &mut self,
@@ -929,13 +1367,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
-        let existing = self
-            .live_overwrites(room)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|overwrite| {
-                overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
-            });
+        let Some(snapshot) = self.live.overwrite_snapshot(room) else {
+            // Keep the witness and retry from fresh authoritative evidence.
+            self.mark_failed_observed(
+                action,
+                "join revoke overwrite evidence unavailable".to_owned(),
+                elapsed_ms(now_ms, started),
+            );
+            return;
+        };
+        let existing = snapshot.overwrites.iter().copied().find(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
+        });
         let Some(existing) = existing else {
             // Nothing to take back: Discord holds no overwrite, so the
             // witness can retire.
@@ -950,21 +1393,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         };
         let remaining = existing.allow & !Permissions::CONNECT;
-        let result = if remaining.is_empty() && existing.deny.is_empty() {
-            self.http
-                .delete_overwrite(room, member, self.live.room_guard(room))
-                .await
-                .map(|()| self.forget_overwrite(room, member))
+        let guard =
+            self.live
+                .overwrite_guard(room, snapshot.generation, snapshot.overwrites.clone());
+        let (written, next) = if remaining.is_empty() && existing.deny.is_empty() {
+            let next = snapshot
+                .overwrites
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    !(entry.kind == PermissionOverwriteType::Member && entry.id.get() == member)
+                })
+                .collect::<Vec<_>>();
+            (self.http.delete_overwrite(room, member, guard).await, next)
         } else {
             let kept = PermissionOverwrite {
                 allow: remaining,
                 ..existing
             };
-            self.http
-                .put_overwrite(room, kept, self.live.room_guard(room))
-                .await
-                .map(|()| self.note_overwrite(room, &kept))
+            let next = private_runtime::with_overwrite(&snapshot.overwrites, &kept);
+            (self.http.put_overwrite(room, kept, guard).await, next)
         };
+        let result = written.and_then(|()| {
+            if self
+                .live
+                .advance_overwrites(room, snapshot.generation, &snapshot.overwrites, &next)
+            {
+                Ok(())
+            } else {
+                Err(RoomHttpError::Cancelled)
+            }
+        });
         match result {
             Ok(()) => match self.retire_join_grant(room, member).await {
                 Ok(()) => {
@@ -989,20 +1448,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     elapsed_ms(now_ms, started),
                 );
             }
-            Err(error) => self.complete_error(action, room, error),
-        }
-    }
-
-    /// Drop a deleted overwrite from the live snapshot, so the next decision
-    /// reads what Discord now holds without waiting for the gateway echo.
-    fn forget_overwrite(&self, room: Snowflake, member: Snowflake) {
-        let mut live = self.live.write_state();
-        if let Some(channel) = live.channels.get_mut(&room) {
-            if let Some(overwrites) = channel.permission_overwrites.as_mut() {
-                overwrites.retain(|entry| {
-                    !(entry.kind == PermissionOverwriteType::Member && entry.id.get() == member)
-                });
+            Err(RoomHttpError::Cancelled) => {
+                // The snapshot went stale; replan the revoke on the next attempt.
+                self.mark_failed_observed(
+                    action,
+                    "join revoke planned from stale overwrites".to_owned(),
+                    elapsed_ms(now_ms, started),
+                );
             }
+            Err(error) => self.complete_error(action, room, error),
         }
     }
 

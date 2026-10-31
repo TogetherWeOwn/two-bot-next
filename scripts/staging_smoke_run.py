@@ -57,7 +57,7 @@ PUBLISH_SET = ROOT / "crates/core/tests/fixtures/staging_published_commands.json
 # The "always" rows of docs/staging-e2e-command-matrix.md: published with no
 # staging env gate, so a missing one is a failure, not an unset flag. The unit
 # tests cross-check this tuple against the matrix doc.
-CORE_SURFACES = ("rank", "leaderboard", "help")
+CORE_SURFACES = ("rank", "leaderboard", "help", "privacy", "reopen", "welcome-preview", "game-mix")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 BUILD_ID_RE = re.compile(r"([0-9]+)-[0-9]+")
 RUN_ID_RE = re.compile(r"[0-9]+")
@@ -125,7 +125,7 @@ def fences(args, token):
         origin = health_probe.staging_origin(args.staging_url)
     except health_probe.ProbeError as error:
         raise Refused(str(error))
-    if args.expected_sha and not SHA_RE.fullmatch(args.expected_sha):
+    if args.expected_sha is not None and not SHA_RE.fullmatch(args.expected_sha):
         raise Refused("refusing: --expected-sha must be 40 lowercase hex characters")
     if args.deploy_run_id and not RUN_ID_RE.fullmatch(args.deploy_run_id):
         raise Refused("refusing: --deploy-run-id must be digits")
@@ -154,9 +154,9 @@ def health_rows(args, origin, run, fetch_fn):
     probe_args = argparse.Namespace(staging_url=origin, expected_sha=args.expected_sha)
     started = utc()
     _, results, report = health_probe.run(probe_args, timed_fetch(fetch_fn, run))
-    if isinstance(report, dict):
-        run.build_revision = report.get("build_revision")
-        run.build_id = report.get("build_id")
+    identity = health_probe.canonical_build_identity(report)
+    run.build_revision = identity[0] if identity else None
+    run.build_id = identity[1] if identity else None
     meta = {
         "health": ("GET /health", "200 {\"status\":\"ok\"}", "health", SIGNATURE_HEALTH),
         "readyz": ("GET /readyz", "200, every component ready", "readyz", SIGNATURE_READYZ),

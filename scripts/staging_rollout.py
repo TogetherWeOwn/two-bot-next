@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed staging gate for Wrangler 4.149.0's rolling Containers API.
+"""Fail-closed staging gate for Wrangler 4.152.0's rolling Containers API.
 
 Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
@@ -7,6 +7,7 @@ bodies can contain secrets: never print them, including in exception messages.
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,10 +17,12 @@ import tomllib
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
+from build_identity import is_deploy_id_shape, parse_deploy_id
+
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
-WRANGLER = "4.149.0"
+WRANGLER = "4.152.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
@@ -32,15 +35,16 @@ USER_AGENT = "two-bot-next-staging-rollout/1.0"
 ACTIVE_LAG_CONFIRMATIONS = 2
 # Polls tolerated while a completed rollout's target image is not yet reflected
 # by the application listing. The listing is read separately from the rollout
-# record and can trail it right after a deploy; a persistent mismatch still
-# fails closed as `application_image_drift`. A poll cycle runs about 11s in CI
-# (5s sleep plus the control-plane reads), so 24 polls is roughly 4.5 minutes.
-# Stale polls only count once the rollout completes while the 300s verify
-# deadline runs from the start, so the deadline usually ends a mismatch that
-# never clears before this cap does; verify reports that as the same drift
-# (see `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the
-# middle of the observed lag: on 10-05..10-07 completed verify steps ran up to
-# 192s while eight runs with a healthy, exact-build container failed at 129-186s.
+# record and can trail it right after a deploy. A mismatch is accepted only when
+# the pinned rollout plus exact-build /readyz and /health probes prove the new
+# build is serving; otherwise persistent staleness fails as drift. A poll cycle
+# runs about 11s in CI (5s sleep plus the control-plane reads), so 24 polls is
+# roughly 4.5 minutes. Stale polls only count once the rollout completes while
+# the 300s verify deadline runs from the start, so the deadline usually ends a
+# mismatch that never clears before this cap does (see
+# `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the middle
+# of the observed lag: on 10-05..10-07 completed verify steps ran up to 192s while
+# eight runs with a healthy, exact-build container failed at 129-186s.
 APPLICATION_IMAGE_STALE_POLLS = 24
 # Extra time after the verify deadline for the control-plane read behind the
 # drift diagnostic, including when an in-flight poll read reaches the deadline.
@@ -61,6 +65,7 @@ READINESS_TOKENS = frozenset({
     "deployment_id_missing", "operation_failed",
 })
 VERIFY_TIMEOUT_SECONDS = 300
+API_TRANSPORT_BACKOFF_SECONDS = (0.25, 0.5)
 MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -167,16 +172,43 @@ class Client:
             return 0, {}, b""
 
     def api(self, path):
-        status, _, body = self.request(self.base + path, authenticated=True)
-        require(status == 200, "api_http_failure")
-        data = decode(body)
-        require(mapping(data).get("success") is True and "result" in data, "api_failure")
-        return data["result"]
+        for attempt in range(len(API_TRANSPORT_BACKOFF_SECONDS) + 1):
+            try:
+                status, _, body = self.request(self.base + path, authenticated=True)
+            except GateError as error:
+                if str(error) != "api_transport_failure":
+                    raise
+                if attempt == len(API_TRANSPORT_BACKOFF_SECONDS):
+                    raise GateError("api_transport_failure") from None
+                delay = API_TRANSPORT_BACKOFF_SECONDS[attempt]
+                if self.deadline is not None:
+                    delay = min(delay, self.deadline - time.monotonic())
+                    require(delay > 0, "rollout_timeout")
+                time.sleep(delay)
+                continue
+            require(status == 200, "api_http_failure")
+            data = decode(body)
+            require(mapping(data).get("success") is True and "result" in data, "api_failure")
+            return data["result"]
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 def decode(body):
     try:
-        return json.loads(body)
+        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, UnicodeError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget
         # below MAX_BODY; classify it as invalid_json like any malformed body.
@@ -291,12 +323,13 @@ def deploy_version(records, started):
     return version
 
 
-def image_receipt(tags, details, version, revision, build_id):
+def image_receipt(tags, details, version, revision, build_id, deploy_id):
     prefix = version.split("-")[0]
     pattern = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}:{prefix}"
     selected = [tag for tag in tags if re.fullmatch(pattern, tag)]
     require(len(selected) == 1, "image_tag_missing_or_ambiguous")
-    require(details.get("revision") == revision and details.get("build_id") == build_id,
+    require(details.get("revision") == revision and details.get("build_id") == build_id
+            and details.get("deploy_id") == deploy_id,
             "image_build_mismatch")
     digests = [digest for digest in sequence(details.get("digests"))
                if isinstance(digest, str) and re.fullmatch(IMAGE, digest)]
@@ -305,7 +338,7 @@ def image_receipt(tags, details, version, revision, build_id):
     return digests[0]
 
 
-def docker_image(version, revision, build_id):
+def docker_image(version, revision, build_id, deploy_id):
     def docker(*args):
         try:
             result = subprocess.run(["docker", *args], capture_output=True, timeout=20, check=True)
@@ -318,15 +351,63 @@ def docker_image(version, revision, build_id):
     pattern = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}:{version.split('-')[0]}"
     matches = [tag for tag in tags if re.fullmatch(pattern, tag)]
     require(len(matches) == 1, "image_tag_missing_or_ambiguous")
-    # Inspect only the two non-secret labels and RepoDigests, never Config.Env.
+    # Inspect only the three non-secret labels and RepoDigests, never Config.Env.
     format_string = ('{"revision":{{json (index .Config.Labels "org.opencontainers.image.revision")}},'
                      '"build_id":{{json (index .Config.Labels "com.togetherweown.build-id")}},'
+                     '"deploy_id":{{json (index .Config.Labels "com.togetherweown.deploy-id")}},'
                      '"digests":{{json .RepoDigests}}}')
     details = mapping(decode(docker("image", "inspect", matches[0], "--format", format_string)))
-    return image_receipt(tags, details, version, revision, build_id)
+    return image_receipt(tags, details, version, revision, build_id, deploy_id)
+
+
+BASELINE_IDENTITY = re.compile(r"[A-Za-z0-9_-]{1,128}")
+BASELINE_REVISION = re.compile(r"[0-9a-f]{40}")
+BASELINE_BUILD_ID = re.compile(r"[0-9]+-[0-9]+")
+
+
+def validate_baseline(baseline):
+    """Refuse a malformed local baseline receipt before anyone acts on it.
+
+    Mirrors `ProvenanceReceipt.__post_init__`: every member is type- and
+    shape-checked, and any failure raises the single fixed token
+    `invalid_baseline_receipt` with no upstream text. In particular
+    `rollout_ids` must be a list of identifier-shaped strings — a string
+    would silently flip `select_rollout`'s membership test from list- to
+    substring-matching. Valid receipts pass through untouched.
+    """
+    require(isinstance(baseline, dict), "invalid_baseline_receipt")
+    started = baseline.get("started")
+    require(isinstance(started, (int, float)) and not isinstance(started, bool),
+            "invalid_baseline_receipt")
+    # `prepare` writes `started=time.time()`, always finite and positive. A
+    # hand-edited zero/negative value would accept pre-baseline rollouts as
+    # new; NaN/inf would fail later under a misleading stale token. Only
+    # floats take the finiteness check: math.isfinite() raises OverflowError
+    # on ints beyond the float range instead of returning False.
+    require(started > 0 and (isinstance(started, int) or math.isfinite(started)),
+            "invalid_baseline_receipt")
+    for member in ("application_id", "namespace_id"):
+        value = baseline.get(member)
+        require(isinstance(value, str) and BASELINE_IDENTITY.fullmatch(value),
+                "invalid_baseline_receipt")
+    revision = baseline.get("revision")
+    require(isinstance(revision, str) and BASELINE_REVISION.fullmatch(revision),
+            "invalid_baseline_receipt")
+    build_id = baseline.get("build_id")
+    require(isinstance(build_id, str) and BASELINE_BUILD_ID.fullmatch(build_id),
+            "invalid_baseline_receipt")
+    deploy_id = baseline.get("deploy_id")
+    require(is_deploy_id_shape(deploy_id), "invalid_baseline_receipt")
+    rollout_ids = baseline.get("rollout_ids")
+    require(isinstance(rollout_ids, list), "invalid_baseline_receipt")
+    for member in rollout_ids:
+        require(isinstance(member, str) and BASELINE_IDENTITY.fullmatch(member),
+                "invalid_baseline_receipt")
+    return baseline
 
 
 def select_rollout(rows, baseline, image):
+    baseline = validate_baseline(baseline)
     candidates = []
     for row in rows:
         row = mapping(row)
@@ -426,13 +507,14 @@ def active_worker(client, version):
             and versions[0].get("percentage") == 100, "worker_version_not_active")
 
 
-def runtime_ready(status, headers, body, version, revision, build_id):
+def runtime_ready(status, headers, body, version, revision, build_id, deploy_id):
     if status != 200:
         return False
     # Unknown/mismatched identities never pass, even for a healthy old process.
     require(headers.get("x-two-worker-version") == version, "serving_worker_mismatch")
     report = mapping(decode(body))
-    require(report.get("build_revision") == revision and report.get("build_id") == build_id,
+    require(report.get("build_revision") == revision and report.get("build_id") == build_id
+            and report.get("deploy_id") == deploy_id,
             "serving_image_mismatch")
     components = sequence(report.get("components"))
     return bool(components) and all(isinstance(part, list) and len(part) == 2 and part[1] == "ready"
@@ -474,7 +556,7 @@ def gateway_failure(report):
     return None
 
 
-def runtime_observation(status, headers, body, version, revision, build_id):
+def runtime_observation(status, headers, body, version, revision, build_id, deploy_id):
     # Only component names/states that fit a strict token are echoed; the probe
     # body and headers are service output and are otherwise discarded.
     parts = [f"readyz={status}"]
@@ -491,7 +573,8 @@ def runtime_observation(status, headers, body, version, revision, build_id):
         parts.append("components=" + ",".join(components))
     except GateError:
         pass
-    parts.append("identity=" + readiness_identity(headers, report, version, revision, build_id))
+    parts.append("identity=" + readiness_identity(headers, report, version, revision, build_id,
+                                                       deploy_id))
     token = readiness_token(report)
     if token:
         parts.append(f"token={token}")
@@ -501,12 +584,12 @@ def runtime_observation(status, headers, body, version, revision, build_id):
     return " ".join(parts)
 
 
-def readiness_identity(headers, report, version, revision, build_id):
+def readiness_identity(headers, report, version, revision, build_id, deploy_id):
     worker = headers.get("x-two-worker-version")
     if not isinstance(report, dict):
         return "mismatch" if worker is not None and worker != version else "absent"
-    observed = (worker, report.get("build_revision"), report.get("build_id"))
-    expected = (version, revision, build_id)
+    observed = (worker, report.get("build_revision"), report.get("build_id"), report.get("deploy_id"))
+    expected = (version, revision, build_id, deploy_id)
     if any(value is not None and value != target for value, target in zip(observed, expected)):
         return "mismatch"
     if any(value is None for value in observed):
@@ -527,8 +610,9 @@ def readiness_token(report):
     return None
 
 
-def zero_instance_readiness_observation(status, headers, report, version, revision, build_id):
-    if readiness_identity(headers, report, version, revision, build_id) != "match":
+def zero_instance_readiness_observation(status, headers, report, version, revision, build_id,
+                                          deploy_id):
+    if readiness_identity(headers, report, version, revision, build_id, deploy_id) != "match":
         return None
     components = report.get("components")
     if not isinstance(components, list):
@@ -576,7 +660,7 @@ def record_zero_instance_timeout(client, row, verification_started):
     client.observation += f" phase=rollout reason=zero_instances elapsed_s={elapsed}{details}"
 
 
-def unconverged_readiness(client, url, version, revision, build_id, zero_instances):
+def unconverged_readiness(client, url, version, revision, build_id, deploy_id, zero_instances):
     # Best effort from the existing readiness probe; logs contain only status,
     # identity class and fixed tokens, never upstream text or identifiers.
     status, headers, body = client.request(url + "/readyz")
@@ -585,7 +669,7 @@ def unconverged_readiness(client, url, version, revision, build_id, zero_instanc
         report = mapping(decode(body))
     except GateError:
         report = None
-    identity = readiness_identity(headers, report, version, revision, build_id)
+    identity = readiness_identity(headers, report, version, revision, build_id, deploy_id)
     parts = [f"readyz={status_code}", f"identity={identity}"]
     token = readiness_token(report)
     if token:
@@ -594,7 +678,7 @@ def unconverged_readiness(client, url, version, revision, build_id, zero_instanc
         return None, " ".join(parts)
     failure = gateway_failure(report)
     diagnostic = (zero_instance_readiness_observation(
-        status, headers, report, version, revision, build_id) if zero_instances else None)
+        status, headers, report, version, revision, build_id, deploy_id) if zero_instances else None)
     return failure, diagnostic or " ".join(parts)
 
 
@@ -610,12 +694,95 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
+DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
+GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+# Worker-edge span lines log this SHA as `release` (same commit as the
+# container image). Generated-only: a committed value would go stale, so the
+# committed TOML must never carry it (like the drill switch above).
+CONTAINER_RELEASE_VAR = "CONTAINER_RELEASE"
+VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
+UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
+
+
+def apply_gateway_fail_injection(config, enabled):
+    """Stage the rollback-drill injection in the GENERATED config only.
+
+    The committed TOML may never carry the switch or a deploy-env marker
+    outside staging (wrangler/scripts/check-env-bindings.py); this helper
+    refuses such a source again so a hand-generated config cannot smuggle
+    either past CI. When `enabled`, the staging fence marker must already
+    be exactly "staging" and only the staging vars of the generated config
+    gain the switch — top-level, production and every other environment
+    stay untouched, and the checked-in file is never modified. When not
+    enabled nothing is added, so a plain push deploy is byte-identical in
+    behavior to before the drill existed.
+    """
+    envs = config.get("env") or {}
+    tables = [("top-level", config.get("vars") or {})]
+    tables += [(name, (env or {}).get("vars") or {}) for name, env in envs.items()]
+    for _name, variables in tables:
+        require(GATEWAY_FAIL_INJECTION_VAR not in variables,
+                "gateway_fail_injection_in_source_config")
+    for name, variables in tables:
+        if name != "staging":
+            require(DEPLOY_ENV_VAR not in variables, "deploy_env_outside_staging")
+    if not enabled:
+        return
+    staging = mapping(mapping(config.get("env")).get("staging"))
+    variables = staging.get("vars")
+    require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
+            "gateway_fail_injection_fence_missing")
+    variables[GATEWAY_FAIL_INJECTION_VAR] = "1"
+
+
+def apply_remediation_fault_injection(config, voice_stall, unpaired_disconnect):
+    """Stage the remediation-drill switches in the GENERATED config only.
+
+    Same fence as the rollback-drill helper above: the committed TOML may
+    never carry either switch (wrangler/scripts/check-env-bindings.py), and
+    this helper refuses such a source again so a hand-generated config cannot
+    smuggle either past CI. When armed, the staging fence marker must already
+    be exactly "staging" and only the staging vars of the generated config
+    gain the requested switches — top-level, production and every other
+    environment stay untouched, and the checked-in file is never modified.
+    When neither drill is requested nothing is added, so a plain push deploy
+    is byte-identical in behavior to before the injector existed.
+    """
+    envs = config.get("env") or {}
+    tables = [("top-level", config.get("vars") or {})]
+    tables += [(name, (env or {}).get("vars") or {}) for name, env in envs.items()]
+    for _name, variables in tables:
+        require(VOICE_STALL_FAULT_VAR not in variables,
+                "remediation_fault_in_source_config")
+        require(UNPAIRED_FAULT_VAR not in variables,
+                "remediation_fault_in_source_config")
+    for name, variables in tables:
+        if name != "staging":
+            require(DEPLOY_ENV_VAR not in variables, "deploy_env_outside_staging")
+    if not voice_stall and not unpaired_disconnect:
+        return
+    staging = mapping(mapping(config.get("env")).get("staging"))
+    variables = staging.get("vars")
+    require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
+            "remediation_fault_fence_missing")
+    if voice_stall:
+        variables[VOICE_STALL_FAULT_VAR] = "1"
+    if unpaired_disconnect:
+        variables[UNPAIRED_FAULT_VAR] = "1"
+
+
 def prepare(args, client):
     staging_url()
     revision = os.environ.get("GITHUB_SHA", "")
     build_id = f"{os.environ.get('GITHUB_RUN_ID', '')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '')}"
-    require(re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9]+-[0-9]+", build_id),
+    deploy_id = os.environ.get("DEPLOY_ID", "")
+    require(re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9]+-[0-9]+", build_id)
+            and is_deploy_id_shape(deploy_id),
             "invalid_build_identity")
+    # The stamped ID must name this revision: an ID computed for another SHA
+    # (a wiring mistake between the compute and prepare steps) refuses here,
+    # not after the deploy, when the serving report cannot match it.
+    require(parse_deploy_id(deploy_id)[2] == revision[:7], "invalid_build_identity")
     started = time.time()
     app = application(client)
     rows = rollouts(client, app["id"])
@@ -635,13 +802,27 @@ def prepare(args, client):
                                                      for item in env.get("containers", [])]]:
         container["image"] = str((source.parent / container["image"]).resolve())
         container["image_build_context"] = str(source.parent.parent)
-    containers[0]["image_vars"] = {"BOT_BUILD_REVISION": revision, "BOT_BUILD_ID": build_id}
+    containers[0]["image_vars"] = {"BOT_BUILD_REVISION": revision, "BOT_BUILD_ID": build_id,
+                                      "BOT_DEPLOY_ID": deploy_id}
     containers[0]["rollout_kind"] = "full_auto"
+    # The Worker edge has no container probe, so edge span lines would log the
+    # visible `unknown` bucket; stamping the same commit here lets them carry
+    # the real release like the DO-side alert lines do.
+    staging_vars = staging.setdefault("vars", {})
+    require(isinstance(staging_vars, dict), "wrong_staging_config")
+    staging_vars[CONTAINER_RELEASE_VAR] = revision
+    # Rollback drill only: the dispatch-only workflow input reaches the
+    # deployed build solely as this flag on the generated staging config.
+    apply_gateway_fail_injection(config, bool(getattr(args, "inject_gateway_failure", False)))
+    # Remediation drills only: the dispatch-only workflow inputs reach the
+    # deployed build solely as these flags on the generated staging config.
+    apply_remediation_fault_injection(config, bool(getattr(args, "inject_voice_stall", False)),
+                                      bool(getattr(args, "inject_unpaired_disconnect", False)))
     save(args.deploy_config, config)
     save(args.receipt, {"started": started, "application_id": app["id"],
                         "namespace_id": app["durable_objects"]["namespace_id"],
                         "rollout_ids": [row["id"] for row in rows],
-                        "revision": revision, "build_id": build_id})
+                        "revision": revision, "build_id": build_id, "deploy_id": deploy_id})
     # This path must be fresh: Wrangler appends NDJSON across sessions.
     require(not Path(args.output).exists(), "deploy_output_not_fresh")
     print("staging rollout baseline recorded")
@@ -653,7 +834,10 @@ def read_records(path):
 
 def receipt(args, client=None):
     """Network-free: accept the Wrangler deploy receipt before ownership moves."""
-    baseline = mapping(decode(Path(args.receipt).read_bytes()))
+    # Decoded-but-wrong shapes (a JSON list, null, a string) refuse with the
+    # single baseline token; undecodable input still raises `invalid_json`
+    # from `decode` first.
+    baseline = validate_baseline(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
     save(args.evidence, {"worker_version": version})
     print("wrangler deploy receipt accepted")
@@ -718,23 +902,27 @@ def deadline_aware_read(client, read, app, row, image, drift_candidate, verifica
 
 def verify(args, client):
     verification_started = time.monotonic()
-    baseline = mapping(decode(Path(args.receipt).read_bytes()))
+    baseline = validate_baseline(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
-    image = docker_image(version, baseline["revision"], baseline["build_id"])
+    image = docker_image(version, baseline["revision"], baseline["build_id"], baseline["deploy_id"])
     require(worker_namespace(client, version) == baseline["namespace_id"], "worker_namespace_changed")
     url = staging_url()
     pinned = None
     lag_streak = 0
     image_stale = 0
+    listing_seen_target = False
     drift_candidate = False
     app = row = None
     while time.monotonic() < client.deadline:
         probed = False
         passed = False
+        stale = False
         app = deadline_aware_read(
             client, lambda: application(client), app, row, image, drift_candidate, verification_started)
         require(app["id"] == baseline["application_id"]
                 and app["durable_objects"]["namespace_id"] == baseline["namespace_id"], "application_identity_drift")
+        listed_image = mapping(app.get("configuration")).get("image")
+        listing_seen_target = listing_seen_target or listed_image == image
         if pinned is None:
             pinned = select_rollout(rollouts(client, app["id"]), baseline, image)
             client.observation = "no_new_rollout"
@@ -754,25 +942,33 @@ def verify(args, client):
                 deadline_aware_read(
                     client, lambda: active_worker(client, version), app, row, image,
                     drift_candidate, verification_started)
-            stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
+            stale = (complete or lag) and listed_image != image
             drift_candidate = stale
             if stale:
                 image_stale += 1
                 client.observation += f" application_image=stale polls={image_stale}"
-                if image_stale > APPLICATION_IMAGE_STALE_POLLS:
-                    raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
             else:
                 image_stale = 0
-            if (complete or lag) and not stale:
+            # The application listing is eventually consistent and can remain on
+            # its baseline image after the rollout and serving process converge.
+            # The pinned rollout plus exact-build /readyz and /health probes are
+            # the acceptance evidence; keep polling those while the listing lags.
+            if complete or lag:
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
                 probed = True
                 observed = "rollout=active_lag " if lag else "rollout=converged "
                 client.observation = observed + runtime_observation(
-                    status, headers, body, version, baseline["revision"], baseline["build_id"])
-                if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"]):
+                    status, headers, body, version, baseline["revision"], baseline["build_id"],
+                    baseline["deploy_id"])
+                if stale:
+                    client.observation += f" application_image=stale polls={image_stale}"
+                if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"],
+                                   baseline["deploy_id"]):
                     health, health_headers, _ = client.request(url + "/health")
                     client.observation = f"{observed}readyz=200 health={health}"
+                    if stale:
+                        client.observation += f" application_image=stale polls={image_stale}"
                     if health == 200 and health_headers.get("x-two-worker-version") == version:
                         # Re-read control plane after the runtime probes; neither
                         # Worker activation nor container rollout is transactional.
@@ -787,18 +983,39 @@ def verify(args, client):
                                 or active_lag(final, image, pinned["target_version"]),
                                 "rollout_not_converged")
                         final_app = application(client)
-                        if not (final_app["id"] == app["id"]
-                                and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"]
-                                and mapping(final_app.get("configuration")).get("image") == image):
-                            client.observation += " application_image=final_mismatch"
+                        require(final_app["id"] == app["id"]
+                                and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"],
+                                "application_identity_drift")
+                        final_image = mapping(final_app.get("configuration")).get("image")
+                        listing_seen_target = listing_seen_target or final_image == image
+                        final_previous_image = mapping(final.get("current_configuration")).get("image")
+                        verified_previous_image = (
+                            isinstance(final_image, str) and re.fullmatch(IMAGE, final_image)
+                            and isinstance(final_previous_image, str)
+                            and re.fullmatch(IMAGE, final_previous_image)
+                            and final_image == final_previous_image
+                        )
+                        later_rollouts = []
+                        if final_image != image and verified_previous_image and not listing_seen_target:
+                            later_rollouts = [mapping(item) for item in rollouts(client, app["id"])
+                                              if mapping(item).get("id") != pinned["id"]
+                                              and timestamp(mapping(item).get("created_at"))
+                                              > timestamp(pinned.get("created_at"))]
+                        if (final_image != image and (not verified_previous_image or listing_seen_target
+                                                      or later_rollouts)):
                             raise GateError("application_image_drift",
-                                            image_drift_detail(client, final_app, row, image))
+                                            image_drift_detail(client, final_app, final, image))
+                        listing_lag = final_image != image
                         if complete or lag_streak + 1 >= ACTIVE_LAG_CONFIRMATIONS:
                             evidence = {"worker_version": version, "application_id": app["id"],
                                         "rollout_id": pinned["id"],
                                         "target_version": pinned["target_version"],
                                         "image": image, "revision": baseline["revision"],
-                                        "build_id": baseline["build_id"], "readyz": 200, "health": 200}
+                                        "build_id": baseline["build_id"],
+                                        "deploy_id": baseline["deploy_id"],
+                                        "readyz": 200, "health": 200}
+                            if listing_lag:
+                                evidence["application_listing_lag"] = True
                             if lag:
                                 evidence["active_lag"] = True
                             save(args.evidence, evidence)
@@ -815,7 +1032,7 @@ def verify(args, client):
             readiness = deadline_aware_read(
                 client, lambda: unconverged_readiness(
                     client, url, version, baseline["revision"], baseline["build_id"],
-                    completed_zero_instance_rollout(row)),
+                    baseline["deploy_id"], completed_zero_instance_rollout(row)),
                 app, row, image, drift_candidate, verification_started)
             if readiness:
                 failure, diagnostic = readiness
@@ -828,6 +1045,9 @@ def verify(args, client):
                         client.zero_instance_last = diagnostic
                 if failure and "gateway_failure=" not in client.observation:
                     client.observation += " gateway_failure=" + failure
+        if (stale and not passed and image_stale > APPLICATION_IMAGE_STALE_POLLS
+                and "gateway_failure=" not in (client.observation or "")):
+            raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
         if not passed:
             lag_streak = 0
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
@@ -850,7 +1070,22 @@ def main():
     parser.add_argument("--config", default="wrangler.toml")
     parser.add_argument("--deploy-config", default="staging-deploy.json")
     parser.add_argument("--evidence", default="staging-rollout-evidence.json")
+    parser.add_argument("--inject-gateway-failure", action="store_true",
+                        help="prepare only: staging rollback drill — the generated "
+                             "staging deploy config reports gateway not-ready")
+    parser.add_argument("--inject-voice-stall", action="store_true",
+                        help="prepare only: staging remediation drill — the generated "
+                             "staging deploy config holds a stale creator map")
+    parser.add_argument("--inject-unpaired-disconnect", action="store_true",
+                        help="prepare only: staging remediation drill — the generated "
+                             "staging deploy config holds an unpaired disconnect")
     args = parser.parse_args()
+    if args.inject_gateway_failure and args.mode != "prepare":
+        parser.error("--inject-gateway-failure is prepare-only")
+    if args.inject_voice_stall and args.mode != "prepare":
+        parser.error("--inject-voice-stall is prepare-only")
+    if args.inject_unpaired_disconnect and args.mode != "prepare":
+        parser.error("--inject-unpaired-disconnect is prepare-only")
     client = None
     try:
         deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS if args.mode == "verify" else None

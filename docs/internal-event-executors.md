@@ -71,10 +71,15 @@ follow-up.
 
 Synchronous persistence adds stricter response checks than legacy mutations,
 which ignored PATCH bodies: require a complete normalizable row, known status,
-parseable start time, valid event ID, matching requested ID and matching guild
-when present. A cancellation response must actually be cancelled. Unknown
-numeric status names remain supported by `event_status_name`, but cannot be
-persisted as a valid mirror row. Unreadable responses leave the prior row intact.
+parseable start time, and canonical decimal nonzero `u64` event and guild IDs.
+The guild ID must be present and match the configured guild; the event ID must
+match the requested ID when known. Non-null channel IDs must obey the same
+canonical rule; missing/null channels remain valid. The poller and this writer
+share `internal_events::canonical_snowflake` before normalization or storage.
+A cancellation response must actually be cancelled. Unknown numeric status
+names remain supported by `event_status_name`, but cannot be persisted as a
+valid mirror row. Unreadable responses leave the prior row intact and do not
+complete a mutation's retained admission permit.
 
 `EventActionError::is_safe_pre_mutation()` marks a proven Discord or local refusal.
 The receiver releases a claim only for the send guard and admission-blocked refusals

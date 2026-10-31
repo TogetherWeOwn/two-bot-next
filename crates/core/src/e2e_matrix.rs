@@ -9,12 +9,13 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 28 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 45 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
-//! of moderation), `/templateassistant` (voice + assistant gates; both are
-//! pinned by the `voice` section of `staging_published_commands.json`), DB-backed
+//! of moderation), `/templateassistant` (unpublished until its slice lands;
+//! the name and intended gate stay pinned by the `voice` section of
+//! `staging_published_commands.json`), DB-backed
 //! custom commands and `!` prefix triggers (dynamic), component/modal
 //! surfaces, and the dropped `/rota-acknowledge` row. The human-readable
 //! rendering lives in `docs/staging-e2e-command-matrix.md`; the
@@ -33,7 +34,8 @@ use crate::commands::{
 /// must set on staging for the command to be published at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
-    /// Always published (`rank`, `leaderboard`, `help`).
+    /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`,
+    /// `welcome-preview`, `game-mix`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -121,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 28-row contract in publish order (core, scorecard, automation,
+/// The 44-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -156,6 +158,49 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Help",
             "Immediate ephemeral reply (no defer, no store read) listing the live published commands grouped by audience with permission hints.",
             &[],
+        ),
+        row(
+            "privacy",
+            32,
+            E2eGate::Always,
+            0,
+            "Everyone",
+            "Privacy",
+            "Deferred ephemeral reply; analytics opt-out purges the invoker's guild rows plus suppression plus one audit receipt, opt-in clears suppression, status reports suppression plus guild analytics switches; delete queues a member-erasure request, and deletion status/receipt reads bind to the authenticated requester and guild.",
+            &[
+                "Valid:subcommand:required,opt-out|opt-in|status|delete|deletion-status|deletion-receipt",
+                "Valid:request-id:required,max128,deletion-status|deletion-receipt",
+            ],
+        ),
+        row(
+            "reopen",
+            34,
+            E2eGate::Always,
+            0,
+            "Everyone",
+            "Reopen",
+            "Deferred ephemeral reply; a fresh games or session menu edit for the invoker only, built from current roles and current configured picks with zero role, channel or funnel writes. Games menus carry a second no-change preview select alongside the apply route. Disabled kinds, malformed invocations and failed lookups get a private no-effect guidance edit instead of a menu.",
+            &["Valid:kind:required,games|session"],
+        ),
+        row(
+            "welcome-preview",
+            42,
+            E2eGate::Always,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "WelcomePreview",
+            "Deferred private preview of the current welcome and picker for a fixed synthetic newcomer; no delivery, member lookup or state mutation. Disabled or invalid configuration returns private guidance.",
+            &["Perm:ManageServerRequired"],
+        ),
+        row(
+            "game-mix",
+            43,
+            E2eGate::Always,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "GameMix",
+            "Deferred private guild aggregate page: up to ten games per page, play or voice ordering, JSON or readable summary; play milliseconds, in-voice milliseconds and session counts; empty hint or truthful truncation note. Invalid selectors corrected before a read; live guild refused without a read.",
+            &["Perm:ManageServerRequired"],
         ),
         row(
             "attendance",
@@ -210,6 +255,50 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "AutomationAdmin",
             "Ephemeral text list of this server's custom commands.",
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "command-inspect",
+            33,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then one private content-only view: metadata summary by default, saved template, or rendered preview with sample arguments. No channel send, registration, cooldown, mutation or run audit.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+                "Valid:view:choices",
+                "Valid:arguments:utf16<=500",
+            ],
+        ),
+        row(
+            "command-disable",
+            40,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then ephemeral confirmation after the saved definition is paused plus one audit row; a repeated pause is an explicit no-op without republish.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+            ],
+        ),
+        row(
+            "command-enable",
+            41,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then ephemeral confirmation after the saved definition is resumed plus one audit row; a repeated resume is an explicit no-op without republish.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+            ],
         ),
         row(
             "schedule",
@@ -277,16 +366,32 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
         ),
         row(
+            "giveaway",
+            37,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "Giveaway",
+            "Ephemeral defer then ephemeral confirmation after create/list/cancel plus audit row.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:prize:required,1..=200",
+                "Valid:duration:1..=43200",
+                "Valid:winners:1..=100",
+            ],
+        ),
+        row(
             "rsvp",
             24,
             E2eGate::Announcements,
             0,
             "Everyone",
             "Rsvp",
-            "Ephemeral `RSVP saved: <status>.` confirmation.",
+            "Ephemeral `RSVP saved: <status>.` confirmation; a changed or repeated choice adds `(changed from <previous>)` or `(saved again; time updated)` (pasted links append the event id).",
             &[
                 "Gate:AnnouncementsDisabled",
-                "Valid:event-id:required",
+                "Valid:event-id:required,max128",
                 "Valid:status:going|interested|declined",
             ],
         ),
@@ -298,7 +403,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Everyone",
             "RsvpAttendance",
             "Ephemeral RSVP totals for the scheduled event.",
-            &["Gate:AnnouncementsDisabled", "Valid:event-id:required"],
+            &["Gate:AnnouncementsDisabled", "Valid:event-id:required,max128"],
         ),
         row(
             "lfg",
@@ -331,6 +436,37 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "lfg-edit",
+            26,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgEdit",
+            "Ephemeral saved-edit receipt with canonical start time; refreshes the existing post, preserving signups.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:id:required",
+                "Valid:title|starts-at:at-least-one",
+                "Valid:starts-at:future,ISO-8601",
+                "Valid:post:open,same-guild",
+            ],
+        ),
+        row(
+            "lfg-list",
+            38,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgList",
+            "Ephemeral current-channel open confirmed-post list; at most five whole rows and bounded cursor continuation, no mutations.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:cursor:optional,bound-to-guild-and-channel,max-512",
+            ],
+        ),
+        row(
             "feed-add",
             28,
             E2eGate::Announcements,
@@ -360,6 +496,34 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "feed-pause",
+            44,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedPause",
+            "Ephemeral confirmation after pause (paused/already-paused/missing outcome) plus audit row; refused while pending recovery exists.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
+        ),
+        row(
+            "feed-resume",
+            45,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedResume",
+            "Ephemeral confirmation after resume (resumed/already-resumed/missing outcome) plus audit row.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
+        ),
+        row(
             "feed-list",
             30,
             E2eGate::Announcements,
@@ -368,6 +532,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "FeedList",
             "Ephemeral guild-scoped relay list.",
             &["Gate:AnnouncementsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "feed-inspect",
+            39,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedInspect",
+            "Ephemeral guild-scoped relay detail with safe source and last attempt; absent and invalid ids refuse distinctly without mutation.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
         ),
         row(
             "ban",
@@ -402,6 +580,21 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Valid:target:required,user",
                 "Valid:duration_seconds:>=60,runtime-max-365d",
                 "Valid:reason:required,1..=512",
+            ],
+        ),
+        row(
+            "tempban-list",
+            46,
+            E2eGate::Moderation,
+            PERM_BAN_MEMBERS,
+            "BanMembers",
+            "TempbanList",
+            "Ephemeral saved-expiry inventory: ten complete rows per page, localized saved due time, exact state and dispatch uncertainty. Saved/due is not a confirmed Discord unban; running is not completion. Fresh actor authority, suppressed mentions, at most 2000 UTF-16 units; no claims, audit writes or moderation effects.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:TempbanListPermission",
+                "Valid:page:optional,integer,1..=10000",
             ],
         ),
         row(
@@ -518,6 +711,53 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Valid:reason:required,1..=512",
             ],
         ),
+        row(
+            "purge-preview",
+            35,
+            E2eGate::Moderation,
+            PERM_MANAGE_MESSAGES,
+            "ManageMessages",
+            "PurgePreview",
+            "Deferred ephemeral sampled counts, candidate time span and exclusions; no delete, audit, claim or lane writes; sampling and race caveats remain explicit.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:PurgePreviewPermission",
+                "Valid:count:required,1..=100",
+                "Valid:options:count-only",
+            ],
+        ),
+        row(
+            "channel-inspect",
+            36,
+            E2eGate::Moderation,
+            PERM_MANAGE_CHANNELS,
+            "ManageChannels",
+            "ChannelInspect",
+            "Deferred ephemeral saved-lockdown and live-slowmode snapshot; absent lockdown is none, unavailable metadata is unknown; no config, audit, claim or lane writes.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:ChannelInspectPermission",
+                "Valid:options:none",
+            ],
+        ),
+        row(
+            "moderation-recent",
+            47,
+            E2eGate::Moderation,
+            PERM_MODERATE_MEMBERS,
+            "ModerateMembers",
+            "ModerationRecent",
+            "Deferred ephemeral newest-first page of saved moderation ledger rows labelled not live-verified; staff rechecked live; applied, denied and uncertain outcomes stay distinct; no claim, audit, retry or Discord mutation.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:ModerationRecentPermission",
+                "Valid:page:optional,1..=20",
+                "Valid:options:page-only",
+            ],
+        ),
     ]
 }
 
@@ -527,21 +767,60 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn matrix_names_are_unique_and_parity_rows_are_unique() {
+    fn matrix_names_are_unique_and_only_lfg_metadata_shares_a_parity_row() {
         let matrix = e2e_command_matrix();
         let mut names = HashSet::new();
         let mut parity = HashSet::new();
+        let mut lfg_companions = Vec::new();
         for row in &matrix {
             assert!(
                 names.insert(row.command),
                 "duplicate matrix row {}",
                 row.command
             );
-            assert!(
-                parity.insert(row.parity_row),
-                "duplicate parity row {}",
-                row.parity_row
-            );
+            if row.parity_row == 26 {
+                lfg_companions.push(row.command);
+            } else {
+                assert!(
+                    parity.insert(row.parity_row),
+                    "duplicate parity row {}",
+                    row.parity_row
+                );
+            }
+        }
+        lfg_companions.sort_unstable();
+        assert_eq!(lfg_companions, ["lfg", "lfg-edit"]);
+        let edit = matrix.iter().find(|row| row.command == "lfg-edit").unwrap();
+        assert_eq!(edit.gate, E2eGate::Announcements);
+        assert_eq!(edit.required_permissions, 1 << 33);
+        assert_eq!(edit.handler, "LfgEdit");
+    }
+
+    #[test]
+    fn privacy_matrix_pins_required_bounded_request_ids() {
+        let matrix = e2e_command_matrix();
+        let privacy = matrix
+            .iter()
+            .find(|row| row.command == "privacy")
+            .expect("privacy matrix row");
+        assert!(privacy
+            .denials
+            .contains(&"Valid:request-id:required,max128,deletion-status|deletion-receipt"));
+
+        let definition = crate::commands::core_commands()
+            .into_iter()
+            .find(|definition| definition.name == "privacy")
+            .expect("published privacy command");
+        for subcommand in ["deletion-status", "deletion-receipt"] {
+            let option = definition
+                .options
+                .iter()
+                .find(|option| option.name == subcommand)
+                .and_then(|option| option.options.first())
+                .expect("request-id option");
+            assert_eq!(option.name, "request-id");
+            assert_eq!(option.required, Some(true));
+            assert_eq!(option.max_length, Some(128));
         }
     }
 

@@ -48,9 +48,10 @@ async fn message_awards_enforce_durable_minute_cooldown(
     let fixture = database().await;
     let pool = fixture.pool().clone();
     let channel = "200000000000000001";
-    let first = store::award_message(&pool, GUILD, A, &at(0), Some(channel)).await?;
-    let blocked = store::award_message(&pool, GUILD, A, &at(59), Some(channel)).await?;
-    let second = store::award_message(&pool, GUILD, A, &at(60), Some(channel)).await?;
+    let first = store::award_message(&pool, GUILD, A, &at(0), Some(channel), None, false).await?;
+    let blocked =
+        store::award_message(&pool, GUILD, A, &at(59), Some(channel), None, false).await?;
+    let second = store::award_message(&pool, GUILD, A, &at(60), Some(channel), None, false).await?;
     assert_eq!(first.awarded, 15);
     assert_eq!(blocked.awarded, 0);
     assert_eq!(second.awarded, 15);
@@ -136,9 +137,9 @@ async fn profile_without_xp_row_is_unranked_on_empty_and_populated_boards(
     let pool = fixture.pool().clone();
     for member_count in [0, 1] {
         if member_count == 1 {
-            store::award_message(&pool, GUILD, B, &at(0), None).await?;
+            store::award_message(&pool, GUILD, B, &at(0), None, None, false).await?;
             // An XP row in another guild does not rank this member here.
-            store::award_message(&pool, "other-guild", A, &at(0), None).await?;
+            store::award_message(&pool, "other-guild", A, &at(0), None, None, false).await?;
         }
         let profile = store::profile(&pool, GUILD, A).await?;
         assert_eq!(profile.rank, None);
@@ -177,7 +178,7 @@ async fn profile_with_stored_zero_xp_keeps_numeric_rank_and_tie_order(
     let fixture = database().await;
     let pool = fixture.pool().clone();
     let higher = "100000000000000003";
-    store::award_message(&pool, GUILD, higher, &at(0), None).await?;
+    store::award_message(&pool, GUILD, higher, &at(0), None, None, false).await?;
     for member in [B, A] {
         sqlx::query(
             "INSERT INTO member_levels (guild_id, member_id, xp, updated_at)
@@ -228,7 +229,7 @@ async fn ceiling_rejection_preserves_cooldown_and_rank_text_reads(
     .bind(at(0))
     .execute(&pool)
     .await?;
-    let blocked = store::award_message(&pool, GUILD, A, &at(60), None).await?;
+    let blocked = store::award_message(&pool, GUILD, A, &at(60), None, None, false).await?;
     assert_eq!(blocked.awarded, 0);
     assert_eq!(blocked.total_xp, MAX_STORED_XP);
     // Legacy golden: a rejected award leaves no cooldown row behind.
@@ -320,9 +321,11 @@ async fn level_up_crosses_threshold_and_plans_grants(
     let fixture = database().await;
     let pool = fixture.pool().clone();
     // Bring A to 99 XP (message 15 × 6 = 90, then a 9-XP top-up), then one
-    // more award crosses the L1 floor at 100.
+    // more award crosses the L1 floor at 100. One award per UTC day so the
+    // AC2 daily ladder (15/5/0) and same-channel burst halving stay out of
+    // this level-up path; both have dedicated policy tests.
     for step in 0..6 {
-        store::award_message(&pool, GUILD, A, &at(step * 61), None).await?;
+        store::award_message(&pool, GUILD, A, &at(step * 86_400), None, None, false).await?;
     }
     store::award(
         &pool,
@@ -330,11 +333,11 @@ async fn level_up_crosses_threshold_and_plans_grants(
         A,
         two_bot_core::leveling::XpSource::Message,
         9,
-        &at(6 * 61 + 1),
+        &at(6 * 86_400),
         None,
     )
     .await?;
-    let award = store::award_message(&pool, GUILD, A, &at(7 * 61 + 2), None).await?;
+    let award = store::award_message(&pool, GUILD, A, &at(7 * 86_400), None, None, false).await?;
     assert!(award.leveled_up);
     assert_eq!((award.previous_level, award.level), (0, 1));
     assert_eq!(award.total_xp, 114);
@@ -358,11 +361,12 @@ async fn level_up_crosses_threshold_and_plans_grants(
         &[],
         two_bot_core::leveling::level_role_writes_allowed(false),
         false,
-    );
+    )
+    .expect("one rung is under the cap");
     assert_eq!(plan.grant, vec!["400000000000000001".to_owned()]);
     assert!(plan.revoke.is_empty());
     // Bad timestamps are refused before any write.
-    let bad = store::award_message(&pool, GUILD, A, "not-a-timestamp", None).await;
+    let bad = store::award_message(&pool, GUILD, A, "not-a-timestamp", None, None, false).await;
     assert!(matches!(
         bad,
         Err(two_bot_core::LevelingStoreError::InvalidTimestamp(_))
@@ -384,17 +388,53 @@ async fn submillisecond_awards_keep_exact_sixty_second_boundary(
     // second cutoff, so an award exactly 60 s later was rejected. All binds
     // now carry the millisecond-normalized form, matching legacy
     // `new Date(ms).toISOString()`.
-    let first = store::award_message(&pool, GUILD, A, "2026-09-30T12:00:00.000500Z", None).await?;
-    let second = store::award_message(&pool, GUILD, A, "2026-09-30T12:01:00.000500Z", None).await?;
+    let first = store::award_message(
+        &pool,
+        GUILD,
+        A,
+        "2026-09-30T12:00:00.000500Z",
+        None,
+        None,
+        false,
+    )
+    .await?;
+    let second = store::award_message(
+        &pool,
+        GUILD,
+        A,
+        "2026-09-30T12:01:00.000500Z",
+        None,
+        None,
+        false,
+    )
+    .await?;
     assert_eq!((first.awarded, second.awarded), (15, 15));
     assert_eq!(second.total_xp, 30);
     // Equivalent offset forms normalize to the same instants: 59 s after the
     // second award stays inside cooldown, 60 s fires again.
-    let blocked =
-        store::award_message(&pool, GUILD, A, "2026-09-30T14:01:59.000500+02:00", None).await?;
+    let blocked = store::award_message(
+        &pool,
+        GUILD,
+        A,
+        "2026-09-30T14:01:59.000500+02:00",
+        None,
+        None,
+        false,
+    )
+    .await?;
     assert_eq!(blocked.awarded, 0);
-    let third =
-        store::award_message(&pool, GUILD, A, "2026-09-30T14:02:00.000500+02:00", None).await?;
+    // Distinct channel so the AC2 same-channel burst halving (dedicated
+    // policy test) stays out of this millisecond-boundary path.
+    let third = store::award_message(
+        &pool,
+        GUILD,
+        A,
+        "2026-09-30T14:02:00.000500+02:00",
+        Some("200000000000000002"),
+        None,
+        false,
+    )
+    .await?;
     assert_eq!(third.awarded, 15);
     // Stored instants carry no sub-millisecond residue.
     let stored: String = sqlx::query_scalar(
@@ -434,7 +474,7 @@ async fn profile_stays_consistent_under_concurrent_awards(
     for round in 1..=30 {
         let timestamp = at(i64::from(round) * 61);
         let (awarded, profile) = tokio::join!(
-            store::award_message(&pool, GUILD, A, &timestamp, None),
+            store::award_message(&pool, GUILD, A, &timestamp, None, None, false),
             store::profile(&pool, GUILD, A),
         );
         awarded?;
@@ -495,7 +535,9 @@ async fn concurrent_first_message_awards_have_one_winner(
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..8 {
         let pool = pool.clone();
-        tasks.spawn(async move { store::award_message(&pool, GUILD, A, &at(0), None).await });
+        tasks.spawn(async move {
+            store::award_message(&pool, GUILD, A, &at(0), None, None, false).await
+        });
     }
     let mut winners = 0;
     while let Some(result) = tasks.join_next().await {
@@ -528,7 +570,7 @@ async fn concurrent_message_and_voice_awards_emit_one_level_up(
     .await?;
     let timestamp = at(60);
     let (message, voice) = tokio::join!(
-        store::award_message(&pool, GUILD, A, &timestamp, None),
+        store::award_message(&pool, GUILD, A, &timestamp, None, None, false),
         store::award_voice(&pool, GUILD, A, 60, &timestamp, None),
     );
     let (message, voice) = (message?, voice?);
@@ -602,7 +644,7 @@ async fn audit_and_reward_write_failures_roll_back_everything(
     ));
     assert_eq!(store::current_award(&pool, GUILD, A).await?.total_xp, 0);
     assert_eq!(
-        store::award_message(&pool, GUILD, A, &at(0), None)
+        store::award_message(&pool, GUILD, A, &at(0), None, None, false)
             .await?
             .awarded,
         15
@@ -627,6 +669,116 @@ async fn audit_and_reward_write_failures_roll_back_everything(
         .await
         .is_err());
     assert_eq!(store::role_rewards(&pool, GUILD).await?, original);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn short_messages_do_not_consume_daily_ladder_rungs(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    // Six known-short messages (trimmed 2 scalars, no embed/attachment) in
+    // distinct channels so burst halving stays out of the path. Each earns
+    // zero while consuming the cooldown once.
+    for index in 0..6 {
+        let channel = format!("2000000000000000{:02}", 10 + index);
+        let award = store::award_message(
+            &pool,
+            GUILD,
+            A,
+            &at(index * 61),
+            Some(channel.as_str()),
+            Some(2),
+            false,
+        )
+        .await?;
+        assert_eq!(award.awarded, 0, "short #{index} must earn zero");
+    }
+    // The next normal message must still earn the full first rung (15), not
+    // the 5-XP sixth rung short rows would have consumed.
+    let normal = store::award_message(
+        &pool,
+        GUILD,
+        A,
+        &at(6 * 61),
+        Some("200000000000000099"),
+        Some(40),
+        false,
+    )
+    .await?;
+    assert_eq!(normal.awarded, 15);
+    assert_eq!(store::profile(&pool, GUILD, A).await?.message_xp, 15);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn short_messages_do_not_trigger_burst_halving(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    let channel = "200000000000000099";
+    for index in 0..2 {
+        let award = store::award_message(
+            &pool,
+            GUILD,
+            A,
+            &at(index * 61),
+            Some(channel),
+            Some(2),
+            false,
+        )
+        .await?;
+        assert_eq!(award.awarded, 0, "short #{index} must earn zero");
+    }
+    // Two shorts in the same channel within 10 minutes must not halve the
+    // next normal message there: it still earns 15, not 7.
+    let normal =
+        store::award_message(&pool, GUILD, A, &at(2 * 61), Some(channel), Some(40), false).await?;
+    assert_eq!(normal.awarded, 15);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn short_attempt_completes_on_single_connection_pool(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    let channel = "200000000000000099";
+    // Seed an existing member row so the short path runs with the advisory
+    // and row locks held in one open transaction.
+    let first =
+        store::award_message(&pool, GUILD, A, &at(0), Some(channel), Some(40), false).await?;
+    assert_eq!(first.awarded, 15);
+    // One connection proves no hold-and-wait: the old shape held `tx` open
+    // while `record_short_attempt` called `pool.begin()` for a second
+    // connection, so this short award could never complete here.
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with(fixture.pool().connect_options().as_ref().clone())
+        .await
+        .expect("single-connection fixture pool");
+    let short =
+        store::award_message(&single, GUILD, A, &at(61), Some(channel), Some(2), false).await?;
+    assert_eq!(short.awarded, 0, "short must earn zero");
+    assert_eq!(
+        store::profile(&single, GUILD, A).await?.message_xp,
+        15,
+        "short must grant no XP"
+    );
+    let decision: Option<String> = sqlx::query_scalar(
+        "SELECT decision FROM xp_awards
+          WHERE guild_id = $1 AND member_id = $2 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(GUILD)
+    .bind(A)
+    .fetch_one(&single)
+    .await?;
+    assert_eq!(decision.as_deref(), Some("short_message"));
+    single.close().await;
     fixture.close().await.expect("drop test database");
     Ok(())
 }

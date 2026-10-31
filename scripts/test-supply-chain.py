@@ -11,6 +11,8 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -152,6 +154,83 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_text(), f"ref={SHA}\ntag=\n")
 
+    def test_deeply_nested_lockfile_refuses_without_traceback(self):
+        # A sub-cap Cargo.lock nested past the TOML decoder limit must refuse
+        # with fixed vocabulary like the JSON BOMs, not a RecursionError.
+        lockfile = self.directory / "Cargo.lock"
+        lockfile.write_text('[[package]]\nname = "x"\nversion = "1.0"\n\n'
+                            + "x = " + "[" * 10000 + "0" + "]" * 10000 + "\n")
+        result = subprocess.run(["python3", str(ROOT / "scripts/validate-sbom.py"), str(lockfile), str(self.directory)],
+                                capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, combined)
+        self.assertNotIn("Traceback", combined)
+        self.assertEqual(result.stderr, "SBOM lockfile exceeds the nesting bound\n")
+
+    def test_verify_source_missing_and_oversized_files_refuse_without_traceback(self):
+        base = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "RELEASE_TAG": "v0.2.1", "EXPECTED_SHA": SHA}
+        missing = subprocess.run(["python3", str(ROOT / "scripts/release-sbom-target.py"),
+                                  "--verify-source", str(self.directory / "absent-sha.txt")],
+                                 capture_output=True, text=True, env=base)
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+        self.assertNotIn("Traceback", missing.stdout + missing.stderr)
+        self.assertEqual(missing.stderr, "SBOM source file is missing or unreadable\n")
+        big = self.directory / "big-sha.txt"
+        big.write_text("z" * (2 << 20))
+        oversized = subprocess.run(["python3", str(ROOT / "scripts/release-sbom-target.py"),
+                                    "--verify-source", str(big)],
+                                   capture_output=True, text=True, env=base)
+        self.assertEqual(oversized.returncode, 1, oversized.stderr)
+        self.assertNotIn("Traceback", oversized.stdout + oversized.stderr)
+        self.assertEqual(oversized.stderr, "SBOM source file exceeds the byte cap\n")
+
+    def test_deeply_nested_release_response_refuses_without_traceback(self):
+        for label, raw in [("object", '{"a":' * 10000 + "0" + "}" * 10000),
+                           ("array", "[" * 10000 + "0" + "]" * 10000)]:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError) as ctx:
+                    selector.parse_response(raw)
+                self.assertEqual(str(ctx.exception), "Release tag response is too deeply nested")
+
+    def test_deeply_nested_release_response_cli_refuses_without_traceback(self):
+        for label, raw in [("object", '{"a":' * 10000 + "0" + "}" * 10000),
+                           ("array", "[" * 10000 + "0" + "]" * 10000)]:
+            with self.subTest(label=label):
+                bindir = self.directory / f"bin-{label}"
+                bindir.mkdir()
+                response = self.directory / f"deep-{label}.json"
+                response.write_text(raw)
+                gh = bindir / "gh"
+                gh.write_text('#!/bin/sh\ncat "$GH_STUB_RESPONSE"\n')
+                gh.chmod(0o755)
+                result = subprocess.run(
+                    ["python3", str(ROOT / "scripts/release-sbom-target.py")],
+                    capture_output=True, text=True, env={
+                        **os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+                        "GH_STUB_RESPONSE": str(response), "GH_REPO": "example/repo",
+                        "DRY_RUN": "false", "RELEASE_TAG": "v0.2.1",
+                        "GITHUB_SHA": SHA, "GITHUB_OUTPUT": str(self.directory / f"output-{label}")})
+                combined = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 1, combined)
+                self.assertNotIn("Traceback", combined)
+                self.assertEqual(result.stderr, "Release tag response is too deeply nested\n")
+
+    def test_component_nesting_bound_is_pinned(self):
+        def chain(levels):
+            node = {"name": "leaf", "version": "1.0"}
+            for _ in range(levels):
+                node = {"name": "w", "components": [node]}
+            return [node]
+        self.write_bom("rust-workspace", chain(99))
+        self.assertEqual(len(validator.read_bom(self.directory / "rust-workspace.cdx.json")), 100)
+        for levels in (100, 200):
+            with self.subTest(levels=levels):
+                self.write_bom("rust-workspace", chain(levels))
+                with self.assertRaises(ValueError) as ctx:
+                    validator.read_bom(self.directory / "rust-workspace.cdx.json")
+                self.assertEqual(str(ctx.exception), "SBOM components exceed the nesting bound")
+
     def test_all_remote_workflow_actions_are_sha_pinned(self):
         for path in (ROOT / ".github/workflows").glob("*.yml"):
             for action in re.findall(r"^\s*-?\s*uses:\s*(\S+)", path.read_text(), re.MULTILINE):
@@ -226,6 +305,25 @@ class SupplyChainTests(unittest.TestCase):
             # Only the documented routing expression may name a hosted runner.
             routed = "'[\"ubuntu-latest\"]'"
             self.assertNotIn("ubuntu-latest", code.replace(routed, ""), str(path))
+
+    def test_every_trivy_invocation_uses_the_official_database_source(self):
+        supply = yaml.load((ROOT / ".github/workflows/sbom.yml").read_text(), Loader=yaml.BaseLoader)
+        invocations = []
+        for job_name, job in supply["jobs"].items():
+            for step in job.get("steps", []):
+                if not step.get("uses", "").startswith("aquasecurity/trivy-action@"):
+                    continue
+                # Actions resolves env from workflow to job to step. One job
+                # declaration must cover all four scans; a step may not undo it.
+                env = {**supply.get("env", {}), **job.get("env", {}), **step.get("env", {})}
+                invocations.append((job_name, step["name"], env.get("TRIVY_DB_REPOSITORY")))
+                # Preserve the existing scanner, fresh DB and vulnerability gates.
+                self.assertEqual(step["with"]["version"], "v0.69.3")
+        self.assertEqual(len(invocations), 4, "both inventories and both vulnerability gates are covered")
+        for job_name, name, repository in invocations:
+            with self.subTest(job=job_name, step=name):
+                self.assertEqual(repository, "ghcr.io/aquasecurity/trivy-db:2",
+                                 "each Trivy invocation must select the official GHCR DB, not the default mirror")
 
     def test_no_shared_caches(self):
         # The reusable workflow can run in default-branch context against an
@@ -341,10 +439,10 @@ class SupplyChainTests(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/sbom.yml", check)
         self.assertIn("uses: ./.github/workflows/sbom.yml", release)
         self.assertNotIn("uses: ./.github/workflows/supply-chain.yml", check + release)
-        self.assertIn("inputs.dry_run != true", release)
+        self.assertIn("inputs.dry_run == true || inputs.release_tag != ''", release)
         self.assertIn("needs.sbom-target.outputs.tag != ''", release)
         self.assertIn("needs.release-sbom.result == 'success'", release)
-        self.assertIn("needs.tag.outputs.released == 'true'", release)
+        self.assertNotIn("needs.tag.outputs.released", release)
         self.assertIn("ref: ${{ inputs.ref }}", supply)
         self.assertIn("persist-credentials: false", supply)
         self.assertEqual(supply.count("exit-code: '1'"), 2)

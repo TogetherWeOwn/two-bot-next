@@ -14,12 +14,16 @@ members = ["."]
 resolver = "2"
 
 [dependencies]
+hex = "0.4"
+hmac = "0.13"
 libfuzzer-sys = "=0.4.13"
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
 two-bot-core = { version = "0.4.0", path = "../crates/core", default-features = false } # x-release-please-version
 two-bot-cutover = { version = "0.4.0", path = "../crates/cutover" } # x-release-please-version
 two-bot = { version = "0.4.0", path = "../crates/bot" } # x-release-please-version
 two-bot-discord = { version = "0.4.0", path = "../crates/discord", features = ["db"] } # x-release-please-version
+url = "2.5.8"
 
 [[bin]]
 name = "internal_action"
@@ -108,6 +112,90 @@ bench = false
 [[bin]]
 name = "lfg_select"
 path = "fuzz_targets/lfg_select.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "internal_action_validators"
+path = "fuzz_targets/internal_action_validators.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "eventsub_delivery"
+path = "fuzz_targets/eventsub_delivery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helix_token"
+path = "fuzz_targets/helix_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "database_url"
+path = "fuzz_targets/database_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "feeds_http"
+path = "fuzz_targets/feeds_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "custom_command_template"
+path = "fuzz_targets/custom_command_template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fb_page_events"
+path = "fuzz_targets/fb_page_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "self_role_custom_id"
+path = "fuzz_targets/self_role_custom_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helix_subscription_listing"
+path = "fuzz_targets/helix_subscription_listing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_assistant_reply"
+path = "fuzz_targets/voice_assistant_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_room_name"
+path = "fuzz_targets/voice_room_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "automation_transfer_import"
+path = "fuzz_targets/automation_transfer_import.rs"
 test = false
 doc = false
 bench = false

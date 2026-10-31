@@ -1,0 +1,2 @@
+{"table":"member_levels","row":{"guild_id":"g","member_id":"m2","xp":30,"message_xp":30,"voice_xp":0,"imported_xp":0,"updated_at":"2026-10-01T12:00:00+00:00"}}
+{"table":"no_such_table","row":{"id":1,"note":"never exported by rollback-delta"}}

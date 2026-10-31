@@ -1,0 +1,26 @@
+id: no-unwrap-request-paths-in-macros
+language: rust
+severity: warning
+message: "no .unwrap() in request-path source files, including inside macro calls; handle the error or use .expect() with context"
+rule:
+  kind: identifier
+  regex: '^unwrap$'
+  inside: {kind: token_tree, stopBy: end}
+  follows: {regex: '^[.]$'}
+  precedes: {kind: token_tree, regex: '^\(\)$'}
+files:
+  - 'crates/*/src/**/*route*.rs'
+  - 'crates/*/src/**/*handler*.rs'
+  - 'crates/*/src/**/*interaction*.rs'
+  - 'crates/*/src/**/*command*.rs'
+  - 'crates/*/src/**/*webhook*.rs'
+  - 'src/**/*route*.rs'
+  - 'src/**/*handler*.rs'
+  - 'src/**/*interaction*.rs'
+  - 'src/**/*command*.rs'
+  - 'src/**/*webhook*.rs'
+ignores:
+  - '**/*_tests.rs'
+  - '**/tests.rs'
+  - '**/tests/**'
+  - '**/*_tests/**'

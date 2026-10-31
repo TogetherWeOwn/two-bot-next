@@ -32,16 +32,20 @@ pub struct JoinAttribution {
 ///
 /// `prev` maps code → uses at the last capture; `current` is this capture's
 /// reading. Codes absent from `prev` were created inside the window, so all
-/// of their uses are new. Negative deltas clamp to zero.
+/// of their uses are new. Both readings saturate to the persisted INTEGER
+/// domain before differencing; negative deltas clamp to zero.
 pub fn invite_growth(
     prev: &BTreeMap<String, u64>,
     current: &[InviteState],
 ) -> BTreeMap<String, u64> {
     let mut growth = BTreeMap::new();
     for inv in current {
+        let uses = two_bot_core::invites::saturate_invite_uses(inv.uses);
         let delta = match prev.get(&inv.code) {
-            None => inv.uses,
-            Some(before) => inv.uses.saturating_sub(*before),
+            None => uses,
+            Some(before) => {
+                uses.saturating_sub(two_bot_core::invites::saturate_invite_uses(*before))
+            }
         };
         if delta > 0 {
             growth.insert(inv.code.clone(), delta);

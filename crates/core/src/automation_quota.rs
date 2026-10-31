@@ -63,3 +63,36 @@ pub(crate) async fn lock_quota(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AutomationQuota;
+
+    #[test]
+    fn capacity_refusal_replies_pin_copy_limits_and_remedies() {
+        let cases = [
+            (
+                AutomationQuota::Schedules,
+                "This server has reached its limit of 25 schedules. Remove a schedule with /schedule-remove before creating another.",
+                "/schedule-remove",
+            ),
+            (
+                AutomationQuota::Feeds,
+                "This server has reached its limit of 25 feeds. Remove a feed with /feed-remove before creating another.",
+                "/feed-remove",
+            ),
+            (
+                AutomationQuota::OpenLfgPosts,
+                "This server has reached its limit of 20 open LFG posts. Close a post with /lfg-close before creating another.",
+                "/lfg-close",
+            ),
+        ];
+
+        for (quota, expected, remedy) in cases {
+            let reply = quota.to_string();
+            assert_eq!(reply, expected, "{quota:?}");
+            assert!(reply.contains(&quota.limit().to_string()), "{quota:?}");
+            assert!(reply.contains(remedy), "{quota:?}");
+        }
+    }
+}

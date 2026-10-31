@@ -575,6 +575,7 @@ pub struct ContainmentRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuarantineRefusal {
+    InvalidEvidence,
     ManagedRole,
     Hierarchy,
 }
@@ -593,8 +594,41 @@ pub enum QuarantinePlan {
     },
 }
 
+/// Validate the whole observation before classifying any held role. Identity
+/// strings must be canonical nonzero u64s so aliases cannot evade uniqueness.
+fn quarantine_evidence_valid(
+    guild_id: &str,
+    executor_role_ids: &[String],
+    bot_role_ids: &[String],
+    roles: &[ContainmentRole],
+) -> bool {
+    let mut observed = HashSet::new();
+    for role in roles {
+        if !role
+            .id
+            .parse::<u64>()
+            .is_ok_and(|id| id != 0 && id.to_string() == role.id)
+            || role.position < 0
+            || !observed.insert(role.id.as_str())
+        {
+            return false;
+        }
+    }
+    let baseline_valid = roles
+        .iter()
+        .any(|role| role.id == guild_id && role.position == 0 && !role.managed);
+    let held_valid = |held: &[String]| {
+        let mut unique = HashSet::new();
+        held.iter()
+            .all(|id| observed.contains(id.as_str()) && unique.insert(id.as_str()))
+    };
+    baseline_valid && held_valid(executor_role_ids) && held_valid(bot_role_ids)
+}
+
 /// A plan is not authorization to execute it. Staging, identity, session-mode
 /// and successful durable incident claims remain the runtime adapter's fences.
+/// Incomplete or contradictory role evidence refuses before planning, including
+/// an otherwise empty removal list; complete safe-only evidence still succeeds.
 #[must_use]
 pub fn plan_quarantine(
     guild_id: &str,
@@ -603,6 +637,12 @@ pub fn plan_quarantine(
     roles: &[ContainmentRole],
     dry_run: bool,
 ) -> QuarantinePlan {
+    if !quarantine_evidence_valid(guild_id, executor_role_ids, bot_role_ids, roles) {
+        return QuarantinePlan::Refused {
+            reason: QuarantineRefusal::InvalidEvidence,
+            blocked_role_ids: Vec::new(),
+        };
+    }
     if dry_run {
         return QuarantinePlan::DryRun;
     }
@@ -645,6 +685,10 @@ pub enum QuarantineFailure {
     Unavailable,
     Timeout,
     Other,
+    /// The service shutdown latch interrupted planning before the outcome was
+    /// decided. Like a timeout, this is never a definitive rejection: the end
+    /// state is unknown, so the incident stays uncertain (held, not released).
+    Shutdown,
 }
 
 /// Interpret one role-removal response, without transport or retry machinery.
@@ -668,7 +712,8 @@ pub fn quarantine_outcome(
         Some(
             QuarantineFailure::RateLimited
             | QuarantineFailure::Unavailable
-            | QuarantineFailure::Timeout,
+            | QuarantineFailure::Timeout
+            | QuarantineFailure::Shutdown,
         ) => ContainmentIncidentState::Uncertain,
         Some(_) if !removed_role_ids.is_empty() => ContainmentIncidentState::Uncertain,
         Some(_) => ContainmentIncidentState::Refused,
@@ -1047,21 +1092,21 @@ mod tests {
     #[test]
     fn all_dangerous_permissions_are_planned_and_safe_everyone_unheld_roles_are_not() {
         let mut roles = vec![
-            role("bot", 10, 0, false),
-            role("guild", 0, DANGEROUS_PERMISSIONS, false),
-            role("safe", 1, 1 << 11, false),
-            role("unheld", 20, 1 << 3, true),
+            role("88", 10, 0, false),
+            role("22", 0, DANGEROUS_PERMISSIONS, false),
+            role("76", 1, 1 << 11, false),
+            role("75", 20, 1 << 3, true),
         ];
-        let mut executor = ids(&["guild", "safe"]);
+        let mut executor = ids(&["22", "76"]);
         let mut expected = Vec::new();
         for bit in [1, 2, 3, 4, 5, 27, 28, 40] {
-            let id = format!("danger-{bit}");
+            let id = (100 + bit).to_string();
             executor.push(id.clone());
             expected.push(id.clone());
             roles.push(role(&id, 2, 1 << bit, false));
         }
         assert_eq!(
-            plan_quarantine("guild", &executor, &ids(&["bot"]), &roles, false),
+            plan_quarantine("22", &executor, &ids(&["88"]), &roles, false),
             QuarantinePlan::RemoveRoles { role_ids: expected }
         );
     }
@@ -1074,21 +1119,16 @@ mod tests {
             (11, false, QuarantineRefusal::Hierarchy),
         ] {
             let roles = [
-                role("removable", 1, 1 << 2, false),
-                role("blocked", position, 1 << 3, managed),
-                role("bot", 10, 0, false),
+                role("22", 0, 0, false),
+                role("77", 1, 1 << 2, false),
+                role("78", position, 1 << 3, managed),
+                role("88", 10, 0, false),
             ];
             assert_eq!(
-                plan_quarantine(
-                    "guild",
-                    &ids(&["removable", "blocked"]),
-                    &ids(&["bot"]),
-                    &roles,
-                    false
-                ),
+                plan_quarantine("22", &ids(&["77", "78"]), &ids(&["88"]), &roles, false),
                 QuarantinePlan::Refused {
                     reason,
-                    blocked_role_ids: ids(&["blocked"])
+                    blocked_role_ids: ids(&["78"])
                 }
             );
         }
@@ -1097,55 +1137,113 @@ mod tests {
     #[test]
     fn managed_refusal_precedes_hierarchy_and_safe_high_roles_are_untouched() {
         let roles = [
-            role("high", 10, 1 << 3, false),
-            role("managed", 1, 1 << 3, true),
-            role("safe", 100, 1 << 11, true),
-            role("bot", 10, 0, false),
+            role("22", 0, 0, false),
+            role("77", 10, 1 << 3, false),
+            role("78", 1, 1 << 3, true),
+            role("76", 100, 1 << 11, true),
+            role("88", 10, 0, false),
         ];
         assert_eq!(
             plan_quarantine(
-                "guild",
-                &ids(&["high", "managed", "safe"]),
-                &ids(&["bot"]),
+                "22",
+                &ids(&["77", "78", "76"]),
+                &ids(&["88"]),
                 &roles,
                 false
             ),
             QuarantinePlan::Refused {
                 reason: QuarantineRefusal::ManagedRole,
-                blocked_role_ids: ids(&["high", "managed"])
+                blocked_role_ids: ids(&["77", "78"])
             }
         );
         assert_eq!(
-            plan_quarantine("guild", &ids(&["safe"]), &ids(&["bot"]), &roles, false),
+            plan_quarantine("22", &ids(&["76"]), &ids(&["88"]), &roles, false),
             QuarantinePlan::RemoveRoles { role_ids: vec![] }
         );
     }
 
     #[test]
     fn absent_bot_hierarchy_does_not_permit_role_removal() {
-        let roles = [role("danger", 1, 1 << 28, false)];
+        let roles = [role("22", 0, 0, false), role("77", 1, 1 << 28, false)];
         assert!(matches!(
-            plan_quarantine("guild", &ids(&["danger"]), &[], &roles, false),
-            QuarantinePlan::Refused { .. }
+            plan_quarantine("22", &ids(&["77"]), &[], &roles, false),
+            QuarantinePlan::Refused {
+                reason: QuarantineRefusal::Hierarchy,
+                ..
+            }
         ));
         assert!(matches!(
-            plan_quarantine(
-                "guild",
-                &ids(&["danger"]),
-                &ids(&["missing"]),
-                &roles,
-                false
-            ),
-            QuarantinePlan::Refused { .. }
+            plan_quarantine("22", &ids(&["77"]), &ids(&["99"]), &roles, false),
+            QuarantinePlan::Refused {
+                reason: QuarantineRefusal::InvalidEvidence,
+                ..
+            }
         ));
     }
 
     #[test]
     fn dry_run_has_no_role_removals_even_for_blocked_snapshots() {
-        let roles = [role("danger", 100, 1 << 3, true)];
+        let roles = [role("22", 0, 0, false), role("77", 100, 1 << 3, true)];
         assert_eq!(
-            plan_quarantine("guild", &ids(&["danger"]), &[], &roles, true),
+            plan_quarantine("22", &ids(&["77"]), &[], &roles, true),
             QuarantinePlan::DryRun
+        );
+    }
+
+    #[test]
+    fn evidence_refusal_has_a_fixed_reason_and_no_untrusted_role_ids() {
+        let complete = [role("22", 0, 0, false), role("77", 1, 1 << 3, false)];
+        let refused = QuarantinePlan::Refused {
+            reason: QuarantineRefusal::InvalidEvidence,
+            blocked_role_ids: vec![],
+        };
+        for malformed in [
+            "",
+            "0",
+            "00",
+            "077",
+            "+77",
+            "-77",
+            "role",
+            "18446744073709551616",
+        ] {
+            let roles = [complete[0].clone(), role(malformed, 1, 1 << 3, false)];
+            for dry_run in [false, true] {
+                assert_eq!(
+                    plan_quarantine("22", &ids(&[malformed]), &[], &roles, dry_run),
+                    refused,
+                    "{malformed:?}, dry_run={dry_run}"
+                );
+            }
+        }
+        for baseline in [role("22", 1, 0, false), role("22", 0, 0, true)] {
+            let roles = [baseline, complete[1].clone()];
+            assert_eq!(
+                plan_quarantine("22", &ids(&["77"]), &[], &roles, false),
+                refused
+            );
+        }
+        for (held, bot) in [
+            (ids(&["77", "77"]), vec![]),
+            (ids(&["77"]), ids(&["77", "77"])),
+            (ids(&["0"]), vec![]),
+            (vec![], ids(&["0"])),
+        ] {
+            assert_eq!(
+                plan_quarantine("22", &held, &bot, &complete, false),
+                refused
+            );
+        }
+        for guild in ["", "0", "022", "+22", "guild"] {
+            assert_eq!(plan_quarantine(guild, &[], &[], &complete, false), refused);
+        }
+        assert_eq!(
+            plan_quarantine("22", &[], &[], &[complete[0].clone()], false),
+            QuarantinePlan::RemoveRoles { role_ids: vec![] }
+        );
+        assert_eq!(
+            plan_quarantine("22", &ids(&["22"]), &ids(&["22"]), &complete, false),
+            QuarantinePlan::RemoveRoles { role_ids: vec![] }
         );
     }
 
@@ -1205,6 +1303,7 @@ mod tests {
                 QuarantineFailure::RateLimited,
                 QuarantineFailure::Unavailable,
                 QuarantineFailure::Timeout,
+                QuarantineFailure::Shutdown,
             ] {
                 assert_eq!(
                     quarantine_outcome(&removed, Some(error)),

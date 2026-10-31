@@ -15,15 +15,30 @@
 //! Deliberately out of scope: fetching `/guilds/{id}/scheduled-events` (the
 //! S4 REST executor slice owns that when it lands), running the timer, and
 //! SQL. The sqlx swap lives in [`crate::website_store::replace_events`]; the
-//! tick recipe is: acquire [`crate::community_snapshots::JobGate`] → fetch via
-//! REST → [`normalize_events`] (`None` = [`ScheduledEventsSkip::InvalidResponse`],
-//! fetch failure = `DiscordReadFailed`) → swap via the store → drop the guard.
+//! tick recipe is: try to acquire [`crate::community_snapshots::JobGate`] (a
+//! held gate skips the tick outright: no fetch, no publish, no queue, no
+//! error) → fetch via REST → [`normalize_events`] (`None` =
+//! [`ScheduledEventsSkip::InvalidResponse`], fetch failure =
+//! `DiscordReadFailed`) → swap via the store (`Some(StaleSnapshot)` = a newer
+//! tick already swapped; the tick logs the skip and keeps the newer snapshot)
+//! → drop the guard. The scheduler's Events tick holds that guard across the
+//! whole tick, so overlapping ticks cannot both run.
 //! A failed or malformed read leaves the last good snapshot in place rather
 //! than publishing "no events" as a transport error — including leaving it at
 //! zero rows. A successful empty response *does* delete the last event.
 
 /// Poll cadence (legacy `SCHEDULED_EVENTS_INTERVAL_MS`).
 pub const SCHEDULED_EVENTS_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
+/// Snapshot caps (bounded-claim decision §4): at most 100 rows per snapshot,
+/// and per-field `name` ≤ 100 / `description` ≤ 1000 / `channel_id` ≤ 32
+/// chars. Every violation refuses the whole snapshot (`None`, surfaced as
+/// [`ScheduledEventsSkip::InvalidResponse`]) — never a truncated prefix, never
+/// a clipped field.
+pub const MAX_SNAPSHOT_ROWS: usize = 100;
+pub const MAX_EVENT_NAME_CHARS: usize = 100;
+pub const MAX_EVENT_DESCRIPTION_CHARS: usize = 1000;
+pub const MAX_EVENT_CHANNEL_ID_CHARS: usize = 32;
 
 /// Discord event status (legacy `STATUS` map over the API integers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -113,18 +128,41 @@ pub trait ScheduledEventMirror: Send + Sync {
 pub enum ScheduledEventsSkip {
     DiscordReadFailed,
     InvalidResponse,
+    /// The observation exceeds the tick's five-minute age bound, or its
+    /// `observed_at` predates the guild's committed epoch. The tick skips before
+    /// storage in the first case; the store rolls back the whole transaction
+    /// in the second. Neither path changes the last good snapshot.
+    StaleSnapshot,
 }
 
 /// Normalize one raw payload (legacy `normalize`): id, name,
 /// `scheduled_start_time` (any parseable date, rendered UTC millis) and a
 /// known status are all required. `channel_id` / `description` keep only
-/// string values, else `None`.
+/// string values, else `None`. Over-long fields refuse the row: limits count
+/// chars, not bytes, and a violation is never silently truncated.
 #[must_use]
 pub fn normalize_event(raw: &RawScheduledEvent) -> Option<ScheduledEvent> {
     let id = raw.id.as_deref().filter(|s| !s.is_empty())?;
     let name = raw.name.as_deref().filter(|s| !s.is_empty())?;
     let start = raw.scheduled_start_time.as_deref()?;
     let status = raw.status.and_then(EventStatus::from_api)?;
+    if name.chars().count() > MAX_EVENT_NAME_CHARS {
+        return None;
+    }
+    if raw
+        .description
+        .as_deref()
+        .is_some_and(|description| description.chars().count() > MAX_EVENT_DESCRIPTION_CHARS)
+    {
+        return None;
+    }
+    if raw
+        .channel_id
+        .as_deref()
+        .is_some_and(|channel| channel.chars().count() > MAX_EVENT_CHANNEL_ID_CHARS)
+    {
+        return None;
+    }
     Some(ScheduledEvent {
         id: id.to_owned(),
         name: name.to_owned(),
@@ -136,10 +174,25 @@ pub fn normalize_event(raw: &RawScheduledEvent) -> Option<ScheduledEvent> {
 }
 
 /// Normalize a whole poll response (legacy `raw.map(normalize)` + the
-/// `some(null)` rejection): one malformed event rejects the snapshot.
+/// `some(null)` rejection): one malformed event rejects the snapshot. A
+/// repeated event ID also rejects the whole snapshot before any storage
+/// replacement, so conflicting duplicates have no order-dependent
+/// last-row-wins outcome and identical duplicates share the same refusal.
+/// More than [`MAX_SNAPSHOT_ROWS`] rows likewise rejects the whole snapshot:
+/// the tick must refuse over-cap input, never apply a truncated prefix.
 #[must_use]
 pub fn normalize_events(raw: &[RawScheduledEvent]) -> Option<Vec<ScheduledEvent>> {
-    raw.iter().map(normalize_event).collect()
+    if raw.len() > MAX_SNAPSHOT_ROWS {
+        return None;
+    }
+    let events: Vec<ScheduledEvent> = raw.iter().map(normalize_event).collect::<Option<_>>()?;
+    let mut seen = std::collections::HashSet::with_capacity(events.len());
+    for event in &events {
+        if !seen.insert(event.id.as_str()) {
+            return None;
+        }
+    }
+    Some(events)
 }
 
 /// Parse the complete RFC 3339 instant fallibly, then reuse the UTC millis

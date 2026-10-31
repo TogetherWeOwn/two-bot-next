@@ -1030,7 +1030,7 @@
     },
     {
       "id": "rule:fallback",
-      "literal": "fallback name if empty",
+      "literal": "name if empty",
       "section": "V5",
       "case_ids": [
         "empty-fallback",

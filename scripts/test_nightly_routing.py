@@ -139,6 +139,24 @@ class NightlyRoutingTests(unittest.TestCase):
         self.assertIn("-- --include-ignored --test-threads=1", dedicated)
         self.assertNotIn("--skip", dedicated, "routing is not permanent exclusion")
 
+    def test_every_ignored_staging_migrate_fixture_is_routed_to_its_guarded_url(self):
+        source = (ROOT / "crates/cutover/tests/staging_migrate_db.rs").read_text()
+        names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', source))
+        self.assertTrue(names, "guarded ignored fixtures must be discovered")
+        workflow = WORKFLOW.read_text()
+        broad = workflow.split("- name: Full workspace sweep including ignored tests", 1)[1]
+        broad = broad.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]
+        routed = set(re.findall(r"--skip (\w+)", broad))
+        for name in names:
+            self.assertIn(name, routed, f"{name} must skip the incompatible bootstrap")
+        dedicated = workflow.split("- name: Staging migration runner ignored tests with their guarded URL", 1)[1]
+        dedicated = dedicated.split("\n      - name: ", 1)[0]
+        self.assertIn("steps.databases.outcome == 'success'", dedicated)
+        self.assertIn("TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test", dedicated)
+        self.assertIn("cargo test -p two-bot-cutover --all-features --test staging_migrate_db --locked", dedicated)
+        self.assertIn("-- --include-ignored --test-threads=1", dedicated)
+        self.assertNotIn("--skip", dedicated, "routing is not permanent exclusion")
+
     def test_broad_sweep_scratch_root_exists_before_tests_create_children(self):
         workflow = WORKFLOW.read_text()
         prepare = workflow.split("- name: Prepare isolated test databases", 1)[1]
@@ -215,8 +233,8 @@ class NightlyRoutingTests(unittest.TestCase):
         source = (ROOT / "crates/core/tests/leveling_store.rs").read_text()
         self.assertEqual(
             len(re.findall(r"#\[tokio::test", source)),
-            15,
-            "all 15 ordinary store tests must remain",
+            18,
+            "all 18 ordinary store tests must remain",
         )
         self.assertNotIn(
             "#[ignore",

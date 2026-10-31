@@ -7,8 +7,13 @@
     "invocation": "staging-migrate --plan|--apply"
   },
   "mode": "plan",
+  "migration_target": "staging",
   "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "target": {"host": "staging.invalid", "database": "two_bot", "branch_id": ""},
+  "target": {
+    "host": "staging.invalid",
+    "database": "two_bot",
+    "branch_id": ""
+  },
   "recovery_evidence_ref": "recovery-review#decision",
   "acl_plan_ref": "acl-review#decision",
   "role": "two_bot_migrator_ro",
@@ -29,18 +34,64 @@
   ],
   "ledger_before": [],
   "ledger_after": [],
-  "pending_before": [1, 9007199254740993],
-  "expected_pending": [1, 9007199254740993],
+  "pending_before": [
+    1,
+    9007199254740993
+  ],
+  "expected_pending": [
+    1,
+    9007199254740993
+  ],
   "plan_manifest_sha256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
   "plan_run_id": "",
   "plan_provenance_verified": false,
   "applied_count": 0,
   "audit": {
     "ledger_owner": "two_bot_migrator",
-    "ledger_counts": {"successful_rows": 0, "max_version": null, "failed_rows": 0},
-    "memberships": [{"login": "two_bot_migrator_ro_plan", "exists": true, "member_of": ["two_bot_migrator_ro"], "member_of_migrator": false, "member_of_ro": true}],
+    "ledger_counts": {
+      "successful_rows": 0,
+      "max_version": null,
+      "failed_rows": 0
+    },
+    "memberships": [
+      {
+        "login": "two_bot_migrator_ro_plan",
+        "exists": true,
+        "member_of": [
+          "two_bot_migrator_ro"
+        ],
+        "member_of_migrator": false,
+        "member_of_ro": true
+      }
+    ],
     "verify_findings": [],
     "matrix_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "verify_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-  }
+  },
+  "source_store_migrations": [
+    {
+      "version": 400,
+      "description": "store first fixture",
+      "sha384": "5637d6c2b9d57ff02548b4d08c33badd68524ebc42e7cb02889bbd5769c09b762d5b0590c368c1414b66b4569bbccf9d",
+      "sha384_recomputed": "5637d6c2b9d57ff02548b4d08c33badd68524ebc42e7cb02889bbd5769c09b762d5b0590c368c1414b66b4569bbccf9d"
+    },
+    {
+      "version": 9007199254740992,
+      "description": "store fixture résumé",
+      "sha384": "d309d5d648e466c78798a2ad690730cdf4e6e5c43d2931c4ee87a8ce7b5ad89e837fdbbcc5cdeef94d0cae9a3cb016cd",
+      "sha384_recomputed": "d309d5d648e466c78798a2ad690730cdf4e6e5c43d2931c4ee87a8ce7b5ad89e837fdbbcc5cdeef94d0cae9a3cb016cd"
+    }
+  ],
+  "ledger_store_before": [],
+  "ledger_store_after": [],
+  "pending_store_before": [
+    400,
+    9007199254740992
+  ],
+  "expected_store_pending": [
+    400,
+    9007199254740992
+  ],
+  "store_plan_manifest_sha256": "37b4068df78c6e975a6fca576f109260be97c4aa5defa316380be3c0f5c4f593",
+  "applied_store_count": 0
 }

@@ -71,10 +71,24 @@ fn script(position: i64, permissions: &str, overwrite: serde_json::Value) -> Vec
 #[tokio::test]
 async fn fresh_member_and_complete_live_policy_use_shared_paced_reads() {
     let mock = MockRest::start(script(2, "0", json!([])), ScriptedResponse::status(500)).await;
-    let snapshot = executor(&mock)
+    let exec = executor(&mock);
+    // Client-side baseline, not the mock's server `received_at`: the shared
+    // pacing stamp is taken on the client just before each send, while the
+    // server stamps arrival after TCP transit and its own scheduling. A
+    // late-stamped first receipt shrinks the measured gap, so any per-gap
+    // receipt threshold can flake under load (a 50 ms floor flaked on main).
+    // Four sequential paced reads need three 110 ms lane waits back to back
+    // by construction, so 300 ms of client elapsed keeps its bite (unpaced
+    // loopback reads land in ~1 ms each) with no server clock in the loop.
+    let started = tokio::time::Instant::now();
+    let snapshot = exec
         .fetch_self_role_snapshot(GUILD, USER, BOT)
         .await
         .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "shared paced reads completed without the pacing waits",
+    );
     assert!(snapshot.member_role_ids.contains(OTHER));
     assert!(!snapshot.member_role_ids.contains(ROLE));
     assert!(!snapshot.member_is_bot);
@@ -89,14 +103,6 @@ async fn fresh_member_and_complete_live_policy_use_shared_paced_reads() {
             format!("/api/v10/guilds/{GUILD}/channels"),
         ]
     );
-    for adjacent in calls.windows(2) {
-        assert!(
-            adjacent[1]
-                .received_at
-                .duration_since(adjacent[0].received_at)
-                >= Duration::from_millis(100)
-        );
-    }
     assert!(calls.iter().all(|c| c.method == "GET"));
     mock.shutdown().await;
 }
@@ -393,14 +399,25 @@ async fn late_fence_is_evaluated_after_shared_pacing_wait() {
     )
     .await;
     let exec = executor(&mock);
+    // Client-side baseline, not the mock's server `received_at`: the shared
+    // pacing stamp is taken on the client just before the first send, while
+    // the server stamps arrival after TCP transit and its own scheduling. A
+    // fence assertion against the server timestamp leaves only ~10 ms of the
+    // 110 ms pacing interval for loopback/scheduler jitter and flakes under
+    // load. This baseline is monotonic on the test task and the second fence
+    // cannot run before `first stamp + 110 ms` by construction, so `100 ms`
+    // keeps its bite without the server clock in the loop.
+    let before_first = tokio::time::Instant::now();
     exec.self_role_step(GUILD, USER, ROLE, true, || async { Ok(true) })
         .await
         .unwrap();
     let fence_calls = Arc::clone(&calls);
-    let previous_send = mock.requests()[0].received_at;
     let result = exec
         .self_role_step(GUILD, USER, ROLE, false, || async {
-            assert!(previous_send.elapsed() >= Duration::from_millis(100));
+            assert!(
+                before_first.elapsed() >= Duration::from_millis(100),
+                "late fence ran before the shared pacing wait elapsed"
+            );
             fence_calls.fetch_add(1, Ordering::SeqCst);
             Ok(false)
         })

@@ -1,6 +1,6 @@
 /**
- * TOG-12245 (threat-model F7): public /health and /readyz are bounded
- * GET/HEAD probes at the Worker. Synthetic bindings only — the stub DO
+ * TOG-12245 (threat-model F7): public /health, /readyz and /version are
+ * bounded GET/HEAD probes at the Worker. Synthetic bindings only — the stub DO
  * records what the Worker forwards; no endpoint, database or secret is
  * contacted. The Container's own alarm probe bypasses the Worker entirely,
  * so it is covered by the keepalive tests in container.test.ts (full suite).
@@ -9,6 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { type Env } from "../src/index.ts";
+import { isRequestId } from "../src/request-id.ts";
 
 interface Forwarded {
   method: string;
@@ -48,7 +49,7 @@ function harness() {
 const probe = (path: string, init?: RequestInit) =>
   new Request(`https://probe.invalid${path}`, init);
 
-for (const path of ["/health", "/readyz"]) {
+for (const path of ["/health", "/readyz", "/version"]) {
   test(`${path}: POST/PUT/DELETE/PATCH/OPTIONS return 405 and never touch the container`, async () => {
     const h = harness();
     for (const method of ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"]) {
@@ -98,10 +99,12 @@ for (const path of ["/health", "/readyz"]) {
     }
     assert.deepEqual(
       Object.keys(fwd!.headers),
-      ["x-two-bot-deployment-id"],
-      "only the Worker-stamped deployment id reaches the fenced DO",
+      ["x-request-id", "x-two-bot-deployment-id"],
+      "only the Worker-stamped deployment id and the correlation id reach the fenced DO",
     );
     assert.equal(fwd!.headers["x-two-bot-deployment-id"], "synthetic-probe-deployment");
+    // No inbound id here, so the edge minted one: a valid join key, not a leak.
+    assert.ok(isRequestId(fwd!.headers["x-request-id"] ?? ""));
     assert.equal(fwd!.body, "", "no caller body may be forwarded");
   });
 

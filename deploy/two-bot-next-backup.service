@@ -8,6 +8,10 @@
 # (`two-bot backup`), keeps the newest TWO_BACKUP_KEEP files, then PUTs the
 # night's dump to S3-compatible storage via TWO_BACKUP_UPLOAD_CMD.
 #
+# Bounded and loud: TimeoutStartSec=2h kills a hung dump or upload so the timer
+# can fire again, and OnFailure= hands the failure to the failure handler
+# (two-bot-next-failure@.service; see docs/backup.md "Failure signal").
+#
 # This unit does NOT get the Discord token. A backup needs the database and
 # nothing else, which is why the connection string lives in its own
 # environment file rather than in the bot's.
@@ -15,9 +19,12 @@
 [Unit]
 Description=Back up the two-bot-next funnel log
 After=two-bot-next.service
+OnFailure=two-bot-next-failure@%n.service
 
 [Service]
 Type=oneshot
+# Dump + the 30-minute upload deadline; a hung run is killed, not left "activating".
+TimeoutStartSec=2h
 User=twobot
 Group=twobot
 WorkingDirectory=/opt/two-bot-next

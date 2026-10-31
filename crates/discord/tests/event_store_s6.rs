@@ -34,7 +34,7 @@
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{assert_event_store_columns, TestDatabase};
 
 const GUILD: &str = "5555";
 const PARENT: &str = "6666";
@@ -329,74 +329,19 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "invitable",
 ];
 
-/// The reviewed column allowlist for the shared `event_store` table: the union
-/// of the slices' columns (S1 message ids, S2 member deltas, S3 presence, S4
-/// voice, S5 message/reaction, S6 threads, S8 stage/interaction) plus the `id`
-/// primary key. Every actual column must be a member, so any new free-text
-/// column (a body-carrying `raw_payload`, `thread_title`, or similar) fails
-/// the suite. A denylist cannot fail on a new name, so this asserts the closed
-/// union instead. Later slices extend this list when they add their own
-/// reviewed columns (`ADD COLUMN IF NOT EXISTS` per 0429).
-const ALLOWED_COLUMNS: &[&str] = &[
-    "action_type",
-    "activity_type",
-    "actor_id",
-    "application_id",
-    "archived",
-    "audit_log_entry_id",
-    "channel_id",
-    "command_id",
-    "deaf",
-    "dedup_key",
-    "emoji_id",
-    "emoji_name",
-    "event_time",
-    "event_type",
-    "guild_id",
-    "id",
-    "interaction_id",
-    "interaction_type",
-    "invitable",
-    "locked",
-    "message_id",
-    "mute",
-    "nick_changed",
-    "parent_id",
-    "premium_since",
-    "presence_status",
-    "privacy_level",
-    "received_at",
-    "roles",
-    "self_deaf",
-    "self_mute",
-    "self_stream",
-    "self_video",
-    "session_id",
-    "stage_instance_id",
-    "suppress",
-    "target_id",
-    "thread_id",
-    "user_id",
-];
-
+/// Shared-table schema check: the S6 thread-lifecycle/member-delta columns must
+/// be present and every column must sit on the reviewed allowlist in
+/// `two_bot_testsupport::EVENT_STORE_ALLOWED_COLUMNS` (the fence table in
+/// `docs/event-store.md`). Sibling slices share `event_store` via
+/// `ADD COLUMN IF NOT EXISTS`, so an exact S6-only set would break when a
+/// sibling lands (S7 invite/scheduled-event columns); a raw-payload or
+/// free-text column is in no slice and fails here.
 fn assert_thread_schema(columns: &[String]) {
     assert!(
         !columns.is_empty(),
         "S6 creates the thread columns on the append-only event_store table"
     );
-    for required in REQUIRED_COLUMNS {
-        assert!(
-            columns.iter().any(|column| column == required),
-            "event_store keeps thread column {required}; has {columns:?}"
-        );
-    }
-    for column in columns {
-        assert!(
-            ALLOWED_COLUMNS.contains(&column.as_str()),
-            "event_store holds only reviewed slice columns; unexpected {column}; \
-             has {columns:?} (extend ALLOWED_COLUMNS only with a reviewed slice column)"
-        );
-    }
+    assert_event_store_columns(columns, REQUIRED_COLUMNS);
 }
 
 /// No `json`/`jsonb` column may exist except the reviewed `roles` role-id

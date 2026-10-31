@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import math
 import re
 import secrets
 import sys
@@ -55,6 +56,10 @@ PRODUCTION_WORKER_NAMES = frozenset({"two-bot-next", "two-bot-next-production"})
 
 USER_AGENT = "two-bot-next-staging-probe/1 (TOG-12197; read-only)"
 MAX_BODY_BYTES = 64 * 1024
+# Per-request timeout cap: --timeout must be finite and within (0, 60].
+# 60 s is 3x the 20 s default and covers the slowest healthy staging
+# surface; anything larger is a misconfiguration, not a slower check.
+TIMEOUT_MAX_SECONDS = 60.0
 
 VERSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 # Mirrors wrangler/src/redirect.ts INVITE_CODE.
@@ -92,6 +97,25 @@ class FenceError(ValueError):
     """The base URL is not an allowed staging target."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 def is_production_host(host: str) -> bool:
     label = host.split(".", 1)[0]
     return (
@@ -123,6 +147,11 @@ def fence(base_url: str) -> str:
     if host not in STAGING_HOSTS:
         raise FenceError(f"host {host or '(none)'} is not on the staging allowlist")
     return f"https://{host}"
+
+
+def valid_timeout(value: float) -> bool:
+    """A --timeout is usable only when finite and within (0, 60]."""
+    return math.isfinite(value) and 0 < value <= TIMEOUT_MAX_SECONDS
 
 
 @dataclass(frozen=True)
@@ -200,7 +229,9 @@ class Probe:
             return None
         entry: dict[str, object] = {"method": method, "path": path, "status": reply.status}
         if "location" in reply.headers:
-            entry["location"] = reply.headers["location"]
+            # Presence only: a raw Location can carry credentials or control
+            # characters, so it never enters the report.
+            entry["location_present"] = True
         self.requests.append(entry)
         self._seen.append((method, path, reply))
         return reply
@@ -230,7 +261,9 @@ class Probe:
 
 def parse_json(reply: Reply) -> object:
     try:
-        return json.loads(reply.body)
+        return json.loads(reply.body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise
     except (ValueError, RecursionError):
         # Deeply nested in-cap JSON exhausts the decoder recursion limit;
         # refuse it as malformed, same as any other unparseable body.
@@ -242,7 +275,11 @@ def probe_health(p: Probe) -> None:
     if reply is None:
         return
     p.expect(reply.status == 200, f"GET /health: expected 200, got {reply.status}")
-    body = parse_json(reply)
+    try:
+        body = parse_json(reply)
+    except DuplicateKeyError:
+        p.fail("GET /health: carries duplicate JSON object keys")
+        return
     p.expect(isinstance(body, dict) and body.get("status") == "ok", 'GET /health: body is not {"status":"ok"}')
 
 
@@ -252,7 +289,11 @@ def probe_readyz(p: Probe, require_ready: bool) -> None:
     if reply is None:
         return
     p.expect(reply.status in (200, 503), f"GET /readyz: expected 200 or 503, got {reply.status}")
-    body = parse_json(reply)
+    try:
+        body = parse_json(reply)
+    except DuplicateKeyError:
+        p.fail("GET /readyz: carries duplicate JSON object keys")
+        return
     components = body.get("components") if isinstance(body, dict) else None
     well_formed = (
         isinstance(components, list)
@@ -315,7 +356,8 @@ def probe_fallback(p: Probe, unknown_slug: str, expect_code: str | None) -> None
         if root.status == 302 and match:
             fallback = location
             p.observed["fallback"] = "configured"
-            p.observed["fallback_location"] = location
+            # Shape token only: the raw invite target never enters the report.
+            p.observed["fallback_location"] = "discord_invite"
             p.expect(
                 "no-store" in root.headers.get("cache-control", ""),
                 "HEAD /: fallback redirect must be cache-control no-store",
@@ -334,9 +376,11 @@ def probe_fallback(p: Probe, unknown_slug: str, expect_code: str | None) -> None
         elif unknown.status == 302 and fallback is not None and location == fallback:
             p.observed["unknown_slug"] = "fallback"
         else:
+            # Names the check and status only: the raw target never enters
+            # the failure text.
             p.fail(
                 f"HEAD {unknown_path}: expected 404 or 302 to the configured fallback, "
-                f"got {unknown.status}" + (f" to {location}" if location else "")
+                f"got {unknown.status}"
             )
 
 
@@ -433,7 +477,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expect-fallback-code", help="invite code `/` must redirect to (default: observe)")
     parser.add_argument("--require-ready", action="store_true", help="FAIL unless /readyz is 200")
     parser.add_argument("--report", type=Path, help="write the JSON report here (default: stdout)")
-    parser.add_argument("--timeout", type=float, default=20.0, help="per-request timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=20.0,
+                        help="per-request timeout in seconds (finite, > 0, at most 60)")
     args = parser.parse_args(argv)
 
     try:
@@ -446,6 +491,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.expect_fallback_code is not None and not INVITE_CODE.fullmatch(args.expect_fallback_code):
         print("staging_probe: --expect-fallback-code is not a valid invite code", file=sys.stderr)
+        return 2
+    if not valid_timeout(args.timeout):
+        print("staging_probe: --timeout must be a finite number of seconds greater than 0 and at most 60",
+              file=sys.stderr)
         return 2
 
     report = build_report(

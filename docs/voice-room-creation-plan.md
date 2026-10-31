@@ -40,6 +40,58 @@ included in that request and never patched afterwards.
   voice room's plan: the worker creates it through the same per-guild queue
   (V9c), after the room exists.
 
+## Creation receipts and uncertain outcomes
+
+The room, text-companion and Join HTTP adapters accept a successful create body
+only after checking it against the request, before returning a channel to the
+worker:
+
+- A channel id must deserialize as a nonzero Discord id. Missing, malformed or
+  zero channel ids are not receipts.
+- `guild_id` must be present, nonzero and equal the requested guild.
+- `type` must be guild voice for rooms and Join channels, or guild text for
+  companions. Missing, malformed or different kinds are refused.
+- `parent_id` must match the requested parent exactly. Companions always request
+  their category. Rooms and Join channels may request no parent: an omitted or
+  `null` parent is then valid, but an unexpected category is not. A requested
+  parent may not be missing, `null`, malformed, zero or different.
+
+A bodyless, malformed or contradictory **2xx is `RoomHttpError::UnknownOutcome`**,
+not `InvalidRequest` or a definitive Discord rejection. The POST may have created
+something even though its response cannot establish which channel was requested.
+The adapters make one POST per invocation, return no channel on rejection, and
+never retry the create or expose the remote body in errors. They do not validate
+returned overwrite contents or establish provenance for snapshot adoption.
+
+No room binding, creator move, persisted ownership or deletion authority may be
+derived from a rejected receipt. The room worker drops the pending create and
+keeps its durable reservation held: it neither reposts nor settles/refunds that
+reservation on `UnknownOutcome`. Elapsed time and an invalid receipt do not prove
+channel absence. Existing reconciliation/release holds remain in force; this
+change implements no operator release path and grants no new create/delete
+permission.
+
+For a companion, the worker may still adopt a channel from its separate live
+snapshot on an uncertain result. That is not acceptance of the rejected receipt;
+when no snapshot candidate exists, that dispatch persists/tracks nothing and
+backs off. Existing later queue retry/adoption behavior is unchanged here.
+
+**Known separate Join retry/adoption gap:** `dispatch_create_join` records an
+uncertain failure and leaves the Join merely requested, without a stored channel
+id or `join_deletable` entry. A later queue attempt tries snapshot adoption by
+kind, category, name, relative id and absence of another tracked owner. If it
+finds no candidate, it can fall through to another POST; on the final uncertain
+attempt it forgets the plan, allowing a future `/private` to plan again. Those
+heuristics do not prove creation provenance or provide a durable uncertainty
+fence. Receipt validation does not fix that retry/adoption design, promise
+at-most-once Join creation across dispatches, or authorize deleting an uncertain
+channel. It only prevents ownership/deletion authority from the rejected body.
+
+Loopback adapter tests cover the three receipt matrices and one-POST boundary;
+bot worker negative controls pin no bind/move/persist/delete/refund from rejected
+evidence. They use in-memory fakes, not a live guild or database. A merged change
+is not evidence of production installation or a live Discord creation.
+
 ## Assumptions to verify on staging
 
 Discord does not document how create-time `position` interacts with sibling

@@ -222,7 +222,10 @@ fn result_text_names_outcome_without_echoing_input() {
     let hostile = "<@999999999999999999> evil-ping";
     let cases = [
         (
-            ChannelOutcome::Purged { affected: 5 },
+            ChannelOutcome::Purged {
+                affected: 5,
+                stop_reason: None,
+            },
             "Moderation action completed: purged (5).",
         ),
         (

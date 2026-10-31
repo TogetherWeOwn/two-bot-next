@@ -161,6 +161,30 @@ pub fn unlock_overwrite(allow: u64, deny: u64) -> (u64, u64) {
 /// run for a day.
 #[must_use]
 pub fn retry_after_ms(header_secs: Option<f64>, body_retry_after_secs: Option<f64>) -> u64 {
+    retry_after_ms_inner(header_secs, body_retry_after_secs, true)
+}
+
+/// How long a backfill read parks on a per-route 429, in millis: the same
+/// header/body/padding policy as [`retry_after_ms`] without the
+/// [`MAX_RETRY_AFTER_MS`] clamp, so a long `Retry-After` is waited out in one
+/// sleep instead of retry-storming past it — but still bounded by
+/// [`MAX_BACKFILL_RETRY_AFTER_MS`], so a malformed or hostile value cannot
+/// park a caller for days. Kick/publish lanes and the general `get_json`
+/// read keep the clamped form; only the backfill evidence reads
+/// (`get_json_observed`, `get_json_checked`) use this.
+#[must_use]
+pub fn retry_after_ms_unclamped(
+    header_secs: Option<f64>,
+    body_retry_after_secs: Option<f64>,
+) -> u64 {
+    retry_after_ms_inner(header_secs, body_retry_after_secs, false)
+}
+
+fn retry_after_ms_inner(
+    header_secs: Option<f64>,
+    body_retry_after_secs: Option<f64>,
+    clamp: bool,
+) -> u64 {
     let mut seconds = header_secs.unwrap_or(1.0);
     if let Some(body) = body_retry_after_secs {
         if body.is_finite() {
@@ -170,15 +194,23 @@ pub fn retry_after_ms(header_secs: Option<f64>, body_retry_after_secs: Option<f6
     if !seconds.is_finite() || seconds < 0.0 {
         seconds = 1.0;
     }
-    ((seconds * 1000.0).ceil() as u64)
-        .saturating_add(RETRY_AFTER_PADDING_MS)
-        .min(MAX_RETRY_AFTER_MS)
+    let waited = ((seconds * 1000.0).ceil() as u64).saturating_add(RETRY_AFTER_PADDING_MS);
+    if clamp {
+        waited.min(MAX_RETRY_AFTER_MS)
+    } else {
+        waited.min(MAX_BACKFILL_RETRY_AFTER_MS)
+    }
 }
 
 /// Legacy 250 ms padding added to every 429 wait (`kick.ts`, `rest.ts`).
 pub const RETRY_AFTER_PADDING_MS: u64 = 250;
 /// Legacy clamp on one 429 wait (`MAX_RETRY_AFTER_MS` in `kick.ts`).
 pub const MAX_RETRY_AFTER_MS: u64 = 60_000;
+/// Backfill ceiling on one unclamped 429 wait: long per-route `Retry-After`
+/// values are waited out, but no single wait parks a caller past five
+/// minutes — a malformed or hostile value (even `1e300`, which saturates the
+/// millis conversion) stops here instead of parking for days.
+pub const MAX_BACKFILL_RETRY_AFTER_MS: u64 = 300_000;
 /// Legacy 5xx / transport backoff base (`500 * 2 ** attempt` in `rest.ts`,
 /// `500 * 2 ** (attempts - 1)` in `kick.ts` — the same sequence).
 pub const BACKOFF_BASE_MS: u64 = 500;
@@ -193,6 +225,38 @@ pub const MAX_HTTP_TRIES: u32 = 5;
 #[must_use]
 pub fn backoff_ms(attempt: u32) -> u64 {
     BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(20))
+}
+
+/// Deterministic 64-bit mixer (splitmix64) for seeded jitter without a
+/// global RNG: the same `(seed, attempt)` pair always yields the same draw,
+/// on every platform, with no clock and no `rand` dependency.
+fn jitter_draw(seed: u64, attempt: u32) -> u64 {
+    let mixed = seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9E3779B97F4A7C15));
+    let mut z = mixed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// 5xx / transport backoff for failure `attempt` (0-based) with full jitter:
+/// a deterministic draw in `[1, backoff_ms(attempt)]` ms, so concurrent
+/// callers retrying the same outage spread instead of re-hammering in
+/// lockstep. The deterministic [`backoff_ms`] stays as the bound (caps and
+/// the [`MAX_HTTP_TRIES`] budget hold by construction); the same `seed`
+/// replays the same sample, so tests pin ranges without a clock or RNG.
+#[must_use]
+pub fn backoff_ms_jittered(attempt: u32, seed: u64) -> u64 {
+    let base = backoff_ms(attempt);
+    1 + (jitter_draw(seed, attempt) % base)
+}
+
+/// Fresh runtime seed for the jittered backoffs: one CSPRNG draw per call,
+/// so concurrent retry loops spread even when they share an attempt index.
+/// Tests pass explicit seeds to the jittered functions instead, keeping
+/// every pin deterministic without a global RNG.
+#[must_use]
+pub fn jitter_seed() -> u64 {
+    rand::random()
 }
 
 /// How long to wait before the next paced request: the gap between the
@@ -395,6 +459,49 @@ mod tests {
     }
 
     #[test]
+    fn unclamped_backfill_read_waits_out_long_header() {
+        // Backfill reads honor the header past the 60 s kick/publish clamp.
+        assert_eq!(retry_after_ms_unclamped(Some(75.0), None), 75_250);
+        assert_eq!(retry_after_ms_unclamped(Some(2.0), None), 2250);
+        assert_eq!(retry_after_ms_unclamped(Some(5.0), Some(1.5)), 1750);
+        assert_eq!(retry_after_ms_unclamped(None, None), 1250);
+        assert_eq!(retry_after_ms_unclamped(Some(f64::NAN), None), 1250);
+    }
+
+    #[test]
+    fn unclamped_backfill_wait_has_finite_ceiling() {
+        assert_eq!(MAX_BACKFILL_RETRY_AFTER_MS, 300_000);
+        // The specified 75 s wait still passes through in full.
+        assert_eq!(retry_after_ms_unclamped(Some(75.0), None), 75_250);
+        // A plausible-but-huge value stops at the ceiling instead of parking
+        // the caller for a day per attempt.
+        assert_eq!(
+            retry_after_ms_unclamped(Some(86_400.0), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(
+            retry_after_ms_unclamped(Some(3_600.0), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        // A hostile finite value saturates the millis conversion and still
+        // stops at the ceiling, via header or body alike.
+        assert_eq!(
+            retry_after_ms_unclamped(Some(1e300), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(
+            retry_after_ms_unclamped(None, Some(1e300)),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        // Boundary: just under the ceiling passes through, just over stops.
+        assert_eq!(retry_after_ms_unclamped(Some(299.0), None), 299_250);
+        assert_eq!(
+            retry_after_ms_unclamped(Some(300.0), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+    }
+
+    #[test]
     fn backoff_matches_legacy_sequence() {
         // 500 * 2^attempt: rest.ts `500 * 2 ** attempt`, kick.ts identical.
         assert_eq!(
@@ -402,6 +509,37 @@ mod tests {
             [500, 1000, 2000, 4000, 8000]
         );
         assert_eq!(MAX_HTTP_TRIES, 5);
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_base_and_replays_per_seed() {
+        for attempt in 0..5u32 {
+            let base = backoff_ms(attempt);
+            for seed in 0..8u64 {
+                let sample = backoff_ms_jittered(attempt, seed);
+                assert!(
+                    (1..=base).contains(&sample),
+                    "attempt {attempt} seed {seed}: {sample} outside [1, {base}]"
+                );
+            }
+        }
+        assert_eq!(backoff_ms_jittered(3, 42), backoff_ms_jittered(3, 42));
+        assert_eq!(backoff_ms_jittered(0, 7), backoff_ms_jittered(0, 7));
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_across_seeds() {
+        use std::collections::HashSet;
+        // Attempt 3 has a 4 s base: fleet-wide 5xx episodes must not retry
+        // in phase.
+        let distinct: HashSet<u64> = (0..32u64)
+            .map(|seed| backoff_ms_jittered(3, seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct delays across 32 seeds",
+            distinct.len()
+        );
     }
 
     #[test]

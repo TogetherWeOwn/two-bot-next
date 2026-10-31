@@ -17,6 +17,16 @@ rules:
     paths:
       include: ['crates/**', 'src/**']
       exclude: ['**/*_tests.rs', '**/tests.rs', '**/tests/**', '**/*_tests/**']
+  - id: rust-empty-expect-in-macros
+    languages: [rust]
+    severity: WARNING
+    message: ".expect() with an empty message inside a macro carries no context; say what was assumed"
+    patterns:
+      - pattern-regex: \.expect\s*\(\s*""\s*\)
+      - pattern-not-regex: (?m)^[ \t]*//[^\n]*
+    paths:
+      include: ['crates/**', 'src/**']
+      exclude: ['**/*_tests.rs', '**/tests.rs', '**/tests/**', '**/*_tests/**']
   - id: rust-panic-in-prod
     languages: [rust]
     severity: WARNING

@@ -5,8 +5,8 @@
 //! only witness to a session start is the gateway event already seen. A
 //! restart loses every open session; the honest end row is then
 //! `start_known: false` with a null duration, never a duration measured from
-//! boot. The adaptor clears the tracker on both `Resumed` and `Ready`
-//! (TOG-6123).
+//! boot. The adapter clears all starts on `Resumed` and `Ready`, and scoped
+//! starts when guild unavailability/removal or channel deletion breaks continuity.
 
 use std::collections::HashMap;
 
@@ -69,6 +69,30 @@ impl VoiceSessionTracker {
     /// Drop everything: gateway reconnected and open state is unproven.
     pub fn clear(&mut self) {
         self.open.clear();
+    }
+
+    /// Forget a guild's measured starts when observation continuity is lost.
+    /// This is not a leave: no end or duration can be inferred from the gap.
+    pub fn invalidate_guild(&mut self, guild_id: Snowflake) {
+        self.open.retain(|(guild, _), _| *guild != guild_id);
+    }
+
+    /// Forget measured starts in a deleted channel, returning their members
+    /// so the adapter can retire the associated serial chains as well.
+    pub fn invalidate_channel(
+        &mut self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+    ) -> Vec<Snowflake> {
+        let mut members = Vec::new();
+        self.open.retain(|(guild, member), session| {
+            let affected = *guild == guild_id && session.channel_id == channel_id;
+            if affected {
+                members.push(*member);
+            }
+            !affected
+        });
+        members
     }
 
     /// How many sessions are held open. Diagnostics and tests.

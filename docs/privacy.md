@@ -9,8 +9,8 @@ are outside this implementation's scope.
 
 - Discord guild/member IDs, join/leave/activity milestones, invitation attribution
   and event metadata (`members`, `events`, `invite_snapshots`).
-- XP totals, awards and cooldowns, rank projections and raid exclusions
-  (`member_levels`, `xp_awards`, `xp_cooldowns`, `member_ranks`, `member_exclusions`).
+- XP totals, awards and cooldowns, seasonal projections, rank projections and raid exclusions
+  (`member_levels`, `member_season_xp`, `xp_awards`, `xp_cooldowns`, `member_ranks`, `member_exclusions`).
 - Join-risk evidence copied from legacy anti-raid scoring: member ID, account
   age, join time, score and reasons (`join_risk_flags`). Erased by member ID; the
   legacy TEXT `event_id` and `reasons_json` are also checked for the snowflake.
@@ -36,7 +36,16 @@ are outside this implementation's scope.
   erased with its owner takes its whole list with it (the rows cascade). Its approved-grant
   witness (`voice_join_grants`) does the same: erasure removes the erased member's rows from
   every room's grant list, and a room erased with its owner takes its grants with it
-  (the rows cascade). Guild room-command controls
+  (the rows cascade). Its owner-grant journal (`voice_owner_grants`) records
+  prospective recipients, pending or completed: erasure removes the erased
+  member's rows by (`guild_id`, `member_id`), and deleting a parent room
+  removes its journal rows through the migration's `ON DELETE CASCADE`.
+  Event voice presence spans (`event_voice_presence`) record per-member
+  join/leave spans: erasure removes the erased member's rows, guild-scoped
+  through the scheduled-event mirror. The channel claim row
+  (`event_voice_channels`) carries no member identity and is untouched.
+  Erasure removes database tracking only, never the Discord channel.
+  Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
   IDs) and room logging settings (`voice_logging_settings`: detail level, notice
   channel ID, mention role ID) hold channel and role IDs only and no member IDs.
@@ -66,8 +75,9 @@ are outside this implementation's scope.
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
   TEXT, not database-validated JSON. The event-store capture (`event_store`:
   stage-instance, interaction-observe and audit-log-entry rows with IDs and
-  enum fields only, no free text) stores actor/target member IDs, erased as
-  either one.
+  enum fields only, no free text, plus invite rows with the code hash and the
+  inviter ID and scheduled-event rows with IDs and status/entity-type enums)
+  stores actor/target/user/inviter member IDs, erased as any one of them.
 - Automod violation counts and once-per-message ledgers store member and message
   IDs and filter names, never content (`automod_violations`,
   `automod_processed_messages`). Per-delivery replay claims may keep a matched
@@ -95,7 +105,24 @@ are outside this implementation's scope.
   with hashed keys/nonces/event identities. Settings and immutable settings audit
   store operator attribution and JSON policy configuration.
 - Aggregate counters/probes, gateway checkpoints and shared role/event
-  configuration also exist, but are not member activity records.
+  configuration also exist, but are not member activity records. Game-activity
+  analytics (`game_activity_guild_aggregates`: per-guild per-game play/in-voice
+  millis plus session counts, flushed hourly from the voice runtime's
+  in-memory collector) belongs to this class: guild-keyed rows with no member
+  column, gated before every persist by the same per-user opt-out and the
+  presence toggle above, so opted-out members never persist and a disabled
+  guild drains and drops. The gate read and the upsert share one serializing
+  transaction holding the suppression table, so an opt-out landing mid-flush
+  either filters out of that flush or waits for its commit. The voice toggle
+  is independent: with voice off but
+  presence on, play aggregates still persist while voice-derived `in_voice_ms`
+  stays 0 (voice spans drain and drop). The table is not a replay fence and
+  holds no fence rows; member erasure and opt-out purges have no row to delete
+  there. Stale rows do expire by age on the retention cadence (see
+  [Retention](#retention-and-explicit-exceptions)): aggregates whose
+  `updated_at` is older than the horizon are deleted per guild.
+  Operators read these rows through the [game-activity aggregate
+  report](game-activity-report.md).
 
 The authoritative, ordered deletion manifest is
 [`member_erasure_plan.json`](../crates/cutover/src/member_erasure_plan.json).
@@ -132,7 +159,7 @@ When your opt-out runs, the bot:
    invite keeps the joiner's row but with your inviter field blanked.
    Anonymous aggregate counters keep counting throughout.
 3. Writes exactly one audit receipt: the guild/member scope plus the
-   operator actor label and the database timestamp.
+   actor label and the database timestamp.
 
 Moderation, audit, XP/level, ticket, voice-room and settings rows are not
 part of an opt-out: they serve safety, delivery and accountability, not
@@ -144,11 +171,30 @@ already-purged rows. Afterwards the pair persists exactly as before, and
 the re-enable itself writes no purge receipt (the receipt table records
 purges, one row per purge).
 
-Until the member self-serve slash command lands, an opt-out is executed by
-a server operator through the reviewed `opt_out_member` service with an
-explicit operator actor label, against a disposable/staging binding first
-per the rollout gates. The actor label carries operator attribution only:
-never put a member ID, content, count or secret in it.
+Members run this themselves with `/privacy opt-out` (`opt-in` to resume,
+`status` to check). The command acts only on the invoker in the invoking
+guild and writes the receipt with the fixed `member:self-serve` actor label.
+A server operator can still execute an assisted opt-out through the reviewed
+`opt_out_member` service with an explicit operator actor label, against a
+disposable/staging binding first per the rollout gates. Either actor label
+carries attribution only: never put a member ID, content, count or secret
+in it.
+
+Opt-out and opt-in serialize per `(guild, member)` in the privacy service,
+including assisted operator calls. The transaction takes a pair-scoped
+advisory lock before checking suppression or taking the existing purge
+locks (5-second lock timeout, 15-second statement timeout). Concurrent
+opt-outs produce one purge and receipt; already-suppressed calls take no
+purge lock and write no receipt. A first opt-out with no stored activity
+still installs suppression, writes its receipt and gets the opted-out reply.
+
+For member self-serve, the service checks the existing 10-minute receipt
+cooldown under that same pair lock, after suppression. Already-suppressed
+taps get the already-opted-out reply, not a cooldown reply. A recent receipt
+on an unsuppressed pair gets the cooldown reply without reinstalling
+suppression or writing a receipt. Replies use the service's explicit
+outcome, not a preflight read or a zero-row purge count. Assisted operator
+calls remain exempt from the member cooldown.
 
 **Policy note (verified 2026-10-12):** the live Discord Developer Policy
 now lives on Discord's developer support help center (the old
@@ -158,24 +204,164 @@ from this sandbox on 2026-10-12 was blocked after the redirect chain
 about the policy's current text. Before citing Discord policy in a member
 answer, open the live page and quote what it says that day.
 
+### Staging verification read (fixture pairs, CI route)
+
+The manual `staging-privacy-verify-read` workflow reads all-time per-pair
+counts for one fixture member in one staging guild, without handing any
+agent a database credential. The dispatcher chooses only the guild alias
+(`g` for TWO Staging, `h` for the second guild); the script maps the alias
+to its pinned guild and refuses anything else. The `h` pin travels the
+normal config path: until `STAGING_PRIVACY_VERIFY_H_GUILD_ID` is set,
+recorded and verified not-live, every `h` read refuses. The fixture member
+comes only from the `STAGING_FIXTURE_MEMBER_ID` environment secret, never
+from an input, so a dispatch cannot aim the read at another member.
+
+The read-only login `TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL` must name
+role `two_bot_privacy_verify_ro` on database `two_bot` at the host pinned
+in `STAGING_PRIVACY_VERIFY_EXPECTED_HOST`. The role holds column-limited
+`SELECT` on exactly six tables, covering every column the queries read:
+`events` (`guild_id`, `member_id`, `metadata`, `idempotency_key`),
+`members` (`guild_id`, `member_id`), `invite_snapshots` (`guild_id`,
+`inviter_id`), `community_facts` (`guild_id`, `actor_id`, `metadata`,
+`source_event_id`, `idempotency_key`), `privacy_opt_outs` (`guild_id`,
+`member_id`), and `privacy_opt_out_audit` (`guild_id`, `member_id`,
+`actor`, `opted_out_at`, `id`; `actor` and `opted_out_at` are projected,
+`id` orders the receipts), and nothing else. Every statement runs in a
+`READ ONLY` transaction with a 10 s
+statement timeout after a `current_user`/`current_database()` identity
+probe.
+
+The six equality-count queries project `COUNT(*)` only. Two sweep queries
+apply the reviewed `member_erasure` manifest predicates for `events` and
+`community_facts` (the only purge tables matching beyond direct ownership)
+restricted to non-owned rows, and likewise project only counts: a zero
+sweep proves the purge touches only directly owned rows. One capped receipt
+query returns actor labels plus `opted_out_at` (at most 10 rows plus an
+overflow witness; the receipt count stays exact). Every count above
+1,000,000 fails closed: a single fixture pair cannot legitimately reach it,
+so a larger count means the predicates matched beyond the pair. The
+15-minute window of the events-smoke read does not apply here; purge
+verification needs all-time counts.
+
+The run uploads `staging-privacy-verify-read-<run_id>.json` (14 days):
+guild alias, collection timestamp, the six counts, the two sweep counts,
+and the capped receipt rows. Only the exact identity-free actor labels
+`member:self-serve` and `operator:fixture-check` may be published. Any other
+actor fails the whole read without an artifact or summary, even if it has
+a valid service shape or occurs only in the overflow witness. Labels are
+not normalized or replaced. The independent artifact validator enforces
+the same closed allowlist without needing member or guild bindings. Member,
+guild pins, sources and metadata never reach the artifact, the log or the
+step summary.
+
 ## Retention and explicit exceptions
 
-The retention module (`two-bot-cutover::retention`, migration `0435`)
-implements the rolling windows when invoked: raw presence/voice rows roll off
-at 30 days, the audit-log cache expires at 45 days, and user deletion requests
-complete in under 72 hours with a receipt. Long-term aggregates (counts,
-streaks) are never time-purged, and a departed guild's rows go only through
+The retention module (`two-bot-cutover::retention`, migration `0438`)
+applies rolling nominal windows when invoked: raw presence/voice rows use a
+30-day window, the audit-log cache uses 45 days, and user deletion requests
+complete in under 72 hours with a receipt unless a replay guard is unresolved,
+in which case the request stays pending with no receipt and is reported as
+deferred (with overdue requests older than 72 hours counted separately).
+Long-term aggregates (counts,
+streaks) are never time-purged, with one exception: game-activity guild
+aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
+the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
+accepts 1..=36,500 days and any missing, malformed, or out-of-range value
+falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
+`execute`; dry runs count the visited page's full stale rows without deleting).
+Each production pass visits at most 32 candidate guilds and deletes at most
+500 rows per visited guild (test builds page at 4 x 10 to keep fixtures
+meaningful): tens of single-statement deletes per tick, far inside the
+120-second attempt budget, for at most ~16k rows per 15-minute tick
+(~1.5M/day). Each per-guild delete runs with `lock_timeout = '5s'` / `statement_timeout = '15s'`
+(plus a 15 s pool statement timeout), so a lock held by a stuck session fails
+that guild fast as an isolated retryable error instead of blocking the pass
+until the supervisor cancels it and pins its pooled connection. The cursor is
+written per guild immediately before that guild's delete, so a failed or
+cancelled pass still advances past the last attempted guild and the next pass
+reaches the later guilds on the same page, even when the whole fleet fits on
+one page; `guilds_deferred` counts
+eligible guilds after the visited page (zero only at the end of the eligible
+list), so backlog lag is observable via `guilds_deferred`/`stale_rows` with no
+per-guild labels. Dry-run totals are a same-predicate upper bound per pass
+(execute deletes at most the per-guild batch), not an exact future-delete
+promise under concurrent writes. After
+expiry a returning game's totals restart from zero with no marker. Apart
+from that window, a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the
-queued purge). No scheduler, CLI, or gateway hook calls the job yet, and no
-automatic age-based purger is installed: do not claim a live 30/90-day TTL or
-live enforcement where no enforcing timer exists. Gateway wiring for
-`GUILD_DELETE`/`GUILD_CREATE` and a schedule are follow-up work. Every run
-reports per-class metrics and supports a dry run that deletes nothing.
+queued purge). The live gateway invokes the queue/cancel paths on real
+`GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
+available rejoin cancels before the next run), and the supervised retention
+job runs on a bounded schedule: a dry run that deletes nothing unless
+`TWO_RETENTION_MODE` is exactly `execute`. No other automatic age-based
+purger is installed: do not claim a live 30/90-day TTL beyond the windows
+this job enforces. Every run reports per-class metrics, with partial runs
+(deferred/overdue deletions, failed guild purges) surfaced as warnings that
+stay retryable. The existing `presence_probe`, funnel `events` and
+`operational_audit_log` cutoffs are evaluated at each successful run; scheduling
+or database failures can retain those rows beyond their nominal windows until a
+later successful run. The cadence headroom below is specific to `event_store`.
 
-The append-only event-store capture (`event_store`, when its slices land)
-follows the same rule: its rows persist until erasure, and its TTL policy is
-an explicit placeholder awaiting a reviewed migration, not an installed
-timer. The per-user purge path is this procedure plus one manifest entry per
+The authenticated erasure intake (`two-bot-cutover::deletion_intake`) is wired
+through `/privacy delete`, `/privacy deletion-status` and `/privacy deletion-receipt`.
+The handler derives the guild from `interaction.guild_id` and the requester from
+`actor_id(interaction)`; no command accepts a target member. Requests bind to
+that pair and the interaction id. Fresh requests acknowledge as pending;
+idempotent retries reuse the request without queueing it again and direct the
+member to status rather than claiming a new pending queue. Requests persist to
+the same deletion-request ledger the scheduler drains — never the narrower opt-out
+purge. Status and completion-receipt reads use the same authenticated pair plus
+the request id, without the interaction token. Receipts name the erasable rows
+in the member erasure plan, disclose the retained `retention_deletion_requests`
+request/receipt ledger and `privacy_opt_out_audit (member_id, actor)`, and do not
+claim the guild-purge queue. When the database is behind the binary (an unapplied migration or grant),
+the gateway acks dispatches whose queue write hits the schema gap instead of
+crash-looping, with one exception: a missing grant (`42501`) on an available
+rejoin holds the cursor (the gateway fails the dispatch and replays it) until
+the ACL plan is applied, because the queue may hold a pending purge for that
+guild. A missing queue table (`42P01`) on a rejoin is still skipped — an absent
+table holds nothing to cancel — and
+a skipped true guild removal is logged at error level with the guild id
+(`retention purge skipped; schema gap, operator replay required`), increments
+the pollable `retention_replay_needed` counter on `/metrics`
+(`two_bot_retention_replay_needed_total`), and must be replayed by the
+Operator once the migration lands — a nonzero counter means at least one
+skip since the last restart and is only an early hint: the counter resets
+on process restart and carries no guild id, so the error log line
+(`operator replay required`) stays the source of truth for which guilds to
+replay. Always search that line over the whole schema-gap window, then run
+the same insert the live path runs:
+`INSERT INTO retention_guild_purge_queue (guild_id)
+VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
+Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
+the `operator replay required` line — a later `retention lifecycle skipped;
+schema gap, nothing to cancel` warn for the same guild means it rejoined, so
+skip the insert while the guild is live (replaying it would queue a live guild
+for the next `execute` run). Run the default dry run first and confirm the
+guild is still gone before executing.
+
+The append-only event-store capture (`event_store`) carries one narrow,
+documented retention exception: the same retention job expires its raw
+presence and voice captures (`PRESENCE_UPDATE`, `VOICE_STATE_UPDATE`,
+`VOICE_SERVER_UPDATE`) at 30 days and its cached Discord audit entries
+(`GUILD_AUDIT_LOG_ENTRY_CREATE`) at 45 days, selected by `event_time`
+(never the insertion time, so a backfill or replay cannot extend old
+data's lifetime) and only in `execute` mode. For these event-store captures,
+the 15-minute supervised retention lifecycle reserves one cadence as cutoff
+headroom and selects rows at or before `next_sweep_deadline - retention_window`
+(inclusive UTC instant),
+so those captures can expire up to 15 minutes before their nominal maximum age.
+Each run commits at most one globally capped batch of 1,000 rows across all
+three capture classes, ordered by oldest `event_time`; later runs continue the
+backlog, allowing user-deletion and guild-purge work to proceed each cadence.
+Dry-run reports the full eligible capture backlog, not just one batch. If a
+batch times out, that batch rolls back; batches committed by earlier runs stay
+committed, and the remaining backlog is retried on a later cadence. This is not
+a claim that an arbitrarily large or
+continuously growing backlog can be drained within one cadence; steady-state
+expiry depends on the supervised job keeping up with arrivals. Capture writers
+stay insert-only and no other `event_store` family has an age TTL; those rows
+persist until erasure. The per-user purge path is this procedure plus one manifest entry per
 landing slice, deleting by guild plus user; rows without a user id purge per
 guild (and per message or thread where the columns exist) instead. The
 capture fence is ids, timestamps and enums only: no message bodies and no
@@ -191,6 +377,7 @@ The manifest explicitly retains these control-plane records:
 | `guild_settings_audit.actor`, `old_value`, `new_value` | Immutable configuration history; the database refuses DELETE, UPDATE and TRUNCATE, even a zero-row DELETE. No trigger disabling or audit bypass is permitted. IDs in prior/current policy remain here. |
 | `audit_kill_switch.engaged_by` | Global incident-control attribution, with no guild scope. Member erasure never disengages or rewrites the halt. |
 | `member_erasure_audit.actor` | Minimal operator accountability, retained independently of member activity. It is not the erased subject field. |
+| `admin_api_tokens.holder_id`, `issued_by` | Named human/AI credential principal (which may identify a member) and issuing-operator attribution. Guild-local activity erasure must not rewrite holders or silently change cross-guild grants. Separate authorized credential revocation/retention disposition is required; see the [registry contract](admin-registry.md). |
 | `privacy_opt_outs` (guild, member, time) | Guild-scoped opt-out suppression tombstone. Deleting it would silently resume per-user persistence the member refused. Retained until the member opts back in; member erasure never removes suppression. |
 | `privacy_opt_out_audit` (scope, actor, time) | One receipt row per opt-out/purge, same accountability class as `member_erasure_audit`. The subject appears only in the scope columns, never in the actor label. |
 | `guild_analytics_settings` | Per-guild ingestion switches (presence/activity/voice). Guild configuration, not member activity; no member IDs stored. |
@@ -242,9 +429,17 @@ never recreates the purged `member_inactive` row). Every gated writer serializes
 with concurrent opt-outs (a shared table lock, so a write that passes the
 gate can never land after the purge), and `member_join` rows strip a
 suppressed inviter's `inviterId` from metadata while keeping the joiner's
-own row. Under a disabled toggle `touch_activity` / `mark_bot` may still
-refresh `last_active_at` for non-suppressed members, which is a known
-residual for a follow-up, not silent per-user analytics. Duplicate
+own row. Gateway activity timestamps carry their originating family
+(message/activity versus voice) through the timestamp buffer, and the
+batch commit applies the matching guild toggle inside the same
+transaction before the monotonic `last_active_at` upsert, so a disabled
+family's touch creates or advances nothing and a newer disabled stamp
+can never replace the allowed family's timestamp; the runtime funnel
+store's `touch_activity` honors the same toggle. The standalone
+`cutover::db::{touch_activity, mark_bot}` helpers and the backfill
+binaries that call them stay suppression-only (they carry no family
+signal), which is the remaining residual for a follow-up, not silent
+per-user analytics. Duplicate
 reconfirmations for suppressed pairs advance nothing: the gate runs before
 the observation-maximum path too.
 

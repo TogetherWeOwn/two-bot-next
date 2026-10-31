@@ -16,8 +16,8 @@ use two_bot_core::lfg::{
 /// mentions and markdown stay inside the field that carries them.
 const MAX_FIELDS: usize = 4;
 /// Post id, select value and raw `custom_id` fields. Discord caps real
-/// components at 100 chars; the harness deliberately goes beyond it because
-/// the parser itself has no bound.
+/// components at 100 chars; the harness deliberately goes beyond both that
+/// transport cap and the parser's 128-UTF-16-unit post-id bound.
 const MAX_ID_CHARS: usize = 256;
 /// The role-spec field may overshoot the published bound so `TooLong` and the
 /// exact-boundary spec are both reachable.
@@ -62,9 +62,14 @@ fn truncate_chars(s: &str, cap: usize) -> String {
     s.chars().take(cap).collect()
 }
 
+/// Independent post-id contract, not the production validator or its constant.
+fn post_id_in_bounds(post_id: &str) -> bool {
+    (1..=128).contains(&post_id.encode_utf16().count())
+}
+
 /// `parse_lfg_select` against an independent oracle: foreign or forged
-/// prefixes refuse, and everything after the one exact prefix is carried
-/// byte-for-byte (no trim, case fold, unescape or second prefix strip).
+/// prefixes and empty/overlong post ids refuse. Valid ids after the one exact
+/// prefix are carried byte-for-byte (no trim, fold, unescape or second strip).
 fn check_select(custom_id: &str, value: &str) {
     let parsed = parse_lfg_select(custom_id, value);
     assert_eq!(
@@ -77,6 +82,10 @@ fn check_select(custom_id: &str, value: &str) {
         return;
     }
     let rest = &custom_id[WIRE_PREFIX.len()..];
+    if !post_id_in_bounds(rest) {
+        assert_eq!(parsed, None, "post id must be 1..=128 UTF-16 units");
+        return;
+    }
     match parsed {
         Some(LfgSelectAction::Leave { post_id }) => {
             assert_eq!(value, WIRE_LEAVE, "leave only on the exact leave value");
@@ -87,7 +96,7 @@ fn check_select(custom_id: &str, value: &str) {
             assert_eq!(post_id, rest, "post id is carried byte-exact");
             assert_eq!(role_key, value, "role key is carried byte-exact");
         }
-        None => panic!("a prefixed custom id always parses"),
+        None => panic!("an exact prefix with a bounded, nonempty post id parses"),
     }
 }
 
@@ -143,8 +152,9 @@ fn check_accepted_spec(spec: &str, roles: &[LfgRoleSpec], post_id: &str) {
         "canonical rendering re-parses to the same roles"
     );
 
-    // Select menu consistency: every minted role key reaches the store as the
-    // same signup, and the leave entry cannot collide with a role.
+    // Select menu consistency: bounded post ids preserve every minted role
+    // key; invalid ids refuse even otherwise valid options. The leave entry
+    // cannot collide with a role, regardless of post-id validity.
     let custom_id = lfg_custom_id(post_id);
     let rows = spec_roles(post_id, roles);
     let options = lfg_select_options(LfgStatus::Open, &rows, &[]);
@@ -163,23 +173,25 @@ fn check_accepted_spec(spec: &str, roles: &[LfgRoleSpec], post_id: &str) {
     }
     for (option, role) in options.iter().zip(roles) {
         assert_eq!(option.value, role.key);
+        check_select(&custom_id, &option.value);
         assert_eq!(
             parse_lfg_select(&custom_id, &option.value),
-            Some(LfgSelectAction::Signup {
+            post_id_in_bounds(post_id).then(|| LfgSelectAction::Signup {
                 post_id: post_id.to_owned(),
                 role_key: role.key.clone(),
             }),
-            "a role option signs up for exactly that role"
+            "a role option signs up for exactly that role iff the post id is valid"
         );
     }
     let leave = options.last().expect("leave option is last");
     assert_eq!(leave.value, WIRE_LEAVE);
+    check_select(&custom_id, &leave.value);
     assert_eq!(
         parse_lfg_select(&custom_id, &leave.value),
-        Some(LfgSelectAction::Leave {
+        post_id_in_bounds(post_id).then(|| LfgSelectAction::Leave {
             post_id: post_id.to_owned(),
         }),
-        "the leave option leaves"
+        "the leave option leaves iff the post id is valid"
     );
 }
 
@@ -252,14 +264,17 @@ fuzz_target!(|data: &[u8]| {
             post_id: "abc123".to_owned(),
         })
     );
-    // An empty value or post id still parses: the store answers `missing`.
-    assert_eq!(
-        parse_lfg_select("two:lfg:", ""),
-        Some(LfgSelectAction::Signup {
-            post_id: String::new(),
-            role_key: String::new(),
-        })
-    );
+    // Empty/unknown role keys still reach the store for a valid post id.
+    for role_key in ["", "unknown-role", " __leave__", "__leave__ "] {
+        assert_eq!(
+            parse_lfg_select("two:lfg:abc123", role_key),
+            Some(LfgSelectAction::Signup {
+                post_id: "abc123".to_owned(),
+                role_key: role_key.to_owned(),
+            })
+        );
+    }
+    assert_eq!(parse_lfg_select("two:lfg:", ""), None);
     // A doubled prefix strips once; the leave value is exact-match only.
     assert_eq!(
         parse_lfg_select("two:lfg:two:lfg:x", " __leave__"),
@@ -268,6 +283,42 @@ fuzz_target!(|data: &[u8]| {
             role_key: " __leave__".to_owned(),
         })
     );
+    // Literal validity pins distinguish UTF-16 units from bytes/scalars and
+    // count only the suffix, without trimming or stripping a second prefix.
+    for (post_id, valid) in [
+        (String::new(), false),
+        ("a".repeat(129), false),
+        ("é".repeat(129), false),
+        ("😀".repeat(65), false),
+        ("a".repeat(128), true),
+        ("😀".repeat(64), true),
+        ("é".repeat(128), true),
+        ("x".to_owned(), true),
+        (" \t".to_owned(), true),
+        ("two:lfg:x".to_owned(), true),
+    ] {
+        assert_eq!(post_id_in_bounds(&post_id), valid);
+        let custom_id = format!("two:lfg:{post_id}");
+        assert_eq!(lfg_custom_id(&post_id), custom_id);
+        for role_key in ["tank", "", "unknown-role", " __leave__", "__leave__ "] {
+            check_select(&custom_id, role_key);
+            assert_eq!(
+                parse_lfg_select(&custom_id, role_key),
+                valid.then(|| LfgSelectAction::Signup {
+                    post_id: post_id.clone(),
+                    role_key: role_key.to_owned(),
+                })
+            );
+        }
+        check_select(&custom_id, WIRE_LEAVE);
+        assert_eq!(
+            parse_lfg_select(&custom_id, WIRE_LEAVE),
+            valid.then(|| LfgSelectAction::Leave {
+                post_id: post_id.clone(),
+            })
+        );
+        check_spec("tank:Tank:2,healer:Healer:2", &post_id);
+    }
     for forged in [
         "",
         "two:lfg",

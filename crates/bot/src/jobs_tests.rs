@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 async fn settle() {
     for _ in 0..20 {
@@ -11,6 +11,7 @@ fn job(name: &'static str, action: JobAction) -> Job {
     Job {
         name,
         cadence: Duration::from_secs(10),
+        cadence_source: None,
         startup_jitter: Duration::from_secs(2),
         timeout: Duration::from_secs(30),
         action,
@@ -68,7 +69,7 @@ async fn cadence_keeps_startup_phase_and_jitter_is_bounded() {
     settle().await;
     assert_eq!(count.load(Ordering::SeqCst), 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -94,7 +95,7 @@ async fn overrunning_job_skips_deadlines_without_overlap_or_catchup() {
     settle().await;
     assert_eq!(count.load(Ordering::SeqCst), 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -118,7 +119,7 @@ async fn delayed_supervisor_does_not_replay_a_busy_deadline() {
     settle().await;
     assert_eq!(count.load(Ordering::SeqCst), 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -155,7 +156,7 @@ async fn timeout_cancels_attempt_and_next_success_resets_failure_streak() {
     assert_eq!(status.read().await["timeout"].last_error_class, None);
     assert_eq!(status.read().await["timeout"].consecutive_failures, 0);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -190,7 +191,7 @@ async fn panics_in_future_and_factory_do_not_kill_other_jobs() {
     assert_eq!(count.load(Ordering::SeqCst), 2);
     assert_eq!(status.read().await["panic"].consecutive_failures, 2);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -333,7 +334,7 @@ async fn shutdown_while_waiting_for_status_lock_never_starts_an_attempt() {
         drop(stop);
         settle().await;
         drop(locked);
-        task.await.unwrap();
+        task.await.unwrap().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
         let current = &status.read().await["good"];
         assert_eq!(current.last_start, None);
@@ -476,7 +477,9 @@ async fn timeout_and_panics_report_failure_with_bounded_labels() {
     settle().await;
     let text = metrics.render(None);
     assert_eq!(text.lines().count(), before);
-    assert!(!text.contains("secret"));
+    // `invalid_secret` is a legitimate bounded kind: match the hostile
+    // `secret=value` injection marker, not the bare substring.
+    assert!(!text.contains("secret="));
     assert!(!text.contains("job=\"panic\""));
     assert!(!text.contains("job=\"factory\""));
     assert!(text.contains("two_bot_job_runs_total{job=\"other\",outcome=\"failure\"} 3\n"));
@@ -487,6 +490,183 @@ async fn timeout_and_panics_report_failure_with_bounded_labels() {
     for task in tasks {
         task.await.unwrap();
     }
+}
+
+fn dynamic_job(name: &'static str, action: JobAction, cadence_secs: &Arc<AtomicU64>) -> Job {
+    let source = Arc::clone(cadence_secs);
+    Job {
+        name,
+        cadence: Duration::from_secs(cadence_secs.load(Ordering::SeqCst)),
+        cadence_source: Some(Arc::new(move || {
+            Duration::from_secs(source.load(Ordering::SeqCst))
+        })),
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(30),
+        action,
+    }
+}
+
+/// A changed cadence source reschedules the supervisor's next tick to
+/// last-run + new cadence: a decrease lands one new interval after the last
+/// run instead of the old 60 s slot, an unchanged source keeps the phase, and
+/// an increase pushes the already-pending tick out. No run is duplicated or
+/// skipped across a transition.
+#[tokio::test(start_paused = true)]
+async fn dynamic_cadence_reschedules_the_next_tick_without_restart() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let cadence_secs = Arc::new(AtomicU64::new(60));
+    let status = statuses(&["dynamic"], false);
+    let (stop, rx) = watch::channel(false);
+    let task = tokio::spawn(supervise(
+        vec![dynamic_job(
+            "dynamic",
+            counting(&count, Duration::ZERO),
+            &cadence_secs,
+        )],
+        status,
+        rx,
+    ));
+    settle().await;
+    // The zero-jitter first tick runs immediately (t=0).
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // Unchanged source: the fixed phase holds, the next run is at t=60.
+    tokio::time::advance(Duration::from_secs(59)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // Decrease at t=59, before the pending t=60 slot: nothing runs until the
+    // rescheduled slot would already have passed, so exactly one prompt run
+    // fires once the supervisor observes the change, then the 20 s phase
+    // anchored at the last run (t=0) continues at t=80.
+    cadence_secs.store(20, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 2, "one run at the old slot");
+    tokio::time::advance(Duration::from_secs(19)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 2, "no catch-up burst");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        3,
+        "t=80: last run t=60 + 20 s"
+    );
+
+    // Increase at t=80: the pending t=100 tick moves out to t=80 + 100 s.
+    cadence_secs.store(100, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(99)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 3, "increase defers the tick");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        4,
+        "t=180: last run t=80 + 100 s"
+    );
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// A decrease observed long after last-run + new cadence fires one prompt
+/// run (no replay of every missed slot), then continues on the new phase.
+#[tokio::test(start_paused = true)]
+async fn dynamic_cadence_decrease_past_due_runs_once_promptly() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let cadence_secs = Arc::new(AtomicU64::new(3600));
+    let status = statuses(&["dynamic"], false);
+    let (stop, rx) = watch::channel(false);
+    let task = tokio::spawn(supervise(
+        vec![dynamic_job(
+            "dynamic",
+            counting(&count, Duration::ZERO),
+            &cadence_secs,
+        )],
+        status,
+        rx,
+    ));
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "first run at t=0");
+
+    // The interval drops to 60 s at t=300; the pending t=3600 slot must not
+    // hold the decrease hostage: one run fires promptly on observation.
+    tokio::time::advance(Duration::from_secs(300)).await;
+    settle().await;
+    cadence_secs.store(60, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 2, "one prompt run, no burst");
+    // The new phase keeps producing one run per 60 s window thereafter.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// A decrease that becomes due while the action still runs is remembered and
+/// fires promptly when the action completes, instead of waiting a full new
+/// cadence. No overlap: the prompt run starts only after completion, and no
+/// burst follows.
+#[tokio::test(start_paused = true)]
+async fn dynamic_cadence_prompt_during_active_runs_after_completion() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let cadence_secs = Arc::new(AtomicU64::new(3600));
+    let status = statuses(&["dynamic"], false);
+    let (stop, rx) = watch::channel(false);
+    // NOTE: the dynamic fixture times out actions at 30 s, so the long action
+    // must stay under that (25 s) to remain active across the change.
+    let task = tokio::spawn(supervise(
+        vec![dynamic_job(
+            "dynamic",
+            counting(&count, Duration::from_secs(25)),
+            &cadence_secs,
+        )],
+        status,
+        rx,
+    ));
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "first run at t=0");
+
+    // The 25 s action still holds the slot at t=15; dropping to 10 s makes
+    // last-run (t=0) + 10 s already past, so the recheck creates a prompt
+    // tick that must not be lost to the active-action guard.
+    tokio::time::advance(Duration::from_secs(15)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "action still running");
+    cadence_secs.store(10, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "prompt tick waits for the active action, no overlap"
+    );
+
+    // At t=25 the action completes; the remembered prompt runs immediately
+    // instead of deferring to the discarded tick's next slot (t=30).
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "prompt run fires on completion"
+    );
+    // Skip still collapses bursts: nothing else fires in this window. The
+    // prompt run itself holds the slot for 25 s, so the next 10 s tick lands
+    // at t=55 (first slot after the prompt action completes).
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 2, "no catch-up burst");
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        settle().await;
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 3, "next slot after prompt");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -500,7 +680,27 @@ async fn already_stopped_or_closed_signal_never_starts_a_job() {
             statuses(&["good"], false),
             rx,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn supervise_fails_fast_on_an_unregistered_name() {
+    let status = statuses(&["good"], false);
+    let (_stop, rx) = watch::channel(false);
+    let error = supervise(
+        vec![job("ghost", Arc::new(|| Box::pin(async { Ok(()) })))],
+        status.clone(),
+        rx,
+    )
+    .await
+    .expect_err("an unregistered name fails at spawn, never in a supervisor task");
+    assert_eq!(error.to_string(), "unregistered job: ghost");
+    assert!(!status.read().await.contains_key("ghost"));
+    assert!(
+        !status.read().await["good"].running,
+        "no task spawns after a registration failure"
+    );
 }

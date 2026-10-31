@@ -39,6 +39,9 @@ current_database() as that role and database before the rows are read.
 
 Every statement runs in a READ ONLY transaction with a 10 s statement timeout.
 psql's stderr is never echoed: a failure prints one fixed-vocabulary line.
+CSV must parse strictly; every returned timestamp must be a real UTC instant
+inside the inclusive SQL BETWEEN window, including the overflow witness. The
+artifact rechecks the ordered window and all kept rows before publication.
 
 Exit status: 0 read, 1 read failed, 2 refused by a fence.
 
@@ -219,7 +222,7 @@ def database_target(env):
         raise Refused("refusing: the database login query is malformed")
     for key, value in params:
         if key not in URL_PARAMS:
-            raise Refused(f"refusing: the database login may not set {key}")
+            raise Refused("refusing: the database login may not set that query parameter")
         allowed = URL_PARAMS[key]
         if (allowed is not None and value not in allowed) or (allowed is None and not value.isdigit()):
             raise Refused(f"refusing: the database login has a bad {key}")
@@ -270,7 +273,20 @@ def run_psql(psql, pg_env, script, variables=()):
 
 
 def csv_rows(text):
-    return [row for row in csv.reader(io.StringIO(text)) if row]
+    try:
+        return [row for row in csv.reader(io.StringIO(text), strict=True) if row]
+    except csv.Error:
+        raise ReadFailed("a row had an unexpected shape; nothing was written") from None
+
+
+def recorded_instant(value):
+    """Parse the exact UTC millisecond form emitted by the query, or return None."""
+    if not isinstance(value, str) or not RECORDED_AT_RE.fullmatch(value):
+        return None
+    try:
+        return parse_instant("recorded_at", value)
+    except Refused:
+        return None
 
 
 def check_identity(output):
@@ -279,10 +295,17 @@ def check_identity(output):
         raise Refused(f"refusing: the server does not report role {DB_ROLE} on database {DB_NAME}")
 
 
-def parse_rows(output):
+def parse_rows(output, window_start, window_end):
+    first = parse_instant("window_start", window_start)
+    last = parse_instant("window_end", window_end)
     rows = []
     for raw in csv_rows(output):
-        if len(raw) != 2 or raw[0] not in EVENT_TYPES or not RECORDED_AT_RE.fullmatch(raw[1]):
+        if len(raw) != 2 or raw[0] not in EVENT_TYPES:
+            raise ReadFailed("a row had an unexpected shape; nothing was written")
+        moment = recorded_instant(raw[1])
+        # SQL BETWEEN includes both bounds. Check even the 61st overflow witness
+        # before build_artifact truncates; retain ORDER BY id, not time order.
+        if moment is None or not first <= moment <= last:
             raise ReadFailed("a row had an unexpected shape; nothing was written")
         rows.append({"event_type": raw[0], "recorded_at": raw[1]})
     if len(rows) > QUERY_LIMIT:
@@ -303,15 +326,18 @@ def build_artifact(window_start, window_end, rows):
 
 
 def artifact_errors(artifact):
-    """The shape contract, used before every write and by the offline tests."""
+    """The shape and instant/window contract, checked before every write."""
     errors = []
     if set(artifact) != {"schema_version", "window", "row_count", "truncated", "rows"}:
         errors.append("top-level keys")
     if artifact.get("schema_version") != SCHEMA_VERSION:
         errors.append("schema_version")
     window = artifact.get("window")
-    if not isinstance(window, dict) or set(window) != {"start", "end"} or not all(
-            isinstance(v, str) and RECORDED_AT_RE.fullmatch(v) for v in window.values()):
+    first = last = None
+    if isinstance(window, dict) and set(window) == {"start", "end"}:
+        first = recorded_instant(window["start"])
+        last = recorded_instant(window["end"])
+    if first is None or last is None or not first < last or last - first > MAX_WINDOW:
         errors.append("window")
     rows = artifact.get("rows")
     if not isinstance(rows, list) or len(rows) > ROW_CAP or artifact.get("row_count") != len(rows):
@@ -322,8 +348,11 @@ def artifact_errors(artifact):
     for index, row in enumerate(rows, start=1):
         if (not isinstance(row, dict) or set(row) != {"ordinal", "event_type", "recorded_at"}
                 or row["ordinal"] != index or not isinstance(row["event_type"], str)
-                or row["event_type"] not in EVENT_TYPES
-                or not RECORDED_AT_RE.fullmatch(str(row["recorded_at"]))):
+                or row["event_type"] not in EVENT_TYPES):
+            errors.append(f"row {index}")
+            continue
+        moment = recorded_instant(row["recorded_at"])
+        if moment is None or (first is not None and last is not None and not first <= moment <= last):
             errors.append(f"row {index}")
     return errors
 
@@ -349,7 +378,7 @@ def read_events(window_start, window_end, env, psql):
     check_identity(run_psql(psql, pg_env, IDENTITY_SQL))
     output = run_psql(psql, pg_env, ROWS_SQL, (("guild", guild), ("member", member),
                                               ("window_start", window_start), ("window_end", window_end)))
-    artifact = build_artifact(window_start, window_end, parse_rows(output))
+    artifact = build_artifact(window_start, window_end, parse_rows(output, window_start, window_end))
     if artifact_errors(artifact):
         raise ReadFailed("the artifact failed its own shape check; nothing was written")
     return artifact

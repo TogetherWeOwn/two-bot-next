@@ -10,7 +10,7 @@ Fail-closed rules, each pinned by scripts/test_staging_rollback_drill.py:
 - The rollback is one Cloudflare deployment POST that never sends `force`, so a
   target whose secrets changed since it was deployed is refused instead of
   being auto-confirmed (Wrangler's non-interactive prompt answers yes).
-- `code_update_strategy` is `immediate`. Wrangler 4.149's default is `deferred`
+- `code_update_strategy` is `immediate`. Wrangler 4.152's default is `deferred`
   with a 300 s maximum delay, which would keep the old Durable Object code
   running for up to five minutes and make any time-to-ready figure meaningless.
 - A 401/403 from ownership control or Cloudflare stops the run. The restore leg
@@ -35,6 +35,27 @@ import staging_rollout as rollout  # noqa: E402
 
 GateError = rollout.GateError
 require = rollout.require
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 WORKER = rollout.WORKER
 VERSION_ID = re.compile(rollout.UUID)
 READY_BUDGET_SECONDS = 60
@@ -50,6 +71,20 @@ SAFE_CONTROL_LINE = re.compile(r"(Ownership control failed \(HTTP [0-9]{3}\)|"
 AUTH_STATUSES = ("401", "403")
 # Above the client's takeover window plus one attempt of two 15 s requests, so a takeover POST is never killed mid-flight.
 OWNERSHIP_CONTROL_TIMEOUT_SECONDS = 420
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 class DrillClient(rollout.Client):
@@ -88,10 +123,11 @@ class DrillClient(rollout.Client):
             # the HTTP status and integer error codes.
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY))
+                envelope = json.loads(error.read(rollout.MAX_BODY),
+                                        object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
-            except (OSError, ValueError, AttributeError, TypeError):
+            except (OSError, ValueError, AttributeError, TypeError, RecursionError):
                 pass
             raise GateError("api_http_failure", f"status={error.code} codes={','.join(codes) or 'none'}") from None
         except (URLError, TimeoutError, OSError):
@@ -328,8 +364,8 @@ def ownership_control(token, url, actor, root=None, expected_deployment=None):
                 raise GateError("ownership_auth_failed")
             raise GateError("ownership_control_failed", match.group(0) if match else None)
         try:
-            state = json.loads(result.stdout)
-        except ValueError:
+            state = json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys)
+        except (ValueError, RecursionError):
             raise GateError("ownership_control_invalid_response") from None
         return rollout.mapping(state)
 
@@ -362,9 +398,42 @@ def summary(evidence, failures):
     return "\n".join(lines) + "\n"
 
 
+def dry_run_plan(drill, target):
+    """Validate like the live path, print the ordered plan, mutate nothing.
+
+    Runs the same preflight the live legs run (reads only: deployments,
+    serving version, singleton status, baseline readiness), so every
+    invalid input refuses with the identical code before any change. On
+    success prints the fixed-vocabulary plan and exits 0 without POSTing,
+    fencing, taking over, or writing evidence.
+    """
+    try:
+        pre = drill.preflight(target)
+    except GateError as error:
+        drill.failed("drill", error)
+        return 1
+    except Exception:  # No traceback: it may carry request data.
+        drill.failed("drill", GateError("unexpected_error"))
+        return 1
+    print("\n".join([
+        "staging rollback drill dry-run plan",
+        f"target_version: {target}",
+        f"pre_version: {pre}",
+        "legs in order:",
+        f"1. drill: fence singleton, rollback Worker to {target}, "
+        f"takeover to {target}, wait first ready",
+        f"2. restore: fence singleton, rollback Worker to {pre}, "
+        f"takeover to {pre}, wait first ready",
+        "mutations: none (plan only; no POST, no fence, no takeover)",
+    ]))
+    return 0
+
+
 def main(argv=None, *, environ=None, make_control=ownership_control, client_factory=DrillClient):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-version", required=True)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate inputs and print the ordered plan without mutating anything")
     parser.add_argument("--evidence", default="staging-rollback-drill-evidence.json")
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
@@ -379,6 +448,8 @@ def main(argv=None, *, environ=None, make_control=ownership_control, client_fact
         require(ACTOR.fullmatch(actor), "invalid_actor")
         client = client_factory(env.get("CLOUDFLARE_ACCOUNT_ID"), env.get("CLOUDFLARE_API_TOKEN"))
         drill = Drill(client, make_control(token, url, actor), url, run_id, log=print)
+        if args.dry_run:
+            return dry_run_plan(drill, args.target_version)
         failures = drill.run(args.target_version)
     except GateError as error:
         print(f"staging rollback drill refused before any change: {error}")

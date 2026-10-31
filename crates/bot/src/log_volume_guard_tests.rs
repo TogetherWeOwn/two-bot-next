@@ -144,7 +144,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 16] = [
+const JOB_CAPS: [JobCap; 17] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -203,6 +203,10 @@ const JOB_CAPS: [JobCap; 16] = [
     },
     JobCap {
         job: "automod_expiry",
+        shed_order: None,
+    },
+    JobCap {
+        job: "lfg_sweep",
         shed_order: None,
     },
     JobCap {
@@ -532,6 +536,7 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "self_role_recovery"
                         | "member_unban_sweep"
                         | "automod_expiry"
+                        | "lfg_sweep"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",
@@ -610,6 +615,26 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         3,
         "community-facts drain-reason family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::MODERATION_VERBS.len(),
+        9,
+        "moderation verb family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::MODERATION_ENFORCEMENT_OUTCOMES.len(),
+        5,
+        "moderation enforcement outcome family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::TICKET_LIFECYCLE_EVENTS.len(),
+        5,
+        "ticket lifecycle event family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::TICKET_LIFECYCLE_OUTCOMES.len(),
+        18,
+        "ticket lifecycle outcome family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -618,6 +643,7 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (metrics::DB_ERROR_OPS, "db-errors"),
         (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
         (metrics::VOICE_VOTE_KICK_OUTCOMES, "vote-kick"),
+        (metrics::EVENT_VOICE_TICK_OUTCOMES, "event-voice-tick"),
         (metrics::VOICE_NAME_OUTCOMES, "voice-names"),
         (
             metrics::PREFIX_TRIGGER_REFUSED_REASONS,
@@ -631,6 +657,10 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
             metrics::COMMUNITY_FACTS_DRAIN_REASONS,
             "community-facts drain reasons",
         ),
+        (
+            metrics::MODERATION_ENFORCEMENT_OUTCOMES,
+            "moderation-enforcement-outcomes",
+        ),
     ] {
         assert_eq!(
             allowlist.last(),
@@ -642,6 +672,14 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         metrics::INTERNAL_ACTION_OUTCOMES.last(),
         Some(&"internal"),
         "internal-action outcomes lost its `internal` collapse trapdoor; unknowns must never become series"
+    );
+    // The lifecycle outcome vocabulary is closed by the observability
+    // contract (no `other` row renders); the trailing `query` slot is the
+    // trapdoor, matching `db_cause` itself.
+    assert_eq!(
+        metrics::TICKET_LIFECYCLE_OUTCOMES.last(),
+        Some(&"query"),
+        "ticket lifecycle outcomes lost its `query` collapse trapdoor; unknowns must never become series"
     );
 }
 
@@ -655,7 +693,7 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         30,
         "route family changed the budget"
     );
-    assert_eq!(metrics::JOBS.len(), 16, "job family changed the budget");
+    assert_eq!(metrics::JOBS.len(), 17, "job family changed the budget");
     assert_eq!(
         metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
         2,
@@ -666,6 +704,56 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         6,
         "dispatch-lane family changed the budget"
     );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_OUTCOMES.len(),
+        3,
+        "reconcile-pass family changed the budget"
+    );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_ACTIONS.len(),
+        2,
+        "reconcile-action family changed the budget"
+    );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_ERROR_CLASSES.len(),
+        5,
+        "reconcile-error family changed the budget"
+    );
+    assert_eq!(
+        metrics::FEED_FETCH_OUTCOMES.len(),
+        4,
+        "feed-fetch outcome family changed the budget"
+    );
+    assert_eq!(
+        metrics::FEED_FETCH_ERROR_CLASSES.len(),
+        12,
+        "feed-fetch error-class family changed the budget"
+    );
+    assert_eq!(
+        metrics::AUTOMOD_DECISION_OUTCOMES.len(),
+        8,
+        "automod-decision family changed the budget"
+    );
+    assert_eq!(
+        metrics::TICKET_LIFECYCLE_EVENTS.len(),
+        5,
+        "ticket lifecycle event family changed the budget"
+    );
+    assert_eq!(
+        metrics::TICKET_LIFECYCLE_OUTCOMES.len(),
+        18,
+        "ticket lifecycle outcome family changed the budget"
+    );
+    assert_eq!(
+        metrics::CONTAINMENT_STORE_OPS.len(),
+        2,
+        "containment-store-error family changed the budget"
+    );
+    assert_eq!(
+        metrics::DROP_POISON_GUARDS.len(),
+        7,
+        "drop-poison family changed the budget"
+    );
     let text = metrics::Metrics::default().render(None);
     let help_headers = text
         .lines()
@@ -675,13 +763,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 56, "rendered HELP family count changed");
-    assert_eq!(type_headers, 56, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 87, "rendered HELP family count changed");
+    assert_eq!(type_headers, 87, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 614,
-        "exposition grew past the 614-sample budget (21 events + 4 scalars + 1 latency \
-         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 51 voice + 8 join-occupancy + 26 vote-kick + 15 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 3 presence-capture + 4 pool + 1 audit-halt); \
+        series, 788,
+        "exposition grew past the 788-sample budget (4 process-incarnation + 21 events + 4 scalars + 1 rsvp-refused + 1 latency \
+         + 22 histograms + 180 rest + 11 REST guard + 68 jobs + 119 job-last-error-class + 58 voice + 8 join-occupancy + 26 vote-kick + 6 event-voice-tick + 16 voice-names + 2 db-errors + 2 containment-store-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 raid-dropped-joins + 2 join-risk-dropped-joins + 2 checkpoint-failures + 7 drop-poison + 72 internal-actions + 45 moderation-enforcements + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 19 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 1 gateway-drain-skips + 1 retention-replay-needed + 1 ticket-component-drops + 4 feed-fetches + 12 feed-fetch-errors + 1 voice-inbox-overflow + 1 voice-queue-overflow + 22 ticket-lifecycle (2 retire + 3 abandon + 13 purge + 2 claim + 2 close subsets)); \
          update docs/log-volume-guard.md with the new series"
     );
 }

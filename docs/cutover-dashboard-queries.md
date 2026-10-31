@@ -7,7 +7,8 @@ When this file and a live rule disagree, the live rule wins and this file is
 the one to fix.
 
 Scope: DB-error and send-admission signals from the shipped series, plus
-gateway and `/readyz` health. The `db_errors`, `send_admission_blocked` and
+gateway and `/readyz` health, plus the EventSub reconcile and feed intake
+families (Panel 4). The `db_errors`, `send_admission_blocked` and
 `gateway_missed_events` rules already ship (see
 [metrics](metrics.md#off-container-scrape-and-alert-rules)). Pool and job
 health remain complementary signals, not substitutes for those counters.
@@ -115,7 +116,7 @@ can log it many times before a RESUME.)
 | Level | Condition | Action |
 |---|---|---|
 | Warn | Single 503 sample that recovers; single reconnect paired with a later RESUME or READY | Record the finding with timestamp; keep watching |
-| Page | 503 sustained past 60 s after a restart/deploy event; `container_unready_alert` (10 consecutive failed keepalive samples, ~10 min at defaults); reconnects with no later RESUME or fresh READY in the same window | Freeze writers, investigate, evaluate rollback per the 48-hour watch |
+| Page | 503 sustained past 60 s after a restart/deploy event; `container_unready_alert` (2 consecutive failed keepalive samples, ~2 min at defaults); reconnects with no later RESUME or fresh READY in the same window | Freeze writers, investigate, evaluate rollback per the 48-hour watch |
 
 Sources: [gateway recovery](gateway-recovery.md),
 [container readiness](container-readiness.md),
@@ -136,8 +137,9 @@ sum by (op) (increase(two_bot_db_errors_total[1h]))
 The `db_errors` rule fires at 3+ errors across all `op` labels between two
 keepalive samples (resets skip the window). Producers are send-admission SQL
 (`op="admission"`) and voice actor load (`op="other"`), not all stores.
-Correlate voice load failures with `voice actor load failed; actor respawns
-on the next guild snapshot` in container stdout; the warn is throttled to
+Correlate voice load failures with `voice actor load failed; retrying with
+capped backoff` in container stdout (a credential refusal logs `voice
+actor load failed; credential refused, not retrying`); the warn is throttled to
 once per 300 s process-wide, but every failure increments the counter.
 
 Pool saturation (a complementary proxy for DB trouble — SQLx bookkeeping,
@@ -224,8 +226,9 @@ topk(5, sum by (route) (increase(two_bot_rest_requests_total{result="transport"}
 The rule fires above 10% 429s between two keepalive samples with at least 10
 requests in the window (`rest_429_rate`). The executor honors `retry-after`
 per attempt, so read the `route` label first and confirm no deploy is in
-progress before acting. 5xx/transport shares are informational — no rule
-covers them. Counter resets skip the window.
+progress before acting. The 5xx share has the same 10% / 10-request rule
+(`rest_5xx_rate`); only `transport` shares stay informational with no rule.
+Counter resets skip the window.
 
 Guard and token state (private `/metrics` `two_bot_rest_guard_*` + logs + `/readyz`):
 
@@ -245,6 +248,13 @@ Private scrape series: `two_bot_rest_guard_breaker_open`,
 [REST admission guard](metrics.md#rest-admission-guard)). A zero
 `two_bot_rest_guard_global_pause_remaining_seconds` does not mean admission is
 open while `two_bot_rest_guard_pending_global_responses` is nonzero.
+Three metrics rules page on this family: [REST token
+invalid](runbook.md#alert-rest-token-invalid) on the latched token, [REST
+refusal surge](runbook.md#alert-rest-refusal-surge) on invalid/refused bursts,
+and [REST global responses
+stuck](runbook.md#alert-rest-global-responses-stuck) on unresolved pause
+bodies; the paused/remaining gauges stay rule-free by design (see the stuck
+rule's runbook).
 
 Admission lane state (durable gate in `public.discord_send_admission`: one row
 per credential fingerprint, 60 s self-heal lease on `in_flight`, no
@@ -276,6 +286,84 @@ Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
 [REST guard](rest-guard.md),
 [send admission](discord-send-admission.md).
 
+## Panel 4 — EventSub reconcile-error growth and feed error share
+
+Owner: on-call operator; reconcile cause belongs to the EventSub
+subscription owner, feed cause to the feed source or the platform per the
+breakdown below. Read-only: no Helix request, no subscription change, no
+feed edit, no replay.
+
+### 4a. Reconcile-error growth (burn between scrapes)
+
+Failure sites by the same fixed `error_class` strings as the reconcile
+log field, plus the successful-mutation counters for the same window:
+
+```promql
+sum(increase(two_bot_eventsub_reconcile_errors_total[1h]))
+sum by (error_class) (increase(two_bot_eventsub_reconcile_errors_total[1h]))
+sum by (action) (increase(two_bot_eventsub_reconcile_actions_total[1h]))
+```
+
+`error_class` is `reconcile_action_failed`, `reconcile_prior_failed`,
+`reconcile_unhealthy`, `reconcile_failed`, or `other`;
+`action` is `create` or `delete` (2xx only; 409 already-exists
+confirmations fold into the pass outcome). Passes run at startup and on
+the bounded hourly interval, so these deltas move at most once per pass
+plus the startup pass — a flat window with a healthy Q2 outcome is
+steady state, not a gap. Counter resets skip the window rather than
+firing.
+
+Errors are detail, not the ticket: the checked-in
+`eventsub_reconcile_failed` rule tickets when
+`two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rises
+between samples (first sample is baseline-only; a healthy-pass increase
+with no failed increase resolves). Join a nonzero error delta to the Q2
+log lines by `error_class` before acting:
+
+```promql
+sum(increase(two_bot_eventsub_reconcile_passes_total{outcome="failed"}[1h]))
+```
+
+| Level | Condition | Action |
+|---|---|---|
+| Warn | Error growth with no failed-pass growth (healed or verification-pending) | Record the `error_class` breakdown with timestamp; run the Q2 read-only reconcile queries and keep watching |
+| Page | Any failed-pass growth (the ticket fires on a single positive delta) | Follow [runbook Alert: eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed): read-only diagnosis only — no Helix request, no subscription change, no restart to "clear" the counter |
+
+Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
+[runbook Alert: eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed),
+[subscription-health queries](eventsub-subscription-health-queries.md#q2--last-reconcile-outcome).
+
+### 4b. Feed error share (rate over the window)
+
+Failed fetches over all fetch attempts, plus the per-outcome and
+per-class breakdowns:
+
+```promql
+sum(increase(two_bot_feed_fetch_errors_total[1h]))
+  / sum(increase(two_bot_feed_fetches_total[1h]))
+sum by (outcome) (increase(two_bot_feed_fetches_total[1h]))
+topk(5, sum by (error_class) (increase(two_bot_feed_fetch_errors_total[1h])))
+```
+
+`outcome` is `success`, `invalid_source`, `refused_redirect`, or
+`failure`; `error_class` is `invalid_source`, `non_public_address`,
+`redirect_refused`, `too_large`, `invalid_encoding`,
+`unsupported_content_type`, `unsupported_encoding`, `resolve`,
+`transport`, `deadline`, `http_error`, or `other` (successes record
+nothing in the errors family). Labels are per-outcome and per-class,
+never per-feed: no source URL, host, or feed id reaches a label, so a
+single bad relay is visible only as its class. Counter resets skip the
+window rather than firing.
+
+| Level | Condition | Action |
+|---|---|---|
+| Warn | Nonzero share concentrated in one class across 2+ consecutive passes, or any `invalid_source` growth | Source-side: check the source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. See [feed supervisor](feed-supervisor.md#failure-signals-and-triage) |
+| Page | Share above 50% over 1h across classes, or errors paired with `timeout` / `database` / `rest` job classes | Platform-side: treat as platform, not feed config; see the operations runbook. For `feed` / `recovery_required` job classes follow [runbook Alert: job failures](runbook.md#alert-job-failures) — never repost to "fix" a bounded history miss |
+
+Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
+[feed supervisor](feed-supervisor.md#failure-signals-and-triage),
+[runbook Alert: job failures](runbook.md#alert-job-failures).
+
 ## Threshold summary
 
 | Panel | Warn (record, keep watching) | Page (freeze writers, decide rollback) |
@@ -283,6 +371,7 @@ Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
 | Readiness / gateway | Single 503; paired reconnect | 503 past 60 s; unready alert; reconnects with no RESUME/READY; any missed-events increase |
 | DB errors / pool / jobs | 1 saturated sample; 1–2 job failures | `db_errors` (3+ between samples); pool saturated x3; 3 consecutive failures; job stale; store/checkpoint class persists |
 | Send admission / REST | Single 429 window; 5xx/transport spike; one global pause | `send_admission_blocked` (3 windows); repeat 429 after containment; breaker open; token invalid; indefinite/wedged lane |
+| Reconcile errors / feed share | Error growth with no failed-pass growth; single-class feed errors across passes | Any failed-pass growth (ticket firing); feed share >50% over 1h or paired with platform job classes |
 
 ## What this doc does not do
 

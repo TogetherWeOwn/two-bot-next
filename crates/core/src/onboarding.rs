@@ -23,6 +23,11 @@ use std::collections::{HashMap, HashSet};
 /// Game picker select-menu custom id. Static: the panel outlives every restart
 /// (legacy `GAME_SELECT_ID`).
 pub const GAME_SELECT_ID: &str = "two:onboarding:games";
+/// Self-only proposed-choice preview select. Static like the apply route, but
+/// a distinct no-effect submission: preview never writes roles, funnel rows,
+/// audits, tickets or public messages. The `/reopen games` menu renders this
+/// alongside the apply select; a later apply re-reads current roles.
+pub const GAME_PREVIEW_SELECT_ID: &str = "two:onboarding:games:preview";
 /// Session picker select-menu custom id (legacy `SESSION_SELECT_ID`).
 pub const SESSION_SELECT_ID: &str = "two:onboarding:session";
 
@@ -142,7 +147,7 @@ pub enum PromptDecision {
 }
 
 /// Skip reasons, in legacy check order: bots, then the rules gate, then the
-/// once-per-member guard (legacy `decidePrompt`).
+/// per-stay guard (legacy `decidePrompt`; a processed goodbye clears it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptSkip {
     Bot,
@@ -152,7 +157,7 @@ pub enum PromptSkip {
 
 /// Pure prompt gate: a member becomes promptable the moment they can see and
 /// click things. `already_prompted` is the store's `onboarding_prompted`
-/// answer; the store enforces once-per-member again at write time.
+/// answer; the store enforces the per-stay guard again at write time.
 #[must_use]
 pub fn decide_prompt(is_bot: bool, pending: bool, already_prompted: bool) -> PromptDecision {
     if is_bot {
@@ -516,6 +521,10 @@ pub const PICKER_DRY_RUN_REPLY: &str = "Dry run: no roles were changed.";
 /// Cleared-selection reply (legacy empty-`roleIds` branch).
 pub const PICKER_CLEARED_REPLY: &str =
     "Cleared your game roles. Open the menu again whenever you like.";
+/// Stale-menu reply: the submission named choices but none matched the
+/// catalog (a replaced/retired menu). Roles are preserved and nothing is
+/// recorded; the member retries from a fresh menu.
+pub const PICKER_STALE_REPLY: &str = "That menu looks stale - I did not recognize those choices.\nNothing was changed. Open the picker again and choose afresh.";
 
 /// Game-picker outcome for the executor (from `handleGameSelect`):
 /// add/remove roles to match the menu exactly, ephemeral reply, funnel writes
@@ -547,8 +556,9 @@ pub struct GamePickerOutcome {
 impl GamePickerOutcome {
     /// Finalize a successful role selection using refreshed member visibility.
     /// The executor must call this after role writes and before replying or
-    /// recording funnel events. Dry runs and clears retain their special reply
-    /// and record no events. Role deltas and unknown-key diagnostics survive.
+    /// recording funnel events. Dry runs, clears and stale-menu answers retain
+    /// their special reply and record no events. Role deltas and unknown-key
+    /// diagnostics survive.
     #[must_use]
     pub fn finalize_after_grant(mut self, visible: &dyn Fn(&str) -> bool, guild_id: u64) -> Self {
         if !self.record_selected {
@@ -597,8 +607,10 @@ pub fn game_picker_reply(plan: &GameSelection, guild_id: u64) -> String {
 
 /// Adjudicate one game-picker submission. `member_role_ids` is the member's
 /// current role set; unticked game roles they hold are removed so roles never
-/// drift from the declared answer. Unknown keys are logged by the caller, not
-/// shown to the member.
+/// drift from the declared answer. Only a raw empty submission clears: a
+/// nonempty submission with no recognized keys is a stale menu, which
+/// preserves every role and records nothing. Unknown keys are logged by the
+/// caller; the stale subset of a mixed submission is still reported.
 pub fn adjudicate_game_select(
     mode: OnboardingMode,
     selected_keys: &[&str],
@@ -623,9 +635,11 @@ pub fn adjudicate_game_select(
         });
     }
     let plan = plan_game_selection(selected_keys, visible);
-    if plan.role_ids.is_empty() {
+    if selected_keys.is_empty() {
         // The clear branch replies and returns before either recorder call —
-        // roles are removed but no funnel rows are written.
+        // roles are removed but no funnel rows are written. Only a raw empty
+        // submission clears; wholly unrecognized input falls through to the
+        // stale branch below and preserves every role.
         return Some(GamePickerOutcome {
             add_role_ids: Vec::new(),
             remove_role_ids: GAME_PICKS
@@ -634,6 +648,20 @@ pub fn adjudicate_game_select(
                 .filter(|r| member_role_ids.contains(&r.as_str()))
                 .collect(),
             reply: PICKER_CLEARED_REPLY.to_owned(),
+            ephemeral: true,
+            record_selected: false,
+            record_routed: false,
+            routed: plan,
+        });
+    }
+    if plan.role_ids.is_empty() {
+        // Stale menu: the member answered, but no key matched the catalog.
+        // Preserve every role, record nothing, and invite a retry from a
+        // fresh menu. Mixed known/stale input still takes the normal branch.
+        return Some(GamePickerOutcome {
+            add_role_ids: Vec::new(),
+            remove_role_ids: Vec::new(),
+            reply: PICKER_STALE_REPLY.to_owned(),
             ephemeral: true,
             record_selected: false,
             record_routed: false,
@@ -1178,11 +1206,55 @@ pub fn days_in_guild(joined_at_ms: Option<i64>, left_at_ms: Option<i64>) -> Opti
     }
 }
 
+/// Rendered-username bound for the goodbye notice, in characters. Par with the
+/// vote-grade public bound (`VOTE_KICK_PUBLIC_REASON_LIMIT` in the bot crate):
+/// applied to the escaped output so the bound holds on the wire.
+pub const GOODBYE_USERNAME_LIMIT: usize = 512;
+
+/// Sanitize a display name for the goodbye-notice username slot
+/// (vote-reason grade): fold newlines to spaces so the notice stays one line,
+/// neutralize mass mentions with the shared neutralizer, split mention pills
+/// (`<@`, `<#`, `<:`, `<a:`) so they render literally, backslash-escape the
+/// vote-reason markdown set, and cap the escaped output at
+/// [`GOODBYE_USERNAME_LIMIT`] characters. Plain names pass through
+/// byte-identical.
+fn sanitize_goodbye_name(username: &str) -> String {
+    let mut single_line = String::with_capacity(username.len());
+    for chunk in username.split(['\r', '\n']) {
+        if !single_line.is_empty() {
+            single_line.push(' ');
+        }
+        single_line.push_str(chunk);
+    }
+    let neutralized = crate::message_safety::neutralize_mentions(&single_line);
+    let pills = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:");
+    let mut escaped = String::with_capacity(pills.len());
+    for ch in pills.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let mut capped: String = escaped.chars().take(GOODBYE_USERNAME_LIMIT).collect();
+    // A cut mid-escape would leave a lone backslash that eats the closing bold
+    // delimiter, so trim on escape-pair boundaries instead.
+    if capped.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1 {
+        capped.pop();
+    }
+    capped
+}
+
 /// Goodbye copy (legacy `goodbyeText`). Plain on purpose: no guilt, no
 /// retention pitch. The notice (who, when, how long) is the product; the stay
 /// detail already lands in the funnel as `member_leave`.
 ///
-/// The username is legacy-trusted display text; the executor must render it
+/// The username is untrusted display text rendered through
+/// vote-reason-grade sanitizing (single-line, mention-neutralized,
+/// markdown-escaped, length-capped); the executor must still render it
 /// as plain text (no mention parsing) — `GoodbyeEffect::Post` explicitly
 /// supplies `MentionPolicy::None`.
 #[must_use]
@@ -1193,9 +1265,8 @@ pub fn goodbye_text(username: &str, days: Option<i64>) -> String {
         Some(1) => " (was here 1 day)".to_owned(),
         Some(d) => format!(" (was here {d} days)"),
     };
-    format!(
-        "**{username}** left the server{stay}. Their messages and voice history stay on the books."
-    )
+    let safe = sanitize_goodbye_name(username);
+    format!("**{safe}** left the server{stay}. Their messages and voice history stay on the books.")
 }
 
 /// Adjudicate the goodbye. Non-session modes have no goodbye surface at all
@@ -1257,7 +1328,8 @@ pub struct FunnelRow {
 }
 
 /// Stable idempotency key, byte-identical to legacy `idempotencyKey()` for
-/// these types: `onboarding_prompted` is once-per-member; the other two
+/// these types: `onboarding_prompted` is once per stay (a processed goodbye
+/// deletes it, see `clear_onboarding_prompt`); the other two
 /// repeat by design (re-picks) and key on member + time.
 #[must_use]
 pub fn funnel_idempotency_key(row: &FunnelRow) -> String {
@@ -1727,7 +1799,7 @@ mod tests {
     fn welcome_effects_post_the_renderer_bytes_unchanged() {
         // The adjudicated Post content is the renderer output verbatim —
         // no wrapper, no footer, no truncation.
-        match adjudicate_welcome(
+        let legacy = adjudicate_welcome(
             OnboardingMode::Legacy,
             MEMBER,
             Some("111"),
@@ -1735,11 +1807,15 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => assert_eq!(content, legacy_welcome_text(MEMBER)),
-            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        );
+        assert!(
+            matches!(&legacy, WelcomeEffect::Post { .. }),
+            "legacy with a channel posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = legacy {
+            assert_eq!(content, legacy_welcome_text(MEMBER));
         }
-        match adjudicate_welcome(
+        let session = adjudicate_welcome(
             OnboardingMode::Session,
             MEMBER,
             Some("222"),
@@ -1747,13 +1823,15 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => {
-                assert_eq!(content, session_welcome_text(MEMBER))
-            }
-            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        );
+        assert!(
+            matches!(&session, WelcomeEffect::Post { .. }),
+            "session with a channel posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = session {
+            assert_eq!(content, session_welcome_text(MEMBER));
         }
-        match adjudicate_welcome(
+        let anchor = adjudicate_welcome(
             OnboardingMode::Anchor,
             MEMBER,
             None,
@@ -1761,12 +1839,16 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => assert_eq!(
+        );
+        assert!(
+            matches!(&anchor, WelcomeEffect::Post { .. }),
+            "anchor always posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = anchor {
+            assert_eq!(
                 content,
                 anchor_welcome_text(MEMBER, BEFORE_RUN_1, SUNDAY_SQUAD)
-            ),
-            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+            );
         }
     }
 
@@ -1801,7 +1883,10 @@ mod tests {
         let dark = plan_session(&["join-voice"], &see_nothing(), &picks);
         assert_eq!(dark.unavailable, vec!["join-voice".to_owned()]);
         assert!(dark.channel_ids.is_empty());
-        assert!(!session_ack_text(&dark).contains(STAGING_LOBBY_VOICE_CHANNEL_ID));
+        assert_eq!(
+            session_ack_text(&dark),
+            "Those rooms are not open to you right now.\nNothing was changed - try again in a moment, or say hello in the welcome channel and someone will grab you."
+        );
     }
 
     #[test]
@@ -1827,11 +1912,17 @@ mod tests {
         assert!(unknown.picks.is_empty() && unknown.channel_ids.is_empty());
         assert_eq!(unknown.unknown_keys, vec!["nonsense"]);
         let ack = session_ack_text(&unknown);
-        assert!(ack.contains("stale") && ack.contains("Nothing was changed"));
+        assert_eq!(
+            ack,
+            "That option is gone or stale - the panel was probably replaced by a newer one.\nNothing was changed. Open the picker again and choose afresh."
+        );
         let empty = adjudicate_session_select(&[], &see_everything(), &picks);
         assert!(empty.routed.picks.is_empty() && empty.routed.channel_ids.is_empty());
         assert!(!empty.record_routed);
-        assert!(!empty.reply.contains("<#"));
+        assert_eq!(
+            empty.reply,
+            "Those rooms are not open to you right now.\nNothing was changed - try again in a moment, or say hello in the welcome channel and someone will grab you."
+        );
     }
 
     #[test]
@@ -1884,7 +1975,10 @@ mod tests {
         assert_eq!(hit.routed.picks, vec!["join-voice".to_owned()]);
         let miss = adjudicate_session_select(&["gone-option"], &see_everything(), &picks);
         assert!(!miss.record_routed, "nothing routed, nothing recorded");
-        assert!(miss.reply.contains("stale"));
+        assert_eq!(
+            miss.reply,
+            "That option is gone or stale - the panel was probably replaced by a newer one.\nNothing was changed. Open the picker again and choose afresh."
+        );
     }
 
     #[test]
@@ -2004,7 +2098,7 @@ mod tests {
 
     #[test]
     fn welcome_posts_picker_per_mode_and_skips_without_a_channel() {
-        match adjudicate_welcome(
+        let legacy = adjudicate_welcome(
             OnboardingMode::Legacy,
             MEMBER,
             Some("111"),
@@ -2012,20 +2106,23 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                channel_id,
-                picker,
-                mention_user_id,
-                ..
-            } => {
-                assert_eq!(channel_id, "111");
-                assert_eq!(picker, Some(PickerKind::Games));
-                assert_eq!(mention_user_id, MEMBER);
-            }
-            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        );
+        assert!(
+            matches!(&legacy, WelcomeEffect::Post { .. }),
+            "legacy with a channel posts"
+        );
+        if let WelcomeEffect::Post {
+            channel_id,
+            picker,
+            mention_user_id,
+            ..
+        } = legacy
+        {
+            assert_eq!(channel_id, "111");
+            assert_eq!(picker, Some(PickerKind::Games));
+            assert_eq!(mention_user_id, MEMBER);
         }
-        match adjudicate_welcome(
+        let session = adjudicate_welcome(
             OnboardingMode::Session,
             MEMBER,
             Some("222"),
@@ -2033,17 +2130,20 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                picker, content, ..
-            } => {
-                assert_eq!(picker, Some(PickerKind::Session));
-                assert!(content.contains("whole application"));
-            }
-            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        );
+        assert!(
+            matches!(&session, WelcomeEffect::Post { .. }),
+            "session with a channel posts"
+        );
+        if let WelcomeEffect::Post {
+            picker, content, ..
+        } = session
+        {
+            assert_eq!(picker, Some(PickerKind::Session));
+            assert!(content.contains("whole application"));
         }
         // Anchor posts the one message with no picker, channel config aside.
-        match adjudicate_welcome(
+        let anchor = adjudicate_welcome(
             OnboardingMode::Anchor,
             MEMBER,
             None,
@@ -2051,18 +2151,21 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                channel_id,
-                picker,
-                content,
-                ..
-            } => {
-                assert_eq!(channel_id, ANCHOR_CHANNEL_ID);
-                assert_eq!(picker, None);
-                assert!(content.contains("Sunday Squad"));
-            }
-            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+        );
+        assert!(
+            matches!(&anchor, WelcomeEffect::Post { .. }),
+            "anchor always posts"
+        );
+        if let WelcomeEffect::Post {
+            channel_id,
+            picker,
+            content,
+            ..
+        } = anchor
+        {
+            assert_eq!(channel_id, ANCHOR_CHANNEL_ID);
+            assert_eq!(picker, None);
+            assert!(content.contains("Sunday Squad"));
         }
         assert!(matches!(
             adjudicate_welcome(
@@ -2156,6 +2259,21 @@ mod tests {
     }
 
     #[test]
+    fn goodbye_cap_trims_on_escape_pair_boundaries() {
+        // 511 plain chars plus a markdown char escape to 513 chars, so the
+        // 512-char cap would cut mid-escape; the slot must drop the lone
+        // backslash instead of letting it eat the closing bold delimiter.
+        let out = goodbye_text(
+            &format!("{}*", "a".repeat(GOODBYE_USERNAME_LIMIT - 1)),
+            None,
+        );
+        let pos = out.rfind("** left the server").expect("template close");
+        let slot = &out[2..pos];
+        assert_eq!(slot.len(), GOODBYE_USERNAME_LIMIT - 1);
+        assert!(!slot.ends_with('\\'));
+    }
+
+    #[test]
     fn goodbye_is_session_only_and_channel_gated() {
         assert_eq!(
             adjudicate_goodbye(OnboardingMode::Legacy, "dave", Some(3), Some("999"), false),
@@ -2166,17 +2284,21 @@ mod tests {
             adjudicate_goodbye(OnboardingMode::Anchor, "dave", Some(3), Some("999"), false),
             None
         );
-        match adjudicate_goodbye(OnboardingMode::Session, "dave", Some(3), Some("999"), false) {
-            Some(GoodbyeEffect::Post {
-                channel_id,
-                content,
-                mentions,
-            }) => {
-                assert_eq!(mentions, MentionPolicy::None);
-                assert_eq!(channel_id, "999");
-                assert!(content.starts_with("**dave** left the server (was here 3 days)."));
-            }
-            _ => panic!("session with a channel posts the goodbye"),
+        let goodbye =
+            adjudicate_goodbye(OnboardingMode::Session, "dave", Some(3), Some("999"), false);
+        assert!(
+            matches!(&goodbye, Some(GoodbyeEffect::Post { .. })),
+            "session with a channel posts the goodbye"
+        );
+        if let Some(GoodbyeEffect::Post {
+            channel_id,
+            content,
+            mentions,
+        }) = goodbye
+        {
+            assert_eq!(mentions, MentionPolicy::None);
+            assert_eq!(channel_id, "999");
+            assert!(content.starts_with("**dave** left the server (was here 3 days)."));
         }
         // GoodbyeEffect::Post uses explicit MentionPolicy::None — the
         // executor renders allowedMentions { parse: [] }.
@@ -2306,7 +2428,10 @@ mod tests {
     #[test]
     fn select_ids_are_static_and_distinct() {
         assert_eq!(GAME_SELECT_ID, "two:onboarding:games");
+        assert_eq!(GAME_PREVIEW_SELECT_ID, "two:onboarding:games:preview");
         assert_eq!(SESSION_SELECT_ID, "two:onboarding:session");
         assert_ne!(GAME_SELECT_ID, SESSION_SELECT_ID);
+        assert_ne!(GAME_SELECT_ID, GAME_PREVIEW_SELECT_ID);
+        assert_ne!(GAME_PREVIEW_SELECT_ID, SESSION_SELECT_ID);
     }
 }

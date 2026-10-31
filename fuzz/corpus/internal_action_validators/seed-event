@@ -1,0 +1,1 @@
+{"action":"event.upsert","name":"fuzz event 🎮","starts_at":"2026-10-01T10:00:00Z","ends_at":"2026-10-01T11:00:00Z","description":"Synthetic input","channel_key":"fuzz"}

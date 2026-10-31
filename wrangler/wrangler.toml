@@ -2,9 +2,17 @@
 # Worker + Durable Object wrapper (ADR 0001: `lite` target, DO-alarm keepalive).
 #
 # Secrets (DISCORD_TOKEN, DATABASE_URL) are set as Worker secrets and passed
-# into the container as env vars — never baked into the image:
-#   wrangler secret put DISCORD_TOKEN
-#   wrangler secret put DATABASE_URL
+# into the container as env vars — never baked into the image. Stamp each
+# secret-change version with the serving SHA so it keeps its rollback receipt
+# (docs/production-deploy.md); a plain `wrangler secret put` publishes an
+# unstamped version that manual rollback refuses. Precheck first: `versions
+# secret put` builds on the newest-created version, not the serving one —
+# confirm the last `wrangler versions list` block (oldest first) equals
+# `wrangler deployments status` serving, else redeploy the intended SHA
+# through the workflow first:
+#   wrangler versions secret put --env <env> DISCORD_TOKEN --message <sha>
+#   wrangler versions secret put --env <env> DATABASE_URL --message <sha>
+#   wrangler versions deploy --env <env>
 
 name = "two-bot-next"
 main = "src/index.ts"
@@ -29,7 +37,7 @@ binding = "CF_VERSION_METADATA"
 
 # Default-environment bindings. Named environments do NOT inherit these —
 # every [env.*] below repeats the full Container/DO wiring explicitly.
-# Verified against wrangler 4.149.0 (`deploy --dry-run --env <name>` warns on
+# Verified against wrangler 4.152.0 (`deploy --dry-run --env <name>` warns on
 # any omission); enforced in CI by scripts/check-env-bindings.py, which also
 # requires both [env.staging] and [env.production] to be declared.
 [[containers]]
@@ -77,10 +85,20 @@ KEEPALIVE_SECONDS = "60"
 # Staging deploys automatically via deploy-staging.yml; production deploys are
 # manual and owned by B4 (TOG-9699): only the dispatch-only deploy-production.yml,
 # behind the `production` GitHub Environment (docs/production-deploy.md).
-# Secrets per environment (never here):
-#   wrangler secret put --env staging DISCORD_TOKEN      # staging bot token
-#   wrangler secret put --env staging GUILD_ID           # TWO Staging guild
-#   wrangler secret put --env production DISCORD_TOKEN   # B4 only
+# Secrets per environment (never here). Stage each secret on a new version
+# stamped with the serving SHA, then deploy that version, so every serving
+# version keeps its provenance receipt (docs/production-deploy.md). Precheck
+# first: `versions secret put` builds on the newest-created version, not the
+# serving one — confirm the last `wrangler versions list --env <env>` block
+# (oldest first) equals `wrangler deployments status --env <env>` serving,
+# else redeploy the intended
+# SHA through the workflow first:
+#   wrangler versions secret put --env staging DISCORD_TOKEN --message <sha>      # staging bot token
+#   wrangler versions secret put --env staging GUILD_ID --message <sha>           # TWO Staging guild
+#   wrangler versions secret put --env production DISCORD_TOKEN --message <sha>   # B4 only
+#   wrangler versions deploy --env <staging|production>
+# A plain `wrangler secret put` publishes an unstamped version that can never
+# form a receipt, so manual rollback to it refuses.
 [env.staging]
 # Staging break-glass origin for the read-only ops dashboard (TOG-22861).
 workers_dev = true
@@ -121,12 +139,27 @@ BOT_PORT = "8080"
 # (outbound-only, invisible to Container idle billing) never sleeps.
 KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TWO Staging"
+# Deployment-environment marker for the staging rollback-drill fence
+# (docs/staging-rollout-gate.md): forwarded into the container via
+# FORWARDED_FLAGS so the Rust readiness fence can refuse the gateway
+# failure injection outside staging. Exactly "staging", staging vars only:
+# never top-level and never production (check-env-bindings.py). The
+# injection switch itself is never a committed var anywhere; only the
+# generated per-deploy staging config from a manual dispatch carries it.
+TWO_DEPLOY_ENV = "staging"
 # TOG-12980: staging-only, default-dark Worker ingress for POST /internal/actions
 # (the private receiver, docs/internal-actions-receiver.md). The route stays 404
 # until the Operator also sets the Worker secret TWO_INTERNAL_ACTIONS=1, last.
 # Never top-level (top-level vars are required in every environment) and never
 # in the production vars table: scripts/check-env-bindings.py fails either.
 INTERNAL_ACTIONS_INGRESS = "1"
+# TOG-23364: staging-only, default-dark Worker ingress for POST /hooks/twitch
+# (Twitch EventSub deliveries; the container receiver lands in the follow-up
+# slice). The route stays dark until the Operator also sets the Worker secret
+# TWO_EVENTSUB=1, last. Never top-level (top-level vars are required in every
+# environment) and never in the production vars table:
+# scripts/check-env-bindings.py fails either.
+EVENTSUB_INGRESS = "1"
 # Staging-only automation gates: publish + serve automation and announcement
 # command surfaces in the staging guild only. Never top-level and never
 # production. Forwarded into the container via FORWARDED_FLAGS

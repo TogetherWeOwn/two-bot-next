@@ -103,6 +103,50 @@ pub fn normalize_debounce(value: Option<i64>) -> Result<u64, StickyError> {
     }
 }
 
+/// Pure proposed configuration shared by preview and save. Keep the original
+/// body for persistence; rendering is bounded separately, never before validation.
+pub struct StickySetup<'a> {
+    pub body: &'a str,
+    pub debounce_seconds: u64,
+}
+
+impl<'a> StickySetup<'a> {
+    pub fn validate(body: &'a str, debounce: Option<i64>) -> Result<Self, StickyError> {
+        validate_body(body)?;
+        Ok(Self {
+            body,
+            debounce_seconds: normalize_debounce(debounce)?,
+        })
+    }
+
+    /// Proposed delivery text, not a live channel message. Use delivery's
+    /// sanitizer first, then break mention pills for this private management view.
+    /// Reserve all framing before truncation so disclosures cannot be lost.
+    #[must_use]
+    pub fn preview_reply(&self) -> String {
+        use crate::message_safety::{content, text_len, truncate, CONTENT_LIMIT};
+
+        let header = format!(
+            "Preview — not saved\nProposed debounce: {}s\n\
+             Delivery permissions and state are not verified. This private rendering is not a live channel message.\n\
+             To save, run /sticky with the same body and debounce, without preview (or preview:false). A later save revalidates.\n\
+             Proposed content:\n",
+            self.debounce_seconds
+        );
+        let body = content(self.body).replace("<@", "<\u{200b}@");
+        let marker = "\n[Content truncated for preview]";
+        let budget = CONTENT_LIMIT.saturating_sub(text_len(&header));
+        if text_len(&body) > budget {
+            format!(
+                "{header}{}{marker}",
+                truncate(&body, budget.saturating_sub(text_len(marker)))
+            )
+        } else {
+            format!("{header}{body}")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reply text (legacy `discord.ts` ephemeral confirmations)
 // ---------------------------------------------------------------------------
@@ -430,7 +474,9 @@ pub mod store {
 
     /// Upsert a sticky (`store.putSticky`): insert carries NULL post columns;
     /// on conflict the post/creation columns are preserved and any claim is
-    /// cleared. Returns `true` when the row was created (`xmax = 0`
+    /// cleared. An explicit administrator reconfigure also disarms the
+    /// delivery fence — the supported recovery path out of uncertainty.
+    /// Returns `true` when the row was created (`xmax = 0`
     /// distinguishes insert from update atomically — no read-then-write
     /// race; legacy read first only to name the audit action).
     pub async fn put_sticky(
@@ -452,7 +498,8 @@ pub mod store {
                updated_by       = excluded.updated_by,
                updated_at       = excluded.updated_at,
                claim_token      = NULL,
-               claimed_at       = NULL
+               claimed_at       = NULL,
+               delivery_uncertain = FALSE
              RETURNING (xmax = 0) AS created",
         )
         .bind(input.guild_id)
@@ -473,8 +520,11 @@ pub mod store {
     /// timestamp update is the lock: debounce is read from the row itself
     /// (`last_posted_at <= now - debounce_seconds * interval '1 second'`),
     /// so a concurrent debounce edit cannot slip between a read and the
-    /// claim. Returns the post plan for the single winner; `None` means held
-    /// (disabled, debounced, or claimed).
+    /// claim. Arming the delivery fence is part of the same statement, so a
+    /// worker lost after the claim but before a definitive outcome leaves
+    /// uncertainty behind instead of a silently expirable claim. Returns
+    /// the post plan for the single winner; `None` means held (disabled,
+    /// debounced, claimed, or fenced by an uncertain delivery).
     pub async fn claim_sticky_post(
         pool: &Pool<Postgres>,
         guild_id: &str,
@@ -487,8 +537,10 @@ pub mod store {
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "UPDATE sticky_messages
                 SET claim_token = $3,
-                    claimed_at = to_timestamp($4::DOUBLE PRECISION / 1000.0)
+                    claimed_at = to_timestamp($4::DOUBLE PRECISION / 1000.0),
+                    delivery_uncertain = TRUE
               WHERE guild_id = $1 AND channel_id = $2 AND enabled = TRUE
+                AND NOT delivery_uncertain
                 AND (claim_token IS NULL
                      OR claimed_at <= to_timestamp($5::DOUBLE PRECISION / 1000.0))
                 AND (last_posted_at IS NULL
@@ -511,8 +563,9 @@ pub mod store {
 
     /// Record a successful replacement post (`store.recordStickyPost`):
     /// remembers the new message id, stamps the post time, releases the
-    /// claim. Returns `false` when the claim moved on (caller must delete
-    /// the orphan replacement — legacy does exactly this).
+    /// claim and disarms the delivery fence the claim armed (a recorded id
+    /// is definitive). Returns `false` when the claim moved on (caller must
+    /// delete the orphan replacement — legacy does exactly this).
     pub async fn record_sticky_post(
         pool: &Pool<Postgres>,
         guild_id: &str,
@@ -525,7 +578,8 @@ pub mod store {
             "UPDATE sticky_messages SET
                last_message_id = $3,
                last_posted_at = to_timestamp($4::DOUBLE PRECISION / 1000.0),
-               claim_token = NULL, claimed_at = NULL
+               claim_token = NULL, claimed_at = NULL,
+               delivery_uncertain = FALSE
               WHERE guild_id = $1 AND channel_id = $2 AND claim_token = $5",
         )
         .bind(guild_id)
@@ -539,7 +593,10 @@ pub mod store {
     }
 
     /// Release only the claim this attempt acquired (`store.releaseStickyPost`,
-    /// post-failure path — preserves a newer claim).
+    /// proven no-send path — preserves a newer claim). Disarming the fence
+    /// rides the same token gate, so a stale release can neither free a
+    /// newer attempt's window nor clear its uncertainty. Callers must only
+    /// release after a definitive outcome; ambiguous outcomes keep the fence.
     pub async fn release_sticky_post(
         pool: &Pool<Postgres>,
         guild_id: &str,
@@ -547,12 +604,37 @@ pub mod store {
         claim_token: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE sticky_messages SET claim_token = NULL, claimed_at = NULL
+            "UPDATE sticky_messages SET claim_token = NULL, claimed_at = NULL,
+               delivery_uncertain = FALSE
               WHERE guild_id = $1 AND channel_id = $2 AND claim_token = $3",
         )
         .bind(guild_id)
         .bind(channel_id)
         .bind(claim_token)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Re-arm the delivery fence without touching the claim. For an
+    /// unconfirmed orphan cleanup (obsolete completion or failed record):
+    /// a live unrecorded replacement may exist, so future attempts must hold
+    /// until an administrator reconfigures. Idempotent and claim-blind on
+    /// purpose — setting an already-armed fence is a no-op — and a no-op
+    /// when the row is gone (administrator remove), so absence is never
+    /// resurrected. Never clears: only the token-gated record/release paths
+    /// and an explicit administrator update disarm.
+    pub async fn mark_sticky_delivery_uncertain(
+        pool: &Pool<Postgres>,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE sticky_messages SET delivery_uncertain = TRUE
+              WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id)
+        .bind(channel_id)
         .execute(pool)
         .await?;
         Ok(())

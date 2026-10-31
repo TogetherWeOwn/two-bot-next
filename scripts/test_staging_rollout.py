@@ -20,6 +20,9 @@ from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError, URLError
 
 
+# staging_rollout imports its sibling build_identity module; the spec import
+# below does not put the scripts directory on the path by itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 spec = importlib.util.spec_from_file_location(
     "staging_rollout", Path(__file__).with_name("staging_rollout.py")
 )
@@ -31,6 +34,7 @@ VERSION = "12345678-1234-4234-8234-123456789abc"
 OLD_VERSION = "87654321-4321-4321-8321-cba987654321"
 REVISION = "a" * 40
 BUILD_ID = "123456-2"
+DEPLOY_ID = "2026.10.21.1+aaaaaaa"
 ACCOUNT = "b" * 32
 NAMESPACE = "c" * 64  # DO namespaces are opaque hex, not Worker-version UUIDs.
 APPLICATION_ID = "app_opaque-123"
@@ -51,6 +55,7 @@ ENVIRONMENT = {
     "GITHUB_SHA": REVISION,
     "GITHUB_RUN_ID": "123456",
     "GITHUB_RUN_ATTEMPT": "2",
+    "DEPLOY_ID": DEPLOY_ID,
     "STAGING_URL": URL,
     "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
     "CLOUDFLARE_API_TOKEN": SENTINEL,
@@ -86,7 +91,7 @@ def date(offset=0):
 def receipts():
     return [
         {
-            "type": "wrangler-session", "version": 1, "wrangler_version": "4.149.0",
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.152.0",
             "command_line_args": ["deploy", "--config", "staging-deploy.json", "--env", "staging"],
         },
         {
@@ -99,7 +104,7 @@ def receipts():
 
 
 def real_shape_receipts():
-    """Record shapes written by Wrangler 4.149.0 when `wrangler-action` drives a deploy.
+    """Record shapes written by Wrangler 4.152.0 when `wrangler-action` drives a deploy.
 
     Field names follow workers-sdk `packages/wrangler/src/index.ts` (the `wrangler-session`
     entry, written for EVERY invocation) and its deploy output entry; values are
@@ -107,9 +112,9 @@ def real_shape_receipts():
     """
     log = "/home/runner/.config/.wrangler/logs/wrangler-2026-10-03_01-22-59_123.log"
     return [
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.149.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.152.0",
          "command_line_args": ["--version"], "log_file_path": log, "timestamp": date()},
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.149.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.152.0",
          "command_line_args": ["deploy", "--config", "/tmp/staging-deploy.json", "--env", "staging"],
          "log_file_path": log, "timestamp": date()},
         {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
@@ -122,12 +127,13 @@ def baseline():
     return {
         "started": STARTED, "application_id": APPLICATION_ID,
         "namespace_id": NAMESPACE, "rollout_ids": [OLD_ROLLOUT],
-        "revision": REVISION, "build_id": BUILD_ID,
+        "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
     }
 
 
 def image_details():
-    return {"revision": REVISION, "build_id": BUILD_ID, "digests": [IMAGE]}
+    return {"revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
+            "digests": [IMAGE]}
 
 
 def completed_row():
@@ -175,7 +181,7 @@ def deployment():
 
 
 def ready_response():
-    body = {"build_revision": REVISION, "build_id": BUILD_ID,
+    body = {"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
             "components": [["database", "ready"], ["gateway", "ready"], ["http", "ready"]]}
     return 200, {"x-two-worker-version": VERSION}, json.dumps(body).encode()
 
@@ -291,7 +297,7 @@ class DeployReceiptTests(OfflineTestCase):
         for flag in ("--version", "-v"):
             with self.subTest(flag=flag):
                 probe = {"type": "wrangler-session", "version": 1,
-                         "wrangler_version": "4.149.0", "command_line_args": [flag]}
+                         "wrangler_version": "4.152.0", "command_line_args": [flag]}
                 self.assertEqual(rollout.deploy_version([probe] + receipts(), STARTED), VERSION)
                 self.assertEqual(rollout.deploy_version(receipts() + [probe], STARTED), VERSION)
 
@@ -305,7 +311,7 @@ class DeployReceiptTests(OfflineTestCase):
         bad_args = receipts()
         bad_args[0]["command_line_args"] = ["deploy", 1]
         probe = {"type": "wrangler-session", "version": 1,
-                 "wrangler_version": "4.149.0", "command_line_args": ["--version"]}
+                 "wrangler_version": "4.152.0", "command_line_args": ["--version"]}
         wrong_probe = dict(probe, wrangler_version="4.142.0")
         schema_probe = dict(probe, version=2)
         other_command = dict(probe, command_line_args=["secret", "put", "X"])
@@ -392,16 +398,17 @@ class DeployReceiptTests(OfflineTestCase):
 class ImageReceiptTests(OfflineTestCase):
     def test_exact_repo_tag_digest_revision_and_nonce(self):
         tags = [TAG, "unrelated:latest", REPOSITORY + ":87654321"]
-        self.assertEqual(rollout.image_receipt(tags, image_details(), VERSION, REVISION, BUILD_ID), IMAGE)
+        self.assertEqual(rollout.image_receipt(tags, image_details(), VERSION, REVISION, BUILD_ID, DEPLOY_ID), IMAGE)
 
     def test_stale_image_revision_or_build_nonce(self):
         for key, value in [("revision", "f" * 40), ("build_id", "123456-1"),
-                           ("revision", None), ("build_id", None)]:
+                           ("deploy_id", "2026.10.20.9+aaaaaaa"),
+                           ("revision", None), ("build_id", None), ("deploy_id", None)]:
             with self.subTest(key=key, value=value):
                 details = image_details()
                 details[key] = value
                 self.assert_gate("image_build_mismatch", rollout.image_receipt,
-                                 [TAG], details, VERSION, REVISION, BUILD_ID)
+                                 [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_wrong_repo_exact_tag_and_ambiguous_tags(self):
         for tags in [[], [REPOSITORY + ":87654321"], [TAG + "-extra"],
@@ -410,13 +417,13 @@ class ImageReceiptTests(OfflineTestCase):
                      [TAG, TAG], [TAG, TAG.replace(ACCOUNT, "f" * 32)]]:
             with self.subTest(tags=tags):
                 self.assert_gate("image_tag_missing_or_ambiguous", rollout.image_receipt,
-                                 tags, image_details(), VERSION, REVISION, BUILD_ID)
+                                 tags, image_details(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_digest_must_match_selected_exact_repository(self):
         details = image_details()
         details["digests"] = [IMAGE.replace(ACCOUNT, "f" * 32)]
         self.assert_gate("image_digest_missing_or_ambiguous", rollout.image_receipt,
-                         [TAG], details, VERSION, REVISION, BUILD_ID)
+                         [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_missing_ambiguous_or_malformed_digest(self):
         for digests in [[], [IMAGE, OLD_IMAGE], [IMAGE, IMAGE], [IMAGE[:-1]],
@@ -426,7 +433,7 @@ class ImageReceiptTests(OfflineTestCase):
                 details = image_details()
                 details["digests"] = digests
                 self.assert_gate("image_digest_missing_or_ambiguous", rollout.image_receipt,
-                                 [TAG], details, VERSION, REVISION, BUILD_ID)
+                                 [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_unknown_digest_schema(self):
         for value in [None, IMAGE, {"digest": IMAGE}]:
@@ -434,13 +441,13 @@ class ImageReceiptTests(OfflineTestCase):
                 details = image_details()
                 details["digests"] = value
                 self.assert_gate("invalid_api_schema", rollout.image_receipt,
-                                 [TAG], details, VERSION, REVISION, BUILD_ID)
+                                 [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_docker_inspects_only_allowlisted_labels_and_digests(self):
         outputs = [subprocess.CompletedProcess([], 0, (TAG + "\n").encode()),
                    subprocess.CompletedProcess([], 0, json.dumps(image_details()).encode())]
         with patch.object(rollout.subprocess, "run", side_effect=outputs) as run:
-            self.assertEqual(rollout.docker_image(VERSION, REVISION, BUILD_ID), IMAGE)
+            self.assertEqual(rollout.docker_image(VERSION, REVISION, BUILD_ID, DEPLOY_ID), IMAGE)
         self.assertEqual(run.call_count, 2)
         inspect = run.call_args_list[1].args[0]
         self.assertEqual(inspect[:4], ["docker", "image", "inspect", TAG])
@@ -454,7 +461,7 @@ class ImageReceiptTests(OfflineTestCase):
     def test_docker_failure_does_not_expose_stderr(self):
         error = subprocess.CalledProcessError(1, ["docker"], output=SENTINEL, stderr=SENTINEL)
         with patch.object(rollout.subprocess, "run", side_effect=error):
-            self.assert_gate("image_inspection_failed", rollout.docker_image, VERSION, REVISION, BUILD_ID)
+            self.assert_gate("image_inspection_failed", rollout.docker_image, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
 
 class RolloutSelectionTests(OfflineTestCase):
@@ -669,32 +676,33 @@ class ActiveLagTests(OfflineTestCase):
 
 class RuntimeTests(OfflineTestCase):
     def test_all_components_ready_for_exact_worker_sha_and_build(self):
-        self.assertTrue(rollout.runtime_ready(*ready_response(), VERSION, REVISION, BUILD_ID))
+        self.assertTrue(rollout.runtime_ready(*ready_response(), VERSION, REVISION, BUILD_ID, DEPLOY_ID))
 
     def test_503_and_500_never_pass_even_with_exact_ready_body(self):
         _, headers, body = ready_response()
         for status in [503, 500, 0, 204, 302]:
             with self.subTest(status=status):
-                self.assertFalse(rollout.runtime_ready(status, headers, body, VERSION, REVISION, BUILD_ID))
+                self.assertFalse(rollout.runtime_ready(status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID))
                 self.assertFalse(rollout.runtime_ready(status, {}, SENTINEL.encode(),
-                                                       VERSION, REVISION, BUILD_ID))
+                                                       VERSION, REVISION, BUILD_ID, DEPLOY_ID))
 
     def test_old_or_missing_serving_worker_fails(self):
         status, _, body = ready_response()
         for headers in [{}, {"x-two-worker-version": OLD_VERSION}]:
             with self.subTest(headers=headers):
                 self.assert_gate("serving_worker_mismatch", rollout.runtime_ready,
-                                 status, headers, body, VERSION, REVISION, BUILD_ID)
+                                 status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_old_sha_or_build_nonce_fails(self):
         status, headers, body = ready_response()
         for key, value in [("build_revision", "f" * 40), ("build_id", "123456-1"),
-                           ("build_revision", None), ("build_id", None)]:
+                           ("deploy_id", "2026.10.20.9+aaaaaaa"),
+                           ("build_revision", None), ("build_id", None), ("deploy_id", None)]:
             with self.subTest(key=key, value=value):
                 report = json.loads(body)
                 report[key] = value
                 self.assert_gate("serving_image_mismatch", rollout.runtime_ready,
-                                 status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID)
+                                 status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_empty_unready_or_malformed_components_never_pass(self):
         for components in [[], [["database", "ready"], ["gateway", "warming"]],
@@ -705,16 +713,16 @@ class RuntimeTests(OfflineTestCase):
                 report = json.loads(body)
                 report["components"] = components
                 self.assertFalse(rollout.runtime_ready(status, headers, json.dumps(report).encode(),
-                                                       VERSION, REVISION, BUILD_ID))
+                                                       VERSION, REVISION, BUILD_ID, DEPLOY_ID))
 
     def test_missing_components_and_invalid_json_fail_closed(self):
         status, headers, body = ready_response()
         report = json.loads(body)
         del report["components"]
         self.assert_gate("invalid_api_schema", rollout.runtime_ready,
-                         status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID)
+                         status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assert_gate("invalid_json", rollout.runtime_ready,
-                         status, headers, SENTINEL.encode(), VERSION, REVISION, BUILD_ID)
+                         status, headers, SENTINEL.encode(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
 
 class IdentityAndControlPlaneTests(OfflineTestCase):
@@ -771,6 +779,40 @@ class IdentityAndControlPlaneTests(OfflineTestCase):
 
 
 class ClientSanitizationTests(OfflineTestCase):
+    def test_authenticated_api_retries_transport_failures_with_bounded_backoff(self):
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        response = Mock(status=200, headers={})
+        response.read.return_value = json.dumps({"success": True, "result": []}).encode()
+        context = MagicMock()
+        context.__enter__.return_value = response
+        client.opener.open.side_effect = [URLError(SENTINEL), TimeoutError(SENTINEL), context]
+
+        with patch.object(rollout.time, "sleep") as sleep:
+            self.assertEqual(client.api("/containers/applications"), [])
+
+        self.assertEqual(client.opener.open.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
+
+    def test_authenticated_api_backoff_is_clamped_to_the_deadline(self):
+        # Near the deadline the retry sleep must be clamped to the remaining
+        # budget, so the next attempt observes the expired deadline and the
+        # gate reports rollout_timeout, never an unclamped sleep past it.
+        now = [100.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        client = rollout.Client(ACCOUNT, SENTINEL, deadline=100.125)
+        client.opener.open.side_effect = URLError(SENTINEL)
+        with patch.object(rollout.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(rollout.time, "sleep", side_effect=sleep):
+            self.assert_gate("rollout_timeout", client.api, "/containers/applications")
+        self.assertEqual(sleeps, [0.125])
+        self.assertLess(sleeps[0], rollout.API_TRANSPORT_BACKOFF_SECONDS[0])
+        self.assertEqual(client.opener.open.call_count, 1)
+
     def test_authenticated_http_and_transport_errors_have_fixed_codes(self):
         for error, code in [(HTTPError("https://offline.invalid", 500, SENTINEL, {},
                                       io.BytesIO(SENTINEL.encode())), "api_http_failure"),
@@ -929,6 +971,8 @@ class DeploymentWiringTests(unittest.TestCase):
         # the old-to-new handover still re-posts. Deleting either side must
         # redden this suite.
         self.assertIn("set -euo pipefail", takeover[0])
+        self.assertIn("timeout --signal=TERM --kill-after=10s 390s", takeover[0])
+        self.assertIn("timed out after 390 seconds", takeover[0])
         self.assertNotRegex(takeover[0], r"(?m)^\s*(?:if|continue-on-error):")
         self.assertIn("OWNERSHIP_EXPECTED_DEPLOYMENT", takeover[0])
         self.assertIn("receipt.json", takeover[0])
@@ -1047,13 +1091,127 @@ class OrchestrationTests(OfflineTestCase):
                 self.assertEqual(container["image"], str(self.root / f"Dockerfile.{suffix}"))
                 self.assertEqual(container["image_build_context"], str(self.root))
         staging = containers[1]
-        self.assertEqual(staging["image_vars"], {"BOT_BUILD_REVISION": REVISION, "BOT_BUILD_ID": BUILD_ID})
+        self.assertEqual(staging["image_vars"], {"BOT_BUILD_REVISION": REVISION, "BOT_BUILD_ID": BUILD_ID,
+                                                     "BOT_DEPLOY_ID": DEPLOY_ID})
         self.assertEqual(staging["rollout_kind"], "full_auto")
         for container in [containers[0], containers[2]]:
             self.assertNotIn("image_vars", container)
             self.assertNotIn("rollout_kind", container)
         self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
         self.assertEqual(self.config.read_text(), CONFIG)
+
+    def test_prepare_without_drill_flag_never_injects(self):
+        self.config.write_text(CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n')
+        self.prepare_baseline()
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        self.assertEqual(generated["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging", rollout.CONTAINER_RELEASE_VAR: REVISION})
+        self.assertNotIn(rollout.GATEWAY_FAIL_INJECTION_VAR, json.dumps(generated))
+        self.assertEqual(json.loads(Path(self.args.receipt).read_text()), baseline())
+
+    def test_prepare_stamps_container_release_for_worker_edge_span_lines(self):
+        self.prepare_baseline()
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        self.assertEqual(generated["env"]["staging"]["vars"], {rollout.CONTAINER_RELEASE_VAR: REVISION})
+        self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
+        self.assertEqual(self.config.read_text(), CONFIG)
+
+    def test_prepare_with_drill_flag_injects_only_generated_staging_vars(self):
+        config = CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n'
+        self.config.write_text(config)
+        self.args.inject_gateway_failure = True
+        self.prepare_baseline()
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        self.assertEqual(
+            generated["env"]["staging"]["vars"],
+            {"TWO_DEPLOY_ENV": "staging", rollout.GATEWAY_FAIL_INJECTION_VAR: "1", rollout.CONTAINER_RELEASE_VAR: REVISION},
+        )
+        # Production, top level and the checked-in source stay untouched.
+        self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
+        self.assertNotIn("vars", {k: v for k, v in generated.items() if k == "vars"})
+        self.assertEqual(self.config.read_text(), config)
+        self.assertEqual(json.loads(Path(self.args.receipt).read_text()), baseline())
+
+    def test_gateway_fail_injection_helper_fence(self):
+        def cfg(staging_vars=None, production_vars=None, top_vars=None):
+            config = {"env": {"staging": {}, "production": {}}}
+            if top_vars is not None:
+                config["vars"] = top_vars
+            if staging_vars is not None:
+                config["env"]["staging"]["vars"] = staging_vars
+            if production_vars is not None:
+                config["env"]["production"]["vars"] = production_vars
+            return config
+
+        # Disabled is a strict no-op on a clean config.
+        clean = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_gateway_fail_injection(clean, False)
+        self.assertEqual(clean["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging"})
+        # Enabled without the exact staging marker refuses (production shape).
+        for staging_vars in (None, {}, {"TWO_DEPLOY_ENV": "production"}, {"TWO_DEPLOY_ENV": "staging "}):
+            with self.subTest(staging_vars=staging_vars):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_gateway_fail_injection(cfg(staging_vars=staging_vars), True)
+                self.assertEqual(str(caught.exception), "gateway_fail_injection_fence_missing")
+        # A source config already carrying the switch refuses even disabled,
+        # wherever it hides; the marker outside staging refuses too.
+        for kwargs, code in [
+            ({"staging_vars": {rollout.GATEWAY_FAIL_INJECTION_VAR: "1"}},
+             "gateway_fail_injection_in_source_config"),
+            ({"production_vars": {rollout.GATEWAY_FAIL_INJECTION_VAR: "1"}},
+             "gateway_fail_injection_in_source_config"),
+            ({"top_vars": {rollout.GATEWAY_FAIL_INJECTION_VAR: "1"}},
+             "gateway_fail_injection_in_source_config"),
+            ({"production_vars": {"TWO_DEPLOY_ENV": "staging"}}, "deploy_env_outside_staging"),
+            ({"top_vars": {"TWO_DEPLOY_ENV": "staging"}}, "deploy_env_outside_staging"),
+        ]:
+            with self.subTest(code=code, kwargs=kwargs):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_gateway_fail_injection(cfg(**kwargs), False)
+                self.assertEqual(str(caught.exception), code)
+
+    def test_remediation_fault_injection_helper_fence(self):
+        def cfg(staging_vars=None, production_vars=None, top_vars=None):
+            config = {"env": {"staging": {}, "production": {}}}
+            if top_vars is not None:
+                config["vars"] = top_vars
+            if staging_vars is not None:
+                config["env"]["staging"]["vars"] = staging_vars
+            if production_vars is not None:
+                config["env"]["production"]["vars"] = production_vars
+            return config
+
+        # Disabled is a strict no-op on a clean config.
+        clean = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_remediation_fault_injection(clean, False, False)
+        self.assertEqual(clean["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging"})
+        # Each drill arms independently on the generated staging vars only.
+        voice = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_remediation_fault_injection(voice, True, False)
+        self.assertEqual(voice["env"]["staging"]["vars"],
+                         {"TWO_DEPLOY_ENV": "staging", rollout.VOICE_STALL_FAULT_VAR: "1"})
+        both = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_remediation_fault_injection(both, True, True)
+        self.assertEqual(both["env"]["staging"]["vars"],
+                         {"TWO_DEPLOY_ENV": "staging",
+                          rollout.VOICE_STALL_FAULT_VAR: "1",
+                          rollout.UNPAIRED_FAULT_VAR: "1"})
+        # Enabled without the exact staging marker refuses.
+        for staging_vars in (None, {}, {"TWO_DEPLOY_ENV": "production"}):
+            with self.subTest(staging_vars=staging_vars):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_remediation_fault_injection(cfg(staging_vars=staging_vars), True, False)
+                self.assertEqual(str(caught.exception), "remediation_fault_fence_missing")
+        # A source config already carrying either switch refuses even
+        # disabled, wherever it hides.
+        for kwargs in [
+            {"staging_vars": {rollout.VOICE_STALL_FAULT_VAR: "1"}},
+            {"production_vars": {rollout.UNPAIRED_FAULT_VAR: "1"}},
+            {"top_vars": {rollout.VOICE_STALL_FAULT_VAR: "1"}},
+        ]:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_remediation_fault_injection(cfg(**kwargs), False, False)
+                self.assertEqual(str(caught.exception), "remediation_fault_in_source_config")
 
     def test_main_prepare_uses_default_fixture_config_and_generated_paths(self):
         # argparse's first/default config and output paths, not the repository's config.
@@ -1100,6 +1258,12 @@ class OrchestrationTests(OfflineTestCase):
     def test_prepare_invalid_build_identity_and_wrong_config(self):
         with patch.dict(os.environ, {"GITHUB_SHA": "bad-sha"}):
             self.assert_gate("invalid_build_identity", self.prepare_baseline)
+        for deploy_id in ("bad-id", "2026.10.21.1+fffffff", ""):
+            with self.subTest(deploy_id=deploy_id):
+                # A malformed ID, an ID naming another commit, and a missing
+                # ID all refuse before anything is snapshotted or rendered.
+                with patch.dict(os.environ, {"DEPLOY_ID": deploy_id}):
+                    self.assert_gate("invalid_build_identity", self.prepare_baseline)
         for config, code in [(CONFIG.replace('name = "two-bot-next"', 'name = "other"'),
                               "wrong_staging_config"),
                              (CONFIG.replace('binding = "CF_VERSION_METADATA"', 'binding = "OTHER"'),
@@ -1109,6 +1273,41 @@ class OrchestrationTests(OfflineTestCase):
                 self.assert_gate(code, self.prepare_baseline)
         self.assertFalse(Path(self.args.receipt).exists())
 
+    def test_unrelated_application_listing_image_does_not_pass(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        unrelated = app(REPOSITORY + "@sha256:" + "f" * 64)
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[unrelated], [unrelated]]
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
+    def test_unrelated_listing_does_not_mask_gateway_failure_classification(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        unrelated = app(REPOSITORY + "@sha256:" + "f" * 64)
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[unrelated]]
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        client.request_routes[URL + "/readyz"] = [
+            (503, {"x-two-worker-version": VERSION}, self.readyz_body(failure))]
+        client.deadline = self.clock.now + 15
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
+        self.assert_no_evidence()
+
+    def test_stale_application_listing_does_not_reject_exact_healthy_rollout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        stale = app(OLD_IMAGE)
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[stale], [stale]]
+        rollout.verify(self.args, client)
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertEqual(evidence["image"], IMAGE)
+        self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
+        self.assert_no_secret_saved_or_printed()
+
     def test_success_exact_pinned_evidence_with_post_probe_rechecks(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1117,9 +1316,10 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(json.loads(Path(self.args.evidence).read_text()), {
             "worker_version": VERSION, "application_id": APPLICATION_ID,
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
-            "revision": REVISION, "build_id": BUILD_ID, "readyz": 200, "health": 200,
+            "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
+            "readyz": 200, "health": 200,
         })
-        self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID)
+        self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assertEqual(client.calls, [
             ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),
             ("api", DETAIL_PATH), ("api", DEPLOYMENTS_PATH), ("request", URL + "/readyz"),
@@ -1145,7 +1345,8 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(json.loads(Path(self.args.evidence).read_text()), {
             "worker_version": VERSION, "application_id": APPLICATION_ID,
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
-            "revision": REVISION, "build_id": BUILD_ID, "readyz": 200, "health": 200,
+            "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
+            "readyz": 200, "health": 200,
             "active_lag": True,
         })
         self.assertEqual(self.clock.sleeps, [5])
@@ -1313,7 +1514,7 @@ class OrchestrationTests(OfflineTestCase):
         self.prepare_baseline()
         self.write_deploy_output()
         _, headers, _ = ready_response()
-        stuck = {"build_revision": REVISION, "build_id": BUILD_ID,
+        stuck = {"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
                  "components": [["process", "ready"], ["gateway", "starting"],
                                 ["token_invalid", "ready"], ["Bad\nname", "ready"],
                                 ["gateway", SENTINEL], ["x"], "junk"]}
@@ -1356,7 +1557,7 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_no_secret_saved_or_printed()
 
     def readyz_body(self, failure, **extra):
-        body = {"build_revision": REVISION, "build_id": BUILD_ID,
+        body = {"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
                 "components": [["process", "ready"], ["gateway", "down"]], **extra}
         if failure is not None:
             body["gateway_failure"] = failure
@@ -1411,7 +1612,7 @@ class OrchestrationTests(OfflineTestCase):
                 503, {"x-two-worker-version": VERSION},
                 self.readyz_body({"phase": "durable_gateway", "class": "gateway_runtime_failed",
                                   "error": SENTINEL}),
-                VERSION, REVISION, BUILD_ID),
+                VERSION, REVISION, BUILD_ID, DEPLOY_ID),
             "readyz=503 components=process:ready,gateway:down identity=match "
             "gateway_failure=durable_gateway:gateway_runtime_failed")
 
@@ -1444,7 +1645,8 @@ class OrchestrationTests(OfflineTestCase):
         self.write_deploy_output()
         cases = [
             ((503, {"x-two-worker-version": OLD_VERSION},
-              json.dumps({"build_revision": REVISION, "build_id": BUILD_ID}).encode()),
+              json.dumps({"build_revision": REVISION, "build_id": BUILD_ID,
+                            "deploy_id": DEPLOY_ID}).encode()),
              "readyz=503 identity=mismatch"),
             ((503, {"content-type": "application/json"},
               b'{"error":"ownership_fenced","reason":"not_owner"}'),
@@ -1776,7 +1978,7 @@ class OrchestrationTests(OfflineTestCase):
         argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
                 "--output", self.args.output, "--evidence", self.args.evidence]
         _, headers, _ = ready_response()
-        body = json.dumps({"build_revision": REVISION, "build_id": BUILD_ID,
+        body = json.dumps({"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
                            "components": [["process", "ready"], ["gateway", "down"]]}).encode()
         client = verify_client()
         client.request_routes[URL + "/readyz"] = [(503, headers, body)]
@@ -1819,8 +2021,7 @@ class OrchestrationTests(OfflineTestCase):
         self.write_deploy_output()
         for key, value, code in [("id", "different_application", "application_identity_drift"),
                                  ("durable_objects", {"namespace_id": "different_namespace"},
-                                  "application_identity_drift"),
-                                 ("configuration", {"image": OLD_IMAGE}, "application_image_drift")]:
+                                  "application_identity_drift")]:
             with self.subTest(key=key):
                 client = verify_client()
                 client.deadline = 400  # long enough to exhaust the stale-image tolerance
@@ -1842,8 +2043,39 @@ class OrchestrationTests(OfflineTestCase):
         evidence = json.loads(Path(self.args.evidence).read_text())
         self.assertEqual(evidence["image"], IMAGE)
         self.assertNotIn("active_lag", evidence)
-        # Stale polls never count toward acceptance: two waits, then the fresh pass.
-        self.assertEqual(self.clock.sleeps[:2], [5, 5])
+        # The exact healthy runtime is authoritative even while the listing lags.
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertTrue(evidence["application_listing_lag"])
+        self.assert_no_secret_saved_or_printed()
+
+    def test_target_seen_on_final_reread_then_baseline_fails_during_lag_confirmation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = self.lag_client([ready_response(), ready_response()])
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale], [app()], [stale], [stale]]
+        client.deadline = 1000
+
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+        self.assertEqual(self.clock.sleeps, [5])
+        self.assert_no_secret_saved_or_printed()
+
+    def test_lag_confirmation_survives_stale_listing_past_the_poll_cap(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = self.lag_client([*( (503, *ready_response()[1:]) for _ in range(24) ),
+                                  ready_response(), ready_response()])
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale]]
+        client.deadline = 10000
+
+        rollout.verify(self.args, client)
+
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertTrue(evidence["active_lag"])
+        self.assertTrue(evidence["application_listing_lag"])
+        self.assertEqual(evidence["image"], IMAGE)
         self.assert_no_secret_saved_or_printed()
 
     def test_listing_lag_beyond_the_former_twelve_poll_cap_still_passes(self):
@@ -1860,8 +2092,36 @@ class OrchestrationTests(OfflineTestCase):
         rollout.verify(self.args, client)
         evidence = json.loads(Path(self.args.evidence).read_text())
         self.assertEqual(evidence["image"], IMAGE)
-        self.assertEqual(self.clock.sleeps[:20], [5] * 20)
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertTrue(evidence["application_listing_lag"])
         self.assert_no_secret_saved_or_printed()
+
+    def test_missing_listing_and_previous_images_do_not_count_as_verified_lag(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        missing_image = app()
+        missing_image["configuration"] = {}
+        client.api_routes[APP_PATH] = [[missing_image], [missing_image]]
+        missing_previous_image = completed_row()
+        missing_previous_image["current_configuration"] = {}
+        client.api_routes[DETAIL_PATH] = [missing_previous_image, missing_previous_image]
+
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
+    def test_final_rollout_baseline_image_is_used_to_verify_listing_lag(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale], [stale]]
+        changed = completed_row()
+        changed["current_configuration"]["image"] = REPOSITORY + "@sha256:" + "f" * 64
+        client.api_routes[DETAIL_PATH] = [completed_row(), changed]
+
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
 
     def test_stale_application_image_is_reported_and_never_accepted(self):
         self.prepare_baseline()
@@ -1971,24 +2231,56 @@ class OrchestrationTests(OfflineTestCase):
                             test_case.readyz_body(gateway_failure), 503,
                             {"x-two-worker-version": VERSION},
                         )
-                    status, headers, body = ready_response()
-                    return Response(body, status, headers)
+                    _, headers, _ = ready_response()
+                    body = test_case.readyz_body(
+                        None, components=[["process", "ready"], ["gateway", "down"]])
+                    return Response(body, 503, headers)
                 raise AssertionError(f"unexpected runtime URL: {url}")
 
         client = rollout.Client(ACCOUNT, SENTINEL, deadline=clock.now + 300)
         client.opener = Opener()
         return client, timeouts
 
-    def test_deadline_transport_timeout_during_read_keeps_stale_listing_drift_detail(self):
+    def gate_error_at_deadline_offset(self, offset):
+        self.clock.now = 100.0
+        self.clock.sleeps.clear()
+        for path in (self.args.receipt, self.args.output, self.args.deploy_config):
+            Path(path).unlink(missing_ok=True)
         self.prepare_baseline()
         self.write_deploy_output()
         client, timeouts = self.client_with_real_deadline_reads()
-        error = self.drift_error(client)
-        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-        self.assertIn("application_image=stale polls=", client.observation)
-        self.assertTrue(any(url == client.base + APP_PATH and timeout <= 2 for url, timeout in timeouts))
-        self.assert_no_evidence()
-        self.assert_no_secret_saved_or_printed()
+        client.deadline -= offset
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        return client, timeouts, caught.exception
+
+    def test_deadline_aware_reads_cover_deadline_offsets_across_stale_poll(self):
+        expiring_reads = set()
+        offsets = [index / 2 for index in range(27) if index not in range(10, 14)]
+        for offset in offsets:
+            with self.subTest(offset=offset):
+                client, timeouts, error = self.gate_error_at_deadline_offset(offset)
+                self.assertEqual(str(error), "application_image_drift")
+                self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
+                self.assertIn("application_image=stale polls=", client.observation)
+                expiring_reads.update(url for url, timeout in timeouts if timeout <= 2)
+                self.assert_no_evidence()
+                self.assert_no_secret_saved_or_printed()
+        # Offsets 5..6.5s expire before the pinned rollout is established,
+        # so there is no drift candidate yet. The deadline-clamped transport
+        # retry turns those expiring reads into rollout_timeout once the
+        # budget is spent; pin that instead of leaving the band unasserted.
+        for offset in (5.0, 5.5, 6.0, 6.5):
+            with self.subTest(offset=offset):
+                client, timeouts, error = self.gate_error_at_deadline_offset(offset)
+                self.assertEqual(str(error), "rollout_timeout")
+                expiring_reads.update(url for url, timeout in timeouts if timeout <= 2)
+                self.assert_no_evidence()
+                self.assert_no_secret_saved_or_printed()
+        self.assertTrue({
+            client.base + APP_PATH, client.base + DETAIL_PATH,
+            URL + "/health", URL + "/readyz",
+        } <= expiring_reads)
 
     def test_deadline_transport_timeout_keeps_gateway_failure_rollback_class(self):
         self.prepare_baseline()
@@ -1999,41 +2291,6 @@ class OrchestrationTests(OfflineTestCase):
         self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
-
-    def test_deadline_expiring_during_warm_read_keeps_stale_listing_drift(self):
-        self.prepare_baseline()
-        self.write_deploy_output()
-        client, timeouts = self.client_with_real_deadline_reads()
-        client.deadline += 4  # let the final stale poll reach its warm health probe
-        error = self.drift_error(client)
-        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-        self.assertTrue(any(url == URL + "/health" and timeout <= 2 for url, timeout in timeouts))
-        self.assertIn("application_image=stale polls=", client.observation)
-        self.assert_no_evidence()
-        self.assert_no_secret_saved_or_printed()
-
-    def test_deadline_aware_reads_cover_deadline_offsets_across_stale_poll(self):
-        expiring_reads = set()
-        for offset in [index / 2 for index in range(27)]:
-            with self.subTest(offset=offset):
-                self.clock.now = 100.0
-                self.clock.sleeps.clear()
-                for path in (self.args.receipt, self.args.output, self.args.deploy_config):
-                    Path(path).unlink(missing_ok=True)
-                self.prepare_baseline()
-                self.write_deploy_output()
-                client, timeouts = self.client_with_real_deadline_reads()
-                client.deadline -= offset
-                error = self.drift_error(client)
-                self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-                self.assertIn("application_image=stale polls=", client.observation)
-                expiring_reads.update(url for url, timeout in timeouts if timeout <= 2)
-                self.assert_no_evidence()
-                self.assert_no_secret_saved_or_printed()
-        self.assertTrue({
-            client.base + APP_PATH, client.base + DETAIL_PATH,
-            URL + "/health", URL + "/readyz",
-        } <= expiring_reads)
 
     def test_stale_listing_at_the_deadline_keeps_rollout_timeout_when_a_gateway_failure_is_named(self):
         self.prepare_baseline()
@@ -2050,6 +2307,27 @@ class OrchestrationTests(OfflineTestCase):
         self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
         self.assert_no_evidence()
 
+    def test_stale_cap_keeps_rollout_timeout_when_a_gateway_failure_is_named(self):
+        # Past the stale-poll cap, a named gateway failure must keep the
+        # rollout_timeout class the rollback keys on; the cap may only
+        # classify drift when no gateway failure is in the observation.
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        client.request_routes[URL + "/readyz"] = [
+            (503, {"x-two-worker-version": VERSION}, self.readyz_body(failure))]
+        client.deadline = 1000
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
+        self.assertIn("application_image=stale polls=", client.observation)
+        stale_polls = int(re.search(r"application_image=stale polls=(\d+)", client.observation).group(1))
+        self.assertGreater(stale_polls, rollout.APPLICATION_IMAGE_STALE_POLLS)
+        self.assert_no_evidence()
+
     def test_persistent_stale_application_image_fails_as_drift_after_the_tolerance(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -2058,15 +2336,42 @@ class OrchestrationTests(OfflineTestCase):
         stale["configuration"] = {"image": OLD_IMAGE}
         client.api_routes[APP_PATH] = [[stale]]
         client.deadline = 1000
+        self.make_unready(client)
         self.assert_gate("application_image_drift", rollout.verify, self.args, client)
-        self.assertEqual(client.calls.count(("api", APP_PATH)), rollout.APPLICATION_IMAGE_STALE_POLLS + 1)
+        self.assertGreater(client.calls.count(("api", APP_PATH)), rollout.APPLICATION_IMAGE_STALE_POLLS)
         self.assert_no_evidence()
 
+    def make_unready(self, client):
+        _, headers, _ = ready_response()
+        client.request_routes[URL + "/readyz"] = [
+            (503, headers, self.readyz_body(None, components=[["process", "ready"], ["gateway", "down"]]))]
+
     def drift_error(self, client):
+        # Listing drift is an error only when the exact deployed build is not
+        # actually ready; a healthy exact build is accepted despite stale listing.
+        if isinstance(client, FakeClient):
+            self.make_unready(client)
         with self.assertRaises(rollout.GateError) as caught:
             rollout.verify(self.args, client)
         self.assertEqual(str(caught.exception), "application_image_drift")
         return caught.exception
+
+    def test_nonconverged_poll_clears_previous_stale_image_state_before_timeout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale]]
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"]["instances"].update(active=0, healthy=0, starting=1)
+        client.api_routes[DETAIL_PATH] = [completed_row(), pending]
+        _, headers, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+        client.deadline = 100 + 10
+
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assert_no_evidence()
 
     def test_persistent_stale_image_drift_reports_where_the_listing_points(self):
         self.prepare_baseline()
@@ -2106,14 +2411,60 @@ class OrchestrationTests(OfflineTestCase):
         client.deadline = 1000
         self.assertEqual(self.drift_error(client).detail, "listing_image=other later_rollouts=0")
 
-    def test_final_image_mismatch_carries_the_same_detail_and_observation(self):
+    def test_final_listing_regression_to_baseline_fails_with_ready_runtime(self):
         self.prepare_baseline()
         self.write_deploy_output()
         client = verify_client()
         client.api_routes[APP_PATH] = [[app()], [app(OLD_IMAGE)]]
-        error = self.drift_error(client)
-        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-        self.assertIn("application_image=final_mismatch", client.observation)
+        client.deadline = 1000
+
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assertIn(("request", URL + "/readyz"), client.calls)
+        self.assertIn(("request", URL + "/health"), client.calls)
+        self.assert_no_evidence()
+
+    def test_target_seen_before_rollout_pin_then_baseline_listing_fails(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app()], [app(OLD_IMAGE)]]
+        client.api_routes[ROWS_PATH] = [[old_row()], [old_row(), completed_row()]]
+        client.deadline = 1000
+
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assertIn(("request", URL + "/readyz"), client.calls)
+        self.assertIn(("request", URL + "/health"), client.calls)
+        self.assert_no_evidence()
+
+    def test_final_baseline_listing_with_later_rollout_fails_with_ready_runtime(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        reverting = completed_row()
+        reverting.update(id="later_rollout", created_at=date(1))
+        reverting["target_configuration"]["image"] = OLD_IMAGE
+        client.api_routes[ROWS_PATH] = [[old_row(), completed_row()],
+                                        [old_row(), completed_row(), reverting]]
+        client.deadline = 1000
+
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail,
+                         "listing_image=baseline later_rollouts=1 latest_later=completed:baseline")
+        self.assertIn(("request", URL + "/readyz"), client.calls)
+        self.assertIn(("request", URL + "/health"), client.calls)
+        self.assert_no_evidence()
 
     def test_image_drift_detail_failure_never_masks_the_gate_error(self):
         self.prepare_baseline()
@@ -2132,6 +2483,7 @@ class OrchestrationTests(OfflineTestCase):
         client = verify_client()
         client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
         client.deadline = 1000
+        self.make_unready(client)
         self.stdout.seek(0)
         self.stdout.truncate()
         with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
@@ -2140,22 +2492,21 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.stdout.getvalue().splitlines(), [
             "staging rollout gate failed: application_image_drift",
             "staging rollout diagnostic: listing_image=baseline later_rollouts=0",
-            f"last observation before failure: rollout=completed instances=active:1,healthy:1,failed:0,"
-            f"starting:0,scheduling:0 application_image=stale polls={polls}"])
+            f"last observation before failure: rollout=converged readyz=503 "
+            f"components=process:ready,gateway:down identity=match application_image=stale polls={polls}"])
         self.assert_no_secret_saved_or_printed()
 
-    def test_final_application_id_namespace_and_image_are_rechecked(self):
+    def test_final_application_id_and_namespace_are_rechecked(self):
         self.prepare_baseline()
         self.write_deploy_output()
         for key, value in [("id", "different_application"),
-                           ("durable_objects", {"namespace_id": "different_namespace"}),
-                           ("configuration", {"image": OLD_IMAGE})]:
+                           ("durable_objects", {"namespace_id": "different_namespace"})]:
             with self.subTest(key=key):
                 client = verify_client()
                 changed = app()
                 changed[key] = value
                 client.api_routes[APP_PATH] = [[app()], [changed]]
-                self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+                self.assert_gate("application_identity_drift", rollout.verify, self.args, client)
                 self.assertIn(("request", URL + "/readyz"), client.calls)
                 self.assertEqual(client.calls.count(("api", APP_PATH)), 2)
                 self.assert_no_evidence()
@@ -2290,7 +2641,7 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.stdout.getvalue().splitlines()[1:], [
             "staging rollout gate failed: wrong_wrangler_receipt",
             "staging rollout diagnostic: records deploy=1,wrangler-session=2; "
-            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.149.0",
+            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.152.0",
         ])
         self.assert_no_evidence()
         # The caller-owned NDJSON input legitimately holds the sentinel; only
@@ -2417,9 +2768,9 @@ class DeepNestingTests(OfflineTestCase):
         for body in (self.deep_array(), self.deep_object()):
             with self.subTest(length=len(body)):
                 self.assert_gate("invalid_json", rollout.runtime_ready,
-                                 status, headers, body, VERSION, REVISION, BUILD_ID)
+                                 status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
                 observed = rollout.runtime_observation(
-                    status, headers, body, VERSION, REVISION, BUILD_ID)
+                    status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
                 self.assertIn("body=unreadable", observed)
                 self.assertNotIn("Traceback", observed)
                 self.assertNotIn("[[[[[", observed)

@@ -1,5 +1,23 @@
 # Parity soak checklist
 
+<!-- start-here -->
+**Start here — section map**
+
+- [Safety and execution contract](#safety-and-execution-contract)
+- [Maintaining coverage](#maintaining-coverage)
+- [Existing fixture entry points](#existing-fixture-entry-points)
+- [1. Slash / prefix commands](#1-slash--prefix-commands)
+- [2. Non-command interactions](#2-non-command-interactions)
+- [3. Gateway event handlers](#3-gateway-event-handlers)
+- [4. Scheduled jobs & timers](#4-scheduled-jobs--timers)
+- [5. DB tables & queries](#5-db-tables--queries)
+- [6. External integrations](#6-external-integrations)
+- [7. Config / env](#7-config--env)
+- [8. Observable behaviours](#8-observable-behaviours)
+- [12. Baseline additions and corrections](#12-baseline-additions-and-corrections)
+- [13. Post-freeze ledger obligations (non-dropped rows)](#13-post-freeze-ledger-obligations-non-dropped-rows)
+<!-- /start-here -->
+
 <!-- Generated from soak-checklist.json by scripts/check_soak_checklist.py --render. -->
 
 This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699), authored under [TOG-10885](/TOG/issues/TOG-10885). Running the soak is out of scope. `manual`/`automated`/`waived` describe the verification method, not PASS. No row has been executed by writing this checklist.
@@ -133,15 +151,15 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-15: 16 — `/command-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Create soak-faq and invoke /command-list as manager and normal member.
-- **Expected:** Manager sees the fixture definition without secrets; normal member is denied.
+- **Action:** Create enough enabled/disabled fixture commands with text triggers to span pages; as manager, invoke /command-list with no page, traverse all valid pages, and try invalid/unavailable pages. Check the empty list after cleanup and invoke as a normal member.
+- **Expected:** Manager sees every whole name/trigger/on-off row exactly once in name order without secrets; each nonempty page fits 2,000 UTF-16 units with page/total and a next-page hint when applicable. Missing page equals page:1; empty page 1 keeps its existing reply; invalid/unavailable pages are refused without mutation; normal member is denied.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-16: 17 — `/schedule`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule body:soak-once in-minutes:1; also create body:soak-repeat every-minutes:60; try neither option and below-minimum intervals.
-- **Expected:** Valid messages are queued for invoking channel, one-shot fires once; invalid cadence rejected; recurring schedule removed after evidence.
+- **Action:** On staging only, invoke /schedule body:soak-once in-minutes:1 and body:soak-repeat every-minutes:60. Create future at times in Z and a numeric offset naming the same instant; list/remove their IDs. Try malformed/no-offset/past/out-of-horizon at, at plus in-minutes/every-minutes, neither timing and below-minimum intervals. Through the approved restart contract, verify a not-yet-due and an already delivered one-off.
+- **Expected:** Offset-equivalent inputs persist the same canonical UTC millisecond instant; set/list show that instant, localized time, stable ID and uncertain delivery timing. Every invalid time/conflict has zero schedule/audit/channel effects. Relative and recurring semantics, body safety and quota remain intact; restart retains the due instant without a second occurrence. No exact-second SLO. Remove fixture schedules after evidence.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-17: 18 — `/schedule-remove`
@@ -154,8 +172,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-18: 19 — `/schedule-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor.
-- **Expected:** Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences.
+- **Action:** Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor; walk page:1 and an out-of-range page.
+- **Expected:** Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences; every page fits Discord limits with a page indicator and out-of-range pages are refused.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-19: 20 — `/sticky`
@@ -231,8 +249,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-29: 30 — `/feed-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /feed-list before/after relay changes and as actor without ManageGuild.
-- **Expected:** List matches this guild only; unauthorized actor refused; no credentials in output.
+- **Action:** Before the check, seed enough approved fixture relays for /feed-list to report at least two pages; invoke /feed-list before/after relay changes and as actor without ManageGuild; walk page:1, page:2, and an out-of-range page.
+- **Expected:** List matches this guild only; unauthorized actor refused; no credentials in output; every page fits Discord limits; multi-page lists show a page indicator with navigation and totals on each page; out-of-range pages are refused.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ## 2. Non-command interactions
@@ -821,7 +839,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s7-01: Config / env catalogue
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_TICKET_COOLDOWN_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
+- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_AUTOMATIONS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
 - **Expected:** Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
@@ -842,10 +860,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
-### s8-03: Audit kill switch (`audit-switch --halt/--resume/--status`) — presence = halt
+### s8-03: Audit kill switch (`audit_switch`, [usage](audit-store.md#operator-handle)) — presence = halt
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run audit-switch halt/status/resume against local authorized test-container fixture only, never staging/production DB.
+- **Action:** Run `audit_switch --status`, `audit_switch --halt --actor <snowflake>`, `audit_switch --resume` ([usage](audit-store.md#operator-handle)) against local authorized test-container fixture only, never staging/production DB.
 - **Expected:** Switch presence halts, status reports accurately, resume clears only the fixture switch and pending audit resumes safely.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
@@ -1051,7 +1069,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
-### s12-18: Durable join-risk event claim store over the existing flags table (unwired, no new migration)
+### s12-18: Durable join-risk event claim store over the existing flags table (no new migration), wired via the join-risk runtime
 
 - **Method:** `waived` (not an execution verdict).
 - **Action:** Run the #362 join-risk claim fixture on authorized test containers: 10-way concurrent exactly-once claims, serialized burst scoring with threshold-equality bonus, old-account evidence, cross-guild isolation, out-of-window exclusion, bulk-suppression persistence, duplicate replay and the legacy-0015 upgrade shape.
@@ -1165,6 +1183,31 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
 
+### s12-30: Private Twitch EventSub receiver inside the container network (#973)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On staging with the Operator-provisioned webhook secret, enable the receiver dark-flag exactly as configured, deliver a signed Twitch challenge and one signed notification through the Worker ingress, then repeat with a bad signature and with the flag unset.
+- **Expected:** The challenge is echoed only after verification, signed notifications are accepted with scalar-only logs, bad signatures are refused before parsing, the receiver is not served while the flag is unset, and enabled-but-invalid configuration stops startup instead of downgrading.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
+### s12-31: Voice creator-view merge on gateway reconnect plus join-time creator-map refusal naming (#976)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On the disposable staging guild, register a creator channel, force a gateway reconnect, then join the creator channel; also join once against a deliberately stale creator map.
+- **Expected:** The creator view merges stored rows after the reconnect generation change (debounced, failed reads keep the old generation), the join succeeds without a restart, and any refusal names its reason with the join-time map state in the log.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-32: EventSub subscription reconcile at startup plus a bounded hourly interval (#989)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.
+- **Expected:** Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
 ## 13. Post-freeze ledger obligations (non-dropped rows)
 
 ### s13-f114c44: f114c44 — TOG-3052: temp-voice generator (join-to-create), staging only
@@ -1212,7 +1255,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `automated` (not an execution verdict).
 - **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
-- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 28 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 45 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
 - **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata

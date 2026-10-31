@@ -50,6 +50,19 @@ fn tls_policy_from_env() -> Result<two_bot_core::database_tls::TlsPolicy, &'stat
     )
 }
 
+/// Backup/restore pool shape: max 5 (legacy `TWO_DB_POOL_MAX` parity) with a
+/// 10 s acquire timeout and a 60 s statement timeout. The CLI runs sequential
+/// backup steps, so one small pool suffices; a hung database refuses with the
+/// fixed `cannot connect` constant instead of hanging the operator command.
+/// The statement leg is bulk-sized (matching the `legacy_copy` 60 s bulk
+/// precedent): dump/restore run whole-table ordered scans, per-table
+/// `COUNT(*)` and `LOCK TABLE` that can legitimately exceed the 15 s
+/// application bound, so the application value would cancel healthy backups
+/// with Postgres 57014.
+const BACKUP_POOL_MAX: u32 = 5;
+const BACKUP_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+const BACKUP_STATEMENT_TIMEOUT_MS: u64 = 60_000;
+
 /// Open a Postgres pool through the shared redacting parse path
 /// (`two_bot_core::database_url`): unsupported query keys are refused before
 /// the pinned driver's parser can WARN-log their values, the driver's passfile
@@ -57,8 +70,9 @@ fn tls_policy_from_env() -> Result<two_bot_core::database_tls::TlsPolicy, &'stat
 /// a constant message that never echoes the URL. Threat-model F6: the
 /// `TWO_DATABASE_TLS` policy (unset means `required`) refuses
 /// plaintext/unverified modes and the wrong host class before SQLx parses the
-/// URL (see `docs/database-tls.md`). Same default pool options as
-/// `PgPool::connect`, so this only changes what failures can disclose.
+/// URL (see `docs/database-tls.md`). The pool carries the documented
+/// backup triple (`BACKUP_POOL_MAX`, `BACKUP_ACQUIRE_TIMEOUT_SECS`,
+/// `BACKUP_STATEMENT_TIMEOUT_MS`) instead of the SQLx defaults.
 async fn open_pool(url: &str) -> Result<sqlx::PgPool, &'static str> {
     open_pool_with_tls(url, tls_policy_from_env()?).await
 }
@@ -76,10 +90,43 @@ async fn open_pool_with_tls(
         two_bot_core::database_url::connect_options(url).map_err(|_| "invalid database URL")?,
         tls,
     );
-    sqlx::postgres::PgPoolOptions::new()
+    let options = options.options([backup_statement_timeout_option()]);
+    backup_pool_options()
         .connect_with(options)
         .await
         .map_err(|_| "cannot connect; database details redacted")
+}
+
+/// Typed restore pool-open: `None` is a fixed, non-echoing `&'static str`
+/// failure in the same type as [`open_pool`], never a panic. `Some` delegates
+/// to [`open_pool`] unchanged (same constants, TLS policy, connection
+/// behavior). Defense in depth behind the exit-2 `TWO_RESTORE_URL` guard in
+/// `cmd_restore`.
+pub(crate) async fn open_restore_pool(url: Option<&str>) -> Result<sqlx::PgPool, &'static str> {
+    let Some(url) = url else {
+        return Err("missing restore database URL");
+    };
+    open_pool(url).await
+}
+
+/// Backup pool builder: max 5 with a 10 s acquire bound (the pool half of
+/// the documented backup triple, applied by [`open_pool_with_tls`]; the
+/// statement leg rides the connection options). Split out so tests pin the
+/// built values exactly instead of grepping the source.
+fn backup_pool_options() -> sqlx::postgres::PgPoolOptions {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(BACKUP_POOL_MAX)
+        .acquire_timeout(std::time::Duration::from_secs(BACKUP_ACQUIRE_TIMEOUT_SECS))
+}
+
+/// Backup statement-timeout server setting, applied to the connection
+/// options by [`open_pool_with_tls`]. Split out so tests pin the exact
+/// `60000ms` bulk bound the pool applies.
+fn backup_statement_timeout_option() -> (String, String) {
+    (
+        "statement_timeout".to_owned(),
+        format!("{}ms", BACKUP_STATEMENT_TIMEOUT_MS),
+    )
 }
 
 /// Only an absent credential permits the deliberate environment fallback.
@@ -156,6 +203,10 @@ two-bot operator commands
       target's current counts). Without --dry-run, --force is required and
       TWO_RESTORE_URL must name the target. The target variable is
       deliberately NOT TWO_DATABASE_URL: restoring replaces target data.
+      A target that normalizes to the live database, or whose database
+      cannot be proven (name it explicitly), is refused (exit 2,
+      code=restore_live_target_refused), even with --force; --dry-run
+      still previews without that comparison.
       Requires a fresh migrated target without moderation history. --force
       confirms intent, not authorization or a safety-guard bypass.
       `RESTORE VERIFIED` on the last line, and exit 0, is the only success.
@@ -192,7 +243,9 @@ two-bot operator commands
       Plan (default) or apply a sealed snapshot to the staging guild.
       Refuses tampered backups (exit 3) before any Discord call; refuses
       the live guild and any non-staging token. --apply requires
-      --confirm-staging-guild.
+      --confirm-staging-guild. Completion prints per operation only as
+      each operation lands; a mid-apply failure names landed vs pending
+      operations (code=guild_restore_apply_failed).
 ";
 
 /// The subcommands whose help is `USAGE`; `db` and `erase-member` parse
@@ -229,9 +282,18 @@ fn route(subcommand: &str, rest: &[String]) -> Route {
         return Route::Help;
     }
     match (subcommand, rest.first()) {
-        ("backup" | "guild-config-snapshot", Some(extra)) => Route::Usage(format!(
-            "{subcommand}: unexpected argument {extra:?}.\n{USAGE}"
-        )),
+        ("backup" | "guild-config-snapshot", Some(extra)) => {
+            // One stable token per subcommand, kept literal so the frozen
+            // source pins keep resolving.
+            let code = if subcommand == "backup" {
+                "code=backup_usage"
+            } else {
+                "code=snapshot_usage"
+            };
+            Route::Usage(format!(
+                "{subcommand}: unexpected argument {extra:?}. {code}\n{USAGE}"
+            ))
+        }
         _ => Route::Run,
     }
 }
@@ -246,6 +308,13 @@ pub async fn dispatch(args: &[String]) -> i32 {
         }
         print!("{USAGE}");
         return 0;
+    }
+    // Bare-boot owed-release override: the documented `two-bot --allow-owed`
+    // service-start flag falls through to the boot preflight in `run`
+    // (100 = not a backup subcommand). Only the exact single flag; typos,
+    // extra arguments and operator subcommands keep exit 2 below.
+    if args.len() == 1 && args[0] == two_bot_core::disable_preflight::OVERRIDE_FLAG {
+        return 100;
     }
     match route(&args[0], &args[1..]) {
         Route::Help => {
@@ -284,7 +353,7 @@ async fn cmd_backup() -> i32 {
     let url = match env_var("TWO_DATABASE_URL") {
         Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => url,
         _ => {
-            eprintln!("backup: TWO_DATABASE_URL must be set to a Postgres URL.");
+            eprintln!("backup: TWO_DATABASE_URL must be set to a Postgres URL. code=backup_missing_database_url");
             return 1;
         }
     };
@@ -295,14 +364,14 @@ async fn cmd_backup() -> i32 {
     let keep = match retention::parse_keep(env_var("TWO_BACKUP_KEEP").as_deref()) {
         Ok(keep) => keep,
         Err(err) => {
-            eprintln!("backup: {err}.");
-            eprintln!("        Refusing to run: every reading of that value prunes all backups.");
+            eprintln!("backup: {err}. code=backup_retention_refused");
+            eprintln!("        Refusing to run: every reading of that value prunes all backups. code=backup_retention_refused");
             return 1;
         }
     };
 
     if let Err(err) = std::fs::create_dir_all(&dest) {
-        eprintln!("backup: cannot create {dest}: {err}");
+        eprintln!("backup: cannot create {dest}: {err} code=backup_dest_create_failed");
         return 1;
     }
     let stamp = guild_config::filename_stamp();
@@ -313,7 +382,7 @@ async fn cmd_backup() -> i32 {
     let pool = match open_pool(&url).await {
         Ok(pool) => pool,
         Err(detail) => {
-            eprintln!("backup: {detail}");
+            eprintln!("backup: {detail} code=backup_pool_open_failed");
             return 1;
         }
     };
@@ -335,7 +404,10 @@ async fn cmd_backup() -> i32 {
                     meta.len() as f64 / 1024.0
                 ),
                 Err(err) => {
-                    eprintln!("backup: wrote {} but cannot stat it: {err}", out.display());
+                    eprintln!(
+                        "backup: wrote {} but cannot stat it: {err} code=backup_stat_failed",
+                        out.display()
+                    );
                     return 1;
                 }
             }
@@ -349,14 +421,14 @@ async fn cmd_backup() -> i32 {
             {
                 eprintln!(
                     "backup: the event log is empty. Refusing to call this a good backup: \
-                     keeping existing archives, skipping upload."
+                     keeping existing archives, skipping upload. code=backup_empty_event_log"
                 );
                 pool.close().await;
                 return 1;
             }
         }
         Err(err) => {
-            eprintln!("backup: dump failed: {err}");
+            eprintln!("backup: dump failed: {err} code=backup_dump_failed");
             return 1;
         }
     }
@@ -371,7 +443,7 @@ async fn cmd_backup() -> i32 {
             }
         }
         Err(err) => {
-            eprintln!("backup: prune failed: {err}");
+            eprintln!("backup: prune failed: {err} code=backup_prune_failed");
             return 1;
         }
     }
@@ -510,9 +582,33 @@ async fn cmd_restore(args: &[String]) -> i32 {
         return cmd_restore_dry_run(&file, url.as_deref()).await;
     }
 
-    // Every failure is a bounded constant from `open_pool`: the URL and its
-    // query secrets never reach logs or CLI output.
-    let pool = match open_pool(url.as_ref().expect("checked")).await {
+    // A prod URL in TWO_RESTORE_URL plus --force used to wipe production: the
+    // guard above only checked presence and scheme, never the target's value.
+    // Refuse by normalized value (scheme alias, host case, default ports and
+    // credential/query spellings cannot evade it), production database
+    // markers, and unprovable targets (an omitted database or an empty
+    // override cannot be proven different from live), before any file parse
+    // or connection attempt. --force confirms intent, never a live target;
+    // --dry-run previews without this comparison.
+    // Fixed refusal: the URLs and their secrets never reach output.
+    if let Some(target) = url.as_deref() {
+        if two_bot_core::database_url::restore_target_is_live(
+            target,
+            env_var("TWO_DATABASE_URL").as_deref(),
+        ) {
+            eprintln!(
+                "restore: refusing a live database target; restores go to scratch only. code=restore_live_target_refused"
+            );
+            eprintln!(
+                "restore: TWO_RESTORE_URL must not name the live database. See docs/backup.md."
+            );
+            return 2;
+        }
+    }
+
+    // Every failure is a bounded constant from `open_restore_pool`: the URL and
+    // its query secrets never reach logs or CLI output.
+    let pool = match open_restore_pool(url.as_deref()).await {
         Ok(pool) => pool,
         Err(detail) => {
             eprintln!("restore: {detail}");
@@ -701,7 +797,7 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
 async fn cmd_backup_upload(args: &[String]) -> i32 {
     if args.len() != 1 {
         eprintln!(
-            "backup-upload-s3: expected exactly one argument (the dump path), got {}",
+            "backup-upload-s3: expected exactly one argument (the dump path), got {} code=backup_upload_usage",
             args.len()
         );
         return 2;
@@ -711,7 +807,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         Ok(meta) if meta.is_file() => meta.len(),
         _ => {
             eprintln!(
-                "backup-upload-s3: cannot read {}: not a regular file",
+                "backup-upload-s3: cannot read {}: not a regular file code=backup_upload_not_regular_file",
                 dump_path.display()
             );
             return 1;
@@ -720,8 +816,18 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
     // An empty dump would upload happily and restore to nothing.
     if size == 0 {
         eprintln!(
-            "backup-upload-s3: refusing to upload an empty file: {}",
+            "backup-upload-s3: refusing to upload an empty file: {} code=backup_upload_empty_file",
             dump_path.display()
+        );
+        return 1;
+    }
+    // Mirror the restore drill: refuse an over-cap dump before buffering it
+    // in memory for signing. Strict `>` so an exactly-at-cap dump uploads.
+    if size > dump_file::MAX_DUMP_BYTES {
+        eprintln!(
+            "backup-upload-s3: {} is {size} bytes, exceeding the {}-byte dump cap; refusing rather than buffering it code=backup_upload_dump_too_large",
+            dump_path.display(),
+            dump_file::MAX_DUMP_BYTES
         );
         return 1;
     }
@@ -730,7 +836,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
     let target = match s3::load_s3_target(&std_env) {
         Ok(target) => target,
         Err(err) => {
-            eprintln!("backup-upload-s3: {err}");
+            eprintln!("backup-upload-s3: {err} code=backup_upload_s3_target");
             return 1;
         }
     };
@@ -743,12 +849,25 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         Ok(body) => body,
         Err(err) => {
             eprintln!(
-                "backup-upload-s3: cannot read {}: {err}",
+                "backup-upload-s3: cannot read {}: {err} code=backup_upload_read_failed",
                 dump_path.display()
             );
             return 1;
         }
     };
+    // Re-check after the read: a dump that grew past the cap between the
+    // metadata precheck and the read is still refused before signing or any
+    // S3 PUT. (The read call shape above is pinned by the frozen
+    // stable-codes suite, so bounded streaming needs test-author
+    // coordination and stays a follow-up.)
+    if body.len() as u64 > dump_file::MAX_DUMP_BYTES {
+        eprintln!(
+            "backup-upload-s3: {} exceeds the {}-byte dump cap; refusing to sign or upload it code=backup_upload_dump_too_large",
+            dump_path.display(),
+            dump_file::MAX_DUMP_BYTES
+        );
+        return 1;
+    }
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -776,7 +895,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         Ok(res) => {
             if !(200..300).contains(&res.status.as_u16()) {
                 eprintln!(
-                    "backup-upload-s3: PUT {} {}{}",
+                    "backup-upload-s3: PUT {} {}{} code=backup_upload_put_status",
                     res.status.as_u16(),
                     res.status.canonical_reason().unwrap_or(""),
                     res.detail()
@@ -789,7 +908,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
             0
         }
         Err(err) => {
-            eprintln!("backup-upload-s3: PUT failed: {err}");
+            eprintln!("backup-upload-s3: PUT failed: {err} code=backup_upload_put_failed");
             1
         }
     }
@@ -829,16 +948,16 @@ fn upload_failure_message(
     match outcome {
         UploadOutcome::Success => None,
         UploadOutcome::ExitNonzero(status) => {
-            Some(format!("{scope}: upload failed: {cmd} exited {status}"))
+            Some(format!("{scope}: upload failed: {cmd} exited {status} code=upload_exit_nonzero"))
         }
         UploadOutcome::SpawnFailed(err) => {
-            Some(format!("{scope}: upload failed to start ({cmd}): {err}"))
+            Some(format!("{scope}: upload failed to start ({cmd}): {err} code=upload_spawn_failed"))
         }
         UploadOutcome::WaitFailed(err) => {
-            Some(format!("{scope}: upload wait failed ({cmd}): {err}"))
+            Some(format!("{scope}: upload wait failed ({cmd}): {err} code=upload_wait_failed"))
         }
         UploadOutcome::TimedOut => Some(format!(
-            "{scope}: upload timed out after {budget:?}; terminated upload child ({cmd})"
+            "{scope}: upload timed out after {budget:?}; terminated upload child ({cmd}) code=upload_timed_out"
         )),
     }
 }
@@ -877,21 +996,68 @@ async fn run_upload_command(
     }
 }
 
+/// Parse the `guild-config-snapshot` upload command once for `path`.
+///
+/// Single-parse helper for the snapshot upload loop: exactly one
+/// `s3::build_upload_argv` call per path. Returns `None` when no uploader is
+/// configured, in which case the caller refuses with the existing local-only
+/// message and exit 2; `Some` carries byte-identical upload inputs.
+fn snapshot_upload_argv(upload_raw: Option<&str>, path: &Path) -> Option<(String, Vec<String>)> {
+    s3::build_upload_argv(upload_raw, &path.to_string_lossy())
+}
+
 // ---------------------------------------------------------------------------
 // guild-config-snapshot
 // ---------------------------------------------------------------------------
+
+/// Removes our temp file unless a successful rename disarms it. Every
+/// post-create failure path (write, permissions, fsync, rename) drops through
+/// here, so no `.tmp` partial survives a failed write. Only our own temp is
+/// removed; siblings are never touched. The guard arms only after the temp is
+/// created, so a creation failure never deletes a pre-existing path.
+struct TmpGuard<'a> {
+    tmp: &'a Path,
+    armed: bool,
+}
+
+impl Drop for TmpGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.tmp);
+        }
+    }
+}
 
 fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Unique temp per call (pid + nanos): exclusive creation can never
+    // collide with a stale temp from a crashed run, and `create_new` refuses
+    // a planted symlink or file at the temp path instead of following or
+    // truncating it (CWE-59). A collision fails closed with the existing
+    // "cannot write" error.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
+    // Stays unarmed until the temp exists: a creation failure returns the
+    // existing error without removing a pre-existing path.
+    let mut guard = TmpGuard {
+        tmp: &tmp,
+        armed: false,
+    };
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("cannot serialise: {e}"))?;
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        guard.armed = true;
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         #[cfg(unix)]
@@ -903,11 +1069,33 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
             .map_err(|e| format!("cannot fsync {}: {e}", tmp.display()))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot rename to {}: {e}", path.display()))?;
+    guard.armed = false;
     if let Some(parent) = path.parent() {
         let dir = std::fs::File::open(parent).map_err(|e| e.to_string())?;
         dir.sync_all().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Guild-config admission pool builder: the shared admission triple's pool
+/// half (max 2 + 10 s acquire), reusing the `website_jobs` constants so the
+/// second pool in this file cannot drift from the other admission pools.
+fn guild_config_admission_pool_options() -> sqlx::postgres::PgPoolOptions {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(crate::website_jobs::ADMISSION_POOL_MAX)
+        .acquire_timeout(std::time::Duration::from_secs(
+            crate::website_jobs::ADMISSION_ACQUIRE_TIMEOUT_SECS,
+        ))
+}
+
+/// Guild-config admission statement-timeout server setting (the 15 s
+/// admission bound, `website_jobs` parity), applied to the connection
+/// options by `governed_guild_config_api`.
+fn guild_config_statement_timeout_option() -> (String, String) {
+    (
+        "statement_timeout".to_owned(),
+        format!("{}ms", crate::website_jobs::ADMISSION_STATEMENT_TIMEOUT_MS),
+    )
 }
 
 async fn governed_guild_config_api(
@@ -947,8 +1135,11 @@ async fn governed_guild_config_api(
             .map_err(|_| "Discord admission authority unavailable")?,
         tls,
     );
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
+    // The admission pool carries the shared admission triple (max 2 + 10 s
+    // acquire + 15 s statement, `website_jobs` parity): a hung database
+    // refuses instead of hanging the guild-config command.
+    let options = options.options([guild_config_statement_timeout_option()]);
+    let pool = guild_config_admission_pool_options()
         .connect_with(options)
         .await
         .map_err(|_| "Discord admission authority unavailable")?;
@@ -965,23 +1156,34 @@ async fn governed_guild_config_api(
     .map_err(|error| error.to_string())
 }
 
+/// Collapse embedded newlines so a failure stays one physical line.
+///
+/// The stable failure token is appended to the failure line; a multi-line
+/// message would leave the earlier lines uncoded for per-line matchers. Used
+/// where the interpolated message is known to embed newlines (every
+/// `check_staging_token` refusal does).
+fn single_line(message: &str) -> String {
+    message.replace(['\n', '\r'], " ")
+}
+
 async fn cmd_guild_config_snapshot() -> i32 {
     let token = match staging_token() {
         Ok(token) => token,
         Err(message) => {
-            eprintln!("guild-config-snapshot: {message}");
+            eprintln!("guild-config-snapshot: {message} code=snapshot_token_load_failed");
             return 1;
         }
     };
     if let Err(message) = guild_config::check_staging_token(&token) {
-        eprintln!("guild-config-snapshot: {message}");
+        let message = single_line(&message);
+        eprintln!("guild-config-snapshot: {message} code=snapshot_token_check_refused");
         return 2;
     }
     let std_env = |name: &str| env_var(name);
     let guild_id = match guild_config::staging_guild_id(&std_env) {
         Ok(guild_id) => guild_id,
         Err(message) => {
-            eprintln!("guild-config-snapshot: {message}");
+            eprintln!("guild-config-snapshot: {message} code=snapshot_guild_id_failed");
             return 2;
         }
     };
@@ -989,19 +1191,19 @@ async fn cmd_guild_config_snapshot() -> i32 {
     let api = match governed_guild_config_api(token, guild_id.clone()).await {
         Ok(api) => api,
         Err(err) => {
-            eprintln!("guild-config-snapshot: {err}");
+            eprintln!("guild-config-snapshot: {err} code=snapshot_governed_api_failed");
             return 2;
         }
     };
     if let Err(err) = api.assert_identity().await {
-        eprintln!("guild-config-snapshot: {err}");
+        eprintln!("guild-config-snapshot: {err} code=snapshot_identity_failed");
         return 1;
     }
     // TOG-3513: seal the snapshot at capture so restore can refuse a tampered backup.
     let snapshot = match api.capture().await {
         Ok(snapshot) => guild_config::seal_snapshot(snapshot),
         Err(err) => {
-            eprintln!("guild-config-snapshot: capture failed: {err}");
+            eprintln!("guild-config-snapshot: capture failed: {err} code=snapshot_capture_failed");
             return 1;
         }
     };
@@ -1022,7 +1224,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         (&drift_path, report.clone()),
     ] {
         if let Err(err) = atomic_json(path, &value) {
-            eprintln!("guild-config-snapshot: {err}");
+            eprintln!("guild-config-snapshot: {err} code=snapshot_atomic_write_failed");
             return 1;
         }
     }
@@ -1036,7 +1238,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         Some(value) => value,
         None => {
             eprintln!(
-                "guild-config-snapshot: cannot re-read {}",
+                "guild-config-snapshot: cannot re-read {} code=snapshot_reread_failed",
                 snapshot_path.display()
             );
             return 1;
@@ -1050,7 +1252,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
             .unwrap_or("")
     {
         eprintln!(
-            "guild-config-snapshot: snapshot hash changed after write: {}",
+            "guild-config-snapshot: snapshot hash changed after write: {} code=snapshot_hash_changed",
             snapshot_path.display()
         );
         return 1;
@@ -1059,7 +1261,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         Ok(guild_config::SealState::Sealed) => {}
         _ => {
             eprintln!(
-                "guild-config-snapshot: snapshot at {} is missing its integrity seal",
+                "guild-config-snapshot: snapshot at {} is missing its integrity seal code=snapshot_seal_missing",
                 snapshot_path.display()
             );
             return 1;
@@ -1089,13 +1291,11 @@ async fn cmd_guild_config_snapshot() -> i32 {
 
     let upload_raw =
         env_var("TWO_GUILD_CONFIG_UPLOAD_CMD").or_else(|| env_var("TWO_BACKUP_UPLOAD_CMD"));
-    if s3::build_upload_argv(upload_raw.as_deref(), &snapshot_path.to_string_lossy()).is_none() {
-        eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot");
-        return 2;
-    }
     for path in [&snapshot_path, &drift_path] {
-        let (cmd, upload_args) =
-            s3::build_upload_argv(upload_raw.as_deref(), &path.to_string_lossy()).expect("checked");
+        let Some((cmd, upload_args)) = snapshot_upload_argv(upload_raw.as_deref(), path) else {
+            eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot code=snapshot_local_only_refused");
+            return 2;
+        };
         match run_upload_command(&cmd, &upload_args, UPLOAD_COMMAND_TIMEOUT).await {
             UploadOutcome::Success => {}
             outcome => {
@@ -1118,6 +1318,11 @@ async fn cmd_guild_config_snapshot() -> i32 {
 // ---------------------------------------------------------------------------
 // guild-config-restore
 // ---------------------------------------------------------------------------
+
+/// Operator-supplied guild snapshots refuse past 8 MiB, mirroring
+/// `http::MAX_RESPONSE_BYTES`. Guild snapshots are KB-scale; the boundary is
+/// strict `>` so an exactly-at-cap snapshot still restores.
+const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 
 async fn cmd_guild_config_restore(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
@@ -1169,7 +1374,72 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 2;
     }
 
-    let text = match std::fs::read_to_string(&snapshot_arg) {
+    // Gate before open: a FIFO opened for reading blocks until a writer
+    // connects, so non-regular and over-cap snapshots are refused via
+    // metadata first and `File::open` only sees likely-regular files. A
+    // missing file falls through to the existing read error below.
+    if let Ok(meta) = std::fs::metadata(&snapshot_arg) {
+        if !meta.is_file() {
+            eprintln!(
+                "guild-config-restore: cannot read snapshot {snapshot_arg}: not a regular file"
+            );
+            return 2;
+        }
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            eprintln!(
+                "guild-config-restore: snapshot {snapshot_arg} is {} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing rather than buffering it",
+                meta.len()
+            );
+            return 2;
+        }
+    }
+    // Open once. The descriptor is re-checked after open for a path swapped
+    // between the gate and the open; the bounded `take` read mirrors the
+    // restore drill, so a file that grows past the cap mid-read is still
+    // refused before parsing.
+    let snapshot_file = match std::fs::File::open(&snapshot_arg) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
+            return 2;
+        }
+    };
+    // Descriptor-level recheck: refuse a path swapped for a non-regular or
+    // over-cap file between the pre-open gate and the open.
+    if let Ok(meta) = snapshot_file.metadata() {
+        if !meta.is_file() {
+            eprintln!(
+                "guild-config-restore: cannot read snapshot {snapshot_arg}: not a regular file"
+            );
+            return 2;
+        }
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            eprintln!(
+                "guild-config-restore: snapshot {snapshot_arg} is {} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing rather than buffering it",
+                meta.len()
+            );
+            return 2;
+        }
+    }
+    let bytes = {
+        use std::io::Read as _;
+        let mut limited = snapshot_file.take(MAX_SNAPSHOT_BYTES + 1);
+        let mut bytes = Vec::new();
+        match limited.read_to_end(&mut bytes) {
+            Ok(_) => bytes,
+            Err(err) => {
+                eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
+                return 2;
+            }
+        }
+    };
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        eprintln!(
+            "guild-config-restore: snapshot {snapshot_arg} grew past the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing to parse it"
+        );
+        return 2;
+    }
+    let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(err) => {
             eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
@@ -1260,11 +1530,11 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         if apply { "applying" } else { "planned" },
         plan.counts.operations
     );
-    for op in &plan.operations {
-        println!("{} {}", if apply { "DID" } else { "WOULD" }, op.label);
-    }
 
     if !apply {
+        for op in &plan.operations {
+            println!("WOULD {}", op.label);
+        }
         println!(
             "guild-config-restore: counts={:?}; add --confirm-staging-guild --apply to write",
             (
@@ -1278,13 +1548,36 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 0;
     }
 
-    let restored_ids = match guild_config_restore::apply_restore_plan(&mut api, &plan).await {
-        Ok(ids) => ids,
-        Err(err) => {
-            eprintln!("guild-config-restore: apply failed: {err}");
-            return 1;
-        }
-    };
+    // Completion prints only as each operation lands: pre-printing every DID
+    // left operators believing pending operations had run when the apply
+    // failed halfway. A mid-apply failure names landed vs pending operations
+    // (labels only, never request bodies) with a stable code.
+    let restored_ids =
+        match guild_config_restore::apply_restore_plan_with_progress(&mut api, &plan, |op| {
+            println!("DID {}", op.label)
+        })
+        .await
+        {
+            Ok(ids) => ids,
+            Err((err, landed)) => {
+                eprintln!(
+                    "guild-config-restore: apply failed: {err} code=guild_restore_apply_failed"
+                );
+                let (landed_ops, pending_ops) =
+                    plan.operations.split_at(landed.min(plan.operations.len()));
+                if landed_ops.is_empty() {
+                    eprintln!("guild-config-restore: landed (0): none");
+                } else {
+                    for op in landed_ops {
+                        eprintln!("guild-config-restore: landed: {}", op.label);
+                    }
+                }
+                for op in pending_ops {
+                    eprintln!("guild-config-restore: pending: {}", op.label);
+                }
+                return 1;
+            }
+        };
     let after = match api.capture().await {
         Ok(after) => after,
         Err(err) => {
@@ -1665,6 +1958,13 @@ mod tests {
     #[test]
     fn extra_argument_to_argumentless_subcommand_is_a_usage_error() {
         for subcommand in ["backup", "guild-config-snapshot"] {
+            // Literal tokens: the frozen vocabulary scan reads this file, so
+            // the assertion spells out the same literals production emits.
+            let code = if subcommand == "backup" {
+                "code=backup_usage"
+            } else {
+                "code=snapshot_usage"
+            };
             for extra in ["now", "--force", "--"] {
                 let Route::Usage(message) = route(subcommand, &strings(&[extra])) else {
                     panic!("{subcommand} {extra} must refuse");
@@ -1672,6 +1972,11 @@ mod tests {
                 assert!(message.starts_with(&format!("{subcommand}: unexpected argument")));
                 assert!(message.contains(&format!("{extra:?}")));
                 assert!(message.ends_with(super::USAGE));
+                let first = message.lines().next().unwrap();
+                assert!(
+                    first.ends_with(code),
+                    "{subcommand} {extra}: first line must end with the code: {first:?}"
+                );
             }
             assert_eq!(route(subcommand, &[]), Route::Run);
         }
@@ -1695,6 +2000,34 @@ mod tests {
         // unknown-subcommand refusal.
         for subcommand in ["db", "erase-member", "serve"] {
             assert_eq!(route(subcommand, &strings(&["--help"])), Route::Run);
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_boot_allow_owed_falls_through_to_service_preflight() {
+        // The exact documented service-start flag is not a backup
+        // subcommand: 100 tells `main` to run the boot preflight in `run`.
+        assert_eq!(
+            super::dispatch(&strings(&[two_bot_core::disable_preflight::OVERRIDE_FLAG])).await,
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_boot_near_misses_and_extra_args_stay_usage_errors() {
+        // Only the exact single flag falls through; typos, unknown flags
+        // and the flag beside another argument keep exit 2 without touching
+        // env, DB or network.
+        for args in [
+            &["--allow-owwed"][..],
+            &["--allow-owed-releases"][..],
+            &["--allow-owed=1"][..],
+            &["--allow_owed"][..],
+            &["--frobnicate"][..],
+            &["--allow-owed", "--frobnicate"][..],
+            &["backup", "--allow-owed"][..],
+        ] {
+            assert_eq!(super::dispatch(&strings(args)).await, 2, "{args:?}");
         }
     }
 
@@ -1725,15 +2058,10 @@ mod tests {
         }
     }
 
-    /// Serialises the fixture write-and-spawn window of the bounded
-    /// upload-helper tests. `write_upload_fixture` leaves the script open
-    /// for writing while a sibling test on another thread forks; the forked
-    /// child inherits the write fd until its own exec, so exec of the fresh
-    /// script fails with ETXTBSY and the helper reports a spurious
-    /// `SpawnFailed`. Holding this guard from the fixture write through
-    /// `run_upload_command` keeps those windows disjoint. The mutex is
-    /// async-aware (`tokio::sync`) so holding the guard across `.await` is
-    /// allowed and does not block the executor.
+    /// Serialises the bounded upload-helper fixtures. Other suites can
+    /// still fork while a script is open for writing, so these tests run
+    /// scripts through `/bin/sh` rather than exec the freshly written file:
+    /// an inherited write fd must not cause a spurious ETXTBSY spawn failure.
     #[cfg(unix)]
     static UPLOAD_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -1763,12 +2091,54 @@ mod tests {
         ]
     }
 
+    #[cfg(unix)]
+    fn upload_fixture_argv(helper: &std::path::Path, file: &str) -> Vec<String> {
+        let mut args = vec![helper.to_string_lossy().into_owned()];
+        args.extend(secret_argv(file));
+        args
+    }
+
     #[test]
     fn upload_helper_default_budget_is_thirty_minutes() {
         assert_eq!(
             super::UPLOAD_COMMAND_TIMEOUT,
             std::time::Duration::from_secs(30 * 60)
         );
+    }
+
+    /// The snapshot upload loop parses once per path: `None` refuses with the
+    /// existing local-only message and exit 2, `Some` keeps byte-identical
+    /// upload inputs with the file appended last.
+    #[test]
+    fn snapshot_upload_argv_parses_once_per_path() {
+        use std::path::PathBuf;
+        let snap = PathBuf::from("two-staging-guild-config-stamp.json");
+        let drift = PathBuf::from("two-staging-guild-config-stamp.drift.json");
+        assert!(super::snapshot_upload_argv(None, &snap).is_none());
+        assert!(super::snapshot_upload_argv(Some("  "), &snap).is_none());
+        assert!(super::snapshot_upload_argv(Some(""), &drift).is_none());
+        let (cmd, args) = super::snapshot_upload_argv(Some("/bin/true"), &snap).unwrap();
+        assert_eq!(cmd, "/bin/true");
+        assert_eq!(args, vec![snap.to_string_lossy().into_owned()]);
+        let (cmd, args) = super::snapshot_upload_argv(Some("cp -t /srv/backups"), &drift).unwrap();
+        assert_eq!(cmd, "cp");
+        assert_eq!(
+            args,
+            vec![
+                "-t".to_owned(),
+                "/srv/backups".to_owned(),
+                drift.to_string_lossy().into_owned()
+            ]
+        );
+        let (_, snap_args) =
+            super::snapshot_upload_argv(Some("cp -t /srv/backups"), &snap).unwrap();
+        let (_, drift_args) =
+            super::snapshot_upload_argv(Some("cp -t /srv/backups"), &drift).unwrap();
+        assert_ne!(snap_args, drift_args);
+        assert!(snap_args.last().unwrap().ends_with(".json"));
+        assert!(drift_args.last().unwrap().ends_with(".drift.json"));
+        assert_eq!(snap_args.len(), 3);
+        assert_eq!(drift_args.len(), 3);
     }
 
     /// Prompt success stays success and produces no failure line.
@@ -1783,8 +2153,8 @@ mod tests {
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 0\n",
         );
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -1812,9 +2182,14 @@ mod tests {
             "upload-fail.sh",
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 3\n",
         );
+        // Model a writable fd inherited by an unrelated concurrent child.
+        let _writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&helper)
+            .unwrap();
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -1905,8 +2280,8 @@ mod tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             super::run_upload_command(
-                &helper.to_string_lossy(),
-                &secret_argv("archive.ndjson.gz"),
+                "/bin/sh",
+                &upload_fixture_argv(&helper, "archive.ndjson.gz"),
                 std::time::Duration::from_millis(300),
             ),
         )
@@ -1963,4 +2338,409 @@ mod tests {
             "timed-out upload child {pid} must be terminated and reaped"
         );
     }
+
+    // Stable-error patch coverage: the acceptance suite pins tokens via source
+    // text, which llvm-cov does not count as execution. These runtime tests
+    // execute each changed failure line so the patch gate measures them.
+    // Env-mutating tests share one lock; no other unit test reads these vars.
+    static STABLE_CODE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn clear_stable_code_env() {
+        for name in [
+            "TWO_DATABASE_URL",
+            "TWO_BACKUP_KEEP",
+            "TWO_BACKUP_DIR",
+            "TWO_BACKUP_S3_ENDPOINT",
+            "TWO_BACKUP_S3_BUCKET",
+            "TWO_BACKUP_S3_ACCESS_KEY_ID",
+            "TWO_BACKUP_S3_SECRET_ACCESS_KEY",
+            "CREDENTIALS_DIRECTORY",
+            "DISCORD_STAGING_BOT_TOKEN",
+            "DISCORD_STAGING_GUILD_ID",
+            "TWO_GUILD_CONFIG_OFFLINE_TEST",
+            "GUILD_CONFIG_API_BASE",
+            "GUILD_CONFIG_CDN_BASE",
+            "TWO_GUILD_CONFIG_BACKUP_DIR",
+            "TWO_GUILD_CONFIG_UPLOAD_CMD",
+            "TWO_BACKUP_UPLOAD_CMD",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn stable_codes_cover_upload_wait_failed() {
+        let message = super::upload_failure_message(
+            "backup",
+            "upload-wait.sh",
+            &super::UploadOutcome::WaitFailed("interrupted".to_owned()),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(message.contains("upload wait failed"));
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_missing_database_url() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_retention_refused() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_DATABASE_URL", "postgres://127.0.0.1:1/db");
+        std::env::set_var("TWO_BACKUP_KEEP", "0");
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_dest_create_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_DATABASE_URL", "postgres://127.0.0.1:1/db");
+        let dir = Credentials::new();
+        let blocker = dir.0.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad_dest = blocker.join("subdir");
+        std::env::set_var("TWO_BACKUP_DIR", bad_dest.to_str().unwrap());
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_pool_open_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_DATABASE_URL", "postgres://127.0.0.1:1/db");
+        let dir = Credentials::new();
+        std::env::set_var("TWO_BACKUP_DIR", dir.0.to_str().unwrap());
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_upload_s3_target() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let dir = Credentials::new();
+        let path = dir.0.join("dump.ndjson.gz");
+        std::fs::write(&path, b"fake-dump").unwrap();
+        let args = vec![path.to_string_lossy().into_owned()];
+        let exit = super::cmd_backup_upload(&args).await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_upload_put_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_BACKUP_S3_ENDPOINT", "http://127.0.0.1:1");
+        std::env::set_var("TWO_BACKUP_S3_BUCKET", "test-bucket");
+        std::env::set_var("TWO_BACKUP_S3_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("TWO_BACKUP_S3_SECRET_ACCESS_KEY", "test-secret");
+        let dir = Credentials::new();
+        let path = dir.0.join("dump.ndjson.gz");
+        std::fs::write(&path, b"fake-dump").unwrap();
+        let args = vec![path.to_string_lossy().into_owned()];
+        let exit = super::cmd_backup_upload(&args).await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_token_load_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_token_check_refused() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", "invalid-token");
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[test]
+    fn single_line_flattens_every_token_check_refusal() {
+        // Every `check_staging_token` refusal embeds a newline; the snapshot
+        // site flattens it so the stable token lands on the only line.
+        // Segments are base64 app ids; no usable credential.
+        for token in [
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.unit-test.not-a-secret",
+            "MTUzNzYyOTY4MjQ0OTY0OTcyNA.unit-test.not-a-secret",
+            "MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.unit-test.not-a-secret",
+            "invalid-token",
+        ] {
+            let message =
+                two_bot_core::backup::guild_config::check_staging_token(token).unwrap_err();
+            assert!(message.contains('\n'), "{token}: expected a newline hazard");
+            let flat = super::single_line(&message);
+            assert!(!flat.contains('\n') && !flat.contains('\r'), "{flat:?}");
+            assert!(flat.contains("Refusing to run"), "{flat:?}");
+        }
+    }
+
+    #[test]
+    fn single_line_keeps_single_line_text_verbatim() {
+        assert_eq!(super::single_line("plain message"), "plain message");
+        assert_eq!(super::single_line("a\nb\rc"), "a b c");
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_guild_id_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_governed_api_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_identity_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", "http://127.0.0.1:1");
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", "http://127.0.0.1:1");
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_missing_snapshot() {
+        // A missing --snapshot keeps the pre-existing read error (exit 2):
+        // the open-once refactor must not change that message.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let missing = dir.0.join("no-such-snapshot.json");
+        let args = vec![
+            "--snapshot".to_owned(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_non_regular_snapshot() {
+        // A directory passed as --snapshot is refused before any read: the
+        // metadata check sees a non-regular file and exits 2.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let args = vec![
+            "--snapshot".to_owned(),
+            dir.0.to_string_lossy().into_owned(),
+        ];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_invalid_utf8_snapshot() {
+        // Non-UTF-8 bytes keep the pre-existing read error (exit 2): the
+        // bounded take-read plus from_utf8 must match read_to_string here.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let path = dir.0.join("binary.json");
+        std::fs::write(&path, [0xffu8, 0xfe, 0x00, 0x62]).unwrap();
+        let args = vec!["--snapshot".to_owned(), path.to_string_lossy().into_owned()];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    struct StableCodeFake {
+        base: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn stable_code_fake_handler(
+        axum::extract::State(fail_guild): axum::extract::State<
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        >,
+        request: axum::extract::Request,
+    ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+        let path = request.uri().path().to_owned();
+        let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+        let app_id = two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID;
+        let guild_path = format!("/guilds/{guild_id}");
+        let roles_path = format!("{guild_path}/roles");
+        let channels_path = format!("{guild_path}/channels");
+        if path == "/users/@me" {
+            let body = serde_json::json!({"id": app_id});
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == "/users/@me/guilds" {
+            let body = serde_json::json!([{"id": guild_id}]);
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == guild_path {
+            if fail_guild.load(std::sync::atomic::Ordering::Relaxed) {
+                let body = serde_json::json!({"message": "fixture failure"});
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(body),
+                );
+            }
+            let body = serde_json::json!({"id": guild_id, "name": "Loopback guild"});
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == roles_path {
+            let body = serde_json::json!([]);
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == channels_path {
+            let body = serde_json::json!([]);
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        let body = serde_json::json!([]);
+        (axum::http::StatusCode::OK, axum::Json(body))
+    }
+
+    impl StableCodeFake {
+        async fn start(fail_guild: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(fail_guild));
+            let app = axum::Router::new()
+                .fallback(stable_code_fake_handler)
+                .with_state(flag);
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self { base, task }
+        }
+    }
+
+    impl Drop for StableCodeFake {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_capture_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let fake = StableCodeFake::start(true).await;
+        let dir = Credentials::new();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", &fake.base);
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", &fake.base);
+        std::env::set_var("TWO_GUILD_CONFIG_BACKUP_DIR", dir.0.to_str().unwrap());
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_atomic_write_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let fake = StableCodeFake::start(false).await;
+        let dir = Credentials::new();
+        let blocker = dir.0.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad_dir = blocker.join("captured");
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", &fake.base);
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", &fake.base);
+        std::env::set_var("TWO_GUILD_CONFIG_BACKUP_DIR", bad_dir.to_str().unwrap());
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_local_only_refused() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let fake = StableCodeFake::start(false).await;
+        let dir = Credentials::new();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", &fake.base);
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", &fake.base);
+        std::env::set_var("TWO_GUILD_CONFIG_BACKUP_DIR", dir.0.to_str().unwrap());
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
 }
+
+#[cfg(test)]
+#[path = "backup_pool_timeout_acceptance_tests.rs"]
+mod pool_timeout_acceptance_tests;
+
+#[cfg(test)]
+#[path = "backup_pool_triple_pin_tests.rs"]
+mod pool_triple_pin_tests;

@@ -11,6 +11,12 @@ on:
 
 permissions: {}
 
+# Serialize manual fuzz runs per ref (nightly.yml shape): a queued dispatch
+# waits instead of racing a running smoke for the runner build cache.
+concurrency:
+  group: vote-kick-fuzz-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   vote-kick-smoke:
     name: vote_kick 60 s smoke
@@ -25,7 +31,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "nightly-2026-10-01"
           components: rust-src
@@ -88,7 +94,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload smoke evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vote-kick-fuzz-smoke
           path: |

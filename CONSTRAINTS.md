@@ -48,18 +48,22 @@ not adding one.
 | Format | `cargo fmt --all -- --check` clean | `check` lane | every PR |
 | Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |
 | Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds; `#[expect(...)]` and `cfg_attr(..., allow/expect/ignore)` count as waivers | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |
-| Patch coverage | Changed lines >= 80% covered (WARN first) | `cargo llvm-cov` + `scripts/ci/check-patch-coverage.py`, `check` lane | every Rust PR |
+| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov` sweeps + per-suite guarded re-runs, merged with `llvm-cov report --workspace`, + `scripts/ci/check-patch-coverage.py`, `patch-coverage` lane with disposable Postgres (see docs/quality-gates.md) | every Rust PR |
 | Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |
-| Request-path unwrap | No new `.unwrap()` in route/handler/interaction/command/webhook files (WARN first) | ast-grep rule + `scripts/ci/check-unwrap-request-paths.py`, `check` lane | every Rust PR |
-| Rust pitfalls | No new `todo!`/`unimplemented!`, empty `.expect("")`, `panic!` in non-test code, `process::exit` in library code (WARN first) | vendored `.semgrep/rust-warn.yml` + `scripts/ci/check-semgrep-warn.py`, `check` lane | every Rust PR |
+| Worker dependencies | Nothing at high or above; audit errors fail | `npm audit --audit-level=high --include=dev --json`, `worker check` lane | every worker PR, full main and scheduled runs |
+| Request-path unwrap | No new `.unwrap()` in route/handler/interaction/command/webhook files | ast-grep rule + `scripts/ci/check-unwrap-request-paths.py`, `check` lane | every Rust PR |
+| Rust pitfalls | No new `todo!`/`unimplemented!`, empty `.expect("")`, `panic!` in non-test code, `process::exit` in library code | vendored `.semgrep/rust-warn.yml` + `scripts/ci/check-semgrep-warn.py`, `check` lane | every Rust PR |
 | Test inventory | Every test/fuzz target is built or run by some CI job | `scripts/ci/check-test-inventory.py`, `check` lane | every PR |
 | Docs build | Zero rustdoc warnings | `cargo doc --workspace --all-features --no-deps --locked` with `RUSTDOCFLAGS: -D warnings`, `check` lane | every Rust PR |
 
 Why 80% patch coverage: high enough to force a test for new logic, low
-enough to let a config line or a rename through. WARN-first (like unwrap and
-semgrep) because the codebase predates the gate; HARD once the backlog is
-worked down. Below high-or-above for dependencies is mostly noise, so the
-advisory scan stays HARD from day one.
+enough to let a config line or a rename through. Patch coverage is HARD;
+unwrap and Semgrep are HARD from the WARN-first soak; unwrap has no
+ grandfathered production-only set, and pre-existing Semgrep findings are
+ grandfathered through 2027-01-15 (docs/quality-gates.md). Existing request-path
+ unwrap findings are catalogued in
+docs/unwrap-backlog.md. Below high-or-above for dependencies is mostly noise,
+so the advisory scan stays HARD from day one.
 
 ## Measured, not yet enforced
 
@@ -82,4 +86,4 @@ its date, and the waiver fails again until someone renews the row.
 | Path glob | Waiver | Owner | Expires | Why |
 |-----------|--------|-------|---------|-----|
 | crates/*/tests/support/*.rs | `allow(dead_code)` | CI maintainers | 2027-10-11 | shared test-support module compiled into several test binaries, so each binary uses only part of it |
-| crates/discord/tests/event_store_s1.rs | `pending: S1` | S1 build card | 2026-11-12 | S1 acceptance suite pending migration, capture path and lag gauge; un-ignore and route to a lane when the S1 build lands |
+| crates/discord/tests/*.rs | `allow(dead_code)` | CI maintainers | 2027-10-11 | each integration-test binary compiles the shared `common` helper module but uses only part of it |

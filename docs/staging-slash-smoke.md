@@ -123,8 +123,35 @@ this proves the build answers readiness and the guild publishes the surface.
 | `GET /readyz` | 200 and every component ready; a parked or down container fails | `SMOKE-READYZ-NOT-READY`, `SMOKE-READYZ-CHECKPOINT-READ-FAILED` |
 | `readyz build identity` | `build_revision` equals `--expected-sha` | `SMOKE-BUILD-MISMATCH` |
 | `identity and command list` | the token is the staging application and the guild command list reads | `SMOKE-DISCORD-REFUSED` |
-| `/rank`, `/leaderboard`, `/help` | listed and their own resource is scoped to the staging guild | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
-| every other built-in | unpublished: `skipped` (gate off or publish pending); published: listed and its own resource is scoped to the staging guild | `SMOKE-REGISTRY-DETAIL-MISMATCH`, `SMOKE-DISCORD-REFUSED` |
+| `/rank`, `/leaderboard`, `/help` | listed once with an admitted identity and their own resource binds it ([registry admission](#registry-admission)) | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
+| every other built-in | unpublished: `skipped` (gate off or publish pending); published: listed once with an admitted identity and its own resource binds it | `SMOKE-REGISTRY-DETAIL-MISMATCH`, `SMOKE-DISCORD-REFUSED` |
+
+### Registry admission
+
+Both this run and `staging_automation_read_smoke.py` grade a command from
+Discord's [application-command object](https://docs.discord.com/developers/interactions/application-commands):
+`id`, `application_id` and `version` are required, `type` defaults to 1 (slash)
+when omitted and `guild_id` is optional. Every Discord read refuses duplicate
+JSON object keys at any depth. A command passes only when:
+
+- its name appears on exactly one list entry, and no other entry carries its id;
+- the listed id and version are canonical snowflakes (ASCII decimal
+  1..18446744073709551615, no sign, padding or path/query characters), checked
+  before any resource URL is built from the id;
+- the list entry and its own resource both name the staging application, the
+  fenced guild when they carry a `guild_id`, and slash type 1;
+- the resource repeats the admitted id and name and carries its own canonical
+  version.
+
+The two GETs are not an atomic snapshot: valid version drift between them is
+allowed, and the record shows the resource version. Failure reasons are fixed
+text; stdout, receipts and run records carry only admitted ids and versions,
+never remote text. A list-entry admission failure is classified as
+`SMOKE-REGISTRY-DETAIL-MISMATCH`. The automation read smoke also admits all
+four targets (`rank`, `command-list`, `schedule-list`, `feed-list`) before its
+first resource read: one malformed or ambiguous targeted entry fails that
+command and leaves the others unread. This is registration inspection only; it
+does not invoke or test any command handler.
 
 `SMOKE-READYZ-CHECKPOINT-READ-FAILED` replaces the older
 `SMOKE-READYZ-DB-BEHIND` signature for new records. It names the failed read

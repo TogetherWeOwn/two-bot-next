@@ -82,6 +82,50 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("db_store", errors[0])
 
+    def test_block_run_followed_by_name_key_does_not_cover(self):
+        files = base_files()
+        files[".github/workflows/check.yml"] = CHECK_YML.replace(
+            "- run: cargo test -p my-crate --test db_store --locked -- --ignored",
+            "- run: |\n"
+            "          true\n"
+            "        name: cargo test -p my-crate --test db_store --locked -- --ignored")
+        tmp, root = make_root(files)
+        try:
+            errors = gate.check(root)
+        finally:
+            tmp.cleanup()
+        self.assertTrue(any("db_store" in error for error in errors),
+                        f"name key after a block run must not cover: {errors}")
+
+    def test_block_run_followed_by_env_key_does_not_cover(self):
+        files = base_files()
+        files[".github/workflows/check.yml"] = CHECK_YML.replace(
+            "- run: cargo test -p my-crate --test db_store --locked -- --ignored",
+            "- run: |\n"
+            "          true\n"
+            "        env:\n"
+            "          CMD: cargo test -p my-crate --test db_store --locked -- --ignored")
+        tmp, root = make_root(files)
+        try:
+            errors = gate.check(root)
+        finally:
+            tmp.cleanup()
+        self.assertTrue(any("db_store" in error for error in errors),
+                        f"env key after a block run must not cover: {errors}")
+
+    def test_block_run_with_command_inside_covers(self):
+        files = base_files()
+        files[".github/workflows/check.yml"] = CHECK_YML.replace(
+            "- run: cargo test -p my-crate --test db_store --locked -- --ignored",
+            "- run: |\n"
+            "          cargo test -p my-crate --test db_store --locked -- --ignored\n"
+            "        name: ignored db_store lane")
+        tmp, root = make_root(files)
+        try:
+            self.assertEqual(gate.check(root), [])
+        finally:
+            tmp.cleanup()
+
     def test_skip_only_reference_does_not_cover(self):
         files = base_files()
         files[".github/workflows/nightly.yml"] = (
@@ -169,7 +213,7 @@ class FixtureTests(unittest.TestCase):
 class RealTreeTests(unittest.TestCase):
     def test_real_tree_passes_with_the_documented_exemption(self):
         self.assertEqual(gate.check(ROOT), [])
-        self.assertEqual(set(gate.EXEMPT), {"reference_docs", "event_store_s1"})
+        self.assertEqual(set(gate.EXEMPT), {"reference_docs"})
 
 
 if __name__ == "__main__":

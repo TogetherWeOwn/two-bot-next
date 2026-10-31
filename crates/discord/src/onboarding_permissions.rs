@@ -10,6 +10,7 @@ use crate::ActionExecutor;
 const ADMINISTRATOR: u64 = 1 << 3;
 const VIEW_CHANNEL: u64 = 1 << 10;
 const SEND_MESSAGES: u64 = 1 << 11;
+const CONNECT: u64 = 1 << 20;
 
 fn snowflake(value: &Value) -> Option<u64> {
     value.as_str()?.parse().ok().filter(|id| *id != 0)
@@ -31,6 +32,13 @@ pub struct MemberAccess {
 }
 
 impl MemberAccess {
+    /// Unioned guild permissions for role-manageability checks. The preview
+    /// path uses this to refuse unmanageable proposals without writing.
+    #[must_use]
+    pub fn permissions(&self) -> u64 {
+        self.permissions
+    }
+
     fn from_json(
         guild_id: u64,
         user_id: u64,
@@ -190,12 +198,25 @@ impl MemberAccess {
         if post && !matches!(kind, 0 | 2 | 5 | 13) {
             return Ok(false);
         }
-        let needed = VIEW_CHANNEL | if post { SEND_MESSAGES } else { 0 };
+        // A voice recommendation promises the member can join, not just see
+        // the lobby. Posting and text/forum visibility keep their own contract.
+        let needed = VIEW_CHANNEL
+            | if post {
+                SEND_MESSAGES
+            } else if matches!(kind, 2 | 13) {
+                CONNECT
+            } else {
+                0
+            };
         Ok(self
             .channel_permissions(channel)?
             .is_some_and(|bits| bits & needed == needed))
     }
 }
+
+#[cfg(test)]
+#[path = "onboarding_permissions_connect_acceptance_tests.rs"]
+mod connect_acceptance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -267,6 +288,24 @@ mod tests {
         }
         let forum = json!({"id":"12","guild_id":"22","type":15,"permission_overwrites":[]});
         assert_eq!(access(&[]).permits_channel(&forum, 12, false), Ok(true));
+    }
+
+    #[test]
+    fn voice_posting_does_not_require_connect() {
+        let channel = json!({"id":"12","guild_id":"22","type":2,"permission_overwrites":[
+            {"id":"44","type":1,"allow":"0","deny":CONNECT.to_string()}
+        ]});
+        assert_eq!(access(&[]).permits_channel(&channel, 12, true), Ok(true));
+        assert_eq!(access(&[]).permits_channel(&channel, 12, false), Ok(false));
+    }
+
+    #[test]
+    fn stage_lobby_connect_deny_is_not_recommended() {
+        // Discord requires Connect to join a stage channel (type 13) too.
+        let channel = json!({"id":"12","guild_id":"22","type":13,"permission_overwrites":[
+            {"id":"44","type":1,"allow":"0","deny":CONNECT.to_string()}
+        ]});
+        assert_eq!(access(&[]).permits_channel(&channel, 12, false), Ok(false));
     }
 
     #[test]

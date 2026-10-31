@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v6 dump format with v3/v4/v5 read compatibility,
+`two-bot` `main @ d5d11793`): v15 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -13,15 +13,107 @@ against scratch Postgres only (tests: agent-testdb `two_next_backup_test` /
 `two_next_restore_drill`). The restore target is a different variable
 (`TWO_RESTORE_URL`, never `TWO_DATABASE_URL`) and real restores additionally
 require `--force`. This confirmation is not authorization to target production.
+`restore` enforces the rule by value: a target that normalizes to the live
+database (scheme alias, host case, ports defaulted from `PGPORT` exactly as
+the driver seeds them, and credential/query spellings folded away;
+`?host=`/`?hostaddr=`/`?dbname=`/`?port=` overrides honored; database
+derived exactly as the driver derives it, so `//prod` names `prod`;
+socket spellings — encoded authority, `?host=`, redundant separators, `.`
+segments, trailing slash — folded component-wise),
+or whose database name is a production marker (`prod`, `production`,
+`two_prod`, `two_production`, `live`, `two_live`), is refused with a fixed
+message on stderr and exit 2 — even with `--force`, and without echoing
+either URL. A target whose effective target cannot be proven — omitted
+database, an empty `?host=`/`?hostaddr=`/`?dbname=` override, or a socket
+directory mixed with a plain host (the driver's socket slot is sticky) —
+is refused the same way: name the scratch database explicitly.
+`--dry-run` still previews without that comparison.
+
+## Stable failure codes
+
+Every `backup`, `restore`, `backup-upload`, `guild-config-snapshot` and
+`guild-config-restore` failure line
+ends with a stable `code=<snake>` token so agents can match failure classes
+without substring-matching English. The human-readable text is unchanged;
+the code is additive. Success lines (`backup: done`, `RESTORE VERIFIED`,
+`DRY RUN VERIFIED`, `guild-config-snapshot: stored`,
+`backup-upload-s3: stored`, `snapshot and drift report uploaded`) carry no
+code and are byte-identical.
+
+`two-bot backup`:
+
+- `backup_usage` — unexpected extra argument (usage refusal, exit 2).
+- `backup_missing_database_url` — `TWO_DATABASE_URL` unset or not Postgres.
+- `backup_retention_refused` — `TWO_BACKUP_KEEP` would prune every backup.
+- `backup_dest_create_failed` — cannot create the destination directory.
+- `backup_pool_open_failed` — cannot open the database pool (redacted).
+- `backup_stat_failed` — dump written but cannot be statted.
+- `backup_empty_event_log` — zero `events` rows; refusing a hollow backup.
+- `backup_dump_failed` — the dump itself failed.
+- `backup_prune_failed` — retention pruning failed.
+
+`two-bot backup-upload <dump>`:
+
+- `backup_upload_usage` — expected exactly one argument.
+- `backup_upload_not_regular_file` — the path is not a regular file.
+- `backup_upload_empty_file` — refusing to upload an empty file.
+- `backup_upload_dump_too_large` — the dump exceeds the 1 GiB cap.
+- `backup_upload_s3_target` — S3 target/env misconfigured.
+- `backup_upload_read_failed` — cannot read the dump file.
+- `backup_upload_put_status` — PUT returned a non-2xx status.
+- `backup_upload_put_failed` — the PUT request failed.
+
+`two-bot restore <dump> --force`:
+
+- `restore_live_target_refused` — `TWO_RESTORE_URL` normalizes to the live
+  database, names a production database, or cannot be proven different
+  (omitted database, empty overrides, socket/host mixes); fixed refusal,
+  exit 2, even with `--force`. `--dry-run` still previews.
+
+`two-bot guild-config-snapshot`:
+
+- `snapshot_usage` — unexpected extra argument (usage refusal, exit 2).
+- `snapshot_token_load_failed` — cannot load the staging token.
+- `snapshot_token_check_refused` — the token failed the staging check.
+- `snapshot_guild_id_failed` — `DISCORD_STAGING_GUILD_ID` missing/wrong.
+- `snapshot_governed_api_failed` — cannot build the governed API client.
+- `snapshot_identity_failed` — API identity assertion failed.
+- `snapshot_capture_failed` — guild capture failed.
+- `snapshot_atomic_write_failed` — atomic snapshot/drift write failed.
+- `snapshot_reread_failed` — cannot re-read the written snapshot.
+- `snapshot_hash_changed` — snapshot hash changed after the write.
+- `snapshot_seal_missing` — written snapshot lacks its integrity seal.
+- `snapshot_local_only_refused` — no upload command; local-only refused.
+
+`two-bot guild-config-restore --apply`:
+
+- `guild_restore_apply_failed` — a mid-apply failure; the report names
+  landed vs pending operations (labels only). Exit 1. Completion prints
+  `DID <op>` per operation only as each operation lands.
+
+Bounded upload helper (`backup` and `guild-config-snapshot`: external
+upload command; argv and child output never echoed):
+
+- `upload_exit_nonzero` — helper exited nonzero.
+- `upload_spawn_failed` — helper failed to start.
+- `upload_wait_failed` — waiting on the helper failed.
+- `upload_timed_out` — helper exceeded its 30-minute budget; terminated.
 
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v6** (including durable voice-create reservations, the retention
-queues and the event store: voice capture plus presence capture plus
-member-capture deltas plus message/reaction capture plus thread lifecycle
-plus stage/interaction-observe/audit-log capture); the reader also
-accepts frozen **v3**, pre-reservation **v4** and pre-v6 **v5**.
+write **v15** (including durable voice-create reservations, the retention
+queues, the seasonal XP projection, the event store: voice capture plus
+presence capture plus member-capture deltas plus message/reaction capture
+plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
+invite/scheduled-event capture, the stream go-live ledger, guild game-activity
+aggregates, the assistant monthly-cap ledger, the scheduled-event
+epoch-claim guard, the scheduled-event delete tombstones and the admin API
+token registry, event voice pair, three starboard tables and three giveaway tables); the reader also accepts
+frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
+pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
+pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
+pre-starboard **v13** and pre-giveaways **v14**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -54,50 +146,112 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5 and v6)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14 and v15)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **89 durable tables from the
+inventory for both dump and restore. It includes **104 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
-(`voice_create_reservations`), the retention queues
-(`retention_guild_purge_queue`, `retention_deletion_requests`) and the
-event store (voice capture plus presence capture plus member-capture deltas
-plus message/reaction capture plus thread lifecycle plus
-stage/interaction-observe/audit-log capture) (`event_store`).
-`OPTIONAL_LEGACY_TABLES` is empty: the coverage test fails if a covered table
-is not migrated. A dump from a fresh Rust schema has 92 table entries.
-A missing current table refuses a dump/restore: migrate the target first.
-A v4 archive must declare every covered table except the ones v5 added
-(`V5_ADDED_TABLES`) and the ones v6 added (`V6_ADDED_TABLES`), so recovery
-points written before create-reservation persistence remain inspectable and
-restorable. A v5 archive must declare every covered table except the v6
-tables, so recovery points written before the retention queues (0435) or
-event-store capture (0427 voice, 0428 presence, 0429 thread lifecycle,
-0430 message/reaction, 0431 stage/interaction/audit capture and 0432 member
-deltas) remain inspectable and restorable. A v4 or v5
-archive written before any other table joined the inventory is refused at
-inspect ("manifest is missing tables"); take a fresh dump after upgrading.
-V6 requires the full current inventory; an incomplete new archive refuses at
-inspection. Restoring a pre-reservation archive clears the destination's
-reservation table, and restoring a v4 or v5 archive clears the destination's
-retention queues and `event_store`, as with other tables absent from an older
-version.
+(`voice_create_reservations`), the owner-grant journal (`voice_owner_grants`,
+pending and completed recipient provenance, restored after `voice_rooms`),
+the retention queues
+(`retention_guild_purge_queue`, `retention_deletion_requests`), the seasonal
+XP projection (`member_season_xp`), the event store (voice capture plus
+presence capture plus member-capture deltas plus message/reaction capture
+plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
+invite/scheduled-event capture)
+(`event_store`: 0427 voice, 0428 presence, 0429 thread lifecycle, 0430
+message/reaction capture, 0431 stage/interaction-observe/audit-log capture
+plus 0432 member-capture deltas plus 0439 invite/scheduled-event capture)
+the stream go-live ledger (`stream_live_claims`: 0440/0443), guild game-activity
+aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
+monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
+scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
+its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
+admin API token registry (`admin_api_tokens`: 0456/0457, named-holder and
+90-day lifetime repair 0464/0463), the event voice pair
+(`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
+configuration, distinct starrers and post state (`starboard_config`,
+`starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
+entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461).
+The [registry contract](admin-registry.md) adds no table or archive version:
+new v15 dumps discover `holder_id` / `holder_kind` dynamically. Populated
+pre-holder archives refuse transactionally on the required authority columns
+instead of inventing holders; older readable archives that omit the table
+retain their versioned clearing behavior.
+`OPTIONAL_LEGACY_TABLES` is empty: the coverage
+test fails if a covered table is not migrated. A dump from a fresh Rust schema
+has 107 table entries. A missing current table refuses a dump/restore: migrate
+the target first.
+Each readable version requires its historical inventory and waives only
+versioned additions introduced later:
+
+| Version | Tables it may omit |
+| --- | --- |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (game-activity aggregates and assistant monthly-cap ledger), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v9 | `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v10 | `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v11 | `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v12 | `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`, `V15_ADDED_TABLES` (giveaway tables) |
+| v14 | `V15_ADDED_TABLES`: `giveaways`, `giveaway_entries`, `giveaway_draws` |
+| v15 | None: the full current inventory is required |
+
+These are narrow waivers, not permission to omit arbitrary tables. An
+incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
+is unchanged from before these additions. Each version may omit only the later
+additions listed in its row above. In particular, only v4–v8 may omit the v9
+`game_activity_guild_aggregates` and `assistant_monthly_builds` tables; v9 and
+later require both. The separate `guild_counters` table is never waived.
+Restoring an older archive clears
+destination rows for every omitted later table instead of retaining unrelated
+target state. Restoring v8 without the two v9 tables clears their destination
+rows; it cannot recover assistant usage that predates its persistence.
+Restoring v9 without the claim guard clears the guard, the tombstones and
+the registry and event voice pair; the mirror re-fences on the next winning fetch. Restoring a
+claim-only v10 clears the tombstones, registry and event voice pair while keeping the
+epoch fence. Restoring a tombstone-only v11 clears issued tokens; they must
+be re-issued, since secrets are shown once and cannot be re-derived. Use a
+v12 recovery point to preserve the monthly cap, both mirror fences and the
+issued tokens. Restoring v12 without the event voice pair clears both
+tables; the next tick re-claims open instances, but archived presence spans
+are lost. Use a v13 recovery point to preserve claims and spans. Use v14 to
+preserve starboard settings, starrers and post records too. Restoring a pre-v14
+archive clears those three tables, so the board is off until configured again.
+Restoring v14 clears giveaway definitions, entries and draw rounds while
+preserving starboard, event voice and issued tokens. Use v15 to preserve giveaways.
+Current v15 archives must include the monthly cap, both mirror-fence tables,
+the registry, event voice pair, starboard and giveaway tables, so routine restores
+retain their archived state. Tombstone `deleted_at` cells must be real dates in
+exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
+non-string or noncanonical values before restore opens a write transaction.
+Rollback-delta import enforces the same rule during parsing and revalidates the
+whole batch before applying constructed import rows. Values are not normalized;
+unrelated tables keep their existing timestamp behavior.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-Three application tables are excluded, each with its reason inline in
+Four application tables are excluded, each with its reason inline in
 `EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
 target cooldowns), `discord_send_admission` (per-credential lane state that a
-recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
-queue bound to a gateway session). The store chain's `rollback_journal` and
-`rollback_watermarks` are excluded too: the journal is unwired append-only
-cutover evidence (no writer calls `record` yet, and its rows are re-capturable
+recovered process re-learns), `gateway_onboarding_jobs` (a restart-recovery
+queue bound to a gateway session) and `automation_command_registry_resync`
+(the pending registry-publication marker; a recovered process republishes
+the complete custom-command set on boot regardless). The store chain's `rollback_journal` and
+`rollback_watermarks` are excluded too: the journal is append-only
+cutover evidence (the `PgFunnelStore` funnel append and the production
+gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each
+`events` insert inside the primary transaction under a savepoint best-effort
+via `journal::record_in`, and their rows stay re-capturable
 during the watch window), and restoring pre-backup watermarks could mark
 post-backup writes as already journaled, silently breaking rollback coverage.
 Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
@@ -248,6 +402,64 @@ sudo systemctl start two-bot-next-backup      # run one now
 journalctl -u two-bot-next-backup -n 30       # what it did
 ```
 
+## Unit bounds and failure signal
+
+Every `deploy/*.service` is bounded and loud. These are templates; shipping the
+directives installs nothing and starts no timer (host installation stays with the
+Operator). `scripts/test_deploy_units.py` lints every unit, so a new or edited
+unit that drops a directive fails CI naming the file. The lint also pins
+`Type=oneshot` (the start bound only applies to oneshot units) and refuses
+`TimeoutSec=` and `SuccessExitStatus=`/`RestartForceExitStatus=` overrides,
+which would silently drop the bound or the failure hook.
+
+| Unit | `TimeoutStartSec` | Why this long |
+|---|---|---|
+| `two-bot-next-backup.service` | 2 h | dump plus the 30-minute upload deadline |
+| `two-bot-next-guild-config-backup.service` | 2 h | Discord REST reads plus two sequential uploads (snapshot and drift report, 30 min each) |
+| `two-bot-next-restore-drill.service` | 2 h | scratch provision, migrate and restore |
+| `two-bot-next-failure@.service` | 30 s | the handler only writes one log line |
+
+Without a bound, a hung oneshot stays "activating" forever and its timer skips
+every later run. On expiry systemd kills the run and the unit goes `failed`.
+
+**Consuming the signal.** Each of the three units sets
+`OnFailure=two-bot-next-failure@%n.service`. A failed, timed-out or refused run
+starts that template, which writes one `crit`-priority journal line tagged
+`two-bot-next-unit-failed`: `unit failed: <unit> - inspect with journalctl -u <unit>`.
+Alert on that tag (any journal shipper that filters on priority or tag) or on
+`systemctl --failed` / the unit's `failed` state. The handler reads no
+credential, touches no database and sends nothing off the host; delivery to a
+person is the alerting layer's job. Install it next to the other units:
+
+```bash
+sudo cp deploy/two-bot-next-failure@.service /etc/systemd/system/
+journalctl -t two-bot-next-unit-failed --since -2d    # recent failures
+```
+
+**Drill archive age.** The drill refuses to restore an archive older than
+`TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S` (unit default `172800`, 48 h: one missed
+nightly run), measured from the newest `two-funnel-*.ndjson.gz` file's mtime. The
+check runs in the unit's shell script before `restore-drill` allocates any
+database, so a stopped nightly backup cannot pass against an old file. It prints
+one JSON line and, on refusal, the next action on stderr, then exits 1 (which
+fires `OnFailure=`):
+
+```json
+{"verdict":"refuse","code":"archive_stale","archive_age_s":9000000}
+```
+
+| `code` | Verdict | Next action |
+|---|---|---|
+| `archive_fresh` | pass | none; the restore proceeds |
+| `archive_stale` | refuse | the nightly backup stopped: `journalctl -u two-bot-next-backup`, fix it, take a fresh backup, rerun the drill |
+| `archive_missing` | refuse | no archive exists (`archive_age_s` is `null`): run the backup service first |
+| `archive_unreadable` | refuse | the archive cannot be inspected or opened for reading: check backup directory permissions and file ownership |
+| `archive_from_future` | refuse | the file is dated ahead of the host clock: check the clock |
+| `max_age_invalid` | refuse | set the variable to a positive whole number of seconds (no leading zero, at most 9 digits) |
+
+The check is read-only and repeatable, and prints no archive name, path or secret.
+Never `touch` an archive to make the drill pass: the age is the point.
+
 ## Off-box destination
 
 `two-bot backup-upload <file>` PUTs one dump via SigV4 single-PUT. Canonical
@@ -282,7 +494,10 @@ and re-verify hash + seal, then upload **both** via
 snapshot is an error, not success. Each upload shares the 30-minute
 bounded-helper contract from the nightly backup above: a hung helper is
 terminated and reaped (direct child only), the run fails, and both files
-stay on disk.
+stay on disk. The snapshot + drift report land in
+`TWO_GUILD_CONFIG_BACKUP_DIR` (default `./guild-config-backups`;
+`cmd_guild_config_snapshot` in `crates/bot/src/backup_cli.rs`; usage in
+`print_server_usage` in the same file).
 
 Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
 (the service's `LoadCredential` contract). Only an absent credential/no configured
@@ -299,7 +514,9 @@ roles; missing managed resources cannot silently become unresolved late writes.
 
 Restore: `two-bot guild-config-restore --snapshot FILE` plans (prints
 `WOULD …`); add `--confirm-staging-guild --apply` to write, `--evidence
-FILE` for the hash-proven receipt. Tampered backups are refused (exit 3)
+FILE` for the hash-proven receipt. Snapshots past 8 MiB are refused (exit 2)
+before buffering or any Discord read; non-regular `--snapshot` inputs
+(devices, FIFOs) are refused the same way. Tampered backups are refused (exit 3)
 before any Discord read or write; pre-seal snapshots warn and proceed.
 Apply ends with the post-restore hash compared against the remapped source:
 mismatch → exit 1 with the residual operations listed.

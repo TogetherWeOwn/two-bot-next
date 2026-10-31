@@ -8,8 +8,9 @@
 //!
 //! Executor failures map to the member-claim vocabulary: definite refusals
 //! (and local guard refusals, which never reach the wire) become `Rejected`,
-//! so the idempotency claim is safe to release; timeouts, transport/5xx
-//! failures and rate limits stay uncertain, so the claim remains `in_flight`
+//! so the idempotency claim is safe to release; a rate limit proves no
+//! effect and releases only the failed attempt. Timeouts and transport/5xx
+//! failures stay uncertain, so the claim remains `in_flight`
 //! and the sweep never guesses.
 
 use two_bot_core::member_moderation::{DiscordError as MemberError, MemberDiscord};
@@ -19,8 +20,10 @@ use super::executor::{ActionExecutor, DiscordError as ExecutorError};
 /// Map one executor failure to the member-claim vocabulary.
 ///
 /// `Rejected` proves no mutation happened. `Guard` never reaches the wire, so
-/// it is equally safe to release. Every other failure leaves the outcome
-/// unknowable: the claim stays fenced for operator reconciliation.
+/// it is equally safe to release, and `RateLimited` keeps its own variant so
+/// the service can release only the failed attempt via `proves_no_effect`.
+/// Every other failure leaves the outcome unknowable: the claim stays fenced
+/// for operator reconciliation.
 fn member_error(err: ExecutorError) -> MemberError {
     match err {
         ExecutorError::Rejected(detail) => MemberError::Rejected(detail),

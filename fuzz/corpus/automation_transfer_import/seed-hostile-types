@@ -1,0 +1,1 @@
+{"version":1,"commands":[{"name":7,"template":null},{"name":"ok","template":"hi {user}","text_trigger":123},[1,2],"str",null,{"name":"","template":""},{"name":"café 👋","description":12345,"template":"{user} {bogus} {{nested}} {oops"}],"schedules":null,"extra":{"deep":[[[{"x":1}]]]}}

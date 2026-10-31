@@ -83,7 +83,7 @@ compensating signals are independent of webhook fate:
 
 | Loss mode | What still signals it |
 |---|---|
-| Webhook POST failed or timed out | the transition log line (primary signal) plus `container_unready_webhook_failed` / `metrics_alert_webhook_failed` with type and status only |
+| Webhook POST failed or timed out | the transition log line (primary signal) plus `container_unready_webhook_failed` / `metrics_alert_webhook_failed` with type, status, release and log URL (never the binding or body) |
 | Crash between persist and notify | the latched state: the next tick sees no transition and stays silent, but the transition log is absent from the tail while state reads alerted — and the later `RESOLVED` still fires |
 | Unpaired `RESOLVED` arrives | treat as "the alert page was lost, investigate": the incident happened, the page did not |
 

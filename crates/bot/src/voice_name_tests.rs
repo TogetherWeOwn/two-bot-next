@@ -298,6 +298,291 @@ fn clicks_and_submits_parse_and_everything_else_stays_silent() {
 }
 
 #[test]
+fn hostile_name_ids_refuse_through_the_router() {
+    use two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS;
+    let click = |id: &str| component_interaction(id, None, OWNER);
+    let modal = |id: &str| modal_interaction(id, labelled_input("Den"));
+    // Valid controls stay green through both the parser and the router.
+    for room_id in [1, ROOM, u64::MAX] {
+        assert_eq!(
+            name_component_action(&click(&name_custom_custom_id(room_id))),
+            Some(NameInteraction::OpenModal { room_id })
+        );
+        assert_eq!(
+            name_component_action(&click(&name_restore_custom_id(room_id))),
+            Some(NameInteraction::Restore { room_id })
+        );
+        assert_eq!(
+            name_component_action(&modal(&name_modal_custom_id(room_id))),
+            Some(NameInteraction::Submit {
+                room_id,
+                text: "Den".to_owned(),
+            })
+        );
+        // A modal id on a button and button ids on a modal stay silent,
+        // even at the largest encodable room.
+        assert_eq!(
+            name_component_action(&click(&name_modal_custom_id(room_id))),
+            None
+        );
+        assert_eq!(
+            name_component_action(&modal_interaction(
+                &name_custom_custom_id(room_id),
+                labelled_input("Den")
+            )),
+            None
+        );
+    }
+    // Forged, truncated, separator-confused, non-numeric, control and
+    // multibyte `two:voice:name-*` ids refuse through the real router on
+    // both the button and the modal paths without panicking.
+    let hostile = [
+        // Forged verbs, prefixes and lookalikes.
+        "two:voice:Name-Custom:500",
+        "two:voice:NAME-CUSTOM:500",
+        "TWO:VOICE:name-custom:500",
+        "two:voice:name_custom:500",
+        "two:voice:name custom:500",
+        "two:voice:name-custom :500",
+        "two:voice:name-custom:500 ",
+        " two:voice:name-custom:500",
+        "two:voice:name-custom:500\n",
+        "two:lfg:name-custom:500",
+        "two:self-role:name-custom:500",
+        "two:voice:name-custom:500\u{200b}",
+        "two:voice:name-restore:500\u{feff}",
+        // Truncated shapes.
+        "two:voice:name-",
+        "two:voice:name-custom",
+        "two:voice:name-restore",
+        "two:voice:name-modal",
+        "two:voice:name-custom:",
+        "two:voice:name-restore:",
+        "two:voice:name-modal:",
+        // Separator confusion.
+        "two:voice:name-custom:500:600",
+        "two:voice:name-restore:500:600",
+        "two:voice:name-modal:500:600",
+        "two:voice:name-custom:500:",
+        "two:voice:name-custom::500",
+        "two:voice:name-custom:500::",
+        "two::voice:name-custom:500",
+        "two:voice::name-custom:500",
+        "two;voice;name-custom;500",
+        "two:voice:name-custom;500",
+        "two:voice:name-custom/500",
+        // Non-numeric, zero and overflow rooms.
+        "two:voice:name-custom:0",
+        "two:voice:name-restore:00",
+        "two:voice:name-modal:000",
+        "two:voice:name-custom:+500",
+        "two:voice:name-custom:-500",
+        "two:voice:name-custom: 500",
+        "two:voice:name-custom:0x1F4",
+        "two:voice:name-custom:1.5",
+        "two:voice:name-custom:NaN",
+        "two:voice:name-custom:abc",
+        // Control bytes, NUL and non-ASCII rooms.
+        "two:voice:name-custom:\u{0}",
+        "two:voice:name-custom:500\u{0}",
+        "two:voice:name-custom:500\u{7f}",
+        "two:voice:name-restore:500\nmore",
+        "two:voice:name-custom:\u{e9}",
+        "two:voice:name-custom:\u{1f600}",
+        "two:voice:name-custom:\u{ff15}\u{ff10}\u{ff10}",
+        "two:voice:name-modal:\u{200b}",
+    ];
+    for id in hostile {
+        assert_eq!(parse_voice_custom_id(id), None, "{id:?}");
+        assert_eq!(name_component_action(&click(id)), None, "{id:?}");
+        assert_eq!(name_component_action(&modal(id)), None, "{id:?}");
+        assert_eq!(
+            name_component_action(&modal_interaction(id, Vec::new())),
+            None,
+            "{id:?}"
+        );
+    }
+    // 2^64 overflows `u64`: built arithmetically so the source holds no
+    // 17-20 digit snowflake literal (snowflake gate).
+    let overflow = format!("two:voice:name-custom:{}", (u64::MAX as u128) + 1);
+    assert_eq!(parse_voice_custom_id(&overflow), None, "{overflow:?}");
+    assert_eq!(
+        name_component_action(&click(&overflow)),
+        None,
+        "{overflow:?}"
+    );
+    assert_eq!(
+        name_component_action(&modal(&overflow)),
+        None,
+        "{overflow:?}"
+    );
+    assert_eq!(
+        name_component_action(&modal_interaction(&overflow, Vec::new())),
+        None,
+        "{overflow:?}"
+    );
+    // Exact-boundary shape rejections refuse on both paths. The 100- and
+    // 101-byte all-`1` custom ids overflow `u64`, so they refuse on shape at
+    // any length. Lengths are pinned so the boundary cannot drift; the
+    // zero-padded pair below pins the length gate itself.
+    let custom_100 = format!("two:voice:name-custom:{}", "1".repeat(78));
+    let custom_101 = format!("two:voice:name-custom:{}", "1".repeat(79));
+    assert_eq!(custom_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
+    assert_eq!(custom_101.len(), MAX_VOICE_CUSTOM_ID_CHARS + 1);
+    for id in [&custom_100, &custom_101] {
+        assert_eq!(parse_voice_custom_id(id), None, "{id:?}");
+        assert_eq!(name_component_action(&click(id)), None, "{id:?}");
+        assert_eq!(name_component_action(&modal(id)), None, "{id:?}");
+    }
+    // Zero-padded gate pin through the real router: `parse_id` accepts
+    // leading zeros, so the exactly-100-byte room `000…0500` (value 500)
+    // opens the modal while the 101-byte form refuses on both paths.
+    // Deleting the length gate (or an off-by-one `>=`) flips these asserts.
+    let zero_100 = format!("two:voice:name-custom:{}{}", "0".repeat(75), 500);
+    let zero_101 = format!("two:voice:name-custom:{}{}", "0".repeat(76), 500);
+    assert_eq!(zero_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
+    assert_eq!(zero_101.len(), MAX_VOICE_CUSTOM_ID_CHARS + 1);
+    assert_eq!(
+        name_component_action(&click(&zero_100)),
+        Some(NameInteraction::OpenModal { room_id: 500 })
+    );
+    assert_eq!(parse_voice_custom_id(&zero_101), None, "{zero_101:?}");
+    assert_eq!(
+        name_component_action(&click(&zero_101)),
+        None,
+        "{zero_101:?}"
+    );
+    assert_eq!(
+        name_component_action(&modal(&zero_101)),
+        None,
+        "{zero_101:?}"
+    );
+    // Multibyte boundary: 39 `é` are 78 bytes, so with the 22-byte custom
+    // prefix the id is exactly 100 bytes; 40 `é` are 102 bytes. Both refuse.
+    // One emoji is one char but two UTF-16 units and four bytes.
+    let multi_100 = format!("two:voice:name-custom:{}", "é".repeat(39));
+    let multi_over = format!("two:voice:name-custom:{}", "é".repeat(40));
+    assert_eq!(multi_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
+    assert!(multi_over.len() > MAX_VOICE_CUSTOM_ID_CHARS);
+    for id in [&multi_100, &multi_over] {
+        assert_eq!(parse_voice_custom_id(id), None, "{id:?}");
+        assert_eq!(name_component_action(&click(id)), None, "{id:?}");
+        assert_eq!(name_component_action(&modal(id)), None, "{id:?}");
+    }
+    let emoji_over = format!("two:voice:name-custom:{}", "\u{1f600}".repeat(25));
+    assert!(emoji_over.len() > MAX_VOICE_CUSTOM_ID_CHARS);
+    assert!(emoji_over.chars().count() < MAX_VOICE_CUSTOM_ID_CHARS);
+    assert_eq!(parse_voice_custom_id(&emoji_over), None);
+    assert_eq!(name_component_action(&click(&emoji_over)), None);
+}
+
+#[tokio::test]
+async fn hostile_clicks_refuse_at_the_router_and_valid_flow_still_applies() {
+    // Hostile button ids never become a `NameInteraction` through the real
+    // router, and the next valid step still applies, so a hostile battery
+    // cannot confuse the state machine. This test never feeds the worker,
+    // so it asserts no worker state here; hostile-input worker-write and
+    // trace coverage lives in
+    // `hostile_runtime_clicks_are_unowned_and_echo_nothing`, which routes
+    // through the real runtime.
+    let (mut worker, trace) = setup().await;
+    let overlong = format!("two:voice:name-custom:{}", "1".repeat(79));
+    // 2^64 overflows `u64`: built arithmetically so the source holds no
+    // 17-20 digit snowflake literal (snowflake gate).
+    let overflow = format!("two:voice:name-custom:{}", (u64::MAX as u128) + 1);
+    let hostile: Vec<&str> = vec![
+        "two:voice:Name-Custom:500",
+        "two:voice:name-custom:500:600",
+        "two:voice:name-custom:500:",
+        "two:voice:name-custom::500",
+        "two:voice:name-custom:0",
+        "two:voice:name-custom:+500",
+        "two:voice:name-custom:abc",
+        &overflow,
+        "two:voice:name-custom:\u{0}",
+        "two:voice:name-custom:500\u{0}",
+        "two:voice:name-custom:\u{1f600}",
+        "two:voice:name-restore:500\nmore",
+        &overlong,
+    ];
+    for id in hostile.iter().copied() {
+        let click = component_interaction(id, None, OWNER);
+        assert_eq!(name_component_action(&click), None, "{id:?}");
+        let submitted = modal_interaction(id, labelled_input("Den"));
+        assert_eq!(name_component_action(&submitted), None, "{id:?}");
+    }
+    // The valid panel flow still runs after the hostile battery.
+    applied(worker.apply_name(command(OWNER, false, submit("Den")), 0));
+    assert_eq!(
+        worker.custom_names.get(&ROOM).map(String::as_str),
+        Some("Den")
+    );
+    drain(&mut worker).await;
+    let entries = trace.lock().unwrap().clone();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.contains("save_custom_name:500")),
+        "{entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| hostile.iter().any(|id| entry.contains(*id))),
+        "hostile input is never echoed: {entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn hostile_runtime_clicks_are_unowned_and_echo_nothing() {
+    // Through the real runtime, hostile name clicks are not owned and
+    // produce no reply, so hostile bytes never reach a response. A valid
+    // panel click immediately after still owns and answers.
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let names = directory();
+    // `ownership_room_runtime` publishes the room through the real actor, so
+    // the trace already holds its setup writes (`create`, `persist:500`,
+    // `move:300:500`). Settle, then clear, so the empty-trace assertion below
+    // isolates the hostile phase instead of the setup.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    trace.lock().unwrap().clear();
+    for id in [
+        "two:voice:Name-Custom:500",
+        "two:voice:name-custom:500:600",
+        "two:voice:name-custom:0",
+        "two:voice:name-custom:500\u{0}",
+        "two:voice:name-custom:\u{1f600}",
+    ] {
+        let click = with_user(component_interaction(id, None, OWNER), OWNER);
+        let (owned, response) = name_capture_full(&runtime, &click, &names).await;
+        assert!(!owned, "{id:?}");
+        assert!(response.is_none(), "{id:?}");
+        let submitted = modal_interaction(id, labelled_input("Den"));
+        let submitted = with_user(submitted, OWNER);
+        let (owned, response) = name_capture_full(&runtime, &submitted, &names).await;
+        assert!(!owned, "{id:?}");
+        assert!(response.is_none(), "{id:?}");
+    }
+    // Hostile clicks reached the real runtime above, so an empty trace here
+    // proves they queued no worker write and emitted no Discord call. The
+    // actor runs concurrently, so settle before asserting.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "hostile runtime clicks write nothing: {:?}",
+        trace.lock().unwrap()
+    );
+    let click = component_interaction(&name_custom_custom_id(500), None, OWNER);
+    let (owned, response) = name_capture_full(&runtime, &click, &names).await;
+    assert!(owned);
+    let modal = response.expect("valid custom button still opens the modal");
+    assert_eq!(modal.kind, InteractionResponseType::Modal);
+}
+
+#[test]
 fn name_is_a_gated_voice_command_named_name() {
     let interaction = voice_interaction(Some(command_data("name", Vec::new())), None, true);
     assert_eq!(parse_voice_command(&interaction), Some(VoiceCommand::Name));
@@ -1217,4 +1502,215 @@ async fn an_unreadable_settings_store_refuses_a_name_instead_of_guessing() {
     let (owned, response) = name_capture_full(&runtime, &submitted, &directory()).await;
     assert!(owned);
     assert!(response_text(&response.expect("reply")).contains("Voice settings are unavailable"));
+}
+
+// --- custom-name re-render regression pins (review round 2, PR #1232) --------
+// These pin the stale-directory fix and the new re-render gates. They live
+// here (not in voice_name_rerender_tests.rs, which must stay verbatim).
+
+/// A `/name` submit renders from the interaction's fresh directory while the
+/// background re-render reads the worker's copy: the submit must copy the
+/// fresh owner name over, so a later join keeps the promised name.
+#[tokio::test]
+async fn submit_syncs_fresh_owner_name_so_a_later_join_keeps_it() {
+    let (mut worker, trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "Template @@num@@".to_owned();
+    // The worker still holds a stale nickname for the owner.
+    worker.name_directory.insert(OWNER, "Alice".to_owned());
+    // The submit sees the fresh nickname.
+    let mut cmd = command(OWNER, false, submit("@@owner@@'s den"));
+    cmd.directory.insert(OWNER, "Bob".to_owned());
+    let text = applied(worker.apply_name(cmd, 0));
+    assert!(text.contains("Bob's den"), "{text}");
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+
+    // A later occupant join re-renders the stored override: it must keep
+    // the promised Bob render, not fall back to the stale Alice one.
+    worker.live.voice_update(302, Some(ROOM), Some(false));
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&ROOM], "Bob's den");
+    assert_eq!(
+        worker.custom_names.get(&ROOM).map(String::as_str),
+        Some("@@owner@@'s den")
+    );
+}
+
+/// Same as above for restore: the restore reply promises a render from the
+/// interaction's fresh facts, so it must sync them into the worker too.
+#[tokio::test]
+async fn restore_syncs_fresh_owner_name_so_a_later_join_keeps_it() {
+    let (mut worker, _trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "@@owner@@'s hub".to_owned();
+    worker.name_directory.insert(OWNER, "Alice".to_owned());
+    let mut cmd = command(OWNER, false, restore());
+    cmd.directory.insert(OWNER, "Bob".to_owned());
+    let text = applied(worker.apply_name(cmd, 0));
+    assert!(text.contains("Bob's hub"), "{text}");
+    drain(&mut worker).await;
+
+    worker.live.voice_update(302, Some(ROOM), Some(false));
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&ROOM], "Bob's hub");
+    assert!(worker.custom_names.is_empty());
+}
+
+/// A literal override carries no template syntax under a templated creator,
+/// so no fact change can alter its render: a join must not rename it.
+#[tokio::test]
+async fn literal_override_under_a_templated_creator_is_never_rerendered() {
+    let (mut worker, trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "@@owner@@'s den".to_owned();
+    worker.name_directory.insert(OWNER, "Alex".to_owned());
+    worker.custom_names.insert(ROOM, "my room".to_owned());
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    worker.live.voice_update(302, Some(ROOM), Some(false));
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert_eq!(
+        worker.custom_names.get(&ROOM).map(String::as_str),
+        Some("my room")
+    );
+}
+
+/// An occupancy-only override reads no display names, so an unknown owner
+/// must not make the re-render wait.
+#[tokio::test]
+async fn occupancy_only_override_does_not_wait_for_an_unknown_owner() {
+    let (mut worker, trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "Template @@num@@".to_owned();
+    // The worker knows nobody: setup loads with an empty directory.
+    worker.custom_names.insert(ROOM, "@@num@@ here".to_owned());
+    worker.refresh_template_names(0);
+    assert!(worker.name_waits.is_empty());
+    assert!(worker.dispatch_one(0).await);
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:2 here".to_owned()]);
+}
+
+// --- custom-name re-render regression pins (review round 3, PR #1232) --------
+// These pin the remainder of the same list: the blank-template gate, the
+// override name wait, and the original-creator sync. They live here (not in
+// voice_name_rerender_tests.rs, which must stay verbatim). Each fails under
+// its own mutant and passes on the fixed head.
+
+/// Under a blank creator template the room stays manually managed, override
+/// or not: a tokened override must never spend a rename. Kills the
+/// `(true || template.is_some())` mutant at the re-render gate.
+#[tokio::test]
+async fn blank_template_with_a_tokened_override_is_never_rerendered() {
+    let (mut worker, trace) = setup().await;
+    // The fixture creator template is blank by default: keep it blank so the
+    // room is manually managed even though the override reads facts.
+    assert!(
+        worker.creators[&CREATOR].name_template.trim().is_empty(),
+        "fixture creator must start blank"
+    );
+    worker.custom_names.insert(ROOM, "@@num@@ here".to_owned());
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    worker.live.voice_update(302, Some(ROOM), Some(false));
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+/// An `@@owner@@` override with an unknown owner must wait for the name
+/// instead of renaming the room to "member's den". Kills the
+/// force-`unknown`-to-false mutant in `refresh_custom_name`.
+#[tokio::test]
+async fn owner_override_with_an_unknown_owner_waits_for_the_name() {
+    let (mut worker, trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "Template @@num@@".to_owned();
+    // The worker knows nobody: setup loads with an empty directory, so the
+    // owner display name is unknown.
+    worker
+        .custom_names
+        .insert(ROOM, "@@owner@@'s den".to_owned());
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    assert!(
+        worker.name_waits.contains_key(&ROOM),
+        "the room must wait for its owner name"
+    );
+    worker.name_directory.insert(OWNER, "Alex".to_owned());
+    worker.refresh_template_names(1);
+    drain(&mut worker).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Alex's den".to_owned()]);
+}
+
+/// A `/name` submit must sync the fresh original-creator name (not just the
+/// owner), so a later join keeps the promised render when the two differ.
+/// Kills the `[owner_id, original_creator_id] -> [owner_id, owner_id]`
+/// mutants on the submit/restore copy loops.
+#[tokio::test]
+async fn submit_syncs_differing_original_creator_name_so_a_later_join_keeps_it() {
+    let (mut worker, trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "Template @@num@@".to_owned();
+    worker.rooms.get_mut(&ROOM).unwrap().original_creator_id = GUEST;
+    // The worker still holds a stale nickname for the original creator,
+    // while the submit sees the fresh one (`directory()` maps GUEST to Ben).
+    worker.name_directory.insert(GUEST, "Stale".to_owned());
+    let text = applied(worker.apply_name(
+        command(OWNER, false, submit("@@original_creator@@'s den")),
+        0,
+    ));
+    assert!(text.contains("Ben's den"), "{text}");
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+
+    worker.live.voice_update(302, Some(ROOM), Some(false));
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&ROOM], "Ben's den");
+}
+
+async fn lost_name_worker_reply(drop_reply: bool) {
+    let (runtime, mut rx) = stalled_worker_runtime();
+    let interaction = voice_interaction_as(Some(command_data("name", vec![])), None, OWNER);
+    let names = directory();
+    let call = name_capture_full(&runtime, &interaction, &names);
+    tokio::pin!(call);
+    let command = tokio::select! {
+        command = rx.recv() => command.expect("accepted name command"),
+        _ = &mut call => panic!("name handler did not reach its worker boundary"),
+    };
+    assert!(matches!(command, ActorCommand::Name { .. }));
+    // Keep the inbox live in both cases; only the accepted reply is lost.
+    let held = if drop_reply {
+        drop(command);
+        None
+    } else {
+        Some(command)
+    };
+    let (owned, response) = bounded_sibling_wait(&mut call).await;
+    assert!(owned);
+    assert_sibling_worker_lost_reply(&response.expect("one name failure reply"));
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_name_worker_reply_returns_honest_user_copy() {
+    lost_name_worker_reply(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_name_worker_reply_returns_honest_user_copy() {
+    lost_name_worker_reply(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn name_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    let command = NameCommand {
+        actor_id: MEMBER,
+        is_admin: false,
+        request: restore(),
+        settings: NameSettings::default(),
+        directory: directory(),
+        policy: policy(&[]),
+    };
+    assert!(bounded_sibling_wait(runtime.run_name(GUILD, command))
+        .await
+        .is_none());
 }

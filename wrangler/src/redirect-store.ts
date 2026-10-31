@@ -94,6 +94,13 @@ const LOOKUP_SQL = `SELECT slug, invite_code, label, disabled_at, created_at
 export const DEFAULT_HIT_TTL_MS = 30_000;
 export const MAX_NEGATIVE_TTL_MS = 2_000;
 export const DEFAULT_MAX_ENTRIES = 1_024;
+/**
+ * Snapshot row cap: the snapshot path holds at most what the live path
+ * caches, so an unbounded config array cannot grow isolate memory or lookup
+ * cost past the live bound. Over-cap snapshots are refused whole, like any
+ * other malformed snapshot — never silently truncated.
+ */
+export const SNAPSHOT_ROW_CAP = DEFAULT_MAX_ENTRIES;
 
 const INSERT_CLICK_SQL = `INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
   VALUES ('invite_click', NULL, $1, $2, $3, $4, $5)
@@ -116,6 +123,7 @@ export function parseMappingsSnapshot(json: unknown): Campaign[] {
     if (typeof json !== "string") throw new Error();
     const rows: unknown = JSON.parse(json);
     if (!Array.isArray(rows)) throw new Error();
+    if (rows.length > SNAPSHOT_ROW_CAP) throw new Error();
     const seen = new Set<string>();
     return rows.map((row: unknown) => {
       if (row === null || typeof row !== "object" || Array.isArray(row)) throw new Error();
@@ -201,7 +209,7 @@ export class CampaignLookupCache {
 export class RedirectStore {
   private db: HyperdriveLike | undefined;
   private connect: ConnectFn | undefined;
-  private snapshot: Campaign[];
+  private snapshotIndex: Map<string, Campaign>;
   private timeoutMs: number;
   private lookupCache: CampaignLookupCache;
 
@@ -214,7 +222,15 @@ export class RedirectStore {
   ) {
     this.db = db;
     this.connect = connect;
-    this.snapshot = snapshot;
+    // Built-once index: snapshot lookups are O(1), and mutating the caller's
+    // array after construction cannot change results. First row wins on
+    // duplicate slugs, matching the previous Array.find scan.
+    this.snapshotIndex = new Map();
+    for (const campaign of snapshot) {
+      if (!this.snapshotIndex.has(campaign.slug)) {
+        this.snapshotIndex.set(campaign.slug, campaign);
+      }
+    }
     this.timeoutMs = timeoutMs;
     this.lookupCache = lookupCache;
   }
@@ -227,7 +243,7 @@ export class RedirectStore {
   async lookup(slug: string): Promise<Campaign | null> {
     if (!isValidSlug(slug)) return null;
     if (!this.live) {
-      return this.snapshot.find((c) => c.slug === slug) ?? null;
+      return this.snapshotIndex.get(slug) ?? null;
     }
     const cached = this.lookupCache.get(slug);
     if (cached !== undefined) return cached.value;

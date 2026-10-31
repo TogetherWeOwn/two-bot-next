@@ -46,6 +46,12 @@ jobs:
       contents: read
     if: github.ref == 'refs/heads/main'
     environment: voice-synthetic
+    # Staging lifecycle exclusion: this job and the staging deploy job share
+    # one fixed non-cancelling group, so a deploy cannot restart the container
+    # mid-lifecycle. Workflow-level serialization stays unchanged.
+    concurrency:
+      group: staging-lifecycle
+      cancel-in-progress: false
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'synthetic') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
@@ -70,13 +76,14 @@ jobs:
             echo "::error::TWO_VOICE_SYNTHETIC_BOT_TOKEN missing and the voice gate is required (set VOICE_SYNTHETIC_REQUIRED=false to opt out)"
             exit 1
           fi
-          # One retry absorbs a transient gateway/REST hiccup; two failures fail the run.
-          for attempt in 1 2; do
+          # Two retries absorb a transient gateway/REST hiccup and the documented
+          # 95-139 s per-deploy gateway drop; three failures fail the run.
+          for attempt in 1 2 3; do
             if python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
               exit 0
             fi
             echo "::warning::voice synthetic attempt $attempt failed"
-            [ "$attempt" = 2 ] || sleep 30
+            [ "$attempt" = 3 ] || sleep 60
           done
           exit 1
       - name: Upload the evidence

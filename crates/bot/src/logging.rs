@@ -202,6 +202,44 @@ where
     }
 }
 
+/// Build identity stamped on every JSON line (docs/logging.md): the image's
+/// git SHA, `"unknown"` for local builds. `build_sha` names the built commit
+/// and `release` the released commit; the single-image deploy makes them the
+/// same value, so both keys carry it rather than inventing a second source.
+const BUILD_REVISION: &str = match option_env!("BOT_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
+
+/// Span carrying the end-to-end correlation id (see
+/// `two_bot_core::internal_actions::REQUEST_ID_HEADER`). Receivers enter one
+/// per request and queued follow-up tasks inherit it, so every request-scoped
+/// line joins across Worker, Durable Object, container and queued work.
+pub fn request_span(request_id: &str) -> tracing::Span {
+    tracing::info_span!("request", request_id = %request_id)
+}
+
+/// Correlation id for a request span: the inbound `x-request-id` when it has
+/// a generated shape, else a fresh [`two_bot_core::internal_actions`]
+/// id. Only the validated shape is ever honored or logged, so a
+/// caller-supplied secret can never become a join key.
+pub fn incoming_request_id(headers: &axum::http::HeaderMap) -> String {
+    use two_bot_core::internal_actions::{is_request_id, new_request_id, REQUEST_ID_HEADER};
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| is_request_id(value))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    elapsed.as_millis().try_into().unwrap_or(u64::MAX)
+                });
+            new_request_id(now_ms, &rand::random())
+        })
+}
+
 struct CorrelationSpans;
 
 impl<S: Subscriber> Filter<S> for CorrelationSpans {
@@ -210,6 +248,7 @@ impl<S: Subscriber> Filter<S> for CorrelationSpans {
             && (metadata.fields().field("run_id").is_some()
                 || metadata.fields().field("guild_id").is_some()
                 || metadata.fields().field("interaction_id").is_some()
+                || metadata.fields().field("request_id").is_some()
                 // server.rs's redacted request span: tower-http parents its
                 // request/failure events on it, so it must exist even when
                 // DEBUG spans are filtered out or those events lose the run.
@@ -270,7 +309,7 @@ where
         }
         let mut correlation = Map::new();
         for span in &spans {
-            for key in ["interaction_id", "guild_id", "run_id"] {
+            for key in ["interaction_id", "guild_id", "run_id", "request_id"] {
                 if let Some(value) = span.get(key) {
                     correlation.insert(key.to_owned(), value.clone());
                 }
@@ -321,6 +360,8 @@ where
         );
         fields.insert("msg".into(), msg.into());
         fields.insert("target".into(), metadata.target().into());
+        fields.insert("build_sha".into(), BUILD_REVISION.into());
+        fields.insert("release".into(), BUILD_REVISION.into());
         let line = serde_json::to_string(&fields).map_err(|_| fmt::Error)?;
         writeln!(writer, "{line}")
     }
@@ -334,54 +375,159 @@ fn is_event_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
 }
 
+/// In-memory JSON log capture for receiver redaction tests (see
+/// `eventsub_http::tests`): drives the production formatter so the test
+/// proves what staging would emit, not a fixture shape.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'a> MakeWriter<'a> for Capture {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[cfg(test)]
+impl Capture {
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+
+    pub(crate) fn lines(&self) -> Vec<Value> {
+        self.text()
+            .lines()
+            .map(|line| {
+                let value: Value = serde_json::from_str(line).unwrap();
+                assert!(value.is_object());
+                for key in ["ts", "level", "msg", "target"] {
+                    assert!(value[key].is_string(), "missing string {key}: {line}");
+                }
+                assert!(!line.contains('\u{1b}'));
+                value
+            })
+            .collect()
+    }
+}
+
+/// Production JSON subscriber writing into a [`Capture`]: the redaction tests'
+/// entry point to the real envelope (build identity, span promotion).
+#[cfg(test)]
+pub(crate) fn capture_subscriber(capture: Capture) -> Box<dyn Subscriber + Send + Sync> {
+    subscriber(LogFormat::Json, filter(None, None), capture)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use super::*;
 
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+    #[test]
+    fn every_line_carries_build_sha_and_release() {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(
+            subscriber(LogFormat::Json, filter(None, None), capture.clone()),
+            || {
+                tracing::info!(msg = "ready");
+                tracing::warn!(msg = "shard_closed");
+                // Application fields must not spoof build identity.
+                tracing::info!(msg = "ready", build_sha = "spoof", release = "spoof");
+            },
+        );
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            for key in ["build_sha", "release"] {
+                assert!(
+                    line[key].as_str().is_some_and(|v| !v.is_empty()),
+                    "missing {key}: {line}"
+                );
+                assert_ne!(line[key], "spoof", "{key} must not be spoofable: {line}");
+            }
         }
     }
 
-    impl<'a> MakeWriter<'a> for Capture {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+    #[test]
+    fn incoming_request_id_honors_only_generated_shapes() {
+        use two_bot_core::internal_actions::{is_request_id, REQUEST_ID_HEADER};
+        let sent = two_bot_core::internal_actions::new_request_id(1_720_000_000_000, &[7u8; 16]);
+        let honored = axum::http::HeaderMap::from_iter([(
+            axum::http::header::HeaderName::from_static(REQUEST_ID_HEADER),
+            axum::http::header::HeaderValue::from_str(&sent).unwrap(),
+        )]);
+        assert_eq!(incoming_request_id(&honored), sent);
+        for bad in [
+            "Bearer synthetic-id-secret",
+            "https://user:synthetic-id-secret@example.invalid/",
+            "short",
+        ] {
+            let headers = axum::http::HeaderMap::from_iter([(
+                axum::http::header::HeaderName::from_static(REQUEST_ID_HEADER),
+                axum::http::header::HeaderValue::from_str(bad).unwrap(),
+            )]);
+            let minted = incoming_request_id(&headers);
+            assert!(is_request_id(&minted), "must mint a fresh id for {bad:?}");
+            assert_ne!(minted, bad);
         }
+        let minted = incoming_request_id(&axum::http::HeaderMap::new());
+        assert!(is_request_id(&minted), "missing header must mint an id");
     }
 
-    impl Capture {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-
-        fn lines(&self) -> Vec<Value> {
-            self.text()
-                .lines()
-                .map(|line| {
-                    let value: Value = serde_json::from_str(line).unwrap();
-                    assert!(value.is_object());
-                    for key in ["ts", "level", "msg", "target"] {
-                        assert!(value[key].is_string(), "missing string {key}: {line}");
-                    }
-                    assert!(!line.contains('\u{1b}'));
-                    value
-                })
-                .collect()
-        }
+    #[test]
+    fn request_id_promotes_from_spans_with_event_precedence() {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(
+            subscriber(LogFormat::Json, filter(None, None), capture.clone()),
+            || {
+                let outer = tracing::info_span!("request", request_id = "outer-id").entered();
+                tracing::info!(msg = "ready");
+                let inner = tracing::info_span!("request", request_id = "inner-id").entered();
+                tracing::info!(msg = "ready");
+                tracing::info!(msg = "ready", request_id = "explicit-id");
+                drop(inner);
+                drop(outer);
+                tracing::info!(msg = "ready");
+            },
+        );
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["request_id"], "outer-id");
+        // Inner span wins over outer; explicit event field wins over spans.
+        assert_eq!(lines[1]["request_id"], "inner-id");
+        assert_eq!(lines[2]["request_id"], "explicit-id");
+        assert!(lines[3].get("request_id").is_none());
+        // Correlation survives restrictive filters: the request span stays
+        // available (via `CorrelationSpans`) while quiet events stay off.
+        let strict = Capture::default();
+        tracing::subscriber::with_default(
+            subscriber(LogFormat::Json, filter(None, Some("error")), strict.clone()),
+            || {
+                let outer = tracing::info_span!("request", request_id = "outer-id").entered();
+                tracing::warn!(msg = "shard_closed");
+                tracing::error!(msg = "gateway_failed");
+                drop(outer);
+            },
+        );
+        let lines = strict.lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["msg"], "gateway_failed");
+        assert_eq!(lines[0]["request_id"], "outer-id");
     }
 
     #[test]
@@ -954,6 +1100,88 @@ mod tests {
         assert!(!capture.lines().is_empty());
         assert!(!capture.text().contains("do-not-log-this-query"));
         assert!(!capture.text().contains("access_token"));
+    }
+
+    /// The `x-request-id` join key: a generated-shape inbound value is honored
+    /// on every request-scoped line; anything else (bearer-looking secrets,
+    /// URLs, free text, or a missing header) mints a fresh id and never logs
+    /// the attacker value.
+    #[tokio::test]
+    async fn request_id_header_is_honored_or_minted() {
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        async fn request_lines(
+            header: Option<&str>,
+        ) -> (axum::http::StatusCode, Vec<Value>, String) {
+            let capture = Capture::default();
+            let state = crate::server::SharedState::new(
+                Arc::new(tokio::sync::RwLock::new(
+                    crate::gateway::GatewayState::Unconfigured,
+                )),
+                None,
+            );
+            let mut builder = axum::http::Request::builder().uri("/health");
+            if let Some(value) = header {
+                builder = builder.header("x-request-id", value);
+            }
+            let request = builder.body(axum::body::Body::empty()).unwrap();
+            let response = crate::server::router(state)
+                .oneshot(request)
+                .with_subscriber(subscriber(
+                    LogFormat::Json,
+                    filter(Some("debug"), None),
+                    capture.clone(),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = capture.text();
+            (status, capture.lines(), text)
+        }
+
+        let sent = two_bot_core::internal_actions::new_request_id(1_720_000_000_000, &[7u8; 16]);
+        let (status, lines, _) = request_lines(Some(&sent)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            lines.iter().any(|line| line["request_id"] == sent),
+            "honored id missing: {lines:?}"
+        );
+
+        for attacker in [
+            "Bearer synthetic-header-secret",
+            "https://user:synthetic-url-secret@example.invalid/",
+            "not-an-id",
+        ] {
+            let (status, lines, text) = request_lines(Some(attacker)).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert!(
+                !text.contains("synthetic-header-secret") && !text.contains("synthetic-url-secret"),
+                "attacker header value reached logs: {text}"
+            );
+            let minted: Vec<_> = lines
+                .iter()
+                .filter_map(|line| line["request_id"].as_str())
+                .collect();
+            assert!(!minted.is_empty(), "minted id missing: {lines:?}");
+            assert!(
+                minted
+                    .iter()
+                    .copied()
+                    .all(two_bot_core::internal_actions::is_request_id),
+                "minted id has wrong shape: {minted:?}"
+            );
+        }
+
+        let (status, lines, _) = request_lines(None).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            lines
+                .iter()
+                .filter_map(|line| line["request_id"].as_str())
+                .any(two_bot_core::internal_actions::is_request_id),
+            "missing header must still mint an id: {lines:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

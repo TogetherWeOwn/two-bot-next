@@ -278,6 +278,134 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v6", results["PASS manifest"])
 
+    def test_current_dump_version_7_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=7)),
+                              mtime=2_070_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v7", results["PASS manifest"])
+
+    def test_current_dump_version_8_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=8)),
+                              mtime=2_080_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v8", results["PASS manifest"])
+
+    def test_current_dump_version_9_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=9)),
+                              mtime=2_090_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v9", results["PASS manifest"])
+
+    def test_current_dump_version_10_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=10)),
+                              mtime=2_100_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v10", results["PASS manifest"])
+
+    def test_current_dump_version_11_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=11)),
+                              mtime=2_110_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v11", results["PASS manifest"])
+
+    def test_current_dump_version_12_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=12)),
+                              mtime=2_120_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v12", results["PASS manifest"])
+
+    def test_current_dump_version_13_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=13)),
+                              mtime=2_130_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v13", results["PASS manifest"])
+
+    def test_current_dump_version_14_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=14)),
+                              mtime=2_140_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v14", results["PASS manifest"])
+
+    def test_current_dump_version_15_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=15)),
+                              mtime=2_150_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v15", results["PASS manifest"])
+
+    def assert_invalid_created_at(self, value):
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                              archive_lines(manifest(createdAt=value)))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, results, summary = self.probe()
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(code, 1)
+        self.assertEqual(set(results), {"FAIL manifest", "FAIL sequences", "PASS readyz",
+                                        "PASS deploy-config"})
+        self.assertEqual(results["FAIL manifest"],
+                         "FAIL manifest: manifest has invalid createdAt timestamp")
+        self.assertEqual(results["FAIL sequences"],
+                         "FAIL sequences: no valid backup manifest to compare against")
+        self.assertEqual(summary, "rollback readiness: 2/4 checks passed")
+        self.assertNotIn(value, "\n".join(results.values()))
+
+    def test_unicode_digit_created_at_refuses_without_echo(self):
+        timestamp = "2026-10-02T04:17:00.123456789+23:59"
+        for digits in ("٠١٢٣٤٥٦٧٨٩", "０１２３４５６７８９"):
+            translation = str.maketrans("0123456789", digits)
+            for match in re.finditer(r"[0-9]+", timestamp):
+                value = (timestamp[:match.start()] + match[0].translate(translation)
+                         + timestamp[match.end():])
+                with self.subTest(value=value):
+                    self.assert_invalid_created_at(value)
+
+    def test_out_of_range_created_at_offsets_refuse_without_echo(self):
+        for offset in ("+24:00", "-24:00", "+23:60", "-23:60"):
+            with self.subTest(offset=offset):
+                self.assert_invalid_created_at("2026-10-02T04:17:00" + offset)
+
+    def test_invalid_created_at_fraction_lengths_refuse_without_echo(self):
+        for fraction in ("", "1234567890"):
+            for zone in ("Z", "+23:59", "-23:59"):
+                value = f"2026-10-02T04:17:00.{fraction}{zone}"
+                with self.subTest(value=value):
+                    self.assertLess(len(value), probe.CREATED_AT_MAX_LEN)
+                    self.assert_invalid_created_at(value)
+
+    def test_created_at_ascii_fraction_and_offset_boundaries_pass(self):
+        for fraction in ("", ".1", ".123456789"):
+            for zone in ("Z", "+00:00", "-00:00", "+23:59", "-23:59"):
+                value = f"2026-10-02T04:17:00{fraction}{zone}"
+                with self.subTest(value=value):
+                    self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                                          archive_lines(manifest(createdAt=value)))
+                    code, results, summary = self.probe()
+                    self.assertEqual(code, 0, results)
+                    self.assertIn(f"createdAt {value}, eventsSequence", results["PASS manifest"])
+                    self.assertEqual(summary, "rollback readiness: 4/4 checks passed")
+
+    def test_decompressed_reader_stops_at_cap_plus_one(self):
+        cap = 16
+        for prefix in (b"", b"x" * (cap - 2) + b"\n"):
+            with self.subTest(prefix_bytes=len(prefix)), mock.patch.object(probe, "DECOMPRESSED_CAP", cap):
+                raw = io.BytesIO(prefix + b"x" * 64)
+                stream = probe.BudgetedStream(raw)
+                if prefix:
+                    self.assertEqual(probe.read_line(stream), prefix)
+                with self.assertRaisesRegex(probe.ProbeError, "^archive exceeds decompressed byte cap$"):
+                    probe.read_line(stream)
+                self.assertEqual(raw.tell(), cap + 1)
+                self.assertEqual(stream.total, cap + 1)
+
     def test_single_failure_fails_only_that_check(self):
         missing_guild = CONFIG.replace('TWO_GUILD_NAME = "TogetherWeOwn"\n', "")
         cases = {
@@ -377,7 +505,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "empty archive": ([], None, "is empty"),
             "manifest not JSON": ([b"{manifest", *good[1:]], None, "manifest line is not JSON"),
             "row before manifest": (good[1:], None, "first line is not a manifest"),
-            "unknown version": (lines(version=7), None, "manifest version 7 is not one of (3, 4, 5, 6)"),
+            "unknown version": (lines(version=16), None, "manifest version 16 is not one of (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)"),
             "boolean version": (lines(version=True), None, "manifest version True"),
             "no createdAt": (lines(createdAt=None), None, "no createdAt timestamp"),
             "negative eventsSequence": (lines(eventsSequence=-1), None, "invalid eventsSequence"),
@@ -759,6 +887,184 @@ class BodyCapRefusalTests(unittest.TestCase):
             status, _ = probe.fetch(STAGING + "/readyz")
         self.assertEqual(status, 503)
         self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
+
+
+class DuplicateJsonKeyRefusalTests(unittest.TestCase):
+    """Duplicate JSON object keys refuse at every probe decode site.
+
+    Plain json.loads keeps the last duplicate, so a repeated manifest
+    ``version`` or ``components`` could mask a stale backup or a down
+    gateway. Every object at any depth is strict with fixed vocabulary
+    that never echoes keys or values.
+    """
+
+    ARCHIVE = "two-funnel-20261002T041700Z.ndjson.gz"
+    READY_PAIR = ('[["process", "ready"], ["gateway", "ready"], '
+                  '["database", "ready"], ["token_invalid", "ready"]]')
+    DOWN_PAIR = ('[["process", "ready"], ["gateway", "down"], '
+                 '["database", "ready"], ["token_invalid", "ready"]]')
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fx = Fixture(tmp.name)
+
+    def archive_path(self):
+        return self.fx.backups / self.ARCHIVE
+
+    def fetch(self, response=READY):
+        def fake(url):
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def test_manifest_top_level_duplicate_refused_both_orders(self):
+        head = json.dumps(manifest()).encode()
+        marker = "SENTINEL_manifest_dup_abc123"
+        variants = [
+            head[:-1] + (', "version": "%s"}' % marker).encode(),
+            b'{"version": "%s", ' % marker.encode() + head[1:],
+        ]
+        for dup in variants:
+            with self.subTest(dup=dup[:44]):
+                self.fx.write_archive(self.ARCHIVE,
+                                      [dup, *archive_lines(manifest())[1:]])
+                with self.assertRaises(probe.ProbeError) as caught:
+                    probe.read_manifest(self.archive_path())
+                self.assertEqual(str(caught.exception),
+                                 f"{self.ARCHIVE} manifest line carries duplicate JSON object keys")
+                self.assertNotIn(marker, str(caught.exception))
+
+    def test_manifest_nested_duplicate_refused(self):
+        raw = json.dumps(manifest()).replace('"count": 2', '"count": 2, "count": 3', 1)
+        self.assertIn('"count": 2, "count": 3', raw)
+        self.fx.write_archive(self.ARCHIVE,
+                              [raw.encode(), *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.archive_path())
+        self.assertEqual(str(caught.exception),
+                         f"{self.ARCHIVE} manifest line carries duplicate JSON object keys")
+
+    def test_manifest_escaped_spelling_counts_as_duplicate(self):
+        raw = json.dumps(manifest()).replace('"version": 4',
+                                             '"version": 4, "\\u0076ersion": 5', 1)
+        self.assertIn("\\u0076ersion", raw)
+        self.fx.write_archive(self.ARCHIVE,
+                              [raw.encode(), *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.archive_path())
+        self.assertEqual(str(caught.exception),
+                         f"{self.ARCHIVE} manifest line carries duplicate JSON object keys")
+
+    def test_end_marker_duplicate_refused(self):
+        lines = [*archive_lines(manifest())[:-1], b'{"kind": "end", "rows": 3, "rows": 4}']
+        self.fx.write_archive(self.ARCHIVE, lines)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.archive_path())
+        self.assertEqual(str(caught.exception),
+                         f"{self.ARCHIVE} end marker carries duplicate JSON object keys")
+
+    def test_live_sequences_duplicate_refused(self):
+        text = json.dumps(LIVE).replace('"readable": true',
+                                        '"readable": true, "readable": false', 1)
+        self.assertIn('"readable": true, "readable": false', text)
+        self.fx.sequences.write_text(text)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertEqual(str(caught.exception),
+                         f"{self.fx.sequences} carries duplicate JSON object keys")
+
+    def test_live_sequences_escaped_spelling_counts_as_duplicate(self):
+        text = json.dumps(LIVE).replace('"readable": true',
+                                        '"readable": true, "\\u0072eadable": false', 1)
+        self.assertIn("\\u0072eadable", text)
+        self.fx.sequences.write_text(text)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertEqual(str(caught.exception),
+                         f"{self.fx.sequences} carries duplicate JSON object keys")
+
+    def test_readyz_top_level_components_duplicate_refused(self):
+        for status, first, second in ((200, self.DOWN_PAIR, self.READY_PAIR),
+                                      (200, self.READY_PAIR, self.DOWN_PAIR),
+                                      (200, self.READY_PAIR, self.READY_PAIR),
+                                      (503, self.DOWN_PAIR, self.READY_PAIR)):
+            with self.subTest(status=status, first_down=first == self.DOWN_PAIR):
+                raw = ('{"components": %s, "jobs": {}, '
+                       '"build_revision": "unknown", "build_id": "unknown", '
+                       '"components": %s}' % (first, second)).encode()
+                with self.assertRaises(probe.ProbeError) as caught:
+                    probe.readyz_state(status, raw)
+                self.assertEqual(str(caught.exception),
+                                 f"/readyz {status} carries duplicate JSON object keys")
+
+    def test_readyz_nested_duplicate_refused(self):
+        raw = ('{"components": %s, "jobs": {"counter": {"parked": true, "parked": false}}, '
+               '"build_revision": "unknown", "build_id": "unknown"}' % self.READY_PAIR).encode()
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.readyz_state(200, raw)
+        self.assertEqual(str(caught.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+
+    def test_readyz_escaped_spelling_counts_as_duplicate(self):
+        raw = ('{"components": %s, "jobs": {"a": 1, "\\u0061": 2}, '
+               '"build_revision": "unknown", "build_id": "unknown"}' % self.READY_PAIR).encode()
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.readyz_state(200, raw)
+        self.assertEqual(str(caught.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+
+    def test_duplicate_manifest_fails_manifest_and_sequences_end_to_end(self):
+        head = json.dumps(manifest()).encode()
+        dup = head[:-1] + b', "version": 5}'
+        self.fx.write_archive(self.ARCHIVE, [dup, *archive_lines(manifest())[1:]])
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch())
+        text = out.getvalue()
+        self.assertEqual(code, 1, text)
+        self.assertIn("FAIL manifest: two-funnel-20261002T041700Z.ndjson.gz manifest line "
+                      "carries duplicate JSON object keys", text)
+        self.assertIn("FAIL sequences: no valid backup manifest to compare against", text)
+        self.assertIn("PASS readyz", text)
+        self.assertIn("PASS deploy-config", text)
+
+    def test_duplicate_readyz_fails_only_readyz_end_to_end(self):
+        raw = ('{"components": %s, "jobs": {}, "build_revision": "unknown", "build_id": "unknown", '
+               '"components": %s}' % (self.DOWN_PAIR, self.READY_PAIR)).encode()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, raw)))
+        text = out.getvalue()
+        self.assertEqual(code, 1, text)
+        self.assertIn("FAIL readyz: /readyz 200 carries duplicate JSON object keys", text)
+        self.assertIn("PASS manifest", text)
+
+    def test_unique_nested_documents_still_pass_end_to_end(self):
+        head = manifest()
+        head["note"] = {"a": 1, "b": [1, 2, {"c": 3}]}
+        self.fx.write_archive(self.ARCHIVE, archive_lines(head))
+        raw = ('{"components": %s, "jobs": {"counter": {"parked": false, "running": true}}, '
+               '"build_revision": "unknown", "build_id": "unknown"}' % self.READY_PAIR).encode()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, raw)))
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("rollback readiness: 4/4 checks passed", text)
+
+
+def load_tests(loader, tests, pattern):
+    # Keep protected acceptance coverage on the existing CI and direct-script routes.
+    import test_rollback_readiness_input_limits_acceptance as input_limits
+
+    tests.addTests(loader.loadTestsFromModule(input_limits))
+    return tests
 
 
 if __name__ == "__main__":

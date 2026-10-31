@@ -78,6 +78,7 @@ class VoiceSmokeTests(unittest.TestCase):
         return mapping
 
     def run_main(self, argv, routes, token=TOKEN, worker_fetch=None):
+        self.requested = []
         with mock.patch.dict(os.environ, {"DISCORD_STAGING_BOT_TOKEN": token}, clear=True):
             out = io.StringIO()
             with redirect_stdout(out):
@@ -205,6 +206,109 @@ class VoiceSmokeTests(unittest.TestCase):
         self.assertIn("FAIL creator-create: /create is registered but its resource did not read clean", out)
         self.assertIn("FAIL room-cleanup: /create is registered but its resource did not read clean", out)
         self.assertNotIn("awaiting voice command registration; empty-room", out)
+
+    def assert_no_detail_reads(self):
+        app_url = f"{smoke.API}/applications/{STAGING_APP}/guilds/{STAGING_GUILD}/commands"
+        self.assertEqual(self.requested, [f"{smoke.API}/users/@me", app_url])
+
+    def test_wrong_guild_scope_refuses_at_list_and_detail(self):
+        hostile = STAGING_GUILD + "?WRONG_GUILD_SENTINEL_never_echo"
+        for stage in ("list", "detail"):
+            for value in (OTHER_GUILD, "0", hostile, None, True):
+                with self.subTest(stage=stage, value=value):
+                    commands = command_list(FULL_NAMES)
+                    if stage == "list":
+                        commands[0]["guild_id"] = value
+                    routes = self.routes(commands)
+                    if stage == "detail":
+                        app_url = (f"{smoke.API}/applications/{STAGING_APP}/guilds/"
+                                   f"{STAGING_GUILD}/commands")
+                        routes[f"{app_url}/{commands[0]['id']}"] = self.body(
+                            dict(commands[0], guild_id=value))
+                    code, out = self.run_main(
+                        ["--guild-id", STAGING_GUILD, "--staging-url", ""], routes)
+                    self.assertEqual(code, 1)
+                    if stage == "list":
+                        self.assertIn("FAIL rank: registered entry is not scoped"
+                                      " to the staging guild", out)
+                        self.assert_no_detail_reads()
+                    else:
+                        self.assertIn("FAIL rank: command resource is not scoped"
+                                      " to the staging guild", out)
+                    self.assertNotIn("WRONG_GUILD_SENTINEL", out)
+
+    def test_omitted_guild_scope_passes_all_targets(self):
+        commands = command_list(FULL_NAMES)
+        for command in commands:
+            del command["guild_id"]
+        code, out = self.run_main(["--guild-id", STAGING_GUILD, "--staging-url", ""],
+                                  self.routes(commands))
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS rank:", out)
+        receipt = self.read_evidence()
+        self.assertEqual(receipt["result"], "pass")
+        self.assertEqual(receipt["guild_id"], STAGING_GUILD)
+
+    def test_shared_command_id_across_two_targets_refuses_before_any_detail(self):
+        commands = command_list(FULL_NAMES)
+        commands[1]["id"] = commands[0]["id"]
+        code, out = self.run_main(["--guild-id", STAGING_GUILD, "--staging-url", ""],
+                                  self.routes(commands))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL rank: registered command id is shared with another entry",
+                      out)
+        self.assert_no_detail_reads()
+
+    def test_target_id_alias_under_an_unrelated_name_refuses_before_any_detail(self):
+        commands = command_list(FULL_NAMES)
+        commands.append(dict(commands[0], name="unrelated-command"))
+        code, out = self.run_main(["--guild-id", STAGING_GUILD, "--staging-url", ""],
+                                  self.routes(commands))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL rank: registered command id is shared with another entry",
+                      out)
+        self.assert_no_detail_reads()
+
+    def test_non_ascii_digit_ids_refuse_before_every_detail_request(self):
+        # U+FF11 FULLWIDTH DIGIT ONE, U+0661 ARABIC-INDIC DIGIT ONE: int()
+        # parses both, so only the ASCII-only admission regex can refuse them.
+        # The single-char values pin the first class; the mixed "1" + U+0661
+        # value (int() parses it as 11) pins the rest class too.
+        for value in ("１", "١", "1١"):
+            with self.subTest(value=value):
+                commands = command_list(FULL_NAMES)
+                commands[0]["id"] = value
+                code, out = self.run_main(
+                    ["--guild-id", STAGING_GUILD, "--staging-url", ""],
+                    self.routes(commands))
+                self.assertEqual(code, 1)
+                self.assertIn("FAIL rank: registered entry carries no valid command id",
+                              out)
+                self.assert_no_detail_reads()
+
+    def test_non_ascii_digit_versions_refuse_at_list_and_detail(self):
+        for stage in ("list", "detail"):
+            for value in ("１", "١", "1١"):
+                with self.subTest(stage=stage, value=value):
+                    commands = command_list(FULL_NAMES)
+                    if stage == "list":
+                        commands[0]["version"] = value
+                    routes = self.routes(commands)
+                    if stage == "detail":
+                        app_url = (f"{smoke.API}/applications/{STAGING_APP}/guilds/"
+                                   f"{STAGING_GUILD}/commands")
+                        routes[f"{app_url}/{commands[0]['id']}"] = self.body(
+                            dict(commands[0], version=value))
+                    code, out = self.run_main(
+                        ["--guild-id", STAGING_GUILD, "--staging-url", ""], routes)
+                    self.assertEqual(code, 1)
+                    if stage == "list":
+                        self.assertIn("FAIL rank: registered entry carries"
+                                      " no valid version", out)
+                        self.assert_no_detail_reads()
+                    else:
+                        self.assertIn("FAIL rank: command resource carries"
+                                      " no valid version", out)
 
     def test_mock_ignores_staging_url(self):
         def worker_fetch(origin):

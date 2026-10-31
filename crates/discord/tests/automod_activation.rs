@@ -444,7 +444,14 @@ impl FactsSink for Awards {
 }
 
 impl LevelingHook for Awards {
-    fn award_message(&self, _: u64, _: u64, _: &str, _: u64) -> LevelOutcome {
+    fn award_message(
+        &self,
+        _: u64,
+        _: u64,
+        _: &str,
+        _: u64,
+        _: two_bot_core::MessageShape,
+    ) -> LevelOutcome {
         self.0.fetch_add(1, Ordering::SeqCst);
         LevelOutcome {
             leveled_up: false,
@@ -463,8 +470,19 @@ fn assert_send<T: Send>(_: &T) {}
 
 // ---------------------------------------------------------------------- tests
 
+/// Serializes every test that drives `AutomodActivation::process`.
+///
+/// The `two_bot_automod_decisions_total{outcome}` series live on the
+/// process-global registry, so exact-delta counter asserts are only race-free
+/// while no sibling test can settle the same outcome concurrently (precedent:
+/// `PREFIX_REFUSED_SERIES_GUARD` in `custom_command_runtime.rs`).
+static AUTOMOD_DECISION_SERIES_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn dry_run_match_captures_only_and_sends_nothing() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let (ledger, facts) = (MemLedger::default(), StaticFacts::allowed());
     let activation = AutomodActivation::new(
@@ -493,6 +511,9 @@ async fn dry_run_match_captures_only_and_sends_nothing() {
 
 #[tokio::test]
 async fn protected_target_is_counted_but_untouched() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let (ledger, facts) = (MemLedger::default(), StaticFacts::default());
     facts.set(Some(target_facts(true, 1)));
@@ -512,6 +533,9 @@ async fn protected_target_is_counted_but_untouched() {
 
 #[tokio::test]
 async fn ladder_deletes_then_warns_then_times_out() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
@@ -562,6 +586,9 @@ async fn ladder_deletes_then_warns_then_times_out() {
 
 #[tokio::test]
 async fn duplicate_delivery_is_processed_once() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![ScriptedResponse::status(204)],
         ScriptedResponse::status(500),
@@ -621,6 +648,9 @@ async fn duplicate_delivery_is_processed_once() {
 
 #[tokio::test]
 async fn crash_before_checkpoint_restores_the_funnel_once_without_resending() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![ScriptedResponse::status(204)],
         ScriptedResponse::status(500),
@@ -693,6 +723,9 @@ async fn crash_before_checkpoint_restores_the_funnel_once_without_resending() {
 
 #[tokio::test]
 async fn mode_change_after_crash_funnels_the_message_once() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let ledger = MemLedger::default();
     let clean = create_event("5101", "clean");
@@ -739,6 +772,9 @@ async fn mode_change_after_crash_funnels_the_message_once() {
 
 #[tokio::test]
 async fn uncertain_delete_retains_claim_and_sends_no_timeout() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![ScriptedResponse::status(500)],
         ScriptedResponse::status(500),
@@ -775,6 +811,9 @@ async fn uncertain_delete_retains_claim_and_sends_no_timeout() {
 
 #[tokio::test]
 async fn uncertain_timeout_is_retained_after_confirmed_delete() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![ScriptedResponse::status(204), ScriptedResponse::status(500)],
         ScriptedResponse::status(500),
@@ -801,6 +840,9 @@ async fn uncertain_timeout_is_retained_after_confirmed_delete() {
 
 #[tokio::test]
 async fn rejected_delete_settles_without_followup() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![ScriptedResponse::status(403)],
         ScriptedResponse::status(500),
@@ -830,6 +872,9 @@ async fn rejected_delete_settles_without_followup() {
 
 #[tokio::test]
 async fn refused_fence_sends_nothing() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
     let ledger = MemLedger::default();
     ledger.0.refuse_fence.store(true, Ordering::SeqCst);
@@ -853,6 +898,9 @@ async fn refused_fence_sends_nothing() {
 
 #[tokio::test]
 async fn unavailable_target_releases_then_preserved_retry_enforces() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![ScriptedResponse::status(204)],
         ScriptedResponse::status(500),
@@ -891,6 +939,9 @@ async fn unavailable_target_releases_then_preserved_retry_enforces() {
 
 #[tokio::test]
 async fn outside_scope_bypasses_without_claim() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let ledger = MemLedger::default();
     let activation = AutomodActivation::new(
@@ -933,6 +984,9 @@ fn member_json(user: &str, role: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn partial_edit_fetches_reinspects_and_never_awards() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mut edited = message_json("7001", "now blocked");
     edited["edited_timestamp"] = json!("2026-10-02T00:01:00.000000+00:00");
     let mock = MockRest::start(
@@ -990,6 +1044,9 @@ async fn partial_edit_fetches_reinspects_and_never_awards() {
 
 #[tokio::test]
 async fn failed_edit_fetch_is_unavailable_without_claim() {
+    // Serialize with the other `process` callers while exact decision-counter
+    // deltas are asserted (see `AUTOMOD_DECISION_SERIES_GUARD`).
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
     let mock = MockRest::start(
         vec![ScriptedResponse::status(404)],
         ScriptedResponse::status(500),
@@ -1026,4 +1083,193 @@ async fn failed_edit_fetch_is_unavailable_without_claim() {
         "a missing message is not empty content"
     );
     mock.shutdown().await;
+}
+
+/// Every committed `StoredOutcome` records one terminal decision on the
+/// process-global `two_bot_automod_decisions_total{outcome}` series (PR
+/// #1099); replays, retained claims and bypassed deliveries never settle, so
+/// they record nothing.
+///
+/// Counter asserts are exact deltas: every `process` caller in this file holds
+/// `AUTOMOD_DECISION_SERIES_GUARD`, so no sibling test can settle the same
+/// outcome concurrently. Exact per-outcome counting (including hostile-label
+/// collapse and saturation) also lives in the core unit tests on an isolated
+/// `Metrics`, where it is race-free; this test pins the activation-to-counter
+/// wiring end to end.
+#[tokio::test]
+async fn settled_decisions_reach_the_global_outcome_counters() {
+    let _series_guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
+    fn decisions(outcome: &str) -> u64 {
+        two_bot_core::metrics::global()
+            .render(None)
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} "
+                ))
+            })
+            .unwrap_or_else(|| panic!("automod decision series for {outcome} is missing"))
+            .rsplit_once(' ')
+            .expect("sample")
+            .1
+            .parse()
+            .expect("count")
+    }
+    fn all_decisions() -> [u64; 8] {
+        [
+            decisions("accepted"),
+            decisions("already_processed"),
+            decisions("dry_run"),
+            decisions("protected"),
+            decisions("deleted"),
+            decisions("warned"),
+            decisions("timed_out"),
+            decisions("sanction_refused"),
+        ]
+    }
+
+    // An enforced delete settles and records one deleted decision.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let deleted_base = decisions("deleted");
+    let activation = AutomodActivation::new(
+        runtime(true),
+        MemLedger::default(),
+        StaticFacts::allowed(),
+        executor(&mock),
+    );
+    let first = activation.process(create("8001", "blocked"), AT).await;
+    assert_eq!(first.outcome, completed(true, CompletionKind::Deleted));
+    assert_eq!(
+        decisions("deleted"),
+        deleted_base + 1,
+        "a settled delete records one deleted decision"
+    );
+    // Its redelivery is a replay: same Duplicate outcome, no resend, and no
+    // new decision on any series.
+    let replay_base = all_decisions();
+    let again = activation.process(create("8001", "blocked"), AT).await;
+    assert!(matches!(
+        again.outcome,
+        ActivationOutcome::Duplicate(Some(_))
+    ));
+    assert_eq!(
+        calls(&mock),
+        vec![("DELETE".to_owned(), delete_path("8001"))]
+    );
+    assert_eq!(
+        all_decisions(),
+        replay_base,
+        "a replayed delivery records no decision"
+    );
+    mock.shutdown().await;
+
+    // A dry-run match settles without touching Discord and records one
+    // dry-run decision.
+    let dry_mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let dry_base = decisions("dry_run");
+    let preview = AutomodActivation::new(
+        runtime(false),
+        MemLedger::default(),
+        StaticFacts::allowed(),
+        executor(&dry_mock),
+    );
+    let dry = preview.process(create("8002", "blocked"), AT).await;
+    assert_eq!(dry.outcome, completed(false, CompletionKind::DryRun));
+    assert_eq!(
+        decisions("dry_run"),
+        dry_base + 1,
+        "a settled dry-run records one dry-run decision"
+    );
+    assert!(
+        calls(&dry_mock).is_empty(),
+        "dry-run must not reach Discord"
+    );
+    dry_mock.shutdown().await;
+
+    // A refused sanction still settles, recording one sanction-refused
+    // decision alongside the attempted delete on the wire.
+    let refused_mock = MockRest::start(
+        vec![ScriptedResponse::status(403)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let refused_base = decisions("sanction_refused");
+    let refused_ledger = MemLedger::default();
+    refused_ledger.seed_violations(2);
+    let refused = AutomodActivation::new(
+        runtime(true),
+        refused_ledger,
+        StaticFacts::allowed(),
+        executor(&refused_mock),
+    );
+    let result = refused.process(create("8003", "blocked"), AT).await;
+    assert_eq!(
+        result.outcome,
+        completed(false, CompletionKind::SanctionRefused)
+    );
+    assert_eq!(
+        decisions("sanction_refused"),
+        refused_base + 1,
+        "a settled sanction refusal records one sanction-refused decision"
+    );
+    assert_eq!(
+        calls(&refused_mock),
+        vec![("DELETE".to_owned(), delete_path("8003"))]
+    );
+    refused_mock.shutdown().await;
+
+    // A fence-refused claim stays retained without settling.
+    let fence_mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let fence_ledger = MemLedger::default();
+    fence_ledger.0.refuse_fence.store(true, Ordering::SeqCst);
+    let fenced = AutomodActivation::new(
+        runtime(true),
+        fence_ledger,
+        StaticFacts::allowed(),
+        executor(&fence_mock),
+    );
+    let fence_base = all_decisions();
+    let retained = fenced.process(create("8004", "blocked"), AT).await;
+    assert_eq!(
+        retained.outcome,
+        ActivationOutcome::Retained(RetainReason::FenceRefused)
+    );
+    assert!(calls(&fence_mock).is_empty());
+    assert_eq!(
+        all_decisions(),
+        fence_base,
+        "a fence-retained claim records no decision"
+    );
+    fence_mock.shutdown().await;
+
+    // An out-of-scope delivery bypasses before any claim exists.
+    let bypass_mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let bypass_ledger = MemLedger::default();
+    let bypassed_activation = AutomodActivation::new(
+        runtime(true),
+        bypass_ledger.clone(),
+        StaticFacts::allowed(),
+        executor(&bypass_mock),
+    );
+    let mut outside = create("8005", "blocked");
+    outside.guild_id = Some("326474832151838730".into());
+    let bypass_base = all_decisions();
+    let bypassed = bypassed_activation.process(outside, AT).await;
+    assert_eq!(
+        bypassed.outcome,
+        ActivationOutcome::Bypassed,
+        "out-of-scope delivery bypasses without settling"
+    );
+    assert_eq!(bypass_ledger.claims(), 0);
+    assert!(calls(&bypass_mock).is_empty());
+    assert_eq!(
+        all_decisions(),
+        bypass_base,
+        "a bypassed delivery records no decision"
+    );
+    bypass_mock.shutdown().await;
 }

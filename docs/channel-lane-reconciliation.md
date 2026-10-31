@@ -94,19 +94,22 @@ before retrying and check `moderation_audit` for the matching channel/key and
 `moderation.channel_lane_release` action through the authorized read surface. Do
 not interpret a missing lane as permission to repeat a possibly applied action.
 
-## 429 classification follow-up (not changed here)
+## 429 classification (aligned)
 
-The slash-runtime history-failure fix treats a mutation HTTP 429 as proven not
-applied via `DiscordError::proves_no_effect`. The website executor in
-`crates/discord/src/internal_channel_moderation.rs` and member moderation still
-classify mutation 429 as ambiguous and retain their claims. History GET 429 is
-already safe because no mutation was attempted.
-
-Recommendation: align the mutation classification in a separate reviewed slice,
-with single/bulk delete, overwrite, slowmode and member-action regressions proving
-429 releases only the applicable attempt while preserving recovery seeds. Keep
-5xx, timeout, cancellation and unexpected-status ambiguity fenced. This CLI does
-not change any executor's error classification or authorize automatic release.
+A mutation HTTP 429 is proven not applied via `DiscordError::proves_no_effect`
+in every moderation executor: the slash channel runtime, the website executor
+in `crates/discord/src/internal_channel_moderation.rs`, and member moderation
+(core `DiscordError::proves_no_effect`). A 429 releases only the failed attempt
+— the request claim and channel lane, or the member claim and its staged ban
+attempt — while preserving recovery seeds: a refused first lockdown retires
+only its own new seed, and an existing seed survives a refused re-lock or
+unlock. History GET 429 remains safe because no mutation was attempted. 5xx,
+timeout, cancellation and unexpected-status ambiguity stay fenced.
+Single/bulk delete, overwrite, slowmode and member-action regressions live in
+`crates/discord/tests/mutation_429_proves_no_effect_channel.rs` and
+`crates/discord/tests/mutation_429_proves_no_effect_member.rs`. This CLI does
+not change any executor's error classification or authorize automatic release
+for non-429 failures.
 
 ## Verification
 

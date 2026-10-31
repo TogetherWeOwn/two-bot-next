@@ -6,13 +6,12 @@
 use std::collections::HashSet;
 
 use sqlx::{PgConnection, PgPool};
+use two_bot_core::analytics_family::{category_of_event, AnalyticsCategory};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{
     dispatch_action, BootDirective, DispatchAction, GatewaySession,
 };
-use two_bot_core::privacy::{
-    category_of_event, inviter_in_metadata, scrubbed_member_join_metadata, AnalyticsCategory,
-};
+use two_bot_core::privacy::{inviter_in_metadata, scrubbed_member_join_metadata};
 use two_bot_core::{format_iso_millis, idempotency_key, EventType, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};
@@ -59,6 +58,14 @@ impl GatewaySessionStore {
             guild_id,
             shard_id,
         }
+    }
+
+    /// Borrow the store's pool for serial lifecycle writes that must commit
+    /// before the dispatch checkpoint (retention queue/cancel). A failed
+    /// lifecycle write holds the cursor exactly like any other pre-commit
+    /// failure, so the dispatch replays after restart.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     pub async fn load(&self) -> Result<Option<GatewaySession>, sqlx::Error> {
@@ -248,26 +255,35 @@ impl GatewaySessionStore {
         } else {
             None
         };
-        // Privacy gate, prefetched once for the whole batch: the suppressed
-        // member set plus the guild's analytics switches. A missing settings
-        // row means every category is enabled. Suppressed members drop every
-        // per-user write below; disabled families drop their events while
-        // other members' rows keep the aggregates counting.
-        let suppressed: HashSet<String> =
-            sqlx::query_scalar("SELECT member_id FROM privacy_opt_outs WHERE guild_id = $1")
-                .bind(&self.guild_id)
-                .fetch_all(&mut *tx)
-                .await?
-                .into_iter()
-                .collect();
-        let switches: Option<(bool, bool, bool)> = sqlx::query_as(
-            "SELECT presence_enabled, activity_enabled, voice_enabled
-             FROM guild_analytics_settings WHERE guild_id = $1",
+        // Privacy gate, prefetched once for the whole batch in a single
+        // round-trip (pipeline budget): the suppressed member set plus the
+        // guild's analytics switches. A missing settings row means every
+        // category is enabled. Suppressed members drop every per-user write
+        // below; disabled families drop their events while other members'
+        // rows keep the aggregates counting. One statement (not two) keeps
+        // the per-dispatch statement count inside the pipeline benchmark
+        // tolerance; the LOCK above still serializes with concurrent
+        // opt-outs, so the combined snapshot is at least as fresh.
+        let (suppressed_list, presence_opt, activity_opt, voice_opt): (
+            Vec<String>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        ) = sqlx::query_as(
+            "SELECT (SELECT COALESCE(array_agg(member_id), '{}'::text[]) \
+             FROM privacy_opt_outs WHERE guild_id = $1), \
+             s.presence_enabled, s.activity_enabled, s.voice_enabled \
+             FROM (SELECT 1) AS dummy \
+             LEFT JOIN guild_analytics_settings s ON s.guild_id = $1",
         )
         .bind(&self.guild_id)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        let (presence_on, activity_on, voice_on) = switches.unwrap_or((true, true, true));
+        let suppressed: HashSet<String> = suppressed_list.into_iter().collect();
+        let (presence_on, activity_on, voice_on) = match (presence_opt, activity_opt, voice_opt) {
+            (Some(presence), Some(activity), Some(voice)) => (presence, activity, voice),
+            _ => (true, true, true),
+        };
         let family_off = |event_type: &str| match category_of_event(event_type) {
             Some(AnalyticsCategory::Presence) => !presence_on,
             Some(AnalyticsCategory::Activity) => !activity_on,
@@ -311,13 +327,27 @@ impl GatewaySessionStore {
                             .inviter_id
                             .map(|id| id.to_string())
                             .filter(|id| !suppressed.contains(id.as_str()));
+                        // Discord counters are `u64`; the column is INTEGER.
+                        // Saturate instead of failing the whole dispatch: the
+                        // buffer already clamped at ingest, so this warn fires
+                        // only for batches that bypassed it.
+                        let saturated = two_bot_core::invites::saturate_invite_uses(state.uses);
+                        if saturated != state.uses {
+                            tracing::warn!(
+                                guild_id = %self.guild_id,
+                                code = %state.code,
+                                "invite uses saturated at i32::MAX",
+                            );
+                        }
+                        // `saturated <= i32::MAX`, so the cast cannot truncate.
+                        let uses = saturated as i32;
                         sqlx::query(
                             "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
                              VALUES ($1, $2, $3, $4, $5, to_timestamp($6::double precision / 1000))
                              ON CONFLICT (guild_id, code) DO UPDATE SET uses = EXCLUDED.uses,
                              inviter_id = EXCLUDED.inviter_id, channel_id = EXCLUDED.channel_id, updated_at = EXCLUDED.updated_at",
                         ).bind(&self.guild_id).bind(state.code)
-                            .bind(i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?)
+                            .bind(uses)
                             .bind(inviter)
                             .bind(state.channel_id.map(|id| id.to_string()))
                             .bind(session.updated_at_ms).execute(&mut *tx).await?;
@@ -370,31 +400,84 @@ impl GatewaySessionStore {
             {
                 continue;
             }
-            let inserted = sqlx::query(
+            let inserted: Option<(i64,)> = sqlx::query_as(
                 "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
                  VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
-                 ON CONFLICT (idempotency_key) DO NOTHING",
+                 ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
             ).bind(&write.event_type).bind(&write.member_id).bind(&write.guild_id)
                 .bind(&write.occurred_at).bind(&write.source).bind(&write.metadata)
-                .bind(idempotency_key(&event)).execute(&mut *tx).await?;
-            if inserted.rows_affected() == 1 {
+                .bind(idempotency_key(&event)).fetch_optional(&mut *tx).await?;
+            // Conflict losers inserted no row, so they journal nothing.
+            if let Some((event_row_id,)) = inserted {
                 project_event(&mut tx, &write).await?;
+                // Rollback-journal writer: each committed batch row leaves one
+                // `events` insert entry naming the inserted row, journaled
+                // inside the primary dispatch transaction under a savepoint so
+                // the row and its evidence commit atomically — no crash window
+                // between a primary commit and a second journal transaction
+                // can leave a committed row unjournaled. Evidence-only and
+                // best-effort: only journal statement errors are isolated by
+                // rolling back the savepoint; they never fail or alter the
+                // primary write.
+                let entry = two_bot_store::journal::JournalEntry {
+                    table_name: "events".to_owned(),
+                    row_identity: event_row_id.to_string(),
+                    op: two_bot_store::journal::JournalOp::Insert,
+                    pre_image: None,
+                };
+                sqlx::query("SAVEPOINT gateway_journal")
+                    .execute(&mut *tx)
+                    .await?;
+                match two_bot_store::journal::record_in(&mut tx, &entry).await {
+                    Ok(_) => {
+                        sqlx::query("RELEASE SAVEPOINT gateway_journal")
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    Err(journal_error) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT gateway_journal")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("RELEASE SAVEPOINT gateway_journal")
+                            .execute(&mut *tx)
+                            .await?;
+                        tracing::warn!(
+                            table = "events",
+                            row_identity = %entry.row_identity,
+                            error = %journal_error,
+                            "rollback_journal record failed; primary gateway batch write kept",
+                        );
+                    }
+                }
             }
         }
-        for (guild_id, member_id, at) in batch.activity {
-            if guild_id.to_string() != self.guild_id {
+        for touch in batch.activity {
+            if touch.guild_id.to_string() != self.guild_id {
                 return Err(sqlx::Error::InvalidArgument(
                     "gateway activity belongs to another guild".into(),
                 ));
             }
-            if suppressed.contains(member_id.to_string().as_str()) {
+            if suppressed.contains(touch.member_id.to_string().as_str()) {
+                continue;
+            }
+            // The timestamp carries its originating family through the
+            // buffer, so a disabled family's touch advances nothing: the
+            // gate runs in this same transaction, before the monotonic
+            // upsert, and a newer disabled stamp can never replace the
+            // allowed family's timestamp.
+            let touch_off = match touch.family {
+                AnalyticsCategory::Presence => !presence_on,
+                AnalyticsCategory::Activity => !activity_on,
+                AnalyticsCategory::Voice => !voice_on,
+            };
+            if touch_off {
                 continue;
             }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
                  ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = EXCLUDED.last_active_at
                  WHERE members.last_active_at IS NULL OR members.last_active_at < EXCLUDED.last_active_at",
-            ).bind(&self.guild_id).bind(member_id.to_string()).bind(&at).execute(&mut *tx).await?;
+            ).bind(&self.guild_id).bind(touch.member_id.to_string()).bind(&touch.at).execute(&mut *tx).await?;
         }
         for snapshot in batch.invite_snapshots {
             if snapshot.guild_id.to_string() != self.guild_id {
@@ -404,8 +487,18 @@ impl GatewaySessionStore {
             }
             let mut live_codes = Vec::with_capacity(snapshot.states.len());
             for state in snapshot.states {
-                let uses =
-                    i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                // Same saturation as the `SnapshotWrite` flush above: a
+                // poison counter must degrade, never roll back the dispatch.
+                let saturated = two_bot_core::invites::saturate_invite_uses(state.uses);
+                if saturated != state.uses {
+                    tracing::warn!(
+                        guild_id = %self.guild_id,
+                        code = %state.code,
+                        "invite uses saturated at i32::MAX",
+                    );
+                }
+                // `saturated <= i32::MAX`, so the cast cannot truncate.
+                let uses = saturated as i32;
                 // Suppressed inviters keep the aggregate `uses` count but
                 // lose the per-user attribution.
                 let inviter = state
@@ -549,6 +642,8 @@ impl GatewaySessionStore {
                         .map(|id| id.parse())
                         .transpose()
                         .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                    max_uses: 0,
+                    temporary: false,
                 })
             })
             .collect()

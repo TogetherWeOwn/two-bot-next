@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
 use two_bot_core::voice_create_admission::{
-    decide_admission, AcceptedReservation, AdmissionDecision, AdmissionRequest,
+    decide_admission_counts, AcceptedReservation, AdmissionDecision, AdmissionRequest,
     CreateAdmissionConfig, RefusalReason, CREATE_BURST_WINDOW_SECS,
 };
 use two_bot_core::voice_logging::{parse_detail_level, LoggingSettings};
@@ -25,6 +25,15 @@ use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 use super::voice_config_store::PgVoiceConfigStore;
 
+/// Newest-first TOP-25 burst history; `truncated` is the fixed-vocabulary
+/// receipt for additional rows. Admission uses exact SQL counts, not this
+/// diagnostic prefix, so truncation cannot change its refusal reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurstHistoryPage {
+    pub reservations: Vec<AcceptedReservation>,
+    pub truncated: bool,
+}
+
 /// The verdict of [`PgRoomStore::claim_create`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateClaim {
@@ -32,6 +41,17 @@ pub enum CreateClaim {
     Admitted { reservation_id: String },
     /// Refused before any write; the first tripped limit.
     Refused(RefusalReason),
+}
+
+/// The durable witness observed by [`PgRoomStore::save_join_grant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinGrantIntent {
+    /// No room row exists, so no intent was written.
+    RoomMissing,
+    /// This call inserted the intent; no earlier grant is witnessed.
+    Fresh,
+    /// An earlier intent survives: its Connect PUT may already have landed.
+    Retained,
 }
 
 /// Durable recipients that may hold this room's bot-issued owner mask.
@@ -79,6 +99,12 @@ impl PgRoomStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// This store's pool, for sibling persistence modules (event voice).
+    #[must_use]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// V11 configuration persistence (`/export` reads, `/import` writes)
@@ -607,7 +633,7 @@ impl PgRoomStore {
     /// V3 approved Connect grants for the guild's rooms, keyed by room channel.
     /// One row is one member the worker approved and Discord may still hold a
     /// Connect allow for: it is written before the grant PUT and retired only
-    /// after the revocation PUT lands (or the grant is definitively refused).
+    /// after a safe revoke (or a fresh intent's PUT is definitively refused).
     /// A room absent from the map holds no approved grants.
     pub async fn join_grants_in_guild(
         &self,
@@ -630,15 +656,15 @@ impl PgRoomStore {
         Ok(grants)
     }
 
-    /// Record an approval's intent before granting Connect. Idempotent: a
-    /// retried intent is a no-op. Returns false (writing nothing) when no row
-    /// tracks the room, so a grant can never outlive its room.
+    /// Record an approval's intent before granting Connect. The insert result
+    /// distinguishes a fresh intent from a retained obligation: a refused retry
+    /// cannot disprove an earlier PUT. A missing room writes nothing.
     pub async fn save_join_grant(
         &self,
         guild_id: Snowflake,
         channel_id: Snowflake,
         member_id: Snowflake,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<JoinGrantIntent, sqlx::Error> {
         if member_id == 0 {
             return Err(invalid_argument("join grant member must be nonzero"));
         }
@@ -651,9 +677,9 @@ impl PgRoomStore {
         .fetch_one(&self.pool)
         .await?;
         if !exists {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)
              VALUES ($1, $2, $3)
              ON CONFLICT DO NOTHING",
@@ -662,11 +688,16 @@ impl PgRoomStore {
         .bind(channel_id.to_string())
         .bind(member_id.to_string())
         .execute(&self.pool)
-        .await?;
-        Ok(true)
+        .await?
+        .rows_affected();
+        Ok(if inserted == 0 {
+            JoinGrantIntent::Retained
+        } else {
+            JoinGrantIntent::Fresh
+        })
     }
 
-    /// Retire a grant after its revocation landed (or its grant was refused).
+    /// Retire a grant after a safe revoke (or a fresh intent's PUT was refused).
     /// Idempotent: retiring an absent row is success, so a retried revoke
     /// whose outcome was unknown cannot leave a duplicate or fail.
     pub async fn remove_join_grant(
@@ -744,8 +775,43 @@ impl PgRoomStore {
             .transpose()
     }
 
-    /// Claim one room create: serialize per guild, read the persisted history,
-    /// run [`decide_admission`] and, when allowed, durably record the accepted
+    /// TOP-25 history plus one lookahead, never an unbounded history Vec.
+    /// The window uses integer seconds just like the core admission function.
+    pub async fn burst_history_page(
+        &self,
+        guild_id: Snowflake,
+        now_secs: i64,
+    ) -> Result<BurstHistoryPage, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT user_id, floor(extract(epoch FROM created_at))::bigint
+             FROM voice_create_reservations
+             WHERE guild_id = $1
+               AND created_at >= to_timestamp($2::double precision) + interval '1 second'
+             ORDER BY created_at DESC, id DESC LIMIT 26",
+        )
+        .bind(guild_id.to_string())
+        .bind(now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS))
+        .fetch_all(&self.pool)
+        .await?;
+        let truncated = rows.len() > 25;
+        let reservations = rows
+            .into_iter()
+            .take(25)
+            .map(|(user_id, created_at_secs)| {
+                Ok(AcceptedReservation {
+                    user_id: user_id.parse().map_err(invalid_argument)?,
+                    created_at_secs,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()?;
+        Ok(BurstHistoryPage {
+            reservations,
+            truncated,
+        })
+    }
+
+    /// Claim one room create: serialize per guild, count the persisted history,
+    /// run [`decide_admission_counts`] and, when allowed, durably record the accepted
     /// reservation, all in one transaction. Nothing is written on a refusal.
     ///
     /// The per-guild advisory lock makes concurrent claims (two joins, two
@@ -807,30 +873,23 @@ impl PgRoomStore {
                      WHERE guild_id = $1 AND user_id = $2 AND settled_at IS NULL) AS owned_by_user,
                (SELECT floor(extract(epoch FROM max(created_at)))::bigint
                   FROM voice_create_reservations
-                 WHERE guild_id = $1 AND user_id = $2) AS last_created_secs",
+                 WHERE guild_id = $1 AND user_id = $2) AS last_created_secs,
+               (SELECT COUNT(*) FROM voice_create_reservations
+                 WHERE guild_id = $1 AND user_id = $2
+                   AND created_at >= to_timestamp($4::double precision) + interval '1 second') AS user_burst,
+               (SELECT COUNT(*) FROM voice_create_reservations
+                 WHERE guild_id = $1
+                   AND created_at >= to_timestamp($4::double precision) + interval '1 second') AS guild_burst",
         )
         .bind(&guild)
         .bind(&user)
         .bind(&leaving)
+        .bind(now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS))
         .fetch_one(&mut *tx)
         .await?;
-        let history = sqlx::query(
-            "SELECT user_id, floor(extract(epoch FROM created_at))::bigint AS created_at_secs
-             FROM voice_create_reservations
-             WHERE guild_id = $1 AND created_at > to_timestamp($2::double precision)",
-        )
-        .bind(&guild)
-        .bind(now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS))
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(|row| {
-            Ok(AcceptedReservation {
-                user_id: decode_id(row, "user_id")?,
-                created_at_secs: row.try_get("created_at_secs")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        // Exact aggregate counts under the same advisory lock avoid both an
+        // unbounded history allocation and undercounting a user outside a
+        // newest-first guild prefix.
         let count = |column: &str| -> Result<u32, sqlx::Error> {
             Ok(u32::try_from(counts.try_get::<i64, _>(column)?).unwrap_or(u32::MAX))
         };
@@ -839,9 +898,17 @@ impl PgRoomStore {
             owned_by_user: count("owned_by_user")?,
             rooms_in_guild: count("rooms_in_guild")?,
             last_created_at_secs: counts.try_get("last_created_secs")?,
-            accepted_reservations: &history,
+            accepted_reservations: &[],
         };
-        match decide_admission(config, &request, now_secs).map_err(invalid_argument)? {
+        match decide_admission_counts(
+            config,
+            &request,
+            now_secs,
+            count("user_burst")?,
+            count("guild_burst")?,
+        )
+        .map_err(invalid_argument)?
+        {
             AdmissionDecision::Deny { reason } => Ok(CreateClaim::Refused(reason)),
             AdmissionDecision::Allow => {
                 let reservation_id: String = sqlx::query_scalar(

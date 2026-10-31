@@ -236,5 +236,97 @@ class CutoverWatchCheckpointTests(unittest.TestCase):
         self.assertIn("| +1h checkpoint |", out.getvalue())
 
 
+class DuplicateJsonKeysTests(unittest.TestCase):
+    """Duplicate /readyz object keys refuse before any identity grading.
+
+    Plain json.loads keeps the last duplicate, so a repeated
+    build_revision could mask a stale container as this run's build.
+    Every object at any depth is strict: identical repeats and both
+    conflicting orders fail closed with fixed vocabulary.
+    """
+
+    COMPONENTS = [["process", "ready"], ["gateway", "ready"],
+                  ["database", "ready"], ["token_invalid", "ready"]]
+
+    def test_top_level_build_revision_duplicate_refused(self):
+        comps = json.dumps(self.COMPONENTS)
+        bodies = [
+            # Conflicting: last-wins would read OTHER_SHA.
+            '{"components": %s, "build_revision": "%s", "build_id": "%s", "build_revision": "%s"}'
+            % (comps, SHA, BUILD_ID, OTHER_SHA),
+            # Reversed: last-wins would read SHA and pass.
+            '{"build_revision": "%s", "components": %s, "build_revision": "%s", "build_id": "%s"}'
+            % (OTHER_SHA, comps, SHA, BUILD_ID),
+            # Identical repeat still refuses.
+            '{"components": %s, "build_revision": "%s", "build_id": "%s", "build_revision": "%s"}'
+            % (comps, SHA, BUILD_ID, SHA),
+        ]
+        for raw in bodies:
+            with self.subTest(raw=raw[:64]):
+                with self.assertRaises(checkpoint.CheckpointError) as caught:
+                    checkpoint.check_build_identity(raw.encode(), SHA, BUILD_ID)
+                self.assertEqual(str(caught.exception),
+                                 "/readyz carries duplicate JSON object keys")
+
+    def test_nested_jobs_duplicate_refused(self):
+        comps = json.dumps(self.COMPONENTS)
+        raw = ('{"components": %s, "jobs": {"counter": {"parked": true, "parked": false}}, '
+               '"build_revision": "%s", "build_id": "%s"}') % (comps, SHA, BUILD_ID)
+        with self.assertRaises(checkpoint.CheckpointError) as caught:
+            checkpoint.check_build_identity(raw.encode(), SHA, BUILD_ID)
+        self.assertEqual(str(caught.exception),
+                         "/readyz carries duplicate JSON object keys")
+
+    def test_escaped_key_spelling_counts_as_duplicate(self):
+        comps = json.dumps(self.COMPONENTS)
+        raw = ('{"components": %s, "jobs": {"a": 1, "\\u0061": 2}, '
+               '"build_revision": "%s", "build_id": "%s"}') % (comps, SHA, BUILD_ID)
+        with self.assertRaises(checkpoint.CheckpointError) as caught:
+            checkpoint.check_build_identity(raw.encode(), SHA, BUILD_ID)
+        self.assertEqual(str(caught.exception),
+                         "/readyz carries duplicate JSON object keys")
+
+    def test_duplicate_fails_closed_end_to_end_as_extend(self):
+        marker = "sg%s%s%d" % ("ni", "p", id(object()))
+        comps = json.dumps(self.COMPONENTS)
+        raw = ('{"components": %s, "build_revision": "%s", "build_id": "%s", '
+               '"build_revision": "%s"}') % (comps, SHA, BUILD_ID, marker)
+        requested = []
+
+        def fake(url):
+            requested.append(url)
+            return (200, raw.encode())
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = checkpoint.main(argv(), fetch_fn=fake)
+        row = out.getvalue().strip()
+        self.assertEqual(code, 1, row)
+        self.assertTrue(row.endswith("| EXTEND |"), row)
+        self.assertIn("carries duplicate JSON object keys", row)
+        self.assertNotIn("\n", row)
+        self.assertEqual(row.count("|"), 6, row)
+        self.assertNotIn(marker, row)
+        self.assertEqual(requested, [PRODUCTION + "/readyz"])
+
+    def test_unique_nested_jobs_still_go(self):
+        comps = json.dumps(self.COMPONENTS)
+        raw = ('{"components": %s, "jobs": {"counter": {"parked": false, "running": true}}, '
+               '"build_revision": "%s", "build_id": "%s"}') % (comps, SHA, BUILD_ID)
+        requested = []
+
+        def fake(url):
+            requested.append(url)
+            return (200, raw.encode())
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = checkpoint.main(argv(), fetch_fn=fake)
+        row = out.getvalue().strip()
+        self.assertEqual(code, 0, row)
+        self.assertTrue(row.endswith("| GO |"), row)
+        self.assertEqual(requested, [PRODUCTION + "/readyz"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -167,8 +167,8 @@ before invoking tools. `two-bot` with no subcommand starts the server;
 `two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
 usage and exit 0 before any env, DB or network read, so `--help` never dumps,
 prunes or uploads
-([help routing](../crates/bot/src/backup_cli.rs#L216), [dispatch](../crates/bot/src/backup_cli.rs#L242)).
-A trailing argument that is not `--help` is refused with exit 2 (`:231-236`).
+([help routing](../crates/bot/src/backup_cli.rs#L269), [dispatch](../crates/bot/src/backup_cli.rs#L304)).
+A trailing argument that is not `--help` is refused with exit 2 (`:284-298`).
 Other binaries or future subcommand help paths still require source/fixture
 verification before approval; a `--help` suffix is not a universal read-only
 safety boundary.
@@ -182,8 +182,8 @@ safety boundary.
 | `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
-Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L136),
-[restore implementation](../crates/bot/src/backup_cli.rs#L482) and
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L183),
+[restore implementation](../crates/bot/src/backup_cli.rs#L554) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -200,12 +200,12 @@ FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. A v4 dump covers every
 table that either migration chain creates, except `xp_cooldowns`, the store
 chain's `rollback_journal`/`rollback_watermarks` and the migration ledgers
-([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L185)),
+([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L222)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a
 current table is missing. Coverage and the trigger and sequence handling are in
-[backup.md](backup.md#coverage-and-recovery-semantics-v4-v5-and-v6). Do not
+[backup.md](backup.md#coverage-and-recovery-semantics-v4-v5-v6-v7-v8-v9-v10-v11-v12-v13-v14-and-v15). Do not
 treat its per-table count checks as complete final-copy verification.
 
 MEE6 XP/backfill/capture/reward utilities are **separate binaries**, not a
@@ -214,6 +214,28 @@ previews run migrations on connect; they are not production preflight tools.
 Do not use `dedupe-events` during cutover: it defaults to deletion and has no
 guild fence. Their exact behavior is in the
 [cutover CLI sources](../crates/cutover/src/bin) and is outside this procedure.
+
+#### Cutover CLI input preflight
+
+`capture` and `backfill-messages` validate `DISCORD_GUILD_ID` as a canonical
+Discord snowflake before the live-guild fence, admission or database bootstrap.
+Signed and zero-padded IDs refuse even with `--allow-live-guild`; the existing
+canonical live-guild opt-in is unchanged.
+
+Both scan tools accept `--max-pages` in `1..=10000`, defaulting to 25 for
+`backfill` and 60 for `backfill-messages`. Re-run hints use saturating arithmetic
+and never exceed that cap. At the cap, review scan scope rather than expecting a
+larger page budget. A supplied `backfill-messages --since` must be RFC3339;
+omitting it still selects unbounded history.
+
+All shared cutover CLI consumers preflight `TWO_DB_POOL_MAX` in `1..=32`
+(default 5) before I/O. This includes `rollback-delta import` in both modes,
+before file reads or plan output; valid dry-run imports still stay offline.
+These input refusals exit 2 with empty stdout and a fixed `input error: `
+diagnostic containing `code=` and `next_action=`, never the rejected value.
+The four tools' `--help` (including `rollback-delta import --help`) is
+credential-free and documents the ranges. Input validation grants no new live
+access, deployment or rollback authority.
 
 ### Merged copy, registry and preflight tools
 
@@ -227,9 +249,10 @@ paste them into a production shell without the cutover executor's approval:
 | `two-bot commands publish --apply` | Same source: explicit overwrite; default dry-run and `--allow-live-guild` opt-in required. Global snapshot/restore is not implied by a guild tool |
 | `two-bot preflight --json` | `crates/bot/src/preflight.rs:31-40`: read-only REST identity/intents/role/channel checks, FAIL vs WARN |
 | `gateway-force-identify` (separate cutover binary), default dry-run; `--apply --reason`, `--allow-live-guild` | `crates/cutover/src/bin/gateway_force_identify.rs:1-14`: prints guild, shard, checkpoint age and directive, writes nothing; `--apply` arms a one-shot force-fresh IDENTIFY consumed by the next boot. Required for the first production boot ([gateway recovery](gateway-recovery.md#force-fresh-identify-first-production-boot)) |
-| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs:14-52`: read-only delta report; `--export` writes the report to a file. Reverse import is still missing |
+| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs`: read-only delta report on stdout; `--export` writes the measured post-`T_f` rows as NDJSON (`{"table","row"}` per line) |
+| `rollback-delta import --file <export.ndjson> [--apply] [--allow-live-target] [--acknowledge-divergent]` (same binary) | `crates/cutover/src/rollback_import.rs`: replays an `--export` file into `TWO_DATABASE_URL`. Default dry-run prints a row-count plan without opening a database; `--apply` plus the live-target opt-in applies it in one idempotent transaction, parent-first. `--export` parent-joins `lfg_roles` to every exported `lfg_posts` row so a post-freeze post imports with its roles and signups; a failed insert names its table and constraint for integrity violations, while other server errors stay redacted database errors. The apply reports inserted vs already-present rows per table and advances owned sequences past the imported maxima. Skipped rows with no identical match are divergent (target values kept): the comparison is primary-keyed inside a UTC-pinned transaction with destination-owned columns (e.g. `guild_settings.cas_version`) excluded, the keyless `member_erasure_audit` inserts only when no identical row exists so its re-run never duplicates, the run lists their `table:key` entries and exits 3 unless `--acknowledge-divergent` is passed after manual reconciliation. Malformed lines, unknown tables and row-cap overruns refuse before any write |
 
-No `commands restore` (registry), database delta reverse-import, or
+No `commands restore` (registry) or
 `--disable-resume` command is established by this baseline (re-checked at
 `bce86a791`: `commands_cli.rs` offers only `diff`/`publish`, no `restore`;
 no `disable-resume`/`RESUME=0` in `crates/bot/src`). Gateway RESUME is
@@ -272,7 +295,35 @@ Those writers still need their own containment receipts.
 #### Authenticated control contract
 
 `GET /internal/ownership` reads the current version, owner record (or `null`) and
-native `running` flag without starting the Container. `POST` takes JSON:
+native `running` flag without starting the Container. Both environment-bound
+clients validate every successful GET and POST response before using it. Their
+returned/printed receipt contains only `{deploymentId, owner, running}`:
+
+- `deploymentId` is a string matching `[A-Za-z0-9_-]{1,128}`; `running` is boolean.
+- `owner` is `null` or a non-array record with `phase=active|fenced` and a valid
+  deployment ID. Only a fenced record may have a null deployment ID; a pending
+  takeover may still name its intended deployment while fenced.
+- A supplied `epoch` is a positive safe integer (at most `2^53-1`). Historical
+  abbreviated records may omit audit fields. Only an active legacy owner may
+  omit `epoch`: staging deployment takeover retains its expected-epoch-zero
+  fallback, and production's first POST still requires an explicit epoch. A
+  supplied null, string, zero, fractional or out-of-range epoch is not missing.
+- Supported owner fields are `deploymentId`, `epoch`, `phase`, `actor`,
+  `timestamp`, `oldEpoch`, `oldDeploymentId`. When supplied, actor uses the
+  request's audit-label syntax, timestamp must parse as a finite date, oldEpoch
+  is a nonnegative safe integer equal to `epoch-1` when epoch is present, and
+  oldDeploymentId is null or a valid deployment ID. Omitted fields stay omitted;
+  arbitrary extra fields at either level are dropped, never logged or receipted.
+
+Invalid response shapes fail with `Invalid ownership control response`. An
+invalid GET causes no POST or retry; an invalid POST cannot confirm a transition.
+Existing transition checks, deployment pins, redirect refusal and bounded retry
+rules still apply. This client compatibility does not relax persisted
+`OwnerRecord` validation or the stricter staging-status wrapper: that wrapper
+requires the full record and retains `Invalid ownership status response` for
+shape errors, emitting only `{owner_id, observed_at}`.
+
+`POST` takes JSON:
 
 ```json
 {"action":"takeover","expectedEpoch":0,"actor":"release-operator"}
@@ -355,12 +406,12 @@ alongside an unconfirmed Next gateway.
   `FORWARDED_DISCORD_IDS`:
   [configuration](../crates/core/src/config.rs#L24),
   [tool connection](../crates/cutover/src/cli.rs#L180),
-  [Worker environment](../wrangler/src/index.ts#L480).
+  [Worker environment](../wrangler/src/index.ts) (`containerEnvVars`).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated
-  runtime evidence: [boot](../crates/bot/src/main.rs#L106),
-  [pipeline construction](../crates/bot/src/gateway.rs#L1653).
+  runtime evidence: [boot](../crates/bot/src/main.rs),
+  [pipeline construction](../crates/bot/src/gateway.rs).
 - Fresh checkpoints (up to 15 minutes old) automatically trigger RESUME.
   Persistence deduplicates funnel batches, not all Discord effects:
   [session policy](../crates/core/src/gateway_session.rs#L4),

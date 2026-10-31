@@ -10,7 +10,7 @@ use super::{ActionExecutor, RawResponse, MODERATION_TIMEOUT_MS};
 use crate::ratelimit_guard::GuardError;
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{collections::HashSet, future::Future, time::Duration};
-use twilight_http::request::TryIntoRequest;
+use twilight_http::request::{Request, TryIntoRequest};
 use twilight_model::id::{marker::GenericMarker, Id};
 use two_bot_core::self_roles::{
     is_snowflake, validate_self_role_dispatch, ChannelOverwrite, ChannelSnapshot, DispatchCheck,
@@ -168,6 +168,23 @@ impl ActionExecutor {
         let request = builder
             .try_into_request()
             .map_err(|_| SelfRoleRestError::InvalidId)?;
+        let (_lane, response) = self.self_role_read_response(&request).await?;
+        serde_json::from_slice(&response.body).map_err(|_| SelfRoleRestError::Snapshot)
+    }
+
+    // Share acquisition across decoder types, but retain the reservation in the
+    // caller until decoding finishes and the response has been dropped.
+    #[inline(never)]
+    async fn self_role_read_response(
+        &self,
+        request: &Request,
+    ) -> Result<
+        (
+            tokio::sync::MutexGuard<'_, tokio::time::Instant>,
+            RawResponse,
+        ),
+        SelfRoleRestError,
+    > {
         let mut lane = self.paced_lane(false).await.map_err(guard_error)?;
         self.stamp_paced_lane(&mut lane, false);
         // `send_admitted_within` skips lane locking: the reservation above is
@@ -178,11 +195,11 @@ impl ActionExecutor {
         // body, so a truncated member document stays `Ambiguous`, never a
         // parsed partial snapshot.
         let (response, _) = self
-            .send_admitted_within(&request, Duration::from_millis(MODERATION_TIMEOUT_MS))
+            .send_admitted_within(request, Duration::from_millis(MODERATION_TIMEOUT_MS))
             .await
             .map_err(|_| SelfRoleRestError::Ambiguous)?;
         status(&response)?;
-        serde_json::from_slice(&response.body).map_err(|_| SelfRoleRestError::Snapshot)
+        Ok((lane, response))
     }
 
     /// Reaction removes carry no member, and adds may carry stale member data.
@@ -378,19 +395,17 @@ impl ActionExecutor {
             return Err(guard_error(error));
         }
         self.stamp_paced_lane(&mut lane, false);
-        let (result, response_status) = match tokio::time::timeout(
-            Duration::from_millis(MODERATION_TIMEOUT_MS),
-            self.send_status(&request),
-        )
-        .await
-        {
-            Ok(Ok(204)) => (Ok(()), Some(204)),
-            Ok(Ok(code)) => (
-                status_code(code).and(Err(SelfRoleRestError::Ambiguous)),
-                Some(code),
-            ),
-            _ => (Err(SelfRoleRestError::Ambiguous), None),
-        };
+        let (result, response_status) =
+            match tokio::time::timeout(self.inner.moderation_timeout, self.send_status(&request))
+                .await
+            {
+                Ok(Ok(204)) => (Ok(()), Some(204)),
+                Ok(Ok(code)) => (
+                    status_code(code).and(Err(SelfRoleRestError::Ambiguous)),
+                    Some(code),
+                ),
+                _ => (Err(SelfRoleRestError::Ambiguous), None),
+            };
         let owned_after = owns().await.unwrap_or(false);
         Ok(RoleExchange {
             result,
@@ -398,5 +413,145 @@ impl ActionExecutor {
             response_received: response_status.is_some(),
             response_status,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_fixture(body: &'static str) -> (ActionExecutor, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept fixture request");
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.expect("read fixture request");
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            assert!(request.starts_with(b"GET /api/v10/channels/1/messages/42 "));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write fixture response");
+        });
+        let executor = ActionExecutor::with_proxy("fixture-read-token".into(), Some(origin))
+            .expect("loopback executor");
+        (executor, server)
+    }
+
+    // These probes run synchronously on each test's current-thread runtime.
+    thread_local! {
+        static DECODING_EXECUTOR: RefCell<Option<ActionExecutor>> = const { RefCell::new(None) };
+        static DECODE_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Debug)]
+    struct DecodeProbe<const FAIL: bool>;
+
+    impl<'de, const FAIL: bool> Deserialize<'de> for DecodeProbe<FAIL> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            DECODING_EXECUTOR.with(|slot| {
+                let executor = slot.borrow();
+                let executor = executor.as_ref().expect("decoder probe installed");
+                assert!(
+                    executor.inner.pace_last_at.try_lock().is_err(),
+                    "typed read must retain its pacing reservation during decoding"
+                );
+            });
+            DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
+            let message = Message::deserialize(deserializer)?;
+            assert_eq!(message.id, "42");
+            assert_eq!(message.channel_id, "1");
+            if FAIL {
+                Err(serde::de::Error::custom("fixture decode failure"))
+            } else {
+                Ok(Self)
+            }
+        }
+    }
+
+    async fn assert_typed_read_reservation<const FAIL: bool>() {
+        let (executor, server) = read_fixture(r#"{"id":"42","channel_id":"1"}"#).await;
+        assert!(executor.inner.pace_last_at.try_lock().is_ok());
+        DECODING_EXECUTOR.with(|slot| *slot.borrow_mut() = Some(executor.clone()));
+        DECODE_CALLS.with(|calls| calls.set(0));
+        let decoded = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.self_role_read::<DecodeProbe<FAIL>>(
+                executor.inner.factory.message(Id::new(1), Id::new(42)),
+            ),
+        )
+        .await
+        .expect("typed read must finish");
+        DECODE_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        DECODING_EXECUTOR.with(|slot| *slot.borrow_mut() = None);
+        if FAIL {
+            assert_eq!(
+                decoded.expect_err("probe must reject the document"),
+                SelfRoleRestError::Snapshot
+            );
+        } else {
+            decoded.expect("probe must decode the document");
+        }
+        assert!(executor.inner.pace_last_at.try_lock().is_ok());
+        server.await.expect("fixture server");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_read_retains_pacing_reservation_during_successful_decode() {
+        assert_typed_read_reservation::<false>().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_read_retains_pacing_reservation_during_failed_decode() {
+        assert_typed_read_reservation::<true>().await;
+    }
+
+    #[tokio::test]
+    async fn shared_read_retains_pacing_reservation_through_decoding() {
+        for body in [r#"{"id":"42","channel_id":"1"}"#, "malformed-fixture-body"] {
+            let (executor, server) = read_fixture(body).await;
+            let request = executor
+                .inner
+                .factory
+                .message(Id::new(1), Id::new(42))
+                .try_into_request()
+                .expect("fixture request");
+            let (lane, response) = tokio::time::timeout(
+                Duration::from_secs(5),
+                executor.self_role_read_response(&request),
+            )
+            .await
+            .expect("single read must finish")
+            .expect("fixture response");
+            assert!(executor.inner.pace_last_at.try_lock().is_err());
+            let decoded = serde_json::from_slice::<Message>(&response.body);
+            if body.starts_with('{') {
+                let message = decoded.expect("typed message");
+                assert_eq!(message.id, "42");
+                assert_eq!(message.channel_id, "1");
+            } else {
+                assert!(decoded.is_err());
+            }
+            drop(response);
+            assert!(executor.inner.pace_last_at.try_lock().is_err());
+            drop(lane);
+            assert!(executor.inner.pace_last_at.try_lock().is_ok());
+            server.await.expect("fixture server");
+        }
     }
 }

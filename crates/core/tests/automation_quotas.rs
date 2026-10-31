@@ -126,12 +126,21 @@ async fn schedules_count_disabled_rows_allow_replacement_and_preserve_guild_fenc
         scheduled_store::put_scheduled(db.pool(), &schedule(GUILD, "still-overflow", true)).await,
         Err(QuotaWriteError::Capacity(AutomationQuota::Schedules))
     ));
+    // The listing read stays capped at the per-guild quota even though the
+    // store still holds the grandfathered row: the restore above is not
+    // pruned, it is counted, not listed.
+    assert_eq!(
+        scheduled_store::count_scheduled(db.pool(), GUILD)
+            .await
+            .unwrap(),
+        26
+    );
     assert_eq!(
         scheduled_store::list_scheduled(db.pool(), GUILD)
             .await
             .unwrap()
             .len(),
-        26
+        25
     );
     db.close().await.unwrap();
 }
@@ -307,7 +316,8 @@ async fn write(pool: &PgPool, quota: AutomationQuota, id: &str) -> Result<(), Qu
                 .map(|_| ())
         }
         AutomationQuota::Feeds => match feeds_store::add_feed(pool, &feed(GUILD, id, true)).await {
-            Ok(()) => Ok(()),
+            Ok(feeds_store::FeedAddOutcome::Created) => Ok(()),
+            Ok(feeds_store::FeedAddOutcome::Existing { .. }) => panic!("quota fixture must be new"),
             Err(FeedStoreError::Capacity(quota)) => Err(QuotaWriteError::Capacity(quota)),
             Err(FeedStoreError::Db(error)) => Err(error.into()),
             Err(error) => panic!("valid fixture feed rejected: {error}"),

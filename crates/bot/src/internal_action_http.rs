@@ -21,7 +21,10 @@
 
 use std::{
     future::IntoFuture,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -35,7 +38,12 @@ use axum::{
 };
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
-use tokio::{net::TcpListener, sync::Semaphore};
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
+use tracing::Instrument;
 use two_bot_core::{
     automation_transfer::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
@@ -57,11 +65,10 @@ use two_bot_core::{
         InternalStoreError, RequestIdentity, TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, require_field_str, require_snowflake, unmapped_event_key,
-        validate_announcement, validate_event_input, validate_event_key, validate_idempotency_key,
-        ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode,
-        GuildAddMemberRequest, InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH,
-        MAX_BODY_BYTES, SKEW_SECONDS,
+        require_field_str, require_snowflake, unmapped_event_key, validate_announcement,
+        validate_event_input, validate_event_key, validate_idempotency_key, ActionError,
+        AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode, GuildAddMemberRequest,
+        InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -89,6 +96,11 @@ const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Headroom inside the supervisor's HTTP drain budget: the receiver's shared
+/// shutdown deadline sits this far inside it, so the receiver always runs its
+/// child-abort path and reports before the supervisor backstop — armed on the
+/// same latch — can drop it mid-drain.
+const SUPERVISOR_HEADROOM: Duration = Duration::from_millis(500);
 /// Queued event work waits at most this long, then is refused `in_progress`
 /// before any claim.
 const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
@@ -155,6 +167,7 @@ impl ActionEffect for AnnouncementExecutor {
                         resource_id: Some(message_id),
                         affected: 1,
                         outcome: None,
+                        stop_reason: None,
                     }
                 }
                 ExecutionOutcome::NoEffect(refusal) => TerminalResponse::Failure(match refusal {
@@ -319,8 +332,22 @@ impl ModerationEffect for ModerationExecutor {
                         "moderation_snapshot_unavailable",
                     )
                 })?;
+            // The resolver runs before the instrumented executor: definitive
+            // refusals (`ActionNotAllowed`) record `refused` here so the
+            // website path counts what slash counts via `preflight_refused`.
+            // Snapshot failures stay unsampled.
             let (actor, target, bot_position) =
-                moderation_resolve(&self.discord, request, &facts, bot_position).await?;
+                match moderation_resolve(&self.discord, request, &facts, bot_position).await {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        record_resolver_refusal(
+                            metrics::global(),
+                            request.action().command_name(),
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                };
             match self
                 .inner
                 .execute(
@@ -347,6 +374,7 @@ impl ModerationEffect for ModerationExecutor {
                         resource_id: Some(target_id),
                         affected: 1,
                         outcome: None,
+                        stop_reason: None,
                     })
                 }
                 Err(error) => match error.code {
@@ -413,7 +441,19 @@ impl ChannelModerationEffect for ChannelModerationExecutor {
         Box::pin(async move {
             let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
             let facts = moderation_guild_facts(&self.discord, guild_id).await?;
-            let actor = channel_resolve(&self.discord, request, &facts).await?;
+            // Same boundary as the member path: definitive resolver refusals
+            // record `refused` here, before the instrumented executor runs.
+            let actor = match channel_resolve(&self.discord, request, &facts).await {
+                Ok(actor) => actor,
+                Err(err) => {
+                    record_resolver_refusal(
+                        metrics::global(),
+                        request.action().command_name(),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            };
             self.inner
                 .execute(request, &actor, request_id, idempotency_key, now)
                 .await
@@ -443,6 +483,21 @@ fn channel_action_outcome(action: &str) -> Option<&'static str> {
         "moderation.lockdown" => Some("locked_down"),
         "moderation.unlock" => Some("unlocked"),
         _ => None,
+    }
+}
+
+/// Record a definitive website resolver refusal. The actor/target checks in
+/// [`moderation_resolve`] and [`channel_resolve`] run before the instrumented
+/// executors, so without this the website path under-counts `refused`
+/// relative to slash (which counts the same refusals via `preflight_refused`
+/// and service policy errors). Snapshot failures (`DiscordUnavailable`) and
+/// other indeterminate errors prove nothing about the enforcement and stay
+/// unsampled, matching the slash rule for indeterminate preflight reads.
+/// Takes the recorder so tests assert on a fresh [`metrics::Metrics`]
+/// instead of the process-global registry.
+fn record_resolver_refusal(metrics: &metrics::Metrics, verb: &str, err: &ActionError) {
+    if err.code == ErrorCode::ActionNotAllowed {
+        metrics.moderation_enforcement(verb, "refused");
     }
 }
 
@@ -858,6 +913,16 @@ struct ReceiverState {
     capacity: Arc<Semaphore>,
     event_gate: tokio::sync::Mutex<()>,
     event_gate_wait: Duration,
+    /// Receiver-owned lifecycle set for receipt-finishing event-mutation
+    /// children. Every spawned child is tracked here so shutdown can join it;
+    /// the set holds no result, only the join, and each spawn reaps already
+    /// finished entries so steady state keeps only in-flight work.
+    children: tokio::sync::Mutex<JoinSet<()>>,
+    /// Latched when shutdown is requested (or the listener stops on its own).
+    /// Freshly claimed mutations refuse before their effect while set; replay,
+    /// in-flight and reconciliation answers are unaffected so reads of the
+    /// durable fence keep working through drain.
+    draining: AtomicBool,
 }
 
 impl ReceiverState {
@@ -887,6 +952,8 @@ impl ReceiverState {
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             event_gate: tokio::sync::Mutex::new(()),
             event_gate_wait: EVENT_GATE_WAIT,
+            children: tokio::sync::Mutex::new(JoinSet::new()),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -1164,21 +1231,114 @@ pub async fn bind(
 }
 
 impl BoundReceiver {
+    /// Shutdown budget shared by the Axum drain and the child drain, armed
+    /// when shutdown latches. It sits inside the supervisor's HTTP drain
+    /// budget by [`SUPERVISOR_HEADROOM`], so the receiver reports (and runs
+    /// its child-abort path) before the supervisor backstop fires.
+    fn shutdown_budget() -> Duration {
+        crate::website_jobs::HTTP_DRAIN_TIMEOUT.saturating_sub(SUPERVISOR_HEADROOM)
+    }
+
     /// Supervised by website_jobs along with the other runtime services.
     pub async fn serve(self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
-        let server = axum::serve(self.listener, router(Arc::clone(&self.state)))
+        let Self { listener, state } = self;
+        let mut latch = shutdown.clone();
+        let server = axum::serve(listener, router(Arc::clone(&state)))
             .with_graceful_shutdown(crate::server::shutdown_requested(shutdown))
             .into_future();
         tokio::pin!(server);
         let mut tick = tokio::time::interval(Duration::from_secs(60));
+        let mut draining = false;
+        // One shutdown deadline shared by the Axum drain and the child drain,
+        // armed when shutdown latches: an admitted handler holding a
+        // connection must not starve the child drain past the supervisor's
+        // backstop.
+        let mut deadline: Option<tokio::time::Instant> = None;
         let result = loop {
+            // Copied per iteration so the latch arm can re-arm the deadline
+            // while the nap below is pinned.
+            let latched_at = deadline;
+            let nap = async move {
+                match latched_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(nap);
             tokio::select! {
                 result = &mut server => break result,
-                _ = tick.tick() => self.state.flush(false),
+                _ = tick.tick() => state.flush(false),
+                // Latch drain mode the moment shutdown is requested, while
+                // Axum still drains in-flight connections: handlers admitted
+                // before the latch stop starting new mutation effects.
+                _ = latch.wait_for(|latched| *latched), if !draining => {
+                    draining = true;
+                    state.draining.store(true, Ordering::SeqCst);
+                    deadline = Some(tokio::time::Instant::now() + Self::shutdown_budget());
+                }
+                // The Axum drain shares the shutdown deadline: the child-abort
+                // path below still runs on the deadline's remainder.
+                _ = &mut nap, if draining => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "internal-action receiver drain timed out",
+                    ));
+                }
             }
         };
-        self.state.flush(true);
-        result
+        // A listener that stopped on its own drains the same way.
+        state.draining.store(true, Ordering::SeqCst);
+        let budget = deadline
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_else(Self::shutdown_budget);
+        let drained = Self::drain_children(&state, budget).await;
+        state.flush(true);
+        match (result, drained) {
+            (Ok(()), true) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), false) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "internal-action receiver drain timed out",
+            )),
+        }
+    }
+
+    /// Join tracked receipt-finishing children within `budget`, the remaining
+    /// share of the shutdown deadline the Axum drain did not consume. Clean
+    /// completion needs every child reaped; a reaped failure is terminal work
+    /// (its claim fence keeps durable uncertainty), but work still in flight
+    /// at the deadline is aborted and reported unclean, never waited on past
+    /// the budget.
+    async fn drain_children(state: &ReceiverState, budget: Duration) -> bool {
+        let mut children = state.children.lock().await;
+        let outcome = tokio::time::timeout(budget, async {
+            while let Some(finished) = children.join_next().await {
+                if let Err(join_error) = finished {
+                    tracing::warn!(
+                        msg = "internal_action_child_failed",
+                        error = %join_error,
+                        "receipt-finishing event mutation child failed; \
+                         its claim fence retains durable uncertainty"
+                    );
+                }
+            }
+        })
+        .await;
+        match outcome {
+            Ok(()) => true,
+            Err(_) => {
+                let pending = children.len();
+                children.abort_all();
+                tracing::warn!(
+                    msg = "internal_action_drain_deadline",
+                    pending = pending,
+                    "receiver shutdown reached the drain deadline with tracked \
+                     mutation children still in flight; aborted, their claims \
+                     retain durable uncertainty"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -1191,49 +1351,68 @@ fn router(state: Arc<ReceiverState>) -> Router {
         .with_state(state)
 }
 
-async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
-    state.reject(
-        Failure::http(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            false,
-            ErrorCode::Malformed,
-        ),
-        KeyLabel::Invalid,
-        ActionLabel::Unknown,
-        &request_id(),
-    )
-}
-
-async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
-    let id = request_id();
-    let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return state.reject(
+async fn not_found(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        state.reject(
             Failure::http(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "busy",
-                true,
-                ErrorCode::RateLimited,
+                StatusCode::NOT_FOUND,
+                "not_found",
+                false,
+                ErrorCode::Malformed,
             ),
             KeyLabel::Invalid,
             ActionLabel::Unknown,
             &id,
-        );
-    };
-    match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
-        Ok(response) => response,
-        // Dropping the future retains an announcement claim (a fresh nonce sees
-        // InFlight or NeedsReconciliation); event mutations finish in their own task.
-        Err(_) => state.reject(
-            Failure::code(ErrorCode::UpstreamTimeout),
-            KeyLabel::Invalid,
-            ActionLabel::Unknown,
-            &id,
-        ),
+        )
     }
+    .instrument(span)
+    .await
 }
 
-async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
+async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    // Honor the Worker's `x-request-id` when it has a generated shape, so one
+    // id joins the Worker, Durable Object, container and queued-work logs.
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        let Ok(permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
+            return state.reject(
+                Failure::http(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    true,
+                    ErrorCode::RateLimited,
+                ),
+                KeyLabel::Invalid,
+                ActionLabel::Unknown,
+                &id,
+            );
+        };
+        match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id, permit)).await {
+            Ok(response) => response,
+            // Dropping the future retains an announcement claim (a fresh nonce sees
+            // InFlight or NeedsReconciliation); event mutations finish in their
+            // own receiver-tracked task, holding capacity to their receipt.
+            Err(_) => state.reject(
+                Failure::code(ErrorCode::UpstreamTimeout),
+                KeyLabel::Invalid,
+                ActionLabel::Unknown,
+                &id,
+            ),
+        }
+    }
+    .instrument(span)
+    .await
+}
+
+async fn receive(
+    state: &Arc<ReceiverState>,
+    request: Request,
+    id: &str,
+    permit: OwnedSemaphorePermit,
+) -> Response {
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -1335,26 +1514,50 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     // announcements below, with their own validation and key mapping.
     if supports_event_mutation(&decision.action) {
         // Runs to its receipt even if the client has gone: a claimed create that
-        // was dropped mid-flight must still register its key mapping.
+        // was dropped mid-flight must still register its key mapping. The child
+        // is tracked under the receiver (never detached and ownerless) and
+        // carries the admission permit with it, so capacity stays held through
+        // receipt persistence and repeated timed-out clients cannot admit more
+        // than the work limit. The handler learns the outcome over a oneshot;
+        // dropping the handler drops only the receiver side.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let task_state = Arc::clone(state);
         let task_decision = decision.clone();
         let task_raw = raw.to_vec();
         let task_idempotency = headers.idempotency.map(str::to_owned);
         let task_id = id.to_owned();
         let task_key = key.clone();
-        let task = tokio::spawn(async move {
-            mutate_event(
-                &task_state,
-                &task_decision,
-                &task_raw,
-                task_idempotency.as_deref(),
-                &task_id,
-                task_key,
-                action,
-            )
-            .await
-        });
-        return match task.await {
+        // Queued work inherits the request span: task spawning does not
+        // propagate tracing context, so without this the follow-up's log
+        // lines could not join the Worker/DO/container request by id.
+        let task_span = tracing::Span::current();
+        {
+            // Locked through `state`, not the child's clone: the guard borrows
+            // while the spawned future moves its own Arc.
+            let mut children = state.children.lock().await;
+            children.spawn(
+                async move {
+                    let _permit = permit;
+                    let response = mutate_event(
+                        &task_state,
+                        &task_decision,
+                        &task_raw,
+                        task_idempotency.as_deref(),
+                        &task_id,
+                        task_key,
+                        action,
+                    )
+                    .await;
+                    let _ = done_tx.send(response);
+                }
+                .instrument(task_span),
+            );
+            // Reap finished siblings so the set tracks in-flight work only. A
+            // reaped failure already answered its own handler (or outlived it);
+            // the runtime logs the panic itself.
+            while children.try_join_next().is_some() {}
+        }
+        return match done_rx.await {
             Ok(response) => response,
             Err(_) => state.reject(Failure::reconciliation(), key, action, id),
         };
@@ -1722,6 +1925,7 @@ async fn execute_member(
                 resource_id: None,
                 affected,
                 outcome: None,
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -1827,12 +2031,14 @@ async fn moderation_member(
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
     // Resolution (guild facts, actor/target/bot snapshots) and the shared
-    // moderation service run inside the effect. Definitive refusals become
-    // terminal receipts; snapshot/transport uncertainty stays fenced.
+    // moderation service run inside the effect. Keep the caller-correlated `id`
+    // for logs and wire responses; ledger rows need a container-owned identity
+    // so a caller cannot collide separate moderation executions.
     let now = now_ms() as i64;
+    let ledger_id = two_bot_core::internal_actions::new_request_id(now as u64, &rand::random());
     match state
         .moderation
-        .execute_moderation(&request, id, &idempotency, now)
+        .execute_moderation(&request, &ledger_id, &idempotency, now)
         .await
     {
         Ok(response) => {
@@ -2026,11 +2232,14 @@ async fn moderate_channel(
     };
     // Actor resolution and the shared channel-moderation service run inside
     // the effect. Definitive refusals become terminal receipts; snapshot,
-    // transport and rate-limit uncertainty stays fenced.
-    let now = format_iso_millis(now_ms() as i64);
+    // transport and rate-limit uncertainty stays fenced. Keep the caller-
+    // correlated `id` for logs and wire responses, but use an owned ledger id.
+    let now_ms = now_ms() as i64;
+    let ledger_id = two_bot_core::internal_actions::new_request_id(now_ms as u64, &rand::random());
+    let now = format_iso_millis(now_ms);
     match state
         .channel
-        .execute_channel(&request, id, &idempotency, &now)
+        .execute_channel(&request, &ledger_id, &idempotency, &now)
         .await
     {
         Ok(result) => {
@@ -2051,6 +2260,7 @@ async fn moderate_channel(
                 resource_id: Some(channel_id),
                 affected: stored_affected,
                 outcome: None,
+                stop_reason: result.stop_reason,
             };
             if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -2113,7 +2323,8 @@ async fn moderate_channel(
 /// path. A replayed outer receipt re-derives the outcome from the authorized
 /// action (which maps 1:1 to the planner outcome) and the affected count from
 /// the stored receipt, so the wire stays identical without trusting a second
-/// body parse.
+/// body parse. Fresh and replayed wires both take an early-stopped purge's
+/// `stop_reason` from the receipt; a completed purge omits the key.
 #[allow(clippy::too_many_arguments)]
 fn moderate_channel_terminal(
     state: &ReceiverState,
@@ -2129,6 +2340,7 @@ fn moderate_channel_terminal(
     match response {
         TerminalResponse::Success {
             affected: stored_affected,
+            stop_reason,
             ..
         } => {
             // Bounded receiver counter (TOG-20119): channel-moderation
@@ -2152,6 +2364,9 @@ fn moderate_channel_terminal(
             );
             if let Some(count) = count {
                 result["affected"] = json!(count);
+            }
+            if let Some(reason) = stop_reason {
+                result["stop_reason"] = json!(reason.name());
             }
             let mut wire = (
                 StatusCode::OK,
@@ -2284,6 +2499,26 @@ async fn mutate_event(
         Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
+    // Shutdown stops new mutation effects here, after the claim: replay,
+    // in-flight and reconciliation answers above keep working through drain.
+    // No effect has run at this point, and none can be running (only the
+    // freshly claimed owner ever proceeds), so the claim is released exactly
+    // like a pre-effect admission refusal and the same key may retry after
+    // restart. A failed release keeps the fence occupied instead. Only this
+    // provably-never-sent refusal releases; cancelling work already underway
+    // never does.
+    if state.draining.load(Ordering::SeqCst) {
+        if let Err(release_error) = state.store.release_proven_not_sent(claim).await {
+            log_terminal_persist_failed(action, "release", release_error);
+            return reject(Failure::code(ErrorCode::Internal));
+        }
+        return reject(Failure::http(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            true,
+            ErrorCode::RateLimited,
+        ));
+    }
     // No `observed_at` here: the executor stamps the mirror write after
     // Discord returns, so a slow PATCH is never recorded under a pre-send
     // instant and never loses last-observed-wins to a newer poller snapshot.
@@ -2305,20 +2540,22 @@ async fn mutate_event(
             // Upsert registers (or re-points) the key only after Discord
             // confirms; cancel retains the mapping so a later edit cannot
             // silently recreate the event.
-            if upsert
-                && state
+            if upsert {
+                if let Err(put_error) = state
                     .store
                     .put_event_key(guild_id, &event_key, event_id.as_str())
                     .await
-                    .is_err()
-            {
-                mark_unknown_best_effort(&state.store, &claim, action).await;
-                return reject(Failure::reconciliation());
+                {
+                    log_terminal_persist_failed(action, "event_key", put_error);
+                    mark_unknown_best_effort(&state.store, &claim, action).await;
+                    return reject(Failure::reconciliation());
+                }
             }
             let response = TerminalResponse::Success {
                 resource_id: Some(event_id),
                 affected: 1,
                 outcome: Some(outcome),
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 // Do not return success before its audit/receipt is committed.
@@ -2454,6 +2691,7 @@ async fn write_setting(
                 resource_id: None,
                 affected: u32::from(!deleted),
                 outcome: None,
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -2726,6 +2964,7 @@ async fn import_automations(
                 resource_id: None,
                 affected,
                 outcome: None,
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -2974,21 +3213,26 @@ fn wire_headers(headers: &HeaderMap) -> Result<WireHeaders<'_>, Failure> {
         ));
     }
     if let Some(length) = one_header(headers, header::CONTENT_LENGTH.as_str(), 20)? {
-        match length.parse::<usize>() {
-            Ok(length) if length <= MAX_BODY_BYTES => {}
-            _ => {
-                return Err(Failure::http(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "malformed",
-                    false,
-                    ErrorCode::Malformed,
-                ))
-            }
+        // Wire grammar is digits only: `usize` parsing would accept a leading
+        // `+`, which is not a digit on the wire. Refuse with the existing
+        // fixed vocabulary, never echoing the value.
+        let usable = !length.is_empty()
+            && length.bytes().all(|b| b.is_ascii_digit())
+            && matches!(length.parse::<usize>(), Ok(n) if n <= MAX_BODY_BYTES);
+        if !usable {
+            return Err(Failure::http(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "malformed",
+                false,
+                ErrorCode::Malformed,
+            ));
         }
     }
     let required = |name, max| {
+        // A whitespace-only value carries no credential material: treat it as
+        // the existing missing-header refusal (`unauthorized`), not as present.
         one_header(headers, name, max)?
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| Failure::code(ErrorCode::Unauthorized))
     };
     Ok(WireHeaders {
@@ -3089,6 +3333,7 @@ fn terminal_response(
             resource_id: Some(message_id),
             affected: 1,
             outcome: None,
+            stop_reason: None,
         } => Json(json!({
             "ok": true, "result": {"message_id": message_id.as_str()}, "request_id": id,
         }))
@@ -3097,6 +3342,7 @@ fn terminal_response(
             resource_id: Some(event_id),
             affected: 1,
             outcome: Some(outcome),
+            stop_reason: None,
         } => Json(json!({
             "ok": true,
             "result": {"outcome": outcome.as_str(), "event_id": event_id.as_str()},
@@ -3111,6 +3357,7 @@ fn terminal_response(
             resource_id: None,
             affected,
             outcome: None,
+            stop_reason: None,
         } => match (action.as_str(), affected) {
             ("role.assign", 1) => member_success("assigned", id),
             ("role.assign", 0) => member_success("already_held", id),
@@ -3168,11 +3415,12 @@ async fn mark_unknown_best_effort(
     }
 }
 
-/// A failed terminal (`finish`) or proven-not-sent (`release`) write never
-/// releases the claim or resends; this only surfaces the gap. Mirrors
-/// [`mark_unknown_best_effort`]: fixed `msg`, bounded `action`, fixed
-/// `persist_op` (`finish` or `release`) and fixed `persist_class`. No store
-/// error text, claim, nonce, body, key, request ID or credential is logged.
+/// A failed terminal (`finish`), proven-not-sent (`release`) or event-key
+/// (`event_key`) write never releases the claim or resends; this only
+/// surfaces the gap. Mirrors [`mark_unknown_best_effort`]: fixed `msg`,
+/// bounded `action`, fixed `persist_op` (`finish`, `release` or `event_key`)
+/// and fixed `persist_class`. No store error text, claim, nonce, body, key,
+/// request ID or credential is logged.
 fn log_terminal_persist_failed(action: ActionLabel, op: &'static str, error: InternalStoreError) {
     tracing::error!(
         msg = "internal_action_terminal_persist_failed",
@@ -3213,9 +3461,20 @@ fn now_ms() -> u64 {
         })
 }
 
-fn request_id() -> String {
-    new_request_id(now_ms(), &rand::random())
-}
+/// Serializes exact-delta `two_bot_moderation_enforcements_total` assertions
+/// on the process-global registry across test modules (TOG-28482): the
+/// website refusal/executor tests in `tests` and the slash preflight test in
+/// `command_runtime_tests` both record `refused` for the same member verbs,
+/// and `cargo test --workspace --lib --bins` runs them as threads of one
+/// process. Hold across the before/after reads. Test-only; never used in
+/// production. Acquire before any flag lock; flag locks are leaves under it.
+#[cfg(test)]
+pub(crate) static MODERATION_METRICS_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "internal_action_envelope_tests.rs"]
+mod internal_action_envelope_tests;

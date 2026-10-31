@@ -348,7 +348,10 @@ impl<L: AutomodClaimLedger, F: AutomodFacts> AutomodActivation<L, F> {
         receipt: StoredOutcome,
     ) -> Activation {
         match self.ledger.ledger_complete(claim, &receipt).await {
-            Ok(true) => activation(funnel, ActivationOutcome::Completed(receipt)),
+            Ok(true) => {
+                two_bot_core::metrics::global().automod_decision(receipt.outcome.as_str());
+                activation(funnel, ActivationOutcome::Completed(receipt))
+            }
             Ok(false) => activation(
                 funnel,
                 ActivationOutcome::Retained(RetainReason::CompletionRefused),
@@ -408,6 +411,8 @@ pub struct RestAutomodFacts {
     owen_user_id: String,
     protected_role_ids: HashSet<String>,
     bot_user_id: OnceLock<String>,
+    // Shared across steps and guilds: constant memory even during an outage.
+    last_read_warning: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl RestAutomodFacts {
@@ -422,11 +427,35 @@ impl RestAutomodFacts {
             owen_user_id,
             protected_role_ids,
             bot_user_id: OnceLock::new(),
+            last_read_warning: Mutex::new(None),
         }
     }
 
-    async fn get(&self, path: &str) -> Option<Value> {
-        self.executor.get_json_strict(path).await.ok().flatten()
+    async fn get(&self, path: &str, step: &'static str) -> Option<Value> {
+        match self.executor.get_json_strict(path).await {
+            Ok(value) => value,
+            Err(error) => {
+                let warn = {
+                    let mut last = self
+                        .last_read_warning
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let now = tokio::time::Instant::now();
+                    if last.is_none_or(|last| {
+                        now.duration_since(last) >= std::time::Duration::from_secs(60)
+                    }) {
+                        *last = Some(now);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if warn {
+                    tracing::warn!(step, cause = error.cause(), "automod_facts_read_failed");
+                }
+                None
+            }
+        }
     }
 
     async fn bot_user_id(&self) -> Option<String> {
@@ -439,15 +468,21 @@ impl RestAutomodFacts {
 
     async fn resolve_target(&self, subject: &MessageSubject) -> Option<TargetFacts> {
         let guild_id = subject.guild_id.as_str();
-        let guild = self.get(&format!("/guilds/{guild_id}")).await?;
+        let guild = self.get(&format!("/guilds/{guild_id}"), "guild").await?;
         let owner_id = text(&guild, "owner_id")?;
         let bot_id = self.bot_user_id().await?;
         let bot_member = self
-            .get(&format!("/guilds/{guild_id}/members/{bot_id}"))
+            .get(
+                &format!("/guilds/{guild_id}/members/{bot_id}"),
+                "bot_member",
+            )
             .await?;
         // Target membership is the final read before the mutation fence.
         let member = self
-            .get(&format!("/guilds/{guild_id}/members/{}", subject.author_id))
+            .get(
+                &format!("/guilds/{guild_id}/members/{}", subject.author_id),
+                "target_member",
+            )
             .await?;
         let user = member.get("user")?;
         if text(user, "id")? != subject.author_id || text(bot_member.get("user")?, "id")? != bot_id
@@ -517,12 +552,18 @@ impl AutomodFacts for RestAutomodFacts {
         message_id: &str,
     ) -> Option<FetchedMessage> {
         let value = self
-            .get(&format!("/channels/{channel_id}/messages/{message_id}"))
+            .get(
+                &format!("/channels/{channel_id}/messages/{message_id}"),
+                "message",
+            )
             .await?;
         let message: Message = serde_json::from_value(value).ok()?;
         let author_id = message.author.id.to_string();
         let member = self
-            .get(&format!("/guilds/{guild_id}/members/{author_id}"))
+            .get(
+                &format!("/guilds/{guild_id}/members/{author_id}"),
+                "target_member",
+            )
             .await?;
         if text(member.get("user")?, "id")? != author_id {
             return None;

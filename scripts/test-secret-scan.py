@@ -150,7 +150,9 @@ class SecretScanSurfaceTests(unittest.TestCase):
         self.assertIn("run: bash .github/scripts/gitleaks-scan.sh", scan)
         # Context values reach the shell as env vars, never interpolated into `run:`.
         self.assertIn("EVENT_NAME: ${{ github.event_name }}", scan)
-        self.assertIn("BASE_REF: ${{ github.base_ref }}", scan)
+        # base_ref is empty on merge_group; the queue target arrives as a full
+        # ref and the wrapper strips the prefix.
+        self.assertIn("BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}", scan)
         run_lines = [line for line in scan.splitlines() if line.strip().startswith("run:")]
         self.assertFalse(any("${{" in line for line in run_lines))
         self_test = self.gitleaks_step("Self-test the PR scan policy")
@@ -164,7 +166,11 @@ class SecretScanSurfaceTests(unittest.TestCase):
             self.assertIn(flag, script)
         self.assertNotIn("--no-git", script)
         self.assertIn('== "pull_request"', script)
-        self.assertIn("refs/remotes/origin/${BASE_REF}", script)
+        self.assertIn('== "merge_group"', script)
+        # merge_group.base_ref arrives as refs/heads/<branch>; strip it before
+        # resolving the fetched base.
+        self.assertIn('base_ref="${BASE_REF#refs/heads/}"', script)
+        self.assertIn("refs/remotes/origin/${base_ref}", script)
         self.assertIn(':.gitleaks.toml"', script)
         self.assertIn(':.gitleaksignore"', script)
         self.assertNotIn("continue-on-error", script)
@@ -182,7 +188,10 @@ class SecretScanSurfaceTests(unittest.TestCase):
         for case in ("allowlist added in .gitleaks.toml", "fingerprint added in .gitleaksignore",
                      ".gitleaksignore symlink cannot overwrite the running wrapper",
                      "inline gitleaks:allow", "allowlist already on the base branch is honoured",
-                     "unfetched base branch fails"):
+                     "unfetched base branch fails",
+                     "merge_group: allowlist added in .gitleaks.toml does not silence the scan",
+                     "merge_group: fingerprint added in .gitleaksignore does not silence the scan",
+                     "merge_group: unfetched base branch fails"):
             self.assertIn(case, script)
         # The planted token is derived at run time, never written as a literal.
         self.assertRegex(script, r'token="ghp_\$\(printf [^\n]*sha256sum')

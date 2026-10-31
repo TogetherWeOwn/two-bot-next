@@ -41,10 +41,23 @@ occurrence time and audit ID, and finds the maximum sliding heat at endpoints at
 or after the trigger. An exact-window separation is excluded. This supports
 reverse delivery without summing two adjacent windows together. Defaults are a
 60s window and heat threshold 5. Policy durations are explicit integer
-milliseconds. The bot loader (`ContainmentSettings::from_vars` in
+milliseconds. The live bot loader (`ContainmentSettings::try_from_vars` in
 `crates/bot/src/containment_runtime.rs`) converts `TWO_ANTI_NUKE_*_SECONDS` to
-whole positive milliseconds; a sub-millisecond, overflowing or non-finite value
-uses the shipped default with a warning.
+positive milliseconds, truncating a fractional millisecond as before. Missing,
+empty or whitespace-only keys keep the shipped defaults. Present malformed,
+sub-millisecond, overflowing or non-finite durations, non-positive/non-integral
+heat thresholds, and malformed staff channels refuse the observation before
+claims, heat, alerts or role effects. `containment_tuning_refused` logs only the
+key at error level on entry or a changed refused key, not on every observation.
+Hot rows still override deployment values; failed refreshes retain the last
+outcome, including refusal, until a valid read recovers. The old `from_vars`
+reader exists only for compatibility tests, not the live path.
+
+Trusted/protected user lists are still cold boot settings. Each nonempty CSV
+entry must be a bare 17–20 ASCII-digit snowflake after trimming. Empty entries
+are ignored and valid entries deduplicate without changing their bytes. One
+malformed entry refuses the entire observer at boot; no partial set can reach
+containment, even when arming fences otherwise pass.
 
 `incident_candidate` proposes an incident with the triggering audit ID, state
 `Containing`, and cooldown measured from **processing time**, not occurrence
@@ -58,8 +71,18 @@ window that would end later caps the cooldown there: the incident still opens
 and alerts, the executor stays suppressed through that instant, and the store
 logs `containment_cooldown_capped`.
 
-`plan_quarantine` returns dry-run, whole-plan refusal, or ordered role IDs. It
-excludes safe roles, unheld roles and `@everyone`. If any held dangerous role is
+`plan_quarantine` returns dry-run, whole-plan refusal, or ordered role IDs.
+Before planning (including dry-run), it requires canonical nonzero u64 role
+identities with no duplicate rows, non-negative hierarchy positions, an unmanaged
+`@everyone` baseline (`id == guild_id`, position zero), and snapshot coverage of
+every role in both fetched held-role sets. IDs must be unique within each held-role
+set; overlap between the executor's and bot's sets is allowed.
+Missing or contradictory evidence returns `InvalidEvidence` with no role IDs,
+never removals or an empty-plan success. This defends against malformed or
+incomplete evidence; it does not imply Discord normally returns partial lists.
+
+With complete evidence, the planner excludes safe roles, unheld roles and
+`@everyone`. If any held dangerous role is
 managed or at/above the bot's highest role, **none** are removable. A managed-role
 refusal takes precedence over hierarchy, as in legacy. Dangerous permissions are
 KickMembers, BanMembers, Administrator, ManageChannels, ManageGuild,
@@ -88,8 +111,12 @@ A pure plan is **not** permission to execute it. A subsequent adapter must:
    blockers inside the incident transaction. After starting an incident, persist
    the trigger as `Contain`. Core proposals alone provide **no** concurrency or
    restart guarantee. `containment_store` (migration
-   `0370_containment_claims.sql`, legacy 0015 shape) now provides these claims
-   but is not wired to the gateway, executor or any arming path.
+   `0370_containment_claims.sql`, legacy 0015 shape) provides these claims,
+   wired through `containment_runtime`: the gateway installs it as the
+   audit-entry observer (`crates/bot/src/main.rs:708-711`), and the worker
+   claims each entry (`crates/bot/src/containment_runtime.rs:491`) under exact
+   `TWO_ANTI_NUKE=1` on the staging guild, armed only by explicit
+   `TWO_ANTI_NUKE_DRY_RUN=0` outside session mode.
 5. Capture complete role/member snapshots, perform whole-plan preflight before
    writes, enforce the 5s request timeout, and never automatically retry unknown
    outcomes. Use the shared executor boundary rather than duplicating it.
@@ -118,3 +145,13 @@ startup gates and alert delivery are wired by `crates/bot/src/containment_runtim
 dry-run-default plans, armed-only removals, shared-executor staff posts) with
 mock-Discord plus ignored agent-testdb worker tests; staging soak acceptance
 remains unimplemented and untested.
+
+The adapter rejects malformed JSON fields as `containment_snapshot_failed` and
+reports incomplete or contradictory typed evidence with the fixed diagnostic
+`containment_refused: role evidence incomplete or contradictory`. Neither path
+logs upstream payloads or attempts a role DELETE; it completes the incident as
+failed or refused, never contained. A complete safe-only snapshot still permits
+the genuine empty-plan contained outcome. The protected
+`containment_evidence_acceptance` and `containment_runtime_evidence_` suites pin
+these boundaries alongside the existing managed-role and hierarchy controls.
+No activation, permission widening, automatic retry or deployment is implied.

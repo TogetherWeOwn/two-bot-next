@@ -67,11 +67,41 @@ except for the rank self-heal below, the one tick that writes to Discord:
   `Legend missing matches=0`); it never logs a Discord role name or id and
   still fails closed with `configuration`.
 - Non-nested ranks self-heal when the live-identity fence permits the
-  `rank_heal` capability: the tick grants the missing lower rungs (bounded,
-  hierarchy-fenced, with an audit reason) and republishes; a refused identity
-  keeps the old refusal.
-- Failed or malformed scheduled-event reads keep the previous mirror. Only a
-  valid empty event array clears it.
+  `rank_heal` capability; a refused identity keeps the old refusal. The initial
+  plan must contain at most 25 grants and every target must be below the bot's
+  highest role. Before each candidate grant, the tick reads that member again
+  and recomputes their missing lower rungs. Removed higher ranks, departures,
+  bots and already-held rungs cannot authorize a grant. Wrong user identity,
+  incomplete roles or failed reads refuse repair, not an empty membership.
+- Repair never grows its initial candidate queue: at most 25 eligibility reads,
+  25 additive-only grants with the existing audit reason, and one final read
+  per affected member (at most 25). All affected entries are replaced by their
+  observed roles, or removed on a confirmed 404, before rebuilding publication.
+  Unverifiable or still-nonnested results leave the prior snapshot and its
+  timestamps unchanged. New missing rungs outside the initial queue wait for a
+  later tick rather than causing unbounded replanning. Logs identify actual
+  applied grants separately from successful observed nesting verification.
+- These reads narrow observed-staleness windows, not a distributed atomic
+  transaction: Discord may change roles between the last eligibility read and
+  its PUT, or after the final member observation. A failed tick cannot undo
+  Discord grants already applied; no automatic role removals are performed.
+- Failed or malformed scheduled-event reads keep the previous mirror. Before
+  normalization or storage, the REST adapter requires every row's `guild_id` to
+  match the configured guild and requires guild/event/non-null channel IDs to be
+  canonical decimal nonzero `u64` snowflakes (no sign, whitespace, leading zeros
+  or overflow). Missing/null channels remain valid for external events. A bad
+  identity anywhere, or a duplicate event ID, rejects the entire tick as `rest`
+  without changing rows or observation timestamps; identities are never silently
+  rewritten. The pure `RawScheduledEvent` / `normalize_events` fixture contract
+  stays unchanged; wire identity validation belongs to the adapter. Only a valid
+  empty event array clears the mirror. The observation timestamp is still taken
+  before the GET, preserving the store's last-observed-wins fencing.
+  The internal-action event writer uses the same `internal_events::canonical_snowflake`
+  helper for required guild/event IDs and non-null channel IDs before normalization
+  or storage, binding the response to the requested guild and known event ID.
+  An invalid response remains `InvalidResponse` (not retry-safe), and a mutation
+  retains its admission fence without completing the permit. GET admission behavior
+  and the internal writer's post-response observation timestamp remain unchanged.
 
 `/readyz` retains its existing `components` array and adds an informational
 `jobs` object keyed by the four names above plus the three community-job names below. Each entry carries `parked`, `running`,
@@ -225,6 +255,16 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   audit-retry job, the scheduled-messages job, the self-role recovery job, the
   gated `feeds` job and the DB-only settings poll, each parked when its service
   is unregistered), even when announcements are off.
+- The five community keys (`TWO_COMMUNITY_SCORECARD`,
+  `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`,
+  `TWO_PRESENCE_PROBE`, `TWO_INACTIVITY_DAYS`) are hot-wired: every tick
+  layers the poller-published snapshot over the boot gates store-first
+  (`bot::community_jobs::LIVE_KEYS`), so a dashboard write applies within
+  one 15 s poll. A stored `0` on either enable gate skips that tick; an
+  absent or unparsable stored count falls back to boot per key. Boot
+  registration is unchanged: a job parked at boot needs a restart to start
+  ticking, the facts sink arms once at boot, and the scorecard command
+  surface publishes at boot (see [configuration](configuration.md)).
 
 ## Verification
 
@@ -238,6 +278,59 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   Database cases require `TWO_TEST_DATABASE_URL` on agent-testdb/CI services;
   absent configuration skips locally and fails in CI. Existing hosted CI's
   unit/binary step runs them without changing the workflow.
+- The live-apply pins run fully offline (pure in-memory `live_channel`, no
+  `TWO_TEST_DATABASE_URL` needed):
+
+  ```sh
+  python3 scripts/cargo_cache.py run -- test -p two-bot-core --test community_presence_inactivity_live_keys_acceptance
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot community_jobs::
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot settings_jobs::community_live_log_acceptance_tests
+  ```
+
+  A staging apply-check stays a rollout step, not a test gate.
+- The stored actor/staging exclusion live-apply pins run fully offline too
+  (in-memory `live_channel` plus the real pipeline seam, no database):
+
+  ```sh
+  python3 scripts/cargo_cache.py run -- test -p two-bot-core --test community_exclusion_live_keys_acceptance
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test community_exclusion_pipeline_acceptance
+  ```
+
+- The gateway and attendance regressions call the shared production overlay,
+  real settings poll and migrated disposable fact store. Voice, member joins
+  and rules acceptance must observe replacement, empty and deleted exclusions
+  without an intervening message, including alternating guilds on one pipeline.
+  Five independent overlay controls cover all exclusion keys. Attendance uses
+  the production command composition in both direct and ordered completion;
+  a poll after acknowledgement must affect the check-in classification while
+  preserving membership/event validation, host-check-in proof and audit rows.
+  The ordered gateway also refreshes member removals before ending voice facts.
+  Both bot runtime constructors install the same execution-time provider; the
+  classifier version stays deployment-only.
+
+  ```sh
+  TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+    python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot gateway::live_exclusions_acceptance_tests:: -- --test-threads=1
+  ```
+
+- The production-call-site regressions in `community_live_tick_tests.rs`
+  additionally require the disposable test database. Each uses a child process
+  to register the real settings poll, publish committed overrides and run the
+  production tick without leaking the process-wide reader into other tests.
+  Presence and scorecard must skip all work on stored `0` and resume after
+  deletion; inactivity must persist flags using the stored horizon and restore
+  the boot horizon after deletion. Independent scorecard cases publish
+  recommendations and correction cycles different from boot, then assert the
+  persisted `recommendationsEnabled` and `killSwitchActive` payload fields.
+  Missing stream coverage exercises the two-correction kill switch. Each delete
+  runs in the next eligible week, requiring a fresh output with boot fallback
+  instead of reusing a completed scorecard. Only Discord REST is doubled.
+
+  ```sh
+  TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+    python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot community_jobs::live_tick_tests:: -- --test-threads=1
+  ```
+
 - Run `cargo test -p two-bot-core --features db --locked --lib <filter>`
   separately for `community::tests`, `presence::tests`, `inactivity::tests`,
   `funnel::tests`, `community_store`, `presence_store`, and `inactivity_store`,

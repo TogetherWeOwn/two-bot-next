@@ -98,6 +98,18 @@ const ID: &str = "123456789012345678";
             (path.parent / "other.rs").write_text(source)
             self.assertEqual(len(snowflakes.check(root, allowance)), 1)
 
+    def test_root_allowance_rejects_invalid_paths(self):
+        for path in ["src", "src/../x.rs", "srcx/a.rs"]:
+            with self.subTest(path=path), self.assertRaisesRegex(
+                ValueError, "invalid source allowance path"
+            ):
+                snowflakes.check(Path("."), [{
+                    "path": path,
+                    "value": "123456789012345678",
+                    "source": 'const ID: &str = "123456789012345678";',
+                    "reason": "fixture",
+                }])
+
     def test_allowance_requires_reason_and_source_path(self):
         for entry in [
             {"reason": ""},

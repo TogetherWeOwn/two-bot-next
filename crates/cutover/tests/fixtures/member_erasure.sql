@@ -15,10 +15,11 @@ BEGIN
         VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
       -- event_store is shared by the S1-S8 slices: one presence row per member
       -- here (S5 message/reaction columns ride along) plus three S8 rows per
-      -- member below (actor-only / target-only / user-only), so the erasure
-      -- suites expect four event_store rows per member. Voice columns stay
-      -- NULL here; the backup seed covers the S4 voice, S5 message/reaction
-      -- and S6 thread shapes.
+      -- member below (actor-only / target-only / user-only) plus one S7
+      -- invite row binding the member as inviter only, so the erasure suites
+      -- expect five event_store rows per member. Voice columns stay NULL
+      -- here; the backup seed covers the S4 voice, S5 message/reaction and
+      -- S6 thread shapes.
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
         presence_status, activity_type, application_id, nick_changed, roles,
         channel_id, message_id)
@@ -29,6 +30,8 @@ BEGIN
         VALUES (g, u, 1, u, now());
       INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
         VALUES (g, u, 15, 15, now());
+      INSERT INTO member_season_xp (guild_id, season_id, member_id, seasonal_xp, updated_at)
+        VALUES (g, '2026-Q4', u, 15, now());
       INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at)
         VALUES (g, u, 'message', 15, now());
       INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
@@ -39,6 +42,11 @@ BEGIN
       INSERT INTO moderation_idempotency
         (guild_id, idempotency_key, action, request_hash, state, claimed_at, completed_at, result_json)
         VALUES (g, k, 'warn', 'fixture', 'done', '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z', '{}');
+      -- FK child of the idempotency row above: every self-role send writes an
+      -- exchange row and nothing deletes them, so erasure/purge must delete
+      -- the child first or the parent delete fails with 23503.
+      INSERT INTO moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
+        VALUES ('exec-' || k, g, k, 'tok-' || k);
       INSERT INTO moderation_warnings
         (id, guild_id, user_id, actor_id, reason, request_id, created_at)
         VALUES ('w-' || k, g, u, u, 'fixture', 'w-' || k, now());
@@ -92,6 +100,17 @@ BEGIN
         VALUES (k, 'tank', 'Tank', 2, 1);
       INSERT INTO lfg_signups (lfg_id, user_id, role_key, joined_at)
         VALUES (k, u, 'tank', now());
+      INSERT INTO giveaways
+        (guild_id, id, prize, channel_id, message_id, created_by, winners_count, ends_at,
+         status, requirements_json, max_entries, draw_nonce, created_at, updated_at)
+        VALUES (g, k, 'fixture', '999999999999999999', 'm-' || k, u, 1, now(),
+         'open', '{}'::jsonb, 1, 'nonce-' || k, now(), now());
+      INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at)
+        VALUES (g, k, u, 1, now());
+      INSERT INTO giveaway_draws
+        (guild_id, giveaway_id, draw_no, drawn_at, eligible_count, eligible_hash, seed,
+         winner_ids, reroll_kind)
+        VALUES (g, k, 0, now(), 1, 'fixture', 'fixture', ('["' || u || '"]')::jsonb, NULL);
       INSERT INTO feed_relays (id, guild_id, channel_id, kind, source, created_by, created_at, updated_at)
         VALUES (k, g, u, 'rss', 'https://example.invalid/feed', u, now(), now());
       INSERT INTO feed_deliveries (feed_id, item_key, nonce, state, first_seen_at)
@@ -130,6 +149,10 @@ BEGIN
          added_role_ids, removed_role_ids, created_at)
         VALUES (k, g, 'fixture-panel', u, 'fixture-source', 'button', 'assign', 'assigned',
           '[]', '[]', '2026-10-01T00:00:00Z');
+      -- FK child of the audit row above: insert_role_exchange writes one row
+      -- per send, so erasure/purge must delete exchanges before the audit row.
+      INSERT INTO self_role_exchanges (event_id, origin_generation, role_id, adding, compensating)
+        VALUES (k, 1, '101', TRUE, FALSE);
       INSERT INTO self_role_panel_claims
         (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at,
          latest_event_id, target_committed)
@@ -151,17 +174,38 @@ BEGIN
       INSERT INTO voice_owner_grants (guild_id, channel_id, member_id, revision, pending)
         VALUES (g, 'v-' || k, u, 'fixture-owner-revision', TRUE);
       INSERT INTO voice_logging_mention_members (guild_id, member_id) VALUES (g, u);
+      INSERT INTO member_catchup_members (guild_id, member_id) VALUES (g, u);
+      -- Starboard starrers are BIGINT snowflakes (one row per guild/message/user
+      -- here, like every other member table): four rows total, one matching the
+      -- erasure target, three survivors. The erasure predicate is
+      -- guild_id = $1::bigint AND user_id = $2::bigint (cast the retained text
+      -- binds, never the indexed columns); config.updated_by stays a
+      -- retained-attribution allowlist and posts carry no member column.
+      INSERT INTO starboard_starrers
+        (guild_id, source_channel_id, source_message_id, user_id)
+        VALUES (g::bigint, 155000000000000001, 156000000000000001, u::bigint);
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
       INSERT INTO retention_deletion_requests (request_id, guild_id, user_id)
         VALUES (k, g, u);
+      -- Event voice presence is guild-scoped through the scheduled-event
+      -- mirror (one event per member keeps the loop conflict-free).
+      INSERT INTO scheduled_events
+        (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
+        VALUES (g, 'ev-' || k, 'fixture', '2026-11-01T20:00:00Z', NULL, NULL, 'scheduled', '2026-10-01T00:00:00Z');
+      INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at, left_at)
+        VALUES ('ev-' || k, '2026-11-01T20:00:00Z', u, '2026-11-01T20:00:00Z', NULL);
       -- Three S8 event_store rows per member, each binding the member in exactly
       -- one of actor_id, target_id and user_id (the others NULL) with distinct
       -- dedup_keys, so each erasure predicate branch is exercised
       -- independently; with the presence row above that is four rows per
       -- member. The THREAD_MEMBER_UPDATE shape stays covered by the backup
       -- seed, so no thread row is added here.
+      -- One S7 event_store invite row per member, binding the member as
+      -- inviter_id only (actor/target/user NULL) with a code hash, never the
+      -- raw code; with the rows above that is five rows per member, so the
+      -- inviter predicate branch is exercised independently too.
       INSERT INTO event_store
         (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
          interaction_type, application_id, command_id, audit_log_entry_id, action_type,
@@ -186,6 +230,15 @@ BEGIN
           1, 'app-' || k, 'cmd-' || k, 'audit-user-' || k, 1,
           NULL, NULL, u, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
           'AUDIT_LOG_ENTRY:' || g || ':audit-user-' || k || ':2026-10-01T00:00:00Z');
+      INSERT INTO event_store
+        (event_type, guild_id, channel_id, invite_code_hash, inviter_id,
+         actor_id, target_id, user_id, event_time, received_at, dedup_key)
+        VALUES ('INVITE_CREATE', g, 'c-' || k,
+          repeat(md5('invite-' || k), 2),
+          u, NULL, NULL, NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
+          'INVITE_CREATE:' || g || ':c-' || k || ':' ||
+            repeat(md5('invite-' || k), 2) ||
+            ':2026-10-01T00:00:00Z');
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

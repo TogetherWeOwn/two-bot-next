@@ -1,0 +1,1 @@
+{"action":"moderation.timeout","actor_id":"111111111111111111","member_id":"222222222222222222","reason":"  spam  ","duration_seconds":3600,"starts_at":"2026-10-01T10:00:00.123+02:00","ends_at":"9999-12-31T23:30:00-01:00","event_key":"game-night:2026.10","key":"TWO_VOICE","count":100,"seconds":21600}

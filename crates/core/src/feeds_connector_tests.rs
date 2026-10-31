@@ -237,3 +237,163 @@ async fn expired_deadline_refuses_decode_instead_of_succeeding() {
         b"<rss/>",
     );
 }
+
+fn fetched_with_status(status: StatusCode) -> FetchedFeed {
+    FetchedFeed {
+        url: Url::parse("https://example.org/feed.xml").expect("fixture url"),
+        status,
+        body: "<rss><channel></channel></rss>".to_owned(),
+    }
+}
+
+/// TOG-28423: every policy and connector error maps to the bounded
+/// outcome/error-class vocabulary. No network: errors are constructed
+/// directly, never fetched.
+#[test]
+fn fetch_error_classification_covers_every_variant_without_network() {
+    use crate::feeds_http::FetchError;
+    use crate::metrics::{FEED_FETCH_ERROR_CLASSES, FEED_FETCH_OUTCOMES};
+
+    let policy_cases = [
+        (
+            FetchError::InvalidSource,
+            "invalid_source",
+            "invalid_source",
+        ),
+        (
+            FetchError::NonPublicAddress,
+            "invalid_source",
+            "non_public_address",
+        ),
+        (
+            FetchError::RedirectRefused,
+            "refused_redirect",
+            "redirect_refused",
+        ),
+        (FetchError::TooLarge, "failure", "too_large"),
+        (FetchError::InvalidEncoding, "failure", "invalid_encoding"),
+        (
+            FetchError::UnsupportedContentType,
+            "failure",
+            "unsupported_content_type",
+        ),
+    ];
+    for (error, outcome, error_class) in policy_cases {
+        assert!(
+            FEED_FETCH_OUTCOMES.contains(&outcome),
+            "outcome {outcome} must be allowlisted"
+        );
+        assert!(
+            FEED_FETCH_ERROR_CLASSES.contains(&error_class),
+            "error class {error_class} must be allowlisted"
+        );
+        assert_eq!(error.metrics_outcome(), outcome);
+        assert_eq!(error.metrics_error_class(), error_class);
+        let wrapped = FeedConnectError::Policy(error);
+        assert_eq!(wrapped.metrics_outcome(), outcome);
+        assert_eq!(wrapped.metrics_error_class(), error_class);
+    }
+    let connector_cases: Vec<(FeedConnectError, &'static str, &'static str)> = vec![
+        (
+            FeedConnectError::Resolve(io::Error::other("dns down")),
+            "failure",
+            "resolve",
+        ),
+        (
+            FeedConnectError::Transport("tls failure".to_owned()),
+            "failure",
+            "transport",
+        ),
+        (FeedConnectError::Deadline(15_000), "failure", "deadline"),
+        (
+            FeedConnectError::UnsupportedEncoding("br".to_owned()),
+            "failure",
+            "unsupported_encoding",
+        ),
+    ];
+    for (error, outcome, error_class) in connector_cases {
+        assert_eq!(error.metrics_outcome(), outcome);
+        assert_eq!(error.metrics_error_class(), error_class);
+    }
+}
+
+/// TOG-28423: fetch results map to pass/fail/refused-redirect/invalid-source
+/// plus the error-class breakdown. No network: results are synthetic.
+#[test]
+fn feed_fetch_outcome_maps_status_and_errors_without_network() {
+    use crate::feeds_http::FetchError;
+
+    assert_eq!(
+        feed_fetch_outcome(&Ok(fetched_with_status(StatusCode::OK))),
+        "success"
+    );
+    assert_eq!(
+        feed_fetch_error_class(&Ok(fetched_with_status(StatusCode::OK))),
+        None
+    );
+    // A completed non-2xx fetch is a failure with an http_error class, even
+    // though the transport succeeded: the caller still cannot parse it.
+    for status in [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::NOT_FOUND,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        let result: Result<FetchedFeed, FeedConnectError> = Ok(fetched_with_status(status));
+        assert_eq!(feed_fetch_outcome(&result), "failure", "{status} must fail");
+        assert_eq!(
+            feed_fetch_error_class(&result),
+            Some("http_error"),
+            "{status} must be http_error"
+        );
+    }
+    let invalid: Result<FetchedFeed, FeedConnectError> = Err(FetchError::InvalidSource.into());
+    assert_eq!(feed_fetch_outcome(&invalid), "invalid_source");
+    assert_eq!(feed_fetch_error_class(&invalid), Some("invalid_source"));
+    let refused: Result<FetchedFeed, FeedConnectError> = Err(FetchError::RedirectRefused.into());
+    assert_eq!(feed_fetch_outcome(&refused), "refused_redirect");
+    assert_eq!(feed_fetch_error_class(&refused), Some("redirect_refused"));
+    let failed: Result<FetchedFeed, FeedConnectError> =
+        Err(FeedConnectError::Transport("boom".to_owned()));
+    assert_eq!(feed_fetch_outcome(&failed), "failure");
+    assert_eq!(feed_fetch_error_class(&failed), Some("transport"));
+}
+
+/// TOG-28423: recording uses a runtime-local registry with no network and no
+/// feed id in any label. Each scenario records exactly one outcome sample
+/// and (on failure) exactly one error-class sample.
+#[test]
+fn record_feed_fetch_emits_bounded_series_without_network() {
+    use crate::feeds_http::FetchError;
+    use crate::metrics::Metrics;
+
+    let metrics = Metrics::default();
+    let scenarios: Vec<Result<FetchedFeed, FeedConnectError>> = vec![
+        Ok(fetched_with_status(StatusCode::OK)),
+        Err(FetchError::InvalidSource.into()),
+        Err(FetchError::NonPublicAddress.into()),
+        Err(FetchError::RedirectRefused.into()),
+        Err(FetchError::TooLarge.into()),
+        Err(FeedConnectError::Deadline(15_000)),
+        Err(FeedConnectError::Transport("boom".to_owned())),
+        Ok(fetched_with_status(StatusCode::SERVICE_UNAVAILABLE)),
+    ];
+    for result in &scenarios {
+        record_feed_fetch(&metrics, result);
+    }
+    let text = metrics.render(None);
+    assert!(text.contains("two_bot_feed_fetches_total{outcome=\"success\"} 1\n"));
+    assert!(text.contains("two_bot_feed_fetches_total{outcome=\"invalid_source\"} 2\n"));
+    assert!(text.contains("two_bot_feed_fetches_total{outcome=\"refused_redirect\"} 1\n"));
+    assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 4\n"));
+    assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"invalid_source\"} 1\n"));
+    assert!(
+        text.contains("two_bot_feed_fetch_errors_total{error_class=\"non_public_address\"} 1\n")
+    );
+    assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"redirect_refused\"} 1\n"));
+    assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"too_large\"} 1\n"));
+    assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"deadline\"} 1\n"));
+    assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"transport\"} 1\n"));
+    assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"http_error\"} 1\n"));
+    assert!(!text.contains("example.org"), "no feed host in any label");
+    assert!(!text.contains("feed.xml"), "no feed path in any label");
+}

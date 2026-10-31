@@ -4,7 +4,7 @@
 Four checks, one PASS/FAIL line each; exit 1 if any fails, 0 if all pass:
 
   manifest       the newest `two-funnel-*.ndjson.gz` in the backup directory
-                 (the drill's `ls -1t` selector) has a parseable v3/v4/v5/v6 manifest
+                 (the drill's `ls -1t` selector) has a parseable v3/v4/v5/v6/v7/v8 manifest
                  and an end marker whose row total matches the manifest counts.
   sequences      every live serial/identity sequence, from a saved result of
                  SEQUENCES_QUERY, has a manifest high-water at or past its live
@@ -30,6 +30,14 @@ with the fixed message "/readyz answered over the body cap"; exact-cap valid
 input passes, and the extra byte never reaches a successful JSON path.
 Refusals never echo the body, headers, URL or parse exceptions.
 
+Input budgets: the gzip stream is metered against DECOMPRESSED_CAP (payload
+plus newline bytes; exactly the cap passes, one byte more refuses, and reads
+stop at the breach). The operator-supplied sequences file and wrangler config
+are each read as bounded bytes before any decode, refusing past
+SEQUENCES_FILE_CAP and CONFIG_FILE_CAP. The manifest createdAt is
+shape- and length-validated before it can reach verdict output. All of these
+refuse with fixed vocabulary naming no input content.
+
 Usage:
   python3 scripts/rollback_readiness_probe.py --backup-dir DIR \\
       --sequences live-sequences.json [--staging-url URL] [--config wrangler.toml]
@@ -37,6 +45,7 @@ Usage:
 
 import argparse
 from dataclasses import dataclass
+from datetime import date, time
 import gzip
 import http.client
 import json
@@ -54,10 +63,17 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "wrangler/wrangler.toml"
 ARCHIVE_PREFIX = "two-funnel-"
 ARCHIVE_SUFFIX = ".ndjson.gz"
-DUMP_VERSIONS = (3, 4, 5, 6)
-# Same budgets as the Rust reader (crates/core/src/backup/dump_file.rs).
+DUMP_VERSIONS = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+# Same budgets as the Rust reader (crates/core/src/backup/dump_file.rs),
+# whose decoded budget equals its compressed budget and counts newlines.
 COMPRESSED_CAP = 1 << 30
+DECOMPRESSED_CAP = 1 << 30
 LINE_CAP = 8 << 20
+# Operator-supplied inputs: live sequence dumps are kilobytes and wrangler
+# configs tens of kilobytes, so 1 MiB each is generous headroom that still
+# bounds the gate's reads before any parse runs.
+SEQUENCES_FILE_CAP = 1 << 20
+CONFIG_FILE_CAP = 1 << 20
 I64_MAX = (1 << 63) - 1
 DEFAULT_ENVS = ("staging", "production")
 # Required beyond the TWO_* keys of top-level [vars], which every named env
@@ -70,6 +86,14 @@ READYZ_BODY_CAP = 64 << 10
 # Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
 # (error 1010), so an explicit agent is required for the probe to reach the Worker.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
+# The dumper writes UTC createdAt ("...T00:00:00.000Z"); accept that shape with
+# optional sub-second precision (nanoseconds at most) and numeric offsets, and
+# bound the length well above any of those so hostile text never reaches output.
+CREATED_AT_RE = re.compile(
+    r"(?P<Y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})"
+    r"T(?P<H>\d{2}):(?P<M>\d{2}):(?P<S>\d{2})"
+    r"(?:\.(?P<frac>\d{1,9}))?(?:Z|(?P<oh>[+-]\d{2}):(?P<om>\d{2}))", re.ASCII)
+CREATED_AT_MAX_LEN = 64
 # Component names from crates/bot/src/server.rs; the drift test pins them to the source.
 # Per-surface allowlist: exactly the four components the container serves.
 # Anything else is refused with fixed vocabulary naming no component data.
@@ -117,6 +141,30 @@ class Result:
         return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.reason}"
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def decode_strict(body):
+    """Decode JSON while refusing duplicate object keys at any depth."""
+    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+
+
 def is_int(value, low=0, high=I64_MAX):
     # JSON true/false decode to bool, a subclass of int; floats never count.
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
@@ -143,6 +191,39 @@ def read_line(stream):
     return line
 
 
+class BudgetedStream:
+    """Counts decompressed bytes (payload plus newlines) as they are read."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.total = 0
+
+    def readline(self, size):
+        size = min(size, DECOMPRESSED_CAP - self.total + 1)
+        line = self._stream.readline(size)
+        self.total += len(line)
+        if self.total > DECOMPRESSED_CAP:
+            raise ProbeError("archive exceeds decompressed byte cap")
+        return line
+
+
+def valid_created_at(value):
+    if not isinstance(value, str) or len(value) > CREATED_AT_MAX_LEN:
+        return False
+    match = CREATED_AT_RE.fullmatch(value)
+    if not match:
+        return False
+    try:
+        date(int(match["Y"]), int(match["m"]), int(match["d"]))
+        time(int(match["H"]), int(match["M"]), int(match["S"]))
+        if match["oh"] is not None and (abs(int(match["oh"])) > 23
+                                      or int(match["om"]) > 59):
+            return False
+    except ValueError:
+        return False
+    return True
+
+
 def validate_manifest(obj):
     """Mirror the Rust reader's manifest refusals, minus the table inventory."""
     if not isinstance(obj, dict) or obj.get("kind") != "manifest":
@@ -151,6 +232,8 @@ def validate_manifest(obj):
         raise ProbeError(f"manifest version {obj.get('version')!r} is not one of {DUMP_VERSIONS}")
     if not isinstance(obj.get("createdAt"), str):
         raise ProbeError("manifest has no createdAt timestamp")
+    if not valid_created_at(obj["createdAt"]):
+        raise ProbeError("manifest has invalid createdAt timestamp")
     if not is_int(obj.get("eventsSequence")):
         raise ProbeError("manifest has an invalid eventsSequence")
     migrations = obj.get("schemaMigrations")
@@ -187,26 +270,31 @@ def read_manifest(path):
     if size > COMPRESSED_CAP:
         raise ProbeError(f"{path.name} is {size} bytes, past the {COMPRESSED_CAP}-byte cap")
     try:
-        with gzip.open(path, "rb") as stream:
+        with gzip.open(path, "rb") as raw:
+            stream = BudgetedStream(raw)
             first = read_line(stream)
             while first and not first.strip():
                 first = read_line(stream)
             if not first:
                 raise ProbeError(f"{path.name} is empty")
-            manifest = validate_manifest(json.loads(first))
+            manifest = validate_manifest(decode_strict(first))
             last = b""
             while line := read_line(stream):
                 if line.strip():
                     last = line
     except ProbeError:
         raise
+    except DuplicateKeyError:
+        raise ProbeError(f"{path.name} manifest line carries duplicate JSON object keys")
     except (OSError, EOFError, zlib.error) as e:
         raise ProbeError(f"{path.name} is not a complete gzip archive ({e.__class__.__name__})")
     except (ValueError, RecursionError):
         # ValueError also carries bad UTF-8 and the int-digit cap; refuse all as non-JSON.
         raise ProbeError(f"{path.name} manifest line is not JSON")
     try:
-        end = json.loads(last) if last else None
+        end = decode_strict(last) if last else None
+    except DuplicateKeyError:
+        raise ProbeError(f"{path.name} end marker carries duplicate JSON object keys")
     except (ValueError, RecursionError):
         end = None
     if not isinstance(end, dict) or end.get("kind") != "end" or not is_int(end.get("rows"), high=(1 << 64) - 1):
@@ -226,9 +314,16 @@ def load_live_sequences(path):
     if path is None:
         raise ProbeError("no live sequences query result given (--sequences FILE)")
     try:
-        rows = json.loads(Path(path).read_text())
+        with open(path, "rb") as f:
+            data = f.read(SEQUENCES_FILE_CAP + 1)
     except OSError as e:
         raise ProbeError(f"cannot read {path} ({e.__class__.__name__})")
+    if len(data) > SEQUENCES_FILE_CAP:
+        raise ProbeError("sequences file exceeds byte cap")
+    try:
+        rows = decode_strict(data)
+    except DuplicateKeyError:
+        raise ProbeError(f"{path} carries duplicate JSON object keys")
     except (ValueError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget.
         raise ProbeError(f"{path} is not JSON; expected the SEQUENCES_QUERY result")
@@ -308,7 +403,9 @@ def readyz_state(status, body):
     if len(body) > READYZ_BODY_CAP:
         raise ProbeError("/readyz answered over the body cap")
     try:
-        report = json.loads(body)
+        report = decode_strict(body)
+    except DuplicateKeyError:
+        raise ProbeError(f"/readyz {status} carries duplicate JSON object keys")
     except (ValueError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget
         # below READYZ_BODY_CAP; grade it as no breakdown, never a crash.
@@ -350,10 +447,14 @@ def check_readyz(url, fetch_fn):
 
 def check_deploy_config(config, envs, extra_keys):
     try:
-        with Path(config).open("rb") as f:
-            cfg = tomllib.load(f)
+        with open(config, "rb") as f:
+            data = f.read(CONFIG_FILE_CAP + 1)
     except OSError as e:
         raise ProbeError(f"cannot read {config} ({e.__class__.__name__})")
+    if len(data) > CONFIG_FILE_CAP:
+        raise ProbeError("wrangler config exceeds byte cap")
+    try:
+        cfg = tomllib.loads(data.decode("utf-8"))
     except (ValueError, RecursionError):
         # tomllib raises a plain ValueError for integers past the digit cap.
         raise ProbeError(f"{config} is not valid TOML")

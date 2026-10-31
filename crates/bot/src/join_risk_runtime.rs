@@ -43,6 +43,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use two_bot_core::join_risk_store::{JoinRiskClaim, JoinRiskStore};
+use two_bot_core::metrics::{self, JoinQueueDropReason};
 use two_bot_core::onboarding::MentionPolicy;
 use two_bot_core::raid::{
     JoinRiskInput, JoinRiskPolicy, DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS,
@@ -76,17 +77,17 @@ fn is_snowflake(value: &str) -> bool {
 /// The containment fences for one boot. Cold reads: evaluated once at
 /// construction, never re-read per observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AntiNukeFences {
+pub struct AntiNukeFences {
     /// Exact `TWO_ANTI_NUKE=1` on the staging guild. Without it the chain is
     /// the raid watch alone and no claim is ever recorded.
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     /// Dry-run explicitly `0` outside session mode. R2 has no armed path;
     /// R3 refuses every armed action while this is false.
-    pub(crate) armed: bool,
+    pub armed: bool,
 }
 
 impl AntiNukeFences {
-    pub(crate) fn from_vars(vars: &HashMap<String, String>, guild_id: u64) -> Self {
+    pub fn from_vars(vars: &HashMap<String, String>, guild_id: u64) -> Self {
         let staging = guild_id.to_string() == STAGING_GUILD_ID;
         let flag = vars.get(ENABLE_KEY).is_some_and(|value| value == "1");
         let session = vars
@@ -102,87 +103,113 @@ impl AntiNukeFences {
 
 /// The join-risk configuration for one observation.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JoinRiskSettings {
-    pub(crate) tuning: RaidTuning,
-    pub(crate) bulk_join_window_until_ms: Option<i64>,
+pub struct JoinRiskSettings {
+    pub tuning: RaidTuning,
+    pub bulk_join_window_until_ms: Option<i64>,
     /// `None` means log only: no channel is guessed on a live server.
-    pub(crate) staff_channel: Option<String>,
+    pub staff_channel: Option<String>,
 }
 
-impl JoinRiskSettings {
-    /// A missing or unusable number (zero, negative, non-finite, unparsable)
-    /// falls back to the default rather than disabling scoring, an unusable
-    /// bulk-until falls back to no bulk window, and an unusable channel falls
-    /// back to log-only. Present-but-bad values warn.
-    pub(crate) fn from_vars(vars: &HashMap<String, String>) -> Self {
-        let number = |key: &str, default: f64| match vars.get(key).map(|raw| raw.trim()) {
-            None | Some("") => default,
-            Some(raw) => match raw.parse::<f64>() {
-                Ok(value) if value.is_finite() && value > 0.0 => value,
-                _ => {
-                    warn!(key, "join-risk setting unusable; using the default");
-                    default
-                }
-            },
-        };
-        let tuning = RaidTuning::new(
-            number(WINDOW_KEY, DEFAULT_JOIN_RISK_WINDOW_SECONDS),
-            number(THRESHOLD_KEY, DEFAULT_JOIN_RISK_THRESHOLD),
+/// A present-but-unusable tuning key that refuses scoring and arming.
+///
+/// The refusal names the key family ([`JoinRiskTuningRefusal::key`]), never
+/// the value, so the operator-visible signal identifies the bad key without
+/// echoing a possibly secret value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinRiskTuningRefusal {
+    key: &'static str,
+}
+
+impl JoinRiskTuningRefusal {
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+}
+
+impl std::fmt::Display for JoinRiskTuningRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "join-risk tuning refused: {} present but unusable; scoring disabled",
+            self.key
         )
-        .unwrap_or_else(|_| {
-            warn!("join-risk tuning rejected; using the shipped defaults");
-            RaidTuning::new(
-                DEFAULT_JOIN_RISK_WINDOW_SECONDS,
-                DEFAULT_JOIN_RISK_THRESHOLD,
-            )
-            .expect("shipped join-risk defaults are valid")
-        });
+    }
+}
+
+impl std::error::Error for JoinRiskTuningRefusal {}
+
+impl JoinRiskSettings {
+    /// Fallible reader for the live settings path. A missing key keeps its
+    /// shipped default (tuning 60 s / 5.0, no bulk window, log-only staff
+    /// channel); so does a present-but-empty value. A present-but-unusable
+    /// value (unparsable, non-finite, non-positive, or a rejected tuning
+    /// pair) refuses the whole read: no default is substituted and no
+    /// settings value is produced.
+    pub fn try_from_vars(vars: &HashMap<String, String>) -> Result<Self, JoinRiskTuningRefusal> {
+        let number = |key: &'static str, default: f64| -> Result<f64, JoinRiskTuningRefusal> {
+            match vars.get(key).map(|raw| raw.trim()) {
+                None | Some("") => Ok(default),
+                Some(raw) => match raw.parse::<f64>() {
+                    Ok(value) if value.is_finite() && value > 0.0 => Ok(value),
+                    _ => Err(JoinRiskTuningRefusal { key }),
+                },
+            }
+        };
+        // Window is evaluated first, as in `RaidTuning::new`: when both
+        // tuning numbers are unusable the window key is named.
+        let window = number(WINDOW_KEY, DEFAULT_JOIN_RISK_WINDOW_SECONDS)?;
+        let threshold = number(THRESHOLD_KEY, DEFAULT_JOIN_RISK_THRESHOLD)?;
+        let tuning = RaidTuning::new(window, threshold)
+            .map_err(|_| JoinRiskTuningRefusal { key: WINDOW_KEY })?;
         let bulk_join_window_until_ms = match vars.get(BULK_UNTIL_KEY).map(|raw| raw.trim()) {
             None | Some("") => None,
             Some(raw) => match raw.parse::<i64>() {
                 Ok(value) if value > 0 => Some(value),
                 _ => {
-                    warn!(key = BULK_UNTIL_KEY, "bulk window unusable; no bulk window");
-                    None
+                    return Err(JoinRiskTuningRefusal {
+                        key: BULK_UNTIL_KEY,
+                    })
                 }
             },
         };
         let staff_channel = match vars.get(CHANNEL_KEY).map(|raw| raw.trim()) {
             None | Some("") => None,
             Some(raw) if is_snowflake(raw) => Some(raw.to_owned()),
-            Some(_) => {
-                warn!(key = CHANNEL_KEY, "staff alert channel unusable; log only");
-                None
-            }
+            Some(_) => return Err(JoinRiskTuningRefusal { key: CHANNEL_KEY }),
         };
-        Self {
+        Ok(Self {
             tuning,
             bulk_join_window_until_ms,
             staff_channel,
-        }
+        })
     }
 }
 
-/// Where the live [`JoinRiskSettings`] come from.
-pub(crate) trait SettingsSource: Send + 'static {
-    fn current(&mut self) -> impl Future<Output = JoinRiskSettings> + Send;
+/// Where the live [`JoinRiskSettings`] come from. A present-but-unusable
+/// key refuses the read; the worker drops the observation with no scoring
+/// side effects.
+pub trait SettingsSource: Send + 'static {
+    fn current(
+        &mut self,
+    ) -> impl Future<Output = Result<JoinRiskSettings, JoinRiskTuningRefusal>> + Send;
 }
 
 /// Tuning, the bulk window and the staff channel are store-first (hot rows win
 /// over the deployment environment) and re-read at most every
-/// [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last good values.
-pub(crate) struct StoreSettings {
+/// `SETTINGS_MAX_AGE`; a failed refresh keeps the last outcome (good
+/// settings or the cached refusal).
+pub struct StoreSettings {
     pool: PgPool,
     guild_id: String,
     deployment: HashMap<String, String>,
     max_age: Duration,
     cache: Option<SettingsCache>,
     checked: Option<Instant>,
-    last: Option<JoinRiskSettings>,
+    last: Option<Result<JoinRiskSettings, JoinRiskTuningRefusal>>,
 }
 
 impl StoreSettings {
-    pub(crate) fn new(pool: PgPool, guild_id: u64, deployment: HashMap<String, String>) -> Self {
+    pub fn new(pool: PgPool, guild_id: u64, deployment: HashMap<String, String>) -> Self {
         Self {
             pool,
             guild_id: guild_id.to_string(),
@@ -194,17 +221,33 @@ impl StoreSettings {
         }
     }
 
+    /// Test seam: force the next [`SettingsSource::current`] call to re-read
+    /// instead of returning the cached outcome, so state transitions
+    /// (good to refused, refused to steady refused, tuning changes) are
+    /// coverable without waiting out [`SETTINGS_MAX_AGE`].
+    #[cfg(test)]
+    pub fn expire_for_tests(&mut self) {
+        self.checked = None;
+    }
+
+    /// Test seam: replace the boot-time deployment values under test, so one
+    /// [`StoreSettings`] can walk through deployment transitions.
+    #[cfg(test)]
+    pub fn set_deployment_for_tests(&mut self, deployment: HashMap<String, String>) {
+        self.deployment = deployment;
+    }
+
     async fn refresh(&mut self) {
         let store = SettingsStore::new(&self.pool);
         let stale = self.cache.as_ref();
         // Bound to a local so the timeout future is dropped before the borrows
         // above end (edition-2021 tail-expression temporaries).
         let loaded = tokio::time::timeout(SETTINGS_READ_MAX, async {
-            let (revision, rows) = store.poll_marks().await?;
+            let (revision, rows) = store.poll_guild_marks(&self.guild_id).await?;
             if stale.is_some_and(|cache| !cache.needs_refresh(revision, rows)) {
                 return Ok::<_, sqlx::Error>(None);
             }
-            let snapshot = store.load_snapshot().await?;
+            let snapshot = store.load_guild_snapshot(&self.guild_id).await?;
             Ok(Some(SettingsCache::load(&snapshot)))
         })
         .await;
@@ -219,7 +262,9 @@ impl StoreSettings {
 }
 
 impl SettingsSource for StoreSettings {
-    async fn current(&mut self) -> JoinRiskSettings {
+    async fn current(&mut self) -> Result<JoinRiskSettings, JoinRiskTuningRefusal> {
+        // The cached outcome covers good settings and refusals alike, so a
+        // misconfigured key cannot turn per-15 s polling into per-join load.
         if let (Some(at), Some(last)) = (self.checked, &self.last) {
             if at.elapsed() < self.max_age {
                 return last.clone();
@@ -239,17 +284,42 @@ impl SettingsSource for StoreSettings {
                     .filter(|(key, _)| HOT_KEYS.contains(&key.as_str())),
             );
         }
-        let settings = JoinRiskSettings::from_vars(&vars);
+        let settings = match JoinRiskSettings::try_from_vars(&vars) {
+            Ok(settings) => settings,
+            Err(refusal) => {
+                // Log the refusal at error level only on a state change
+                // (good -> refused, or a different key); a steady refused
+                // state stays cached and quiet until the max age elapses.
+                let changed =
+                    !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key());
+                if changed {
+                    error!(
+                        error_class = "join_risk_tuning_refused",
+                        key = refusal.key(),
+                        "join_risk_tuning_refused: present-but-unusable tuning; scoring disabled"
+                    );
+                } else {
+                    debug!(
+                        key = refusal.key(),
+                        "join_risk_tuning_refused: still refused; scoring disabled"
+                    );
+                }
+                // Fail closed: never fall back to stale good values or ship
+                // defaults the operator did not ask for.
+                self.last = Some(Err(refusal));
+                return Err(refusal);
+            }
+        };
         match &self.last {
-            Some(previous) if previous.tuning != settings.tuning => info!(
+            Some(Ok(previous)) if previous.tuning != settings.tuning => info!(
                 from_threshold = previous.tuning.threshold(),
                 to_threshold = settings.tuning.threshold(),
                 from_window_seconds = previous.tuning.window_seconds(),
                 to_window_seconds = settings.tuning.window_seconds(),
                 "setting_changed: join-risk tuning"
             ),
-            Some(_) => {}
-            None => info!(
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => info!(
                 threshold = settings.tuning.threshold(),
                 window_seconds = settings.tuning.window_seconds(),
                 alert_target = settings
@@ -259,8 +329,8 @@ impl SettingsSource for StoreSettings {
                 "join_risk_enabled"
             ),
         }
-        self.last = Some(settings.clone());
-        settings
+        self.last = Some(Ok(settings.clone()));
+        Ok(settings)
     }
 }
 
@@ -277,18 +347,39 @@ struct JoinRiskWorker<S> {
     store: JoinRiskStore,
     delivery: RaidDelivery,
     joins: mpsc::Receiver<JoinObservation>,
+    shutdown: Arc<crate::raid_runtime::WorkerShutdown>,
 }
 
 impl<S: SettingsSource> JoinRiskWorker<S> {
     async fn run(mut self) {
-        while let Some(join) = self.joins.recv().await {
-            // An internal failure must never end scoring: log it and carry on.
-            if AssertUnwindSafe(self.handle(join))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                error!("join_risk_failed: observation panicked");
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.notified() => {
+                    let dropped = crate::raid_runtime::drain_queued(&mut self.joins);
+                    self.shutdown.note_dropped(dropped);
+                    crate::raid_runtime::worker_shutdown_drain(self.shutdown.finished(), dropped);
+                    return;
+                }
+                msg = self.joins.recv() => {
+                    let Some(join) = msg else {
+                        // Unlatched sender-drop: every buffered join already
+                        // yielded above, so the legacy full drain exits here.
+                        return;
+                    };
+                    // An internal failure must never end scoring: log it and carry on.
+                    if AssertUnwindSafe(self.handle(join))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        error!(
+                            error_class = "join_risk_failed",
+                            "join_risk_failed: observation panicked"
+                        );
+                    }
+                    self.shutdown.note_finished();
+                }
             }
         }
     }
@@ -298,7 +389,21 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         if join.guild_id != self.guild_id {
             return;
         }
-        let settings = self.settings.current().await;
+        // Fail closed on present-but-unusable tuning: drop the observation
+        // with no scoring side effects (no row, no staff post, never a
+        // Discord message). The refusal is already logged at the source on
+        // state changes, so the per-observation drop stays at debug.
+        let settings = match self.settings.current().await {
+            Ok(settings) => settings,
+            Err(refusal) => {
+                debug!(
+                    key = refusal.key(),
+                    member_id = join.member_id,
+                    "join_risk_tuning_refused: observation dropped; no row claimed, no post attempted"
+                );
+                return;
+            }
+        };
         let policy = match JoinRiskPolicy::new(
             self.guild_id.to_string(),
             settings.tuning.window_seconds(),
@@ -307,7 +412,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         ) {
             Ok(policy) => policy,
             Err(_) => {
-                error!("join_risk_policy_rejected: live tuning unusable");
+                error!(
+                    error_class = "join_risk_policy_rejected",
+                    "join_risk_policy_rejected: live tuning unusable"
+                );
                 return;
             }
         };
@@ -317,7 +425,11 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         let Some(created_at_ms) =
             snowflake_to_date_ms(&join.member_id.to_string()).map(|ms| ms as i64)
         else {
-            error!(member_id = join.member_id, "join_risk_no_account_age");
+            error!(
+                error_class = "join_risk_no_account_age",
+                member_id = join.member_id,
+                "join_risk_no_account_age"
+            );
             return;
         };
         let input = JoinRiskInput {
@@ -338,7 +450,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         {
             Ok(claim) => claim,
             Err(_) => {
-                error!("join_risk_store_failed: claim not recorded");
+                error!(
+                    error_class = "join_risk_store_failed",
+                    "join_risk_store_failed: claim not recorded"
+                );
                 return;
             }
         };
@@ -353,6 +468,7 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         };
         // Always log first. If the post fails the evidence still exists.
         error!(
+            error_class = "join_risk_evidence",
             member_id = %evidence.observation.member_id,
             score = evidence.score,
             join_count,
@@ -369,7 +485,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         // The shared executor always sends empty allowed mentions; refuse a
         // proposal that asks for anything else rather than widen that boundary.
         if message.mentions != MentionPolicy::None {
-            error!(channel, "join_risk_refused: mention policy is not empty");
+            error!(
+                error_class = "join_risk_refused",
+                channel, "join_risk_refused: mention policy is not empty"
+            );
             return;
         }
         match self
@@ -383,37 +502,72 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
                 "join_risk_posted"
             ),
             Delivery::Undeliverable => error!(
+                error_class = "join_risk_undeliverable",
                 channel,
                 "join_risk_undeliverable: channel missing, not text, or bot lacks View/Send"
             ),
-            Delivery::Failed => error!(channel, "join_risk_post_failed"),
+            Delivery::Failed => error!(
+                error_class = "join_risk_post_failed",
+                channel, "join_risk_post_failed"
+            ),
         }
     }
 }
 
 /// The pipeline-facing half: queue only, never block.
-pub(crate) struct JoinRiskRuntime {
+pub struct JoinRiskRuntime {
     joins: mpsc::Sender<JoinObservation>,
+    shutdown: Arc<crate::raid_runtime::WorkerShutdown>,
+}
+
+impl JoinRiskRuntime {
+    /// Latch the bounded shutdown drain: the worker finishes its in-flight
+    /// join, drops the queued inbox with a count, logs
+    /// `worker_shutdown_drain`, and exits so its handle joins.
+    pub fn shutdown(&self) {
+        self.shutdown.latch();
+    }
+
+    /// Dequeued joins handled to completion, caught panics included.
+    #[cfg(test)]
+    pub fn finished(&self) -> u64 {
+        self.shutdown.finished()
+    }
+
+    /// Queued joins dropped without starting after a latched shutdown.
+    #[cfg(test)]
+    pub fn dropped_shutdown(&self) -> u64 {
+        self.shutdown.dropped()
+    }
 }
 
 impl JoinObserver for JoinRiskRuntime {
     fn observe_join(&self, join: JoinObservation) {
         match self.joins.try_send(join) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(join)) => warn!(
-                member_id = join.member_id,
-                "join-risk queue full; join not scored"
-            ),
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(join)) => {
+                metrics::global().join_risk_dropped_join(JoinQueueDropReason::QueueFull);
+                warn!(
+                    member_id = join.member_id,
+                    "join-risk queue full; join not scored"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::global().join_risk_dropped_join(JoinQueueDropReason::QueueClosed);
+                error!(
+                    error_class = "join_risk_queue_closed",
+                    "join-risk queue closed; join not scored"
+                );
+            }
         }
     }
 }
 
 /// One pipeline slot, two runtimes: the raid watch always observes, and the
 /// join-risk runtime additionally observes when constructed.
-pub(crate) struct Fanout {
-    pub(crate) first: Arc<dyn JoinObserver>,
-    pub(crate) second: Arc<dyn JoinObserver>,
+pub struct Fanout {
+    pub first: Arc<dyn JoinObserver>,
+    pub second: Arc<dyn JoinObserver>,
 }
 
 impl JoinObserver for Fanout {
@@ -423,23 +577,31 @@ impl JoinObserver for Fanout {
     }
 }
 
-/// Spawn the worker. It ends when the last [`JoinRiskRuntime`] reference drops.
-pub(crate) fn start<S: SettingsSource>(
+/// Spawn the worker. [`JoinRiskRuntime::shutdown`] latches the bounded drain
+/// (finish the in-flight join, drop the queue with a count); an unlatched
+/// worker ends when the last [`JoinRiskRuntime`] reference drops, draining
+/// fully as before.
+pub fn start<S: SettingsSource>(
     guild_id: u64,
     settings: S,
     store: JoinRiskStore,
     executor: ActionExecutor,
 ) -> (Arc<JoinRiskRuntime>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+    let shutdown = Arc::new(crate::raid_runtime::WorkerShutdown::default());
     let worker = JoinRiskWorker {
         guild_id,
         settings,
         store,
         delivery: RaidDelivery::new(executor, guild_id),
         joins: receiver,
+        shutdown: Arc::clone(&shutdown),
     };
     (
-        Arc::new(JoinRiskRuntime { joins: sender }),
+        Arc::new(JoinRiskRuntime {
+            joins: sender,
+            shutdown,
+        }),
         tokio::spawn(worker.run()),
     )
 }
@@ -447,13 +609,18 @@ pub(crate) fn start<S: SettingsSource>(
 /// Production wiring: the raid watch always, plus join-risk delivery only
 /// inside the anti-nuke fences. Cold reads (`TWO_ANTI_NUKE`,
 /// `TWO_ANTI_NUKE_DRY_RUN`, `TWO_ONBOARDING_MODE`) come from the deployment
-/// environment; Hot tuning comes from the settings store.
-pub(crate) fn chain_from_env(
+/// environment; Hot tuning comes from the settings store. The service
+/// shutdown receiver latches the risk worker drain through a bounded
+/// supervisor that holds the worker handle and joins-or-aborts it; the
+/// supervisor handle is returned for the `main` shutdown join (`None` when
+/// the fences refuse and no risk worker spawns) and must not be detached.
+pub fn chain_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,
     raid: Arc<RaidRuntime>,
-) -> Arc<dyn JoinObserver> {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (Arc<dyn JoinObserver>, Option<JoinHandle<()>>) {
     let vars: HashMap<String, String> = std::env::vars().collect();
     let fences = AntiNukeFences::from_vars(&vars, guild_id);
     if !fences.enabled {
@@ -462,7 +629,8 @@ pub(crate) fn chain_from_env(
             staging_guild = guild_id.to_string() == STAGING_GUILD_ID,
             "join_risk_disabled: chain is the raid watch alone"
         );
-        return raid;
+        let observer: Arc<dyn JoinObserver> = raid;
+        return (observer, None);
     }
     info!(
         armed = fences.armed,
@@ -478,14 +646,106 @@ pub(crate) fn chain_from_env(
                 .map(|value| ((*key).to_owned(), value.clone()))
         })
         .collect();
-    let (risk, _worker) = start(
+    let (risk, worker) = start(
         guild_id,
         StoreSettings::new(pool.clone(), guild_id, deployment),
         JoinRiskStore::from_pool(pool),
         executor,
     );
-    Arc::new(Fanout {
+    let supervisor = crate::raid_runtime::join_on_shutdown(
+        worker,
+        shutdown,
+        crate::raid_runtime::WORKER_JOIN_BUDGET,
+        {
+            let risk = Arc::clone(&risk);
+            move || risk.shutdown()
+        },
+    );
+    let observer: Arc<dyn JoinObserver> = Arc::new(Fanout {
         first: raid,
         second: risk,
-    })
+    });
+    (observer, Some(supervisor))
+}
+
+#[cfg(test)]
+mod store_settings_cache_tests {
+    //! Non-ignored coverage for [`StoreSettings::current`]: the 15 s outcome
+    //! cache must hold good settings and refusals alike, so a misconfigured
+    //! key cannot turn per-join reads into per-join database load. The pool
+    //! below points at a closed loopback port, so [`StoreSettings::refresh`]
+    //! fails fast and the deployment values alone decide each read.
+
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn test_pool() -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool never fails to construct")
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn good_outcome_caches_within_window_and_covers_tuning_branches() {
+        let mut source = StoreSettings::new(
+            test_pool(),
+            22,
+            vars(&[(WINDOW_KEY, "30.5"), (THRESHOLD_KEY, "8")]),
+        );
+        // First read: the Ok arm, the first-enable log arm, store and return.
+        let first = source.current().await.expect("valid deployment reads");
+        assert_eq!(first.tuning.threshold(), 8.0);
+        // Immediate second read: the cached outcome, no re-read.
+        let cached = source.current().await.expect("cached good reads");
+        assert_eq!(cached, first);
+        // Same tuning after expiry: the unchanged-tuning arm.
+        source.expire_for_tests();
+        let same = source.current().await.expect("same tuning reads");
+        assert_eq!(same, first);
+        // Different tuning after expiry: the tuning-changed arm.
+        source.expire_for_tests();
+        source.set_deployment_for_tests(vars(&[(WINDOW_KEY, "30.5"), (THRESHOLD_KEY, "9")]));
+        let changed = source.current().await.expect("changed tuning reads");
+        assert_eq!(changed.tuning.threshold(), 9.0);
+    }
+
+    #[tokio::test]
+    async fn refusal_caches_within_window() {
+        let mut source = StoreSettings::new(test_pool(), 22, vars(&[(THRESHOLD_KEY, "abc")]));
+        // First read: the refusal names the key (error-on-change arm).
+        let refused = source
+            .current()
+            .await
+            .expect_err("unusable threshold refuses");
+        assert_eq!(refused.key(), THRESHOLD_KEY);
+        // Immediate second read: the cached refusal, same key, no re-read.
+        let cached = source.current().await.expect_err("cached refusal refuses");
+        assert_eq!(cached.key(), THRESHOLD_KEY);
+    }
+
+    #[tokio::test]
+    async fn steady_refusal_takes_debug_arm_and_key_change_errors_again() {
+        let mut source = StoreSettings::new(test_pool(), 22, vars(&[(THRESHOLD_KEY, "abc")]));
+        let first = source.current().await.expect_err("first refusal refuses");
+        assert_eq!(first.key(), THRESHOLD_KEY);
+        // Expire the window but keep the same bad key: the steady refused
+        // state takes the debug (not error) arm and returns the same refusal.
+        source.expire_for_tests();
+        let steady = source.current().await.expect_err("steady refusal refuses");
+        assert_eq!(steady.key(), THRESHOLD_KEY);
+        // A different bad key is a state change: the error arm again.
+        source.expire_for_tests();
+        source.set_deployment_for_tests(vars(&[(WINDOW_KEY, "0")]));
+        let changed = source.current().await.expect_err("different key refuses");
+        assert_eq!(changed.key(), WINDOW_KEY);
+    }
 }

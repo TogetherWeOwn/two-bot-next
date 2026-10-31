@@ -21,6 +21,7 @@ jobs:
     env:
       # Runners share a Docker daemon; never scan or remove a sibling's tag.
       IMAGE: two-bot-next:scan-${{ github.run_id }}-${{ github.run_attempt }}
+      TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,6 +36,7 @@ jobs:
         run: |
           python3 scripts/test-supply-chain.py
           python3 scripts/test-runtime-image-evidence.py
+          python3 scripts/test_runtime_image_inspect_acceptance.py
           python3 scripts/test-vulnerability-preflight.py
       # Keep the workflow's validation tools while inventorying a historical
       # release tag that may predate those tools.

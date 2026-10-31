@@ -23,12 +23,23 @@ use std::collections::HashSet;
 
 use sqlx::{postgres::PgRow, Pool, Postgres, Row};
 use two_bot_core::{
+    analytics_family::AnalyticsCategory,
     membership::{
-        advance_observation, is_membership, project, set_observation, valid_observation,
-        Membership, MembershipStore,
+        advance_observation, is_membership, set_observation, valid_observation, Membership,
+        MembershipProjection, MembershipStore,
     },
-    EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, StoredRow, MESSAGE_RUNGS,
+    metrics, EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, StoredRow,
+    MESSAGE_RUNGS,
 };
+
+/// Membership projected across TOP-25 keyset pages. `truncated` means the
+/// first page did not contain the whole history; the membership itself is
+/// complete, including evidence in later pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipPage {
+    pub membership: Membership,
+    pub truncated: bool,
+}
 
 /// Postgres-backed [`FunnelStore`].
 ///
@@ -59,6 +70,26 @@ impl PgFunnelStore {
         &self.pool
     }
 
+    /// Full membership with a fixed-vocabulary receipt for a multi-page read.
+    /// SQL holds at most TOP-25 rows plus one lookahead; the chronological
+    /// fold keeps constant state and never silently drops older evidence.
+    pub fn membership_paged(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Option<MembershipPage> {
+        match crate::retry::block_on_retry(&self.handle, || {
+            fetch_membership_paged(&self.pool, guild_id, member_id)
+        }) {
+            Ok(page) => page,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(error = %error, "funnel membership degraded to None after retries");
+                None
+            }
+        }
+    }
+
     /// Fallible append + projection for async callers. The sync core seam
     /// fails closed on an error; async tools can handle the error explicitly.
     pub async fn try_record(&self, event: &FunnelEvent) -> Result<RecordOutcome, sqlx::Error> {
@@ -76,14 +107,6 @@ impl PgFunnelStore {
         observed_at: Option<&str>,
     ) -> Result<RecordOutcome, sqlx::Error> {
         record_async(&self.pool, event, observed_at).await
-    }
-
-    /// Run an async query from the sync trait methods.
-    fn block_on<F, T>(&self, fut: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        tokio::task::block_in_place(|| self.handle.block_on(fut))
     }
 }
 
@@ -167,12 +190,53 @@ async fn record_async(
     .bind(&key)
     .fetch_optional(&mut *tx)
     .await?;
-    if inserted.is_none() {
+    let Some((event_row_id,)) = inserted else {
         let outcome = advance_duplicate(&mut tx, event, &key, observed_at).await?;
         tx.commit().await?;
+        // Duplicates write no event row, so they journal nothing.
         return Ok(outcome);
-    }
+    };
     project_event(&mut tx, event, &guild_id).await?;
+    // Rollback-journal writer for the `PgFunnelStore` seam (the production
+    // gateway batch writer in `cutover::gateway_session` journals its own
+    // appends the same way): each `PgFunnelStore` funnel append leaves one
+    // `events` insert entry naming the inserted row, journaled inside the
+    // primary transaction under a savepoint so the row and its evidence
+    // commit atomically — no crash window between a primary commit and a
+    // second journal transaction can leave a committed row unjournaled.
+    // Evidence-only and best-effort: only journal statement errors are
+    // isolated by rolling back the savepoint; they never fail or alter the
+    // primary write.
+    let entry = crate::journal::JournalEntry {
+        table_name: "events".to_owned(),
+        row_identity: event_row_id.to_string(),
+        op: crate::journal::JournalOp::Insert,
+        pre_image: None,
+    };
+    sqlx::query("SAVEPOINT funnel_journal")
+        .execute(&mut *tx)
+        .await?;
+    match crate::journal::record_in(&mut tx, &entry).await {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT funnel_journal")
+                .execute(&mut *tx)
+                .await?;
+        }
+        Err(journal_error) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT funnel_journal")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT funnel_journal")
+                .execute(&mut *tx)
+                .await?;
+            tracing::warn!(
+                table = "events",
+                row_identity = %entry.row_identity,
+                error = %journal_error,
+                "rollback_journal record failed; primary funnel append kept",
+            );
+        }
+    }
     tx.commit().await?;
     Ok(RecordOutcome { inserted: true })
 }
@@ -233,6 +297,51 @@ async fn advance_duplicate(
         }
     }
     Ok(RecordOutcome { inserted: false })
+}
+
+async fn fetch_membership_paged(
+    pool: &Pool<Postgres>,
+    guild_id: Snowflake,
+    member_id: Snowflake,
+) -> Result<Option<MembershipPage>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // One snapshot across pages: a reconfirmation cannot move observation
+    // evidence while the fold is crossing the page boundary.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let mut after = None::<i64>;
+    let mut projection = MembershipProjection::default();
+    let mut truncated = false;
+    loop {
+        let rows = sqlx::query(
+            "SELECT id, event_type, member_id, guild_id,
+                    to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS occurred_at,
+                    source, metadata, idempotency_key
+             FROM events WHERE guild_id = $1 AND member_id = $2
+               AND ($3::bigint IS NULL OR id > $3)
+             ORDER BY id LIMIT 26",
+        )
+        .bind(snowflake_text(guild_id))
+        .bind(snowflake_text(member_id))
+        .bind(after)
+        .fetch_all(&mut *tx)
+        .await?;
+        let more = rows.len() > 25;
+        truncated |= more;
+        for row in rows.iter().take(25) {
+            projection.observe(&stored_row(row)?);
+            after = Some(row.try_get("id")?);
+        }
+        if !more {
+            break;
+        }
+    }
+    tx.commit().await?;
+    Ok(projection.finish().map(|membership| MembershipPage {
+        membership,
+        truncated,
+    }))
 }
 
 /// Read back one member's event rows with microsecond UTC ISO text. The
@@ -413,7 +522,7 @@ async fn advance_activity(
 
 impl FunnelStore for PgFunnelStore {
     fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake) {
-        self.block_on(async {
+        crate::retry::block_on_retry(&self.handle, || async {
             // Suppressed pairs stay unwritten: the flag would create a
             // per-user `members` row for a member who opted out. The gate
             // runs inside the write transaction under the shared table lock
@@ -451,22 +560,34 @@ impl FunnelStore for PgFunnelStore {
     ///
     /// # Panics
     ///
-    /// Propagates a database failure as a panic: the sync [`FunnelStore`]
-    /// seam has no fallible channel. A write failure must stop the pipeline
-    /// rather than silently drop data; the release profile aborts the process
-    /// so the container can restart without partially advanced in-memory state.
+    /// Propagates a database failure as a panic after bounded retries are
+    /// exhausted: the sync [`FunnelStore`] seam has no fallible channel, and
+    /// a write failure must stop the pipeline rather than silently drop data.
+    /// The release profile unwinds (`panic = "unwind"` in the workspace
+    /// `Cargo.toml`), so the panic kills only the task that made the call —
+    /// never the supervisor — but it poisons any mutex that task holds
+    /// across the call; holders must recover from poisoning instead of
+    /// `expect`ing the lock.
     fn record(&self, event: FunnelEvent) -> RecordOutcome {
-        self.block_on(record_async(&self.pool, &event, None))
+        crate::retry::block_on_retry(&self.handle, || record_async(&self.pool, &event, None))
             .expect("funnel record failed")
     }
 
     /// Monotonic recency bump (never moves backwards). Failures panic — see
-    /// [`FunnelStore::record`].
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
+    /// [`FunnelStore::record`]. Like `record`, the bump honors the guild
+    /// analytics toggle for its originating family: a disabled family's
+    /// touch advances nothing.
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    ) {
         let guild_id = snowflake_text(guild_id);
         let member_id = snowflake_text(member_id);
         let at = at.to_owned();
-        self.block_on(async {
+        crate::retry::block_on_retry(&self.handle, || async {
             // Suppressed pairs stay untouched: the bump would create or
             // refresh a per-user `members` row for a member who opted out.
             // Like `mark_bot`, the gate runs under the shared table lock so
@@ -476,6 +597,10 @@ impl FunnelStore for PgFunnelStore {
                 .execute(&mut *tx)
                 .await?;
             if two_bot_core::privacy::suppressed_in(&mut tx, &guild_id, &member_id).await? {
+                tx.rollback().await?;
+                return Ok::<(), sqlx::Error>(());
+            }
+            if two_bot_core::privacy::category_off_in(&mut tx, &guild_id, family).await? {
                 tx.rollback().await?;
                 return Ok::<(), sqlx::Error>(());
             }
@@ -498,7 +623,8 @@ impl FunnelStore for PgFunnelStore {
     /// Lowest empty message rung for a message arriving at `at`, or `None`
     /// when the ladder is full — including the redelivery guard (a rung is
     /// filled only strictly after the rung below). Mirrors [`MemStore`]
-    /// exactly; failures panic — see [`FunnelStore::record`].
+    /// exactly on the healthy path; on a persistent DB error degrades to
+    /// `None` with an error metric after bounded retries, never panicking.
     ///
     /// [`MemStore`]: two_bot_core::MemStore
     fn next_message_rung(
@@ -510,8 +636,9 @@ impl FunnelStore for PgFunnelStore {
         let guild_id = snowflake_text(guild_id);
         let member_id = snowflake_text(member_id);
         let at = at.to_owned();
-        let rows: Vec<(String, String)> = self
-            .block_on(async {
+        let rows: Vec<(String, String)> = match crate::retry::block_on_retry(
+            &self.handle,
+            || async {
                 sqlx::query_as(
                     "SELECT event_type, to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
                      FROM events WHERE guild_id = $1 AND member_id = $2
@@ -521,8 +648,24 @@ impl FunnelStore for PgFunnelStore {
                 .bind(&member_id)
                 .fetch_all(&self.pool)
                 .await
-            })
-            .expect("funnel next_message_rung failed");
+            },
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "funnel next_message_rung degraded to None after retries"
+                );
+                // Fail closed as ladder-full: `None` fills no rung this
+                // window, so an outage under-counts instead of inventing
+                // milestones. This is the opposite of the empty-ladder
+                // answer (`Some(FirstMessage)`): every message during the
+                // outage fills nothing, and the next healthy message
+                // re-reads the true ladder — no stuck state.
+                return None;
+            }
+        };
         // ISO-8601 UTC compares lexicographically (legacy string compare).
         let mut filled: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for (event_type, stamp) in &rows {
@@ -543,13 +686,14 @@ impl FunnelStore for PgFunnelStore {
         None
     }
 
-    /// Whether the member already has a row of this type. Failures panic —
-    /// see [`FunnelStore::record`].
+    /// Whether the member already has a row of this type. On a persistent DB
+    /// error degrades to `false` with an error metric after bounded retries,
+    /// never panicking.
     fn has_event(&self, guild_id: Snowflake, member_id: Snowflake, event_type: EventType) -> bool {
         let guild_id = snowflake_text(guild_id);
         let member_id = snowflake_text(member_id);
         let event_type = event_type.as_str();
-        self.block_on(async {
+        match crate::retry::block_on_retry(&self.handle, || async {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM events WHERE guild_id = $1 AND member_id = $2 AND event_type = $3)",
             )
@@ -558,8 +702,23 @@ impl FunnelStore for PgFunnelStore {
             .bind(event_type)
             .fetch_one(&self.pool)
             .await
-        })
-        .expect("funnel has_event failed")
+        }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "funnel has_event degraded to false after retries"
+                );
+                // Fail closed as unseen: `false` re-runs the follow-up write,
+                // which is idempotent (insert-first arbitration dedupes),
+                // rather than skipping a genuinely new event. Concurrent
+                // callers already race this way on the healthy path, so
+                // downstream tolerates the duplicate claim; the store itself
+                // stays exact.
+                false
+            }
+        }
     }
 }
 
@@ -567,26 +726,42 @@ impl FunnelStore for PgFunnelStore {
 /// projection derives from persisted event rows (not arrival-ordered
 /// `members` columns), so historical joins and any-order replays converge
 /// exactly like memory. Duplicate reconfirmations advance only the stored
-/// observation maximum. Failures panic — see [`FunnelStore::record`].
+/// observation maximum. Reads degrade fail-closed with an error metric after
+/// bounded retries, never panicking; writes panic — see
+/// [`FunnelStore::record`].
 impl MembershipStore for PgFunnelStore {
     fn membership(&self, guild_id: Snowflake, member_id: Snowflake) -> Option<Membership> {
-        let rows = self
-            .block_on(fetch_member_rows(&self.pool, guild_id, member_id))
-            .expect("funnel membership failed");
-        project(rows.iter())
+        self.membership_paged(guild_id, member_id)
+            .map(|page| page.membership)
     }
 
     fn membership_rows(&self, guild_id: Snowflake, member_id: Snowflake) -> Vec<StoredRow> {
-        self.block_on(fetch_member_rows(&self.pool, guild_id, member_id))
-            .expect("funnel membership rows failed")
+        match crate::retry::block_on_retry(&self.handle, || {
+            fetch_member_rows(&self.pool, guild_id, member_id)
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "funnel membership_rows degraded to empty after retries"
+                );
+                // Fail closed as no rows: projecting zero rows yields `None`,
+                // the same unknown-member answer as a never-seen member —
+                // never a fabricated row.
+                Vec::new()
+            }
+        }
     }
 
     /// Insert or reconfirm a membership event. Invalid/non-membership hints
     /// are ignored; an existing row's occurrence/source/other metadata stay
     /// put. Failures panic — see [`FunnelStore::record`].
     fn record_observed(&self, event: FunnelEvent, observed_at: Option<&str>) -> RecordOutcome {
-        self.block_on(record_async(&self.pool, &event, observed_at))
-            .expect("funnel record_observed failed")
+        crate::retry::block_on_retry(&self.handle, || {
+            record_async(&self.pool, &event, observed_at)
+        })
+        .expect("funnel record_observed failed")
     }
 }
 
@@ -620,7 +795,7 @@ mod privacy_lock_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use sqlx::{Pool, Postgres};
 
-    use two_bot_core::{EventType, FunnelEvent, FunnelStore};
+    use two_bot_core::{analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore};
 
     use super::PgFunnelStore;
 
@@ -815,7 +990,7 @@ mod privacy_lock_tests {
             let store = PgFunnelStore::new(writer_pool);
             for i in 0..20 {
                 let at = format!("2026-10-13T00:{i:02}:00.000Z");
-                store.touch_activity(guild, member, &at);
+                store.touch_activity(guild, member, &at, AnalyticsCategory::Activity);
                 store.mark_bot(guild, member);
             }
         });
@@ -838,7 +1013,12 @@ mod privacy_lock_tests {
 
         // Other members still bump after the race.
         let store = PgFunnelStore::new(pool.clone());
-        store.touch_activity(guild, other, "2026-10-13T01:00:00.000Z");
+        store.touch_activity(
+            guild,
+            other,
+            "2026-10-13T01:00:00.000Z",
+            AnalyticsCategory::Activity,
+        );
         let other_rows: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
         )
@@ -883,7 +1063,12 @@ mod privacy_lock_tests {
         let writer_pool = pool.clone();
         let writer = tokio::spawn(async move {
             let store = PgFunnelStore::new(writer_pool);
-            store.touch_activity(guild, member, "2026-10-13T00:00:00.000Z");
+            store.touch_activity(
+                guild,
+                member,
+                "2026-10-13T00:00:00.000Z",
+                AnalyticsCategory::Activity,
+            );
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         opt_tx.commit().await.expect("opt-out commit");

@@ -63,9 +63,33 @@ export const MIN_OPS_TOKEN_LENGTH = 32;
 export const MAX_OPS_BODY_BYTES = 16 * 1024;
 /** GET /ops/audit returns at most this many rows, newest first. */
 export const MAX_AUDIT_ROWS = 100;
+/** Entire UTF-8 JSON body, including deployment ID and completeness metadata. */
+export const MAX_AUDIT_RESPONSE_BYTES = 64 * 1024;
 
 const ACTOR_PATTERN = /^[a-zA-Z0-9_.:@/-]{1,128}$/;
 const ALLOWED_FLAGS: ReadonlySet<string> = new Set(FORWARDED_FLAGS);
+/**
+ * Reach/identity keys the PUT allowlist refuses (Slice 0a, spec section 3.1
+ * mismatch decision + B5): `SETTING_CLASSES` marks them EnvOnly, yet they
+ * stay forwarded so the container's env-only reach bounds arrive via env.
+ * They leave only the PUT path, never forwarding. Stored-record validation
+ * stays lenient on purpose: a record written before the narrowing still
+ * serves, and the Rust runtime drops reach keys read-side.
+ */
+const PUT_REFUSED_FLAGS: ReadonlySet<string> = new Set([
+  "TWO_MODERATION",
+  "TWO_MODERATION_PROTECTED_ROLE_IDS",
+  "TWO_OWEN_USER_ID",
+  "TWO_ONBOARDING_MODE",
+  "TWO_ANTI_NUKE_PROTECTED_USER_IDS",
+  "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
+  "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
+  "TWO_ASSISTANT_ENDPOINT",
+  "TWO_ASSISTANT_MODEL",
+  // Catalogue edits must serialize with durable self-role work in Postgres;
+  // the independently expiring ops layer cannot honor that drain boundary.
+  "TWO_SELF_ROLE_PANELS",
+]);
 const FENCE_KEYS = ["automation", "automod", "publish", "gateway_park"] as const;
 export type FenceKey = (typeof FENCE_KEYS)[number];
 export type Fences = Record<FenceKey, boolean>;
@@ -99,6 +123,18 @@ export interface OpsAuditRow {
   epoch: number;
   timestamp: string;
   detail: Record<string, unknown>;
+}
+
+/** Readback is constructed field-by-field; stored extras are never serialized. */
+export type OpsAuditReadbackRow = Omit<OpsAuditRow, "detail"> & { id: string } & (
+  | { action: "config_put"; detail: { overrides: Record<string, string> } }
+  | { action: "kill_switch"; detail: { fences: Fences } }
+);
+
+export interface OpsAuditHistory {
+  deploymentId: string;
+  rows: OpsAuditReadbackRow[];
+  truncated: boolean;
 }
 
 export interface OpsEnv {
@@ -144,6 +180,21 @@ function validOverrides(overrides: unknown): overrides is Record<string, string>
   return true;
 }
 
+/**
+ * PUT-time override check: the forwarded shape plus the reach/identity
+ * refuse set. Whole-record, fail-closed like unknown keys: one refused name
+ * refuses the entire PUT. Stored-record validation (`validConfigRecord`)
+ * deliberately uses the lenient `validOverrides` so pre-narrowing records
+ * still serve.
+ */
+function validPutOverrides(overrides: unknown): overrides is Record<string, string> {
+  if (!validOverrides(overrides)) return false;
+  for (const key of Object.keys(overrides)) {
+    if (PUT_REFUSED_FLAGS.has(key)) return false;
+  }
+  return true;
+}
+
 function validFences(fences: unknown): fences is Fences {
   if (!fences || typeof fences !== "object" || Array.isArray(fences)) return false;
   const record = fences as Record<string, unknown>;
@@ -170,6 +221,28 @@ function validKillswitchRecord(value: unknown): value is OpsKillswitchRecord {
     validFences(v.fences) && validActor(v.actor) && validTimestamp(v.timestamp);
 }
 
+function projectAuditRow(id: string, value: unknown): OpsAuditReadbackRow {
+  const invalid = () => new OpsRefused("storage_invalid", 503);
+  const sequence = id.slice(OPS_AUDIT_PREFIX.length);
+  if (!id.startsWith(OPS_AUDIT_PREFIX) || !/^\d{16}$/.test(sequence) ||
+      !validEpoch(Number(sequence)) || Number(sequence) === 0) throw invalid();
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid();
+  const row = value as Record<string, unknown>;
+  if (!validActor(row.actor) || !validEpoch(row.epoch) || row.epoch === 0 ||
+      !validTimestamp(row.timestamp) || new Date(row.timestamp).toISOString() !== row.timestamp ||
+      !row.detail || typeof row.detail !== "object" || Array.isArray(row.detail)) throw invalid();
+  const detail = row.detail as Record<string, unknown>;
+  const common = { id, actor: row.actor, epoch: row.epoch, timestamp: row.timestamp };
+  if (row.action === "config_put" && !("fences" in detail) && validOverrides(detail.overrides)) {
+    return { ...common, action: "config_put", detail: { overrides: { ...detail.overrides } } };
+  }
+  if (row.action === "kill_switch" && !("overrides" in detail) && validFences(detail.fences)) {
+    const { automation, automod, publish, gateway_park } = detail.fences;
+    return { ...common, action: "kill_switch", detail: { fences: { automation, automod, publish, gateway_park } } };
+  }
+  throw invalid();
+}
+
 export interface ConfigPut {
   overrides: Record<string, string>;
   expectedEpoch: number;
@@ -185,7 +258,7 @@ export interface KillswitchPost {
 export function parseConfigPut(value: unknown): ConfigPut | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
-  if (!validOverrides(v.overrides) || !validEpoch(v.expectedEpoch) || !validActor(v.actor)) {
+  if (!validPutOverrides(v.overrides) || !validEpoch(v.expectedEpoch) || !validActor(v.actor)) {
     return null;
   }
   return {
@@ -208,22 +281,33 @@ export function parseKillswitchPost(value: unknown): KillswitchPost | null {
   };
 }
 
+/** Whole-body deadline mirroring the receiver convention (internal-actions BODY_TIMEOUT_MS). */
+export const OPS_BODY_TIMEOUT_MS = 5_000;
+
 /** Bound control input independently of the untrusted Content-Length header. */
 export async function readOpsBody(request: Request): Promise<unknown> {
   const reader = request.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
   let size = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), OPS_BODY_TIMEOUT_MS);
+  });
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > MAX_OPS_BODY_BYTES) {
-        await reader.cancel();
+    for (;;) {
+      const step = await Promise.race([reader.read(), timeout]);
+      if (step === "timeout") {
+        void reader.cancel().catch(() => {});
         return null;
       }
-      chunks.push(value);
+      if (step.done) break;
+      size += step.value.byteLength;
+      if (size > MAX_OPS_BODY_BYTES) {
+        void reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(step.value);
     }
     const bytes = new Uint8Array(size);
     let offset = 0;
@@ -234,6 +318,8 @@ export async function readOpsBody(request: Request): Promise<unknown> {
     return JSON.parse(new TextDecoder().decode(bytes));
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -419,10 +505,44 @@ export class OpsControl {
     return record;
   }
 
-  async listAudit(limit = MAX_AUDIT_ROWS): Promise<OpsAuditRow[]> {
+  async listAudit(limit = MAX_AUDIT_ROWS): Promise<OpsAuditReadbackRow[]> {
+    return (await this.auditWindow(limit)).rows;
+  }
+
+  /** Budget the same complete JSON envelope the DO serializes, never raw values. */
+  async readAudit(deploymentId: string): Promise<OpsAuditHistory> {
+    const window = await this.auditWindow(MAX_AUDIT_ROWS);
+    const history: OpsAuditHistory = { deploymentId, ...window };
+    const encoder = new TextEncoder();
+    const size = (value: unknown) => encoder.encode(JSON.stringify(value)).byteLength;
+    const emptySize = size({ deploymentId, rows: [], truncated: history.truncated });
+    if (emptySize > MAX_AUDIT_RESPONSE_BYTES) throw new OpsRefused("response_too_large", 503);
+    // Re-measure the actual envelope after every pop: the budget never
+    // hand-counts commas or the false/true delta, so the after-drop boundary
+    // is self-oracling. An overflowing envelope always loses a whole row, not
+    // merely a shorter boolean. Each pop strictly shrinks the body, and the
+    // empty-envelope check above guarantees termination with rows to spare.
+    while (size(history) > MAX_AUDIT_RESPONSE_BYTES && history.rows.length > 0) {
+      history.rows.pop();
+      history.truncated = true;
+    }
+    return history;
+  }
+
+  private async auditWindow(limit: number): Promise<{ rows: OpsAuditReadbackRow[]; truncated: boolean }> {
     const bound = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, MAX_AUDIT_ROWS) : MAX_AUDIT_ROWS;
-    const rows = await this.storage.list<OpsAuditRow>({ prefix: OPS_AUDIT_PREFIX, limit: bound, reverse: true });
-    return [...rows.values()];
+    let stored: Map<string, unknown>;
+    try {
+      // One extra row distinguishes exactly-full history from an incomplete listing.
+      stored = await this.storage.list<unknown>({ prefix: OPS_AUDIT_PREFIX, limit: bound + 1, reverse: true });
+    } catch {
+      throw new OpsRefused("storage_unavailable", 503);
+    }
+    // Validate the entire bounded listing (including lookahead) before any
+    // truncation. Malformed history must not masquerade as a successful prefix.
+    const rows = [...stored].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0)
+      .map(([id, value]) => projectAuditRow(id, value));
+    return { rows: rows.slice(0, bound), truncated: rows.length > bound };
   }
 
   private baseline(): Record<string, string> {
@@ -480,13 +600,32 @@ export class OpsControl {
   }
 }
 
-export function opsRefused(error: unknown): Response {
+export function opsRefused(error: unknown, isRead: boolean): Response {
   if (error instanceof OpsRefused) {
     if (error.reason === "epoch_conflict") {
       console.warn(JSON.stringify({ event: "ops_control_refused", reason: error.reason }));
       return json(409, { error: "ops_conflict", reason: error.reason });
     }
     console.warn(JSON.stringify({ event: "ops_control_refused", reason: error.reason }));
+    if (error.reason === "response_too_large") {
+      return json(error.status, {
+        error: "ops_unavailable", reason: error.reason, code: error.reason, next_action: "escalate_deployment",
+      });
+    }
+    if (error.reason === "storage_invalid" || error.reason === "storage_unavailable") {
+      // The storage_unavailable remediation is scoped by operation kind: a
+      // failed read retries the read, while a failed mutation must re-read
+      // and reconcile the intended change before retrying it. A shared
+      // retry_read token would steer a failed fence change into a GET that
+      // never re-applies it.
+      const nextAction = error.reason === "storage_invalid"
+        ? "escalate_storage"
+        : isRead ? "retry_read" : "reconcile_then_retry";
+      return json(error.status, {
+        error: "ops_unavailable", reason: error.reason, code: error.reason,
+        next_action: nextAction,
+      });
+    }
     return json(error.status, { error: "ops_unavailable", reason: error.reason });
   }
   return json(503, { error: "ops_unavailable", reason: "operation_failed" });

@@ -28,12 +28,17 @@ instead of failing the whole snapshot (see `website_store` tick recipe):
   mutually exclusive, and `ranked_member_count <= human_member_count`.
 - A higher rank without every lower rung still builds with `nested: false`;
   the rank tick self-heals it first (`plan_rank_heal`: grant the missing
-  lower rungs with an audit reason, bounded at 25 grants per tick and
-  fenced below the bot's highest role, then rebuild and re-verify) and
-  publishes the healed snapshot with a repair alert naming the members
-  and roles. A ladder that is still bad afterwards, or an unhealable one
-  (over bound, hierarchy refusal), maps to `RankSkip::RanksNotNested`
-  (writes nothing) instead of publishing a broken ladder.
+  lower rungs with an audit reason, bounded at 25 candidates per tick and
+  fenced below the bot's highest role). Each candidate is revalidated against
+  an identity-bound current member read; removed higher ranks or departure
+  cannot justify a grant. The tick then refreshes each affected member and
+  rebuilds from observed roles, never assumed PUT success. Applied-grant logs
+  name actual members and rungs; verification is reported separately. An
+  unreadable or still-nonnested result, or an unhealable plan (over bound,
+  hierarchy refusal), writes nothing instead of publishing a broken ladder.
+  The candidate queue never grows during repair; new missing rungs defer
+  publication until a later tick. Discord can still change roles after a
+  check: this is bounded observation freshness, not an atomic transaction.
 - `JobGate` is single-flight: a second `try_acquire` while a tick holds
   the guard returns `None` (skip, do not queue); the gate releases on
   guard drop.

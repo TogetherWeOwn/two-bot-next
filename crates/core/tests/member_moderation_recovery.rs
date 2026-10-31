@@ -323,10 +323,20 @@ async fn safe_sweep_failure_does_not_retry_or_reserve_the_next_job() {
     let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
         1_700_000_000_000
     });
-    assert!(svc.run_due_unbans(GUILD).await.is_err());
-    assert_eq!(discord.call_count("unban"), 1);
+    // Both refusals are recorded and the sweep completes: nothing lands,
+    // and neither job is retried within the tick.
+    assert_eq!(svc.run_due_unbans(GUILD).await.expect("continues"), 0);
+    assert_eq!(discord.call_count("unban"), 2);
     assert_eq!(store.unban_state("1").as_deref(), Some("pending"));
     assert_eq!(store.unban_state("2").as_deref(), Some("pending"));
+    for user in ["1", "2"] {
+        assert!(
+            store.audits().iter().any(|row| {
+                row.request_id == format!("{user}:unban-failed") && row.outcome == "unban_failed"
+            }),
+            "refused job {user} is recorded"
+        );
+    }
 }
 
 #[derive(Clone)]

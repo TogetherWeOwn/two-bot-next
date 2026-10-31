@@ -1,0 +1,58 @@
+name: staging-mcp-proveout
+
+# Manual, staging-only, read-only authenticated MCP prove-out (TOG-23456).
+# Runs the Streamable HTTP read-only slice against the staging Worker with
+# the `staging` environment secret STAGING_MCP_TOKEN, so no agent ever holds
+# the bearer. The bearer travels only as `secrets.STAGING_MCP_TOKEN` into an
+# `Authorization: Bearer` header; GitHub masks it as *** and the reviewed
+# script never prints, stores or uploads it. Response bodies carry no
+# credential and are printed (redacted commands) plus uploaded as a sanitized
+# artifact for the Paperclip post-back. Never runs automatically and has no
+# production path. A container-backed JSON-RPC -32000 fails proof as
+# uncorroborated (FENCE_UNCORROBORATED) unless the dispatcher explicitly
+# corroborates the fence with STAGING_MCP_EXPECT_FENCE=1; the pinned Run
+# step below sets no such flag, so a fenced-stage run reports the fence
+# instead of passing. Corroborate via /readyz before re-dispatching.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: staging-mcp-proveout
+  cancel-in-progress: false
+
+jobs:
+  proveout:
+    name: staging MCP prove-out
+    permissions:
+      contents: read
+    # Dispatch from main only. The bearer binding is scoped to the `staging`
+    # environment, so a workflow edited on another branch cannot read it.
+    # TOG-23397: STAGING_MCP_TOKEN is a `staging` environment secret; the job
+    # must declare the environment to read it.
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'proveout') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Authenticated MCP prove-out (bearer via secrets, never echoed)
+        env:
+          # Must already exist as a staging environment secret; absent means
+          # refusal before any request. Secrets print as ***.
+          STAGING_MCP_TOKEN: ${{ secrets.STAGING_MCP_TOKEN }}
+          STAGING_MCP_URL: https://two-bot-next-staging.5150.workers.dev/mcp
+          RUN_ID: ${{ github.run_id }}
+        run: python3 scripts/staging_mcp_proveout.py --output "staging-mcp-proveout-$RUN_ID.json"
+      - name: Upload the sanitized prove-out
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-mcp-proveout-${{ github.run_id }}
+          path: staging-mcp-proveout-${{ github.run_id }}.json
+          if-no-files-found: error
+          retention-days: 14

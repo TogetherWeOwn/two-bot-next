@@ -6,6 +6,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "support/invalid_saved_templates_acceptance.rs"]
+mod invalid_saved_templates_acceptance;
+
 use std::sync::Arc;
 
 use common::{MockRest, ScriptedResponse};
@@ -957,5 +960,411 @@ async fn disabled_and_unknown_dynamic_rows_and_failed_delivery() {
         "ambiguous delivery is not retried"
     );
     mock.shutdown().await;
+    pool.close().await;
+}
+
+fn patch_contents(mock: &MockRest) -> Vec<Value> {
+    mock.requests()
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn manage_missing_options_reply_exact_copy() {
+    let pool = PgPoolOptions::new().connect_lazy_with(test_options());
+    // A missed early gate fails immediately instead of trying a live connection.
+    pool.close().await;
+    for (id, name, expected) in [
+        (110u64, "command", "A command name is required."),
+        (111u64, "command-remove", "A command name is required."),
+        (112u64, "command", "A template is required."),
+    ] {
+        let options: &[(&str, &str)] = if id == 112 { &[("name", "faq")] } else { &[] };
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::status(204),
+                ScriptedResponse::json(200, json!({"id": "9000"})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let runtime = runtime(pool.clone(), &mock, true);
+        assert!(
+            runtime
+                .handle_interaction(&slash(id, name, 32, options), None)
+                .await
+                .unwrap(),
+            "{expected}"
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "{expected}");
+        assert!(
+            requests.iter().all(|request| request.method != "PUT"),
+            "missing options must not republish: {expected}"
+        );
+        let patches = patch_contents(&mock);
+        assert_eq!(patches.len(), 1, "{expected}");
+        assert_eq!(patches[0]["content"], expected);
+        assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+        mock.shutdown().await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn manage_save_remove_absent_replies_are_pinned() {
+    let pool = test_pool().await;
+    let base = InteractionRouter::new(gates(true))
+        .publish_set(&[])
+        .expect("base registry size")
+        .len();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // #120 defer
+            registry_receipt(base + 1, 7100),                   // create PUT
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #120 complete
+            ScriptedResponse::status(204),                      // #121 defer
+            registry_receipt(base, 7200),                       // remove PUT
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #121 complete
+            ScriptedResponse::status(204),                      // #122 defer
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #122 complete
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(
+            &slash(
+                120,
+                "command",
+                32,
+                &[("name", "faq"), ("template", "saved")]
+            ),
+            None
+        )
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(&slash(121, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(&slash(122, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap());
+    let requests = mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .count(),
+        2,
+        "absent delete does not republish"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[0]["content"], "Saved /faq.");
+    assert_eq!(patches[1]["content"], "Removed /faq.");
+    assert_eq!(patches[2]["content"], "No command /faq found.");
+    for body in &patches {
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    }
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn manage_registry_publish_failure_suffix_is_pinned() {
+    const SUFFIX: &str = "Registry publication failed; the command picker is not yet synchronized. Synchronization is pending and will resync automatically on the next publication; no further action is needed.";
+    let pool = test_pool().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::status(403),                      // registry publish (no retry)
+            ScriptedResponse::json(200, json!({"id": "9000"})), // honest partial-result edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    runtime
+        .handle_interaction(
+            &slash(
+                130,
+                "command",
+                32,
+                &[("name", "faq"), ("template", "saved")],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store::get_command(&pool, "2222", "faq")
+            .await
+            .unwrap()
+            .is_some(),
+        "the write commits despite the publish failure"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], format!("Saved /faq. {SUFFIX}"),);
+    assert_eq!(mock.requests().len(), 3, "no hidden reads or retry PUTs");
+    mock.shutdown().await;
+
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(403),
+            ScriptedResponse::json(200, json!({"id": "9000"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = self::runtime(pool.clone(), &mock, true);
+    runtime
+        .handle_interaction(&slash(131, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap();
+    assert!(
+        store::get_command(&pool, "2222", "faq")
+            .await
+            .unwrap()
+            .is_none(),
+        "the delete commits despite the publish failure"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], format!("Removed /faq. {SUFFIX}"),);
+    assert_eq!(mock.requests().len(), 3, "no hidden reads or retry PUTs");
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+// ---- display pins ----
+
+#[test]
+fn custom_command_error_display_strings_are_pinned() {
+    use two_bot_discord::custom_commands::CustomCommandError;
+    assert_eq!(
+        CustomCommandError::Storage.to_string(),
+        "Custom-command storage failed."
+    );
+    assert_eq!(
+        CustomCommandError::Delivery.to_string(),
+        "Custom-command Discord delivery failed."
+    );
+    assert_eq!(
+        CustomCommandError::DeliveryUnknown.to_string(),
+        "Custom-command Discord delivery outcome is unknown."
+    );
+    assert_eq!(
+        CustomCommandError::Publication.to_string(),
+        "Custom-command registry publication failed; the saved definition is unchanged."
+    );
+    assert_eq!(
+        CustomCommandError::Context.to_string(),
+        "Custom-command context is unavailable."
+    );
+    assert_eq!(
+        CustomCommandError::Render.to_string(),
+        "Custom-command template could not be rendered."
+    );
+}
+
+// Acceptance: a refused slash defer leaves a failed `command.run` row.
+//
+// `docs/custom-commands.md` handoff item 5 requires rendering inside the
+// delivery/audit outcome path so a REST failure leaves a failed
+// `command.run` fact. A defer refused before any Discord-side mutation
+// (scripted 4xx) is such a failure; an ambiguous defer failure (uncertain
+// wire outcome) must stay unaudited so a later retry cannot double-record.
+
+type RunAuditRow = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+async fn run_audit_row(pool: &sqlx::PgPool, interaction_id: u64) -> Option<RunAuditRow> {
+    sqlx::query_as(
+        "SELECT guild_id, actor_id, action, target_key, outcome, reason \
+         FROM automation_audit_log WHERE id = $1",
+    )
+    .bind(format!("custom:run:{interaction_id}"))
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+async fn command_run_row_count(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM automation_audit_log WHERE action = 'command.run'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn refused_slash_defer_leaves_failed_command_run_row() {
+    let pool = test_pool().await;
+    seed_text_command(&pool, "audit marker xyzzy {user}").await;
+    // The first (and only) REST call is the interaction defer; Discord
+    // refuses it with a definitive 4xx before any reply or edit can exist.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(403)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(140, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .is_err());
+    assert_eq!(mock.requests().len(), 1, "only the refused defer is sent");
+    mock.shutdown().await;
+
+    let row = run_audit_row(&pool, 140)
+        .await
+        .expect("a refused defer leaves a failed command.run row");
+    assert_eq!(
+        row,
+        (
+            "2222".to_owned(),
+            Some("3333".to_owned()),
+            "command.run".to_owned(),
+            Some("faq".to_owned()),
+            "failed".to_owned(),
+            Some("delivery_failed".to_owned()),
+        )
+    );
+    assert_eq!(command_run_row_count(&pool).await, 1);
+    // No template or rendered message content may reach any audit column.
+    let joined = [
+        "custom:run:140",
+        row.0.as_str(),
+        row.1.as_deref().unwrap_or_default(),
+        row.2.as_str(),
+        row.3.as_deref().unwrap_or_default(),
+        row.4.as_str(),
+        row.5.as_deref().unwrap_or_default(),
+    ]
+    .join(" ");
+    assert!(
+        !joined.contains("xyzzy"),
+        "audit row stores no template/message content: {joined}"
+    );
+    assert!(
+        !joined.contains("<@"),
+        "audit row stores no rendered mention: {joined}"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn ambiguous_slash_defer_leaves_no_command_run_row() {
+    let pool = test_pool().await;
+    seed_text_command(&pool, "audit marker xyzzy {user}").await;
+    for (id, response) in [
+        (141, ScriptedResponse::status(500)),
+        // The defer may have landed, but its response arrives after the
+        // shared executor's five-second deadline. Acceptance is unknown.
+        (
+            142,
+            ScriptedResponse::status(204).delayed(std::time::Duration::from_secs(6)),
+        ),
+    ] {
+        let mock = MockRest::start(vec![response], ScriptedResponse::status(500)).await;
+        let runtime = runtime(pool.clone(), &mock, true);
+        assert!(runtime
+            .handle_interaction(&slash(id, "faq", 0, &[]), Some("Test guild"))
+            .await
+            .is_err());
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "the uncertain defer is not retried"
+        );
+        mock.shutdown().await;
+        assert!(
+            run_audit_row(&pool, id).await.is_none(),
+            "an ambiguous defer must not append a definitive command.run row"
+        );
+    }
+    assert_eq!(command_run_row_count(&pool).await, 0);
+
+    // Because the ambiguous attempt stayed unaudited, a later retry of the
+    // same interaction records exactly one row: its own success.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "9000"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = self::runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(141, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .unwrap());
+    mock.shutdown().await;
+    let row = run_audit_row(&pool, 141)
+        .await
+        .expect("the retry records its success");
+    assert_eq!(row.4, "ok");
+    assert_eq!(command_run_row_count(&pool).await, 1, "no double-record");
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn successful_slash_run_audit_row_is_unchanged() {
+    let pool = test_pool().await;
+    seed_text_command(&pool, "audit marker xyzzy {user}").await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::json(200, json!({"id": "9000"})), // edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(143, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .unwrap());
+    assert_eq!(mock.requests().len(), 2, "defer plus edit, nothing else");
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], "audit marker xyzzy <@3333>");
+    assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+    mock.shutdown().await;
+
+    let row = run_audit_row(&pool, 143)
+        .await
+        .expect("the success path audits its run");
+    assert_eq!(
+        row,
+        (
+            "2222".to_owned(),
+            Some("3333".to_owned()),
+            "command.run".to_owned(),
+            Some("faq".to_owned()),
+            "ok".to_owned(),
+            None,
+        )
+    );
+    assert_eq!(command_run_row_count(&pool).await, 1);
     pool.close().await;
 }

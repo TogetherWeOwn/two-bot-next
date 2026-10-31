@@ -18,7 +18,9 @@ proxy configuration, unchanged by this slice.
   booleans, numbers, arrays and objects are invalid binding types. Each row
   requires a unique canonical lowercase `slug` (2–40 ASCII alphanumeric/internal-hyphen characters) and a
   valid `invite_code`. `label`, when supplied, must be a string; `disabled_at`
-  must be absent, null or a string. Retired campaigns still redirect. Extra
+  must be absent, null or a string. At most 1024 rows are accepted (the same
+  bound the live lookup cache enforces); a larger snapshot is invalid and the
+  whole configuration is rejected. Retired campaigns still redirect. Extra
   database export fields are ignored, as before.
 - `healthz` and `metrics` are reserved campaign inputs. Case, slash and encoded
   aliases cannot become campaign redirects. Only exact `/healthz` serves the
@@ -33,9 +35,22 @@ an empty store or a disabled fallback. `/health` and `/readyz` still proxy the
 Container independently; those are not redirect configuration probes. Internal
 reserved aliases remain 404 before configuration parsing.
 
-The snapshot remains the current Worker mapping source. This change does not
-wire the deferred Hyperdrive connector, alter cache/proxy policy, add campaign
-management UI or contact deployed services.
+When `REDIRECT_DB` is bound, the Worker supplies `connectPostgres` to
+`RedirectStore` ([wiring](../wrangler/src/index.ts),
+[store](../wrangler/src/redirect-store.ts)): lookups and click inserts go live
+against the database. Without that binding, the store serves the
+`REDIRECT_MAPPINGS_JSON` snapshot and click records are logged and dropped,
+never faked into a store. A failed live lookup serves the configured
+`REDIRECT_FALLBACK_CODE` invite, or 503 with `Retry-After: 30` when none is
+valid ([outage path](../wrangler/src/redirect.ts)); it never falls back to the
+snapshot. Pinned by `wrangler/test/redirect-db.test.ts` (bound hit ignores the
+snapshot, unbound mode never connects and drops clicks, store failures use the
+fallback without leaking the connection string) and
+`wrangler/test/redirect.test.ts` (lookup outage with no fallback is a 503 that
+records nothing). Whether any deployed environment actually binds
+`REDIRECT_DB` is a deployment fact, not stated here: confirm the deployed
+wiring before diagnosing. This change does not alter cache/proxy policy, add
+campaign management UI or contact deployed services.
 
 ## Diagnostics and privacy
 
@@ -69,7 +84,7 @@ From `wrangler/` with the pinned dev dependencies installed:
 ```sh
 npm run typecheck
 node --import ./test/cloudflare-loader.mjs --test \
-  test/redirect.test.ts test/redirect-config.test.ts test/container.test.ts
+  test/redirect.test.ts test/redirect-config.test.ts test/redirect-db.test.ts test/container.test.ts
 ```
 
 All bindings and errors are synthetic. No live endpoint, Discord or database
@@ -98,7 +113,7 @@ STAGING_WORKER_URL=https://two-bot-next-staging.<sub>.workers.dev \
 Offline fixtures cover the same assertion logic with no network access:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_staging_redirect_smoke.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_redirect_smoke*.py' -v
 ```
 
 CI runs them in the worker job beside the rollout provenance suite.

@@ -1892,15 +1892,51 @@ async fn postgres_warning_acquisition_timeout_releases_only_new_key_and_retries(
     );
     assert!(matches!(error, MemberError::Store(ref e)
         if e.is_safe_pre_mutation() && e.message.contains("pool_timeout")));
-    let rows: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM moderation_warnings) +
-                (SELECT COUNT(*) FROM moderation_audit) +
+    let mutations: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM moderation_warnings),
                 (SELECT COUNT(*) FROM moderation_idempotency)",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(rows, 0, "no warning/audit; only the new claim was released");
+    assert_eq!(
+        mutations,
+        (0, 0),
+        "no warning; only the new claim was released"
+    );
+    // The safely-failed attempt is still audited: exactly one bound `failed`
+    // row under the suffixed request id, correlated to the original request
+    // so it can never mask the accepted retry's row.
+    let audit = sqlx::query(
+        "SELECT guild_id, actor_id, action, target_id, outcome, idempotency_key,
+                metadata_json
+         FROM moderation_audit WHERE request_id = $1",
+    )
+    .bind("warning-pool-loss:failed")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit.get::<String, _>("guild_id"), "100000000000000001");
+    assert_eq!(audit.get::<String, _>("actor_id"), "111111111111111111");
+    assert_eq!(audit.get::<String, _>("action"), "moderation.warn");
+    assert_eq!(
+        audit.get::<Option<String>, _>("target_id").as_deref(),
+        Some("333333333333333333")
+    );
+    assert_eq!(audit.get::<String, _>("outcome"), "failed");
+    assert_eq!(
+        audit.get::<String, _>("idempotency_key"),
+        "warning-pool-loss"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_str(&audit.get::<String, _>("metadata_json")).unwrap();
+    assert_eq!(metadata["stage"], "store");
+    assert_eq!(metadata["request_id"], "warning-pool-loss");
+    let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM moderation_audit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(audits, 1, "only the bound failure row is audited");
     assert!(
         !svc.execute(&request)
             .await
@@ -1922,6 +1958,19 @@ async fn postgres_warning_acquisition_timeout_releases_only_new_key_and_retries(
     .await
     .unwrap();
     assert_eq!(counts, (1, 1, 1));
+    // The failure row survives the accepted retry untouched: the retry adds
+    // its own plain-request-id success row instead of masking it.
+    let retained: (String, String) = sqlx::query_as(
+        "SELECT outcome, metadata_json FROM moderation_audit
+         WHERE request_id = 'warning-pool-loss:failed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained.0, "failed");
+    let retained_metadata: serde_json::Value = serde_json::from_str(&retained.1).unwrap();
+    assert_eq!(retained_metadata["stage"], "store");
+    assert_eq!(retained_metadata["request_id"], "warning-pool-loss");
     assert_eq!(discord.call_count("ban") + discord.call_count("kick"), 0);
     warning_pool.close().await;
     cleanup(admin, pool, schema).await;
@@ -2320,10 +2369,9 @@ async fn postgres_void_requeues_current_expiry_and_fence_refusal_releases_only_n
         let old = format!("old-{i}");
         accepted_unban(&store, guild, user, &old, NOW, NOW).await;
         discord.fail_with("unban", DiscordError::Timeout);
-        assert!(matches!(
-            svc.run_due_unbans(guild).await,
-            Err(MemberError::Discord(DiscordError::Timeout))
-        ));
+        // The timeout fences its row and the sweep continues past it; the
+        // void/retry assertions below are unchanged.
+        assert_eq!(svc.run_due_unbans(guild).await.expect("timeout fenced"), 0);
         let token: String = sqlx::query_scalar(
             "SELECT claim_token FROM moderation_scheduled_unbans WHERE request_id = $1",
         )
@@ -2370,7 +2418,7 @@ async fn postgres_void_requeues_current_expiry_and_fence_refusal_releases_only_n
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition() {
-    use two_bot_core::member_moderation::{DiscordError, MemberError};
+    use two_bot_core::member_moderation::DiscordError;
     // OVERDUE is two hours before NOW: a sweep at NOW must still claim it,
     // not drop it. FUTURE must be retained untouched by every sweep here.
     const OVERDUE: &str = "2023-11-14T20:13:20.000Z";
@@ -2473,10 +2521,11 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
     });
     accepted_unban(&store, guild, "refused-user", "refused-expiry", NOW, NOW).await;
     discord.fail_with("unban", DiscordError::Rejected("already unbanned".into()));
-    assert!(matches!(
-        svc.run_due_unbans(guild).await,
-        Err(MemberError::Discord(DiscordError::Rejected(_)))
-    ));
+    // The refusal is recorded and requeued; the sweep continues past it.
+    assert_eq!(
+        svc.run_due_unbans(guild).await.expect("refusal recorded"),
+        0
+    );
     assert_eq!(unban_state(&pool, "refused-expiry").await, "pending");
     discord.clear_failure("unban");
     assert_eq!(svc.run_due_unbans(guild).await.expect("retry sweep"), 1);
@@ -2484,10 +2533,8 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
 
     accepted_unban(&store, guild, "timeout-user", "timeout-expiry", NOW, NOW).await;
     discord.fail_with("unban", DiscordError::Timeout);
-    assert!(matches!(
-        svc.run_due_unbans(guild).await,
-        Err(MemberError::Discord(DiscordError::Timeout))
-    ));
+    // The timeout fences its row and the sweep continues past it.
+    assert_eq!(svc.run_due_unbans(guild).await.expect("timeout fenced"), 0);
     assert_eq!(unban_state(&pool, "timeout-expiry").await, "running");
     assert_eq!(
         svc.run_due_unbans(guild)
@@ -2523,9 +2570,10 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
     assert_eq!(unban_state(&pool, "timeout-expiry").await, "done");
 
     // Receipt counts for the waiver ledger: four unbans done (due, overdue,
-    // refused, timeout), the future expiry still pending. Only the two
-    // sweep-driven unbans carry an unban audit: direct store-level completes
-    // close the claim without dispatching, so they audit nothing.
+    // refused, timeout), the future expiry still pending. The two
+    // sweep-driven unbans each carry a success audit plus one failure audit
+    // from their first failed attempt; direct store-level completes close
+    // the claim without dispatching, so they audit nothing.
     let (done, pending, audits): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM moderation_scheduled_unbans WHERE state = 'done'),
                 (SELECT COUNT(*) FROM moderation_scheduled_unbans WHERE state = 'pending'),
@@ -2535,5 +2583,5 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
     .await
     .expect("receipt counts");
     cleanup(admin, pool, schema).await;
-    assert_eq!((done, pending, audits), (4, 1, 2));
+    assert_eq!((done, pending, audits), (4, 1, 4));
 }

@@ -315,8 +315,39 @@ async fn limit_while_halted_refuses_as_paused() {
     let (live, store, http, trace) = owned_room();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.halted = true;
-    let (text, _) = run_once(&mut worker, MEMBER, false, LimitCommand::Unlimit).await;
-    assert!(text.contains("paused"), "{text}");
+    for command in [
+        LimitCommand::Limit(LimitArg::Value(3)),
+        LimitCommand::Unlimit,
+    ] {
+        let (text, ack) = run_once(&mut worker, MEMBER, false, command).await;
+        assert_eq!(ack, None);
+        assert_eq!(
+            text,
+            "Voice rooms are paused: Discord refused the bot credential. \
+             Fix the token, then restart the bot."
+        );
+    }
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    assert!(limit_writes(&trace).is_empty());
+}
+
+#[tokio::test]
+async fn limit_before_warmup_refuses_with_exact_text() {
+    let (live, store, http, trace) = owned_room();
+    live.disconnect();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    for command in [
+        LimitCommand::Limit(LimitArg::Value(3)),
+        LimitCommand::Unlimit,
+    ] {
+        let (text, ack) = run_once(&mut worker, MEMBER, false, command).await;
+        assert_eq!(ack, None);
+        assert_eq!(
+            text,
+            "The voice worker isn't warmed up yet — try again in a moment."
+        );
+    }
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
     assert!(limit_writes(&trace).is_empty());
 }
 
@@ -402,6 +433,71 @@ async fn a_terminal_discord_refusal_is_reported_and_recorded() {
     assert!(worker.failures().contains(&LifecycleFailure::Discord {
         channel_id: 500,
         error: RoomHttpError::AccessDenied,
+    }));
+    // The live limit still shows what Discord has.
+    let live = worker.live.inner.read().unwrap();
+    assert_eq!(live.channels.get(&500).unwrap().user_limit, Some(8));
+}
+
+#[tokio::test]
+async fn limit_unauthorized_refusal_pins_exact_text() {
+    let (live, store, http, trace) = owned_room();
+    http.limit_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::Unauthorized);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (text, ack) = run_once(
+        &mut worker,
+        MEMBER,
+        false,
+        LimitCommand::Limit(LimitArg::Value(3)),
+    )
+    .await;
+    assert_eq!(ack, Some(LimitAck::Refused(RoomHttpError::Unauthorized)));
+    assert_eq!(
+        text,
+        "Voice rooms are paused: Discord refused the bot credential. \
+         Tell an admin to fix the token, then restart the bot."
+    );
+    // The write left the queue for good and surfaces under `/setup`.
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    assert_eq!(limit_writes(&trace), ["limit:500:3"]);
+    assert!(worker.failures().contains(&LifecycleFailure::Discord {
+        channel_id: 500,
+        error: RoomHttpError::Unauthorized,
+    }));
+    // The live limit still shows what Discord has.
+    let live = worker.live.inner.read().unwrap();
+    assert_eq!(live.channels.get(&500).unwrap().user_limit, Some(8));
+}
+
+#[tokio::test]
+async fn limit_generic_refusal_pins_exact_text() {
+    let (live, store, http, trace) = owned_room();
+    http.limit_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::InvalidRequest);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (text, ack) = run_once(
+        &mut worker,
+        MEMBER,
+        false,
+        LimitCommand::Limit(LimitArg::Value(3)),
+    )
+    .await;
+    assert_eq!(ack, Some(LimitAck::Refused(RoomHttpError::InvalidRequest)));
+    assert_eq!(
+        text,
+        "Discord refused the limit change. Nothing was changed; try again."
+    );
+    // The write left the queue for good and surfaces under `/setup`.
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    assert_eq!(limit_writes(&trace), ["limit:500:3"]);
+    assert!(worker.failures().contains(&LifecycleFailure::Discord {
+        channel_id: 500,
+        error: RoomHttpError::InvalidRequest,
     }));
     // The live limit still shows what Discord has.
     let live = worker.live.inner.read().unwrap();

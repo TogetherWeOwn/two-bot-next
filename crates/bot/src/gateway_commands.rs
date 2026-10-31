@@ -39,9 +39,25 @@ pub struct GatewayCommandConfig {
 }
 
 impl GatewayCommandConfig {
-    pub fn from_map(guild_id: u64, vars: &HashMap<String, String>) -> Result<Self, sqlx::Error> {
+    /// Activation-aware constructor mirroring `CommandRuntime::from_env`: a
+    /// denied Moderation capability never reaches moderation validation, so a
+    /// stale comma-space protected-role value cannot fail boot on live
+    /// identities. Permitted staging still validates the strict verbatim list.
+    pub fn from_map_for_activation(
+        guild_id: u64,
+        vars: &HashMap<String, String>,
+        moderation_permitted: bool,
+    ) -> Result<Self, sqlx::Error> {
         let features = FeatureGates::from_map(vars).map_err(|_| config_error())?;
-        let moderation = ModerationGates::from_map(vars).map_err(|_| config_error())?;
+        let moderation = if moderation_permitted {
+            ModerationGates::from_map(vars).map_err(|_| config_error())?
+        } else {
+            ModerationGates {
+                enabled: false,
+                owen_user_id: String::new(),
+                protected_role_ids: Default::default(),
+            }
+        };
         if guild_id == 0 {
             return Err(config_error());
         }
@@ -136,7 +152,8 @@ impl GatewayCommands {
             .and_then(Id::new_checked)
             .expect("test command config has a valid guild");
         Self {
-            runtime: CustomCommandRuntime::new(pool, router, executor, 1111),
+            runtime: CustomCommandRuntime::new(pool, router, executor, 1111)
+                .with_text_commands(config.text_commands),
             application_id: 1111,
             guild_id,
             guild_name: RwLock::new("Test guild".to_owned()),
@@ -191,7 +208,8 @@ impl GatewayCommands {
             );
             sqlx::Error::InvalidArgument("gateway guild context unavailable".into())
         })?;
-        let runtime = CustomCommandRuntime::new(pool, router, executor, application_id);
+        let runtime = CustomCommandRuntime::new(pool, router, executor, application_id)
+            .with_text_commands(config.text_commands);
         Ok(Self {
             runtime,
             application_id,
@@ -379,19 +397,57 @@ mod tests {
     #[test]
     fn command_gates_use_shared_parsers_and_fail_closed() {
         let mut vars = HashMap::new();
-        assert!(GatewayCommandConfig::from_map(0, &vars).is_err());
-        let config = GatewayCommandConfig::from_map(1, &vars).unwrap();
+        assert!(GatewayCommandConfig::from_map_for_activation(0, &vars, true).is_err());
+        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true)
+            .expect("empty settings keep command gates disabled");
         assert!(!config.gates.automations);
         assert!(!config.text_commands);
         assert!(!config.acceptance.permits_automations());
         vars.insert("TWO_AUTOMATIONS".into(), "1".into());
         vars.insert("TWO_TEXT_COMMANDS".into(), "1".into());
         vars.insert("TWO_AUTOMOD".into(), "0".into());
-        let config = GatewayCommandConfig::from_map(1, &vars).unwrap();
+        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true)
+            .expect("valid automation flags enable command gates");
         assert!(config.gates.automations && config.text_commands);
         assert!(config.acceptance.permits_automations());
         vars.insert("TWO_MODERATION".into(), "1".into());
-        assert!(GatewayCommandConfig::from_map(1, &vars).is_err());
+        assert!(GatewayCommandConfig::from_map_for_activation(1, &vars, true).is_err());
+    }
+
+    #[test]
+    fn denied_moderation_never_reaches_strict_role_validation() {
+        // Stale comma-space value that permitted staging must refuse.
+        let vars = HashMap::from([
+            (
+                "TWO_MODERATION_PROTECTED_ROLE_IDS".to_owned(),
+                "444444444444444444, 555555555555555555".to_owned(),
+            ),
+            ("TWO_MODERATION".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+        ]);
+        assert!(GatewayCommandConfig::from_map_for_activation(1, &vars, true).is_err());
+        // Denied capability: same stale value boots, moderation stays off.
+        let denied = GatewayCommandConfig::from_map_for_activation(1, &vars, false)
+            .expect("denied moderation ignores stale role value");
+        assert!(!denied.gates.moderation);
+        // Permitted strict shape still boots.
+        let strict = HashMap::from([
+            (
+                "TWO_MODERATION_PROTECTED_ROLE_IDS".to_owned(),
+                "444444444444444444,555555555555555555".to_owned(),
+            ),
+            ("TWO_MODERATION".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+        ]);
+        let permitted = GatewayCommandConfig::from_map_for_activation(1, &strict, true)
+            .expect("permitted strict list boots");
+        assert!(permitted.gates.moderation);
     }
 
     /// Worker decision coverage for the verdict-to-trigger plumbing
@@ -494,7 +550,8 @@ mod tests {
             ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
             ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
         ]);
-        let config = GatewayCommandConfig::from_map(2222, &vars).expect("command config");
+        let config = GatewayCommandConfig::from_map_for_activation(2222, &vars, true)
+            .expect("command config");
         assert_eq!(config.acceptance, AutomationMessageAcceptance::Unavailable);
         assert!(!config.acceptance.permits_automations());
 

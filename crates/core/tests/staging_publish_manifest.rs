@@ -3,16 +3,16 @@
 //! Pins the command set expected on the staging guild — the all-gates-on
 //! [`InteractionRouter::publish_set`] output in legacy publish order — plus
 //! the automation-gating contract for dynamic DB-backed custom commands.
-//! Code-derived: the fixture (`fixtures/staging_published_commands.json`)
-//! is generated from the router, and this test fails on any drift between
-//! the router-advertised set and the manifest.
+//! The fixture (`fixtures/staging_published_commands.json`) independently
+//! preserves both saved-command inspection and current-channel discovery;
+//! this test fails on drift between the router-advertised set and the manifest.
 //!
 //! Offline carve only: no guild touch, no staging secrets, no database.
 //! The live diff/publish workflow stays in `docs/command-publish.md`.
 //! Distinct from `registry_golden.rs` (legacy parity axis: next vs the frozen
 //! legacy snapshot) — this is the staging publish axis (router vs manifest).
 
-use two_bot_core::commands::CustomCommand;
+use two_bot_core::commands::{CustomCommand, PERM_MANAGE_GUILD};
 use two_bot_core::router::{InteractionRouter, RouterGates};
 
 use serde_json::Value;
@@ -23,7 +23,7 @@ fn manifest() -> Value {
 }
 
 fn manifest_names(key: &str) -> Vec<String> {
-    manifest()[key]
+    let mut names: Vec<String> = manifest()[key]
         .as_array()
         .unwrap_or_else(|| panic!("manifest must list {key}"))
         .iter()
@@ -32,7 +32,17 @@ fn manifest_names(key: &str) -> Vec<String> {
                 .unwrap_or_else(|| panic!("manifest {key} entries are command names"))
                 .to_owned()
         })
-        .collect()
+        .collect();
+    // Compiled-only companion: keep the saved publication fixture immutable.
+    // This expectation does not authorize a staging or production publish.
+    assert!(!names.iter().any(|name| name == "lfg-edit"));
+    let after_close = names
+        .iter()
+        .position(|name| name == "lfg-close")
+        .expect("saved manifest retains close")
+        + 1;
+    names.insert(after_close, "lfg-edit".to_owned());
+    names
 }
 
 /// Staging enables every publish gate; the guild id here is a placeholder —
@@ -110,10 +120,38 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 28 all-on builtins minus the 8 automation admin commands, and the
-    // stored dynamic row stays unpublished: every such invocation refuses
-    // at dispatch while gated off, so publishing would burn the ceiling.
-    assert_eq!(names.len(), 20, "automations-off staging set: {names:?}");
+    // 45 all-on builtins minus 12 automation-gated commands, including
+    // command-inspect, pause/resume and giveaway; announcements-gated lfg-edit and
+    // feed-inspect still publish, and read-only current-channel discovery
+    // lfg-list stays published. welcome-preview is core-always and survives too.
+    // The stored dynamic row stays unpublished:
+    // every such invocation refuses at dispatch while gated off, so publishing
+    // would burn the ceiling.
+    assert_eq!(names.len(), 33, "automations-off staging set: {names:?}");
+    assert!(names.iter().any(|name| name == "tempban-list"));
+    assert!(names.iter().any(|name| name == "moderation-recent"));
+    assert!(names.contains(&"reopen".to_owned()));
+    assert!(names.contains(&"game-mix".to_owned()));
+    assert!(
+        names.iter().any(|name| name == "lfg-edit"),
+        "lfg-edit is announcements-gated and survives automations-off: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "welcome-preview"),
+        "welcome-preview is core-always and survives automations-off: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "lfg-list"),
+        "read-only current-channel discovery stays published while automations are off"
+    );
+    assert!(
+        names.iter().any(|name| name == "feed-inspect"),
+        "feed-inspect is announcements-gated and survives automations-off: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "reopen"),
+        "reopen is core-always and survives automations-off: {names:?}"
+    );
     assert!(
         !names.iter().any(|name| name == "faq"),
         "dynamic rows must not publish while automations are off: {names:?}"
@@ -122,11 +160,15 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "command",
         "command-remove",
         "command-list",
+        "command-inspect",
+        "command-disable",
+        "command-enable",
         "schedule",
         "schedule-remove",
         "schedule-list",
         "sticky",
         "sticky-remove",
+        "giveaway",
     ] {
         assert!(
             !names.contains(&gated.to_owned()),
@@ -232,11 +274,20 @@ fn voice_kick_is_shadowed_by_moderation_kick() {
 }
 
 #[test]
-fn templateassistant_publishes_last_only_with_both_gates() {
+fn templateassistant_stays_unpublished_until_its_slice_lands() {
+    // The fixture keeps the assistant name (and its intended default gate)
+    // so the slice re-activates against the same shape; the router must not
+    // publish it in any gate state until then.
     let voice = voice_manifest();
     let assistant = &voice["assistant"];
     let name = assistant["name"].as_str().expect("assistant name");
-    for (voice_gate, assistant_gate) in [(false, false), (false, true), (true, false)] {
+    assert_eq!(
+        permission_cell(&assistant["default_member_permissions"]),
+        Some(PERM_MANAGE_GUILD.to_string()),
+        "fixture keeps the intended assistant gate",
+    );
+    for (voice_gate, assistant_gate) in [(false, false), (false, true), (true, false), (true, true)]
+    {
         let set = voice_router(voice_gate, assistant_gate)
             .publish_set(&[])
             .expect("staging set assembles");
@@ -245,15 +296,6 @@ fn templateassistant_publishes_last_only_with_both_gates() {
             "/{name} must not publish with voice={voice_gate} assistant={assistant_gate}",
         );
     }
-    let set = voice_router(true, true)
-        .publish_set(&[])
-        .expect("staging set assembles");
-    let last = set.last().expect("non-empty publish set");
-    assert_eq!(last.name, name, "/{name} publishes after the voice set");
-    assert_eq!(
-        last.default_member_permissions,
-        permission_cell(&assistant["default_member_permissions"]),
-    );
 }
 
 #[test]

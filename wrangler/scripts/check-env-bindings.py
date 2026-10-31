@@ -50,6 +50,9 @@ OPTIONAL_SECRET_BINDINGS = {
     # secrets only; a committed value would hand out dashboard access.
     "OPS_DASHBOARD_CLIENT_ID",
     "OPS_DASHBOARD_CLIENT_SECRET",
+    # TOG-29201: the MCP shared bearer (docs/mcp.md). Optional Worker
+    # secret only; a committed var would publish the bearer.
+    "MCP_TOKEN",
 }
 # TOG-22861 workers.dev break-glass: staging and production serve the public
 # suffix until a custom domain and Access app exist. Every named environment
@@ -63,8 +66,21 @@ OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
 # environment, so it is denied there too; production must never carry it.
 INGRESS_VAR = "INTERNAL_ACTIONS_INGRESS"
 INGRESS_ENVS = {"staging"}
+# TOG-23364: the default-dark POST /hooks/twitch EventSub ingress exists in
+# staging only, under the same rule as the internal-actions ingress above.
+EVENTSUB_INGRESS_VAR = "EVENTSUB_INGRESS"
+EVENTSUB_INGRESS_ENVS = {"staging"}
 # Private-receiver config is Operator-set Worker secrets, never wrangler.toml.
 RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
+# The EventSub Operator switch is the last enable step for the public Twitch
+# ingress (wrangler/src/eventsub.ts): the route stays dark until the Operator
+# sets the Worker secret TWO_EVENTSUB=1. A committed var would turn the route
+# on from a toml change alone, so it is rejected in every vars table, like
+# the TWO_INTERNAL_* receiver config above. The prefix also covers the
+# private receiver enable, bind and signing secret (TWO_EVENTSUB_BIND,
+# TWO_TWITCH_*), which are Operator-set Worker secrets for the same reason.
+EVENTSUB_RECEIVER_PREFIX = "TWO_EVENTSUB"
+TWITCH_SECRET_PREFIX = "TWO_TWITCH_"
 # Boot publication of the guild command registry is a full replacement of the
 # guild's commands. wrangler.toml may opt in for staging only; production
 # publication stays an Operator-approved Worker binding, never a committed var.
@@ -83,6 +99,13 @@ VOICE_GATE_ENVS = {"staging"}
 # Operator-set Worker binding after the app's Presence Intent is on.
 VOICE_PRESENCE_VAR = "TWO_VOICE_PRESENCE"
 VOICE_PRESENCE_ENVS = {"staging"}
+# The music voice-node spike gate attaches the Lavalink voice-update
+# forwarder (docs/music-voice-node-spike.md). Staging-only like the voice
+# gate: a top-level var would be required in every environment, so it is
+# denied there too; production music is an explicit follow-up decision,
+# never a committed var.
+MUSIC_GATE_VAR = "TWO_MUSIC"
+MUSIC_GATE_ENVS = {"staging"}
 # TOG-22862 (CISO AC4): the mutating admin controls (PUT /ops/config,
 # POST /ops/kill-switch) stay dark unless the environment opts in with these
 # exact-"1" switches. A top-level var would be required in every environment,
@@ -91,6 +114,23 @@ OPS_CONFIG_WRITES_VAR = "OPS_CONFIG_WRITES_ENABLED"
 OPS_CONFIG_WRITES_ENVS = {"staging"}
 OPS_KILLSWITCH_VAR = "OPS_KILLSWITCH_ENABLED"
 OPS_KILLSWITCH_ENVS = {"staging"}
+# Rollback-drill fence (docs/staging-rollout-gate.md): the deploy-env marker
+# is exactly "staging" in the staging vars only, so neither the Worker
+# forward nor the Rust readiness fence can treat another environment as
+# staging. The injection switch itself is denied in every vars table,
+# staging included: only the generated per-deploy staging config written
+# by scripts/staging_rollout.py for a manual dispatch may carry it, so a
+# toml change alone can never arm (or leave armed) a failing gateway.
+DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
+DEPLOY_ENV_ENVS = {"staging"}
+GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+# Remediation-drill fence (staging fault injector): the same generated-only
+# rule as the rollback-drill switch above. Either switch committed anywhere —
+# staging included — fails; only the generated per-deploy staging config from
+# a manual drill dispatch may carry them, so a toml change alone can never
+# arm (or leave armed) a synthetic stall or unpaired disconnect.
+VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
+UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
 
 
 def check(path: Path) -> list[str]:
@@ -159,6 +199,13 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(INGRESS_VAR, "1") != "1":
             errors.append(f'{prefix}: {INGRESS_VAR} must be exactly "1" or absent')
+        if EVENTSUB_INGRESS_VAR in variables and env_name not in EVENTSUB_INGRESS_ENVS:
+            errors.append(
+                f"{prefix}: {EVENTSUB_INGRESS_VAR} is staging-only "
+                "(top-level vars are required in every env; production must never set it)"
+            )
+        if variables.get(EVENTSUB_INGRESS_VAR, "1") != "1":
+            errors.append(f'{prefix}: {EVENTSUB_INGRESS_VAR} must be exactly "1" or absent')
         if BOOT_PUBLISH_VAR in variables and env_name not in BOOT_PUBLISH_ENVS:
             errors.append(
                 f"{prefix}: {BOOT_PUBLISH_VAR} is staging-only "
@@ -180,6 +227,13 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(VOICE_PRESENCE_VAR, "1") != "1":
             errors.append(f'{prefix}: {VOICE_PRESENCE_VAR} must be exactly "1" or absent')
+        if MUSIC_GATE_VAR in variables and env_name not in MUSIC_GATE_ENVS:
+            errors.append(
+                f"{prefix}: {MUSIC_GATE_VAR} is staging-only "
+                "(top-level vars are required in every env; production music is a follow-up, never a committed var)"
+            )
+        if variables.get(MUSIC_GATE_VAR, "1") != "1":
+            errors.append(f'{prefix}: {MUSIC_GATE_VAR} must be exactly "1" or absent')
         if OPS_CONFIG_WRITES_VAR in variables and env_name not in OPS_CONFIG_WRITES_ENVS:
             errors.append(
                 f"{prefix}: {OPS_CONFIG_WRITES_VAR} is staging-only "
@@ -194,7 +248,31 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(OPS_KILLSWITCH_VAR, "1") != "1":
             errors.append(f'{prefix}: {OPS_KILLSWITCH_VAR} must be exactly "1" or absent')
+        if DEPLOY_ENV_VAR in variables and env_name not in DEPLOY_ENV_ENVS:
+            errors.append(
+                f"{prefix}: {DEPLOY_ENV_VAR} is staging-only "
+                "(top-level vars are required in every env; production must never carry the staging fence marker)"
+            )
+        if variables.get(DEPLOY_ENV_VAR, "staging") != "staging":
+            errors.append(f'{prefix}: {DEPLOY_ENV_VAR} must be exactly "staging" or absent')
+        if GATEWAY_FAIL_INJECTION_VAR in variables:
+            errors.append(
+                f"{prefix}: {GATEWAY_FAIL_INJECTION_VAR} must never be a committed var "
+                "(only the generated staging deploy config from a manual drill dispatch may carry it)"
+            )
+        for fault_var in (VOICE_STALL_FAULT_VAR, UNPAIRED_FAULT_VAR):
+            if fault_var in variables:
+                errors.append(
+                    f"{prefix}: {fault_var} must never be a committed var "
+                    "(only the generated staging deploy config from a manual drill dispatch may carry it)"
+                )
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
+            errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
+        for key in sorted(
+            k
+            for k in variables
+            if k.startswith(EVENTSUB_RECEIVER_PREFIX) or k.startswith(TWITCH_SECRET_PREFIX)
+        ):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")
         if threshold is not None and (

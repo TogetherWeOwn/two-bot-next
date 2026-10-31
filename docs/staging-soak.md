@@ -50,6 +50,20 @@ technical-policy question remains pending with the CTO; the CEO-held fixture
 authorization remains an execution hold. Neither is treated as the missing
 method's owner or as resolved or widened by this document.
 
+### Bounded event-read evidence contract
+
+The existing [processed-event collector](evidence-route.md) strictly parses
+psql CSV and rejects malformed quoting, impossible UTC instants and rows outside
+its inclusive SQL `BETWEEN` window before writing any artifact or step summary.
+That check includes the 61st returned truncation witness; the artifact validator
+also checks real, ordered window bounds (at most 15 minutes) and every kept row.
+Rows retain SQL ID order, not chronological order. Zero rows are a valid read,
+not proof of zero loss; more than 60 rows retains `truncated: true` and UNKNOWN
+coverage. The offline acceptance matrix is
+`scripts/test_staging_events_read_acceptance.py`. Passing it proves this bounded
+contract only: it neither authorizes a new live read nor closes the four-family,
+ACTIVE-hour or one-minute-sample evidence gaps above.
+
 ## Deployment interruption and recovery gap
 
 The current staging deploy workflow documents a **95–139-second gateway drop
@@ -75,11 +89,14 @@ environment. Names only — values never go in cards, logs, or PRs:
 
 - `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` — GitHub Actions secrets,
   used by `deploy-staging.yml`.
-- `DISCORD_TOKEN` — Worker secret (`wrangler secret put --env staging`),
+- `DISCORD_TOKEN` — Worker secret (staged with `wrangler versions secret put
+  --env staging DISCORD_TOKEN --message <sha>`, then `wrangler versions deploy --env staging`),
   the staging bot token.
-- `GUILD_ID` — Worker secret (`wrangler secret put --env staging`),
+- `GUILD_ID` — Worker secret (staged with `wrangler versions secret put
+  --env staging GUILD_ID --message <sha>`, then `wrangler versions deploy --env staging`),
   the TWO Staging guild (`1545644954272137297`).
-- `DATABASE_URL` — Worker secret (`wrangler secret put --env staging`),
+- `DATABASE_URL` — Worker secret (staged with `wrangler versions secret put
+  --env staging DATABASE_URL --message <sha>`, then `wrangler versions deploy --env staging`),
   the direct, unpooled URL for the bot's dedicated `two_bot` database and role
   on the Neon **staging** branch (`br-summer-sunset`, project
   `rough-dream-43123587`), separate from the web's `two` / `two_app`.
@@ -87,6 +104,16 @@ environment. Names only — values never go in cards, logs, or PRs:
 - `STAGING_WORKER_URL` — GitHub Actions **variable** (not a secret), the
   staging Worker URL, used by the `/readyz` gate. If it is missing the gate
   fails closed with instructions instead of deploying blind.
+
+`<sha>` above is the live `/readyz` `build_revision` of staging: a plain
+`wrangler secret put` publishes an unstamped version that can never form a
+rollback receipt (see `docs/production-deploy.md`). Precheck first:
+`versions secret put` builds on the newest-created version, not necessarily the
+serving one — confirm the last block of `wrangler versions list --env staging`
+(the list prints oldest first, so the last block is the newest version)
+is the serving version (same id as `wrangler deployments status --env staging`),
+and if they differ redeploy the intended SHA through the workflow first (full rule
+in `docs/production-deploy.md`).
 
 ## Starting the soak
 
@@ -140,6 +167,42 @@ The approved exercise set—three redeploys, two drops, Neon idle-hit and actual
 429 categories—still requires exact reviewed budgets, an independent stop and
 restore arrangements before execution. This documentation does not authorize
 live faults, load, dispatch, or any new evidence/fault mechanism.
+
+## Offline gateway evidence field contract
+
+`scripts/soak_evidence.py` reconciles synthetic JSONL fixtures only. Dispatch
+`seq` must be a nonnegative integer, excluding booleans, nulls, strings,
+floats, arrays and objects. A supplied resume `seq` follows the same rule;
+only omission permits a sequence-less resume, retaining the previous baseline.
+Invalid sequences produce fixed UNKNOWN evidence without updating counters,
+sequence baselines, the accepted timestamp window or pending outages. A
+malformed resume cannot close a disconnect; a later valid recovery measures
+from the original disconnect, and an unrecovered outage remains open UNKNOWN.
+
+Only `connect`, `disconnect`, `resume`, `dispatch` and `unknown` event kinds
+are accepted. Missing or unrecognised kinds remain UNKNOWN evidence but cannot
+advance the accepted timestamp window or make later valid recovery appear
+regressed. In the committed sample, `heartbeat_oops` at 00:00:26 remains an
+UNKNOWN interval; the accepted window ends at the explicit `unknown` record's
+event timestamp, 00:00:22, not its interval endpoint or the rejected event.
+
+Event timestamps and explicit UNKNOWN start/end timestamps must normalize to
+representable UTC datetimes. UTC underflow/overflow becomes bounded malformed
+evidence, not a traceback or a diagnostic containing the rejected value;
+following valid records are still processed. Input is not sorted. Zero and
+positive sequences, ordered duplicates, equal timestamps and legitimate session
+resets retain their existing behavior.
+
+Run the bundled summarize/CLI matrix offline:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p '*soak*evidence*.py' -v
+```
+
+An offline PASS is only parser reconciliation, not a live soak verdict or proof
+of deployment. Empty or dispatch-free input still refuses PASS, and the existing
+under-60-second outage budget and all live acceptance requirements above remain
+unchanged.
 
 ## Waiver ledger (B4 parity sign-off)
 

@@ -14,7 +14,9 @@
 use std::collections::HashSet;
 use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;
-use two_bot_cutover::cli::{open_db, Args, ScanReport};
+use two_bot_cutover::cli::{
+    open_db, scan_page_hint, Args, ScanReport, DB_POOL_HELP, MAX_SCAN_PAGES,
+};
 use two_bot_cutover::{
     event_metadata_json, mark_bot, member_log_kind_for_channel, parse_member_log_message,
     parse_voice_message, plan_backfill_merge, record_earliest, record_event, touch_activity,
@@ -60,11 +62,20 @@ fn to_embed_view(e: &twilight_model::channel::message::Embed) -> EmbedView {
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = Args::parse(&argv);
+    if args.has("help") {
+        println!(
+            "Usage: backfill [--dry-run] [--max-pages=N] [--discord-base <url>] [--allow-live-guild]\n\
+             --max-pages: integer 1..={MAX_SCAN_PAGES} (default 25).\n\
+             Env: DISCORD_TOKEN (or DISCORD_BOT_TOKEN), DISCORD_GUILD_ID, TWO_DATABASE_URL.\n\
+             {DB_POOL_HELP}"
+        );
+        return;
+    }
     let dry_run = args.has("dry-run");
-    let max_pages: usize = args
-        .get("max-pages")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(25);
+    let max_pages = args.max_pages(25).unwrap_or_else(|error| {
+        eprintln!("input error: {error}");
+        std::process::exit(2);
+    });
 
     let token = token();
     if token.is_empty() {
@@ -149,11 +160,13 @@ async fn main() {
     let humans = listed.len();
 
     // --- 2. log channels ----------------------------------------------------
-    let channels = rest
-        .guild_channels(guild)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_default();
+    let channels = match rest.guild_channels(guild).await {
+        Ok(Some(channels)) => channels,
+        Ok(None) | Err(_) => {
+            eprintln!("Guild-channel discovery unavailable; backfill stopped.");
+            std::process::exit(1);
+        }
+    };
     let candidates: Vec<_> = channels
         .iter()
         .filter(|c| {
@@ -463,7 +476,7 @@ async fn main() {
         println!(
             "\n  INCOMPLETE: hit the {max_pages}-page cap on {}. There is older history we did not read. Re-run with --max-pages={}.",
             truncated.join(", "),
-            max_pages * 4
+            scan_page_hint(max_pages)
         );
     }
     println!(
@@ -501,7 +514,7 @@ async fn store_invite_baseline(
         .iter()
         .map(|inv| two_bot_cutover::invite_store::CounterRow {
             code: inv.code.clone(),
-            uses: inv.uses.unwrap_or(0) as i64,
+            uses: inv.uses.unwrap_or(0),
             inviter_id: inv.inviter.as_ref().map(|u| u.id.get().to_string()),
             channel_id: inv.channel.as_ref().map(|c| c.id.get().to_string()),
         })

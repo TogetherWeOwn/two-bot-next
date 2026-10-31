@@ -18,7 +18,7 @@
  *   text echoed; a hung stub aborts at ~6 s with a JSON-RPC error.
  */
 
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import worker, { type Env } from "../src/index.ts";
 
@@ -430,8 +430,9 @@ test("tools/call get_config reports the Worker version, never unknown here", asy
   assert.deepEqual(h.forwarded, [], "get_config must not touch the container");
 });
 
-test("tools/call get_audit pins the implemented=false stub", async () => {
-  const h = harness(() => Response.json({ synthetic: true }));
+test("tools/call get_audit returns a real empty excerpt with one fenced GET", async () => {
+  const excerpt = { available: true, rows: [], truncated: false };
+  const h = harness(() => Response.json(excerpt));
   const res = await worker.fetch(
     rpc("tools/call", { name: "get_audit", arguments: {} }),
     h.env,
@@ -439,8 +440,12 @@ test("tools/call get_audit pins the implemented=false stub", async () => {
   );
   assert.equal(res.status, 200);
   const body = await rpcBody(res);
-  assert.deepEqual(body.result?.structuredContent, { implemented: false });
-  assert.deepEqual(h.forwarded, [], "get_audit must not touch the container");
+  assert.deepEqual(body.result?.structuredContent, excerpt);
+  assert.equal(h.forwarded.length, 1);
+  assert.equal(h.forwarded[0]!.method, "GET");
+  assert.equal(new URL(h.forwarded[0]!.url).pathname, "/ops/audit");
+  assert.equal(h.forwarded[0]!.headers["x-two-bot-deployment-id"], "synthetic-mcp-deployment");
+  assert.equal(h.forwarded[0]!.headers.authorization, undefined);
 });
 
 test("initialize falls back to a supported version for unknown requests", async () => {
@@ -465,4 +470,558 @@ test("initialize falls back to a supported version for unknown requests", async 
     h.ctx,
   );
   assert.equal((await rpcBody(unknown)).result?.protocolVersion, "2025-06-18");
+});
+
+// ------------------------------------------------------------ inbound intake
+//
+// Bounded authenticated request bodies, before JSON parsing (test files
+// only — no src changes). Contract under test (builder: implement exactly
+// this on POST /mcp, after the existing bearer/rate gate):
+// - Collect at most 64 KiB of inbound bytes under a six-second body
+//   deadline before JSON parsing. The byte count is measured on the bytes
+//   actually read, never on Content-Length alone: streamed bodies with no
+//   declared length and bodies whose declared length lies are held to the
+//   same cap. Multi-byte characters count by encoded bytes, not characters.
+//   This bounds inbound intake only; the existing 64 KiB / ~6 s bounds on
+//   outbound container reads (pinned above) are a separate budget.
+// - Oversize, deadline-expired, aborted/errored and malformed bodies all
+//   produce the one fixed, non-echoing refusal the malformed path already
+//   returns (HTTP 200, JSON-RPC -32700 "parse error", id null), the body
+//   reader is cancelled/released, and no container request occurs.
+// - Authentication and rate refusal still happen before the body is read:
+//   a hostile stalled body must not be pulled on those paths.
+// - Notifications, refused methods and bearer non-forwarding are unchanged
+//   for bodies inside the bound; an oversize notification is still refused
+//   at intake, not accepted.
+
+const INBOUND_CAP_BYTES = 64 * 1024;
+const FIXED_INTAKE_REFUSAL = {
+  jsonrpc: "2.0",
+  id: null,
+  error: { code: -32700, message: "parse error" },
+};
+
+let rawCallerSeq = 0;
+/** Raw POST /mcp with a caller-isolated IP, like rpc() above. */
+const rawMcp = (
+  body: BodyInit,
+  opts: { auth?: string | null; headers?: Record<string, string>; signal?: AbortSignal; ip?: string } = {},
+) => {
+  rawCallerSeq += 1;
+  const auth = opts.auth === undefined ? `Bearer ${MCP_TOKEN}` : opts.auth;
+  const init: RequestInit & { duplex?: "half" } = {
+    method: "POST",
+    headers: {
+      ...(auth ? { authorization: auth } : {}),
+      "content-type": "application/json",
+      "cf-connecting-ip": opts.ip ?? `198.51.100.${(rawCallerSeq % 200) + 1}`,
+      ...opts.headers,
+    },
+    body,
+  };
+  if (typeof body === "object" && body !== null && "getReader" in body) init.duplex = "half";
+  if (opts.signal) init.signal = opts.signal;
+  return new Request("https://probe.invalid/mcp", init);
+};
+
+const encoder = new TextEncoder();
+const byteLength = (s: string) => encoder.encode(s).byteLength;
+
+/** A valid JSON-RPC body of exactly totalBytes bytes (ASCII pad). */
+function paddedRpcBody(
+  totalBytes: number,
+  opts: { method?: string; notification?: boolean; marker?: string } = {},
+): string {
+  const marker = opts.marker ?? "";
+  const prefix = opts.notification
+    ? `{"jsonrpc":"2.0","method":"${opts.method ?? "notifications/initialized"}","params":{"pad":"${marker}`
+    : `{"jsonrpc":"2.0","id":1,"method":"${opts.method ?? "tools/list"}","params":{"pad":"${marker}`;
+  const suffix = '"}}';
+  const fill = totalBytes - byteLength(prefix) - byteLength(suffix);
+  assert.ok(fill >= 0, "fixture target smaller than its own framing");
+  const body = prefix + "x".repeat(fill) + suffix;
+  assert.equal(byteLength(body), totalBytes, "fixture must be exactly the target byte count");
+  return body;
+}
+
+/** Pull-driven chunk stream with delivered/cancelled bookkeeping. */
+function trackedChunks(chunks: Uint8Array[], highWaterMark = 1) {
+  const state = { pulls: 0, delivered: 0, cancelled: false };
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        state.pulls++;
+        if (state.delivered < chunks.length) {
+          controller.enqueue(chunks[state.delivered++]!);
+        } else {
+          controller.close();
+        }
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    },
+    { highWaterMark },
+  );
+  return { stream, state };
+}
+
+/** A stream that yields one prefix chunk and then stalls forever. */
+function stalledBody(prefix: string) {
+  const state = { pulls: 0, cancelled: false };
+  let sent = false;
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        state.pulls++;
+        if (!sent) {
+          sent = true;
+          controller.enqueue(encoder.encode(prefix));
+          return;
+        }
+        return new Promise<void>(() => {});
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return { stream, state };
+}
+
+/** Fail rather than hang when the Worker does not settle inside ms. */
+async function settleWithin<T>(work: Promise<T>, label: string, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, guard]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Model runtime cleanup throws; a native source cancel hook only rejects. */
+function syncThrowingReaderCleanup(
+  t: TestContext,
+  stream: ReadableStream<Uint8Array>,
+  method: "cancel" | "releaseLock",
+  marker: string,
+) {
+  const state = { attempts: 0 };
+  const getReader = stream.getReader.bind(stream);
+  t.mock.method(stream, "getReader", () => {
+    const reader = getReader();
+    const cancel = reader.cancel.bind(reader);
+    const release = reader.releaseLock.bind(reader);
+    t.mock.method(reader, method, () => {
+      state.attempts++;
+      throw new Error(marker);
+    });
+    // Use the original methods so even a guard-removal mutant leaves no lock.
+    t.after(async () => {
+      if (stream.locked) {
+        await cancel();
+        release();
+      } else {
+        await stream.cancel();
+      }
+    });
+    return reader;
+  });
+  return state;
+}
+
+for (const method of ["cancel", "releaseLock"] as const) {
+  test(`inbound oversize keeps the parse refusal when reader ${method} throws synchronously`, async (t) => {
+    const marker = `synthetic-intake-sync-${method}`;
+    const h = harness(() => Response.json({ synthetic: true }));
+    const { stream } = trackedChunks([encoder.encode(paddedRpcBody(INBOUND_CAP_BYTES + 1))], 0);
+    const state = syncThrowingReaderCleanup(t, stream, method, marker);
+    const res = await settleWithin(worker.fetch(rawMcp(stream), h.env, h.ctx), marker, 3_000);
+    await assertIntakeRefusal(res, marker);
+    assert.equal(state.attempts, 1, "throwing cleanup is attempted exactly once");
+    assert.deepEqual(h.names, [], "refused intake must not resolve the DO");
+    assert.deepEqual(h.forwarded, [], "refused intake must not reach the container");
+    // node:test also fails on any unhandled rejection from this request.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
+  test(`outbound oversize keeps the limit refusal when reader ${method} throws synchronously`, async (t) => {
+    const marker = `synthetic-outbound-sync-${method}`;
+    const { stream } = trackedChunks([encoder.encode(`${marker}${"x".repeat(INBOUND_CAP_BYTES)}`)], 0);
+    const state = syncThrowingReaderCleanup(t, stream, method, marker);
+    const h = harness(() => new Response(stream));
+    const res = await settleWithin(
+      worker.fetch(rpc("tools/call", { name: "get_status", arguments: {} }), h.env, h.ctx),
+      marker,
+      3_000,
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual(await rpcBody(res), {
+      jsonrpc: "2.0", id: 1, error: { code: -32000, message: "container body exceeds limit" },
+    }, "cleanup must not turn overflow into a generic failure or echo the marker");
+    assert.equal(state.attempts, 1, "throwing cleanup is attempted exactly once");
+    assert.equal(h.forwarded.length, 1, "one bounded container request, no cleanup retry");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+}
+
+test("rejected upstream keeps the tool refusal when body cancel throws synchronously", async (t) => {
+  const marker = "synthetic-response-sync-cancel";
+  const { stream } = trackedChunks([encoder.encode(marker)], 0);
+  const cancel = stream.cancel.bind(stream);
+  const cleanup = t.mock.method(stream, "cancel", () => { throw new Error(marker); });
+  t.after(async () => { await cancel(); });
+  const h = harness(() => new Response(stream, { status: 500 }));
+  const res = await settleWithin(
+    worker.fetch(rpc("tools/call", { name: "get_status", arguments: {} }), h.env, h.ctx),
+    marker,
+    3_000,
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(await rpcBody(res), {
+    jsonrpc: "2.0", id: 1, error: { code: -32000, message: "container request failed" },
+  });
+  assert.equal(cleanup.mock.callCount(), 1, "throwing body cleanup is attempted exactly once");
+  assert.equal(h.forwarded.length, 1);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+});
+
+/** The one fixed intake refusal: same shape for every intake failure. */
+async function assertIntakeRefusal(res: Response, marker?: string) {
+  assert.equal(res.status, 200, "intake refusal keeps the JSON-RPC error channel");
+  const text = await res.text();
+  if (marker) assert.ok(!text.includes(marker), "refusal must never echo body bytes");
+  assert.ok(!text.includes(MCP_TOKEN), "refusal must never echo the bearer");
+  assert.deepEqual(JSON.parse(text), FIXED_INTAKE_REFUSAL);
+}
+
+test("inbound body of exactly 64 KiB is parsed and answered", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const res = await worker.fetch(rawMcp(paddedRpcBody(INBOUND_CAP_BYTES)), h.env, h.ctx);
+  assert.equal(res.status, 200);
+  const body = await rpcBody(res);
+  const names = (body.result?.tools as { name: string }[] | undefined)?.map((t) => t.name).sort();
+  assert.deepEqual(names, [...EXPECTED_TOOL_NAMES].sort(), "at-cap body must behave like any valid call");
+});
+
+test("inbound body of 64 KiB + 1 byte is refused before parsing, zero container fetches", async () => {
+  const marker = "synthetic-intake-oversize-marker";
+  const h = harness(() => Response.json({ synthetic: true }));
+  const res = await worker.fetch(
+    rawMcp(paddedRpcBody(INBOUND_CAP_BYTES + 1, { marker })),
+    h.env,
+    h.ctx,
+  );
+  await assertIntakeRefusal(res, marker);
+  assert.deepEqual(h.names, [], "oversize intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
+});
+
+test("a Content-Length that understates the body does not lift the cap", async () => {
+  const marker = "synthetic-intake-lying-length-marker";
+  const h = harness(() => Response.json({ synthetic: true }));
+  const req = rawMcp(paddedRpcBody(INBOUND_CAP_BYTES + 1, { marker }), {
+    headers: { "content-length": "10" },
+  });
+  assert.equal(req.headers.get("content-length"), "10", "fixture must lie about its length");
+  const res = await worker.fetch(req, h.env, h.ctx);
+  await assertIntakeRefusal(res, marker);
+  assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
+});
+
+test("streamed oversize without Content-Length is cancelled at the cap, tail unread", async () => {
+  const marker = "synthetic-intake-streamed-marker";
+  const h = harness(() => Response.json({ synthetic: true }));
+  const bytes = encoder.encode(paddedRpcBody(INBOUND_CAP_BYTES + 8192, { marker }));
+  const chunks = [
+    bytes.subarray(0, 32 * 1024),
+    bytes.subarray(32 * 1024, INBOUND_CAP_BYTES),
+    bytes.subarray(INBOUND_CAP_BYTES, INBOUND_CAP_BYTES + 1),
+  ];
+  // Split the post-cap tail into small chunks so every extra read past
+  // the cap is visible as one more delivered chunk (see the bound below).
+  for (let off = INBOUND_CAP_BYTES + 1; off < bytes.length; off += 1024) {
+    chunks.push(bytes.subarray(off, off + 1024));
+  }
+  // highWaterMark 0 disables this fixture's own one-chunk-ahead pull (the
+  // default HWM of 1), so delivered counts the Worker's demand reads only.
+  const { stream, state } = trackedChunks(chunks, 0);
+  const res = await worker.fetch(rawMcp(stream), h.env, h.ctx);
+  await assertIntakeRefusal(res, marker);
+  // Stopping at the cap costs exactly three demand reads: the 32 KiB
+  // chunk, the rest up to the cap, and the cap+1 byte that proves the
+  // body is oversize. Any read past that point delivers a fourth chunk
+  // and fails here, as does draining (all chunks).
+  assert.ok(
+    state.delivered <= 3,
+    `tail past cap+1 must stay unread (delivered ${state.delivered}/${chunks.length})`,
+  );
+  assert.equal(state.cancelled, true, "oversize streamed body must be cancelled, not drained");
+  assert.deepEqual(h.names, [], "oversize intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
+});
+
+test("the cap counts encoded bytes: a multi-byte body under the character cap is refused", async () => {
+  const marker = "synthetic-intake-multibyte-marker";
+  const h = harness(() => Response.json({ synthetic: true }));
+  // "é" is one character but two UTF-8 bytes: this body is well under
+  // 64 Ki characters while exceeding 64 KiB on the wire.
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/list",
+    params: { pad: `${marker}${"é".repeat(33_000)}` },
+  });
+  assert.ok(body.length < INBOUND_CAP_BYTES, `fixture chars ${body.length} must be under the cap`);
+  assert.ok(byteLength(body) > INBOUND_CAP_BYTES, `fixture bytes ${byteLength(body)} must exceed the cap`);
+  const res = await worker.fetch(rawMcp(body), h.env, h.ctx);
+  await assertIntakeRefusal(res, marker);
+  assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
+});
+
+test("a multi-byte character split across chunks inside the cap still parses and proxies", async () => {
+  const marker = "synthetic-intake-split-ok";
+  const h = harness(() => Response.json({ status: "ok", marker }));
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "get_status", arguments: {}, note: "café — €" },
+  });
+  const bytes = encoder.encode(body);
+  assert.ok(bytes.byteLength < INBOUND_CAP_BYTES, "fixture must be inside the cap");
+  // Split between the two UTF-8 bytes of "é" (0xC3 0xA9).
+  const at = bytes.indexOf(0xc3);
+  assert.ok(at > 0 && bytes[at + 1] === 0xa9, "fixture must locate the split point");
+  const { stream, state } = trackedChunks([bytes.subarray(0, at + 1), bytes.subarray(at + 1)]);
+  const res = await worker.fetch(rawMcp(stream), h.env, h.ctx);
+  assert.equal(res.status, 200);
+  const parsed = await rpcBody(res);
+  assert.ok(JSON.stringify(parsed).includes(marker), "split-chunk call must return the container JSON");
+  assert.equal(state.cancelled, false, "an in-bounds body is read to the end, not cancelled");
+  assert.equal(h.forwarded.length, 1, "one tool call proxies exactly one container fetch");
+  assert.equal(
+    h.forwarded[0]!.headers["authorization"],
+    undefined,
+    "caller bearer must not be forwarded",
+  );
+});
+
+test("a multi-byte character split across chunks inside the string id echoes exactly", async () => {
+  const marker = "synthetic-intake-split-id-ok";
+  const h = harness(() => Response.json({ status: "ok", marker }));
+  const splitId = "café-€";
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: splitId,
+    method: "tools/call",
+    params: { name: "get_status", arguments: {} },
+  });
+  const bytes = encoder.encode(body);
+  assert.ok(bytes.byteLength < INBOUND_CAP_BYTES, "fixture must be inside the cap");
+  assert.ok(body.includes(splitId), "fixture must carry the split id");
+  // Split between the two UTF-8 bytes of "é" in the id (0xC3 0xA9). The
+  // fixture carries no other non-ASCII bytes, so this split is inside the id.
+  const at = bytes.indexOf(0xc3);
+  assert.ok(at > 0 && bytes[at + 1] === 0xa9, "fixture must locate the id split point");
+  const { stream, state } = trackedChunks([bytes.subarray(0, at + 1), bytes.subarray(at + 1)]);
+  const res = await worker.fetch(rawMcp(stream), h.env, h.ctx);
+  assert.equal(res.status, 200);
+  const parsed = await rpcBody(res);
+  assert.equal(parsed.id, splitId, "split string id must decode exactly, preserving JSON-RPC correlation");
+  assert.ok(JSON.stringify(parsed).includes(marker), "split-id call must return the container JSON");
+  assert.equal(state.cancelled, false, "an in-bounds body is read to the end, not cancelled");
+  assert.equal(h.forwarded.length, 1, "one tool call proxies exactly one container fetch");
+  assert.equal(
+    h.forwarded[0]!.headers["authorization"],
+    undefined,
+    "caller bearer must not be forwarded",
+  );
+});
+
+test("a stalled inbound body is refused at the six-second deadline and cancelled", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const { stream, state } = stalledBody('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"');
+  const start = Date.now();
+  const res = await settleWithin(
+    worker.fetch(rawMcp(stream), h.env, h.ctx),
+    "stalled inbound body",
+    15_000,
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 4_000, `stalled body must be held to the deadline, refused after ${elapsed}ms`);
+  assert.ok(elapsed < 12_000, `stalled body must be refused near 6s, took ${elapsed}ms`);
+  await assertIntakeRefusal(res);
+  assert.equal(state.cancelled, true, "deadline refusal must cancel the reader");
+  assert.deepEqual(h.names, [], "stalled intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "stalled intake must never reach the container");
+});
+
+test("a client abort mid-body settles as the fixed refusal well before the deadline", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const { stream, state } = stalledBody('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"');
+  const ac = new AbortController();
+  const start = Date.now();
+  const pending = settleWithin(
+    worker.fetch(rawMcp(stream, { signal: ac.signal }), h.env, h.ctx),
+    "aborted inbound body",
+    4_500,
+  );
+  setTimeout(() => ac.abort(), 100);
+  const res = await pending;
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 4_500, `abort must settle promptly, took ${elapsed}ms`);
+  await assertIntakeRefusal(res);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(state.cancelled, true, "abort refusal must release/cancel the reader");
+  assert.deepEqual(h.names, [], "aborted intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "aborted intake must never reach the container");
+});
+
+test("a complete body that then stalls is still refused at the deadline with no forward", async () => {
+  const h = harness(() => Response.json({ status: "ok", marker: "synthetic-intake-complete-stall" }));
+  // Complete valid tools/call body: without the deadline/abort discriminator
+  // a cancelled read resolving done:true would look like EOF, parse, and
+  // forward. The intake must refuse instead.
+  const complete = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "get_status", arguments: {} },
+  });
+  const { stream, state } = stalledBody(complete);
+  const start = Date.now();
+  const res = await settleWithin(
+    worker.fetch(rawMcp(stream), h.env, h.ctx),
+    "complete-then-stalled inbound body",
+    15_000,
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 4_000, `complete-then-stalled body must be held to the deadline, refused after ${elapsed}ms`);
+  assert.ok(elapsed < 12_000, `complete-then-stalled body must be refused near 6s, took ${elapsed}ms`);
+  await assertIntakeRefusal(res);
+  assert.equal(state.cancelled, true, "deadline refusal must cancel the reader");
+  assert.deepEqual(h.names, [], "complete-then-stalled intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "complete-then-stalled intake must never reach the container");
+});
+
+test("a complete body that then aborts settles as the fixed refusal with no forward", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const complete = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "get_status", arguments: {} },
+  });
+  const { stream, state } = stalledBody(complete);
+  const ac = new AbortController();
+  const pending = settleWithin(
+    worker.fetch(rawMcp(stream, { signal: ac.signal }), h.env, h.ctx),
+    "complete-then-aborted inbound body",
+    4_500,
+  );
+  setTimeout(() => ac.abort(), 100);
+  const res = await pending;
+  await assertIntakeRefusal(res);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(state.cancelled, true, "abort refusal must release/cancel the reader");
+  assert.deepEqual(h.names, [], "complete-then-aborted intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "complete-then-aborted intake must never reach the container");
+});
+
+test("a body stream that errors mid-body gets the fixed refusal with no echo", async () => {
+  const marker = "synthetic-intake-stream-error-marker";
+  const h = harness(() => Response.json({ synthetic: true }));
+  let step = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      step++;
+      if (step === 1) {
+        controller.enqueue(encoder.encode('{"jsonrpc":"2.0","id":1'));
+      } else {
+        controller.error(new Error(marker));
+      }
+    },
+  });
+  const res = await settleWithin(worker.fetch(rawMcp(stream), h.env, h.ctx), "errored body", 4_500);
+  await assertIntakeRefusal(res, marker);
+  assert.deepEqual(h.forwarded, [], "errored intake must never reach the container");
+});
+
+test("malformed and empty bodies keep the fixed parse-error refusal with no echo", async () => {
+  const marker = "synthetic-intake-malformed-marker";
+  const h = harness(() => Response.json({ synthetic: true }));
+  for (const body of [`{not json ${marker}`, ""]) {
+    const res = await worker.fetch(rawMcp(body), h.env, h.ctx);
+    await assertIntakeRefusal(res, marker);
+  }
+  assert.deepEqual(h.names, [], "malformed intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "malformed intake must never reach the container");
+});
+
+test("authentication refusal happens before a hostile body is read", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  for (const auth of [null, "Bearer wrong-bearer-value"] as const) {
+    const hostile = stalledBody('{"jsonrpc":"2.0"');
+    const res = await settleWithin(
+      worker.fetch(rawMcp(hostile.stream, { auth }), h.env, h.ctx),
+      "unauthenticated stalled body",
+      3_000,
+    );
+    assert.equal(res.status, 401);
+    assert.match(res.headers.get("www-authenticate") ?? "", /Bearer/);
+    await res.text();
+    assert.equal(hostile.state.pulls, 0, "unauthenticated requests must not read the body");
+  }
+  assert.deepEqual(h.names, [], "unauthenticated calls must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "unauthenticated calls must never reach the container");
+});
+
+test("rate refusal happens before a hostile body is read", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  // Own TEST-NET-3 caller, far from the rawMcp()/rpc() pools and from the
+  // budget test above: 10-burst, so the 11th rapid call is shed.
+  const ip = "203.0.113.99";
+  const valid = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+  for (let i = 0; i < 10; i++) {
+    const res = await worker.fetch(rawMcp(valid, { ip }), h.env, h.ctx);
+    await res.text();
+  }
+  const hostile = stalledBody('{"jsonrpc":"2.0"');
+  const res = await settleWithin(
+    worker.fetch(rawMcp(hostile.stream, { ip }), h.env, h.ctx),
+    "rate-limited stalled body",
+    3_000,
+  );
+  assert.equal(res.status, 429, "11th rapid call on a 10-burst must be shed before intake");
+  await res.text();
+  assert.equal(hostile.state.pulls, 0, "rate-limited requests must not read the body");
+});
+
+test("notifications inside the bound keep the empty 202 acknowledgement", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const res = await worker.fetch(
+    rawMcp(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })),
+    h.env,
+    h.ctx,
+  );
+  assert.equal(res.status, 202);
+  assert.equal(await res.text(), "", "notification acknowledgement carries no body");
+  assert.deepEqual(h.forwarded, [], "notifications must not reach the container");
+});
+
+test("an oversize notification is refused at intake, not acknowledged", async () => {
+  const marker = "synthetic-intake-oversize-notification-marker";
+  const h = harness(() => Response.json({ synthetic: true }));
+  const res = await worker.fetch(
+    rawMcp(paddedRpcBody(INBOUND_CAP_BYTES + 1, { notification: true, marker })),
+    h.env,
+    h.ctx,
+  );
+  await assertIntakeRefusal(res, marker);
+  assert.deepEqual(h.forwarded, [], "oversize notifications must never reach the container");
 });

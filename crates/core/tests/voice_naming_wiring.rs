@@ -62,9 +62,11 @@ fn rename_rerenders_on_membership_change_without_reroll() {
     assert!(solo.ends_with("1 person"), "unexpected {solo:?}");
     let busy = resolve_room_name(template, &ctx("Ava", 4, 1, 9), &solo);
     assert!(busy.ends_with("4 people"), "unexpected {busy:?}");
+    // The leading emoji now joins the count with 〢, so the seeded pick is
+    // everything before the separator.
     assert_eq!(
-        solo.split(' ').next(),
-        busy.split(' ').next(),
+        solo.split('〢').next(),
+        busy.split('〢').next(),
         "rename re-rolled the seeded pick"
     );
 }

@@ -602,6 +602,7 @@ fn success() -> TerminalResponse {
         resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
         affected: 2,
         outcome: None,
+        stop_reason: None,
     }
 }
 
@@ -1036,6 +1037,7 @@ async fn event_outcome_persists_and_replays_the_recorded_response() {
             resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
             affected: 1,
             outcome: Some(outcome),
+            stop_reason: None,
         };
         store.finish(&claim, &receipt).await.unwrap();
         assert!(
@@ -1050,6 +1052,247 @@ async fn event_outcome_persists_and_replays_the_recorded_response() {
     assert!(
         matches!(store.claim(&legacy, &subject()).await.unwrap(), InternalClaim::Replay(r) if r == success())
     );
+    db.cleanup().await;
+}
+
+/// Losing the typed reason in finish, reconciliation, hydration, or terminal
+/// audit must fail this matrix. NULL remains the historical success shape.
+#[tokio::test]
+async fn purge_stop_reason_finish_and_reconcile_preserve_receipt_audit_and_replay() {
+    use two_bot_core::PurgeStopReason::{RateLimited, Refused};
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    let peer = db.independent_pool().await;
+    let restarted = InternalActionStore::new(peer.clone());
+    for reconcile in [false, true] {
+        for (label, stop_reason, stored_reason, affected) in [
+            ("refused", Some(Refused), Some("refused"), 1),
+            ("rate", Some(RateLimited), Some("rate_limited"), 1),
+            ("complete", None, None, 3),
+        ] {
+            let id = identity(
+                &format!("purge-stop-{reconcile}-{label}"),
+                "moderation.purge",
+                br#"{"count":3}"#,
+            );
+            let claim = claimed(store.claim(&id, &subject()).await.unwrap());
+            let receipt = TerminalResponse::Success {
+                resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
+                affected,
+                outcome: None,
+                stop_reason,
+            };
+            if reconcile {
+                store.mark_unknown(&claim).await.unwrap();
+                restarted
+                    .reconcile(
+                        &id,
+                        &receipt,
+                        ReconciliationEvidence::DiscordConfirmedEffect,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                store.finish(&claim, &receipt).await.unwrap();
+            }
+            for _ in 0..2 {
+                assert!(
+                    matches!(restarted.claim(&id, &subject()).await.unwrap(), InternalClaim::Replay(response) if response == receipt),
+                    "{label}: reason and affected count must survive a repeated claim"
+                );
+            }
+            let stored: (Option<i64>, Option<String>) = sqlx::query_as(
+                "SELECT affected, stop_reason FROM internal_idempotency WHERE intent_id = $1",
+            )
+            .bind(claim.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                stored,
+                (Some(i64::from(affected)), stored_reason.map(str::to_owned))
+            );
+            let terminal: (Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT affected, stop_reason, evidence_code FROM internal_action_log \
+                 WHERE intent_id = $1 AND phase = 'terminal'",
+            )
+            .bind(claim.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                terminal,
+                (
+                    Some(i64::from(affected)),
+                    stored_reason.map(str::to_owned),
+                    Some(
+                        if reconcile {
+                            "discord_confirmed_effect"
+                        } else {
+                            "executor"
+                        }
+                        .to_owned()
+                    ),
+                )
+            );
+            let intent_reason: Option<String> = sqlx::query_scalar(
+                "SELECT stop_reason FROM internal_action_log WHERE intent_id = $1 AND phase = 'intent'",
+            )
+            .bind(claim.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                intent_reason, None,
+                "intent cannot predict an executor reason"
+            );
+            let terminal_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM internal_action_log WHERE intent_id = $1 AND phase = 'terminal'",
+            )
+            .bind(claim.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                terminal_count, 1,
+                "replay must not duplicate terminal audit"
+            );
+            assert_eq!(
+                store.finish(&claim, &receipt).await,
+                Err(InternalStoreError::TransitionRefused),
+            );
+        }
+    }
+    peer.close().await;
+    db.cleanup().await;
+}
+
+/// Both durable surfaces reject values outside the nullable closed vocabulary;
+/// accepting arbitrary strings would let corrupt evidence flow into a receipt.
+#[tokio::test]
+async fn purge_stop_reason_columns_reject_unknown_words() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let id = identity("purge-stop-vocabulary", "moderation.purge", b"{}");
+    let claim = claimed(store.claim(&id, &subject()).await.unwrap());
+    let receipt = TerminalResponse::Success {
+        resource_id: None,
+        affected: 3,
+        outcome: None,
+        stop_reason: None,
+    };
+    store.finish(&claim, &receipt).await.unwrap();
+    for table in ["internal_idempotency", "internal_action_log"] {
+        for invalid in ["bogus", "", "Refused", "rate-limited", "refused "] {
+            let error = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET stop_reason = $1 WHERE intent_id = $2",
+            )))
+            .bind(invalid)
+            .bind(claim.intent_id())
+            .execute(&db.pool)
+            .await
+            .expect_err("closed vocabulary must reject invalid stored reasons");
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("23514"),
+                "{table}: stop_reason must have a closed-vocabulary CHECK",
+            );
+        }
+        let reasons: Vec<Option<String>> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT stop_reason FROM {table} WHERE intent_id = $1",
+        )))
+        .bind(claim.intent_id())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert!(!reasons.is_empty());
+        assert!(
+            reasons.iter().all(Option::is_none),
+            "failed writes retain NULL"
+        );
+    }
+    assert!(
+        matches!(store.claim(&id, &subject()).await.unwrap(), InternalClaim::Replay(response) if response == receipt)
+    );
+    db.cleanup().await;
+}
+
+/// Simulate corrupt historical data in this disposable fixture only. A parser
+/// using `.ok()` would silently turn bogus into None and replay success.
+#[tokio::test]
+async fn purge_stop_reason_corrupt_outer_replay_fails_closed() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let id = identity("purge-stop-corrupt", "moderation.purge", b"{}");
+    let claim = claimed(store.claim(&id, &subject()).await.unwrap());
+    store
+        .finish(
+            &claim,
+            &TerminalResponse::Success {
+                resource_id: None,
+                affected: 1,
+                outcome: None,
+                stop_reason: Some(two_bot_core::PurgeStopReason::Refused),
+            },
+        )
+        .await
+        .unwrap();
+    // Discover names, not an implementation-specific constraint name. Only
+    // remove stop_reason checks from the uniquely owned TestDatabase.
+    let constraints: Vec<String> = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint WHERE conrelid = 'internal_idempotency'::regclass \
+         AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%stop_reason%'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(!constraints.is_empty(), "stop_reason must be constrained");
+    for constraint in constraints {
+        let quoted = constraint.replace('"', "\"\"");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE internal_idempotency DROP CONSTRAINT \"{quoted}\"",
+        )))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE internal_idempotency SET stop_reason = 'bogus' WHERE intent_id = $1")
+        .bind(claim.intent_id())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let peer = db.independent_pool().await;
+    let restarted = InternalActionStore::new(peer.clone());
+    for _ in 0..2 {
+        assert_eq!(
+            restarted.claim(&id, &subject()).await.unwrap_err(),
+            InternalStoreError::Unavailable,
+            "invalid reason must neither grant execution nor replay success",
+        );
+    }
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, stop_reason FROM internal_idempotency WHERE intent_id = $1")
+            .bind(claim.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row, ("completed".to_owned(), Some("bogus".to_owned())));
+    let terminal_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM internal_action_log WHERE intent_id = $1 AND phase = 'terminal'",
+    )
+    .bind(claim.intent_id())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_count, 1,
+        "corrupt replay must not write another audit"
+    );
+    peer.close().await;
     db.cleanup().await;
 }
 
@@ -1075,6 +1318,7 @@ async fn terminal_audit_names_receipt_resource_and_outcome() {
         resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
         affected: 1,
         outcome: Some(EventOutcome::Created),
+        stop_reason: None,
     };
     store.finish(&claim, &receipt).await.unwrap();
     let intent: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
@@ -1366,6 +1610,7 @@ fn created_receipt(event_id: &str) -> TerminalResponse {
         resource_id: Some(DiscordId::new(event_id).unwrap()),
         affected: 1,
         outcome: Some(EventOutcome::Created),
+        stop_reason: None,
     }
 }
 
@@ -1498,6 +1743,7 @@ async fn resolve_event_cancel_retains_mapping_and_replays_cancelled() {
         resource_id: Some(DiscordId::new(MAPPED_EVENT).unwrap()),
         affected: 1,
         outcome: Some(EventOutcome::Cancelled),
+        stop_reason: None,
     };
     store
         .resolve_event_intent(
@@ -1560,6 +1806,7 @@ async fn resolve_event_intent_refuses_mismatched_rows_and_shapes() {
         resource_id: Some(DiscordId::new(MAPPED_EVENT).unwrap()),
         affected: 1,
         outcome: Some(EventOutcome::Cancelled),
+        stop_reason: None,
     };
     let effect = ReconciliationEvidence::DiscordConfirmedEffect;
     // Wrong guild, wrong action, and unknown intent ids never resolve.

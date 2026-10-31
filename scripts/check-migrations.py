@@ -15,6 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 PATH = re.compile(r"crates/[^/]+/migrations/([0-9]{4})_[a-z][a-z0-9_]*\.sql")
 CHECKSUM = re.compile(r"[0-9a-f]{64}")
 
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git reads answer in well under a
+# second; 30s bounds the stall without touching valid runs.
+GIT_TIMEOUT_SECONDS = 30
+
 
 class MigrationError(ValueError):
     pass
@@ -78,9 +84,25 @@ def unique_keys(pairs):
 
 
 def git(root, *args):
-    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True, timeout=GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise MigrationError(
+            f"cannot read Git baseline: git {' '.join(args)} timeout after "
+            f"{GIT_TIMEOUT_SECONDS}s; next: re-run the check; if the stall "
+            "repeats, inspect the git invocation and runner state") from error
+    except OSError as error:
+        raise MigrationError(
+            "cannot read Git baseline: git spawn failed "
+            f"({error}); next: re-run the check on a runner with git "
+            "installed") from error
     if result.returncode:
-        raise MigrationError(f"cannot read Git baseline: {result.stderr.decode(errors='replace').strip()}")
+        raise MigrationError(
+            f"cannot read Git baseline: git {' '.join(args)} failed with "
+            f"exit status {result.returncode}; next: verify the baseline "
+            "ref exists and is fetchable, then re-run the check")
     return result.stdout
 
 

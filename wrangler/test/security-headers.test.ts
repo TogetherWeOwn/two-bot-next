@@ -5,8 +5,8 @@
  * Decided set: `x-content-type-options: nosniff`,
  * `referrer-policy: no-referrer` (matches the existing 302), and
  * `x-frame-options: DENY` (probe/metrics/control/redirect bodies are
- * machine-consumed text or JSON, never framed HTML). No `frame-ancestors`
- * CSP: X-Frame-Options DENY already states the posture with fewer bytes.
+ * machine-consumed text or JSON). Only the HTML dashboard adds a CSP;
+ * ops-dashboard.test.ts checks that page-specific policy.
  */
 
 import { test, type TestContext } from "node:test";
@@ -19,7 +19,22 @@ import {
   CONTROL_PATH,
   DEPLOYMENT_HEADER,
   OWNER_KEY,
+  OwnershipRefused,
+  refused,
 } from "../src/ownership.ts";
+import {
+  ACTIONS_PATH,
+  envelope as actionsEnvelope,
+  handleActionsIngress,
+  relayReceiverResponse,
+} from "../src/internal-actions.ts";
+import {
+  EVENTSUB_PATH,
+  envelope as eventsubEnvelope,
+  handleEventsubIngress,
+  relayEventsubResponse,
+} from "../src/eventsub.ts";
+import { newRequestId } from "../src/request-id.ts";
 
 const EXPECTED: Record<string, string> = {
   "x-content-type-options": "nosniff",
@@ -28,6 +43,7 @@ const EXPECTED: Record<string, string> = {
 };
 
 function assertHardened(headers: Headers, where: string): void {
+  assert.equal(headers.get("content-security-policy"), null, `${where}: CSP is dashboard-only`);
   for (const [name, value] of Object.entries(EXPECTED)) {
     assert.equal(headers.get(name), value, `${where}: ${name} must be ${value}`);
   }
@@ -194,6 +210,184 @@ test("Worker probe edge copy stamps the decided set on bot-shaped upstream", asy
   assertHardened(parked.headers, "edge 503");
   assert.deepEqual(await parked.json(), { ready: false });
 });
+
+const INGRESS_CASES = [
+  {
+    name: "actions",
+    path: ACTIONS_PATH,
+    handle: handleActionsIngress,
+    envelope: actionsEnvelope,
+    relay: relayReceiverResponse,
+    caller: "192.0.2.70",
+    media: "application/json; charset=utf-8",
+  },
+  {
+    name: "EventSub",
+    path: EVENTSUB_PATH,
+    handle: handleEventsubIngress,
+    envelope: eventsubEnvelope,
+    relay: relayEventsubResponse,
+    caller: "192.0.2.71",
+    media: "application/json",
+  },
+];
+
+for (const ingress of INGRESS_CASES) {
+  const url = `https://worker.invalid${ingress.path}`;
+  const neverForward = async (): Promise<Response> => {
+    assert.fail("refused ingress must not reach the container");
+  };
+
+  test(`${ingress.name} path 404 carries the decided set`, async () => {
+    const response = await ingress.handle(new Request(url), ingress.caller, neverForward);
+    assert.equal(response.status, 404);
+    assert.equal(await response.text(), "not found");
+    assertHardened(response.headers, `${ingress.name} 404`);
+  });
+
+  test(`${ingress.name} path 415 carries the decided set`, async (t) => {
+    t.mock.method(console, "warn", () => {});
+    const requestId = newRequestId();
+    const response = await ingress.handle(new Request(url, {
+      method: "POST",
+      headers: { "x-request-id": requestId },
+    }), ingress.caller, neverForward);
+    assert.equal(response.status, 415);
+    assert.equal(await response.text(), JSON.stringify({
+      ok: false,
+      request_id: requestId,
+      error: { code: "unsupported_media_type", message: "request refused", retryable: false },
+    }));
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assertHardened(response.headers, `${ingress.name} 415`);
+  });
+
+  test(`${ingress.name} path 429 carries the decided set and retry-after`, async (t) => {
+    t.mock.method(console, "warn", () => {});
+    const requestId = newRequestId();
+    // A separate caller keeps this burst independent of the preceding 415.
+    const burstCaller = ingress.name === "actions" ? "192.0.2.72" : "192.0.2.73";
+    const post = () => ingress.handle(new Request(url, {
+      method: "POST",
+      headers: { "x-request-id": requestId },
+    }), burstCaller, neverForward);
+    for (let i = 0; i < 20; i++) {
+      const admitted = await post();
+      assert.equal(admitted.status, 415);
+      await admitted.text();
+    }
+    const response = await post();
+    assert.equal(response.status, 429);
+    assert.equal(await response.text(), JSON.stringify({
+      ok: false,
+      request_id: requestId,
+      error: { code: "rate_limited", message: "request refused", retryable: true },
+    }));
+    assert.match(response.headers.get("retry-after") ?? "", /^\d{1,6}$/);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assertHardened(response.headers, `${ingress.name} 429`);
+  });
+
+  test(`${ingress.name} envelope callers cannot weaken the decided set`, async () => {
+    for (const name of ["x-frame-options", "X-Frame-Options"]) {
+      const requestId = newRequestId();
+      const response = ingress.envelope(503, "unavailable", true, {
+        [name]: "SAMEORIGIN",
+        "referrer-policy": "unsafe-url",
+        "x-content-type-options": "weakened",
+        "retry-after": "7",
+      }, requestId);
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get("retry-after"), "7");
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assertHardened(response.headers, `${ingress.name} envelope ${name}`);
+      await response.text();
+    }
+  });
+
+  test(`${ingress.name} relayed JSON keeps supported content and header filtering with hardening`, async (t) => {
+    t.mock.method(console, "warn", () => {});
+    const requestId = newRequestId();
+    const ack = ingress.name === "actions"
+      ? { ok: true, request_id: requestId, result: { message_id: "1" } }
+      : { ok: true, request_id: requestId };
+    const json = JSON.stringify({ ...ack, text: "café" });
+    for (const body of [new TextEncoder().encode(json), null]) {
+      for (const retry of ["7", "7.5"]) {
+        await t.test(`${body === null ? "empty" : "streamed"} body, retry-after ${retry}`, async () => {
+          const response = await ingress.relay(new Response(body, {
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "retry-after": retry,
+              "idempotent-replay": "true",
+              "cache-control": "public",
+              "x-frame-options": "SAMEORIGIN",
+              "referrer-policy": "unsafe-url",
+              "x-content-type-options": "weakened",
+              "set-cookie": "fixture=value",
+            },
+          }), requestId);
+          const refusedEmpty = body === null;
+          const projected = refusedEmpty
+            ? { ok: false, request_id: requestId, error: { code: "unavailable", message: "request refused", retryable: true } }
+            : ack;
+          const expectedBody = new TextEncoder().encode(JSON.stringify(projected));
+          assert.equal(response.status, refusedEmpty ? 503 : 200);
+          assert.deepEqual(new Uint8Array(await response.arrayBuffer()), expectedBody);
+          assert.equal(response.headers.get("content-type"), refusedEmpty ? "application/json" : ingress.media);
+          assert.equal(response.headers.get("retry-after"), !refusedEmpty && retry === "7" ? "7" : null);
+          assert.equal(response.headers.get("idempotent-replay"), ingress.name === "actions" && !refusedEmpty ? "true" : null);
+          assert.equal(response.headers.get("cache-control"), "no-store");
+          assert.equal(response.headers.get("set-cookie"), null);
+          assertHardened(response.headers, `${ingress.name} relayed 200`);
+        });
+      }
+    }
+  });
+}
+
+test("EventSub relayed challenge keeps bytes and gains hardening", async () => {
+  const challenge = new TextEncoder().encode("synthetic-challenge-headers");
+  const response = await relayEventsubResponse(new Response(challenge, {
+    headers: { "content-type": "text/plain; charset=utf-8", "retry-after": "9" },
+  }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), challenge);
+  assert.equal(response.headers.get("content-type"), "text/plain");
+  assert.equal(response.headers.get("retry-after"), "9");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assertHardened(response.headers, "EventSub challenge 200");
+});
+
+test("EventSub invalid challenge becomes a hardened refusal without upstream headers", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const requestId = newRequestId();
+  const response = await relayEventsubResponse(new Response("synthetic-challenge-headers\n", {
+    headers: { "content-type": "text/plain", "retry-after": "9", "set-cookie": "fixture=value" },
+  }), requestId);
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+  assert.equal(response.headers.get("content-type"), "application/json");
+  assert.equal(response.headers.get("retry-after"), null);
+  assert.equal(response.headers.get("set-cookie"), null);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assertHardened(response.headers, "EventSub invalid challenge 503");
+});
+
+for (const [reason, status] of [["epoch_conflict", 409], ["not_owner", 503]] as const) {
+  test(`ownership_fenced ${status} carries the decided set`, async (t) => {
+    t.mock.method(console, "warn", () => {});
+    const response = refused(new OwnershipRefused(reason));
+    assert.equal(response.status, status);
+    assert.equal(await response.text(), JSON.stringify({ error: "ownership_fenced", reason }));
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assertHardened(response.headers, `ownership_fenced ${status}`);
+  });
+}
 
 const DO_ID = "synthetic-headers-do-deployment";
 const DO_CONTROL_TOKEN = "synthetic-headers-control-token-0123456789";

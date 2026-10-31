@@ -46,7 +46,10 @@ override. Everything else is treated as live/unknown—even staging, loopback,
 Neon, and a hostname containing `test`. Source and target cannot resolve to the
 same host/port/database tuple. This check cannot prove that two different DNS
 aliases are different servers; the approved cutover operator must also verify
-endpoint identity. No target connection is made before the fence passes.
+endpoint identity. No target connection is made before the fence passes. TLS policy
+(`docs/database-tls.md`): unset `TWO_DATABASE_TLS` means `required` (remote
+host plus TLS `sslmode`); disposable `agent-testdb` runs need
+`TWO_DATABASE_TLS=local-only`.
 
 ## Schema provenance and provisioning
 

@@ -1,0 +1,167 @@
+name: slow-burn-tracker
+
+# Creator-join slow-burn card filer (runbook: docs/runbook.md#alert-voice-join-slow-burn).
+# The `voice_join_slow_burn` Worker rule only alerts; this workflow turns the
+# first firing into one GitHub tracking issue (`slow-burn` label, one open
+# card per firing key), refreshes it at most every six hours while the burn
+# continues, and closes it when the burn clears. An unknown verdict never
+# closes an open card.
+#
+# How it works: every five minutes the tracker scrapes staging /ops/metrics
+# with the environment bearer, appends the snapshot to the cached burn ring
+# and asks the checked-in evaluator (wrangler/scripts/slow-burn-decide.mjs,
+# zero edits to the rule file) whether the slow ticket fires. The five-minute
+# cadence is load-bearing: the slow long-window baseline sits one long window
+# behind the previous scrape, so a coarser cadence prunes its own baseline.
+# GitHub runs `*/5` on a best-effort cadence, so a ring gap of 600 s or more
+# emits a ::warning:: instead of reading as a clean bill of burn health.
+# Entry age alone cannot prove coverage (sub-600 s spacings can also leave the
+# baseline window empty), so the tracker records the most recent covered
+# moment beside the ring and warns once the slow windows go ~6.5 h uncovered.
+#
+# Bindings: the live `tracker` job reads the existing `staging` environment
+# secret STAGING_METRICS_SCRAPE_TOKEN (the same bearer the Worker serves
+# /ops/metrics with; unset or short server-side reads 404) and hands it to
+# the script as METRICS_SCRAPE_TOKEN. `deployment: false` keeps the
+# five-minute read out of the staging deployment history; the environment's
+# main-only branch policy and any reviewer or wait timer still apply.
+# STAGING_WORKER_URL is the existing repo variable. Without either binding
+# the run fails closed with an error naming the unset binding: an
+# unconfigured tracker must not read as a clean bill of burn health. Issue
+# writes use the job GITHUB_TOKEN
+# (contents:read plus issues:write).
+#
+# Proof: dispatch with fixture fire (or clear) to run the now-anchored burn
+# fixture through the real evaluator and the real issue calls under the
+# `slow-burn-test` label. Proofs run in the separate `fixture` job, which
+# binds no environment and holds no scrape bearer or staging URL; nothing is
+# scraped and the cache ring is untouched.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      fixture:
+        description: Live scrape or a now-anchored burn fixture (proof runs only)
+        type: choice
+        options: [live, fire, clear]
+        default: live
+      dry_run:
+        description: Decide and print without any issue write
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: slow-burn-tracker
+  cancel-in-progress: false
+
+jobs:
+  # Scheduled runs and live dispatches only: fire/clear proofs run in
+  # `fixture`, so the staging bearer never reaches a fixture run.
+  tracker:
+    name: slow-burn tracker
+    permissions:
+      contents: read # checkout only; the scrape authenticates with the `staging` environment bearer
+      issues: write # file, refresh and resolve the one tracking issue per firing key
+    if: github.ref == 'refs/heads/main' && (github.event.inputs.fixture || 'live') == 'live'
+    environment:
+      name: staging
+      deployment: false
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tracker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      # Restore-only: a full actions/cache step would save the stale ring in
+      # its post phase and could restore over the tracker's fresh ring.
+      - name: Restore the burn ring and coverage
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            slow-burn-ring.json
+            slow-burn-coverage.json
+          key: slow-burn-ring-v1-${{ github.run_id }}
+          restore-keys: |
+            slow-burn-ring-v1-
+      - name: Run the slow-burn tracker
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RING_PATH: slow-burn-ring.json
+          COVERAGE_PATH: slow-burn-coverage.json
+          TRACKER_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--ring "$RING_PATH" --coverage-path "$COVERAGE_PATH" --evidence-out slow-burn-tracker-evidence.json --exposition-out slow-burn-exposition.prom)
+          if [ "$TRACKER_DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/slow_burn_tracker.py "${args[@]}"
+      # Save-only without restore-keys: restoring here would overwrite the
+      # tracker's fresh ring with the stale cached copy before the save.
+      - name: Save the burn ring and coverage
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            slow-burn-ring.json
+            slow-burn-coverage.json
+          key: slow-burn-ring-v1-${{ github.run_id }}
+      - name: Upload the tracker evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slow-burn-tracker-${{ github.run_id }}
+          path: |
+            slow-burn-tracker-evidence.json
+            slow-burn-exposition.prom
+          retention-days: 14
+
+  # Dispatched fire/clear proofs only: no environment, no scrape bearer, no
+  # staging URL and no ring cache. Cards file under the test label.
+  fixture:
+    name: slow-burn fixture proof
+    permissions:
+      contents: read # checkout only; proofs read no environment secret
+      issues: write # file and resolve the proof card under the slow-burn-test label
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && (github.event.inputs.fixture == 'fire' || github.event.inputs.fixture == 'clear')
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'fixture') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Run the slow-burn fixture proof
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRACKER_FIXTURE: ${{ github.event.inputs.fixture }}
+          TRACKER_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--fixture "$TRACKER_FIXTURE" --label slow-burn-test --title-prefix '[slow-burn-test]' --evidence-out slow-burn-tracker-evidence.json --exposition-out slow-burn-exposition.prom)
+          if [ "$TRACKER_DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/slow_burn_tracker.py "${args[@]}"
+      - name: Upload the fixture evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slow-burn-fixture-${{ github.run_id }}
+          path: |
+            slow-burn-tracker-evidence.json
+            slow-burn-exposition.prom
+          retention-days: 14

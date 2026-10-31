@@ -38,7 +38,7 @@
 //! - `normalize_event` / `EventStatus` (`crates/core/src/scheduled_events.rs`):
 //!   every request below starts from a normalized Discord mirror row; Cancelled
 //!   rows route to delete.
-//! - `replace_events` (`crates/core/src/website_store.rs:286`): the atomic-swap
+//! - `replace_events` (`crates/core/src/website_store.rs:298`): the atomic-swap
 //!   contract is why the idempotency map must be update-not-duplicate at the
 //!   orchestrator layer, never a whole-guild sweep.
 //! - `FeatureGates` (`crates/core/src/feature_commands.rs:342`): the kill

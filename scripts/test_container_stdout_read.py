@@ -254,6 +254,15 @@ class RedactionTests(unittest.TestCase):
                 self.assertEqual(event["persist_class"], "storage_unavailable")
                 self.assertNotIn("action", event)
 
+    def test_bounded_message_type_is_kept_and_the_raw_header_is_not(self):
+        packet = self.packet_for("eventsub delivery refused",
+                                 msg="eventsub_delivery_refused",
+                                 message_type="webhook_callback_verification",
+                                 messageType="webhook_callback_verification")
+        event = packet["events"][0]
+        self.assertEqual(event["message_type"], "webhook_callback_verification")
+        self.assertNotIn("messageType", event)
+
     def test_a_real_run_id_survives_but_a_snowflake_does_not(self):
         packet = self.packet_for("guild " + HOSTILE["snowflake"], run_id="1791721100000000000-7")
         event = packet["events"][0]
@@ -426,7 +435,10 @@ class FenceTests(unittest.TestCase):
         self.assertIn("--service", run.stdout)
 
     def test_end_of_now_is_allowed(self):
-        code, _, _ = run_main(["--service", SERVICE, "--end", "2026-10-11T12:30:00Z"], FakeTransport(),
+        # The fixture events are 12:18-12:19, so a 15-minute window ending at
+        # now (12:15-12:30) keeps them in-window while still pinning end==now.
+        code, _, _ = run_main(["--service", SERVICE, "--end", "2026-10-11T12:30:00Z",
+                               "--minutes", "15"], FakeTransport(),
                               env={reader.ACCOUNT_ENV: ACCOUNT})
         self.assertEqual(code, 0)
 

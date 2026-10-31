@@ -203,17 +203,28 @@ async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::
     Ok(())
 }
 
-/// Every cutover migration in source order, read from the directory so a new
-/// migration is exercised without updating a hardcoded list.
+/// Every migration path in apply order: the cutover chain, then the store
+/// chain that staging applies on top under its own ledger. Both are read from
+/// their directories so a new migration is exercised without a hardcoded list.
+fn migration_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for chain in ["../cutover/migrations", "../store/migrations"] {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(chain);
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("migrations directory")
+            .map(|entry| entry.expect("migration entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        entries.sort();
+        assert!(!entries.is_empty(), "no migrations found in {chain}");
+        paths.extend(entries);
+    }
+    paths
+}
+
+/// `migration_paths` with each file's version prefix and contents.
 fn migration_files() -> Vec<(i64, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .expect("cutover migrations directory")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
-        .collect();
-    entries.sort();
-    entries
+    let files: Vec<(i64, String)> = migration_paths()
         .iter()
         .map(|path| {
             let name = path
@@ -225,20 +236,24 @@ fn migration_files() -> Vec<(i64, String)> {
             let sql = std::fs::read_to_string(path).expect("read migration");
             (version, sql)
         })
-        .collect()
+        .collect();
+    // The two ledgers are separate, but the fixtures below select by version
+    // alone, so a version reused across the chains would apply the wrong file.
+    let mut seen = std::collections::BTreeSet::new();
+    for (version, _) in &files {
+        assert!(
+            seen.insert(*version),
+            "migration version {version} is in both chains"
+        );
+    }
+    files
 }
 
 async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
-    // Every real migration file in version order, not a reduced fixture that
+    // Every real migration file in apply order, not a reduced fixture that
     // omits trigger/sequence paths or newer tables. A new migration without a
     // matrix row fails the offline coverage test and drifts here.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .expect("migrations directory")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
-        .collect();
-    paths.sort();
+    let paths = migration_paths();
     assert!(!paths.is_empty(), "no migrations found");
     for path in paths {
         let sql = std::fs::read_to_string(&path).expect("migration file readable");
@@ -246,6 +261,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         execute(pool, isolated(&sql, roles)).await?;
     }
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql("CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);")
         .execute(pool)
         .await?;
     sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
@@ -379,6 +397,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "contract_meta",
         "live_counts",
         "rank_counts",
+        "rank_ladder",
         "members",
         "member_milestones",
         "upcoming_events",
@@ -1450,6 +1469,9 @@ async fn scratch_membership_run(creation_self_grant: Option<&str>) {
         sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
             .execute(&provisioner_pool)
             .await?;
+        sqlx::raw_sql("CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);")
+            .execute(&provisioner_pool)
+            .await?;
         sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
             .execute(&provisioner_pool)
             .await?;
@@ -1538,6 +1560,10 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .await
         .unwrap();
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);")
         .execute(&provision_pool)
         .await
         .unwrap();

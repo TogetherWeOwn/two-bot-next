@@ -274,13 +274,13 @@
         "row": [
           "16",
           "`/command-list`",
-          "none",
+          "`page` opt ≥1 (1-based, default 1)",
           "`ManageGuild`"
         ]
       },
       "status": "manual",
-      "action": "Create soak-faq and invoke /command-list as manager and normal member.",
-      "expected": "Manager sees the fixture definition without secrets; normal member is denied.",
+      "action": "Create enough enabled/disabled fixture commands with text triggers to span pages; as manager, invoke /command-list with no page, traverse all valid pages, and try invalid/unavailable pages. Check the empty list after cleanup and invoke as a normal member.",
+      "expected": "Manager sees every whole name/trigger/on-off row exactly once in name order without secrets; each nonempty page fits 2,000 UTF-16 units with page/total and a next-page hint when applicable. Missing page equals page:1; empty page 1 keeps its existing reply; invalid/unavailable pages are refused without mutation; normal member is denied.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
@@ -290,13 +290,13 @@
         "row": [
           "17",
           "`/schedule`",
-          "`body` req ≤2000; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required)",
+          "`body` req ≤2000; `at` RFC3339 with explicit offset opt ≤64 (one-off only, future ≤365 days); or `in-minutes` 1–525600 opt / `every-minutes` 60–525600 opt (at least one timing required); `preview` boolean opt",
           "`ManageGuild`, runs in invoking channel"
         ]
       },
       "status": "manual",
-      "action": "Invoke /schedule body:soak-once in-minutes:1; also create body:soak-repeat every-minutes:60; try neither option and below-minimum intervals.",
-      "expected": "Valid messages are queued for invoking channel, one-shot fires once; invalid cadence rejected; recurring schedule removed after evidence.",
+      "action": "On staging only, invoke /schedule body:soak-once in-minutes:1 and body:soak-repeat every-minutes:60. Create future at times in Z and a numeric offset naming the same instant; list/remove their IDs. Try malformed/no-offset/past/out-of-horizon at, at plus in-minutes/every-minutes, neither timing and below-minimum intervals. Through the approved restart contract, verify a not-yet-due and an already delivered one-off.",
+      "expected": "Offset-equivalent inputs persist the same canonical UTC millisecond instant; set/list show that instant, localized time, stable ID and uncertain delivery timing. Every invalid time/conflict has zero schedule/audit/channel effects. Relative and recurring semantics, body safety and quota remain intact; restart retains the due instant without a second occurrence. No exact-second SLO. Remove fixture schedules after evidence.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
@@ -322,13 +322,13 @@
         "row": [
           "19",
           "`/schedule-list`",
-          "none",
+          "`page` opt ≥1 (1-based, default 1)",
           "`ManageGuild`"
         ]
       },
       "status": "manual",
-      "action": "Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor.",
-      "expected": "Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences.",
+      "action": "Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor; walk page:1 and an out-of-range page.",
+      "expected": "Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences; every page fits Discord limits with a page indicator and out-of-range pages are refused.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
@@ -498,13 +498,13 @@
         "row": [
           "30",
           "`/feed-list`",
-          "none",
+          "`page` opt ≥1 (1-based, default 1)",
           "`ManageGuild`"
         ]
       },
       "status": "manual",
-      "action": "Invoke /feed-list before/after relay changes and as actor without ManageGuild.",
-      "expected": "List matches this guild only; unauthorized actor refused; no credentials in output.",
+      "action": "Before the check, seed enough approved fixture relays for /feed-list to report at least two pages; invoke /feed-list before/after relay changes and as actor without ManageGuild; walk page:1, page:2, and an out-of-range page.",
+      "expected": "List matches this guild only; unauthorized actor refused; no credentials in output; every page fits Discord limits; multi-page lists show a page indicator with navigation and totals on each page; out-of-range pages are refused.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
@@ -1605,7 +1605,7 @@
         ]
       },
       "status": "manual",
-      "action": "With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_TICKET_COOLDOWN_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.",
+      "action": "With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_AUTOMATIONS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.",
       "expected": "Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
@@ -1643,12 +1643,12 @@
       "parity": {
         "section": 8,
         "row": [
-          "Audit kill switch (`audit-switch --halt/--resume/--status`)",
+          "Audit kill switch (`audit_switch`, [usage](audit-store.md#operator-handle))",
           "presence = halt"
         ]
       },
       "status": "waived",
-      "action": "Run audit-switch halt/status/resume against local authorized test-container fixture only, never staging/production DB.",
+      "action": "Run `audit_switch --status`, `audit_switch --halt --actor <snowflake>`, `audit_switch --resume` ([usage](audit-store.md#operator-handle)) against local authorized test-container fixture only, never staging/production DB.",
       "expected": "Switch presence halts, status reports accurately, resume clears only the fixture switch and pending audit resumes safely.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
@@ -2067,8 +2067,8 @@
       "parity": {
         "section": 12,
         "row": [
-          "Durable join-risk event claim store over the existing flags table (unwired, no new migration)",
-          "`JoinRiskStore` record with legacy lock-key derivation and exactly-once claim tests plus audit-DB step (#362)"
+          "Durable join-risk event claim store over the existing flags table (no new migration), wired via the join-risk runtime",
+          "`JoinRiskStore::record` (`crates/core/src/join_risk_store.rs:79`) claimed from `crates/bot/src/join_risk_runtime.rs:418` and production-wired in `chain_from_env` (`:566`), plus exactly-once claim tests and audit-DB step (#362)"
         ]
       },
       "owner": [
@@ -2289,6 +2289,59 @@
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
+      "id": "s12-30",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Private Twitch EventSub receiver inside the container network (#973)",
+          "`crates/bot/src/eventsub_http.rs:97-128` (bind plus serve; header `:1-18` states verification-before-parsing and scalar-only logs, challenge echoed at `:519-526`) and `crates/core/src/eventsub_receiver_config.rs:52-93` (served only when `TWO_EVENTSUB` is exactly `1`, `TWO_EVENTSUB_BIND` literal-IP:port rule with the Worker-set container marker admitting a wildcard, `TWO_TWITCH_WEBHOOK_SECRET` 10-100 printable ASCII). Env-only catalog `crates/core/src/settings.rs:130-142` with generated rows `docs/configuration.md:200-202,269`, Worker ingress `wrangler/src/eventsub.ts:44,73-74` and forward/secret guard `wrangler/src/container-env.ts:270,288-290,319`; receiver contract `docs/stream-funnel.md:196-249`"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "On staging with the Operator-provisioned webhook secret, enable the receiver dark-flag exactly as configured, deliver a signed Twitch challenge and one signed notification through the Worker ingress, then repeat with a bad signature and with the flag unset.",
+      "expected": "The challenge is echoed only after verification, signed notifications are accepted with scalar-only logs, bad signatures are refused before parsing, the receiver is not served while the flag is unset, and enabled-but-invalid configuration stops startup instead of downgrading.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-31",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Voice creator-view merge on gateway reconnect plus join-time creator-map refusal naming (#976)",
+          "`crates/bot/src/voice_rooms.rs:3600-3662` (`reload_creators` merges the stored rows on a generation change, debounced 10 s by `CREATORS_REFRESH_DEBOUNCE_MS` at `:3091` against the five-minute `CREATORS_REFRESH_INTERVAL_MS` at `:3092`; a failed read keeps the old generation and retries on the next debounced tick), driven by the maintenance tick at `:9170`; join refusals name the reason (`unknown_creator` at `:3368` and siblings) with the map state at join time (length, known, halted, ready, live and ticket generations) at `:3380-3430`"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "On the disposable staging guild, register a creator channel, force a gateway reconnect, then join the creator channel; also join once against a deliberately stale creator map.",
+      "expected": "The creator view merges stored rows after the reconnect generation change (debounced, failed reads keep the old generation), the join succeeds without a restart, and any refusal names its reason with the join-time map state in the log.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-32",
+      "parity": {
+        "section": 12,
+        "row": [
+          "EventSub subscription reconcile at startup plus a bounded hourly interval (#989)",
+          "`crates/bot/src/eventsub_reconcile.rs:64-72` (`TWO_TWITCH_CALLBACK_URL` callback gate, `TWO_TWITCH_BROADCASTERS` allowlist with empty-parks at `:128-144`, `RECONCILE_INTERVAL_SECS = 3_600`), `:104-112` (`gate_open`/`enabled`, exactly-`1` gate) plus `:646-678` (`spawn_if_enabled`, gated by `enabled()`), spawned in `crates/bot/src/main.rs:501`; catalog `crates/core/src/settings.rs:138-139` plus generated rows `docs/configuration.md:265-266` plus container-env `wrangler/src/container-env.ts:286-289`, and the `docs/stream-funnel.md:96-112` interval rewrite"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "On staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.",
+      "expected": "Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
       "id": "s13-f114c44",
       "parity": {
         "section": 13,
@@ -2393,7 +2446,7 @@
       ],
       "status": "automated",
       "action": "Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.",
-      "expected": "With `TWO_VOICE=1` the merged publish set carries the 28 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.",
+      "expected": "With `TWO_VOICE=1` the merged publish set carries the 45 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.",
       "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.",
       "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — deployed registry read-back and temp-voice scenario evidence; the offline publish pins above are this row's automated proof."

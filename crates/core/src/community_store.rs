@@ -37,7 +37,16 @@ pub enum CommunityStoreError {
     UnknownFactType(String),
     #[error("scorecard build failed: {0}")]
     Build(String),
+    #[error(
+        "scorecard week holds more than {ceiling} facts: unrepresentative sample, refusing the run"
+    )]
+    TooManyFacts { ceiling: usize },
 }
+
+/// Weekly fact ceiling for the Monday scorecard load. The store fetches at
+/// most `WEEK_FACT_CEILING + 1` rows; a week that exceeds the ceiling refuses
+/// the run as unrepresentative instead of silently truncating.
+pub const WEEK_FACT_CEILING: usize = 10_000;
 
 /// One fact write. The classifier verdict travels with the row so the store
 /// stays a thin transliteration; S3 supplies it via [`crate::community::classify`].
@@ -122,17 +131,40 @@ pub async fn record_fact(
     Ok(inserted.is_some())
 }
 
-/// Message fact (legacy `recordMessage` inputs, minus the classifier).
+/// Inputs for [`message_fact`] (legacy `recordMessage` inputs, minus the
+/// classifier). A struct, not positional parameters: the function already
+/// sat at the argument-count limit before `content_length` arrived.
+/// `content_length` is the Unicode scalar count measured where the gateway
+/// content was in hand; only the integer is threaded here, never content.
+pub struct MessageFactInput<'a> {
+    pub guild_id: &'a str,
+    pub message_id: &'a str,
+    pub channel_id: &'a str,
+    pub channel_class: &'a str,
+    pub actor: &'a ClassifyInput,
+    pub occurred_at: &'a str,
+    pub content_length: Option<usize>,
+    pub classification: Classification,
+}
+
 #[must_use]
-pub fn message_fact(
-    guild_id: &str,
-    message_id: &str,
-    channel_id: &str,
-    channel_class: &str,
-    actor: &ClassifyInput,
-    occurred_at: &str,
-    classification: Classification,
-) -> FactWrite {
+pub fn message_fact(input: MessageFactInput<'_>) -> FactWrite {
+    let MessageFactInput {
+        guild_id,
+        message_id,
+        channel_id,
+        channel_class,
+        actor,
+        occurred_at,
+        content_length,
+        classification,
+    } = input;
+    // A measured length is recorded; absent or zero records no key at all,
+    // so an unknown length never masquerades as a measured zero.
+    let length_part = match content_length {
+        Some(n) if n > 0 => format!(",\"contentLength\":{n}"),
+        _ => String::new(),
+    };
     FactWrite {
         guild_id: guild_id.to_owned(),
         event_type: "message_created".to_owned(),
@@ -142,9 +174,10 @@ pub fn message_fact(
         source: format!("channel:{channel_id}"),
         classification,
         metadata: Some(format!(
-            "{{\"channelId\":\"{channel_id}\",\"channelClass\":\"{channel_class}\",\"webhookId\":{},\"discordBot\":{}}}",
+            "{{\"channelId\":\"{channel_id}\",\"channelClass\":\"{channel_class}\",\"webhookId\":{},\"discordBot\":{}{}}}",
             actor.webhook_id.as_deref().map_or("null".to_owned(), |w| format!("\"{w}\"")),
-            actor.is_bot
+            actor.is_bot,
+            length_part
         )),
         idempotency_key: format!("discord-message:{message_id}"),
     }
@@ -153,8 +186,9 @@ pub fn message_fact(
 /// Record one gateway `MessageCreate` fact: build via [`message_fact`] and
 /// insert via [`record_fact`]. Returns `true` when inserted, `false` when the
 /// `discord-message:{message_id}` key already held it (duplicate delivery).
-/// Content-minimized by construction: [`message_fact`] carries IDs plus the
-/// classifier verdict plus the channel class only, never message content.
+/// Content-minimized by construction: [`message_fact`] carries IDs, the
+/// classifier verdict, the channel class, and the measured content-length
+/// integer only, never message content.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_message_fact(
     pool: &Pool<Postgres>,
@@ -164,17 +198,19 @@ pub async fn record_message_fact(
     channel_class: &str,
     actor: &ClassifyInput,
     occurred_at: &str,
+    content_length: Option<usize>,
     classification: Classification,
 ) -> Result<bool, CommunityStoreError> {
-    let write = message_fact(
+    let write = message_fact(MessageFactInput {
         guild_id,
         message_id,
         channel_id,
         channel_class,
         actor,
         occurred_at,
+        content_length,
         classification,
-    );
+    });
     record_fact(pool, &write).await
 }
 
@@ -421,14 +457,21 @@ pub async fn load_scorecard_inputs(
                 classifier_version, classification, matched_rule, metadata, idempotency_key
            FROM community_facts
           WHERE guild_id = $1 AND occurred_at >= $2 AND occurred_at < $3 AND id <= $4
-          ORDER BY id",
+          ORDER BY id
+          LIMIT $5",
     )
     .bind(&load.guild_id)
     .bind(&load.week_start)
     .bind(&load.week_end)
     .bind(load.watermark)
+    .bind((WEEK_FACT_CEILING + 1) as i64)
     .fetch_all(pool)
     .await?;
+    if rows.len() > WEEK_FACT_CEILING {
+        return Err(CommunityStoreError::TooManyFacts {
+            ceiling: WEEK_FACT_CEILING,
+        });
+    }
     let mut facts = Vec::with_capacity(rows.len());
     for (
         id,
@@ -792,7 +835,16 @@ mod tests {
                 "2026-09-01T11:00:00.000Z"
             };
             let input = actor(who);
-            let write = message_fact(GUILD, id, "general", "human", &input, at, verdict(class));
+            let write = message_fact(MessageFactInput {
+                guild_id: GUILD,
+                message_id: id,
+                channel_id: "general",
+                channel_class: "human",
+                actor: &input,
+                occurred_at: at,
+                content_length: None,
+                classification: verdict(class),
+            });
             record_fact(pool, &write).await.expect("seed message");
         }
         for (id, who, at, class) in [
@@ -1060,15 +1112,16 @@ mod tests {
         // Discord message id, carries the classifier verdict, and stores no
         // message text.
         let input = actor("human-1");
-        let write = message_fact(
-            GUILD,
-            "msg-1",
-            "chan-9",
-            "human",
-            &input,
-            "2026-09-02T10:00:00.000Z",
-            verdict("eligible_human"),
-        );
+        let write = message_fact(MessageFactInput {
+            guild_id: GUILD,
+            message_id: "msg-1",
+            channel_id: "chan-9",
+            channel_class: "human",
+            actor: &input,
+            occurred_at: "2026-09-02T10:00:00.000Z",
+            content_length: None,
+            classification: verdict("eligible_human"),
+        });
         assert_eq!(write.event_type, "message_created");
         assert_eq!(write.source_event_id, "msg-1");
         assert_eq!(write.idempotency_key, "discord-message:msg-1");
@@ -1081,8 +1134,10 @@ mod tests {
             "channel class travels: {metadata}"
         );
         assert!(
-            !metadata.contains("hello") && !metadata.contains("content"),
-            "no message content stored: {metadata}"
+            !metadata.contains("hello")
+                && !metadata.contains("\"content\":")
+                && !metadata.contains("contentLength"),
+            "no message content stored, and no length key when unmeasured: {metadata}"
         );
     }
 
@@ -1207,6 +1262,7 @@ mod tests {
             "human",
             &input,
             at,
+            None,
             verdict("eligible_human"),
         )
         .await
@@ -1220,6 +1276,7 @@ mod tests {
             "human",
             &input,
             at,
+            None,
             verdict("eligible_human"),
         )
         .await

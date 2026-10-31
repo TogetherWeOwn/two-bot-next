@@ -1,0 +1,4 @@
+{"table":"member_levels","row":{"guild_id":"g","member_id":"m2","xp":30,"message_xp":30,"voice_xp":0,"imported_xp":0,"updated_at":"2026-10-01T12:00:00+00:00"}}
+{"table":"member_levels","row":{"guild_id":"g","member_id":"m3","xp":45,"message_xp":45,"voice_xp":0,"imported_xp":0,"updated_at":"2026-10-01T12:00:00+00:00"}}
+{"table":"tickets","row":{"id":"t-after","guild_id":"g","channel_id":"ch-after","opener_id":"o2","claimed_by":null,"status":"open","created_at":"2026-10-01T12:00:00Z","closing_started_at":null,"closed_at":null}}
+{"table":"members","row":{"guild_id":"g","member_id":"m-after","joined_at":"2026-09-29T12:00:00+00:00","last_active_at":"2026-10-01T12:00:00+00:00"}}

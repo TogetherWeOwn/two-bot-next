@@ -1,0 +1,1 @@
+postgres://fixture:fixture-password@ep-fixture.neon.tech/db?sslmode=require&channel_binding=require

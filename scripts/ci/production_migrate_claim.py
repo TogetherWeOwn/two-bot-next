@@ -72,6 +72,38 @@ def projection_hash(manifest):
     return hashlib.sha256("".join(rows).encode()).hexdigest()
 
 
+def store_projection_hash(manifest):
+    """Match the runner's store projection byte-for-byte.
+
+    Same shape as `projection_hash`, over the store chain's own pending list
+    (`pending_store_before`) and migration table (`source_store_migrations`).
+    The cutover projection above is unchanged, so old manifests keep matching.
+    """
+    source = manifest.get("source_sha")
+    require(isinstance(source, str) and SHA40.fullmatch(source), "source SHA is invalid")
+    pending = versions(manifest.get("pending_store_before"))
+    migrations = manifest.get("source_store_migrations")
+    require(isinstance(migrations, list), "store source migrations are invalid")
+    migration_versions = []
+    rows = [source + "\n"] + [f"{v}\n" for v in pending]
+    for migration in migrations:
+        require(isinstance(migration, dict), "store source migration is invalid")
+        version, checksum = migration.get("version"), migration.get("sha384")
+        description = migration.get("description")
+        require(type(version) is int and 0 < version <= I64_MAX,
+                "store source migration version is invalid")
+        require(isinstance(checksum, str) and CHECKSUM.fullmatch(checksum),
+                "store source migration checksum is invalid")
+        require(isinstance(description, str) and "\n" not in description and "\r" not in description,
+                "store source migration description is invalid")
+        migration_versions.append(version)
+        rows.append(f"{version}:{description}:{checksum}\n")
+    require(migration_versions == sorted(set(migration_versions)),
+            "store source migration versions are not strictly ascending")
+    require(set(pending).issubset(migration_versions), "store pending versions are not present in the source")
+    return hashlib.sha256("".join(rows).encode()).hexdigest()
+
+
 def build_claim(manifest, env):
     require(isinstance(manifest, dict), "plan manifest is invalid")
     require(env.get("GITHUB_REPOSITORY") == REPOSITORY, "repository is outside scope")
@@ -95,10 +127,23 @@ def build_claim(manifest, env):
             and isinstance(manifest.get("ledger_before"), list)
             and manifest["ledger_before"] == manifest.get("ledger_after"),
             "manifest is not an unchanged read-only plan")
+    # The store chain plans alongside with its own ledger and hash: a plan
+    # that applied store migrations, or whose store ledger moved, is not a
+    # read-only plan either.
+    require(type(manifest.get("applied_store_count")) is int
+            and manifest["applied_store_count"] == 0
+            and isinstance(manifest.get("ledger_store_before"), list)
+            and manifest["ledger_store_before"] == manifest.get("ledger_store_after"),
+            "manifest is not an unchanged read-only plan")
     digest = env.get("PLAN_MANIFEST_SHA256", "")
     require(SHA256.fullmatch(digest), "claimed projection hash is invalid")
     require(projection_hash(manifest) == manifest.get("plan_manifest_sha256") == digest,
             "plan projection hash does not match the request")
+    store_digest = env.get("STORE_PLAN_MANIFEST_SHA256", "")
+    require(SHA256.fullmatch(store_digest), "claimed store projection hash is invalid")
+    require(store_projection_hash(manifest)
+            == manifest.get("store_plan_manifest_sha256") == store_digest,
+            "store plan projection hash does not match the request")
     require(manifest.get("source_sha") == env.get("SOURCE_SHA"), "source SHA does not match the request")
     require(manifest.get("migration_target") == "production",
             "manifest is not a production plan")
@@ -109,14 +154,17 @@ def build_claim(manifest, env):
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", target["host"])
             and isinstance(target.get("database"), str)
             and re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", target["database"])
-            and target.get("branch_id") == ""
+            and isinstance(target.get("branch_id"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{0,63}", target["branch_id"])
             and "staging" not in target["host"].lower()
             and "neon.tech" not in target["host"].lower()
             and "agent-testdb" not in target["host"].lower()
             and "-pooler" not in target["host"].lower(),
             "target is not a bare production identity")
+    if target["host"].lower().endswith(".psdb.cloud"):
+        require(target["branch_id"] != "", "PlanetScale target must carry the pinned branch id")
     require(target == {"host": env.get("PRODUCTION_HOST"), "database": env.get("PRODUCTION_DATABASE"),
-                       "branch_id": ""},
+                       "branch_id": env.get("PRODUCTION_BRANCH_ID", "")},
             "plan target does not match the request")
     for key, env_key in (("recovery_evidence_ref", "RECOVERY_REF"), ("acl_plan_ref", "ACL_REF")):
         value = env.get(env_key, "")
@@ -137,6 +185,17 @@ def build_claim(manifest, env):
     require(requested == versions(manifest.get("pending_before")),
             "pending versions do not match the request")
     pending = [str(version) for version in requested]
+    store_raw = env.get("EXPECTED_STORE_PENDING", "").strip()
+    store_parts = [] if not store_raw else [part.strip() for part in store_raw.split(",")]
+    require(all(re.fullmatch(r"[+]?[0-9]+", part) for part in store_parts),
+            "requested store pending versions are invalid")
+    try:
+        requested_store = versions([int(part) for part in store_parts])
+    except ValueError:
+        raise Refused("requested store pending versions are invalid") from None
+    require(requested_store == versions(manifest.get("pending_store_before")),
+            "store pending versions do not match the request")
+    store_pending = [str(version) for version in requested_store]
     return {
         "schema_version": 1,
         "kind": CLAIM_KIND,
@@ -148,9 +207,11 @@ def build_claim(manifest, env):
         "workflow_head_sha": head,
         "plan_run_id": env["PLAN_RUN_ID"],
         "plan_manifest_sha256": digest,
+        "store_plan_manifest_sha256": store_digest,
         "source_sha": env["SOURCE_SHA"],
         "target": target,
         "expected_pending": pending,
+        "expected_store_pending": store_pending,
         "recovery_evidence_ref": env["RECOVERY_REF"],
         "acl_plan_ref": env["ACL_REF"],
     }

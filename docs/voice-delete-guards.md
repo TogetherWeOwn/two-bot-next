@@ -4,7 +4,9 @@ The worker shares delete evidence with gateway publication. Every ordinary
 room delete checks authoritative readiness, tracked provenance, protected IDs,
 human occupancy, a continuous human-empty grace, and current permissions. The
 grace defaults to 60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600, read
-at boot) changes it. The HTTP adapter re-evaluates the same live guard immediately before
+at boot) changes it, and a stored per-guild row overrides the boot value live
+(out-of-range rows fail closed to the boot value with an `out_of_range` warning).
+The HTTP adapter re-evaluates the same live guard immediately before
 sending, including after rate-limit waits. A human join cancels the marker even
 if they leave again before the actor next reconciles. Unknown bot identity counts
 as human; known bot-only occupancy still permits cleanup after the grace.

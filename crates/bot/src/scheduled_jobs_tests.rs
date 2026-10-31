@@ -1,3 +1,12 @@
+#[path = "event_reminder_acceptance_tests.rs"]
+mod event_reminder_acceptance;
+#[path = "event_reminder_regression_tests.rs"]
+mod event_reminder_regression;
+#[path = "scheduled_phase_isolation_acceptance_tests.rs"]
+mod phase_isolation_acceptance;
+#[path = "scheduled_uncertainty_acceptance_tests.rs"]
+mod uncertainty_acceptance;
+
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use two_bot_core::{advance_next_run_iso, get_scheduled, put_scheduled, ScheduledWrite};
@@ -327,18 +336,14 @@ fn parse_iso(iso: &str) -> u64 {
 }
 
 #[tokio::test]
-async fn retryable_failures_requeue_with_the_clamped_delay_and_keep_the_nonce() {
+async fn ambiguous_503_arms_durable_uncertainty_and_never_reposts() {
     let Some(fixture) = fixture().await else {
         return;
     };
     let pool = fixture.pool();
     seed(pool, "flaky", T0 - 1_000, None).await;
     let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(503),
-            ScriptedResponse::status(429),
-            posted(),
-        ],
+        vec![ScriptedResponse::status(503)],
         ScriptedResponse::status(500),
     )
     .await;
@@ -347,39 +352,176 @@ async fn retryable_failures_requeue_with_the_clamped_delay_and_keep_the_nonce() 
     assert_eq!(delay, two_bot_core::RETRY_DEFAULT_MS);
 
     tick(pool, &rest, GUILD, || T0).await.expect("tick");
-    let requeued = row(pool, "flaky").await;
-    assert!(requeued.enabled);
-    assert_eq!(requeued.next_run_at, format_iso_ms(T0 + delay));
-    assert_eq!(requeued.claim_token, None);
-    let nonce = requeued.occurrence_nonce.clone().expect("nonce kept");
+    let fenced = row(pool, "flaky").await;
+    assert!(fenced.enabled, "uncertainty never completes the occurrence");
+    assert_eq!(fenced.next_run_at, format_iso_ms(T0 + delay));
+    assert_eq!(fenced.claim_token, None);
+    let nonce = fenced.occurrence_nonce.clone().expect("nonce kept");
+    assert!(
+        fenced.delivery_uncertain,
+        "the pre-wire fence survives the ambiguous 503"
+    );
+    assert_eq!(fenced.last_run_at, None);
+    assert_eq!(fenced.last_message_id, None);
+    assert_eq!(
+        audits(pool, "flaky").await,
+        [audit("delivery_uncertain", Some("discord_unavailable"))],
+    );
 
     // Not due until the clamped delay passes.
     tick(pool, &rest, GUILD, || T0 + delay - 1)
         .await
         .expect("tick");
     assert_eq!(posts(&mock).len(), 1);
+    assert_eq!(audits(pool, "flaky").await.len(), 1);
 
+    // At the retry horizon the fenced occurrence is held, never re-posted.
     tick(pool, &rest, GUILD, || T0 + delay).await.expect("tick");
-    assert_eq!(
-        row(pool, "flaky").await.next_run_at,
-        format_iso_ms(T0 + 2 * delay)
-    );
-    tick(pool, &rest, GUILD, || T0 + 2 * delay)
-        .await
-        .expect("tick");
-
-    let sent = posts(&mock);
-    assert_eq!(sent.len(), 3);
-    assert!(
-        sent.iter().all(|body| body["nonce"] == nonce.as_str()),
-        "every retry of one occurrence carries its nonce"
-    );
-    assert!(!row(pool, "flaky").await.enabled);
+    assert_eq!(posts(&mock).len(), 1, "a fenced row never POSTs again");
+    let held = row(pool, "flaky").await;
+    assert!(held.enabled);
+    assert!(held.claim_token.is_some(), "the held claim stays parked");
+    assert_eq!(held.occurrence_nonce.as_deref(), Some(nonce.as_str()));
+    assert!(held.delivery_uncertain);
     assert_eq!(
         audits(pool, "flaky").await,
         [
-            audit("retry_scheduled", Some("discord_unavailable")),
+            audit("delivery_uncertain", Some("discord_unavailable")),
+            audit("delivery_uncertain", Some("scheduled_delivery_uncertain")),
+        ]
+    );
+
+    // Past the lease the reclaim still holds without posting.
+    let lease = lease_until_ms(T0 + delay);
+    tick(pool, &rest, GUILD, || lease).await.expect("tick");
+    assert_eq!(posts(&mock).len(), 1);
+    assert!(row(pool, "flaky").await.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "flaky").await.len(),
+        3,
+        "each reclaim audits the hold"
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn proven_429_retries_without_a_fence_and_completes() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    seed(pool, "limited", T0 - 1_000, None).await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(429), posted()],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    let delay = clamp_retry_delay_ms(None);
+
+    tick(pool, &rest, GUILD, || T0).await.expect("tick");
+    let requeued = row(pool, "limited").await;
+    assert!(requeued.enabled);
+    assert_eq!(requeued.next_run_at, format_iso_ms(T0 + delay));
+    assert_eq!(requeued.claim_token, None);
+    assert_eq!(
+        requeued.occurrence_nonce, None,
+        "a proven no-effect clears the nonce for a fresh identity"
+    );
+    assert!(
+        !requeued.delivery_uncertain,
+        "a 429 never arms durable uncertainty"
+    );
+    assert_eq!(
+        audits(pool, "limited").await,
+        [audit("retry_scheduled", Some("discord_rate_limited"))],
+    );
+    assert_eq!(posts(&mock).len(), 1);
+    let first_nonce = posts(&mock)[0]["nonce"].clone();
+
+    tick(pool, &rest, GUILD, || T0 + delay - 1)
+        .await
+        .expect("tick");
+    assert_eq!(posts(&mock).len(), 1);
+
+    tick(pool, &rest, GUILD, || T0 + delay).await.expect("tick");
+    let sent = posts(&mock);
+    assert_eq!(sent.len(), 2);
+    assert_ne!(
+        sent[1]["nonce"], first_nonce,
+        "the safe retry uses a fresh nonce"
+    );
+    let done = row(pool, "limited").await;
+    assert!(!done.enabled);
+    assert_eq!(done.last_message_id.as_deref(), Some("9001"));
+    assert!(!done.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "limited").await,
+        [
             audit("retry_scheduled", Some("discord_rate_limited")),
+            audit("ok", None),
+        ]
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn guard_refusal_retries_without_a_fence_and_completes() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    seed(pool, "guarded", T0 - 1_000, None).await;
+    let mock = MockRest::start(vec![posted()], ScriptedResponse::status(500)).await;
+    crate::gateway::ensure_crypto_provider();
+    let guard = std::sync::Arc::new(
+        two_bot_discord::ratelimit_guard::RateLimitGuard::new(Default::default()).unwrap(),
+    );
+    guard.observe_status(401, true);
+    let refused = two_bot_discord::executor::ActionExecutor::with_proxy_and_guard(
+        "synthetic-job-test-token".to_owned(),
+        Some(mock.origin()),
+        guard,
+    )
+    .unwrap();
+    let delay = clamp_retry_delay_ms(None);
+
+    tick(pool, &refused, GUILD, || T0).await.expect("tick");
+    assert!(
+        posts(&mock).is_empty(),
+        "a guard refusal never reaches the wire"
+    );
+    let requeued = row(pool, "guarded").await;
+    assert!(requeued.enabled);
+    assert_eq!(requeued.next_run_at, format_iso_ms(T0 + delay));
+    assert_eq!(requeued.claim_token, None);
+    assert_eq!(requeued.occurrence_nonce, None);
+    assert!(!requeued.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "guarded").await,
+        [audit("retry_scheduled", Some("discord_guard_refused"))],
+    );
+
+    let fresh_guard = std::sync::Arc::new(
+        two_bot_discord::ratelimit_guard::RateLimitGuard::new(Default::default()).unwrap(),
+    );
+    let rest = two_bot_discord::executor::ActionExecutor::with_proxy_and_guard(
+        "synthetic-job-test-token".to_owned(),
+        Some(mock.origin()),
+        fresh_guard,
+    )
+    .unwrap();
+    tick(pool, &rest, GUILD, || T0 + delay).await.expect("tick");
+    assert_eq!(posts(&mock).len(), 1);
+    let done = row(pool, "guarded").await;
+    assert!(!done.enabled);
+    assert!(!done.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "guarded").await,
+        [
+            audit("retry_scheduled", Some("discord_guard_refused")),
             audit("ok", None),
         ]
     );
@@ -611,6 +753,277 @@ async fn definition_replaced_mid_post_surfaces_a_timed_out_orphan_delete() {
     fixture.close().await.unwrap();
 }
 
+/// Seed a due row with a caller-chosen body, stored verbatim exactly as
+/// a row written before any validate-side screen would already sit in
+/// the table. The ticker — the post boundary — is what must keep such a
+/// stored body from ambushing the channel.
+async fn seed_body(pool: &PgPool, id: &str, due_at: u64, body: &str) {
+    let at = format_iso_ms(T0 - 3_600_000);
+    let stored = put_scheduled(
+        pool,
+        &ScheduledWrite {
+            id: id.to_owned(),
+            guild_id: GUILD.to_owned(),
+            channel_id: CHANNEL.to_owned(),
+            body: body.to_owned(),
+            next_run_at: format_iso_ms(due_at),
+            interval_seconds: None,
+            enabled: true,
+            created_by: "5555".to_owned(),
+            created_at: at.clone(),
+            updated_by: "5555".to_owned(),
+            updated_at: at,
+        },
+    )
+    .await
+    .expect("seed scheduled row with body");
+    assert!(stored);
+}
+
+/// Inert on the wire: nothing left for the shared mention neutralizer
+/// to rewrite (raw and zero-width-split mass mentions alike) and no
+/// contiguous invite host Discord would linkify. A property of the
+/// captured output, not a pinned neutralization spelling — and never
+/// satisfied by a raw repost of the stored body.
+fn assert_posted_inert(sent: &Value) {
+    let content = sent["content"].as_str().expect("posted content text");
+    assert!(
+        !two_bot_core::message_safety::contains_mass_mention(content),
+        "posted content still carries a mass mention: {content:?}"
+    );
+    assert!(
+        !content.contains("@everyone") && !content.contains("@here"),
+        "posted content still contains a pingable mass mention: {content:?}"
+    );
+    assert!(
+        !content.to_lowercase().contains("discord.gg"),
+        "posted content still contains a linkable invite host: {content:?}"
+    );
+    // Mention pills render as text only while parsing stays closed:
+    // nothing in any posted body may actually notify a user or role.
+    assert_eq!(
+        sent["allowed_mentions"],
+        json!({"parse": [], "roles": [], "users": [], "replied_user": false}),
+        "ticker posts must keep the closed legacy mention policy"
+    );
+}
+
+/// Acceptance: hostile bodies already in storage (written before any
+/// validate-side screen, or by any other writer) never reach the
+/// channel as pingable or linkable output. Each hostile row may be
+/// defused or not posted at all; the benign control row in the same
+/// tick proves the ticker really ran, and every hostile post that does
+/// go out must be inert while keeping the announcement around the
+/// payload.
+#[tokio::test]
+async fn hostile_stored_bodies_never_post_pingable_or_linkable_output() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    let hostile = [
+        "Game night @everyone bring snacks",
+        "Game night @here bring snacks",
+        "Game night @e\u{200b}v\u{200b}e\u{200b}r\u{200b}y\u{200b}o\u{200b}n\u{200b}e bring snacks",
+        "Game night @he\u{200d}re bring snacks",
+        "Game night discord.gg/free-nitro bring snacks",
+        "Game night https://DISCORD.GG/FREE-NITRO bring snacks",
+        "Game night www.discord.gg/free-nitro bring snacks",
+        "Game night @here claim at discord.gg/free-nitro <@&123> <@456> bring snacks",
+    ];
+    for (index, body) in hostile.iter().enumerate() {
+        seed_body(
+            pool,
+            &format!("hostile-{index}"),
+            T0 - 10_000 + index as u64 * 100,
+            body,
+        )
+        .await;
+    }
+    seed_body(pool, "control", T0 - 1_000, "Game night Friday at 19:00").await;
+    let mock = MockRest::start(Vec::new(), posted()).await;
+    let rest = executor(&mock);
+
+    tick(pool, &rest, GUILD, || T0).await.expect("tick");
+
+    let sent = posts(&mock);
+    let control = sent
+        .iter()
+        .find(|post| post["content"] == "Game night Friday at 19:00")
+        .expect("the benign control posts in the same tick, byte-identical");
+    assert_posted_inert(control);
+    assert!(
+        sent.len() <= hostile.len() + 1,
+        "no stored body may post more than once, got {} posts",
+        sent.len()
+    );
+    for post in &sent {
+        assert_posted_inert(post);
+        let content = post["content"].as_str().expect("posted content text");
+        assert!(
+            content.contains("Game night"),
+            "defusing must keep the announcement, not replace it: {content:?}"
+        );
+        if content != "Game night Friday at 19:00" {
+            assert!(
+                content.contains("bring snacks"),
+                "defusing must keep the text after the payload: {content:?}"
+            );
+        }
+    }
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+/// Acceptance: benign stored bodies post byte-identical — markdown,
+/// newlines, dotted non-links and legitimate Unicode joiners are
+/// announcement text, not an ambush, and the safety screen must not
+/// rewrite them on the way to the channel.
+#[tokio::test]
+async fn benign_stored_bodies_post_byte_identical() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    let benign = [
+        "Game night Friday at 19:00 — bring snacks!",
+        "Line one\nLine two with **bold** and a `code` span",
+        "Reminder: update to v1.2 and check notes.txt, می\u{200c}روم \u{1f469}\u{200d}\u{1f4bb}",
+    ];
+    for (index, body) in benign.iter().enumerate() {
+        seed_body(
+            pool,
+            &format!("benign-{index}"),
+            T0 - 10_000 + index as u64 * 100,
+            body,
+        )
+        .await;
+    }
+    let mock = MockRest::start(Vec::new(), posted()).await;
+    let rest = executor(&mock);
+
+    tick(pool, &rest, GUILD, || T0).await.expect("tick");
+
+    let sent = posts(&mock);
+    let contents: Vec<&str> = sent
+        .iter()
+        .map(|post| post["content"].as_str().expect("posted content text"))
+        .collect();
+    assert_eq!(
+        contents, benign,
+        "benign bodies reach the channel byte-identical, in due order"
+    );
+    for post in &sent {
+        assert_posted_inert(post);
+    }
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retryable_failure_with_replaced_definition_audits_stale_completion() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool().clone();
+    seed(&pool, "retry-stale", T0 - 1_000, None).await;
+    let (mock, gate) = MockRest::start_gated(
+        vec![ScriptedResponse::status(503)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+
+    let ticker = {
+        let (pool, rest) = (pool.clone(), rest.clone());
+        tokio::spawn(async move { tick(&pool, &rest, GUILD, || T0).await })
+    };
+    gate.wait_for_request().await;
+    // The claim goes stale first: replacing the definition clears it, so the
+    // re-queue lands nowhere.
+    seed(&pool, "retry-stale", T0 + 600_000, None).await;
+    gate.release();
+    ticker.await.unwrap().expect("tick");
+
+    assert_eq!(
+        posts(&mock).len(),
+        1,
+        "the retryable failure is never re-posted"
+    );
+    let replaced = row(&pool, "retry-stale").await;
+    assert!(replaced.enabled, "the new definition stands");
+    assert_eq!(replaced.next_run_at, format_iso_ms(T0 + 600_000));
+    assert_eq!(replaced.claim_token, None);
+    assert_eq!(
+        audits(&pool, "retry-stale").await,
+        [audit("stale_completion", Some("discord_unavailable"))],
+        "a retryable failure whose claim went stale is audited, not silent"
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+/// Make recording a run fail the way a store error would: the completion
+/// update sets `last_run_at`, the claim/retry updates never do, so a
+/// trigger on that column refuses exactly the recording write.
+async fn refuse_run_recording(pool: &PgPool) {
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_scheduled_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.last_run_at IS DISTINCT FROM OLD.last_run_at THEN RAISE EXCEPTION 'fixture completion failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_scheduled_completion BEFORE UPDATE ON scheduled_messages FOR EACH ROW EXECUTE FUNCTION refuse_scheduled_completion();",
+    )
+    .execute(pool)
+    .await
+    .expect("install completion-refusing trigger");
+}
+
+#[tokio::test]
+async fn unrecorded_post_with_lost_claim_and_surviving_orphan_audits_stale_completion() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool().clone();
+    seed(&pool, "unrecorded-surviving", T0 - 1_000, None).await;
+    refuse_run_recording(&pool).await;
+    // The gate holds the orphan DELETE (the last scripted response): the
+    // window between the failed recording and the re-queue attempt. The
+    // delete is refused, so the orphan survives and keeps no nonce.
+    let (mock, gate) = MockRest::start_gated(
+        vec![posted(), ScriptedResponse::status(403)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+
+    let ticker = {
+        let (pool, rest) = (pool.clone(), rest.clone());
+        tokio::spawn(async move { tick(&pool, &rest, GUILD, || T0).await })
+    };
+    gate.wait_for_request().await;
+    // The claim is lost before the re-queue: replacing clears it.
+    seed(&pool, "unrecorded-surviving", T0 + 600_000, None).await;
+    gate.release();
+    let outcome = ticker.await.unwrap();
+    assert!(
+        matches!(outcome, Err(ErrorClass::Database)),
+        "a failed recording still fails the attempt, got {outcome:?}"
+    );
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].method, "DELETE");
+    assert_eq!(requests[1].path, "/api/v10/channels/4444/messages/9001");
+    assert_eq!(posts(&mock).len(), 1, "the orphan is never re-posted");
+    let replaced = row(&pool, "unrecorded-surviving").await;
+    assert!(replaced.enabled, "the new definition stands");
+    assert_eq!(replaced.next_run_at, format_iso_ms(T0 + 600_000));
+    assert_eq!(
+        audits(&pool, "unrecorded-surviving").await,
+        [audit("stale_completion", Some("database"))],
+        "a surviving orphan with a lost claim audits stale, not retry-idempotent"
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn supervised_runs_reach_the_metrics_endpoint() {
     use axum::{
@@ -651,7 +1064,7 @@ async fn supervised_runs_reach_the_metrics_endpoint() {
     .await
     .expect("first supervised tick succeeds");
     stop.send(true).unwrap();
-    supervisor.await.unwrap();
+    supervisor.await.unwrap().unwrap();
     assert_eq!(posts(&mock).len(), 1);
 
     let response = crate::metrics_http::router()

@@ -25,6 +25,7 @@
 use unicode_normalization::UnicodeNormalization;
 
 use crate::automod::{match_automod, AutomodFilter, AutomodMessage, AutomodPolicy, RepeatTracker};
+use crate::voice_naming::join_emoji_separator;
 
 /// Discord's channel-name length bounds, in Unicode scalar values. Legacy
 /// measures UTF-16 code units; astral characters (emoji) count one here where
@@ -268,9 +269,10 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     s[..end].to_string()
 }
 
-/// Legacy `onGeneratorJoin` name decision: filter the rendered template; when
-/// it is blocked, retry with an empty username and use that name instead.
-/// Only a template that is itself blocked refuses — an operator
+/// Legacy `onGeneratorJoin` name decision: join a leading emoji with
+/// [`crate::voice_naming::EMOJI_NAME_SEPARATOR`], then filter the rendered
+/// template; when it is blocked, retry with an empty username and use that
+/// name instead. Only a template that is itself blocked refuses — an operator
 /// misconfiguration to fix, not a member to punish — with audit reason
 /// [`NAME_BLOCKED_AUDIT_REASON`]. Creating anyway would mint a forbidden name,
 /// so refusal is loud rather than laundered.
@@ -283,13 +285,16 @@ pub fn resolve_create_name(
     context: &NameFilterContext,
 ) -> Result<ResolvedRoomName, BlockedRoomName> {
     let rendered = render_name_template(template, username, count, seq);
-    if let Ok(name) = filter_channel_name(&rendered, policy, context) {
+    // Mint with the guild's emoji separator, then filter what is minted.
+    let minted = join_emoji_separator(&rendered);
+    if let Ok(name) = filter_channel_name(&minted, policy, context) {
         return Ok(ResolvedRoomName {
             name,
             username_stripped: false,
         });
     }
     let bare = render_name_template(template, "", count, seq);
+    let bare = join_emoji_separator(&bare);
     match filter_channel_name(&bare, policy, context) {
         Ok(name) => Ok(ResolvedRoomName {
             name,
@@ -300,5 +305,56 @@ pub fn resolve_create_name(
             audit_reason: NAME_BLOCKED_AUDIT_REASON,
             error,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::automod::AutomodPolicy;
+
+    fn context() -> NameFilterContext {
+        NameFilterContext {
+            guild_id: "1".to_string(),
+            channel_id: "2".to_string(),
+            user_id: "3".to_string(),
+        }
+    }
+
+    #[test]
+    fn sanitize_preserves_emoji_separator() {
+        assert_eq!(
+            sanitize_channel_name("👾〢WARDOGS deep dive"),
+            "👾〢WARDOGS deep dive"
+        );
+    }
+
+    #[test]
+    fn create_name_uses_emoji_separator_for_emoji_display() {
+        let resolved = resolve_create_name(
+            "{username}'s room",
+            "👾 Wardogs",
+            0,
+            0,
+            &AutomodPolicy::default(),
+            &context(),
+        )
+        .expect("emoji display passes the filter");
+        assert_eq!(resolved.name, "👾〢Wardogs's room");
+        assert!(!resolved.username_stripped);
+    }
+
+    #[test]
+    fn create_name_leaves_plain_display_alone() {
+        let resolved = resolve_create_name(
+            "{username}'s room",
+            "Ava",
+            0,
+            0,
+            &AutomodPolicy::default(),
+            &context(),
+        )
+        .expect("plain display passes the filter");
+        assert_eq!(resolved.name, "Ava's room");
     }
 }

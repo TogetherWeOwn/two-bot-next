@@ -6,6 +6,7 @@
 use sqlx::{PgPool, Row};
 use std::str::FromStr as _;
 
+use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
     body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
@@ -17,6 +18,11 @@ use crate::internal_actions::{
 /// domain: DB `clock_timestamp()` readings are not comparable with any
 /// process-local wall clock, so the durable mark lives in its own domain row.
 pub const NONCE_DB_CLOCK_DOMAIN: &str = "internal_nonce_db";
+
+// Operator `--list` page: the default rows per listing and the ceiling an
+// explicit `--limit` clamps to. The reconcile-event CLI documents both.
+pub const OPERATOR_LIST_DEFAULT_LIMIT: i64 = 25;
+pub const OPERATOR_LIST_MAX_LIMIT: i64 = 100;
 
 /// Public errors deliberately omit SQLx sources and all request/provider details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -156,6 +162,9 @@ pub enum TerminalResponse {
         resource_id: Option<DiscordId>,
         affected: u32,
         outcome: Option<EventOutcome>,
+        /// Why a channel purge stopped after at least one deletion. `None` for
+        /// a completed purge and every other receipt; feeds the wire envelope.
+        stop_reason: Option<PurgeStopReason>,
     },
     Failure(TerminalFailure),
 }
@@ -206,6 +215,13 @@ impl TerminalResponse {
         }
     }
 
+    fn stop_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Success { stop_reason, .. } => stop_reason.map(PurgeStopReason::name),
+            Self::Failure(_) => None,
+        }
+    }
+
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, InternalStoreError> {
         let code: &str = row.try_get("response_code")?;
         let response = match code {
@@ -220,6 +236,13 @@ impl TerminalResponse {
                 outcome: row
                     .try_get::<Option<&str>, _>("outcome")?
                     .map(EventOutcome::from_str)
+                    .transpose()?,
+                // An unknown word fails closed: never a completed replay.
+                stop_reason: row
+                    .try_get::<Option<&str>, _>("stop_reason")?
+                    .map(|name| {
+                        PurgeStopReason::from_name(name).ok_or(InternalStoreError::Unavailable)
+                    })
                     .transpose()?,
             },
             "malformed" => Self::Failure(TerminalFailure::Malformed),
@@ -648,7 +671,7 @@ impl InternalActionStore {
         sqlx::query(
             "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
              http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
-             updated_at = clock_timestamp() WHERE intent_id = $1",
+             stop_reason = $7, updated_at = clock_timestamp() WHERE intent_id = $1",
         )
         .bind(intent_id)
         .bind(response.code())
@@ -656,6 +679,7 @@ impl InternalActionStore {
         .bind(response.resource_id())
         .bind(response.affected())
         .bind(response.outcome())
+        .bind(response.stop_reason())
         .execute(&mut *tx)
         .await?;
         Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
@@ -675,7 +699,7 @@ impl InternalActionStore {
         sqlx::query(
             "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
              http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
-             updated_at = clock_timestamp() WHERE intent_id = $1",
+             stop_reason = $7, updated_at = clock_timestamp() WHERE intent_id = $1",
         )
         .bind(intent_id)
         .bind(response.code())
@@ -683,6 +707,7 @@ impl InternalActionStore {
         .bind(response.resource_id())
         .bind(response.affected())
         .bind(response.outcome())
+        .bind(response.stop_reason())
         .execute(&mut **tx)
         .await?;
         Self::audit(
@@ -693,6 +718,14 @@ impl InternalActionStore {
         )
         .await?;
         Ok(())
+    }
+
+    fn unknown_event_intent(row: &sqlx::postgres::PgRow) -> UnknownEventIntent {
+        UnknownEventIntent {
+            intent_id: row.try_get("intent_id").unwrap_or_default(),
+            action: row.try_get("action").unwrap_or_default(),
+            created_at_utc: row.try_get("created_at_utc").unwrap_or_default(),
+        }
     }
 
     /// Read-only listing of `unknown` event intents for one guild, oldest
@@ -715,12 +748,51 @@ impl InternalActionStore {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|row| UnknownEventIntent {
-            intent_id: row.try_get("intent_id").unwrap_or_default(),
-            action: row.try_get("action").unwrap_or_default(),
-            created_at_utc: row.try_get("created_at_utc").unwrap_or_default(),
-        })
+        .map(|row| Self::unknown_event_intent(&row))
         .collect())
+    }
+
+    /// Bounded operator page over the same unknown event intents
+    /// `list_unknown_event_intents` reports, oldest first: at most `limit`
+    /// rows plus the total fenced count so `--list` can print its truncation
+    /// receipt. The limit clamps to `OPERATOR_LIST_MAX_LIMIT`. Never migrates,
+    /// never writes, never contacts Discord.
+    pub async fn list_unknown_event_intents_limited(
+        &self,
+        guild_id: &str,
+        limit: i64,
+    ) -> Result<(Vec<UnknownEventIntent>, i64), InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        // Page before counting, against the same WHERE clause: a row arriving
+        // between the two reads then prints a (converging) receipt instead of
+        // hiding behind a stale count, while a row resolved between them only
+        // stales already-shown rows — and the resolution re-checks its exact
+        // row under lock before writing.
+        let rows: Vec<UnknownEventIntent> = sqlx::query(
+            "SELECT intent_id, action, \
+             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at_utc \
+             FROM internal_idempotency \
+             WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
+             AND guild_id = $1 ORDER BY intent_id LIMIT $2",
+        )
+        .bind(guild_id)
+        .bind(limit.clamp(0, OPERATOR_LIST_MAX_LIMIT))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| Self::unknown_event_intent(&row))
+        .collect();
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM internal_idempotency \
+             WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
+             AND guild_id = $1",
+        )
+        .bind(guild_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((rows, total))
     }
 
     /// Operator resolution of one exact unknown event intent, in a single
@@ -857,9 +929,9 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code, resource_id, affected, outcome) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3, resource_id, affected, outcome \
+                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )
@@ -1003,6 +1075,7 @@ mod tests {
             resource_id: None,
             affected: 1,
             outcome: None,
+            stop_reason: None,
         };
         let failure = TerminalResponse::Failure(TerminalFailure::NoEffect);
         assert!(ReconciliationEvidence::DiscordConfirmedEffect.supports(&success));

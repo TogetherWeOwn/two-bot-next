@@ -704,7 +704,7 @@ async fn supervise_once<M: AuditMirror + Clone + 'static>(
     .await
     .expect("audit_retry ran once");
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
     finished
 }
 
@@ -833,4 +833,701 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
     }
     db.close().await.unwrap();
+}
+
+// ------------------------------------------- refresh coherence acceptance --
+// Protected acceptance suite: destination channels and the settings revision
+// must stay coherent under refresh. Written against the existing test surface
+// only (`refresh_channels_with`, `channels_for_test`, the live settings
+// channel); the implementation handoff must make these pass without editing
+// this section. No database, poller or Discord is involved.
+
+fn acceptance_row(key: &str, value: &str) -> SettingRow {
+    SettingRow {
+        guild_id: GUILD.to_owned(),
+        key: key.to_owned(),
+        value: json!(value),
+        version: 1,
+    }
+}
+
+/// Deterministic RED on the baseline: the settings writer republishes to live
+/// readers when the row set changes even at an unchanged revision
+/// (`changed` covers row count), so a refresh that skips solely because the
+/// revision matches its cache strands the previous destinations under the
+/// current revision, and every later current-publication call also skips.
+/// The outcome contract requires that call to repair the destinations to the
+/// currently published snapshot.
+#[test]
+fn acceptance_current_publication_refresh_repairs_destinations_at_reused_revision() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().audit.as_deref(), Some("4444"));
+
+    // Same revision, different published row set: this reaches live readers.
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![
+            acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "5555"),
+            acceptance_row("DISCORD_VOICE_LOG_CHANNEL_ID", "6666"),
+        ],
+    });
+    assert_eq!(live.revision(), 7);
+    runtime.refresh_channels_with(Some(&live));
+    let repaired = runtime.channels_for_test();
+    assert_eq!(
+        repaired.audit.as_deref(),
+        Some("5555"),
+        "a current-publication refresh must not skip needed repair when the \
+         cached revision already matches"
+    );
+    assert_eq!(repaired.voice.as_deref(), Some("6666"));
+    assert_eq!(repaired.moderation.as_deref(), Some(MOD_CH));
+
+    // Rows deleted again at the same revision: destinations fall back to the
+    // boot deployment values instead of stranding the last stored ones.
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(
+        runtime.channels_for_test(),
+        channels(),
+        "deleting every stored row hands destinations back to deployment"
+    );
+}
+
+/// Competing refreshes (record and sweep both reach refresh through the wired
+/// path) must converge: after they quiesce, one more refresh against the
+/// current publication leaves exactly that publication's destinations
+/// installed. A late completion of an older snapshot's refresh must never
+/// strand stale destinations that later calls then refuse to repair.
+#[test]
+fn acceptance_competing_refreshes_converge_to_current_publication() {
+    use std::sync::Barrier;
+
+    let (mut writer, live) = live_channel();
+    let runtime = Arc::new(unconnected_runtime(all_vars()));
+
+    for round in 0..600_u64 {
+        let old_audit = format!("{}", 100_000 + round * 2);
+        let new_audit = format!("{}", 100_001 + round * 2);
+        writer.publish(&SettingsSnapshot {
+            revision: (round * 2 + 1) as i64,
+            rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", &old_audit)],
+        });
+
+        // Three competitors refresh the older publication from a barrier
+        // release while this thread publishes and applies the newer one.
+        let barrier = Arc::new(Barrier::new(4));
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let (runtime, live, barrier) = (&runtime, &live, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    runtime.refresh_channels_with(Some(live));
+                });
+            }
+            barrier.wait();
+            writer.publish(&SettingsSnapshot {
+                revision: (round * 2 + 2) as i64,
+                rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", &new_audit)],
+            });
+            runtime.refresh_channels_with(Some(&live));
+        });
+
+        runtime.refresh_channels_with(Some(&live));
+        assert_eq!(
+            runtime.channels_for_test().audit.as_deref(),
+            Some(new_audit.as_str()),
+            "round {round}: destinations must converge to the current \
+             publication, never strand the older snapshot's channels"
+        );
+    }
+}
+
+/// Control: many concurrent refreshes of one unchanged publication are
+/// idempotent and keep the installed destinations exact.
+#[test]
+fn acceptance_concurrent_refresh_of_one_publication_is_idempotent() {
+    let (mut writer, live) = live_channel();
+    let runtime = Arc::new(unconnected_runtime(all_vars()));
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let (runtime, live) = (&runtime, &live);
+            scope.spawn(move || {
+                for _ in 0..50 {
+                    runtime.refresh_channels_with(Some(live));
+                }
+            });
+        }
+    });
+
+    let settled = runtime.channels_for_test();
+    assert_eq!(settled.audit.as_deref(), Some("4444"));
+    assert_eq!(settled.voice.as_deref(), Some(VOICE_CH));
+    assert_eq!(settled.moderation.as_deref(), Some(MOD_CH));
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), settled);
+}
+
+/// Control: a restored snapshot whose revision is numerically lower than the
+/// applied one is legitimate and must be applied — refresh must not grow a
+/// monotonic-only revision policy.
+#[test]
+fn acceptance_restored_lower_revision_snapshot_is_applied() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    writer.publish(&SettingsSnapshot {
+        revision: 9,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().audit.as_deref(), Some("4444"));
+
+    writer.publish(&SettingsSnapshot {
+        revision: 4,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "5555")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(
+        runtime.channels_for_test().audit.as_deref(),
+        Some("5555"),
+        "a restored lower-revision snapshot must reload, not be rejected"
+    );
+
+    // And forward again, so neither direction is treated as one-way.
+    writer.publish(&SettingsSnapshot {
+        revision: 9,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().audit.as_deref(), Some("4444"));
+}
+
+/// Controls: malformed last-good, blank-disable and deployment fallback keep
+/// their documented behavior under repeated current-publication refreshes,
+/// and each state can still be left by a later coherent publication.
+#[test]
+fn acceptance_malformed_blank_and_fallback_controls_hold() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    // No live reader at all: boot deployment destinations stand.
+    runtime.refresh_channels_with(None);
+    assert_eq!(runtime.channels_for_test(), channels());
+
+    // Malformed stored row: last good destinations stand, repeatedly.
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![acceptance_row(
+            "DISCORD_VOICE_LOG_CHANNEL_ID",
+            "not-a-snowflake",
+        )],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), channels());
+
+    // A later valid publication recovers from the malformed one.
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![acceptance_row("DISCORD_VOICE_LOG_CHANNEL_ID", "6666")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().voice.as_deref(), Some("6666"));
+
+    // Blanking every destination parks the mirror, repeatedly.
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![
+            acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", ""),
+            acceptance_row("DISCORD_VOICE_LOG_CHANNEL_ID", ""),
+            acceptance_row("DISCORD_MODERATION_LOG_CHANNEL_ID", ""),
+        ],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), AuditChannelIds::default());
+
+    // Deleting the blanking rows restores the deployment fallback.
+    writer.publish(&SettingsSnapshot {
+        revision: 4,
+        rows: vec![],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), channels());
+}
+
+// ----------------------------------------------- drain-report outcomes --
+
+/// `ScanBoundReached` and `Unclaimed` deliveries report through the outcome
+/// counter without quarantine: executes the bounded-scan arm of `log_report`
+/// and asserts the counter mapping.
+#[test]
+fn log_report_counts_scan_bound_reached_and_unclaimed() {
+    let report = DrainReport {
+        deliveries: vec![
+            (
+                "scan-bound-entry".to_owned(),
+                DeliverOutcome::ScanBoundReached,
+            ),
+            ("unclaimed-entry".to_owned(), DeliverOutcome::Unclaimed),
+        ],
+        failed: vec![],
+    };
+    let capture = sweep_log_capture();
+    let start = capture.text().len();
+    log_report(&report);
+    let logs = capture.text().split_off(start);
+    assert!(logs.contains("rows=2"), "report counts both rows");
+    assert!(
+        logs.contains("scan_bound_reached=1"),
+        "report counts the bound hit"
+    );
+    assert!(logs.contains("unclaimed=1"), "report counts the refusal");
+}
+
+// ------------------------------------------ protected cursor budget tests --
+
+/// Freeze wall time for the entire real job, including every SQL await. A
+/// runnable task prevents Tokio's idle-time advance while SQL is in flight.
+/// Only a deliberately pending history read parks that task, letting the
+/// actual scan/outer timers fire; cancelling the read makes it runnable again
+/// before checkpoint/release SQL. Neither deadline is replaced by a test seam.
+struct CursorReadClock {
+    runnable: watch::Sender<bool>,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl CursorReadClock {
+    fn pause() -> Self {
+        tokio::time::pause();
+        let (runnable, mut enabled) = watch::channel(true);
+        let driver = tokio::spawn(async move {
+            loop {
+                let run = *enabled.borrow_and_update();
+                if run {
+                    tokio::task::yield_now().await;
+                } else if enabled.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self { runnable, driver }
+    }
+}
+
+impl Drop for CursorReadClock {
+    fn drop(&mut self) {
+        self.driver.abort();
+        tokio::time::resume();
+    }
+}
+
+/// Drop runs inside the real history timeout, before the service starts SQL.
+/// Waking the parked driver here forbids another automatic clock jump during
+/// that SQL, even if the database takes longer than the checkpoint reserve.
+struct CursorHistoryWait(watch::Sender<bool>);
+
+impl CursorHistoryWait {
+    fn new(runnable: watch::Sender<bool>) -> Self {
+        runnable.send_replace(false);
+        Self(runnable)
+    }
+}
+
+impl Drop for CursorHistoryWait {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+#[derive(Default)]
+struct PacedHistory {
+    scanning: bool,
+    shared_batch: bool,
+    clock: Option<watch::Sender<bool>>,
+    requests: Vec<(String, Option<String>)>,
+    markers: HashMap<String, MirrorMessage>,
+}
+
+#[derive(Clone, Default)]
+struct PacedCursorMirror {
+    history: Arc<Mutex<PacedHistory>>,
+    posts: Arc<Mutex<Vec<String>>>,
+}
+
+impl AuditMirror for PacedCursorMirror {
+    async fn post_mirror_checked<Fut, E>(
+        &self,
+        channel: &str,
+        _content: &str,
+        _nonce: &str,
+        authorize: Fut,
+    ) -> Result<Result<String, MirrorError>, E>
+    where
+        Fut: std::future::Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        authorize.await?;
+        self.posts.lock().unwrap().push(channel.to_owned());
+        Ok(Err(MirrorError::Uncertain(
+            "accepted but timed out".to_owned(),
+        )))
+    }
+
+    async fn channel_document(&self, channel: &str) -> Result<MirrorChannel, MirrorError> {
+        assert!([AUDIT_CH, VOICE_CH].contains(&channel));
+        Ok(private_document())
+    }
+
+    async fn channel_history(&self, channel: &str, before: Option<&str>, limit: u8) -> PageResult {
+        assert_eq!(limit, 100);
+        let (shared, clock) = {
+            let mut history = self.history.lock().unwrap();
+            history
+                .requests
+                .push((channel.to_owned(), before.map(str::to_owned)));
+            if !history.scanning {
+                return Ok(vec![]);
+            }
+            if let Some(marker) = history.markers.get(channel) {
+                return Ok(vec![marker.clone()]);
+            }
+            (history.shared_batch, history.clock.clone().unwrap())
+        };
+        let newest = match channel {
+            AUDIT_CH => 900_000_u64,
+            VOICE_CH => 800_000,
+            _ => panic!("unexpected synthetic channel"),
+        };
+        let top = before.map_or(newest, |id| id.parse::<u64>().unwrap() - 1);
+        let page = (newest - top) / 100;
+        let stall = if shared {
+            channel == VOICE_CH && page == 1
+        } else {
+            page == 10
+        };
+        if stall {
+            // Auto-advance is safe only while this read is pending: there is
+            // no SQL until its actual deadline cancels it. Without the reserve
+            // (or the shared budget), the real outer timeout cancels the job.
+            let _wait = CursorHistoryWait::new(clock);
+            return std::future::pending().await;
+        }
+        if page < 10 || channel == VOICE_CH {
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        Ok((0..100_u64)
+            .map(|offset| MirrorMessage {
+                id: (top - offset).to_string(),
+                author_id: "1234".to_owned(),
+                content: "unrelated channel noise".to_owned(),
+            })
+            .collect())
+    }
+}
+
+fn paced_runtime(
+    pool: &PgPool,
+    mirror: &PacedCursorMirror,
+) -> Arc<AuditRuntime<PacedCursorMirror>> {
+    let (pool, mirror) = (pool.clone(), mirror.clone());
+    Arc::new(
+        AuditRuntime::new(
+            all_vars(),
+            GUILD.to_owned(),
+            Box::new(move || {
+                let parts = Parts {
+                    pool: pool.clone(),
+                    mirror: mirror.clone(),
+                    bot_user_id: BOT.to_owned(),
+                };
+                Box::pin(async move { Ok(parts) })
+            }),
+        )
+        .unwrap(),
+    )
+}
+
+async fn cursor_budget_case(shared: bool, delay_halt: bool) {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("guarded test bootstrap required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create disposable runtime cursor fixture");
+    let mirror = PacedCursorMirror::default();
+    let runtime = paced_runtime(db.pool(), &mirror);
+    let mut entries = vec![("paced-audit", AUDIT_CH, event("paced-audit"))];
+    if shared {
+        let mut voice = event("paced-voice");
+        voice.kind = AuditKind::VoiceJoin;
+        voice.channel = two_bot_core::audit::AuditChannel::Voice;
+        entries.push(("paced-voice", VOICE_CH, voice));
+    }
+    for (_, channel, event) in &entries {
+        assert_eq!(
+            runtime.record(event).await.unwrap(),
+            RecordOutcome::Queued {
+                mirror_channel_id: (*channel).to_owned()
+            }
+        );
+    }
+    let seeded = drained(&runtime).await;
+    assert_eq!(seeded.len(), entries.len());
+    assert!(seeded
+        .iter()
+        .all(|(_, result)| *result == DeliverOutcome::Ambiguous));
+    let store = AuditStore::new(db.pool());
+    let mut originals = Vec::new();
+    for (entry, _, _) in &entries {
+        originals.push(store.get(entry).await.unwrap().unwrap());
+        sqlx::query("UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() - interval '1 second' WHERE entry_id = $1")
+            .bind(entry).execute(db.pool()).await.unwrap();
+    }
+    // A later fresh row is not even claimed once the shared deadline has
+    // elapsed. Its entire authoritative row must remain untouched.
+    let untouched =
+        if shared {
+            runtime.record(&event("after-budget")).await.unwrap();
+            Some(sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(a) FROM operational_audit_log a WHERE entry_id = 'after-budget'",
+        ).fetch_one(db.pool()).await.unwrap())
+        } else {
+            None
+        };
+    // The delayed variant holds only this disposable fixture's halt table.
+    // A real, successful server-side wait releases it below, within the
+    // fixture's five-second statement allowance; no production seam changes.
+    let halt_lock = if delay_halt {
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("LOCK TABLE audit_kill_switch IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        Some(tx)
+    } else {
+        None
+    };
+    let clock = CursorReadClock::pause();
+    {
+        let mut history = mirror.history.lock().unwrap();
+        history.scanning = true;
+        history.shared_batch = shared;
+        history.requests.clear();
+        history.clock = Some(clock.runnable.clone());
+    }
+    let (_stop, shutdown) = watch::channel(false);
+    let job = retry_job(runtime.clone(), shutdown, Duration::ZERO);
+    // Same timeout wrapper as the production supervisor, using the actual
+    // retry_job action -> runtime sweep -> service drain_pending path.
+    let sweep = tokio::time::timeout(job.timeout, (job.action)());
+    let outcome = if let Some(mut tx) = halt_lock {
+        let started = tokio::time::Instant::now();
+        let (outcome, ()) = tokio::join!(
+            biased;
+            sweep,
+            async {
+                sqlx::query("SELECT pg_sleep(1.5)")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    tokio::time::Instant::now(), started,
+                    "successful SQL wall time must not consume the logical budget"
+                );
+                assert!(mirror.history.lock().unwrap().requests.is_empty());
+                tx.rollback().await.unwrap();
+            }
+        );
+        outcome
+    } else {
+        sweep.await
+    };
+    drop(clock);
+    let requests = mirror.history.lock().unwrap().requests.clone();
+    let mut bounded = Vec::new();
+    for (entry, _, _) in &entries {
+        let row = store.get(entry).await.unwrap().unwrap();
+        let released: bool = sqlx::query_scalar("SELECT delivery_state = 'pending' AND delivery_claim_token IS NULL AND delivery_lease_until IS NULL FROM operational_audit_log WHERE entry_id = $1")
+            .bind(entry).fetch_one(db.pool()).await.unwrap();
+        bounded.push((row, released));
+        // Also permit observation of restart behavior on the broken baseline;
+        // release itself was already captured above, not repaired as evidence.
+        sqlx::query("UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() - interval '1 second' WHERE entry_id = $1 AND delivery_lease_until IS NOT NULL")
+            .bind(entry).execute(db.pool()).await.unwrap();
+    }
+    let untouched_after = if shared {
+        let after = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(a) FROM operational_audit_log a WHERE entry_id = 'after-budget'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        // Hold this fixture row out of the independent restart below. The
+        // comparison captures the production sweep before this test-only claim.
+        let _held = store.claim("after-budget").await.unwrap();
+        Some(after)
+    } else {
+        None
+    };
+    drop((job, runtime));
+    let peer = db.independent_pool().await.unwrap();
+    {
+        let mut history = mirror.history.lock().unwrap();
+        history.requests.clear();
+        history.markers.insert(
+            AUDIT_CH.to_owned(),
+            marked(
+                if shared { "898400" } else { "899000" },
+                &event("paced-audit"),
+            ),
+        );
+        if shared {
+            let mut voice = event("paced-voice");
+            voice.kind = AuditKind::VoiceJoin;
+            voice.channel = two_bot_core::audit::AuditChannel::Voice;
+            history
+                .markers
+                .insert(VOICE_CH.to_owned(), marked("799900", &voice));
+        }
+    }
+    let restarted = paced_runtime(&peer, &mirror);
+    let recovered = drained(&restarted).await;
+    let restart_requests = mirror.history.lock().unwrap().requests.clone();
+    let posts = mirror.posts.lock().unwrap().clone();
+    drop(restarted);
+    peer.close().await;
+    db.close().await.unwrap();
+
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "sweep must checkpoint before outer cancellation: {outcome:?}"
+    );
+    assert!(
+        untouched_after == untouched,
+        "deadline must prevent starting a later row"
+    );
+    let audit_pages = if shared { 16 } else { 11 };
+    let mut expected: Vec<_> = (0..audit_pages)
+        .map(|n| {
+            (
+                AUDIT_CH.to_owned(),
+                if n == 0 {
+                    None
+                } else {
+                    Some((900_001 - n * 100).to_string())
+                },
+            )
+        })
+        .collect();
+    if shared {
+        expected.extend([
+            (VOICE_CH.to_owned(), None),
+            (VOICE_CH.to_owned(), Some("799901".to_owned())),
+        ]);
+    }
+    assert_eq!(
+        requests, expected,
+        "only completed pages can advance the cursor"
+    );
+    let audit_floor = if shared { "898401" } else { "899001" };
+    let mut expected_restart = vec![(AUDIT_CH.to_owned(), Some(audit_floor.to_owned()))];
+    if shared {
+        expected_restart.push((VOICE_CH.to_owned(), Some("799901".to_owned())));
+    }
+    assert_eq!(
+        restart_requests, expected_restart,
+        "independent owners resume at the exact saved floors"
+    );
+    for (n, (row, released)) in bounded.iter().enumerate() {
+        assert!(
+            *released,
+            "bounded scan must release before the outer timeout"
+        );
+        assert_eq!(
+            row.reconcile_before.as_deref(),
+            Some(if n == 0 { audit_floor } else { "799901" })
+        );
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.search_before, originals[n].search_before);
+        assert_eq!(row.nonce, originals[n].nonce);
+        assert_eq!(row.attempted_at, originals[n].attempted_at);
+    }
+    assert_eq!(
+        posts,
+        entries
+            .iter()
+            .map(|(_, channel, _)| (*channel).to_owned())
+            .collect::<Vec<_>>(),
+        "reconcile cannot POST again"
+    );
+    assert_eq!(recovered.len(), entries.len());
+    for (entry, result) in recovered {
+        let id = if entry == "paced-voice" {
+            "799900"
+        } else if shared {
+            "898400"
+        } else {
+            "899000"
+        };
+        assert_eq!(
+            result,
+            DeliverOutcome::Reconciled {
+                message_id: id.to_owned()
+            }
+        );
+    }
+}
+
+/// Default 30-second reconcile scanning must yield before the production
+/// 25-second job timeout; otherwise ten validated pages are lost on cancel.
+#[tokio::test]
+async fn retry_job_checkpoints_progress_before_its_production_timeout() {
+    cursor_budget_case(false, false).await;
+}
+
+/// A 20-second first row consumes the same sweep budget as the later row.
+/// Giving each row a fresh timeout loses the later row's validated floor.
+#[tokio::test]
+async fn retry_job_later_rows_share_the_remaining_sweep_budget() {
+    cursor_budget_case(true, false).await;
+}
+
+/// A successful 1.5-second halt-table wait must not alter either exact page
+/// sequence, saved cursor, restart, untouched-row or single-POST observation.
+#[tokio::test]
+async fn retry_job_cursor_budget_excludes_successful_sql_wall_time() {
+    for shared in [false, true] {
+        cursor_budget_case(shared, true).await;
+    }
+}
+
+#[tokio::test]
+async fn cursor_budget_clock_restores_time_when_its_action_is_cancelled() {
+    let (ready, wait) = tokio::sync::oneshot::channel();
+    let action = tokio::spawn(async move {
+        let clock = CursorReadClock::pause();
+        let _wait = CursorHistoryWait::new(clock.runnable.clone());
+        ready.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    wait.await.unwrap();
+    action.abort();
+    assert!(action.await.unwrap_err().is_cancelled());
+    // pause() would panic if cancellation had left the runtime clock paused.
+    drop(CursorReadClock::pause());
 }

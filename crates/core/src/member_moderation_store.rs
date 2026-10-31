@@ -152,12 +152,135 @@ impl PgMemberModerationStore {
         }
         Ok(())
     }
+
+    fn uncertain_row(row: &sqlx::postgres::PgRow) -> Result<UncertainRow, StoreError> {
+        let kind = match row.try_get::<String, _>("kind").map_err(db_error)?.as_str() {
+            "prepared_ban" => UncertainKind::PreparedBan,
+            "quarantined_unban" => UncertainKind::QuarantinedUnban,
+            _ => UncertainKind::RunningUnban,
+        };
+        Ok(UncertainRow {
+            request_id: row.try_get("request_id").map_err(db_error)?,
+            user_id: row.try_get("user_id").map_err(db_error)?,
+            kind,
+            generation: row.try_get("generation").map_err(db_error)?,
+            execute_at: row.try_get("execute_at").map_err(db_error)?,
+        })
+    }
+
+    /// Read-only staff inventory, not the operator uncertainty query or due-job
+    /// claim path. SQL owns ordering and the page-plus-one materialization bound.
+    pub async fn saved_expiries(
+        &self,
+        guild_id: &str,
+        page: crate::tempban_inventory::ExpiryPage,
+    ) -> Result<Vec<crate::tempban_inventory::SavedExpiry>, StoreError> {
+        use crate::tempban_inventory::{ExpiryState, SavedExpiry, PAGE_SIZE};
+
+        self.ensure_guild(guild_id)?;
+        let rows = sqlx::query(
+            "SELECT request_id, user_id, FLOOR(EXTRACT(EPOCH FROM execute_at))::bigint AS execute_at,
+               state, dispatch_uncertain, execute_at <= CURRENT_TIMESTAMP AS due
+             FROM moderation_scheduled_unbans AS expiry
+             WHERE guild_id = $1 AND state IN ('pending', 'staged', 'running', 'quarantined')
+             ORDER BY expiry.execute_at, request_id COLLATE \"C\"
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(&self.guild_id)
+        .bind((PAGE_SIZE + 1) as i64)
+        .bind(page.offset())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let state = match row
+                    .try_get::<String, _>("state")
+                    .map_err(db_error)?
+                    .as_str()
+                {
+                    "pending" => ExpiryState::Pending,
+                    "staged" => ExpiryState::Staged,
+                    "running" => ExpiryState::Running,
+                    "quarantined" => ExpiryState::Quarantined,
+                    _ => return Err(StoreError::new("unknown saved expiry state")),
+                };
+                Ok(SavedExpiry {
+                    request_id: row.try_get("request_id").map_err(db_error)?,
+                    user_id: row.try_get("user_id").map_err(db_error)?,
+                    execute_at: row.try_get("execute_at").map_err(db_error)?,
+                    state,
+                    dispatch_uncertain: row.try_get("dispatch_uncertain").map_err(db_error)?,
+                    due: row.try_get("due").map_err(db_error)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Bounded operator page over the same fenced rows `surface_uncertain`
+    /// reports, oldest request first: at most `limit` rows plus the total
+    /// fenced count so `--list` can print its truncation receipt. The limit
+    /// clamps to `OPERATOR_LIST_MAX_LIMIT`. Identifiers only, tokens never.
+    pub async fn surface_uncertain_limited(
+        &self,
+        guild_id: &str,
+        limit: i64,
+    ) -> Result<(Vec<UncertainRow>, i64), StoreError> {
+        self.ensure_guild(guild_id)?;
+        // Page before counting, against the same UNION ALL: a row arriving
+        // between the two reads then prints a (converging) receipt instead of
+        // hiding behind a stale count, while a row resolved between them only
+        // stales already-shown rows — and every resolution re-checks its
+        // exact row under lock before writing.
+        let rows = sqlx::query(
+            "SELECT request_id, user_id, generation, NULL::text AS execute_at,
+               'prepared_ban' AS kind
+             FROM moderation_member_bans WHERE guild_id = $1 AND state = 'prepared'
+             UNION ALL
+             SELECT request_id, user_id, retry_generation AS generation,
+               execute_at::text AS execute_at,
+               CASE WHEN state = 'quarantined' THEN 'quarantined_unban'
+                 ELSE 'running_unban' END AS kind
+             FROM moderation_scheduled_unbans WHERE guild_id = $1
+               AND (state = 'running' OR dispatch_uncertain OR state = 'quarantined')
+             ORDER BY 1 LIMIT $2",
+        )
+        .bind(&self.guild_id)
+        .bind(limit.clamp(0, OPERATOR_LIST_MAX_LIMIT))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (
+               SELECT request_id FROM moderation_member_bans
+               WHERE guild_id = $1 AND state = 'prepared'
+               UNION ALL
+               SELECT request_id FROM moderation_scheduled_unbans
+               WHERE guild_id = $1
+                 AND (state = 'running' OR dispatch_uncertain OR state = 'quarantined')
+             ) AS fenced",
+        )
+        .bind(&self.guild_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let mut uncertain = Vec::with_capacity(rows.len());
+        for row in &rows {
+            uncertain.push(Self::uncertain_row(row)?);
+        }
+        Ok((uncertain, total))
+    }
 }
 
 // The request id is already owned by a durable non-rejected intent: the
 // request itself is fenced, never safe to retry under the same key.
 const REQUEST_ID_IN_USE: &str = "ban request id is already in use";
 const UNBAN_REQUEST_ID_IN_USE: &str = "unban request id is already in use";
+
+// Operator `--list` page: the default rows per listing and the ceiling an
+// explicit `--limit` clamps to. The reconcile-member CLI documents both.
+pub const OPERATOR_LIST_DEFAULT_LIMIT: i64 = 25;
+pub const OPERATOR_LIST_MAX_LIMIT: i64 = 100;
 
 // Never log SQL parameter values or database DETAIL (which can contain a
 // moderator's reason). The SQLSTATE is enough to diagnose a ledger failure.
@@ -255,6 +378,32 @@ impl MemberModerationStore for PgMemberModerationStore {
         Ok(ClaimState::InFlight)
     }
 
+    async fn completed_outcome(
+        &self,
+        guild_id: &str,
+        key: &str,
+        hash: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.ensure_guild(guild_id)?;
+        let row = sqlx::query(
+            "SELECT outcome FROM moderation_idempotency
+             WHERE guild_id = $1 AND idempotency_key = $2
+               AND request_hash = $3 AND state = 'done'",
+        )
+        .bind(&self.guild_id)
+        .bind(key)
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?;
+        row.map(|row| {
+            row.try_get::<Option<String>, _>("outcome")
+                .map_err(db_error)?
+                .ok_or_else(|| StoreError::new("completed claim has no outcome"))
+        })
+        .transpose()
+    }
+
     async fn complete(
         &self,
         guild_id: &str,
@@ -304,7 +453,11 @@ impl MemberModerationStore for PgMemberModerationStore {
             "INSERT INTO moderation_audit
              (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
               outcome, idempotency_key, metadata_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, NOW())
+             SELECT $1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, NOW()
+             WHERE NOT EXISTS (
+               SELECT 1 FROM moderation_audit
+               WHERE guild_id = $2 AND request_id = $10
+             )
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(&row.request_id)
@@ -316,6 +469,12 @@ impl MemberModerationStore for PgMemberModerationStore {
         .bind(row.outcome)
         .bind(&row.idempotency_key)
         .bind(&row.metadata_json)
+        // Preserve accepted-effect evidence when only completion is uncertain.
+        .bind(
+            (row.outcome == "in_progress")
+                .then(|| row.request_id.strip_suffix(":in_progress"))
+                .flatten(),
+        )
         .execute(&self.pool)
         .await
         .map_err(db_error)?;
@@ -619,6 +778,10 @@ impl MemberModerationStore for PgMemberModerationStore {
         limit: i64,
     ) -> Result<Vec<UnbanJob>, StoreError> {
         self.ensure_guild(guild)?;
+        // Both phases honor the same bound. Activate earliest expiries first
+        // so future rows cannot consume a limit-one pass and stop the sweep
+        // while due rows remain staged. Equal expiries take oldest intents
+        // first; candidate dispatch keeps its generation/retry ordering.
         let staged = sqlx::query(
             "SELECT job.request_id, job.user_id FROM moderation_scheduled_unbans AS job
              JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
@@ -636,9 +799,10 @@ impl MemberModerationStore for PgMemberModerationStore {
                    AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
                      OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                )
-             ORDER BY intent.generation DESC",
+             ORDER BY job.execute_at ASC, intent.generation ASC, job.request_id ASC LIMIT $2",
         )
         .bind(&self.guild_id)
+        .bind(limit.clamp(0, 25))
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
@@ -788,19 +952,8 @@ impl MemberModerationStore for PgMemberModerationStore {
         .await
         .map_err(db_error)?;
         let mut uncertain = Vec::with_capacity(rows.len());
-        for row in rows {
-            let kind = match row.try_get::<String, _>("kind").map_err(db_error)?.as_str() {
-                "prepared_ban" => UncertainKind::PreparedBan,
-                "quarantined_unban" => UncertainKind::QuarantinedUnban,
-                _ => UncertainKind::RunningUnban,
-            };
-            uncertain.push(UncertainRow {
-                request_id: row.try_get("request_id").map_err(db_error)?,
-                user_id: row.try_get("user_id").map_err(db_error)?,
-                kind,
-                generation: row.try_get("generation").map_err(db_error)?,
-                execute_at: row.try_get("execute_at").map_err(db_error)?,
-            });
+        for row in &rows {
+            uncertain.push(Self::uncertain_row(row)?);
         }
         Ok(uncertain)
     }

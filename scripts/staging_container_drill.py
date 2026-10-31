@@ -36,8 +36,10 @@ Fail-closed rules, each pinned by scripts/test_staging_container_drill.py:
   leg is skipped, never retried with another credential.
 - Readiness requires every `/readyz` component `ready` (process AND gateway
   plus database) on the exact Worker version, revision and build id, with a
-  converged full_auto rollout and the application listing pointing at the
-  intended image. A converged rollout alone is not readiness.
+  converged or steady-state active_lag full_auto rollout (mirroring
+  `staging_rollout.verify`) and the application listing pointing at the
+  intended image. An accepted rollout alone is not readiness, and a wait
+  failure keeps its timeline plus the last observation in the leg evidence.
 - Exactly one gateway session per leg is witnessed, never assumed: the
   drill records a temporally complete probe timeline (baseline ready,
   teardown gap, first ready on the target, confirmation probes) and folds in
@@ -69,6 +71,27 @@ from staging_rollback_drill import ownership_control  # noqa: E402
 
 GateError = rollout.GateError
 require = rollout.require
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 WORKER = rollout.WORKER
 APPLICATION = rollout.APPLICATION
 CLASS = rollout.CLASS
@@ -87,7 +110,14 @@ READY_BUDGET_SECONDS = 60
 READY_TIMEOUT_SECONDS = 300
 POLL_SECONDS = 5
 CONFIRM_PROBES = 2
-STALE_IMAGE_POLLS = 3
+# Polls tolerated while an accepted rollout's target image is not yet
+# reflected by the application listing. Mirrors
+# `staging_rollout.APPLICATION_IMAGE_STALE_POLLS`: the listing is read
+# separately from the rollout record and can trail it right after a deploy
+# (run-8: backout accepted active_lag, listing trailed 3+ polls, drill failed
+# `application_image_drift` with probes=0 on a stale budget). Single-sourced
+# so the two gates cannot drift apart again.
+STALE_IMAGE_POLLS = rollout.APPLICATION_IMAGE_STALE_POLLS
 WRANGLER_TIMEOUT_SECONDS = 600
 
 
@@ -115,10 +145,11 @@ class ContainerDrillClient(rollout.Client):
         except HTTPError as error:
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY))
+                envelope = json.loads(error.read(rollout.MAX_BODY),
+                                        object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
-            except (OSError, ValueError, AttributeError, TypeError):
+            except (OSError, ValueError, AttributeError, TypeError, RecursionError):
                 pass
             raise GateError("api_http_failure",
                             f"status={error.code} codes={','.join(codes) or 'none'}") from None
@@ -271,7 +302,9 @@ def validate_attestation(text):
     if text is None or text == "":
         return None
     try:
-        raw = json.loads(text)
+        raw = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise GateError("invalid_session_attestation") from None
     except ValueError:
         raise GateError("invalid_session_attestation") from None
     require(isinstance(raw, dict), "invalid_session_attestation")
@@ -309,6 +342,13 @@ class Drill:
         self.auth_failed = False
         self.evidence = {"worker": WORKER, "application": APPLICATION,
                          "budget_seconds": READY_BUDGET_SECONDS}
+        # Last wait_ready snapshot, kept so a ready_timeout (or any other
+        # wait failure) can leave the timeline plus the last observation in
+        # the leg evidence instead of discarding them. Secret-safe by
+        # construction: ISO times, integers and booleans plus a fixed
+        # vocabulary observation string only.
+        self._last_wait_timeline = []
+        self._last_wait_observation = ""
 
     # -- primitives ---------------------------------------------------------
     def owner(self, state):
@@ -320,7 +360,7 @@ class Drill:
         self.log(f"{name} {iso(moment)}")
         return moment
 
-    def deploy_image(self, image, label):
+    def deploy_image(self, image, label, source_sha):
         """Full-container deploy of the pinned pre-built image, no rebuild.
 
         The deploy config is generated from the reviewed `wrangler.toml` on
@@ -328,16 +368,41 @@ class Drill:
         registry reference (Cloudflare docs: for a registry image
         `wrangler deploy` uses the configured reference without building).
         Old source is never checked out and no Dockerfile is rebuilt.
+        The version is stamped with the pinned source SHA (`--message`) so
+        the drill leg keeps its provenance receipt.
         Wrangler's own output may carry paths or gleamed config, so it is
         discarded: only the exit code and duration are recorded.
         """
         generate_deploy_config(self.deploy_path, image, self.wrangler_dir)
         started = self.now()
-        returncode = self.deploy(self.deploy_path)
+        returncode = self.deploy(self.deploy_path, source_sha)
         elapsed = round(self.now() - started, 1)
         require(returncode == 0, "deploy_failed",
                 f"elapsed={elapsed} code={returncode}")
         return self.stamp(f"{label}: deployed"), elapsed
+
+    def _snapshot_wait(self, pinned, probes, status, accepted, timeline):
+        """Remember the wait timeline plus the last observation for evidence.
+
+        Only ISO times, integer statuses and booleans reach the snapshot;
+        the observation names the probe counts, the last `/readyz` status,
+        whether a new rollout was pinned (allowlisted id or none) and
+        whether its shape was accepted, so probes=0 separates a missing
+        rollout from an unconverged one.
+        """
+        pinned_label = "none"
+        if pinned is not None:
+            try:
+                pinned_label = rollout.identifier(pinned.get("id"))
+            except GateError:
+                pinned_label = "unrecognized"
+        self._last_wait_timeline = [[iso(moment), poll_status, gateway,
+                                     version, shape]
+                                    for (moment, poll_status, gateway,
+                                         version, shape) in timeline]
+        self._last_wait_observation = (
+            f"probes={probes} last_readyz={status} pinned={pinned_label} "
+            f"rollout_accepted={accepted}")
 
     def wait_ready(self, worker, revision, build_id, image, deployed,
                    expect_rollout=True):
@@ -346,12 +411,21 @@ class Drill:
         Returns (first ready time, probe counts, timeline). The timeline is
         the temporally complete in-band half of the session witness: every
         poll records its UTC time, `/readyz` status, gateway state, version
-        agreement and rollout convergence with no bodies or identifiers.
+        agreement and rollout acceptance with no bodies or identifiers.
+
+        Mirrors `staging_rollout.verify`: a `completed` rollout in either the
+        strict converged shape or the steady-state active_lag shape is
+        accepted for exact-version probing (the post-ready confirmation
+        still requires consecutive agreeing probes). Every poll updates the
+        wait snapshot so a failure preserves the timeline plus the last
+        observation in the leg evidence.
         """
         deadline = deployed + READY_TIMEOUT_SECONDS
         pinned, stale = None, 0
         probes = non_200 = 0
         timeline = []
+        self._last_wait_timeline = []
+        self._last_wait_observation = ""
         while True:
             app = rollout.application(self.client)
             if pinned is None and expect_rollout:
@@ -360,6 +434,7 @@ class Drill:
                 candidates = [rollout.mapping(row) for row in rows
                               if row.get("id") not in baseline_ids
                               and rollout_image(rollout.mapping(row)) == image]
+                self._snapshot_wait(pinned, probes, 0, False, timeline)
                 require(len(candidates) <= 1, "ambiguous_new_rollout")
                 pinned = candidates[0] if candidates else None
             if pinned is None and not expect_rollout:
@@ -384,12 +459,14 @@ class Drill:
                     moment = self.stamp("ready")
                     return (moment, {"probes": probes, "non_200_readyz": non_200},
                             timeline)
+                self._snapshot_wait(pinned, probes, status, False, timeline)
                 require(self.now() < deadline, "ready_timeout",
                         f"probes={probes} last_readyz={status}")
                 self.sleep(POLL_SECONDS)
                 continue
             status = health = 0
-            gateway_ready = version_ok = converged_now = False
+            gateway_ready = version_ok = False
+            accepted_now = False
             if pinned is not None:
                 row = rollout.mapping(self.client.api(
                     f"/containers/applications/{app['id']}/rollouts/"
@@ -397,11 +474,16 @@ class Drill:
                 require(row.get("id") == pinned["id"], "rollout_identity_drift")
                 target = rollout.number(row.get("target_version"))
                 converged_now = rollout.converged(row, image, target)
+                lag_now = (False if converged_now
+                           else rollout.active_lag(row, image, target))
+                accepted_now = converged_now or lag_now
                 listing = rollout.mapping(app.get("configuration")).get("image")
-                if converged_now and listing != image:
+                if accepted_now and listing != image:
                     stale += 1
+                    self._snapshot_wait(pinned, probes, status, accepted_now,
+                                        timeline)
                     require(stale <= STALE_IMAGE_POLLS, "application_image_drift")
-                elif converged_now:
+                elif accepted_now:
                     stale = 0
                     rollout.active_worker(self.client, worker)
                     status, health, headers, report = probe_report(self.client, self.url)
@@ -427,7 +509,8 @@ class Drill:
                                      "non_200_readyz": non_200},
                                     timeline)
                         version_ok = False  # confirmation disagreed: keep polling
-            timeline.append((self.now(), status, gateway_ready, version_ok, converged_now))
+            timeline.append((self.now(), status, gateway_ready, version_ok, accepted_now))
+            self._snapshot_wait(pinned, probes, status, accepted_now, timeline)
             require(self.now() < deadline, "ready_timeout",
                     f"probes={probes} last_readyz={status}")
             self.sleep(POLL_SECONDS)
@@ -541,8 +624,18 @@ class Drill:
             self.control("fence", self.owner(state).get("epoch"))
         fenced = self.stamp(f"{name}: fenced")
         leg["fenced"] = iso(fenced)
-        if serving_image(self.client, rollout.application(self.client)) != pin["image"]:
-            deployed, deploy_elapsed = self.deploy_image(pin["image"], name)
+        try:
+            current = serving_image(self.client, rollout.application(self.client))
+        except GateError as error:
+            if name != "restore" or str(error) != "application_image_drift":
+                raise
+            # Run-8: the backout leg left the listing drifted (rollout
+            # accepted, listing trailed), so a fail-closed read would skip the
+            # restore deploy and leave staging on the backout image. Deploy
+            # the baseline then verify instead.
+            current = None
+        if current != pin["image"]:
+            deployed, deploy_elapsed = self.deploy_image(pin["image"], name, pin["source_sha"])
             expect_rollout = True
         else:
             # Restore after a refused backout deploy: the baseline still serves.
@@ -554,9 +647,19 @@ class Drill:
         taken = self.stamp(f"{name}: ownership taken")
         leg["takeover"] = iso(taken)
         target_worker = serving_version(self.client)
-        first_ready, counts, timeline = self.wait_ready(
-            target_worker, pin["source_sha"], pin["build_id"], pin["image"], deployed,
-            expect_rollout)
+        try:
+            first_ready, counts, timeline = self.wait_ready(
+                target_worker, pin["source_sha"], pin["build_id"], pin["image"],
+                deployed, expect_rollout)
+        except GateError:
+            # Keep the wait timeline plus the last observation in the leg
+            # evidence so a timeout distinguishes a missing rollout
+            # (pinned=none) from an unconverged one (probes=0 with a pinned
+            # rollout). Secret-safe: the snapshot holds ISO times, integers
+            # and booleans plus fixed-vocabulary text only.
+            leg["wait_timeline"] = list(self._last_wait_timeline)
+            leg["last_observation"] = self._last_wait_observation
+            raise
         leg.update({"serving_worker_version": target_worker,
                     "first_ready": iso(first_ready),
                     "time_to_ready_seconds": round(first_ready - deployed, 1),
@@ -690,13 +793,18 @@ WRANGLER_ENV_KEYS = ("PATH", "HOME", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT
 
 
 def wrangler_deploy(wrangler_bin, wrangler_dir, environ):
-    """Deploy closure: pinned wrangler binary, discarded output, exit code only."""
+    """Deploy closure: pinned wrangler binary, discarded output, exit code only.
+
+    The deployed version is stamped with the pinned source SHA (`--message`)
+    so the drill leg keeps its provenance receipt.
+    """
     child_env = {key: environ[key] for key in WRANGLER_ENV_KEYS if key in environ}
 
-    def deploy(config_path):
+    def deploy(config_path, message_sha):
         try:
             result = subprocess.run(
-                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging"],
+                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging",
+                 "--message", message_sha],
                 cwd=wrangler_dir, env=child_env, capture_output=True,
                 timeout=WRANGLER_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError):
@@ -744,6 +852,43 @@ def summary(evidence, failures):
     return "\n".join(lines) + "\n"
 
 
+def dry_run_plan(drill, pin):
+    """Validate like the live path, print the ordered plan, mutate nothing.
+
+    Runs the same preflight the live legs run (reads only: application,
+    deployments, serving image, rollouts, worker namespace, singleton
+    status, baseline readiness), so every invalid pin or input refuses
+    with the identical code before any change. On success prints the
+    fixed-vocabulary plan and exits 0 without deploying, fencing, taking
+    over, or writing evidence.
+    """
+    try:
+        baseline = drill.preflight(pin)
+    except GateError as error:
+        drill.failed("drill", error)
+        return 1
+    except Exception:  # No traceback: it may carry request data.
+        drill.failed("drill", GateError("unexpected_error"))
+        return 1
+    print("\n".join([
+        "staging container drill dry-run plan",
+        f"backout source_sha: {pin['source_sha']}",
+        f"backout build_id: {pin['build_id']}",
+        f"backout image: {pin['image']}",
+        f"backout worker_version: {pin['worker_version']}",
+        f"backout rollout_id: {pin['rollout_id']}",
+        f"baseline worker_version: {baseline['worker_version']}",
+        f"baseline image: {baseline['image']}",
+        "legs in order:",
+        f"1. drill: fence singleton, deploy {pin['image']}, "
+        f"takeover to {pin['worker_version']}, wait converged ready",
+        f"2. restore: fence singleton, deploy {baseline['image']}, "
+        f"takeover to {baseline['worker_version']}, wait converged ready",
+        "mutations: none (plan only; no deploy, no fence, no takeover)",
+    ]))
+    return 0
+
+
 def main(argv=None, *, environ=None, make_control=ownership_control,
          client_factory=ContainerDrillClient, deploy_factory=wrangler_deploy):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -755,6 +900,8 @@ def main(argv=None, *, environ=None, make_control=ownership_control,
     parser.add_argument("--backout-review-ref", required=True)
     parser.add_argument("--backout-staging-run-id", required=True)
     parser.add_argument("--compatibility-note", required=True)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate inputs and print the ordered plan without mutating anything")
     parser.add_argument("--session-attestation", default="")
     parser.add_argument("--evidence", default="staging-container-drill-evidence.json")
     parser.add_argument("--deploy-config", default="staging-container-deploy.json")
@@ -790,6 +937,8 @@ def main(argv=None, *, environ=None, make_control=ownership_control,
                        deploy_factory(args.wrangler_bin, wrangler_dir, env),
                        wrangler_dir),
                       log=print)
+        if args.dry_run:
+            return dry_run_plan(drill, pin)
         failures = drill.run(pin, attestation)
     except GateError as error:
         print(f"staging container drill refused before any change: {error}")

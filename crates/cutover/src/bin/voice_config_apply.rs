@@ -25,11 +25,14 @@ use two_bot_cutover::voice_config_apply::{
 };
 use two_bot_cutover::voice_config_store::PgVoiceConfigStore;
 use two_bot_cutover::RestClient;
+use two_bot_cutover::{over_cap_message, read_bytes_capped, IntakeReadError};
 
 const USAGE: &str = "Usage: voice-config-apply --guild <id> --file <v11.json> \
 [--apply --expect-hash <hash>] [--allow-live-guild] [--discord-base <url>]\n\
 Prints the /import diff and its hash for the file against the stored voice configuration.\n\
 Writes only with --apply, and only when --expect-hash equals the hash of the reviewed dry run.\n\
+Intake cap: the file must not exceed 8 MiB (exit 1, before any network touch);\n\
+the decode itself is capped at 256 KiB.\n\
 Env: DISCORD_TOKEN (or DISCORD_BOT_TOKEN), TWO_DATABASE_URL.";
 
 fn usage_error(message: &str) -> ! {
@@ -95,7 +98,11 @@ async fn main() {
         .get("file")
         .unwrap_or_else(|| usage_error("--file is required"))
         .to_owned();
-    let bytes = std::fs::read(&path).unwrap_or_else(|_| fail("cannot read --file"));
+    let bytes = match read_bytes_capped(&path) {
+        Ok(bytes) => bytes,
+        Err(IntakeReadError::OverCap) => fail(&over_cap_message("voice config file")),
+        Err(IntakeReadError::Unreadable(_)) => fail("cannot read --file"),
+    };
     let apply = args.has("apply");
     let expected_hash = args.values.get("expect-hash").cloned();
     if apply && expected_hash.is_none() {

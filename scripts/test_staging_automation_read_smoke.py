@@ -25,15 +25,16 @@ TOKEN = "RAW_SECRET_SENTINEL_never_disclose_bot_token"
 DEEP_ARRAY = b"[" * 32768 + b"]" * 32768
 DEEP_OBJECT = b'{"":' * 13000 + b"{}" + b"}" * 13000
 
+# Discord command objects always carry the owning application_id.
 COMMANDS = [
-    {"id": "1549621908675366953", "name": "rank", "type": 1,
+    {"id": "1549621908675366953", "name": "rank", "type": 1, "application_id": STAGING_APP,
      "guild_id": STAGING_GUILD, "version": "1000000000000000001"},
     {"id": "2000000000000000001", "name": "command-list", "type": 1,
-     "guild_id": STAGING_GUILD, "version": "1000000000000000002"},
+     "application_id": STAGING_APP, "guild_id": STAGING_GUILD, "version": "1000000000000000002"},
     {"id": "2000000000000000002", "name": "schedule-list", "type": 1,
-     "guild_id": STAGING_GUILD, "version": "1000000000000000003"},
+     "application_id": STAGING_APP, "guild_id": STAGING_GUILD, "version": "1000000000000000003"},
     {"id": "2000000000000000003", "name": "feed-list", "type": 1,
-     "guild_id": STAGING_GUILD, "version": "1000000000000000004"},
+     "application_id": STAGING_APP, "guild_id": STAGING_GUILD, "version": "1000000000000000004"},
 ]
 
 

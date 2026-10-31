@@ -327,3 +327,51 @@ fn completed_reply<E: Debug>(
         "Something went wrong (ref {reference}). Please try again — if it keeps happening, share this reference with a server admin."
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_component_reply_is_pinned() {
+        assert_eq!(
+            EXPIRED_COMPONENT_REPLY,
+            "That button or menu has expired. Run the command again to get a fresh one."
+        );
+    }
+
+    fn mask_reference(content: &str) -> String {
+        const PREFIX: &str = "Something went wrong (ref ";
+        const SUFFIX: &str =
+            "). Please try again — if it keeps happening, share this reference with a server admin.";
+        let rest = content
+            .strip_prefix(PREFIX)
+            .expect("generic failure keeps its prefix");
+        let end = rest
+            .find(')')
+            .expect("generic failure closes the reference");
+        let (reference, tail) = rest.split_at(end);
+        assert_eq!(
+            reference.len(),
+            8,
+            "reference is eight hex digits: {content}"
+        );
+        assert!(
+            reference.bytes().all(|b| b.is_ascii_hexdigit()),
+            "reference is hex: {content}"
+        );
+        assert_eq!(tail, SUFFIX, "generic failure keeps its suffix: {content}");
+        format!("{PREFIX}<REF>{SUFFIX}")
+    }
+
+    #[test]
+    fn generic_failure_reply_is_pinned_with_masked_reference() {
+        let Err(content) = completed_reply::<&str>(Ok(Err("boom"))) else {
+            panic!("handler errors must produce the generic failure reply");
+        };
+        assert_eq!(
+            mask_reference(&content),
+            "Something went wrong (ref <REF>). Please try again — if it keeps happening, share this reference with a server admin."
+        );
+    }
+}

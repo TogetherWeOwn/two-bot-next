@@ -16,6 +16,9 @@ use two_bot_core::audit::delivery_nonce;
 use two_bot_core::audit_mirror::{AuditMirror, MirrorError};
 use two_bot_discord::ActionExecutor;
 
+#[path = "support/audit_history_evidence.rs"]
+mod audit_history_evidence;
+
 const CHANNEL: &str = "4444";
 const GUILD: &str = "2222";
 const BOT: &str = "9999";

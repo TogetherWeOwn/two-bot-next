@@ -20,14 +20,175 @@ DISCOVER = re.compile(r"unittest\s+discover\b(?P<args>[^\n]*)")
 SUITE_DIR = re.compile(r"""(?:^|\s)-s\s+(?P<q>['"]?)(?P<dir>[^\s'"]+)(?P=q)""")
 SUITE_PATTERN = re.compile(r"""(?:^|\s)-p\s+(?P<q>['"]?)(?P<pat>[^\s'"]+)(?P=q)""")
 
+_RUN_RE = re.compile(r"^(?P<prefix>[ ]*(?:-[ ]+)?)run:[ ]*(?P<value>.*)$")
+_BLOCK_SCALAR_RE = re.compile(r"^[|>][+-]?[0-9]*$")
+
+# Bounded run-step extraction, mirroring the check-test-inventory.py
+# executable-command precedent: only `run:` values count, comments and
+# echo/printf prints are stripped, no shell/YAML interpreter.
+
+
+def extract_run_blocks(text):
+    """Return the shell text of each ``run:`` value, one entry per step."""
+    lines = text.splitlines()
+    blocks = []
+    index = 0
+    while index < len(lines):
+        match = _RUN_RE.match(lines[index])
+        index += 1
+        if match is None:
+            continue
+        value = match.group("value").strip()
+        marker = value.split("#", 1)[0].strip() if value else ""
+        if marker and _BLOCK_SCALAR_RE.match(marker):
+            prefix = match.group("prefix")
+            parent_col = len(prefix)
+            body = []
+            while index < len(lines):
+                line = lines[index]
+                if not line.strip():
+                    body.append("")
+                    index += 1
+                    continue
+                indent = len(line) - len(line.lstrip(" "))
+                if indent <= parent_col:
+                    break
+                body.append(line)
+                index += 1
+            if marker.startswith(">"):
+                folded, pending = [], ""
+                for line in body:
+                    if line.strip():
+                        pending = f"{pending} {line.strip()}".strip()
+                    elif pending:
+                        folded.append(pending)
+                        pending = ""
+                if pending:
+                    folded.append(pending)
+                body = folded
+            blocks.append(body)
+        elif value:
+            blocks.append([match.group("value")])
+    return blocks
+
+
+def _logical_lines(body):
+    """Join backslash-continued shell lines into single logical lines."""
+    logical = []
+    pending = ""
+    for line in body:
+        stripped = line.rstrip()
+        if stripped.endswith("\\") and not stripped.endswith("\\\\"):
+            pending += stripped[:-1] + " "
+            continue
+        logical.append(pending + line)
+        pending = ""
+    if pending:
+        logical.append(pending)
+    return logical
+
+
+def _strip_inline_comment(line):
+    in_single = in_double = False
+    escaped = False
+    for position, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double and (
+                position == 0 or line[position - 1] in " \t;|&"):
+            return line[:position]
+    return line
+
+
+def _split_segments(line):
+    """Split a logical line on ``;``, ``&&``, ``||`` and ``|`` outside quotes."""
+    segments = []
+    start = 0
+    depth = 0
+    in_single = in_double = False
+    escaped = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if escaped:
+            escaped = False
+        elif char == "\\" and not in_single:
+            escaped = True
+        elif char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and char == ";":
+                segments.append(line[start:index])
+                start = index + 1
+            elif depth == 0 and line.startswith(("&&", "||"), index):
+                segments.append(line[start:index])
+                start = index + 2
+                index += 1
+            elif depth == 0 and char == "|":
+                segments.append(line[start:index])
+                start = index + 1
+        index += 1
+    segments.append(line[start:])
+    return segments
+
+
+_WRAPPER_WORDS = ("do", "then", "else", "time", "!", "sudo", "command",
+                  "builtin", "env")
+_TOKEN_RE = re.compile(r"^\s*(\S+)")
+
+
+def _is_print_segment(segment):
+    """True for echo/printf commands, which print a name without running it."""
+    rest = segment
+    after_wrapper = False
+    while True:
+        match = _TOKEN_RE.match(rest)
+        if match is None:
+            return False
+        token = match.group(1).lstrip("({!")
+        rest = rest[match.end():]
+        if token in _WRAPPER_WORDS:
+            after_wrapper = token in ("sudo", "env")
+            continue
+        if re.match(r"[A-Za-z_][\w]*=", token):
+            continue
+        if after_wrapper and token.startswith("-"):
+            continue
+        return token.rsplit("/", 1)[-1] in ("echo", "printf")
+
+
+def executable_block_text(body):
+    """Shell text stripped of comments and echo/printf prints."""
+    kept = []
+    for line in _logical_lines(body):
+        line = _strip_inline_comment(line)
+        for segment in _split_segments(line):
+            if not _is_print_segment(segment):
+                kept.append(segment)
+    return "\n".join(kept)
+
 
 def workflow_commands(root):
-    """Workflow text with comment-only lines removed, so a mention is not a run."""
-    lines = []
+    """Executable run-step shell text, so a mention is not a run."""
+    texts = []
     for path in sorted((root / ".github/workflows").glob("*.y*ml")):
-        lines += [line for line in path.read_text().splitlines()
-                  if not line.lstrip().startswith("#")]
-    return "\n".join(lines)
+        blocks = extract_run_blocks(path.read_text())
+        texts.extend(executable_block_text(body) for body in blocks)
+    return "\n".join(texts)
 
 
 def discover_patterns(commands, suite_dir):

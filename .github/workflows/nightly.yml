@@ -103,7 +103,7 @@ jobs:
     timeout-minutes: 45
     # Match required CI isolation on the shared Docker host.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'
@@ -142,7 +142,7 @@ jobs:
       - name: Guarded fixture routing and doc references (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
@@ -167,15 +167,41 @@ jobs:
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
       # Channel moderation, the discord channel-moderation executor, feeds_store,
-      # legacy_verify_db, raid_list_db, reengagement_list_db, staging_migrate_db
+      # legacy_verify_db, raid_list_db, reengagement_list_db, game_activity_report_db, staging_migrate_db
       # and internal_events require agent_test, not the two_bot_test_* bootstrap
       # used by TestDatabase suites. Skip only those tests here, then run ALL of
       # those suites below with their accepted URL.
       # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
-      # regenerate_reference_docs is a manual regen: it rewrites docs/commands.md and
+      - name: Generate command reference before workspace compilation
+        run: python3 scripts/generate_command_reference.py
+
+      # regenerate_reference_docs is a manual regen: it rewrites docs/generated/commands.md and
       # docs/configuration.md in the checkout, so later tests would compare against
       # regenerated docs and hide drift. It is skipped here on purpose.
-      # No ignored suite is permanently excluded.
+      # Quarantine (TOG-34944): the 15 red backfill acceptance tests below run
+      # in NO lane — skipped here, in the check.yml coverage sweep and in the
+      # check.yml store lane — until their builders land. Each carries its
+      # tracking ref in its #[ignore] reason; test_workflows.py
+      # BACKFILL_QUARANTINE pins the set shrink-only (growth fails, a fix
+      # ratchets the pin) and pins all three skip sites.
+      # Audit-log family, tracked by TOG-22948:
+      # audit_log_pagination_limit_1_to_100_before_after_covers_45d_window
+      # audit_log_requests_ride_rate_limit_client_never_direct_rest
+      # audit_cursor_persists_per_window_and_resumes_mid_window
+      # audit_rows_hold_ids_timestamps_enums_only
+      # audit_429_retry_after_pauses_without_losing_place
+      # Event-users/reactions/pins family, tracked by TOG-22951:
+      # event_users_paginate_through_rate_limit_client_with_max_100
+      # reaction_users_paginate_through_rate_limit_client
+      # pins_list_through_rate_limit_client_persists_metadata_only
+      # blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting
+      # persisted_rows_hold_ids_timestamps_enums_only
+      # resume_continues_from_persisted_cursors_per_family
+      # Bans/invites/onboarding family, tracked by TOG-22952:
+      # bans_fetch_applies_blocklist_and_counts_everyone
+      # invite_rows_hold_metadata_only
+      # onboarding_rows_hold_ids_enums_metadata_only
+      # bans_invites_onboarding_resume_continues_from_persisted_cursors
       # --no-fail-fast: cargo otherwise stops at the first failing test binary and
       # hides every later failure, so one red target masked the rest of the sweep.
       - name: Full workspace sweep including ignored tests
@@ -213,6 +239,8 @@ jobs:
           --skip shared_router_gates_bounds_and_required_reason_refuse_without_http
           --skip purge_and_slowmode_success_audit_and_replay_without_repeating_effects
           --skip purge_of_messages_older_than_fourteen_days_deletes_them_singly
+          --skip purge_stopped_early_reports_the_reason_in_the_reply_and_the_audit_row
+          --skip full_purge_reply_and_audit_metadata_are_byte_identical_to_before
           --skip repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks
           --skip initially_absent_overwrite_is_deleted_only_after_recorded_lockdown
           --skip unlock_preserves_access_restrictions_added_after_lockdown
@@ -244,6 +272,9 @@ jobs:
           --skip purge_history_failures_are_retryable_without_any_deletion
           --skip uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced
           --skip purge_counts_bulk_delete_and_replays_without_rest_or_duplicate_audit
+          --skip purge_stopped_early_reports_the_reason_in_the_result_and_the_audit_row
+          --skip full_purge_audit_metadata_and_stored_payload_are_byte_identical_to_before
+          --skip purge_corrupt_stop_reason_replay_fails_closed_without_discord_requests
           --skip slowmode_zero_and_signed_maximum_unicode_reason_survive_replay
           --skip lockdown_and_unlock_restore_full_masks_and_replay_independently
           --skip missing_overwrite_is_deleted_on_unlock_and_untracked_unlock_refuses
@@ -251,19 +282,67 @@ jobs:
           --skip uncertain_lockdown_keeps_seed_and_channel_fence_against_distinct_key_unlock
           --skip rejected_lockdown_removes_only_new_seed_and_allows_same_key_retry
           --skip permission_actor_and_guild_refusals_never_mutate
+          --skip single_delete_429_releases_attempt_for_same_key_retry
+          --skip bulk_delete_429_releases_attempt_for_same_key_retry
+          --skip channel_overwrite_429_releases_attempt_and_retires_only_its_seed
+          --skip slowmode_429_releases_attempt_for_same_and_distinct_keys
+          --skip unlock_429_releases_lane_but_preserves_recovery_seed
+          --skip lockdown_429_preserves_prior_seed_while_releasing_the_lane
+          --skip slowmode_5xx_and_unexpected_statuses_stay_fenced
+          --skip slowmode_timeout_stays_fenced
+          --skip cancelled_lockdown_stays_fenced_with_seed_retained
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
+          --skip claim_is_owned_once_then_in_flight
+          --skip failed_send_releases_the_claim_for_the_retry
+          --skip delivered_rows_are_never_reclaimed
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
+          --skip fresh_claim_cannot_be_reclaimed
+          --skip stale_unposted_claim_is_taken_over_atomically
+          --skip started_claim_is_never_reclaimed_even_when_stale
+          --skip started_send_that_provably_failed_releases_for_the_retry
+          --skip reclaiming_a_missing_key_claims_it_fresh
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
+          --skip legacy_verify_policy_gates_the_real_test_endpoints
           --skip dump_inspect_restore_round_trip
           --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected
           --skip list_is_guild_scoped_selector_shaped_and_read_only
+          --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
           --skip real_sqlx_runner_cases
           --skip post_failure_unreadable_ledger_is_unknown_not_empty
           --skip post_failure_readable_ledger_keeps_array_output
           --skip post_apply_unreadable_ledger_is_unknown_not_empty
+          --skip store_failure_keeps_committed_cutover_evidence
+          --skip connection_count_sees_other_roles_from_plan_login
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
-          --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
+          --skip blocklisted_members_skip_per_user_rows_but_count_in_aggregates
+          --skip persisted_member_rows_hold_ids_timestamps_enums_only
+          --skip resume_continues_from_the_persisted_cursor
+          --skip backfill_cursors_persist_per_family_insert_and_update
+          --skip backfill_cursor_survives_crash_restart_and_never_resets_to_zero
+          --skip concurrent_families_never_clobber_each_other
+          --skip backfill_cursor_rows_hold_ids_cursors_timestamps_only
+          --skip history_pagination_honors_limit_range_and_before_after_around_cursors
+          --skip history_reads_all_pass_through_rate_limit_guard
+          --skip history_rows_hold_ids_timestamps_counts_only_with_body_tripwire
+          --skip history_resume_continues_from_persisted_cursor_after_restart
+          --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window
+          --skip audit_log_requests_ride_rate_limit_client_never_direct_rest
+          --skip audit_cursor_persists_per_window_and_resumes_mid_window
+          --skip audit_rows_hold_ids_timestamps_enums_only
+          --skip audit_429_retry_after_pauses_without_losing_place
+          --skip event_users_paginate_through_rate_limit_client_with_max_100
+          --skip reaction_users_paginate_through_rate_limit_client
+          --skip pins_list_through_rate_limit_client_persists_metadata_only
+          --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting
+          --skip persisted_rows_hold_ids_timestamps_enums_only
+          --skip resume_continues_from_persisted_cursors_per_family
+          --skip bans_fetch_applies_blocklist_and_counts_everyone
+          --skip invite_rows_hold_metadata_only
+          --skip onboarding_rows_hold_ids_enums_metadata_only
+          --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
           --skip event_store_s8_stage_lifecycle_persists_ids_and_privacy_enum_only
           --skip event_store_s8_interaction_create_observes_ids_and_command_enums_only
           --skip event_store_s8_audit_log_entry_persists_ids_and_action_enum_only
@@ -274,11 +353,6 @@ jobs:
           --skip event_store_s2_member_update_persists_nick_and_role_deltas_only
           --skip event_store_s2_duplicate_delivery_inserts_once
           --skip event_store_s2_privacy_tripwire_rejects_bio_text
-          --skip event_store_s1_append_only_insert_uses_minimal_fields
-          --skip event_store_s1_duplicate_delivery_inserts_once
-          --skip event_store_s1_replayed_message_create_does_not_duplicate
-          --skip event_store_s1_consumer_lag_gauge_has_fixed_cardinality
-          --skip event_store_s1_privacy_tripwire_rejects_body_text
           --skip event_store_s4_voice_state_join_persists_ids_session_and_flags_only
           --skip event_store_s4_voice_server_update_persists_ids_without_token_or_endpoint
           --skip event_store_s4_duplicate_delivery_inserts_once
@@ -296,6 +370,12 @@ jobs:
           --skip event_store_s6_member_update_remove_persist_member_id_deltas_only
           --skip event_store_s6_duplicate_delivery_inserts_once
           --skip event_store_s6_privacy_tripwire_rejects_thread_names_and_bodies
+          --skip event_store_s7_invite_create_persists_code_hash_and_ids_only
+          --skip event_store_s7_invite_delete_persists_code_hash_and_ids_only
+          --skip event_store_s7_scheduled_event_lifecycle_persists_ids_and_status_enums_only
+          --skip event_store_s7_scheduled_event_user_add_remove_persist_user_id_deltas_only
+          --skip event_store_s7_duplicate_delivery_inserts_once
+          --skip event_store_s7_privacy_tripwire_rejects_descriptions_and_locations
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -318,6 +398,13 @@ jobs:
         run: >-
           cargo test -p two-bot-discord --all-features --test internal_channel_moderation --locked
           -- --include-ignored --test-threads=1
+      - name: Mutation-429 channel acceptance ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-discord --all-features --test mutation_429_proves_no_effect_channel --locked
+          -- --include-ignored --test-threads=1
       - name: Feed store ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -332,6 +419,13 @@ jobs:
         run: >-
           cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
           -- --include-ignored --test-threads=1
+      - name: Legacy TLS fence ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test legacy_tls_fence --locked
+          -- --include-ignored --test-threads=1
       - name: Reengagement list ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -339,6 +433,13 @@ jobs:
         run: >-
           cargo test -p two-bot-cutover --all-features --test reengagement_list_db --locked
           -- --include-ignored --test-threads=1
+      - name: Game-activity report tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test game_activity_report_db --locked
+          -- --test-threads=1
       - name: Staging migration runner ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:

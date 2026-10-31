@@ -1,6 +1,24 @@
 //! Combined shared-router/REST and isolated agent-testdb acceptance. No live inputs.
 #![allow(dead_code)]
+
+#[path = "onboarding_connect_acceptance_tests.rs"]
+mod connect_acceptance;
+#[path = "onboarding_durable_picker_rejoin_acceptance_tests.rs"]
+mod durable_picker_rejoin_acceptance;
+#[path = "onboarding_game_role_preview_acceptance_tests.rs"]
+mod game_role_preview_acceptance;
+#[path = "onboarding_game_role_preview_manageability_tests.rs"]
+mod game_role_preview_manageability;
+#[path = "onboarding_presubmit_clarity_acceptance_tests.rs"]
+mod presubmit_clarity_acceptance;
+#[path = "onboarding_reopen_identity_review_acceptance_tests.rs"]
+mod reopen_identity_review_acceptance;
+#[path = "onboarding_reopen_picker_acceptance_tests.rs"]
+mod reopen_picker_acceptance;
+#[path = "welcome_preview_acceptance_tests.rs"]
+mod welcome_preview_acceptance;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +40,22 @@ use crate::onboarding::{OnboardingJob, OnboardingRuntime};
 const TEST_DATABASE: &str = "postgres://agent_test@agent-testdb:5432/postgres";
 const NOW: i64 = 1_790_780_400_000;
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "tog10278_onboarding_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -29,11 +63,16 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
+        // PID + counter + nanos: wall-clock nanos can repeat across parallel
+        // tests on a coarse clock (run 39175965289 attempt 1: duplicate
+        // schema `tog10278_*` -> 23505). The counter keeps same-tick
+        // names distinct, the PID separates test binaries, and nanos keeps a
+        // leaked schema plus PID reuse from ever repeating a name.
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("tog10278_onboarding_{stamp}");
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = schema_name_at(nanos);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");
@@ -124,6 +163,9 @@ struct DiscordState {
     unavailable_channel: Option<String>,
     reject_next_post: bool,
     reject_roles: bool,
+    /// Role id whose grant/revoke answers 403 while every other role write
+    /// succeeds, for partial-failure tests.
+    fail_role: Option<String>,
     member_reads: usize,
     reject_member_read: Option<usize>,
     reject_next_reply: bool,
@@ -140,7 +182,7 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
         match (request.method.as_str(), path) {
             ("GET", "/guilds/22") => ScriptedResponse::json(200, json!({"id":"22","owner_id":"888"})),
             ("GET", "/guilds/22/roles") => {
-                let mut roles = vec![json!({"id":"22","permissions":"3072"}), json!({"id":"77","permissions":"0"})];
+                let mut roles = vec![json!({"id":"22","permissions":"1051648"}), json!({"id":"77","permissions":"0"})];
                 roles.extend(GAME_PICKS.iter().chain(PLATFORM_PICKS.iter()).map(|pick| json!({"id":pick.role_id,"permissions":"0"})));
                 ScriptedResponse::json(200, Value::Array(roles))
             }
@@ -176,6 +218,7 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
             ("PUT" | "DELETE", path) if path.contains("/roles/") => {
                 if state.reject_roles { return ScriptedResponse::status(403); }
                 let role = path.rsplit('/').next().unwrap();
+                if state.fail_role.as_deref() == Some(role) { return ScriptedResponse::status(403); }
                 if request.method == "PUT" { state.roles.insert(role.to_owned()); } else { state.roles.remove(role); }
                 ScriptedResponse::status(204)
             }
@@ -228,6 +271,55 @@ fn runtime(pool: &PgPool, mock: &MockRest, vars: &HashMap<String, String>) -> On
         ActionExecutor::with_proxy("onboarding-test-only-token".into(), Some(mock.origin()))
             .unwrap();
     OnboardingRuntime::new(pool.clone(), executor, vars, 22, 999).unwrap()
+}
+
+use crate::hotpath_settings_test_support as hotpath_scope;
+
+#[tokio::test]
+async fn onboarding_runtime_hotpath_config_materializes_only_its_guild() {
+    use hotpath_scope::queries::Queries;
+    let db = hotpath_scope::database("TWO_ONBOARDING_DRY_RUN").await;
+    let store = SettingsStore::new(db.pool());
+    // Stored dry-run uses the runtime's canonical string values, not bools.
+    store
+        .set("22", "TWO_ONBOARDING_DRY_RUN", Some(json!("0")), "fixture")
+        .await
+        .unwrap();
+    for index in 0..30 {
+        store
+            .set(
+                &format!("{}", 300 + index),
+                "TWO_ONBOARDING_DRY_RUN",
+                Some(json!("1")),
+                "fixture",
+            )
+            .await
+            .unwrap();
+    }
+    let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+    let runtime = runtime(db.pool(), &mock, &vars("legacy", false));
+    let (first, reads) = Queries::capture(runtime.handle(welcome(44), NOW)).await;
+    first.unwrap();
+    hotpath_scope::assert_reads(&reads, Some(2), false);
+    assert_eq!(
+        posts(&mock).len(),
+        1,
+        "foreign dry-run overrides cannot suppress this guild's welcome"
+    );
+    assert_eq!(posts(&mock)[0].path, "/api/v10/channels/12/messages");
+    store
+        .set("22", "TWO_ONBOARDING_DRY_RUN", Some(json!("1")), "fixture")
+        .await
+        .unwrap();
+    let (next, reads) = Queries::capture(runtime.handle(welcome(45), NOW + 1)).await;
+    next.unwrap();
+    hotpath_scope::assert_reads(&reads, Some(2), false);
+    assert_eq!(
+        posts(&mock).len(),
+        1,
+        "actual config reload applies the target guild's update"
+    );
+    db.close().await.unwrap();
 }
 
 fn welcome(member_id: u64) -> OnboardingJob {
@@ -637,6 +729,9 @@ async fn onboarding_runtime_roleless_session_reselection_stale_menu_and_goodbye_
                     username: "@everyone <@44> <@&77>".into(),
                     bot: false,
                     joined_at_ms: Some(NOW - 2 * 86_400_000),
+                    // Unknown leaver: the goodbye posts, only the guard
+                    // clearing is skipped.
+                    member_id: None,
                 },
                 NOW + 3,
             )
@@ -898,6 +993,7 @@ async fn onboarding_runtime_goodbye_hot_setting_reaches_live_handler() {
             username: "dave".into(),
             bot: false,
             joined_at_ms: Some(NOW - 86_400_000),
+            member_id: None,
         };
         live.handle(goodbye(), NOW).await.unwrap();
         assert_eq!(
@@ -1052,6 +1148,13 @@ fn replies(mock: &MockRest) -> Vec<RestRequest> {
 async fn assert_picker_failure(db: &TestSchema, mock: &MockRest, reply_count: usize) {
     assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
     assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
+    assert_error_edit(mock, reply_count).await;
+}
+
+/// The terminal error-edit half of [`assert_picker_failure`], for failures
+/// that leave deliberate state behind (a partial game-role failure commits
+/// its applied grants): the defer is still finished with the failure copy.
+async fn assert_error_edit(mock: &MockRest, reply_count: usize) {
     let requests = mock.requests();
     let defer: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(defer["type"], 5);
@@ -1184,7 +1287,10 @@ async fn onboarding_runtime_picker_insert_and_commit_failures_are_atomic_and_ter
                 let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
                 runtime(&db.pool, &mock, &vars(mode, false))
                     .handle(component(custom_id, &[key]), NOW).await.unwrap();
-                assert_picker_failure(&db, &mock, if deferred { 2 } else { 1 }).await;
+                // Both branches commit before replying: an immediate insert
+                // failure and a deferred commit failure both yield exactly one
+                // failure reply, never a success claim plus a correction.
+                assert_picker_failure(&db, &mock, 1).await;
             }
             if deferred {
                 sqlx::raw_sql("DROP TRIGGER reject_route ON events; DROP FUNCTION reject_route();")
@@ -1433,5 +1539,171 @@ async fn onboarding_capture_requires_real_pending_transition_and_preserves_leave
             1,
             "S3 owns exactly one {kind:?} fact"
         );
+    }
+}
+
+fn goodbye_for(member_id: u64) -> OnboardingJob {
+    OnboardingJob::Goodbye {
+        guild_id: 22,
+        username: "member".into(),
+        bot: false,
+        joined_at_ms: Some(NOW - 86_400_000),
+        member_id: Some(member_id),
+    }
+}
+
+fn role_id_of(key: &str) -> String {
+    GAME_PICKS
+        .iter()
+        .find(|pick| pick.key == key)
+        .expect("catalog keeps the pick")
+        .role_id
+        .to_owned()
+}
+
+async fn selected_picks(db: &TestSchema) -> Vec<String> {
+    sqlx::query_scalar("SELECT metadata::text FROM events WHERE event_type = $1 ORDER BY id")
+        .bind(EVENT_GAME_ROLES_SELECTED)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_partial_game_failure_commits_only_applied_grants() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mock = discord(Arc::new(Mutex::new(DiscordState {
+            fail_role: Some(role_id_of("survival")),
+            ..Default::default()
+        })))
+        .await;
+        runtime(&db.pool, &mock, &vars("legacy", false))
+            .handle(component(GAME_SELECT_ID, &["shooters", "survival"]), NOW)
+            .await
+            .unwrap();
+        // Exactly one selection row naming the applied grant only, and no
+        // route: nothing was delivered to the member.
+        assert_eq!(
+            selected_picks(&db).await,
+            vec![r#"{"picks":["shooters"]}"#.to_owned()]
+        );
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
+        assert_error_edit(&mock, 1).await;
+
+        // A suppressed member's applied grants persist no row at all.
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ('22', '44')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM events WHERE event_type = $1")
+            .bind(EVENT_GAME_ROLES_SELECTED)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mock = discord(Arc::new(Mutex::new(DiscordState {
+            fail_role: Some(role_id_of("survival")),
+            ..Default::default()
+        })))
+        .await;
+        runtime(&db.pool, &mock, &vars("legacy", false))
+            .handle(
+                component(GAME_SELECT_ID, &["shooters", "survival"]),
+                NOW + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_goodbye_clear_failure_posts_nothing_and_retries() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+        let runtime = runtime(&db.pool, &mock, &vars("session", false));
+        runtime.handle(welcome(44), NOW).await.unwrap();
+        assert_eq!(posts(&mock).len(), 1, "the welcome posted");
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_clear() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'forced clear failure'; END; $$; \
+             CREATE TRIGGER reject_clear BEFORE DELETE ON events \
+             FOR EACH ROW EXECUTE FUNCTION reject_clear();",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            runtime.handle(goodbye_for(44), NOW + 1).await.is_err(),
+            "a failed clear is retryable"
+        );
+        assert_eq!(
+            posts(&mock).len(),
+            1,
+            "nothing public goes out before the guard is released"
+        );
+        sqlx::raw_sql("DROP TRIGGER reject_clear ON events; DROP FUNCTION reject_clear();")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        runtime.handle(goodbye_for(44), NOW + 2).await.unwrap();
+        assert_eq!(posts(&mock).len(), 2, "the retry posts the goodbye once");
+        assert!(!has_onboarding_prompt(&db.pool, "22", "44").await.unwrap());
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_goodbye_releases_guard_even_when_goodbye_posting_is_gated_off() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        // Welcomes post in session dry run and in legacy mode, but the
+        // goodbye post is session-only and off in dry run: the guard still
+        // clears, so a rejoin is welcomed in every mode.
+        for (mode, dry_run, member) in [("session", true, 44u64), ("legacy", false, 45)] {
+            let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+            let runtime = runtime(&db.pool, &mock, &vars(mode, dry_run));
+            runtime.handle(welcome(member), NOW).await.unwrap();
+            assert_eq!(posts(&mock).len(), 1, "{mode} dry_run={dry_run}: welcomed");
+            runtime.handle(goodbye_for(member), NOW + 1).await.unwrap();
+            assert_eq!(
+                posts(&mock).len(),
+                1,
+                "{mode} dry_run={dry_run}: no goodbye post"
+            );
+            assert!(
+                !has_onboarding_prompt(&db.pool, "22", &member.to_string())
+                    .await
+                    .unwrap(),
+                "{mode} dry_run={dry_run}: the leave releases the guard"
+            );
+            runtime.handle(welcome(member), NOW + 2).await.unwrap();
+            assert_eq!(
+                posts(&mock).len(),
+                2,
+                "{mode} dry_run={dry_run}: the rejoin is welcomed again"
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
     }
 }

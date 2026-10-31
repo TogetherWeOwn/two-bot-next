@@ -20,6 +20,7 @@ must appear in no stored row.
 
 | Slice | Stored besides identity + timestamps | Never stored |
 | --- | --- | --- |
+| Message create | Message/channel/guild/author ids only (`message_id` plus the shared identity columns) | Content/body, embeds, attachments, username, custom-status text |
 | Member add/remove/update | Membership deltas only: `premium_since`, `nick_changed` flag, role-id list | Bio, about, username, nickname |
 | Presence | Status and activity-TYPE enums plus application id | Custom-status text; activity name, details, state, URL, emoji |
 | Voice state/server | Channel/session ids plus mute, deaf, self-mute, self-deaf, self-video, self-stream and suppress flags | Audio, transcripts, voice tokens, endpoints |
@@ -39,15 +40,16 @@ adding a second unique constraint.
 
 ## Retention and erasure wiring
 
-No automatic age-based purger exists for this table. Rows persist until an
-authorized erasure or a per-guild purge removes them. Do not claim a
-30/90-day TTL where no enforcing timer exists; see
-[privacy.md](privacy.md#retention-and-explicit-exceptions).
-
-The TTL policy is a placeholder on purpose: a future retention decision
-needs its own reviewed migration and policy, roughly shaped as a
-`DELETE` bounded by `event_time`, never as a silent background rewrite.
-This note does not authorize that migration, its interval or its schedule.
+The existing supervised retention job applies age expiry only to the raw
+presence/voice capture families and cached Discord audit entries described in
+[privacy.md](privacy.md#retention-and-explicit-exceptions). It selects by
+`event_time`, runs deletes only in `execute` mode, and processes one globally
+capped batch per cadence. The job defaults to dry-run; its report shows the full
+eligible backlog, while an execute run deletes at most 1,000 rows. Cutoff
+headroom and the limits of the batch guarantee are documented in the privacy
+policy section. This does not add age expiry to other `event_store` families,
+which remain until authorized erasure or per-guild purge. Do not claim a
+30/90-day TTL for those unrelated families.
 
 The per-user purge path is the existing member-erasure procedure in
 [privacy.md](privacy.md#procedure): each landing slice registers an
@@ -70,13 +72,15 @@ them. Handle it exactly like the existing missed-events alert in the
 [runbook](runbook.md#alert-gateway-missed-events).
 
 Capture lag is the spread between `received_at` and `event_time` per
-`event_type` over a window. No counter tracks it yet: until a slice ships a
-real counter and rule, the staging verify query below is the only detector.
-Treat a spread that stays above one keepalive window (about 60 s) across
-consecutive windows as a missed-events-equivalent: scrape the authorized
-`/ops/metrics` path, correlate disconnects and recent deploys, and do not
-restart the container to clear the counter. A replacement resets baselines
-without recovering the gap.
+`event_type` over a window. The `two_bot_event_store_consumer_lag_seconds`
+gauge exposes the newest observed spread (`0` when unobserved), and the
+`event_store_consumer_lag` Worker rule tickets when it stays above one
+keepalive window (about 60 s) across three consecutive valid samples; the
+staging verify query below remains the manual check. Treat such a spread as a
+missed-events-equivalent: scrape the authorized `/ops/metrics` path,
+correlate disconnects and recent deploys, and do not restart the container
+to clear the counter. A replacement resets baselines without recovering
+the gap.
 
 ### Backfill-no-replay rule
 

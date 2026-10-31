@@ -16,11 +16,11 @@
 //! <https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT>
 
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc,
 };
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use time::{Duration, OffsetDateTime};
 use two_bot_core::self_roles::{
     event_order_from_snowflake, self_role_renew_after_ms, PanelMode, RoleOperation, SettledOutcome,
@@ -295,6 +295,27 @@ pub struct PanelClaim {
     maintenance: bool,
 }
 
+impl PanelClaim {
+    /// Synthetic claim for offline renewal tests against an already-closed pool.
+    /// This fixture does not acquire a database lease or confer ownership.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn offline_fixture(renew_after_ms: u64) -> Self {
+        Self {
+            key: PanelKey {
+                guild_id: "keeper-offline-guild".to_owned(),
+                member_id: "keeper-offline-member".to_owned(),
+                panel_id: "keeper-offline-panel".to_owned(),
+            },
+            token: Secret::new("keeper-offline-panel-sentinel".to_owned()),
+            generation: 1,
+            target: PanelTarget::default(),
+            renew_after_ms,
+            maintenance: false,
+        }
+    }
+}
+
 /// A superseded event has no ownership; do not confuse it with a claim.
 #[derive(Debug, Clone)]
 pub enum PanelClaimResult {
@@ -309,6 +330,8 @@ pub enum StoreError {
     Db(#[from] sqlx::Error),
     #[error("invalid persisted self-role intent: {0}")]
     Intent(#[from] serde_json::Error),
+    #[error("self-role catalogue changed before admission")]
+    CatalogueChanged,
     #[error("self-role event claim is stale or belongs to another event")]
     StaleClaim,
     #[error("self-role event and panel claim scopes differ")]
@@ -321,6 +344,8 @@ pub enum StoreError {
     GenerationExhausted,
     #[error("invalid persisted self-role audit metadata")]
     InvalidAudit,
+    #[error("self-role acknowledgement refused: {0}")]
+    AcknowledgementRefused(String),
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +353,62 @@ pub struct SelfRoleStore {
     pool: PgPool,
     lease_ms: u64,
     test_clock_ms: Option<Arc<AtomicI64>>,
+}
+
+/// Acknowledgement caps from the bounded durable acknowledgement decision:
+/// 500 unresolved ticket rows per guild, 50 per member, 20 per event, and
+/// 512 bytes per row. [`SelfRoleStore::journal_role_exchange`] refuses the
+/// insert that would exceed a cap before writing anything. Best-effort under
+/// concurrent cross-event journals (only same-event journals serialize on the
+/// event lock); terminal repair journals bypass enforcement deliberately so
+/// backpressure never blocks recovery.
+const ACK_MAX_UNRESOLVED_PER_GUILD: u32 = 500;
+const ACK_MAX_UNRESOLVED_PER_MEMBER: u32 = 50;
+const ACK_MAX_UNRESOLVED_PER_EVENT: u32 = 20;
+const ACK_MAX_ROW_BYTES: usize = 512;
+/// Fixed per-row storage above the variable event/role identifiers: tuple
+/// header, null bitmap, the two uuid-text identity columns, disposition,
+/// flags and timestamps sum to roughly 130-150 B, so 160 B of fixed cost
+/// plus the two identifiers estimates the inserted row conservatively while
+/// leaving headroom under the 512 B bound.
+const ACK_ROW_FIXED_BYTES: usize = 160;
+
+/// Ambiguous send outcomes persisted in `outcome_class` (migration 0449):
+/// a journaled send with no received response, a received-but-not-definite
+/// response status, and a bounded retry loop that gave up. Definite outcomes
+/// keep the column NULL. Matches the migration CHECK set exactly.
+const OUTCOME_TIMEOUT_NO_RESPONSE: &str = "timeout_no_response";
+const OUTCOME_RESPONSE_AMBIGUOUS: &str = "response_ambiguous";
+const OUTCOME_LOOP_EXHAUSTION: &str = "loop_exhaustion";
+/// Settlement decisions persisted in `settled_as`: a replacement ticket took
+/// over, or the send aged out unresolved. Matches the migration CHECK set.
+const SETTLED_SUPERSEDED: &str = "superseded_settled";
+const SETTLED_EXPIRED_UNKNOWN: &str = "expired_unknown";
+
+/// Postgres `undefined_column`: the build was deployed ahead of migration
+/// 0449. Settlement writers degrade to the pre-acknowledgement behavior
+/// (receipts still land, settlement stays invisible) instead of failing;
+/// the columns activate on their own once the migration lands.
+const UNDEFINED_COLUMN: &str = "42703";
+
+fn is_undefined_column(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some(UNDEFINED_COLUMN)
+    )
+}
+
+/// One loud warning per process: every later settlement write takes the
+/// same degraded path until migration 0449 lands.
+static ACK_LEGACY_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_ack_legacy_lane() {
+    if !ACK_LEGACY_WARNED.swap(true, Ordering::SeqCst) {
+        tracing::warn!(
+            "self_role_exchanges lacks acknowledgement columns; \
+             settlement degraded until migration 0449 lands"
+        );
+    }
 }
 
 impl SelfRoleStore {
@@ -724,7 +805,7 @@ impl SelfRoleStore {
 
     /// Insert-first deduplication with an already computed immutable intent.
     pub async fn claim_audit(&self, row: &SelfRoleAudit) -> Result<Option<EventClaim>, StoreError> {
-        self.claim_audit_inner(row, true).await
+        self.claim_audit_inner(row, true, None).await
     }
 
     /// Runtime admission before lane acquisition and authoritative REST reads.
@@ -734,21 +815,53 @@ impl SelfRoleStore {
         &self,
         row: &SelfRoleAudit,
     ) -> Result<Option<EventClaim>, StoreError> {
+        self.claim_pending_inner(row, None).await
+    }
+
+    /// Fresh service admission shares the settings writer's revision lock.
+    /// A stale catalogue cannot insert work after a destructive edit commits;
+    /// if admission wins, its processing audit makes that edit refuse to drain.
+    /// Recovery uses the original claim path, never a new settings revision.
+    pub async fn claim_pending_audit_at_revision(
+        &self,
+        row: &SelfRoleAudit,
+        revision: i64,
+    ) -> Result<Option<EventClaim>, StoreError> {
+        self.claim_pending_inner(row, Some(revision)).await
+    }
+
+    async fn claim_pending_inner(
+        &self,
+        row: &SelfRoleAudit,
+        revision: Option<i64>,
+    ) -> Result<Option<EventClaim>, StoreError> {
         if !row.desired_role_ids.is_empty()
             || !row.pre_mutation_role_ids.is_empty()
             || row.effects != AuditEffects::default()
         {
             return Err(StoreError::StaleClaim);
         }
-        self.claim_audit_inner(row, false).await
+        self.claim_audit_inner(row, false, revision).await
     }
 
     async fn claim_audit_inner(
         &self,
         row: &SelfRoleAudit,
         initialized: bool,
+        expected_revision: Option<i64>,
     ) -> Result<Option<EventClaim>, StoreError> {
         let mut tx = self.pool.begin().await?;
+        if let Some(expected) = expected_revision {
+            let (current,): (i64,) = sqlx::query_as(
+                "SELECT revision FROM guild_settings_revision WHERE singleton=TRUE FOR SHARE",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if current != expected {
+                tx.rollback().await?;
+                return Err(StoreError::CatalogueChanged);
+            }
+        }
         let now = self.now(&mut tx).await?;
         let expires = self.expiry(now)?;
         let created = now
@@ -1247,6 +1360,44 @@ impl SelfRoleStore {
         self.checkpoint_execution(claim, effects, false).await
     }
 
+    /// Pure acknowledgement cap check (no database): allow the insert only when
+    /// every unresolved count is strictly under its cap and the estimated row
+    /// fits the 512 B bound. Over any cap, refuse at the store boundary with
+    /// an error naming the tripped dimension, never a silent substitution.
+    /// Mapping the refusal through the runtime error taxonomy so operators
+    /// see the dimension end to end is follow-up work.
+    pub fn check_acknowledgement_caps(
+        guild_unresolved: u32,
+        member_unresolved: u32,
+        event_unresolved: u32,
+        row_bytes: usize,
+    ) -> Result<(), StoreError> {
+        if guild_unresolved >= ACK_MAX_UNRESOLVED_PER_GUILD {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "guild cap reached: {guild_unresolved} unresolved rows \
+                 (cap {ACK_MAX_UNRESOLVED_PER_GUILD})"
+            )));
+        }
+        if member_unresolved >= ACK_MAX_UNRESOLVED_PER_MEMBER {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "member cap reached: {member_unresolved} unresolved rows \
+                 (cap {ACK_MAX_UNRESOLVED_PER_MEMBER})"
+            )));
+        }
+        if event_unresolved >= ACK_MAX_UNRESOLVED_PER_EVENT {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "event cap reached: {event_unresolved} unresolved rows \
+                 (cap {ACK_MAX_UNRESOLVED_PER_EVENT})"
+            )));
+        }
+        if row_bytes > ACK_MAX_ROW_BYTES {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "row size {row_bytes} B exceeds the {ACK_MAX_ROW_BYTES} B bound"
+            )));
+        }
+        Ok(())
+    }
+
     /// Journal a distinct send and its attempted/unresolved role evidence in one
     /// transaction. The clock is sampled after panel -> event lock waits. This is
     /// not send authorization: the executor must fence again after the DB wait.
@@ -1290,6 +1441,10 @@ impl SelfRoleStore {
                 return Ok(None);
             }
         }
+        // Fixed refusal before any insert: a capped guild/member/event or an
+        // oversized row refuses here, so a refused attempt never partially
+        // writes. The transaction rolls back on drop.
+        enforce_acknowledgement_caps(&mut tx, claim, intent).await?;
         let ticket = insert_role_exchange(&mut tx, claim, intent).await?;
         tx.commit().await?;
         Ok(Some(ticket))
@@ -1325,11 +1480,31 @@ impl SelfRoleStore {
         Ok(Some(ticket))
     }
 
+    /// Definite versus ambiguous is the `merge_receipt_evidence` definition:
+    /// `NoSend`, `Response 204` and `Response 400..=499` are definite; any
+    /// other received `200..=599` status is ambiguous. Returns the ambiguous
+    /// outcome class, or `None` for definite statuses and for values outside
+    /// `200..=599` (which [`Self::complete_role_exchange`] rejects before
+    /// classification).
+    pub fn classify_ambiguous_response(status: u16) -> Option<&'static str> {
+        if !(200..=599).contains(&status) {
+            return None;
+        }
+        if status == 204 || (400..=499).contains(&status) {
+            return None;
+        }
+        Some(OUTCOME_RESPONSE_AMBIGUOUS)
+    }
+
     /// Complete only this immutable exchange receipt. The original sender may
     /// write after event/lane generation transfer because this statement cannot
     /// touch either ownership relation, aggregate effects, outcome or target.
     /// Exact replay is idempotent; contradictory receipts fail closed. Neither a
     /// receipt nor its timestamp retires aggregate unknown work by itself.
+    /// An ambiguous response also persists its outcome class; a definite
+    /// receipt clears ambiguity (a received definite outcome supersedes any
+    /// earlier timeout note). Ahead of migration 0449 the receipt still lands
+    /// through the legacy statement and the class stays invisible.
     pub async fn complete_role_exchange(
         &self,
         ticket: &ExchangeTicket,
@@ -1343,9 +1518,13 @@ impl SelfRoleStore {
             ),
             ExchangeReceipt::Response { .. } => return Err(StoreError::InvalidAudit),
         };
-        Ok(sqlx::query(
+        let outcome_class = match receipt {
+            ExchangeReceipt::Response { status } => Self::classify_ambiguous_response(status),
+            ExchangeReceipt::NoSend => None,
+        };
+        let settled = sqlx::query(
             "UPDATE self_role_exchanges SET disposition=$5,response_status=$6,
-             completed_at=COALESCE(completed_at,clock_timestamp())
+             completed_at=COALESCE(completed_at,clock_timestamp()),outcome_class=$7
              WHERE exchange_id=$1 AND event_id=$2 AND origin_generation=$3 AND receipt_token=$4
              AND (disposition='pending' OR (disposition=$5 AND response_status IS NOT DISTINCT FROM $6))",
         )
@@ -1355,9 +1534,198 @@ impl SelfRoleStore {
         .bind(ticket.receipt_token.expose())
         .bind(disposition)
         .bind(status)
+        .bind(outcome_class)
         .execute(&self.pool)
-        .await?
-        .rows_affected() == 1)
+        .await;
+        let settled = match settled {
+            Ok(settled) => settled,
+            Err(error) if is_undefined_column(&error) => {
+                warn_ack_legacy_lane();
+                sqlx::query(
+                    "UPDATE self_role_exchanges SET disposition=$5,response_status=$6,
+                     completed_at=COALESCE(completed_at,clock_timestamp())
+                     WHERE exchange_id=$1 AND event_id=$2 AND origin_generation=$3 AND receipt_token=$4
+                     AND (disposition='pending' OR (disposition=$5 AND response_status IS NOT DISTINCT FROM $6))",
+                )
+                .bind(&ticket.exchange_id)
+                .bind(&ticket.event_id)
+                .bind(ticket.origin_generation)
+                .bind(ticket.receipt_token.expose())
+                .bind(disposition)
+                .bind(status)
+                .execute(&self.pool)
+                .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(settled.rows_affected() == 1)
+    }
+
+    /// Count one more wire send for a still-live ticket. Fresh tickets start
+    /// at one send; each retry bumps the count. Returns true when it bumped.
+    /// Completed or settled tickets are never bumped, and ahead of migration
+    /// 0449 the count stays invisible.
+    pub async fn note_wire_retry(&self, ticket: &ExchangeTicket) -> Result<bool, StoreError> {
+        let bumped = sqlx::query(
+            "UPDATE self_role_exchanges SET attempt_no=attempt_no+1
+             WHERE exchange_id=$1 AND event_id=$2 AND origin_generation=$3 AND receipt_token=$4
+             AND disposition='pending' AND settled_at IS NULL",
+        )
+        .bind(&ticket.exchange_id)
+        .bind(&ticket.event_id)
+        .bind(ticket.origin_generation)
+        .bind(ticket.receipt_token.expose())
+        .execute(&self.pool)
+        .await;
+        match bumped {
+            Ok(bumped) => Ok(bumped.rows_affected() == 1),
+            Err(error) if is_undefined_column(&error) => {
+                warn_ack_legacy_lane();
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Record a timeout or loop-exhaustion outcome on a still-pending ticket
+    /// without completing it: disposition stays `pending`, `completed_at`
+    /// stays NULL, so no pending-to-terminal transition changes meaning.
+    /// Only `OUTCOME_TIMEOUT_NO_RESPONSE` and `OUTCOME_LOOP_EXHAUSTION`
+    /// are accepted; anything else (including the completion-owned
+    /// `OUTCOME_RESPONSE_AMBIGUOUS`) is refused. Returns true when it wrote.
+    pub async fn note_ambiguous_outcome(
+        &self,
+        ticket: &ExchangeTicket,
+        outcome_class: &str,
+    ) -> Result<bool, StoreError> {
+        if outcome_class != OUTCOME_TIMEOUT_NO_RESPONSE && outcome_class != OUTCOME_LOOP_EXHAUSTION
+        {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "unknown outcome class '{outcome_class}'"
+            )));
+        }
+        let noted = sqlx::query(
+            "UPDATE self_role_exchanges SET outcome_class=$5
+             WHERE exchange_id=$1 AND event_id=$2 AND origin_generation=$3 AND receipt_token=$4
+             AND disposition='pending' AND settled_at IS NULL",
+        )
+        .bind(&ticket.exchange_id)
+        .bind(&ticket.event_id)
+        .bind(ticket.origin_generation)
+        .bind(ticket.receipt_token.expose())
+        .bind(outcome_class)
+        .execute(&self.pool)
+        .await;
+        match noted {
+            Ok(noted) => Ok(noted.rows_affected() == 1),
+            Err(error) if is_undefined_column(&error) => {
+                warn_ack_legacy_lane();
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Settle the superseded row when a replacement ticket takes over:
+    /// `superseded_by` names the replacement ticket's `exchange_id`,
+    /// `settled_as` becomes `SETTLED_SUPERSEDED` and `settled_at` is set.
+    /// The replacement row is untouched. Both tickets must belong to the
+    /// same event and differ; settled rows are never re-settled. Returns
+    /// true when it wrote. Ahead of migration 0449 the link stays invisible.
+    pub async fn supersede_role_exchange(
+        &self,
+        superseded: &ExchangeTicket,
+        replacement: &ExchangeTicket,
+    ) -> Result<bool, StoreError> {
+        if superseded.event_id != replacement.event_id
+            || superseded.exchange_id == replacement.exchange_id
+        {
+            return Ok(false);
+        }
+        let linked = sqlx::query(
+            "UPDATE self_role_exchanges SET superseded_by=$5,settled_as=$6,
+             settled_at=clock_timestamp()
+             WHERE exchange_id=$1 AND event_id=$2 AND origin_generation=$3 AND receipt_token=$4
+             AND settled_at IS NULL",
+        )
+        .bind(&superseded.exchange_id)
+        .bind(&superseded.event_id)
+        .bind(superseded.origin_generation)
+        .bind(superseded.receipt_token.expose())
+        .bind(&replacement.exchange_id)
+        .bind(SETTLED_SUPERSEDED)
+        .execute(&self.pool)
+        .await;
+        match linked {
+            Ok(linked) => Ok(linked.rows_affected() == 1),
+            Err(error) if is_undefined_column(&error) => {
+                warn_ack_legacy_lane();
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Settle pending, unsettled rows older than the bound (database clock)
+    /// as `SETTLED_EXPIRED_UNKNOWN` with `settled_at` set, and return how
+    /// many rows settled. Expiry settles; it never invents a receipt, so
+    /// disposition stays `pending` and the row is never re-settled. Ahead
+    /// of migration 0449 there is nothing to settle.
+    pub async fn expire_stale_exchanges(&self, older_than: Duration) -> Result<u64, StoreError> {
+        if older_than.is_negative() {
+            return Ok(0);
+        }
+        let settled = sqlx::query(
+            "UPDATE self_role_exchanges SET settled_as=$2,settled_at=clock_timestamp()
+             WHERE disposition='pending' AND settled_at IS NULL
+             AND created_at < clock_timestamp() - make_interval(secs => $1)",
+        )
+        .bind(older_than.as_seconds_f64())
+        .bind(SETTLED_EXPIRED_UNKNOWN)
+        .execute(&self.pool)
+        .await;
+        match settled {
+            Ok(settled) => Ok(settled.rows_affected()),
+            Err(error) if is_undefined_column(&error) => {
+                warn_ack_legacy_lane();
+                Ok(0)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// List the `exchange_id`s of pending, unsettled rows for the event, in
+    /// order: the recovery retry set. Settled rows are skipped instead of
+    /// re-probed; genuinely pending rows are returned. Ahead of migration
+    /// 0449 every pending row is unsettled, so the unfiltered pending list
+    /// is exactly this query.
+    pub async fn pending_retry_candidates(
+        pool: &PgPool,
+        event_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let candidates: Result<Vec<(String,)>, sqlx::Error> = sqlx::query_as(
+            "SELECT exchange_id FROM self_role_exchanges \
+             WHERE event_id = $1 AND disposition = 'pending' AND settled_at IS NULL \
+             ORDER BY exchange_id",
+        )
+        .bind(event_id)
+        .fetch_all(pool)
+        .await;
+        match candidates {
+            Ok(rows) => Ok(rows.into_iter().map(|row| row.0).collect()),
+            Err(error) if is_undefined_column(&error) => {
+                warn_ack_legacy_lane();
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT exchange_id FROM self_role_exchanges \
+                     WHERE event_id = $1 AND disposition = 'pending' ORDER BY exchange_id",
+                )
+                .bind(event_id)
+                .fetch_all(pool)
+                .await?;
+                Ok(rows.into_iter().map(|row| row.0).collect())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Incorporate sender facts only with the current live processing fences.
@@ -1721,6 +2089,67 @@ fn validate_exchange_intent(intent: &ExchangeIntent) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Count unresolved ticket rows for the journal's guild/member/event and refuse
+/// the insert that would exceed a cap. Unresolved means `pending`: nothing
+/// writes the acknowledgement settlement columns yet, so the predicate stays
+/// valid on databases with and without migration 0449. Runs inside the
+/// journal transaction after the event lock, before the insert. Same-event
+/// journals serialize on the event lock, so the event cap is exact; the
+/// guild/member counts are best-effort under concurrent cross-event journals.
+async fn enforce_acknowledgement_caps(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    intent: &ExchangeIntent,
+) -> Result<(), StoreError> {
+    let scope: Option<(String, String)> =
+        sqlx::query_as("SELECT guild_id,member_id FROM self_role_audit WHERE event_id=$1")
+            .bind(&claim.event_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((guild_id, member_id)) = scope else {
+        return Err(StoreError::StaleClaim);
+    };
+    let guild_unresolved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM self_role_exchanges e
+         JOIN self_role_audit a ON e.event_id=a.event_id
+         WHERE a.guild_id=$1 AND e.disposition='pending'",
+    )
+    .bind(&guild_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let member_unresolved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM self_role_exchanges e
+         JOIN self_role_audit a ON e.event_id=a.event_id
+         WHERE a.guild_id=$1 AND a.member_id=$2 AND e.disposition='pending'",
+    )
+    .bind(&guild_id)
+    .bind(&member_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let event_unresolved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending'",
+    )
+    .bind(&claim.event_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    // Counts cannot be negative; an unrepresentable count fails closed.
+    SelfRoleStore::check_acknowledgement_caps(
+        u32::try_from(guild_unresolved).unwrap_or(u32::MAX),
+        u32::try_from(member_unresolved).unwrap_or(u32::MAX),
+        u32::try_from(event_unresolved).unwrap_or(u32::MAX),
+        estimated_ack_row_bytes(&claim.event_id, &intent.role_id),
+    )
+}
+
+/// Estimated stored size of the ticket row the journal is about to insert:
+/// fixed per-row storage plus the variable event/role identifiers. Settlement
+/// fields are NULL at insert time, so they contribute nothing here.
+fn estimated_ack_row_bytes(event_id: &str, role_id: &str) -> usize {
+    ACK_ROW_FIXED_BYTES
+        .saturating_add(event_id.len())
+        .saturating_add(role_id.len())
+}
+
 async fn check_exchange_scope(
     conn: &mut PgConnection,
     claim: &EventClaim,
@@ -1853,15 +2282,44 @@ async fn retire_exchange_evidence(
         &legacy_removed,
         &receipts,
     );
-    sqlx::query(
-        "UPDATE self_role_exchanges SET retired_at=$2,retired_generation=$3
+    // Retiring an ambiguous ticket settles it as expired-unknown; definite
+    // rows keep settled_* NULL and already-settled rows keep their decision.
+    // Evidence semantics above are unchanged: settlement never clears
+    // uncertainty, it only records that the ticket stopped being probed.
+    // Missing columns abort a PostgreSQL transaction. Isolate the new-column
+    // write in a savepoint so the legacy fallback can use the enclosing one.
+    let mut settlement = conn.begin().await?;
+    let retired = sqlx::query(
+        "UPDATE self_role_exchanges SET retired_at=$2,retired_generation=$3,
+         settled_at=CASE WHEN outcome_class IS NOT NULL AND settled_at IS NULL
+             THEN clock_timestamp() ELSE settled_at END,
+         settled_as=CASE WHEN outcome_class IS NOT NULL AND settled_at IS NULL
+             THEN $4 ELSE settled_as END
          WHERE event_id=$1 AND retired_at IS NULL AND disposition <> 'pending'",
     )
     .bind(&claim.event_id)
     .bind(now)
     .bind(claim.generation)
-    .execute(&mut *conn)
-    .await?;
+    .bind(SETTLED_EXPIRED_UNKNOWN)
+    .execute(&mut *settlement)
+    .await;
+    match retired {
+        Ok(_) => settlement.commit().await?,
+        Err(error) if is_undefined_column(&error) => {
+            settlement.rollback().await?;
+            warn_ack_legacy_lane();
+            sqlx::query(
+                "UPDATE self_role_exchanges SET retired_at=$2,retired_generation=$3
+                 WHERE event_id=$1 AND retired_at IS NULL AND disposition <> 'pending'",
+            )
+            .bind(&claim.event_id)
+            .bind(now)
+            .bind(claim.generation)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     let mut query = sqlx::query(
         "UPDATE self_role_audit SET attempted_added_role_ids=$1,attempted_removed_role_ids=$2,
          compensated_added_role_ids=$3,compensated_removed_role_ids=$4,

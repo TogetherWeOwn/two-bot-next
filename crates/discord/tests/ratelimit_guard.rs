@@ -3,7 +3,10 @@
 mod common;
 
 use common::{MockRest, ScriptedResponse};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::time::Instant;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use two_bot_discord::{
@@ -31,8 +34,16 @@ async fn audit_global_admission_precedes_the_late_authorization() {
     .await;
     let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
     let exec = executor(&mock, &guard);
-    guard.observe_global(Some(0.4));
+    // Anchor before observing the pause: the guard sets its deadline at
+    // observation time plus 0.4 s and the 250 ms pad, and admission only
+    // returns at or after that deadline, so authorization (which runs after
+    // admission) lands at least 650 ms after this anchor. Anchoring after
+    // `observe_global` instead subtracted any scheduling gap between the two
+    // lines from the measured wait, so a gap over 50 ms made the 600 ms floor
+    // unsatisfiable even though admission honored the full pause. Delays
+    // after this anchor can only push observation and authorization later.
     let started = Instant::now();
+    guard.observe_global(Some(0.4));
     let result = exec
         .post_mirror_checked("4444", "audit test", "oa_fixture", async {
             assert!(started.elapsed() >= Duration::from_millis(600));
@@ -427,6 +438,12 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
         })
         .await
         .unwrap();
+        // Header-observation time: the guard anchors every pause at `observed_at`
+        // plus `retry_after + 250ms`, so the settled deadline minus this instant
+        // must stay near the body timing plus the pad — not shift by the
+        // body-finish delay. Sampling here (1ms poll) keeps measurement error
+        // far below the 400-600ms restart signal.
+        let header_observed = Instant::now();
         let callers = tokio::spawn(async move { tokio::join!(ban(&second), ban(&second)) });
         tokio::time::sleep(body_delay - Duration::from_millis(100)).await;
         assert!(!initial.is_finished(), "body must still be pending");
@@ -436,6 +453,31 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
             "known header restriction bypassed"
         );
         assert_eq!(initial.await.unwrap(), Err(DiscordError::RateLimited));
+        // No-restart proof via the guard deadline, not the wire clock: a true
+        // restart-at-body would add the full `body_delay` (400-600ms) to the
+        // deadline, while post-deadline scheduling stalls (which flaked the old
+        // `retry_after + 0.55` wire bound on loaded runners) leave the deadline
+        // itself untouched.
+        //
+        // Only the upper bound is asserted: both sampling lag (the 1ms poll
+        // lands after the guard records the headers) and an expired pause
+        // (zero remaining) shrink `anchored`, so a lower deadline bound would
+        // reintroduce the flake class this removes. Short deadlines stay
+        // covered by the wire lower bound below, and the exact pad/anchor
+        // arithmetic by the paused-clock unit tests. A retained pre-body
+        // deadline cannot serve instead: the provisional pause legitimately
+        // differs from the settled one (60s fallback without header timing;
+        // body timing wins over header timing).
+        let settled_at = Instant::now();
+        let remaining = guard.snapshot().global_pause_remaining;
+        let anchored = settled_at
+            .checked_add(remaining)
+            .unwrap_or(settled_at)
+            .saturating_duration_since(header_observed);
+        assert!(
+            anchored < Duration::from_secs_f64(retry_after + 0.35),
+            "cooldown restarted at body: {anchored:?}"
+        );
         let (a, b) = callers.await.unwrap();
         a.unwrap();
         b.unwrap();
@@ -444,10 +486,6 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
         for request in &requests[1..] {
             let elapsed = request.received_at.duration_since(requests[0].received_at);
             assert!(elapsed >= Duration::from_secs_f64(retry_after + 0.20));
-            assert!(
-                elapsed < Duration::from_secs_f64(retry_after + 0.55),
-                "cooldown restarted at body"
-            );
         }
         assert_eq!(guard.snapshot().global_pauses_total, 1);
         mock.shutdown().await;
@@ -1063,4 +1101,288 @@ async fn evidence_reads_recover_after_a_single_429() {
         assert_eq!(mock.requests().len(), 2);
         mock.shutdown().await;
     }
+}
+
+// Global-pause cap acceptance: a global pause learned from a 429 with no
+// usable timing stays fail-closed but is bounded at `min(window, 60 s)`
+// instead of a full budget window, and an HTTP-date `Retry-After` is parsed
+// as usable timing before that fallback applies. Well-formed global 429s
+// keep their exact waits (timing + the 250 ms pad), however long they are.
+
+/// The bound for a global pause with no usable timing.
+const CAP: Duration = Duration::from_secs(60);
+/// The 429 path's long-standing safety pad over learned timing.
+const PAD: Duration = Duration::from_millis(250);
+
+/// Format an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the HTTP-date
+/// form `Retry-After` may carry instead of delta-seconds.
+fn http_date(at: SystemTime) -> String {
+    let secs = at.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    // Civil calendar from days since the epoch (Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year_at_march = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 {
+        year_at_march + 1
+    } else {
+        year_at_march
+    };
+    let weekday =
+        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][(days + 4).rem_euclid(7) as usize];
+    let month_name = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(month - 1) as usize];
+    format!(
+        "{weekday}, {day:02} {month_name} {year} {:02}:{:02}:{:02} GMT",
+        tod / 3_600,
+        (tod % 3_600) / 60,
+        tod % 60
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_global_timing_fails_closed_but_is_capped_at_sixty_seconds() {
+    // The default window is 600 s; every unusable timing shape must land
+    // on the 60 s cap, not on the window, and never on zero (fail-closed).
+    for timing in [
+        None,
+        Some(-1.0),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(1e100),
+    ] {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        guard.observe_global(timing);
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            CAP,
+            "timing {timing:?} must fail closed at the cap"
+        );
+        assert_eq!(guard.snapshot().global_pauses_total, 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unusable_timing_cap_is_the_smaller_of_window_and_sixty_seconds() {
+    for (window, expected) in [
+        (Duration::from_secs(30), Duration::from_secs(30)),
+        (Duration::from_secs(60), Duration::from_secs(60)),
+        (Duration::from_secs(90), Duration::from_secs(60)),
+        (Duration::from_secs(600), Duration::from_secs(60)),
+    ] {
+        let guard = RateLimitGuard::new(GuardConfig {
+            window,
+            ..GuardConfig::default()
+        })
+        .unwrap();
+        guard.observe_global(None);
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            expected,
+            "window {window:?} must cap at min(window, 60 s)"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn capped_pause_still_blocks_admission_until_the_cap_expires() {
+    let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+    guard.observe_global(None);
+    let waiter = tokio::spawn({
+        let guard = guard.clone();
+        async move { guard.admit(false).await }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the capped pause must still fail closed before 60 s"
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    waiter.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn well_formed_global_timing_keeps_its_exact_wait_even_above_the_cap() {
+    // The cap bounds only the no-usable-timing fallback: a usable wait is
+    // honored exactly (plus the pad), never clamped down to 60 s.
+    for (timing, expected) in [
+        (120.0, Duration::from_secs(120) + PAD),
+        (61.0, Duration::from_secs(61) + PAD),
+        (2.0, Duration::from_secs(2) + PAD),
+        (0.0, PAD),
+    ] {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        guard.observe_global(Some(timing));
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            expected,
+            "usable timing {timing} must keep its exact wait"
+        );
+    }
+}
+
+#[tokio::test]
+async fn loopback_global_429_without_usable_timing_is_capped() {
+    // (a) Global scope learned from the body, no timing anywhere.
+    // (b) Global scope from the header, a Retry-After that is neither
+    // delta-seconds nor an HTTP-date, and no body timing.
+    let mut malformed = ScriptedResponse::json(429, serde_json::json!({}));
+    malformed
+        .headers
+        .push(("X-RateLimit-Global".into(), "true".into()));
+    malformed
+        .headers
+        .push(("Retry-After".into(), "not-a-number-or-date".into()));
+    for response in [
+        ScriptedResponse::json(429, serde_json::json!({"global": true})),
+        malformed,
+    ] {
+        let mock = MockRest::start(vec![response], ScriptedResponse::status(204)).await;
+        let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+        let exec = executor(&mock, &guard);
+        assert_eq!(ban(&exec).await, Err(DiscordError::RateLimited));
+        let remaining = guard.snapshot().global_pause_remaining;
+        assert!(
+            remaining <= CAP,
+            "unusable-timing pause must be capped, got {remaining:?}"
+        );
+        assert!(
+            remaining >= CAP - Duration::from_secs(15),
+            "unusable-timing pause must still fail closed near the cap, got {remaining:?}"
+        );
+        assert_eq!(guard.snapshot().global_pauses_total, 1);
+        assert_eq!(guard.snapshot().invalid_requests_total, 1);
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn loopback_http_date_retry_after_is_parsed_before_the_fallback() {
+    assert_eq!(http_date(UNIX_EPOCH), "Thu, 01 Jan 1970 00:00:00 GMT");
+    let target = SystemTime::now() + Duration::from_secs(4);
+    let mut response = ScriptedResponse::json(429, serde_json::json!({}));
+    response
+        .headers
+        .push(("X-RateLimit-Global".into(), "true".into()));
+    response
+        .headers
+        .push(("Retry-After".into(), http_date(target)));
+    let mock = MockRest::start(vec![response], ScriptedResponse::status(204)).await;
+    let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    assert_eq!(ban(&exec).await, Err(DiscordError::RateLimited));
+    // Pause ~= (date - now) + pad: a few seconds, far below both the 60 s
+    // capped fallback and the 600 s window.
+    let remaining = guard.snapshot().global_pause_remaining;
+    assert!(
+        remaining >= Duration::from_secs(1),
+        "HTTP-date pause must reflect the date, got {remaining:?}"
+    );
+    assert!(
+        remaining <= Duration::from_secs(5),
+        "HTTP-date pause must not fall back to the cap or window, got {remaining:?}"
+    );
+    assert_eq!(guard.snapshot().global_pauses_total, 1);
+    // Admission recovers on the date's schedule, not the fallback's.
+    tokio::time::timeout(Duration::from_secs(8), ban(&exec))
+        .await
+        .expect("the HTTP-date pause must expire in seconds")
+        .unwrap();
+    assert_eq!(mock.requests().len(), 2);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn loopback_provisional_pause_without_timing_is_capped_while_body_is_pending() {
+    let mut response = ScriptedResponse::json(429, serde_json::json!({"retry_after": 0.8}));
+    response
+        .headers
+        .push(("X-RateLimit-Global".into(), "true".into()));
+    let mock = MockRest::start_with_body_delay(
+        vec![response],
+        ScriptedResponse::status(204),
+        Duration::from_millis(600),
+    )
+    .await;
+    let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let initial = tokio::spawn(async move { ban(&exec).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while guard.snapshot().pending_global_responses == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Headers alone (no usable timing) hold a provisional pause: capped,
+    // not a full window, while the body is still in flight.
+    let provisional = guard.snapshot().global_pause_remaining;
+    assert!(
+        provisional <= CAP,
+        "provisional pause must be capped, got {provisional:?}"
+    );
+    assert!(
+        provisional >= CAP - Duration::from_secs(15),
+        "provisional pause must fail closed near the cap, got {provisional:?}"
+    );
+    assert_eq!(initial.await.unwrap(), Err(DiscordError::RateLimited));
+    // The body's usable timing then replaces the provisional fallback.
+    let settled = guard.snapshot().global_pause_remaining;
+    assert!(
+        settled <= Duration::from_millis(1_050),
+        "body timing must replace the provisional cap, got {settled:?}"
+    );
+    assert_eq!(guard.snapshot().pending_global_responses, 0);
+    assert_eq!(guard.snapshot().global_pauses_total, 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn loopback_dropped_global_body_commits_the_capped_fallback() {
+    let mut response = ScriptedResponse::json(429, serde_json::json!({"retry_after": 60}));
+    response
+        .headers
+        .push(("X-RateLimit-Global".into(), "true".into()));
+    let mock =
+        MockRest::start_with_stalled_bodies(vec![response], ScriptedResponse::status(204)).await;
+    let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let initial = tokio::spawn(async move { exec.get_json("/guilds/2222").await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while guard.snapshot().pending_global_responses == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The stalled body times out and its accounting is dropped; the pause
+    // that commits carries no usable timing, so it is the capped fallback.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while guard.snapshot().pending_global_responses != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("body deadline must drop the pending accounting");
+    let remaining = guard.snapshot().global_pause_remaining;
+    assert!(
+        remaining <= CAP,
+        "dropped-body pause must be capped, got {remaining:?}"
+    );
+    assert!(
+        remaining >= CAP - Duration::from_secs(15),
+        "dropped-body pause must fail closed near the cap, got {remaining:?}"
+    );
+    initial.abort();
+    mock.shutdown().await;
 }

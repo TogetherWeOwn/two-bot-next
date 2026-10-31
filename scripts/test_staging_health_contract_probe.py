@@ -28,7 +28,7 @@ READY = {
     "components": components(("process", "ready"), ("gateway", "ready"),
                              ("database", "ready"), ("token_invalid", "ready")),
     "jobs": {},
-    "build_revision": "abc123",
+    "build_revision": "0123456789abcdef0123456789abcdef01234567",
     "build_id": "1-1",
 }
 
@@ -124,7 +124,7 @@ class HealthContractProbeTests(unittest.TestCase):
         receipt = json.loads(Path(self.evidence).read_text())
         self.assertEqual(receipt["origin"], STAGING)
         self.assertEqual(receipt["result"], "pass")
-        self.assertEqual(receipt["build_revision"], "abc123")
+        self.assertEqual(receipt["build_revision"], "0123456789abcdef0123456789abcdef01234567")
         self.assertEqual(receipt["build_id"], "1-1")
         self.assertIsNone(receipt["gateway_failure_class"])
         self.assertIsNone(receipt["gateway_failure_root_cause"])
@@ -134,10 +134,29 @@ class HealthContractProbeTests(unittest.TestCase):
     def test_expected_sha_match_and_mismatch(self):
         routes = {STAGING + "/health": body({"status": "ok"}),
                   STAGING + "/readyz": body(dict(READY))}
-        code, _, _ = self.drive(routes, "--expected-sha", "abc123")
+        code, _, _ = self.drive(routes, "--expected-sha", "0123456789abcdef0123456789abcdef01234567")
         self.assertEqual(code, 0)
-        code, results, _ = self.drive(routes, "--expected-sha", "deadbeef")
+        code, results, _ = self.drive(routes, "--expected-sha", "fedcba9876543210fedcba9876543210fedcba98")
         self.assert_only_failure("build", "does not match the expected SHA", code, results)
+
+    def test_empty_supplied_pin_refuses_before_requests_or_evidence(self):
+        for extra, env in ((("--expected-sha", ""), {}), ((), {"EXPECTED_SHA": ""})):
+            with self.subTest(source="cli" if extra else "env"):
+                code, results, _ = self.drive({}, *extra, env=env)
+                self.assertEqual(code, 2)
+                self.assertEqual(set(results), {"FAIL origin"})
+                self.assertEqual(self.requested, [])
+                self.assertFalse(Path(self.evidence).exists())
+
+    def test_direct_helpers_reject_malformed_pins_without_retaining_them(self):
+        for pin in ("malformed-pin-sentinel", "", "unknown", 123, ["nested-pin-sentinel"]):
+            with self.subTest(pin=pin):
+                result = probe.check_build(dict(READY), pin)
+                self.assertFalse(result.ok)
+                self.assertIn("expected SHA must be", result.reason)
+                receipt = probe.evidence_shape([result], dict(READY), pin)
+                self.assertIsNone(receipt["expected_sha"])
+                self.assertNotIn("pin-sentinel", result.reason + json.dumps(receipt))
 
     def test_parked_gateway_is_truthful_not_approval(self):
         degraded = dict(READY)
@@ -368,8 +387,8 @@ class HealthContractProbeTests(unittest.TestCase):
                     nested = [nested]
                 report = dict(READY, **{field: nested})
 
-                def parse(raw, report=report):
-                    return report if raw == b"READYZ" else real_loads(raw)
+                def parse(raw, *args, report=report, **kwargs):
+                    return report if raw == b"READYZ" else real_loads(raw, *args, **kwargs)
 
                 routes = {STAGING + "/health": body({"status": "ok"}),
                           STAGING + "/readyz": (200, {}, b"READYZ")}
@@ -603,7 +622,7 @@ class BodyCapRefusalTests(unittest.TestCase):
         base = json.dumps(dict(READY, note=sentinel)).encode()
         big = base + b" " * (probe.BODY_CAP + 1 - len(base))
         self.assertEqual(len(big), probe.BODY_CAP + 1)
-        self.assertEqual(json.loads(big)["build_revision"], "abc123")
+        self.assertEqual(json.loads(big)["build_revision"], "0123456789abcdef0123456789abcdef01234567")
         self.assertEqual(json.loads(big)["note"], sentinel)
         routes = {STAGING + "/health": body({"status": "ok"}),
                   STAGING + "/readyz": (503, {}, big)}

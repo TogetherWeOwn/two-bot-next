@@ -58,10 +58,32 @@ SEND_MESSAGES_BIT = 2048
 LOCKDOWN_BITS = SEND_MESSAGES_BIT | (1 << 6) | (1 << 35) | (1 << 36) | (1 << 38)
 DRILL_SLOWMODE_SECONDS = 30
 MAX_REASON_LEN = 512
+# Discord's Unknown Message code: the only 404 that proves a message is gone.
+# Generic 404s, permission errors and malformed replies are not absence.
+UNKNOWN_MESSAGE_CODE = 10008
 
 
 class DrillError(Exception):
     """A step's one-line failure reason (fixed vocabulary only)."""
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 def guild_fence(guild_id):
@@ -129,6 +151,14 @@ def _to_int(value, what):
         raise DrillError(f"unparseable {what} in channel payload")
 
 
+def _check_channel_identity(channel, channel_id):
+    """Refuse a readback from the wrong guild or channel before trusting it."""
+    if channel.get("guild_id") != STAGING_GUILD_ID:
+        raise DrillError("refusing: channel is not in the staging guild")
+    if channel.get("id") != channel_id:
+        raise DrillError("refusing: channel id does not match the drill channel")
+
+
 class StepTimer:
     """Per-step UTC start + monotonic duration capture."""
 
@@ -153,7 +183,7 @@ class StepTimer:
 
 def mock_channel():
     """Fixture channel: open staging drill channel with no @everyone overwrite."""
-    return {"id": "1000000000000000001", "guild_id": STAGING_GUILD_ID,
+    return {"id": "mock-drill-channel", "guild_id": STAGING_GUILD_ID,
             "name": "cutover-drill", "rate_limit_per_user": 0,
             "permission_overwrites": []}
 
@@ -197,6 +227,11 @@ def mock_transport(state=None):
         if op == "delete_notice":
             box["notices"].pop(kw["notice_id"], None)
             return {}
+        if op == "get_notice":
+            nid = kw["notice_id"]
+            if nid in box["notices"]:
+                return {"id": nid, "channel_id": kw.get("channel_id", box["channel"]["id"])}
+            return {"code": UNKNOWN_MESSAGE_CODE, "message": "Unknown Message"}
         if op == "get_commands":
             return [dict(c) for c in box["commands"]]
         raise DrillError(f"mock transport has no op {op}")
@@ -241,16 +276,77 @@ def live_transport(token):
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
         try:
-            value = json.loads(body) if body else expect()
+            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                     if body else expect())
+        except DuplicateKeyError:
+            raise DrillError(
+                f"discord answered duplicate JSON object keys on {method}") from None
         except (ValueError, RecursionError):
             raise DrillError(f"discord answered a non-JSON body on {method}") from None
         if not isinstance(value, expect):
             raise DrillError(f"discord answered an unexpected body shape on {method}")
         return value
 
+    def request_notice(url):
+        """GET one message: 404+10008 proves absence, anything else does not.
+
+        Uses the same refusing opener, timeout, body cap and fixed error
+        vocabulary as `request`, so the token, bodies and headers never leak.
+        """
+        req = urllib.request.Request(
+            url, method="GET",
+            headers={"Authorization": f"Bot {token}", "User-Agent": USER_AGENT,
+                     "Content-Type": "application/json"})
+        try:
+            with opener.open(req, timeout=20) as resp:
+                body = resp.read(BODY_CAP + 1)
+        except DrillError:
+            raise
+        except urllib.error.HTTPError as error:
+            code = error.code
+            try:
+                body = error.read(BODY_CAP + 1)
+            except Exception:
+                body = b""
+            finally:
+                error.close()
+            if code == 404:
+                if len(body) > BODY_CAP:
+                    raise DrillError("discord answered over the body cap")
+                try:
+                    value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                             if body else {})
+                except DuplicateKeyError:
+                    raise DrillError(
+                        "discord answered duplicate JSON object keys on GET") from None
+                except (ValueError, RecursionError):
+                    raise DrillError("discord answered a non-JSON body on GET") from None
+                if isinstance(value, dict) and value.get("code") == UNKNOWN_MESSAGE_CODE:
+                    return {"code": UNKNOWN_MESSAGE_CODE, "message": "Unknown Message"}
+                raise DrillError("discord answered 404 on GET")
+            raise DrillError(f"discord answered {code} on GET")
+        except Exception as error:
+            raise DrillError(f"discord did not respond ({error.__class__.__name__})")
+        if len(body) > BODY_CAP:
+            raise DrillError("discord answered over the body cap")
+        try:
+            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                     if body else {})
+        except DuplicateKeyError:
+            raise DrillError(
+                "discord answered duplicate JSON object keys on GET") from None
+        except (ValueError, RecursionError):
+            raise DrillError("discord answered a non-JSON body on GET") from None
+        if not isinstance(value, dict):
+            raise DrillError("discord answered an unexpected body shape on GET")
+        return value
+
     def call(op, **kw):
         if op == "get_channel":
             return request("GET", f"{API}/channels/{kw['channel_id']}")
+        if op == "get_notice":
+            return request_notice(
+                f"{API}/channels/{kw['channel_id']}/messages/{kw['notice_id']}")
         if op == "post_notice":
             return request("POST", f"{API}/channels/{kw['channel_id']}/messages",
                            {"content": kw["content"]})
@@ -306,6 +402,7 @@ def run_drill(guild_id, channel_id, reason, call, timer=None):
         prior = baseline["prior"]
         timer.run("freeze-notice-post",
                   lambda: _post_notice(call, channel_id, applied))
+        created_notice_id = applied.get("notice")
         timer.run("slowmode-on",
                   lambda: _set_slowmode(call, channel_id, DRILL_SLOWMODE_SECONDS,
                                         applied, audit_reason))
@@ -323,7 +420,7 @@ def run_drill(guild_id, channel_id, reason, call, timer=None):
         restore_state = {}
 
         def do_restore_verify():
-            state = _verify_restore(call, channel_id, pre_hash)
+            state = _verify_restore(call, channel_id, pre_hash, created_notice_id)
             restore_state.update(state)
             return state["detail"]
 
@@ -337,7 +434,8 @@ def run_drill(guild_id, channel_id, reason, call, timer=None):
                              applied, audit_reason, timer)
         return {"guild_id": guild,
                 "result": "fail", "steps": timer.rows,
-                "restore": {"restored": False, "reason": str(error)}}
+                "restore": {"restored": False, "notice_removed": False,
+                            "reason": str(error)}}
     return {"guild_id": guild, "result": "pass", "steps": timer.rows,
             "restore": {"restored": restore["restored"],
                         "pre_hash": pre_hash, "post_hash": restore["post_hash"],
@@ -347,10 +445,13 @@ def run_drill(guild_id, channel_id, reason, call, timer=None):
 
 def _read_baseline(call, channel_id):
     channel = call("get_channel", channel_id=channel_id)
-    if channel.get("guild_id") != STAGING_GUILD_ID:
-        raise DrillError("refusing: channel is not in the staging guild")
+    _check_channel_identity(channel, channel_id)
     ow = everyone_overwrite(channel)
     slowmode = _to_int(channel.get("rate_limit_per_user") or 0, "slowmode")
+    _to_int(ow["allow"], "allow mask")
+    deny_int = _to_int(ow["deny"], "deny mask")
+    if deny_int & SEND_MESSAGES_BIT:
+        raise DrillError("refusing: baseline channel is already locked")
     state = {"slowmode": slowmode, "prior": ow,
              "hash": semantic_hash(slowmode, ow["allow"], ow["deny"], ow["exists"])}
     return _baseline_detail(state)
@@ -369,6 +470,10 @@ def _post_notice(call, channel_id, applied):
     if not isinstance(notice_id, str) or not notice_id:
         raise DrillError("discord notice reply carried no message id")
     applied["notice"] = notice_id
+    observed = call("get_notice", channel_id=channel_id, notice_id=notice_id)
+    if (not isinstance(observed, dict) or observed.get("id") != notice_id
+            or observed.get("channel_id") != channel_id):
+        raise DrillError("notice presence readback does not match the created notice")
     return "freeze notice posted"
 
 
@@ -376,6 +481,11 @@ def _set_slowmode(call, channel_id, seconds, applied, _reason, restore=False):
     if not 0 <= seconds <= MAX_SLOWMODE_SECONDS:
         raise DrillError("slowmode seconds out of range 0..=21600")
     call("patch_slowmode", channel_id=channel_id, seconds=seconds)
+    channel = call("get_channel", channel_id=channel_id)
+    _check_channel_identity(channel, channel_id)
+    observed = _to_int(channel.get("rate_limit_per_user") or 0, "slowmode")
+    if observed != seconds:
+        raise DrillError("slowmode readback does not match the requested value")
     applied["slowmode"] = not restore
     return f"slowmode={'restored' if restore else 'on'}"
 
@@ -384,6 +494,16 @@ def _lock(call, channel_id, guild, prior, applied, _reason):
     allow, deny = plan_lockdown_masks(prior["allow"], prior["deny"])
     call("patch_overwrite", channel_id=channel_id, guild_id=guild,
          allow=allow, deny=deny)
+    channel = call("get_channel", channel_id=channel_id)
+    _check_channel_identity(channel, channel_id)
+    observed_slowmode = _to_int(channel.get("rate_limit_per_user") or 0, "slowmode")
+    if observed_slowmode != DRILL_SLOWMODE_SECONDS:
+        raise DrillError("frozen slowmode readback does not match the drill value")
+    ow = everyone_overwrite(channel)
+    _to_int(ow["allow"], "allow mask")
+    _to_int(ow["deny"], "deny mask")
+    if ow["allow"] != allow or ow["deny"] != deny or not ow["exists"]:
+        raise DrillError("frozen lockdown readback does not match the intended masks")
     applied["lockdown"] = True
     return "locked_down."
 
@@ -402,29 +522,56 @@ def _unlock(call, channel_id, guild, prior, applied, _reason):
     else:
         call("patch_overwrite", channel_id=channel_id, guild_id=guild,
              allow=prior["allow"], deny=prior["deny"])
+    channel = call("get_channel", channel_id=channel_id)
+    _check_channel_identity(channel, channel_id)
+    ow = everyone_overwrite(channel)
+    _to_int(ow["allow"], "allow mask")
+    _to_int(ow["deny"], "deny mask")
+    if ow["allow"] != prior["allow"] or ow["deny"] != prior["deny"] or ow["exists"] != prior["exists"]:
+        raise DrillError("unlock readback does not match the baseline seed")
     applied["lockdown"] = False
     return "unlocked."
 
 
+def _notice_is_absent(result):
+    """Only Discord's Unknown Message proves the exact notice is gone."""
+    return isinstance(result, dict) and result.get("code") == UNKNOWN_MESSAGE_CODE
+
+
 def _delete_notice(call, channel_id, applied):
-    if applied.get("notice"):
-        call("delete_notice", channel_id=channel_id, notice_id=applied["notice"])
+    nid = applied.get("notice")
+    if nid:
+        call("delete_notice", channel_id=channel_id, notice_id=nid)
+        result = call("get_notice", channel_id=channel_id, notice_id=nid)
+        if not _notice_is_absent(result):
+            raise DrillError("notice still present after delete")
         applied["notice"] = None
     return "notice removed"
 
 
-def _verify_restore(call, channel_id, pre_hash):
+def _verify_restore(call, channel_id, pre_hash, notice_id):
     channel = call("get_channel", channel_id=channel_id)
-    if channel.get("guild_id") != STAGING_GUILD_ID:
-        raise DrillError("refusing: channel is not in the staging guild")
+    _check_channel_identity(channel, channel_id)
     ow = everyone_overwrite(channel)
     slowmode = _to_int(channel.get("rate_limit_per_user") or 0, "slowmode")
     post_hash = semantic_hash(slowmode, ow["allow"], ow["deny"], ow["exists"])
     unlocked = (_to_int(ow["deny"], "deny mask") & SEND_MESSAGES_BIT) == 0
-    result = {"restored": post_hash == pre_hash and unlocked,
+    notice_removed = False
+    if notice_id:
+        try:
+            result = call("get_notice", channel_id=channel_id, notice_id=notice_id)
+        except DrillError:
+            notice_removed = False
+        else:
+            notice_removed = _notice_is_absent(result)
+    else:
+        notice_removed = True
+    result = {"restored": post_hash == pre_hash and unlocked and notice_removed,
               "post_hash": post_hash, "unlocked": unlocked,
-              "notice_removed": True}
+              "notice_removed": notice_removed}
     if not result["restored"]:
+        if not notice_removed:
+            raise DrillError("restore mismatch: notice still present")
         raise DrillError("restore mismatch: post state differs from baseline")
     result["detail"] = "pre==post semantic hash, unlocked, notice removed"
     return result
@@ -457,6 +604,28 @@ def evidence_shape(outcome, transport, run_id):
             "restore": outcome.get("restore")}
 
 
+# Ordered step names printed by the dry-run plan. Mirrors the nine
+# timer.run calls in run_drill; the dry-run acceptance suite pins both
+# surfaces to this order.
+DRY_RUN_STEPS = ("baseline-read", "freeze-notice-post", "slowmode-on",
+                 "lockdown", "command-surface-verify", "slowmode-restore",
+                 "unlock-restore", "notice-delete", "restore-verify")
+
+
+def dry_run_plan_text(guild_id, channel_id, reason, transport):
+    """Fixed-vocabulary ordered plan; no timestamps, no transport calls."""
+    lines = ["cutover freeze drill dry-run plan",
+             f"guild_id: {guild_id}",
+             f"channel_id: {channel_id}",
+             f"reason: {reason}",
+             f"transport: {transport}",
+             "steps in order:"]
+    lines += [f"{index}. {step}" for index, step in enumerate(DRY_RUN_STEPS, 1)]
+    lines.append("mutations: none (plan only; no notice, no slowmode, "
+                 "no overwrite, no delete)")
+    return "\n".join(lines)
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--guild-id",
@@ -470,6 +639,8 @@ def parse_args(argv):
                         help="drive local fixtures (no network, no token)")
     parser.add_argument("--live", action="store_true",
                         help="drive the real staging REST transport")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate inputs and print the ordered plan without mutating anything")
     parser.add_argument("--confirm-staging", action="store_true",
                         help="explicit live-run confirmation")
     parser.add_argument("--evidence", default="cutover-freeze-drill-evidence.json",
@@ -511,6 +682,19 @@ def main(argv=None, call=None):
     else:
         transport = MOCK_TRANSPORT
     channel = args.channel_id or "mock-drill-channel"
+    if args.dry_run:
+        # Guards above already validated guild, reason, transport mode and
+        # (for live) confirm, channel and token exactly like the live path.
+        # Run the read-only baseline step so a wrong-guild or already-locked
+        # channel refuses exactly like live step 1, then print the plan.
+        try:
+            _read_baseline(call, channel)
+        except DrillError as error:
+            print(f"FAIL baseline-read: {error}")
+            return 1
+        print(dry_run_plan_text(args.guild_id, channel,
+                                check_reason(args.reason), transport))
+        return 0
     outcome = run_drill(args.guild_id, channel, args.reason, call)
     for step in outcome["steps"]:
         print(f"{'PASS' if step['result'] == 'pass' else 'FAIL'} "

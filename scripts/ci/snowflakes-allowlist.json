@@ -1,5 +1,11 @@
 [
   {
+    "path": "crates/bot/src/welcome_preview.rs",
+    "value": "765432109876543210",
+    "source": "const FIXTURE_MEMBER_ID: u64 = 765_432_109_876_543_210;",
+    "reason": "Fixed documented synthetic welcome-preview identity required by the private read-only rendering contract; no Discord/member lookup or delivery uses it. Protected acceptance tests pin this exact fixture and zero effects. This is not a deployment/member configuration ID."
+  },
+  {
     "path": "crates/bot/src/audit_runtime_tests.rs",
     "value": "18446744073709551611",
     "source": "const OPERATOR: &str = \"18446744073709551611\";",
@@ -227,60 +233,60 @@
     "source": "pub const LIVE_GUILD_ID: &str = \"326474832151838730\";",
     "reason": "Existing cutover guard/parity constant; LIVE_GUILD_ID enforces refusal before any database/file access, and STAGING_GUILD_ID pins the legacy soak fixture."
   },
- {
-  "path": "crates/bot/src/raid_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "(\"DISCORD_STAFF_ALERT_CHANNEL_ID\", \" 123456789012345678 \"),",
-  "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/raid_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "assert_eq!(set.staff_channel.as_deref(), Some(\"123456789012345678\"));",
-  "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/raid_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "\"123456789012345678\".to_owned(),",
-  "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/raid_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "assert_eq!(first.staff_channel.as_deref(), Some(\"123456789012345678\"));",
-  "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/raid_runtime_tests.rs",
-  "value": "999999999999999999",
-  "source": "Some(json!(\"999999999999999999\")),",
-  "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/join_risk_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "(\"DISCORD_STAFF_ALERT_CHANNEL_ID\", \"123456789012345678\"),",
-  "reason": "Join-risk runtime acceptance tests (PR #383) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/join_risk_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "assert_eq!(set.staff_channel.as_deref(), Some(\"123456789012345678\"));",
-  "reason": "Join-risk runtime acceptance tests (PR #383) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/containment_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "(\"DISCORD_STAFF_ALERT_CHANNEL_ID\", \"123456789012345678\"),",
-  "reason": "Containment runtime acceptance tests use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
-  "path": "crates/bot/src/containment_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "assert_eq!(set.staff_channel.as_deref(), Some(\"123456789012345678\"));",
-  "reason": "Containment runtime acceptance tests use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
+  {
+    "path": "crates/bot/src/raid_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "(\"DISCORD_STAFF_ALERT_CHANNEL_ID\", \" 123456789012345678 \"),",
+    "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/raid_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "assert_eq!(set.staff_channel.as_deref(), Some(\"123456789012345678\"));",
+    "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/raid_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "\"123456789012345678\".to_owned(),",
+    "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/raid_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "assert_eq!(first.staff_channel.as_deref(), Some(\"123456789012345678\"));",
+    "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/raid_runtime_tests.rs",
+    "value": "999999999999999999",
+    "source": "Some(json!(\"999999999999999999\")),",
+    "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/join_risk_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "(\"DISCORD_STAFF_ALERT_CHANNEL_ID\", \"123456789012345678\"),",
+    "reason": "Join-risk runtime acceptance tests (PR #383) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/join_risk_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "assert_eq!(set.staff_channel.as_deref(), Some(\"123456789012345678\"));",
+    "reason": "Join-risk runtime acceptance tests (PR #383) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/containment_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "(\"DISCORD_STAFF_ALERT_CHANNEL_ID\", \"123456789012345678\"),",
+    "reason": "Containment runtime acceptance tests use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/containment_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "assert_eq!(set.staff_channel.as_deref(), Some(\"123456789012345678\"));",
+    "reason": "Containment runtime acceptance tests use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
   {
     "path": "crates/bot/src/raid_runtime_tests.rs",
     "value": "999999999999999999",
@@ -304,5 +310,17 @@
     "value": "123456789012345678",
     "source": ".is_some_and(|value| value == json!(\"123456789012345678\")),",
     "reason": "Settings live-reload tests publish reserved-example Discord snowflakes as synthetic destination values through the in-process live channel; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/backfill_error_chain_acceptance_tests.rs",
+    "value": "987654321098765432",
+    "source": "const MEMBER_ID: &str = \"987654321098765432\";",
+    "reason": "Backfill and retention error-chain acceptance tests use a reserved synthetic member-id fixture as hostile redaction input; it is not a real Discord entity and is never sent externally."
+  },
+  {
+    "path": "crates/bot/src/retention_error_chain_acceptance_tests.rs",
+    "value": "987654321098765432",
+    "source": "const MEMBER_ID: &str = \"987654321098765432\";",
+    "reason": "Backfill and retention error-chain acceptance tests use a reserved synthetic member-id fixture as hostile redaction input; it is not a real Discord entity and is never sent externally."
   }
 ]

@@ -37,8 +37,8 @@ use two_bot_core::{
     voice_naming::{local_hour, minutes_tier, GameOptions, RoomContext},
     voice_presence::{apply_room_presence, OccupantPresence},
     voice_room_name::{
-        decide_custom_name, decide_template_name, NameChecks, RenderFacts, MAX_CUSTOM_NAME_CHARS,
-        NAME_INPUT_ID,
+        decide_custom_name, decide_template_name, is_literal_name, NameChecks, RenderFacts,
+        MAX_CUSTOM_NAME_CHARS, NAME_INPUT_ID,
     },
 };
 
@@ -116,6 +116,10 @@ impl NameDirectory {
 
     pub(super) fn knows(&self, member: Snowflake) -> bool {
         self.names.contains_key(&member)
+    }
+
+    fn display_for(&self, member: Snowflake) -> Option<String> {
+        self.names.get(&member).cloned()
     }
 
     fn retain(&mut self, mut keep: impl FnMut(Snowflake) -> bool) {
@@ -400,6 +404,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 prefill: self.custom_names.get(&room_id).cloned(),
             },
             NameInteraction::Submit { text, .. } => {
+                // The submit renders from the interaction's fresh directory
+                // while the background re-render reads the worker's copy: copy
+                // the fresh owner and original-creator names over so the next
+                // fact change keeps the name just promised, instead of
+                // re-rendering with a stale nickname.
+                for member in [room.owner_id, room.original_creator_id] {
+                    if let Some(display) = command.directory.display_for(member) {
+                        self.name_directory.insert(member, display);
+                    }
+                }
                 let facts = self.name_facts(&room, &command);
                 let checks = NameChecks {
                     policy: &command.policy,
@@ -420,6 +434,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
             }
             NameInteraction::Restore { .. } => {
+                // Same fresh-directory sync as a submit: the restore reply
+                // promises a render from the interaction's facts.
+                for member in [room.owner_id, room.original_creator_id] {
+                    if let Some(display) = command.directory.display_for(member) {
+                        self.name_directory.insert(member, display);
+                    }
+                }
                 let facts = self.name_facts(&room, &command);
                 let checks = NameChecks {
                     policy: &command.policy,
@@ -534,7 +555,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// whenever the facts it depends on change (creation, joins and leaves,
     /// owner handoff, limit) and propose the result on the rename lane, which
     /// coalesces to one pending name per channel within Discord's rename
-    /// budget. Rooms with a `/name` override keep it; a blank template keeps
+    /// budget. Rooms with a `/name` override under a creator with a name
+    /// template re-render the stored override through the same sanitizer and
+    /// filter instead of the creator template (see `refresh_custom_name`);
+    /// a literal override (no template syntax) never re-renders, so it stays
+    /// manually managed like the submit left it. Under a blank template the
+    /// room stays manually managed, override or not. A blank template keeps
     /// the room's current name; a render the name filter blocks is skipped.
     pub(super) fn refresh_template_names(&mut self, now_ms: u64) {
         let (ready, generation) = {
@@ -599,15 +625,25 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // The status line follows the room whatever its name does: a
             // `/name` override, a blank name template or a name wait.
             self.refresh_voice_status(&room, &command);
-            if self.custom_names.contains_key(&room_id) {
-                continue;
-            }
-            let Some(template) = self
+            let template = self
                 .creators
                 .get(&room.creator_channel_id)
                 .map(|creator| creator.name_template.clone())
-                .filter(|template| !template.trim().is_empty())
-            else {
+                .filter(|template| !template.trim().is_empty());
+            if let Some(stored) = self.custom_names.get(&room_id).cloned() {
+                // Automatic re-renders run only where automatic naming runs:
+                // under a blank creator template the room stays manually
+                // managed (override or not), so a status-only room never
+                // spends a rename and a `/name` submit keeps its own render.
+                // A literal override carries no template syntax, so no fact
+                // change can alter its render: leave it as the submit left it
+                // instead of spending a rename on today's channel name.
+                if template.is_some() && !is_literal_name(&stored) {
+                    self.refresh_custom_name(&room, &command, &facts, &stored, now_ms);
+                }
+                continue;
+            }
+            let Some(template) = template else {
                 continue;
             };
             // A person whose display name is unknown would render as
@@ -653,6 +689,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     // on a later pass.
                     match self.propose_name(room_id, &name, now_ms) {
                         Some(outcome) => {
+                            let decision = match outcome {
+                                ProposeOutcome::Unchanged => "unchanged",
+                                ProposeOutcome::Queued { .. } => "queued",
+                            };
+                            log_template_name_decision(
+                                self.live.guild_id,
+                                room_id,
+                                facts.context.members_playing,
+                                decision,
+                            );
                             metrics::global().voice_name(match outcome {
                                 ProposeOutcome::Unchanged => "unchanged",
                                 ProposeOutcome::Queued { .. } => "proposed",
@@ -660,12 +706,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             self.name_signatures.insert(room_id, signature);
                         }
                         None => {
+                            log_template_name_decision(
+                                self.live.guild_id,
+                                room_id,
+                                facts.context.members_playing,
+                                "channel_unseen",
+                            );
                             metrics::global().voice_name("channel_unseen");
                             self.name_inputs = None;
                         }
                     }
                 }
                 Err(_) => {
+                    log_template_name_decision(
+                        self.live.guild_id,
+                        room_id,
+                        facts.context.members_playing,
+                        "template_blocked",
+                    );
                     metrics::global().voice_name("blocked");
                     self.name_signatures.insert(room_id, signature);
                 }
@@ -686,6 +744,106 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .retain(|room_id, _| rooms.contains_key(room_id));
         self.status_unknown
             .retain(|room_id| rooms.contains_key(room_id));
+    }
+
+    /// V5 recalculation for a room holding a `/name` override: render the
+    /// stored override against the room's live facts and propose the result on
+    /// the rename lane, which keeps one pending name per channel within
+    /// Discord's rename budget. Runs only under a creator with a name
+    /// template; template-named rooms are untouched by this path. A render
+    /// the name filter blocks keeps the last proposed name and
+    /// the stored override. The stored text is never written back, so
+    /// `name_touched_at` keeps measuring set/restore, not recalculation.
+    fn refresh_custom_name(
+        &mut self,
+        room: &VoiceRoom,
+        command: &NameCommand,
+        facts: &NameFacts,
+        stored: &str,
+        now_ms: u64,
+    ) {
+        let room_id = room.channel_id;
+        // A person whose display name is unknown would render as "member":
+        // wait briefly for the name instead of spending a rename, but never
+        // longer than NAME_WAIT_MS. Only wait for names the override actually
+        // reads: occupancy- and limit-only overrides must not wait.
+        let stored_lower = stored.to_ascii_lowercase();
+        let uses_owner = stored_lower.contains("@@owner@@") || stored_lower.contains("@@creator@@");
+        let uses_original_creator = stored_lower.contains("@@original_creator@@");
+        let unknown = (uses_owner && !self.name_directory.knows(room.owner_id))
+            || (uses_original_creator && !self.name_directory.knows(room.original_creator_id));
+        if unknown {
+            if !self.name_waits.contains_key(&room_id) {
+                metrics::global().voice_name("waiting_for_name");
+            }
+            let since = *self.name_waits.entry(room_id).or_insert(now_ms);
+            if now_ms.saturating_sub(since) < NAME_WAIT_MS {
+                self.name_inputs = None;
+                return;
+            }
+        } else {
+            self.name_waits.remove(&room_id);
+        }
+        let signature = NameSignature::of(facts);
+        if self.name_signatures.get(&room_id) == Some(&signature) {
+            return;
+        }
+        let checks = NameChecks {
+            policy: &command.policy,
+            filter: &facts.filter,
+            unique_names: false,
+            other_voice_names: &facts.other_names,
+        };
+        let render = RenderFacts {
+            context: &facts.context,
+            conditions: &facts.conditions,
+            fallback_name: &facts.fallback,
+        };
+        match decide_template_name(stored, &render, &checks) {
+            Ok(name) => {
+                // A channel the live snapshot cannot see yet is retried
+                // on a later pass.
+                match self.propose_name(room_id, &name, now_ms) {
+                    Some(outcome) => {
+                        let decision = match outcome {
+                            ProposeOutcome::Unchanged => "unchanged",
+                            ProposeOutcome::Queued { .. } => "queued",
+                        };
+                        log_template_name_decision(
+                            self.live.guild_id,
+                            room_id,
+                            facts.context.members_playing,
+                            decision,
+                        );
+                        metrics::global().voice_name(match outcome {
+                            ProposeOutcome::Unchanged => "unchanged",
+                            ProposeOutcome::Queued { .. } => "proposed",
+                        });
+                        self.name_signatures.insert(room_id, signature);
+                    }
+                    None => {
+                        log_template_name_decision(
+                            self.live.guild_id,
+                            room_id,
+                            facts.context.members_playing,
+                            "channel_unseen",
+                        );
+                        metrics::global().voice_name("channel_unseen");
+                        self.name_inputs = None;
+                    }
+                }
+            }
+            Err(_) => {
+                log_template_name_decision(
+                    self.live.guild_id,
+                    room_id,
+                    facts.context.members_playing,
+                    "template_blocked",
+                );
+                metrics::global().voice_name("blocked");
+                self.name_signatures.insert(room_id, signature);
+            }
+        }
     }
 
     /// Render the room's voice status line and leave it pending when it
@@ -876,7 +1034,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         self.name_settings_read_ms = Some(now_ms);
-        if let Ok(config) = self.store.config_snapshot(self.live.guild_id).await {
+        let snapshot = self.store.config_snapshot(self.live.guild_id).await;
+        if let Err(error) = &snapshot {
+            // A persistently failing snapshot is how a creator view stays
+            // stale for longer than the reload interval: surface it instead
+            // of swallowing it. The direct creator merge still converges the
+            // view while this fails.
+            tracing::warn!(
+                guild = self.live.guild_id.to_string(),
+                ?error,
+                "voice naming settings refresh failed; keeping the cached view"
+            );
+        }
+        if let Ok(config) = snapshot {
             // Use the same snapshot for creator templates and naming settings.
             // The export codec omits per-creator companion overrides and folds
             // an inherited limit into zero; preserve those just as config_apply
@@ -1160,6 +1330,39 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
+        // Member-requested overrides pass the same automod name filter as
+        // every other naming path: a blocked override is refused here,
+        // before any store write or Discord call, with the stable
+        // `name_blocked` outcome. A restore (`None`) carries no name.
+        if let Some(text) = custom_name.as_deref() {
+            let owner_id = self
+                .rooms
+                .get(&channel_id)
+                .map(|room| room.owner_id)
+                .unwrap_or(channel_id);
+            let context = NameFilterContext {
+                guild_id: self.live.guild_id.to_string(),
+                channel_id: channel_id.to_string(),
+                user_id: owner_id.to_string(),
+            };
+            if filter_channel_name(text, &self.name_policy, &context).is_err() {
+                log_rename_decision(
+                    self.live.guild_id,
+                    channel_id,
+                    "name_blocked",
+                    "name_blocked",
+                    0,
+                    false,
+                );
+                metrics::global().voice_name("name_blocked");
+                // Drop the hostile override so it never renders or renames;
+                // the store keeps its previous value (or none).
+                self.custom_names.remove(&channel_id);
+                self.desired_names.remove(&channel_id);
+                self.queue.mark_succeeded(&action);
+                return;
+            }
+        }
         match self
             .store
             .save_custom_name(self.live.guild_id, channel_id, custom_name.as_deref())
@@ -1207,12 +1410,20 @@ where
     H: RoomWrites + Send + 'static,
 {
     /// Run one `/name` step through the guild actor. `None` when the guild
-    /// has no live actor yet or its inbox already drained.
-    async fn run_name(&self, guild: Snowflake, command: NameCommand) -> Option<NameReply> {
+    /// has no live actor yet, when its inbox already drained, or when no
+    /// answer arrived within `WORKER_ACK_WAIT`.
+    pub(super) async fn run_name(
+        &self,
+        guild: Snowflake,
+        command: NameCommand,
+    ) -> Option<NameReply> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::Name { command, reply }).ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 }
 
@@ -1289,6 +1500,7 @@ where
         policy: Arc::clone(&runtime.name_policy),
     };
     let response = match runtime.run_name(guild_id, command).await {
+        None if runtime.has_actor(guild_id) => ephemeral_response(WORKER_LOST_REPLY),
         None => ephemeral_response(NOT_WARM),
         Some(NameReply::Refused(text) | NameReply::Applied(text)) => ephemeral_response(&text),
         Some(NameReply::Panel { room_id, text }) => panel_response(room_id, &text),

@@ -242,6 +242,271 @@ fn parked_reason_taxonomy_selects_warn_vs_info() {
     }
 }
 
+use two_bot_core::settings::{live_channel, LiveSettingsWriter, SettingRow, SettingsSnapshot};
+
+/// Pure in-memory live snapshot: each publish bumps the revision so the poll
+/// marks move and the rows land, exactly like a dashboard write + poll. No
+/// database, no network, no process-environment reads.
+struct LiveFixture {
+    writer: LiveSettingsWriter,
+    live: two_bot_core::settings::LiveSettings,
+    revision: i64,
+}
+
+impl LiveFixture {
+    fn new() -> Self {
+        let (writer, live) = live_channel();
+        Self {
+            writer,
+            live,
+            revision: 0,
+        }
+    }
+
+    fn publish(&mut self, rows: Vec<SettingRow>) {
+        self.revision += 1;
+        let revision = self.revision;
+        self.writer.publish(&SettingsSnapshot { revision, rows });
+    }
+}
+
+fn live_row(guild: &str, key: &str, value: Value) -> SettingRow {
+    SettingRow {
+        guild_id: guild.to_owned(),
+        key: key.to_owned(),
+        value,
+        version: 1,
+    }
+}
+
+const LIVE_GUILD: &str = "live-guild";
+const OTHER_GUILD: &str = "other-live-guild";
+
+fn boot_gates() -> ScorecardGates {
+    ScorecardGates {
+        enabled: true,
+        recommendations_enabled: false,
+        correction_cycles: 0,
+    }
+}
+
+#[test]
+fn live_keys_are_the_hot_wired_five() {
+    use two_bot_core::settings::{classify_key, SettingClass, HOT_WIRED};
+    assert_eq!(
+        LIVE_KEYS,
+        [
+            "TWO_COMMUNITY_SCORECARD",
+            "TWO_COMMUNITY_RECOMMENDATIONS",
+            "TWO_COMMUNITY_CORRECTION_CYCLES",
+            "TWO_PRESENCE_PROBE",
+            "TWO_INACTIVITY_DAYS",
+        ]
+    );
+    for key in LIVE_KEYS {
+        assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
+        assert!(HOT_WIRED.contains(&key), "{key}");
+    }
+}
+
+#[test]
+fn scorecard_enable_applies_live_per_tick() {
+    // Stored `0` disables over a boot `1`.
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_COMMUNITY_SCORECARD",
+        json!(false),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_gates(), LIVE_GUILD, Some(&live.live));
+    assert!(!gates.enabled);
+    // Stored `1` enables over a boot `0` (the resolve direction; the tick
+    // only consults it when the job registered at boot).
+    let boot_off = ScorecardGates {
+        enabled: false,
+        recommendations_enabled: false,
+        correction_cycles: 0,
+    };
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_COMMUNITY_SCORECARD",
+        json!(true),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_off, LIVE_GUILD, Some(&live.live));
+    assert!(gates.enabled);
+    // Delete hands the key back to boot; another guild's row never leaks.
+    live.publish(vec![]);
+    let gates = live_scorecard_gates_with(&boot_off, LIVE_GUILD, Some(&live.live));
+    assert!(!gates.enabled);
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        OTHER_GUILD,
+        "TWO_COMMUNITY_SCORECARD",
+        json!(false),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_gates(), LIVE_GUILD, Some(&live.live));
+    assert!(gates.enabled);
+    // Parked poller layers nothing.
+    let gates = live_scorecard_gates_with(&boot_gates(), LIVE_GUILD, None);
+    assert_eq!(gates, boot_gates());
+    // Foreign live rows never reach the scorecard vars.
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_RAID_JOIN_THRESHOLD",
+        json!(1),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_gates(), LIVE_GUILD, Some(&live.live));
+    assert_eq!(gates, boot_gates());
+}
+
+#[test]
+fn recommendations_apply_live_per_tick() {
+    // Stored `1` enables over a boot `0`, and back: on unless exactly `0`.
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_COMMUNITY_RECOMMENDATIONS",
+        json!(true),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_gates(), LIVE_GUILD, Some(&live.live));
+    assert!(gates.recommendations_enabled);
+    assert!(gates.enabled, "the enable gate is untouched");
+    let boot_on = ScorecardGates {
+        enabled: true,
+        recommendations_enabled: true,
+        correction_cycles: 0,
+    };
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_COMMUNITY_RECOMMENDATIONS",
+        json!(false),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_on, LIVE_GUILD, Some(&live.live));
+    assert!(!gates.recommendations_enabled);
+    // Delete hands the key back to boot.
+    live.publish(vec![]);
+    let gates = live_scorecard_gates_with(&boot_on, LIVE_GUILD, Some(&live.live));
+    assert!(gates.recommendations_enabled);
+}
+
+#[test]
+fn correction_cycles_apply_live_per_tick() {
+    // Stored counts win in both directions.
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_COMMUNITY_CORRECTION_CYCLES",
+        json!(2),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_gates(), LIVE_GUILD, Some(&live.live));
+    assert_eq!(gates.correction_cycles, 2);
+    let boot_five = ScorecardGates {
+        enabled: true,
+        recommendations_enabled: false,
+        correction_cycles: 5,
+    };
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_COMMUNITY_CORRECTION_CYCLES",
+        json!(0),
+    )]);
+    let gates = live_scorecard_gates_with(&boot_five, LIVE_GUILD, Some(&live.live));
+    assert_eq!(gates.correction_cycles, 0);
+    // A garbage count keeps boot while the other stored rows still apply
+    // (per-key fallback; the write guard refuses such values, so this is a
+    // direct-SQL path only).
+    live.publish(vec![
+        live_row(LIVE_GUILD, "TWO_COMMUNITY_CORRECTION_CYCLES", json!("many")),
+        live_row(LIVE_GUILD, "TWO_COMMUNITY_RECOMMENDATIONS", json!(true)),
+    ]);
+    let gates = live_scorecard_gates_with(&boot_five, LIVE_GUILD, Some(&live.live));
+    assert_eq!(gates.correction_cycles, 5);
+    assert!(gates.recommendations_enabled);
+    // Delete hands the key back to boot.
+    live.publish(vec![]);
+    let gates = live_scorecard_gates_with(&boot_five, LIVE_GUILD, Some(&live.live));
+    assert_eq!(gates.correction_cycles, 5);
+}
+
+#[test]
+fn presence_probe_applies_live_per_tick() {
+    // Parked poller reads enabled: the job only ticks when boot enabled it.
+    assert!(live_presence_enabled_with(LIVE_GUILD, None));
+    let mut live = LiveFixture::new();
+    // Stored `0` stops the tick; any other stored row keeps it running.
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_PRESENCE_PROBE",
+        json!(false),
+    )]);
+    assert!(!live_presence_enabled_with(LIVE_GUILD, Some(&live.live)));
+    live.publish(vec![live_row(
+        LIVE_GUILD,
+        "TWO_PRESENCE_PROBE",
+        json!(true),
+    )]);
+    assert!(live_presence_enabled_with(LIVE_GUILD, Some(&live.live)));
+    // Delete hands the key back to boot; another guild's row never leaks.
+    live.publish(vec![]);
+    assert!(live_presence_enabled_with(LIVE_GUILD, Some(&live.live)));
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        OTHER_GUILD,
+        "TWO_PRESENCE_PROBE",
+        json!(false),
+    )]);
+    assert!(live_presence_enabled_with(LIVE_GUILD, Some(&live.live)));
+}
+
+#[test]
+fn inactivity_days_apply_live_per_tick() {
+    // Parked poller keeps the boot horizon.
+    assert_eq!(live_inactivity_days_with(LIVE_GUILD, 14, None), 14);
+    let mut live = LiveFixture::new();
+    // Stored counts win in both directions.
+    live.publish(vec![live_row(LIVE_GUILD, "TWO_INACTIVITY_DAYS", json!(30))]);
+    assert_eq!(
+        live_inactivity_days_with(LIVE_GUILD, 14, Some(&live.live)),
+        30
+    );
+    live.publish(vec![live_row(LIVE_GUILD, "TWO_INACTIVITY_DAYS", json!(14))]);
+    assert_eq!(
+        live_inactivity_days_with(LIVE_GUILD, 30, Some(&live.live)),
+        14
+    );
+    // Garbage keeps boot (the write guard refuses such values, so this is a
+    // direct-SQL path only); another guild's row never leaks.
+    for value in [json!("many"), json!(-5), json!("1.5"), json!({"days": 30})] {
+        live.publish(vec![live_row(
+            LIVE_GUILD,
+            "TWO_INACTIVITY_DAYS",
+            value.clone(),
+        )]);
+        assert_eq!(
+            live_inactivity_days_with(LIVE_GUILD, 14, Some(&live.live)),
+            14,
+            "{value}"
+        );
+    }
+    live.publish(vec![]);
+    assert_eq!(
+        live_inactivity_days_with(LIVE_GUILD, 14, Some(&live.live)),
+        14
+    );
+    let mut live = LiveFixture::new();
+    live.publish(vec![live_row(
+        OTHER_GUILD,
+        "TWO_INACTIVITY_DAYS",
+        json!(30),
+    )]);
+    assert_eq!(
+        live_inactivity_days_with(LIVE_GUILD, 14, Some(&live.live)),
+        14
+    );
+}
+
 use scorecard_retry::{decide, AttemptState, Decision, RETRY_DELAY_MS};
 
 fn at(iso: &str) -> i64 {
@@ -408,6 +673,7 @@ async fn scorecard_stop_cancels_future_retry_ticks() {
         vec![Job {
             name: "community_scorecard",
             cadence: cadence(Kind::Scorecard),
+            cadence_source: None,
             startup_jitter: Duration::ZERO,
             timeout: Duration::from_secs(120),
             action,
@@ -420,7 +686,7 @@ async fn scorecard_stop_cancels_future_retry_ticks() {
     }
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
     clock.store(monday + RETRY_DELAY_MS, Ordering::SeqCst);
     tokio::time::advance(Duration::from_secs(300)).await;
     assert_eq!(attempts.load(Ordering::SeqCst), 1);

@@ -106,6 +106,26 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace('INTERNAL_ACTIONS_INGRESS = "1"', f"INTERNAL_ACTIONS_INGRESS = {value}")
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
 
+    def test_eventsub_ingress_is_staging_only_and_deployed_dark(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('EVENTSUB_INGRESS = "1"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nEVENTSUB_INGRESS = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("EVENTSUB_INGRESS is staging-only" in e for e in errors), errors)
+        # Absent from staging is also fine: the route is simply dark.
+        self.assertEqual(
+            self.check_config(BASE.replace('EVENTSUB_INGRESS = "1"\n', "")), []
+        )
+
+    def test_eventsub_ingress_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('EVENTSUB_INGRESS = "1"', f"EVENTSUB_INGRESS = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
     def test_boot_publish_is_staging_only(self):
         staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
         self.assertIn('TWO_COMMANDS_PUBLISH_ON_BOOT = "1"', staging)
@@ -159,6 +179,69 @@ class AlertBindingTests(unittest.TestCase):
             with self.subTest(value=value):
                 config = BASE.replace('TWO_VOICE_PRESENCE = "1"', f"TWO_VOICE_PRESENCE = {value}")
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_music_gate_is_staging_only(self):
+        # Staging placement is accepted; top-level and production are refused.
+        # The spike commits no staging var yet, so the fixture inserts it.
+        staging_ok = BASE.replace("[env.staging.vars]", '[env.staging.vars]\nTWO_MUSIC = "1"', 1)
+        self.assertEqual(self.check_config(staging_ok), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_MUSIC = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_MUSIC is staging-only" in e for e in errors), errors)
+
+    def test_music_gate_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace("[env.staging.vars]", f"[env.staging.vars]\nTWO_MUSIC = {value}", 1)
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_deploy_env_marker_is_staging_only_and_exact(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('TWO_DEPLOY_ENV = "staging"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_DEPLOY_ENV = "staging"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_DEPLOY_ENV is staging-only" in e for e in errors), errors)
+        # Absent is fine (the drill then simply cannot arm); any other
+        # spelling is not the fence marker.
+        self.assertEqual(self.check_config(BASE.replace('TWO_DEPLOY_ENV = "staging"\n', "")), [])
+        for value in ['"production"', '"Staging"', '"staging "', '""', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('TWO_DEPLOY_ENV = "staging"', f"TWO_DEPLOY_ENV = {value}")
+                self.assertTrue(any('must be exactly "staging"' in e for e in self.check_config(config)))
+
+    def test_gateway_failure_injection_is_never_a_committed_var(self):
+        # Even staging must not commit it: only the generated per-deploy
+        # config from a manual drill dispatch may carry the switch.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nTWO_GATEWAY_READINESS_FAIL_INJECTION = "1"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("TWO_GATEWAY_READINESS_FAIL_INJECTION must never be a committed var" in e for e in errors),
+                    errors,
+                )
+        self.assertEqual(self.check_config(BASE), [])
+
+    def test_remediation_fault_switches_are_never_committed_vars(self):
+        # Same generated-only rule as the rollback-drill switch: either
+        # remediation drill switch committed anywhere fails.
+        for key in ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]:
+            for section in ["vars", "env.staging.vars", "env.production.vars"]:
+                with self.subTest(key=key, section=section):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "1"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(
+                        any(f"{key} must never be a committed var" in e for e in errors),
+                        errors,
+                    )
+        self.assertEqual(self.check_config(BASE), [])
 
     def test_dashboard_secrets_are_never_toml_vars(self):
         # TOG-22861: the dashboard service-token pair gates human access; a
@@ -242,6 +325,34 @@ class AlertBindingTests(unittest.TestCase):
                 )
                 self.assertFalse(any("synthetic-secret" in e for e in errors))
 
+    def test_mcp_token_is_never_a_toml_var(self):
+        # TOG-29201: MCP_TOKEN is an optional Worker secret (docs/mcp.md);
+        # a plain var in any section must be refused without echoing the
+        # synthetic value, while absence stays valid and introduces no
+        # required binding.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nMCP_TOKEN = "synthetic-secret"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("MCP_TOKEN must be an optional Worker secret" in e for e in errors),
+                    errors,
+                )
+                self.assertFalse(any("synthetic-secret" in e for e in errors))
+        extra = BASE + '\n[env.preview]\nworkers_dev = false\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\nMCP_TOKEN = "synthetic-secret"\n'
+        errors = self.check_config(extra)
+        self.assertTrue(
+            any(
+                "[env.preview.vars]: MCP_TOKEN must be an optional Worker secret" in e
+                for e in errors
+            ),
+            errors,
+        )
+        self.assertFalse(any("synthetic-secret" in e for e in errors))
+        self.assertEqual(self.check_config(BASE), [])
+
     def test_receiver_config_is_never_a_toml_var(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:
             for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND", "TWO_INTERNAL_CONTAINER"]:
@@ -250,6 +361,27 @@ class AlertBindingTests(unittest.TestCase):
                     errors = self.check_config(config)
                     self.assertTrue(any(f"{key} is an Operator-set Worker secret" in e for e in errors), errors)
                     self.assertFalse(any("synthetic-secret" in e for e in errors))
+
+    def test_eventsub_operator_switch_is_never_a_toml_var(self):
+        # TOG-23364: TWO_EVENTSUB=1 is the Operator's last switch for the
+        # public Twitch ingress; a committed var would turn the route on from
+        # a toml change alone, without the Operator step. TOG-23387: the
+        # private receiver enable, bind and signing secret plus the Twitch
+        # client pair are Operator-set Worker secrets for the same reason.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            for key in [
+                "TWO_EVENTSUB",
+                "TWO_EVENTSUB_BIND",
+                "TWO_TWITCH_WEBHOOK_SECRET",
+                "TWO_TWITCH_CLIENT_ID",
+                "TWO_TWITCH_CLIENT_SECRET",
+            ]:
+                with self.subTest(section=section, key=key):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "synthetic-secret"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(any(f"{key} is an Operator-set Worker secret" in e for e in errors), errors)
+                    self.assertFalse(any("synthetic-secret" in e for e in errors))
+        self.assertEqual(self.check_config(BASE), [])
 
 
 def drop_env(content, env):

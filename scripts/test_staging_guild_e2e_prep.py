@@ -44,6 +44,7 @@ class PrepTests(unittest.TestCase):
         return fetch
 
     def run_main(self, guild, fetch_fn, token=TOKEN):
+        self.requested = []
         env = {"DISCORD_STAGING_BOT_TOKEN": token,
                "DISCORD_STAGING_GUILD_ID": "env-guild-never-used-by-flag-runs"}
         with mock.patch.dict(os.environ, env, clear=True):
@@ -60,6 +61,27 @@ class PrepTests(unittest.TestCase):
         self.assertEqual(self.requested, [])
         self.assertFalse(Path(self.evidence).exists())
         return out
+
+    def routes(self, commands, app=STAGING_APP):
+        app_url = f"{prep.API}/applications/{app}/guilds/{STAGING_GUILD}/commands"
+        mapping = {f"{prep.API}/users/@me":
+                   (200, json.dumps({"id": app, "username": "fixture"}).encode()),
+                   app_url: (200, json.dumps(commands).encode())}
+        for command in commands:
+            mapping[f"{app_url}/{command['id']}"] = (
+                200, json.dumps(command).encode())
+        return mapping
+
+    def strict_fetch(self, routes):
+        def fetch(url):
+            if url not in routes:
+                raise AssertionError(f"unexpected offline fixture route: {url}")
+            return routes[url]
+        return fetch
+
+    def assert_no_detail_reads(self):
+        app_url = f"{prep.API}/applications/{STAGING_APP}/guilds/{STAGING_GUILD}/commands"
+        self.assertEqual(self.requested, [f"{prep.API}/users/@me", app_url])
 
     def test_live_guild_refuses_before_any_request(self):
         out = self.run_refused(LIVE_GUILD)
@@ -143,6 +165,101 @@ class PrepTests(unittest.TestCase):
         code, out = self.run_main(STAGING_GUILD, fetch)
         self.assertEqual(code, 1)
         self.assertIn("FAIL leaderboard: command resource disagrees with the list entry", out)
+
+    def test_wrong_guild_scope_refuses_at_list_and_detail(self):
+        hostile = STAGING_GUILD + "?WRONG_GUILD_SENTINEL_never_echo"
+        app_url = f"{prep.API}/applications/{STAGING_APP}/guilds/{STAGING_GUILD}/commands"
+        for stage in ("list", "detail"):
+            for value in (OTHER_GUILD, "0", hostile, None, True):
+                with self.subTest(stage=stage, value=value):
+                    commands = [dict(c) for c in prep.fixture_commands()]
+                    if stage == "list":
+                        commands[0]["guild_id"] = value
+                    routes = self.routes(commands)
+                    if stage == "detail":
+                        routes[f"{app_url}/{commands[0]['id']}"] = (
+                            200, json.dumps(
+                                dict(commands[0], guild_id=value)).encode())
+                    code, out = self.run_main(
+                        STAGING_GUILD, self.strict_fetch(routes))
+                    self.assertEqual(code, 1)
+                    if stage == "list":
+                        self.assertIn("FAIL rank: registered entry is not scoped"
+                                      " to the staging guild", out)
+                        self.assert_no_detail_reads()
+                    else:
+                        self.assertIn("FAIL rank: command resource is not scoped"
+                                      " to the staging guild", out)
+                    self.assertNotIn("WRONG_GUILD_SENTINEL", out)
+
+    def test_omitted_guild_scope_passes_both_surfaces(self):
+        commands = [dict(c) for c in prep.fixture_commands()]
+        for command in commands:
+            del command["guild_id"]
+        code, out = self.run_main(
+            STAGING_GUILD, self.strict_fetch(self.routes(commands)))
+        self.assertEqual(code, 0, out)
+        self.assertIn("2/2 checks passed (mock-local-fixtures)", out)
+
+    def test_shared_command_id_across_two_targets_refuses_before_any_detail(self):
+        commands = [dict(c) for c in prep.fixture_commands()]
+        commands[1]["id"] = commands[0]["id"]
+        code, out = self.run_main(
+            STAGING_GUILD, self.strict_fetch(self.routes(commands)))
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "FAIL rank: registered command id is shared with another entry", out)
+        self.assert_no_detail_reads()
+
+    def test_target_id_alias_under_an_unrelated_name_refuses_before_any_detail(self):
+        commands = [dict(c) for c in prep.fixture_commands()]
+        commands.append(dict(commands[0], name="unrelated-command"))
+        code, out = self.run_main(
+            STAGING_GUILD, self.strict_fetch(self.routes(commands)))
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "FAIL rank: registered command id is shared with another entry", out)
+        self.assert_no_detail_reads()
+
+    def test_non_ascii_digit_ids_refuse_before_every_detail_request(self):
+        # U+FF11 FULLWIDTH DIGIT ONE, U+0661 ARABIC-INDIC DIGIT ONE: int()
+        # parses both, so only the ASCII-only admission regex can refuse them.
+        # The single-char values pin the first class; the mixed "1" + U+0661
+        # value (int() parses it as 11) pins the rest class too.
+        for value in ("１", "١", "1١"):
+            with self.subTest(value=value):
+                commands = [dict(c) for c in prep.fixture_commands()]
+                commands[0]["id"] = value
+                code, out = self.run_main(
+                    STAGING_GUILD, self.strict_fetch(self.routes(commands)))
+                self.assertEqual(code, 1)
+                self.assertIn(
+                    "FAIL rank: registered entry carries no valid command id", out)
+                self.assert_no_detail_reads()
+
+    def test_non_ascii_digit_versions_refuse_at_list_and_detail(self):
+        app_url = f"{prep.API}/applications/{STAGING_APP}/guilds/{STAGING_GUILD}/commands"
+        for stage in ("list", "detail"):
+            for value in ("１", "١", "1١"):
+                with self.subTest(stage=stage, value=value):
+                    commands = [dict(c) for c in prep.fixture_commands()]
+                    if stage == "list":
+                        commands[0]["version"] = value
+                    routes = self.routes(commands)
+                    if stage == "detail":
+                        routes[f"{app_url}/{commands[0]['id']}"] = (
+                            200, json.dumps(
+                                dict(commands[0], version=value)).encode())
+                    code, out = self.run_main(
+                        STAGING_GUILD, self.strict_fetch(routes))
+                    self.assertEqual(code, 1)
+                    if stage == "list":
+                        self.assertIn("FAIL rank: registered entry carries"
+                                      " no valid version", out)
+                        self.assert_no_detail_reads()
+                    else:
+                        self.assertIn("FAIL rank: command resource carries"
+                                      " no valid version", out)
 
     def test_wrong_application_refuses_after_identity_only(self):
         routes = {f"{prep.API}/users/@me":

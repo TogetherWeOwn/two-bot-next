@@ -73,7 +73,7 @@ fn event_string(event: &serde_json::Value, field: &str) -> Result<String, Stream
 }
 
 /// Validate a Twitch broadcaster user id: 1-32 ASCII digits.
-fn valid_broadcaster_id(value: &str) -> bool {
+pub(crate) fn valid_broadcaster_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 32 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
@@ -88,6 +88,13 @@ fn valid_broadcaster_login(value: &str) -> bool {
 
 fn valid_started_at(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && crate::funnel::parse_iso_millis(value).is_some()
+}
+
+/// Validate a configured Discord invite URL with the exact rule the
+/// post renderer applies, so delivery configuration can refuse an
+/// unpostable invite at startup instead of failing every go-live.
+pub fn validated_invite_url(url: &str) -> Result<String, StreamFunnelError> {
+    message_invite_url(url)
 }
 
 /// Validate a caller-supplied Discord invite URL and return the exact string

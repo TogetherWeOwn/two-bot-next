@@ -1,0 +1,439 @@
+name: reusable rust nextest
+
+# Shared Rust nextest lane (SDLC 2.3 CI speed pilot, promoted to required).
+# Org-level home is TogetherWeOwn/.github (.github/workflows/rust-nextest.yml),
+# called via `uses:` with a pinned SHA like the test-guard precedent; this
+# file is the same content with a local path so the pilot runs before the
+# central move. Required: check.yml calls it as the `nextest` job, gated by
+# the rust selector and aggregated by `ci-ok`.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Full head SHA the caller checked out for selection
+        required: true
+        type: string
+      quarantine:
+        description: Whitespace-separated nextest filters to skip (red-group ejection without a revert; empty runs everything)
+        required: false
+        default: ''
+        type: string
+    secrets:
+      SCCACHE_BUCKET:
+        description: R2 bucket for the sccache backend (absent keeps the GitHub-cache backend)
+        required: false
+      SCCACHE_ENDPOINT:
+        description: R2 S3-compatible endpoint (absent keeps the GitHub-cache backend)
+        required: false
+      SCCACHE_REGION:
+        description: R2 region, usually auto (absent keeps the GitHub-cache backend)
+        required: false
+      AWS_ACCESS_KEY_ID:
+        description: R2 access key id (absent keeps the GitHub-cache backend)
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        description: R2 secret access key (absent keeps the GitHub-cache backend)
+        required: false
+
+# Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
+# empty; the least-privilege grant lives on the job instead.
+permissions: {}
+
+jobs:
+  nextest:
+    name: rust nextest
+    permissions:
+      contents: read
+    # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
+    # CI_OVERFLOW_* switch for this named job, then the self-hosted pool.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'nextest') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 45
+    # Same job-container and disposable Postgres service as the `rust-tests`
+    # lane in check.yml: the lib/bins run below needs the CI test database.
+    # A job container gets its own network namespace, so no published host
+    # port collides on the shared self-hosted Docker host.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    # NOTE: job-container steps default to sh (no pipefail), so every run
+    # step below declares bash explicitly.
+    env:
+      CARGO_TERM_COLOR: always
+      # Disk hygiene (same pins as the check lanes): smaller binaries, no
+      # incremental artifacts.
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`.
+      TWO_DATABASE_TLS: local-only
+      # sccache wraps every rustc call; the backend step below selects R2 or
+      # the GitHub cache before the server starts.
+      RUSTC_WRAPPER: sccache
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Ephemeral CI service only; tests explicitly use an empty password.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --tmpfs /var/lib/postgresql:rw,size=1073741824
+          --memory 2147483648
+          --memory-swap 2147483648
+          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Job-container prerequisites (loopback forward to agent-testdb)
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          set -e
+          # /etc/hosts is mounted in the job container; sed -i cannot rename over it.
+          # Remove any runner/image mapping first so resolution uses the
+          # disposable service's current job-scoped address.
+          hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"
+          sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > "$hosts_tmp"
+          cat "$hosts_tmp" > /etc/hosts
+          rm -f "$hosts_tmp"
+          # Resolve the disposable service and pin its job-scoped address so
+          # long database runs do not depend on service-alias DNS staying up.
+          service_ip=""
+          for attempt in $(seq 1 30); do
+            service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk 'NR == 1 { print $1; exit }')" || service_ip=""
+            if [[ "$service_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+              break
+            fi
+            service_ip=""
+            sleep 1
+          done
+          if [ -z "$service_ip" ]; then
+            echo "agent-testdb did not resolve to an IPv4 address"
+            exit 1
+          fi
+          printf '%s agent-testdb\n' "$service_ip" >> /etc/hosts
+          pinned_ip="$(getent ahostsv4 agent-testdb | awk 'NR == 1 { print $1; exit }')"
+          if [ "$pinned_ip" != "$service_ip" ]; then
+            echo "agent-testdb hosts pin did not take effect"
+            exit 1
+          fi
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+
+      # Disk guard (run 39209332791): the ignored-db-stores lane died mid-suite
+      # with Postgres `PANIC: could not write to file "pg_wal/xlogtemp.*": No
+      # space left on device` on a 1 GiB tmpfs, and two Oct 2 main heads died
+      # with 98 MB left on the job-container overlay at link time. A runner
+      # that starts exhausted cannot finish a Rust build, so fail fast here
+      # with a clear infra verdict instead of a mid-suite PANIC. Service
+      # containers start before any step runs and steps see only the job
+      # container, so host-side reclaims (docker prune, toolchain removal) are
+      # not possible from here; the tmpfs-side mitigation is the bounded WAL
+      # budget in the prepare step plus the storage-headroom report.
+      - name: Guard runner disk headroom
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          du -sh "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # 1 GiB free on both the job-container overlay (/) and the
+          # host-mounted workspace: below that the toolchain install and cache
+          # restore cannot fit, so stop now with an infra verdict (rerun).
+          floor=1073741824
+          for mount in / "$GITHUB_WORKSPACE"; do
+            free_bytes=$(df -B1 --output=avail "$mount" | tail -n 1 | tr -d '[:space:]')
+            echo "disk headroom on $mount: $free_bytes bytes free (floor $floor)"
+            if [ "$free_bytes" -lt "$floor" ]; then
+              echo "::error::runner disk exhausted: $mount has $free_bytes bytes free, below the $floor-byte floor. Infra flake: rerun the job."
+              exit 1
+            fi
+          done
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
+      # PR and merge-queue isolation first: sccache stays on local disk
+      # only and no shared-backend credential is written anywhere. R2 write
+      # credentials must never reach PR- or merge-queue-built code (this lane
+      # compiles and executes build scripts and tests at a head that is not
+      # on `main` yet, and a shared R2 bucket has no per-PR scope, so a PR
+      # could poison objects a later main build links). The GitHub-cache
+      # backend stays off PRs and the merge queue too: its entries share the
+      # repo Actions cache quota with the warm `check` entry the required
+      # lanes restore, so a non-main lane must not grow it. Push-to-main and
+      # workflow_dispatch runs use R2 when the caller passed all the pins,
+      # else the GitHub-cache backend. Values travel via the environment
+      # file, never the log: secrets stay masked.
+      - name: Select sccache backend (R2 when pinned, GitHub cache otherwise)
+        env:
+          R2_BUCKET: ${{ secrets.SCCACHE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.SCCACHE_ENDPOINT }}
+          R2_REGION: ${{ secrets.SCCACHE_REGION }}
+          R2_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          R2_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          NEXTEST_EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then
+            if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
+              {
+                echo "SCCACHE_BUCKET=$R2_BUCKET"
+                echo "SCCACHE_ENDPOINT=$R2_ENDPOINT"
+                echo "SCCACHE_REGION=${R2_REGION:-auto}"
+                echo "AWS_ACCESS_KEY_ID=$R2_KEY"
+                echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET"
+              } >> "$GITHUB_ENV"
+              echo "sccache backend: R2"
+            else
+              echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+              echo "sccache backend: GitHub cache"
+            fi
+          else
+            echo "sccache backend: local disk only (no shared writes on PRs, the merge queue, or other events)"
+          fi
+
+      - name: Start sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          # The explicit advisory stats step below owns reporting. The action's
+          # post hook otherwise fails the job if the cache server is unavailable.
+          disable_annotations: true
+
+      # A shared-cache outage must not prevent the required suite from running.
+      # --zero-stats connects to or starts the server, validating backend setup
+      # before Cargo's first rustc probe. Do not print startup errors: remote
+      # cache diagnostics can contain signed URLs.
+      - name: Verify sccache availability (uncached fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if sccache --zero-stats >/dev/null 2>&1; then
+            echo "sccache ready"
+          else
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            echo "::warning::sccache unavailable; compiling without cache. Compiler and test failures remain fatal."
+          fi
+
+      # Restore-only: the warm `check` entry in check.yml owns the registry
+      # write, so this step never saves. sccache is the only shared-cache
+      # writer left, and only on push to main or workflow_dispatch (R2 or
+      # GitHub cache; local disk everywhere else per the backend step above).
+      - name: Restore cargo registry cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          shared-key: check
+          save-if: false
+
+      - name: Install pinned cargo-nextest
+        shell: bash
+        run: cargo install cargo-nextest --version 0.9.99 --locked
+
+      - name: Prepare isolated test databases
+        shell: bash
+        run: |
+          # The database service stores data and WAL on a 1 GiB tmpfs. This
+          # lane runs the workspace lib/bins suites against it. Unbounded WAL
+          # (the PG18 default max_wal_size is 1GB) filled the stores lane's
+          # tmpfs in run 39209332791 with `PANIC: could not write to file
+          # "pg_wal/xlogtemp.*": No space left on device`. max_wal_size is a
+          # soft checkpoint target, not a hard ceiling: heavy WAL can exceed
+          # it, so keep recycling bounded with headroom for relation files and
+          # segment creation (same bound as the check.yml lanes). The pre/post
+          # suite reports bracket the run for future budget tuning.
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
+          printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Verify disposable Postgres defaults
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if any(name.startswith('PG') for name in os.environ):
+              raise SystemExit('unset ambient libpq PG* configuration before probing the test service')
+          expected = {
+              'data_directory': '/var/lib/postgresql/18/docker',
+              'fsync': 'on',
+              'full_page_writes': 'on',
+              'synchronous_commit': 'on',
+              'max_wal_size': '512MB',
+              'min_wal_size': '64MB',
+          }
+          fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
+          settings = json.loads(subprocess.check_output([
+              'psql', 'postgres://agent_test:@agent-testdb:5432/two_bot_test_ci',
+              '-X', '-w', '-At', '-v', 'ON_ERROR_STOP=1',
+              '-c', f'SELECT json_build_object({fields})',
+          ], text=True, env=os.environ | {
+              'PGPASSFILE': '/dev/null', 'PGSSLMODE': 'disable',
+              'PGOPTIONS': '-c statement_timeout=5000',
+          }))
+          if settings != expected:
+              raise SystemExit('disposable Postgres data path or durability defaults changed')
+          print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
+          PY
+
+      # Storage-headroom evidence (run 39209332791): the tmpfs holding PGDATA
+      # is invisible from this container, so report what Postgres sees: per-DB
+      # sizes, WAL segment bytes, and the bounded WAL budget. Runs right after
+      # verify so the sizes give the next incident a prepare-time baseline.
+      # Fail-closed: a broken report must not read as headroom.
+      - name: Report Postgres storage headroom
+        shell: bash
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
+
+      # Required scope: workspace lib/bins via nextest (retries=1 and
+      # JUnit come from .config/nextest.toml profile `ci`). A fail-then-pass
+      # retry is reported flaky, not red; the ledger step still runs.
+      # `inputs.quarantine` ejects a red group without a revert: each
+      # whitespace-separated filter becomes one `--skip` (test-name
+      # substrings, no spaces), so the rest of the suite still gates. The
+      # skips travel AFTER the `--` separator: pinned cargo-nextest 0.9.99
+      # only accepts `--skip` as an emulated libtest argument there, and a
+      # `--skip` before `--` fails the whole lane with a usage error.
+      # JUnit `path = "junit.xml"` in .config/nextest.toml is profile-store
+      # relative (target/nextest/ci/junit.xml), not workspace-root. Resolve it
+      # and copy to the workspace root so the parse/upload steps below see one
+      # stable path. The nextest exit status is preserved: a failing test run
+      # still fails this step, but its JUnit evidence is retained for upload.
+      - name: Generate command reference before nextest compilation
+        shell: bash
+        run: python3 scripts/generate_command_reference.py
+
+      - name: cargo nextest (unit and binary, retries=1, JUnit)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          QUARANTINE: ${{ inputs.quarantine }}
+        shell: bash
+        run: |
+          status=0
+          skip_args=()
+          # Word splitting is the mechanism: filters are test-name
+          # substrings and never contain spaces.
+          for filter in $QUARANTINE; do
+            skip_args+=(--skip "$filter")
+          done
+          # One command line for both quarantine states so a flag cannot
+          # drift in only one branch: the expansion appends `--` plus the
+          # skips when the array is non-empty and nothing when it is empty
+          # (behaviorally pinned in scripts/ci/test_workflows.py).
+          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci ${skip_args[@]:+-- "${skip_args[@]}"} || status=$?
+          for candidate in target/nextest/ci/junit.xml junit.xml; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" junit.xml
+              break
+            fi
+          done
+          if [ ! -f junit.xml ]; then
+            found=$(find target/nextest -name junit.xml -print -quit 2>/dev/null || true)
+            if [ -n "$found" ]; then
+              cp "$found" junit.xml
+            fi
+          fi
+          test -f junit.xml
+          exit $status
+
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        shell: bash
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
+
+      - name: sccache stats (advisory speed evidence)
+        shell: bash
+        run: |
+          if stats=$(sccache --show-stats 2>/dev/null); then
+            printf '%s\n' "$stats"
+          else
+            echo "::warning::sccache statistics unavailable; compiler and test results are unchanged."
+          fi
+
+      - name: Parse JUnit into the flake ledger
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Consequence, not root: when nextest never ran there is no JUnit
+          # to parse. Fail with a pointer upstream instead of a raw
+          # traceback so triage lands on the originating step.
+          if [ ! -f junit.xml ]; then
+            echo "junit.xml not found: nextest produced no output; see the upstream step for the root failure." >&2
+            exit 1
+          fi
+          python3 scripts/ci/flake_ledger.py --junit junit.xml --output flake-ledger.jsonl
+
+      - name: Upload JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-junit-${{ github.run_id }}
+          path: junit.xml
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload flake ledger
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flake-ledger-${{ github.run_id }}
+          path: flake-ledger.jsonl
+          if-no-files-found: error
+          retention-days: 14

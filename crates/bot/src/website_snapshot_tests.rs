@@ -16,7 +16,7 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 }
 
 fn event(id: &str) -> Value {
-    json!({"id":id, "name":"Test night", "scheduled_start_time":"2026-10-01T19:00:00Z", "status":1})
+    json!({"id":id, "guild_id":"2222", "name":"Test night", "scheduled_start_time":"2026-10-01T19:00:00Z", "status":1})
 }
 
 fn malformed_snapshots() -> Vec<Value> {
@@ -117,14 +117,22 @@ async fn malformed_event_elements_and_optionals_never_reach_storage() {
 
 #[test]
 fn valid_optional_combinations_keep_their_representation() {
-    let values = [
+    // Channel strings must be canonical nonzero snowflakes; descriptions
+    // keep the empty/value string cases.
+    let channel_values = [
+        None,
+        Some(Value::Null),
+        Some(json!("4000")),
+        Some(json!("4001")),
+    ];
+    let description_values = [
         None,
         Some(Value::Null),
         Some(json!("")),
         Some(json!("value")),
     ];
-    for channel in &values {
-        for description in &values {
+    for channel in &channel_values {
+        for description in &description_values {
             let mut row = event("3000");
             if let Some(value) = channel {
                 row["channel_id"] = value.clone();
@@ -132,7 +140,7 @@ fn valid_optional_combinations_keep_their_representation() {
             if let Some(value) = description {
                 row["description"] = value.clone();
             }
-            let normalized = normalize_events(&[raw_event(&row).unwrap()]).unwrap();
+            let normalized = normalize_events(&[raw_event(&row, "2222").unwrap()]).unwrap();
             assert_eq!(
                 normalized[0].channel_id.as_deref(),
                 channel.as_ref().and_then(Value::as_str)
@@ -143,6 +151,19 @@ fn valid_optional_combinations_keep_their_representation() {
             );
             assert_eq!(normalized[0].starts_at, "2026-10-01T19:00:00.000Z");
         }
+    }
+}
+
+#[test]
+fn canonical_snowflake_extremes_are_accepted() {
+    // Minimum nonzero (1) and maximum u64 snowflakes stay valid identities.
+    let max = u64::MAX.to_string();
+    for (id, channel) in [("1", max.as_str()), (max.as_str(), "1")] {
+        let mut row = event(id);
+        row["channel_id"] = json!(channel);
+        let normalized = normalize_events(&[raw_event(&row, "2222").unwrap()]).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].channel_id.as_deref(), Some(channel));
     }
 }
 
@@ -246,7 +267,7 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     let pool = db.pool();
     let (_stop, shutdown) = watch::channel(false);
     let observation = Mutex::new(());
-    let seed = normalize_events(&[raw_event(&event("3000")).unwrap()]).unwrap();
+    let seed = normalize_events(&[raw_event(&event("3000"), "2222").unwrap()]).unwrap();
     replace_events(pool, "2222", "2026-09-30T12:00:00.123Z", &seed)
         .await
         .unwrap();
@@ -300,8 +321,8 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     for (i, channel) in [
         None,
         Some(Value::Null),
-        Some(json!("")),
-        Some(json!("value")),
+        Some(json!("4000")),
+        Some(json!("4001")),
     ]
     .into_iter()
     .enumerate()
@@ -382,6 +403,165 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
             .await
             .unwrap();
     assert_eq!(pin, "2222");
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT guild_id FROM scheduled_events ORDER BY guild_id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        ["3333"],
+        "valid empty response clears only its own guild"
+    );
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+fn named_event(id: &str, name: &str, start: &str, status: u64) -> Value {
+    json!({"id":id, "guild_id":"2222", "name":name, "scheduled_start_time":start, "status":status})
+}
+
+fn duplicate_id_snapshots() -> Vec<Value> {
+    let first = named_event("3000", "First name", "2026-10-01T19:00:00Z", 1);
+    let second = named_event("3000", "Second name", "2026-10-02T19:00:00Z", 2);
+    vec![
+        // Identical duplicates refuse under the same policy as conflicts.
+        json!([event("3000"), event("3000")]),
+        // Conflicting duplicates refuse in either order; no last-row winner.
+        json!([first.clone(), second.clone()]),
+        json!([second, first]),
+        // A duplicate anywhere refuses the whole snapshot.
+        json!([event("3001"), event("3000"), event("3000")]),
+        json!([event("3000"), event("3001"), event("3002"), event("3000")]),
+        json!([event("3000"), event("3000"), event("3000")]),
+    ]
+}
+
+#[tokio::test]
+async fn duplicate_event_ids_never_reach_storage() {
+    let snapshots = duplicate_id_snapshots();
+    let mock = MockRest::start(
+        snapshots
+            .iter()
+            .cloned()
+            .map(|v| ScriptedResponse::json(200, v))
+            .collect(),
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = poison_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    for snapshot in &snapshots {
+        assert_eq!(
+            run_once(
+                Kind::Events,
+                &pool,
+                &executor(&mock),
+                "2222",
+                &Mutex::new(()),
+                &shutdown,
+                false
+            )
+            .await,
+            Err(ErrorClass::Rest),
+            "{snapshot}"
+        );
+    }
+    assert_eq!(mock.requests().len(), snapshots.len());
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn duplicate_event_ids_preserve_full_mirror_and_valid_controls_still_replace() {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let pool = db.pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let observation = Mutex::new(());
+    let seed = normalize_events(&[raw_event(&event("3000"), "2222").unwrap()]).unwrap();
+    replace_events(pool, "2222", "2026-09-30T12:00:00.123Z", &seed)
+        .await
+        .unwrap();
+    replace_events(pool, "3333", "2026-09-30T12:00:00.123Z", &seed)
+        .await
+        .unwrap();
+    let before = mirror(pool).await;
+    let snapshots = duplicate_id_snapshots();
+    let mock = MockRest::start(
+        snapshots
+            .iter()
+            .cloned()
+            .map(|v| ScriptedResponse::json(200, v))
+            .collect(),
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let rest = executor(&mock);
+    for snapshot in &snapshots {
+        assert_eq!(
+            run_once(
+                Kind::Events,
+                pool,
+                &rest,
+                "2222",
+                &observation,
+                &shutdown,
+                false
+            )
+            .await,
+            Err(ErrorClass::Rest),
+            "{snapshot}"
+        );
+        assert_eq!(
+            mirror(pool).await,
+            before,
+            "duplicate-id snapshot changed rows/timestamps/contract pin: {snapshot}"
+        );
+    }
+    mock.shutdown().await;
+
+    // Controls: a unique snapshot still replaces, and a valid empty snapshot
+    // still performs the intentional empty-set replacement for its guild.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!([event("3001"), event("3002")])),
+            ScriptedResponse::json(200, json!([])),
+        ],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let rest = executor(&mock);
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
+    let replaced: Vec<String> = sqlx::query_scalar(
+        "SELECT event_id FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(replaced, ["3001", "3002"]);
     run_once(
         Kind::Events,
         pool,
@@ -540,5 +720,229 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
         );
         mock.shutdown().await;
     }
+    db.close().await.unwrap();
+}
+
+// ── Scheduled-event snapshot bounds (bounded-claim decision, caps item) ──
+// Tick-level pins for the caps the pure `normalize_events` suite cannot see:
+// the raw-body 1 MiB cap (body bytes never reach `normalize_*`), plus
+// tick wiring for the row and name bounds (refuse, never truncate-then-
+// accept). Every refusal below must surface as `Err(ErrorClass::Rest)`
+// with the poison pool untouched, which proves zero writes: no partial
+// application, and the last good snapshot kept by construction. Controls
+// assert `Err(ErrorClass::Database)`: with a poison pool that error is the
+// observable proof an in-bounds snapshot still attempted publication.
+// The channel-id length bound is pinned only in the pure core suite: the
+// tick's pre-existing canonical-snowflake check rejects non-snowflake
+// channels before normalization, so over-length channels are unreachable
+// here by a stricter, older property.
+
+/// Raw response-body cap: 1 MiB.
+const SNAPSHOT_BODY_CAP: usize = 1_048_576;
+
+/// Cap the decision pins on rows per snapshot.
+const SNAPSHOT_ROW_CAP: usize = 100;
+
+/// Two valid events with an unknown-field pad sized so the served body is
+/// exactly `target_len` bytes. Known fields stay in bounds and rows stay far
+/// under the row cap, so only the body bound can refuse. Padding hides in an
+/// unknown field on purpose: the bound measures RAW body bytes, so a
+/// stripped-known-fields measure (which would see ~200 bytes here) must not
+/// satisfy it.
+fn padded_snapshot_body(target_len: usize) -> Value {
+    let mut first = event("3000");
+    first["pad"] = json!("");
+    let mut body = json!([first, event("3001")]);
+    let base_len = body.to_string().len();
+    assert!(
+        target_len > base_len,
+        "target {target_len} must exceed the unpadded body {base_len}"
+    );
+    body[0]["pad"] = json!("x".repeat(target_len - base_len));
+    let wire = body.to_string();
+    assert_eq!(
+        wire.len(),
+        target_len,
+        "served body must be exactly the target length"
+    );
+    body
+}
+
+/// 101 valid small events: rows over cap, every field in bounds.
+fn over_cap_row_snapshot() -> Value {
+    Value::Array(
+        (0..SNAPSHOT_ROW_CAP + 1)
+            .map(|i| event(&format!("3{:03}", 100 + i)))
+            .collect(),
+    )
+}
+
+/// 100 events with at-cap names and descriptions: fully in bounds.
+fn at_cap_snapshot() -> Value {
+    Value::Array(
+        (0..SNAPSHOT_ROW_CAP)
+            .map(|i| {
+                let mut row = event(&format!("3{:03}", 100 + i));
+                row["name"] = json!("n".repeat(100));
+                row["description"] = json!("d".repeat(1000));
+                row
+            })
+            .collect(),
+    )
+}
+
+/// Run one Events tick against a single scripted body and a poison pool.
+/// Returns the tick outcome plus the mock-side request count.
+async fn run_events_tick(body: Value) -> (Result<(), ErrorClass>, usize) {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, body)],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = poison_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = run_once(
+        Kind::Events,
+        &pool,
+        &executor(&mock),
+        "2222",
+        &Mutex::new(()),
+        &shutdown,
+        false,
+    )
+    .await;
+    let requests = mock.requests().len();
+    mock.shutdown().await;
+    pool.close().await;
+    (outcome, requests)
+}
+
+#[tokio::test]
+async fn over_cap_body_is_read_failure_and_never_reaches_storage() {
+    let body = padded_snapshot_body(SNAPSHOT_BODY_CAP + 1);
+    let (outcome, requests) = run_events_tick(body).await;
+    assert_eq!(requests, 1, "the tick must fetch before it can refuse");
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "a 1 MiB + 1 byte body must refuse before storage; reaching the \
+         poison pool would surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn exact_cap_body_still_reaches_storage() {
+    let (outcome, requests) = run_events_tick(padded_snapshot_body(SNAPSHOT_BODY_CAP)).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "an exactly-1 MiB body is in bounds and must still attempt publication"
+    );
+}
+
+#[tokio::test]
+async fn just_under_cap_body_still_reaches_storage() {
+    let (outcome, requests) = run_events_tick(padded_snapshot_body(SNAPSHOT_BODY_CAP - 1)).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "a 1 MiB - 1 byte body is in bounds and must still attempt publication"
+    );
+}
+
+#[tokio::test]
+async fn over_100_rows_never_reaches_storage() {
+    let body = over_cap_row_snapshot();
+    assert!(
+        body.to_string().len() < SNAPSHOT_BODY_CAP,
+        "row fixture must stay under the body cap to isolate the row bound"
+    );
+    let (outcome, requests) = run_events_tick(body).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "101 rows must refuse the whole snapshot; applying any prefix would \
+         reach the poison pool and surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn over_length_name_is_refused_not_truncated() {
+    let mut row = event("3000");
+    row["name"] = json!("n".repeat(101));
+    let (outcome, requests) = run_events_tick(json!([row])).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "a 101-char name must refuse; truncating to 100 and accepting would \
+         reach the poison pool and surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn at_cap_rows_and_fields_reach_storage() {
+    let body = at_cap_snapshot();
+    assert_eq!(body.as_array().expect("array snapshot").len(), 100);
+    assert!(
+        body.to_string().len() < SNAPSHOT_BODY_CAP,
+        "at-cap fixture must stay under the body cap to isolate the row/field bounds"
+    );
+    let (outcome, requests) = run_events_tick(body).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "100 rows with at-cap fields are in bounds and must still attempt publication"
+    );
+}
+
+#[tokio::test]
+async fn stale_tick_returns_ok_and_writes_nothing() {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let pool = db.pool();
+    // Seed a newer snapshot with a far-future stamp: the live tick stamps
+    // `now`, strictly older, so the epoch gate must roll the swap back.
+    let seed = normalize_events(&[raw_event(&event("3000"), "2222").unwrap()]).unwrap();
+    replace_events(pool, "2222", "2036-01-01T00:00:00.000Z", &seed)
+        .await
+        .unwrap();
+    let before = mirror(pool).await;
+    // The stale fetch carries a never-before-seen id: only the epoch gate
+    // stops the resurrection, and the tick still reports success.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(
+            200,
+            json!([event("3000"), event("3009")]),
+        )],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let (_stop, shutdown) = watch::channel(false);
+    assert_eq!(
+        run_once(
+            Kind::Events,
+            pool,
+            &executor(&mock),
+            "2222",
+            &Mutex::new(()),
+            &shutdown,
+            false
+        )
+        .await,
+        Ok(())
+    );
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        mirror(pool).await,
+        before,
+        "stale tick changed rows/timestamps/contract pin"
+    );
+    mock.shutdown().await;
     db.close().await.unwrap();
 }

@@ -58,8 +58,10 @@ running-gateway failure (`shutdown::RUNTIME_FAILURE_LINGER`) before the drain
 and exit-1 restart. A shutdown signal ends the linger at once. Readers:
 
 - Worker keepalive: one `console.warn` JSON line
-  `{"event":"container_gateway_failure","phase":…,"class":…}` per tick, only when
-  both values are `[a-z0-9_]{1,32}` tokens, so it reaches Workers Logs.
+  `{"event":"container_gateway_failure","phase":…,"class":…,"release":…,"worker_version":…}`
+  per tick, only when both values are `[a-z0-9_]{1,32}` tokens, so it reaches
+  Workers Logs. `release` is the container git SHA (`"unknown"` when the probe
+  answer has none); `worker_version` is the platform Worker version id.
 - `scripts/staging_rollout.py`: the rollout gate's `last observation before
   timeout` line ends with `gateway_failure=<phase>:<class>`. The gate also
   probes `/readyz` while this build's rollout exists but has not converged,
@@ -96,7 +98,11 @@ python3 scripts/container_stdout_read.py --service <container-application-id> \
     --minutes 5 [--end 2026-10-11T12:00:00Z] [--contains "durable gateway failed"]
 ```
 
-Zero events means "not observed in this window". Offline fixtures
+Zero events means "not observed in this window". Integer values are redacted too:
+a numeric `run_id` never survives and snowflake-shaped integers become `[id]`,
+while bounded counters keep their values. Events outside the requested window
+fail the read, and a response with more events than the requested limit fails
+the read; both print no partial JSON. Offline fixtures
 (`scripts/test_container_stdout_read.py`) pin the request body to the example above.
 
 Structured fields are filterable by key (`error_class exists`, `startup_phase exists`);

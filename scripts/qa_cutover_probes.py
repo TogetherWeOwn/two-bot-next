@@ -39,6 +39,11 @@ Probes and the code path each one checks:
                    NaN/Infinity, including an overflowing exponent decoded
                    to Infinity) fails and is named with bounded diagnostics,
                    never a traceback and never a verified-fresh count.
+                   Absurd finite magnitudes are display-capped (ages at
+                   9,999,999,999 s, failure counts at 999,999,999), far above
+                   every fail line, so an in-cap body cannot expand
+                   digit-for-digit past the machine output bound; grading is
+                   unchanged, since anything past a cap was already stale.
                    While degraded without --expect-ready the jobs map stays
                    informational so a truthful parked 503 stays green. feeds
                    is ungraded (its cadence is env-configured), as is any
@@ -75,9 +80,45 @@ object keys"; identical repeats and both conflicting orders fail closed, and
 unique objects still parse. Refusals leave no receipt and never echo keys,
 values, paths or parse exceptions.
 
+Nesting budget: decoded JSON nesting past 32 levels (precedent:
+scripts/check_run_record.py MAX_NESTING_DEPTH) is unusable like malformed
+JSON, so the route fails an ordinary check. The walk is iterative, so deep
+input cannot exhaust the stack, and the verdict never depends on the
+interpreter's own recursion limit.
+
 Usage:
   python3 scripts/qa_cutover_probes.py --base-url URL [--expect-ready]
-      [--timeout SECONDS] [--evidence FILE]
+      [--timeout SECONDS] [--evidence FILE] [--json]
+
+Origin admission contract: the base URL must be a usable nonempty bare
+http(s) origin before either route is fetched. A refusal names only a
+fixed-vocabulary reason (missing, malformed, unusable port, non-http(s)
+scheme, credentials, path/query/fragment present, empty host, or unusable
+host); it never echoes the rejected URL, not even truncated, and attempts
+zero requests.
+
+Build identity contract: /readyz build_revision/build_id must be the
+canonical stamped shape (40-char lowercase hex revision, digits-digits
+build id; scripts/build_identity.py) or the exact unstamped unknown/unknown
+pair. Anything else fails readiness-shape with fixed vocabulary that echoes
+neither field.
+
+Remote-field projection contract: only supported values reach diagnostics.
+Job names outside the graded cadence map are counted, never listed; a
+last_error_class outside the seven JobErrorClass values
+(crates/core/src/metrics.rs) is reported as unrecognized, never echoed; a
+top-level error payload is reported as present, never quoted. Unknown extra
+fields are ignored in both text and evidence output.
+
+Machine verdict contract: --json prints exactly one JSON object on stdout
+(verdict, report next_action, and one row per check with stable id, verdict,
+code, next_action and detail) with empty stderr. A failed verdict never
+claims result=pass and, like text failures, never creates or overwrites
+--evidence; the success-only evidence receipt keeps its existing schema.
+When the checks pass but the receipt itself cannot be written, the verdict
+is FAIL with an additional evidence row (code evidence_not_written): stdout
+still holds exactly one JSON object, stderr stays empty, and the exit code
+is 1, so a verdict consumer never proceeds as if attested.
 """
 
 import argparse
@@ -92,8 +133,18 @@ from urllib.parse import urlsplit
 import urllib.error
 import urllib.request
 
+from build_identity import (
+    UNSTAMPED,
+    is_build_id_shape,
+    is_build_revision_shape,
+)
+
 BODY_CAP = 64 << 10
 DEFAULT_TIMEOUT_SECONDS = 10
+# Per-request timeout cap: --timeout must be finite and within (0, 60].
+# 60 s is 6x the 10 s default and covers the slowest healthy surface;
+# anything larger is a misconfiguration, not a slower check.
+TIMEOUT_MAX_SECONDS = 60
 # Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
 # (error 1010), so an explicit agent is required for the probe to reach the Worker.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
@@ -118,7 +169,7 @@ KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"}
 #   self_role_recovery: 30s cadence + 25s timeout (recovery_job,
 #     self_role_handlers.rs:303-310) -> warn 55, max 85
 #   automod_expiry: 60s cadence (EXPIRY_CADENCE, automod_gateway.rs:44) + 5s
-#     timeout (expiry_job, automod_gateway.rs:327-332) -> warn 65, max 125
+#     timeout (expiry_job, automod_gateway.rs:339-344) -> warn 65, max 125
 #   scheduled_messages: 15s cadence (SCHEDULER_TICK_MS, scheduled.rs:49)
 #     + 120s timeout (scheduled_jobs.rs) -> warn 135, max 150
 #   settings: 15s cadence (POLL_SECONDS, settings.rs:47) + 10s timeout
@@ -166,10 +217,42 @@ MAX_LAST_SUCCESS_AGE_SECONDS = {
     name: 2 * JOB_CADENCE_SECONDS[name] + JOB_TIMEOUT_SECONDS[name]
     for name in JOB_CADENCE_SECONDS
 }
+# Display caps for remote-derived magnitudes. The largest graded fail line is
+# 7320 s (inactivity/presence_probe) and failure counts are small ints, so
+# capping here never changes a grading decision: anything past a cap was
+# already stale or failing. Without the caps a single in-cap body carrying
+# e.g. last_success=-(10**4200) would expand digit-for-digit into diagnostics
+# past the 16 KiB machine output bound.
+MAX_DISPLAY_AGE_SECONDS = 9_999_999_999
+MAX_DISPLAY_FAILURES = 999_999_999
+# Only these last_error_class values may reach diagnostics; anything else is
+# reported as unrecognized, never echoed. Source: JobErrorClass,
+# crates/core/src/metrics.rs (serde snake_case); null means no failure yet.
+JOB_ERROR_CLASSES = frozenset({
+    "database", "rest", "configuration", "timeout", "panic", "feed",
+    "recovery_required",
+})
+# Fallback machine code/action for a ProbeError raised without either. Every
+# raise site in this module passes explicit values; the defaults only keep
+# direct constructions (and older callers) on the verdict path.
+DEFAULT_FAIL_CODE = "check_failed"
+DEFAULT_FAIL_ACTION = "inspect the failing check and re-run the probe"
+CHECK_PASSED_ACTION = "no action needed"
 
 
 class ProbeError(Exception):
-    """A check's one-line failure reason."""
+    """A check's one-line failure reason, with a stable machine code.
+
+    The message is fixed vocabulary: it never carries remote input. The code
+    is a bounded lowercase token and next_action a short remediation; both
+    are stable across equivalent failures and feed the --json verdict rows.
+    """
+
+    def __init__(self, message, code=DEFAULT_FAIL_CODE,
+                 next_action=DEFAULT_FAIL_ACTION):
+        super().__init__(message)
+        self.code = code
+        self.next_action = next_action
 
 
 class DuplicateKeyError(ValueError):
@@ -202,9 +285,18 @@ class Result:
     ok: bool
     reason: str
     source: str
+    code: str = DEFAULT_FAIL_CODE
+    next_action: str = DEFAULT_FAIL_ACTION
 
     def line(self):
         return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.reason} [{self.source}]"
+
+    def verdict_row(self):
+        return {"id": self.name,
+                "verdict": "PASS" if self.ok else "FAIL",
+                "code": self.code,
+                "next_action": self.next_action,
+                "detail": self.reason}
 
 
 SRC_SERVER = "crates/bot/src/server.rs"
@@ -214,28 +306,73 @@ SRC_JOBS = "crates/bot/src/jobs.rs"
 SRC_FENCE = "wrangler/src/ownership.ts"
 
 
+def valid_timeout(value):
+    """A --timeout is usable only when finite and within (0, 60]."""
+    return math.isfinite(value) and 0 < value <= TIMEOUT_MAX_SECONDS
+
+
 def normalize_base(url):
-    """Accept an http(s) origin without credentials; probes append their paths."""
+    """Accept a usable nonempty bare http(s) origin; probes append paths.
+
+    Every refusal is fixed vocabulary with its own code: the rejected URL is
+    never echoed, not even truncated, and no request is attempted.
+    """
     if not url:
-        raise ProbeError("no base URL given (--base-url or QA_PROBE_BASE_URL)")
+        raise ProbeError("no base URL given (--base-url or QA_PROBE_BASE_URL)",
+                         code="origin_missing",
+                         next_action="pass a bare http(s) origin as "
+                                     "--base-url or QA_PROBE_BASE_URL")
     try:
         parts = urlsplit(url)
     except ValueError:
-        raise ProbeError(f"refusing: {url!r:.80} is not a usable base URL")
+        raise ProbeError("refusing: base URL is malformed",
+                         code="origin_malformed",
+                         next_action="pass a bare http(s) origin such as "
+                                     "https://staging.example")
     try:
-        parts.port
+        port = parts.port
     except ValueError:
-        raise ProbeError(f"refusing: {url!r:.80} has an unusable port")
+        raise ProbeError("refusing: base URL has an unusable port",
+                         code="origin_bad_port",
+                         next_action="pass a bare http(s) origin with a usable "
+                                     "port 1-65535 or no port")
+    if port is not None and not 1 <= port <= 65535:
+        raise ProbeError("refusing: base URL has an unusable port",
+                         code="origin_bad_port",
+                         next_action="pass a bare http(s) origin with a usable "
+                                     "port 1-65535 or no port")
     if parts.scheme not in ("http", "https"):
-        raise ProbeError(f"refusing: {url!r:.80} is not http(s)")
+        raise ProbeError("refusing: base URL is not http(s)",
+                         code="origin_bad_scheme",
+                         next_action="pass a bare http or https origin as --base-url")
     if parts.username or parts.password:
-        raise ProbeError("refusing: base URL must not carry credentials")
+        raise ProbeError("refusing: base URL must not carry credentials",
+                         code="origin_has_credentials",
+                         next_action="remove credentials from --base-url; "
+                                     "probes send no credentials")
     if parts.path not in ("", "/") or parts.query or parts.fragment:
-        raise ProbeError(f"refusing: {url!r:.80} must be a bare origin, no path")
+        raise ProbeError("refusing: base URL must be a bare origin, no path",
+                         code="origin_not_bare",
+                         next_action="pass a bare origin without path, query "
+                                     "or fragment")
     host = parts.hostname or ""
+    if not host:
+        raise ProbeError("refusing: base URL has no host",
+                         code="origin_missing_host",
+                         next_action="pass a bare http(s) origin with a nonempty host")
+    try:
+        host.encode("idna")
+    except UnicodeError:
+        # Mirrors the IDNA encoding socket.getaddrinfo applies before any
+        # packet: an overlong label would otherwise escape the fetch guards
+        # (UnicodeError is a ValueError, not an OSError) with a traceback.
+        raise ProbeError("refusing: base URL host is not usable",
+                         code="origin_bad_host",
+                         next_action="pass a bare http(s) origin with a usable "
+                                     "DNS host") from None
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    port_suffix = f":{parts.port}" if parts.port else ""
+    port_suffix = f":{port}" if port else ""
     return f"{parts.scheme}://{host}{port_suffix}"
 
 
@@ -256,67 +393,162 @@ def fetch(url, timeout):
         return e.code, e.read(BODY_CAP + 1)
 
 
+# Keeps every decoded walk far below the interpreter's recursion limit.
+# Legitimate route shapes nest about 4 levels; anything past 32 is refused
+# as unusable, like malformed JSON.
+MAX_NESTING_DEPTH = 32
+
+
+def exceeds_nesting_budget(value):
+    """True when any container nests deeper than MAX_NESTING_DEPTH levels.
+
+    Iterative, so deep input cannot exhaust the stack.
+    """
+    pending = [(value, 1)]
+    while pending:
+        node, level = pending.pop()
+        if isinstance(node, dict):
+            children = list(node.values())
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if level > MAX_NESTING_DEPTH:
+            return True
+        pending.extend((child, level + 1) for child in children)
+    return False
+
+
 def decode(body):
+    """Decode a route body, or None when it is not usable JSON.
+
+    Duplicate keys stay a loud refusal; malformed JSON, a decoder
+    RecursionError (not a ValueError), and input nesting past the budget
+    become None so the caller fails an ordinary check instead of escaping
+    the verdict path.
+    """
     try:
-        return decode_strict(body)
+        parsed = decode_strict(body)
     except DuplicateKeyError:
         raise
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return None
+    if exceeds_nesting_budget(parsed):
+        return None
+    return parsed
+
+
+def canonical_build_identity(report):
+    """Return a canonical stamped identity or the exact unstamped pair."""
+    if not isinstance(report, dict):
+        return None
+    revision, build_id = report.get("build_revision"), report.get("build_id")
+    if revision == UNSTAMPED and build_id == UNSTAMPED:
+        return revision, build_id
+    if is_build_revision_shape(revision) and is_build_id_shape(build_id):
+        return revision, build_id
+    return None
 
 
 def check_liveness(status, body):
     if status != 200:
-        raise ProbeError(f"/health answered {status}, expected 200")
+        raise ProbeError(f"/health answered {status}, expected 200",
+                         code="liveness_bad_status",
+                         next_action="inspect the target /health route and "
+                                     "re-run the probe")
     if len(body) > BODY_CAP:
-        raise ProbeError("/health answered over the body cap")
+        raise ProbeError("/health answered over the body cap",
+                         code="liveness_over_body_cap",
+                         next_action="inspect why /health answered over the "
+                                     "64 KiB body cap")
     try:
         parsed = decode(body)
     except DuplicateKeyError:
-        raise ProbeError("/health carries duplicate JSON object keys")
+        raise ProbeError("/health carries duplicate JSON object keys",
+                         code="liveness_duplicate_keys",
+                         next_action="inspect why /health carries duplicate "
+                                     "JSON object keys")
     if parsed != {"status": "ok"}:
-        raise ProbeError("/health 200 without {\"status\": \"ok\"}")
+        raise ProbeError("/health 200 without {\"status\": \"ok\"}",
+                         code="liveness_bad_shape",
+                         next_action="inspect the target /health route and "
+                                     "re-run the probe")
     return "/health 200 {\"status\": \"ok\"}: process answers HTTP"
 
 
 def check_readyz_shape(status, body):
+    inspect_breakdown = ("inspect the target /readyz breakdown and re-run "
+                         "the probe")
     if len(body) > BODY_CAP:
-        raise ProbeError("/readyz answered over the body cap")
+        raise ProbeError("/readyz answered over the body cap",
+                         code="readyz_over_body_cap",
+                         next_action="inspect why /readyz answered over the "
+                                     "64 KiB body cap")
     try:
         report = decode(body)
     except DuplicateKeyError:
-        raise ProbeError(f"/readyz {status} carries duplicate JSON object keys")
+        raise ProbeError(f"/readyz {status} carries duplicate JSON object keys",
+                         code="readyz_duplicate_keys",
+                         next_action="inspect why /readyz carries duplicate "
+                                     "JSON object keys")
     if isinstance(report, dict) and report.get("error"):
-        raise ProbeError(f"/readyz refused with error {report.get('error')!r:.40} "
-                         "(ownership fence or proxy refusal, not the container breakdown)")
+        raise ProbeError("/readyz refused with an error field (ownership "
+                         "fence or proxy refusal, not the container breakdown)",
+                         code="readyz_refused_error",
+                         next_action="read Worker ownership state; this is not "
+                                     "the container breakdown")
     if status in (301, 302, 303, 307, 308):
-        raise ProbeError(f"/readyz answered {status}: refusing to follow a redirect")
+        raise ProbeError(f"/readyz answered {status}: refusing to follow a redirect",
+                         code="readyz_redirect",
+                         next_action="probe the container origin directly; "
+                                     "redirects are never followed")
     components = report.get("components") if isinstance(report, dict) else None
     if (not isinstance(components, list) or not components
             or not all(isinstance(c, list) and len(c) == 2
                        and isinstance(c[0], str) and c[0]
                        and c[1] in KNOWN_STATUSES for c in components)):
         raise ProbeError(f"/readyz {status} without the components breakdown "
-                         "(expected [[name, ready|starting|down], ...])")
+                         "(expected [[name, ready|starting|down], ...])",
+                         code="readyz_bad_shape",
+                         next_action=inspect_breakdown)
     # Reject duplicates before any readiness math: last-wins would let a
     # later ready mask an earlier down.
     names = [c[0] for c in components]
     if len(set(names)) != len(names):
-        raise ProbeError(f"/readyz {status} repeats a component name")
+        raise ProbeError(f"/readyz {status} repeats a component name",
+                         code="readyz_duplicate_component",
+                         next_action=inspect_breakdown)
     if any(name not in KNOWN_COMPONENTS for name in names):
-        raise ProbeError(f"/readyz {status} carries an unknown component name")
+        raise ProbeError(f"/readyz {status} carries an unknown component name",
+                         code="readyz_unknown_component",
+                         next_action=inspect_breakdown)
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:
-        raise ProbeError(f"/readyz breakdown lacks {', '.join(missing)}")
+        raise ProbeError(f"/readyz breakdown lacks {', '.join(missing)}",
+                         code="readyz_missing_component",
+                         next_action=inspect_breakdown)
     for key in ("build_revision", "build_id"):
         if not isinstance(report.get(key), str):
-            raise ProbeError(f"/readyz breakdown lacks {key!r} build identity")
+            raise ProbeError(f"/readyz breakdown lacks {key!r} build identity",
+                             code="readyz_missing_build_identity",
+                             next_action="inspect why /readyz omits "
+                                         "build_revision/build_id")
+    if canonical_build_identity(report) is None:
+        raise ProbeError("/readyz build identity is not the canonical stamped "
+                         "shape or the exact unknown pair (expected 40-hex "
+                         "build_revision and digits-digits build_id)",
+                         code="readyz_bad_build_identity",
+                         next_action="inspect why /readyz build identity is "
+                                     "not canonical")
     ready = all(value == "ready" for value in state.values())
     expected = 200 if ready else 503
     if status != expected:
         raise ProbeError(f"/readyz {status} disagrees with its breakdown "
-                         f"({'all ready' if ready else 'not all ready'}, expected {expected})")
+                         f"({'all ready' if ready else 'not all ready'}, expected {expected})",
+                         code="readyz_status_disagrees",
+                         next_action="inspect why the /readyz status disagrees "
+                                     "with its breakdown")
     return state, (f"/readyz {status}: "
                    f"{', '.join(f'{k}={v}' for k, v in state.items())} "
                    f"(build {report['build_revision']:.20}/{report['build_id']:.20})")
@@ -333,14 +565,24 @@ def check_gateway(state, status, expect_ready):
         if status == 200:
             return note
         if expect_ready:
-            raise ProbeError(f"{note}, but HTTP {status}: service not ready")
+            raise ProbeError(f"{note}, but HTTP {status}: service not ready",
+                             code="gateway_service_not_ready",
+                             next_action="inspect the down components, then "
+                                         "re-run with --expect-ready once 200")
         return f"{note}, but HTTP {status} (truthful, probe stays green)"
     if status == 503 and gateway in ("down", "starting"):
         note = f"gateway {gateway}: parked, not E2E approval"
         if expect_ready:
-            raise ProbeError(f"{note}; --expect-ready needs gateway ready")
+            raise ProbeError(f"{note}; --expect-ready needs gateway ready",
+                             code="gateway_parked",
+                             next_action="start the gateway prerequisites, or "
+                                         "drop --expect-ready to grade "
+                                         "truthfulness only")
         return f"{note} (truthful 503, probe stays green)"
-    raise ProbeError(f"gateway {gateway!r} disagrees with HTTP {status}")
+    raise ProbeError(f"gateway {gateway!r} disagrees with HTTP {status}",
+                     code="gateway_disagrees",
+                     next_action="inspect why the gateway state disagrees "
+                                 "with the HTTP status")
 
 
 def _field_age_seconds(entry, field, now_ms):
@@ -356,8 +598,11 @@ def _field_age_seconds(entry, field, now_ms):
         return None
     if isinstance(last, float) and not math.isfinite(last):
         raise ProbeError(f"nonfinite {field} (refusing to grade freshness "
-                         f"from NaN/Infinity)")
-    return max(0, int(now_ms - last) // 1000)
+                         f"from NaN/Infinity)",
+                         code="jobs_nonfinite_field",
+                         next_action="inspect why the job timestamp is not "
+                                     "finite and re-run the probe")
+    return min(MAX_DISPLAY_AGE_SECONDS, max(0, int(now_ms - last) // 1000))
 
 
 def job_age_seconds(entry, now_ms):
@@ -382,21 +627,34 @@ def consecutive_failures(entry):
         return 0
     if isinstance(failures, float) and not math.isfinite(failures):
         raise ProbeError("nonfinite consecutive_failures (refusing to grade "
-                         "freshness from NaN/Infinity)")
-    return max(0, int(failures))
+                         "freshness from NaN/Infinity)",
+                         code="jobs_nonfinite_field",
+                         next_action="inspect why the failure count is not "
+                                     "finite and re-run the probe")
+    return min(MAX_DISPLAY_FAILURES, max(0, int(failures)))
 
 
 def check_jobs(report, now_ms=None, enforce_freshness=True):
+    """Grade the informational jobs map, naming only graded job names.
+
+    Unknown job names are remote input: they stay ungraded and are counted,
+    never listed. Only names with a known cadence constant reach diagnostics.
+    """
     jobs = report.get("jobs")
     if not isinstance(jobs, dict) or not jobs:
-        raise ProbeError("/readyz carries no informational jobs map")
+        raise ProbeError("/readyz carries no informational jobs map",
+                         code="jobs_missing_map",
+                         next_action="inspect why /readyz omits the "
+                                     "informational jobs map")
     bad = [name for name, entry in jobs.items()
            if not isinstance(entry, dict)
            or not isinstance(entry.get("parked"), bool)
            or not isinstance(entry.get("running"), bool)]
     if bad:
-        shown = ", ".join(sorted(bad)[:3]) + ("..." if len(bad) > 3 else "")
-        raise ProbeError(f"/readyz jobs map has malformed entries: {shown}")
+        raise ProbeError(f"/readyz jobs map has {len(bad)} malformed entries",
+                         code="jobs_malformed_entries",
+                         next_action="inspect why /readyz job entries lack "
+                                     "parked/running booleans")
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     parked_while_degraded = sum(1 for entry in jobs.values()
@@ -446,8 +704,10 @@ def check_jobs(report, now_ms=None, enforce_freshness=True):
             if failures > 0:
                 detail = f"{name}=no-success {failures} consecutive failures"
                 error = entry.get("last_error_class")
-                if isinstance(error, str) and error:
+                if isinstance(error, str) and error in JOB_ERROR_CLASSES:
                     detail += f" (last error {error})"
+                elif isinstance(error, str) and error:
+                    detail += " (last error class unrecognized)"
                 stale.append(detail)
                 continue
             started = _field_age_seconds(entry, "last_start", now_ms)
@@ -466,10 +726,13 @@ def check_jobs(report, now_ms=None, enforce_freshness=True):
     if stale:
         shown = ", ".join(stale)
         raise ProbeError(f"stale jobs past max_last_success_age_seconds or "
-                         f"failing with no success: {shown}")
+                         f"failing with no success: {shown}",
+                         code="jobs_stale_or_failing",
+                         next_action="inspect the failing jobs on the target "
+                                     "and re-run the probe")
     parts = [f"{fresh} jobs fresh within cadence"]
     if ungraded:
-        parts.append(f"{len(ungraded)} ungraded ({', '.join(sorted(ungraded))})")
+        parts.append(f"{len(ungraded)} ungraded")
     if not_yet:
         parts.append(f"{not_yet} not yet run")
     parts.append(f"{parked} parked")
@@ -482,47 +745,60 @@ def check_jobs(report, now_ms=None, enforce_freshness=True):
 def run(args, fetch_fn=None):
     """Fetch once per route, then evaluate every probe on the bodies."""
     results = []
+    shape_source = f"{SRC_SERVER}, {SRC_HEALTH}"
+    no_breakdown = "fix the readiness-shape failure first"
 
-    def record(name, source, check, *check_args):
+    def record(name, source, check, *check_args, ok_code):
         try:
-            results.append(Result(name, True, check(*check_args), source))
+            results.append(Result(name, True, check(*check_args), source,
+                                  ok_code, CHECK_PASSED_ACTION))
         except ProbeError as e:
-            results.append(Result(name, False, str(e), source))
+            results.append(Result(name, False, str(e), source,
+                                  e.code, e.next_action))
 
     try:
         base = normalize_base(args.base_url)
     except ProbeError as e:
-        return None, [Result("base-url", False, str(e), "scripts/qa_cutover_probes.py")]
+        return None, [Result("base-url", False, str(e),
+                             "scripts/qa_cutover_probes.py", e.code, e.next_action)]
 
     fetch_one = fetch_fn if fetch_fn is not None else (lambda url: fetch(url, args.timeout))
+    unreachable = "check the probe target is reachable and re-run the probe"
     try:
         health_status, health_body = fetch_one(base + "/health")
-    except (OSError, http.client.HTTPException) as e:
+    except (OSError, http.client.HTTPException, UnicodeError) as e:
         return None, [Result("liveness", False,
-                             f"/health did not respond ({e.__class__.__name__})", SRC_SERVER)]
+                             f"/health did not respond ({e.__class__.__name__})",
+                             SRC_SERVER, "liveness_no_response", unreachable)]
     try:
         readyz_status, readyz_body = fetch_one(base + "/readyz")
-    except (OSError, http.client.HTTPException) as e:
-        record("liveness", SRC_SERVER, check_liveness, health_status, health_body)
+    except (OSError, http.client.HTTPException, UnicodeError) as e:
+        record("liveness", SRC_SERVER, check_liveness, health_status,
+               health_body, ok_code="liveness_ok")
         results.append(Result("readiness-shape", False,
                               f"/readyz did not respond ({e.__class__.__name__})",
-                              f"{SRC_SERVER}, {SRC_HEALTH}"))
+                              shape_source, "readyz_no_response", unreachable))
         return None, results
     # Liveness first: it is independent of the readyz body.
-    record("liveness", SRC_SERVER, check_liveness, health_status, health_body)
+    record("liveness", SRC_SERVER, check_liveness, health_status, health_body,
+           ok_code="liveness_ok")
 
     if len(readyz_body) > BODY_CAP:
         # Refuse before any JSON parsing: the extra byte never reaches decode.
         oversize = "/readyz answered over the body cap"
-        results.append(Result("readiness-shape", False, oversize,
-                              f"{SRC_SERVER}, {SRC_HEALTH}"))
+        oversize_action = ("inspect why /readyz answered over the 64 KiB "
+                           "body cap")
+        results.append(Result("readiness-shape", False, oversize, shape_source,
+                              "readyz_over_body_cap", oversize_action))
         results.append(Result("gateway-state", False,
-                              "no truthful breakdown to read gateway from", SRC_GATEWAY))
+                              "no truthful breakdown to read gateway from", SRC_GATEWAY,
+                              "gateway_no_breakdown", no_breakdown))
         results.append(Result("jobs-map", False,
-                              "no truthful breakdown to read jobs from", SRC_JOBS))
+                              "no truthful breakdown to read jobs from", SRC_JOBS,
+                              "jobs_no_breakdown", no_breakdown))
         results.append(Result("fence-watch", False,
                               "no truthful breakdown to rule out a fence refusal",
-                              SRC_FENCE))
+                              SRC_FENCE, "fence_no_breakdown", no_breakdown))
         return None, results
     try:
         report = decode(readyz_body)
@@ -533,33 +809,48 @@ def run(args, fetch_fn=None):
     try:
         state, shape_reason = check_readyz_shape(readyz_status, readyz_body)
     except ProbeError as e:
-        results.append(Result("readiness-shape", False, str(e),
-                              f"{SRC_SERVER}, {SRC_HEALTH}"))
+        results.append(Result("readiness-shape", False, str(e), shape_source,
+                              e.code, e.next_action))
         results.append(Result("gateway-state", False,
-                              "no truthful breakdown to read gateway from", SRC_GATEWAY))
+                              "no truthful breakdown to read gateway from", SRC_GATEWAY,
+                              "gateway_no_breakdown", no_breakdown))
         results.append(Result("jobs-map", False,
-                              "no truthful breakdown to read jobs from", SRC_JOBS))
-        results.append(Result("fence-watch", False, str(e), SRC_FENCE)
-                       if isinstance(report, dict) and report.get("error")
-                       else Result("fence-watch", False,
-                                   "no truthful breakdown to rule out a fence refusal",
-                                   SRC_FENCE))
+                              "no truthful breakdown to read jobs from", SRC_JOBS,
+                              "jobs_no_breakdown", no_breakdown))
+        if isinstance(report, dict) and report.get("error"):
+            results.append(Result("fence-watch", False, str(e), SRC_FENCE,
+                                  "fence_refusal_present",
+                                  "read Worker ownership state; this is not "
+                                  "the container breakdown"))
+        else:
+            results.append(Result("fence-watch", False,
+                                  "no truthful breakdown to rule out a fence refusal",
+                                  SRC_FENCE, "fence_no_breakdown", no_breakdown))
         return report, results
-    results.append(Result("readiness-shape", True, shape_reason,
-                          f"{SRC_SERVER}, {SRC_HEALTH}"))
+    results.append(Result("readiness-shape", True, shape_reason, shape_source,
+                          "readiness_shape_ok", CHECK_PASSED_ACTION))
     record("gateway-state", SRC_GATEWAY, check_gateway, state,
-           readyz_status, args.expect_ready)
+           readyz_status, args.expect_ready, ok_code="gateway_state_ok")
     enforce = readyz_status == 200 or bool(args.expect_ready)
     record("jobs-map", SRC_JOBS,
-           lambda rep: check_jobs(rep, enforce_freshness=enforce), report)
+           lambda rep: check_jobs(rep, enforce_freshness=enforce), report,
+           ok_code="jobs_map_ok")
     if isinstance(report, dict) and report.get("error"):
         results.append(Result("fence-watch", False,
-                              f"container breakdown carries error {report.get('error')!r:.40}",
-                              SRC_FENCE))
+                              "container breakdown carries an error field",
+                              SRC_FENCE, "fence_error_present",
+                              "read Worker ownership state; this is not "
+                              "the container breakdown"))
     else:
         results.append(Result("fence-watch", True,
-                              "container breakdown, no ownership refusal", SRC_FENCE))
+                              "container breakdown, no ownership refusal", SRC_FENCE,
+                              "fence_watch_ok", CHECK_PASSED_ACTION))
     return report, results
+
+
+JSON_PASS_ACTION = "all cutover probes passed: proceed with the cutover gate"
+JSON_FAIL_ACTION = ("one or more cutover probes failed: fix the target and "
+                    "re-run the probe")
 
 
 def parse_args(argv):
@@ -570,24 +861,26 @@ def parse_args(argv):
                         help="fail gateway-state unless the service is ready "
                              "(default: a truthful parked 503 stays green)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
-                        help=f"seconds per GET (default: {DEFAULT_TIMEOUT_SECONDS})")
+                        help=f"seconds per GET, finite and within (0, 60] "
+                             f"(default: {DEFAULT_TIMEOUT_SECONDS})")
     parser.add_argument("--evidence", default=None,
                         help="receipt path written when both routes answer")
+    parser.add_argument("--json", action="store_true",
+                        help="print one machine-readable JSON verdict object "
+                             "instead of text lines")
     return parser.parse_args(argv)
 
 
 def main(argv=None, fetch_fn=None):
     args = parse_args(argv)
+    if not valid_timeout(args.timeout):
+        print("qa_cutover_probes: --timeout must be a finite number of seconds "
+              "greater than 0 and at most 60", file=sys.stderr)
+        return 2
     report, results = run(args, fetch_fn)
-    for result in results:
-        print(result.line())
-    failed = sum(not r.ok for r in results)
-    print(f"cutover acceptance probes: {len(results) - failed}/{len(results)} checks passed")
-    if report is None or not all(r.ok for r in results):
-        if args.evidence and report is not None:
-            pass  # Refusals and failures leave no receipt to attest.
-        return 1
-    if args.evidence:
+    passed = report is not None and all(r.ok for r in results)
+    evidence_error = None
+    if passed and args.evidence:
         receipt = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                    "result": "pass",
                    "expect_ready": args.expect_ready,
@@ -598,9 +891,41 @@ def main(argv=None, fetch_fn=None):
                 json.dump(receipt, handle, indent=2)
                 handle.write("\n")
         except OSError as error:
+            evidence_error = error.__class__.__name__
+    if args.json:
+        rows = [r.verdict_row() for r in results]
+        if evidence_error is not None:
+            rows.append({
+                "id": "evidence",
+                "verdict": "FAIL",
+                "code": "evidence_not_written",
+                "next_action": ("check the --evidence path is writable "
+                                "and re-run the probe"),
+                "detail": (f"evidence receipt not written "
+                           f"({evidence_error})"),
+            })
+        verdict = "PASS" if passed and evidence_error is None else "FAIL"
+        print(json.dumps({
+            "verdict": verdict,
+            "next_action": JSON_PASS_ACTION if verdict == "PASS" else JSON_FAIL_ACTION,
+            "checks": rows,
+        }, indent=2))
+    else:
+        for result in results:
+            print(result.line())
+        failed = sum(not r.ok for r in results)
+        print(f"cutover acceptance probes: {len(results) - failed}/{len(results)} checks passed")
+    if evidence_error is not None:
+        # The verdict above already carries the failure in --json mode, so
+        # stderr stays empty there; text mode keeps the one-line notice.
+        if not args.json:
             print(f"cutover acceptance probes failed: evidence not written "
-                  f"({error.__class__.__name__})")
-            return 1
+                  f"({evidence_error})")
+        return 1
+    if not passed:
+        # Refusals and failures leave no receipt to attest: --evidence is
+        # neither created nor overwritten here.
+        return 1
     return 0
 
 

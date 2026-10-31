@@ -53,6 +53,8 @@ fn counter(code: &str, uses: u64, inviter: u64) -> InviteState {
         uses,
         inviter_id: Some(inviter),
         channel_id: Some(4444),
+        max_uses: 0,
+        temporary: false,
     }
 }
 

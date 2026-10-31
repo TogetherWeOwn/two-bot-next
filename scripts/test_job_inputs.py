@@ -67,8 +67,7 @@ class SelectionTests(unittest.TestCase):
         # The container selector owns the image build and the check job's
         # offline manifest step always runs, so no test job is needed -- but
         # the SBOM/vulnerability scan inventories exactly these files.
-        for path in ["Dockerfile", "Dockerfile.distroless",
-                     ".dockerignore"]:
+        for path in ["Dockerfile", ".dockerignore"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {SUPPLY}, path)
         self.assertEqual(
@@ -187,6 +186,15 @@ class SelectionTests(unittest.TestCase):
                 selected = inputs.classify(path)
                 self.assertEqual(selected, {RUST, WORKER, PARITY}, path)
 
+    def test_receiver_contract_doc_selects_its_worker_conformance_check(self):
+        path = "docs/internal-actions-receiver.md"
+        self.assertIn(path, inputs.WORKER_DOCS)
+        self.assertEqual(inputs.classify(path), {WORKER})
+        self.assertEqual(
+            jobs([path]),
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: True})
+
     def test_worker_tree_selects_worker_only(self):
         for path in ["wrangler/src/index.ts",
                      "wrangler/test/container-env.test.ts",
@@ -196,12 +204,19 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
 
     def test_rust_docs_select_rust_only(self):
-        # Content reads only; existence-only docs (staging-soak/backup/
+        # Content reads only; existence-only docs (staging-soak/
         # preflight) fall through to the worker-only docs rule.
+        # docs/backup.md reads content in the voice owner-grant journal
+        # regression, so it selects rust despite the preconditions
+        # existence check. docs/tickets.md is embedded by the ticket
+        # component admission acceptance suite.
         rust_docs = ["docs/cutover.md",
                      "docs/commands.md", "docs/configuration.md",
                      "docs/voice-rooms.md",
-                     "docs/soak-checklist.json", "docs/soak-checklist.md"]
+                     "docs/soak-checklist.json", "docs/soak-checklist.md",
+                     "docs/privacy.md", "docs/database-roles.md",
+                     "docs/rollback-delta.md", "docs/backup.md",
+                     "docs/tickets.md"]
         for path in rust_docs:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
@@ -244,10 +259,11 @@ class SelectionTests(unittest.TestCase):
     def test_unrelated_docs_select_worker_only(self):
         # No file reader in PR-run code, but runbook.test.ts asserts on the
         # docs/ listing itself (case-collision + readiness links).
+        # docs/database-roles.md left this list: the voice owner-grant
+        # journal regression reads its content, so it selects rust.
         for path in ["docs/gateway-recovery.md",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
-                     "docs/database-roles.md",
                      "docs/member-journey-parity.md"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
@@ -381,6 +397,22 @@ class SelectionTests(unittest.TestCase):
                     inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
 
 
+class DocsIndexWiringTests(unittest.TestCase):
+    def test_docs_index_inputs_and_ungated_execution(self):
+        for path in ("docs/README.md", "docs/nested/new-guide.md"):
+            with self.subTest(path=path):
+                selected = jobs([path])
+                self.assertTrue(selected[DOCS])
+                self.assertTrue(selected[WORKER])
+        for path in ("scripts/check_docs_index.py", "scripts/test_docs_index.py"):
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), {RUST, WORKER})
+        body = CHECK_YML.read_text()
+        step = body.split("- name: Docs index, orphan and byte-budget conformance (offline)\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("python3 -m unittest discover -s scripts -p 'test_docs_index.py' -v", step)
+        self.assertNotIn("if:", step, "docs-only selection must never skip the guard")
+
+
 class ReaderCoverageTests(unittest.TestCase):
     """Every repo-owned literal content reader must agree with the classifier.
 
@@ -392,10 +424,12 @@ class ReaderCoverageTests(unittest.TestCase):
     # Docs the preconditions binary checks by existence only (is_file, never
     # content): a content edit cannot break Rust, and a deletion forces all
     # jobs via the deletion rule. Every other docs/ literal in Rust is a
-    # content read and must select the rust job.
+    # content read and must select the rust job. docs/backup.md left this
+    # set: the voice owner-grant journal regression reads its content, so a
+    # content edit must select rust (the preconditions is_file check still
+    # holds alongside the content read).
     EXISTENCE_ONLY_DOCS = frozenset({
         "docs/staging-soak.md",
-        "docs/backup.md",
         "docs/preflight.md",
         "docs/runbook.md",
     })
@@ -516,7 +550,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("test_job_inputs.py", self.selector)
 
     def test_consumer_jobs_wait_on_selector(self):
-        for job in ("check", "rust-tests", "ignored-db-stores",
+        for job in ("check", "rust-tests", "coverage-plan", "coverage-shard",
+                    "patch-coverage", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
                     "tickets-postgres", "worker", "supply-chain", "ci-ok",
                     "fuzz-compile"):
@@ -548,6 +583,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         head = self.text.split("\n  ci-ok:")[1].split("steps:", 1)[0]
         self.assertIn("always()", head)
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
+                    "coverage-plan", "coverage-shard", "patch-coverage",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
                     "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
@@ -624,8 +660,11 @@ class WorkflowSurfaceTests(unittest.TestCase):
                    "\n".join(lines))
 
     # The `check` lane always runs, so its Rust/DB steps carry the selector
-    # guard per step; the three Rust test lanes skip at the job level instead.
-    RUST_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
+    # guard per step; the four Rust test lanes skip at the job level instead.
+    # The coverage planner skips at the job level too but is too small for
+    # the lane-shape pin below, and the merge uses a fail-closed `always()`
+    # form; both are pinned by test_coverage_plan_and_merge_skip_without_rust.
+    RUST_LANES = ("rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime")
     LANE_GUARD = "if: needs.job-inputs.outputs.rust != 'false'"
 
     # What a step must not do on a rust=false PR: that run never installs the
@@ -683,6 +722,22 @@ class WorkflowSurfaceTests(unittest.TestCase):
                         body, r"(?m)^\s+if:.*outputs\.rust",
                         f"{name!r}: the lane is already gated at the job level")
 
+    def test_coverage_plan_and_merge_skip_without_rust(self):
+        # No Rust inputs (docs-only, worker-UI-only): the planner skips at
+        # the job level like the test lanes, and the merge skips too — its
+        # fail-closed `always()` form still requires the rust selector plus a
+        # successful plan, so a partial shard set can never read as measured.
+        # ci-ok accepts the skips only because the selector deselected them.
+        plan = self.job_text(self.text, "coverage-plan").split("\n    steps:\n", 1)[0]
+        self.assertIn(f"\n    {self.LANE_GUARD}\n", plan)
+        self.assertIn("job-inputs", plan)
+        merge = self.job_text(self.text, "patch-coverage").split("\n    steps:\n", 1)[0]
+        self.assertIn("always()", merge)
+        self.assertIn("!cancelled()", merge)
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", merge)
+        self.assertIn("needs.coverage-plan.result == 'success'", merge)
+        self.assertIn("coverage-shard", merge)
+
     def test_fuzz_compile_lane_skips_at_the_job_level(self):
         # Compile-only libFuzzer lane follows the same rust selector as the
         # test lanes; ci-ok only accepts its skip when rust was deselected.
@@ -709,14 +764,19 @@ class WorkflowSurfaceTests(unittest.TestCase):
                          ["channel moderation store clippy"])
 
     def test_check_lanes_start_with_the_selector_not_behind_slow_jobs(self):
-        # The lint lane and the three test lanes run in parallel: each waits
+        # The lint lane and the test lanes run in parallel: each waits
         # on the selector only, never on the SBOM scan or the DB jobs (the old
         # `check` started a median ~7.8 min after the run began because it
         # waited on them). The aggregators carry those gates instead.
+        # Exception: coverage-shard also waits on coverage-plan, the fast
+        # (~2 min) matrix it cannot start without.
         for job in ("check", *self.RUST_LANES):
             with self.subTest(job=job):
                 head = self.job_text(self.text, job)
-                self.assertRegex(head, r"(?m)^    needs: \[job-inputs\]$")
+                if job == "coverage-shard":
+                    self.assertRegex(head, r"(?m)^    needs: \[job-inputs, coverage-plan\]$")
+                else:
+                    self.assertRegex(head, r"(?m)^    needs: \[job-inputs\]$")
 
     def test_push_to_main_selects_everything(self):
         self.assertIn("pull_request", self.selector)
@@ -738,6 +798,9 @@ class VoiceSelectionTest(unittest.TestCase):
             "tests/voice_templates/corpus.json",
             "Cargo.lock",
             "scripts/staging_voice_synthetic.py",
+            "scripts/test_staging_voice_synthetic_dry_run_acceptance.py",
+            "scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py",
+            "scripts/test_staging_voice_synthetic_owned_room_acceptance.py",
             ".github/workflows/voice-synthetic.yml",
             "./crates/bot/src/voice_room_plan.rs",
         ):

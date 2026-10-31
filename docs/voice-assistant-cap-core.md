@@ -51,14 +51,17 @@ are claimed by these tests.
 
 ## Residual parent work
 
-The per-guild month-start/build-count column, the OpenAI-compatible endpoint
-configuration gate ("disabled unless configured"), the actual endpoint call
-with the validated payload, the Apply/Refine/Cancel flow, the six-scenario
-output validation, and the admin-only command gate all remain outside this
-slice. The V12 parent must authenticate the caller, route the persisted row,
-enforce the endpoint-configured gate, and consume this module for the cap
-check before sending. Unit tests establish domain behavior only, not runtime
-parity or staging readiness.
+The OpenAI-compatible endpoint call with the validated payload, the
+Apply/Refine/Cancel flow, the six-scenario output validation, and the
+admin-only command gate all remain outside this slice. The per-guild
+month-start/build-count column has landed since (`assistant_monthly_builds`,
+migration `0446`, decided through this module by the `two-bot-store`
+`PgAssistantCapLedger`), as has the "disabled unless configured"
+before-send gate (`two_bot_core::voice_assistant::require_send_allowed`,
+refusing `assistant_not_configured` before any send and `monthly_cap_reached`
+at the cap). The V12 parent must authenticate the caller and consume the
+gate for the cap check before sending. Unit tests establish domain behavior
+only, not runtime parity or staging readiness.
 
 ## Hermetic verification
 

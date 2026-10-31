@@ -55,8 +55,13 @@ exact head commit. Never bypass or weaken a check.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests) and two database lanes, `ignored db (stores)`
-and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
+(unit, integration and doc tests), the sharded `patch coverage` measurement
+(`coverage-plan` selects the legs, the `coverage-shard` matrix runs them,
+`patch-coverage` merges and gates, so the unit-test signal and the coverage
+verdict fail independently),
+`rust nextest` (workspace lib/bins under
+cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
+`ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
 SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.
@@ -66,18 +71,36 @@ in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
 exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
 
-Deterministic quality gates (patch coverage WARN, per-PR advisories HARD,
-ast-grep and Semgrep WARN, required voice synthetic, test-target inventory
-HARD) run as steps of the `check` lane on the existing routed runner; see
-[`docs/quality-gates.md`](docs/quality-gates.md). New checks start in WARN
-(report, never fail) and flip to HARD only with their backlog burned down.
+Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
+HARD, required voice synthetic, test-target inventory HARD) run as steps of
+the `check` lane on the existing routed runner; see
+[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs
+sharded across `coverage-plan`, the `coverage-shard` matrix (with per-shard
+disposable Postgres services and ignored database-backed tests) and the
+`patch-coverage` merge. New checks start in WARN (report, never fail) and flip
+to HARD only with their backlog burned down.
 
 Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use
 floating `stable`: Cargo still follows the repository pin, so differing versions
 can cause component-install conflicts before fmt runs. The offline workflow
-policy suite pins all nine installers to the repository version; bump them and
+policy suite pins all ten installers to the repository version; bump them and
 the toolchain and builder-image pins together.
+
+### Pull-request size labels (advisory)
+
+`.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
+counted lines), `size/M` (up to 400), `size/L` (up to 1000) or `size/XL`, and
+keeps one advisory comment on pull requests over the 400-line threshold.
+Counted lines are additions + deletions excluding lockfiles, generated files
+and fixtures (plus `migrations.lock`, the generated migration inventory; the
+hand-written migration SQL stays counted). The labeller lives once in the org
+[TogetherWeOwn/.github](https://github.com/TogetherWeOwn/.github) repository
+(CI-STANDARD.md, "Advisory PR-size labels"); the workflow here is a thin
+caller pinned to a central SHA and passes only this repo's generated paths.
+This is advisory only: it is not a required check and never blocks a merge.
+A Monday run of the same workflow prints the weekly tally of merged pull
+requests per size; the labels are the durable record behind it.
 
 ### Issues
 
@@ -87,12 +110,12 @@ issue. Blank issues are off. Report a vulnerability privately; see
 
 ## Releases
 
-Each successful production promote tags the deployed commit `vX.Y.Z` and
-publishes a GitHub Release from the Conventional Commit subjects since the
-previous tag (`release.yml`, called by `deploy-production`). There is no release
-PR and no freeze. One flat `vX.Y.Z` tag covers the whole repository, not one
-release per crate. See [`docs/releases.md`](docs/releases.md). Never tag or
-release by hand.
+The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`
+when production has moved forward since the last digest, and publishes a GitHub
+Release from Conventional Commit subjects. Deploys never create version tags.
+There is no release PR or freeze. One digest tag covers the whole repository,
+not one release per crate. See [`docs/releases.md`](docs/releases.md) for repair
+and dry-run dispatches. Never tag or release by hand.
 
 Release notes use the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
@@ -101,8 +124,9 @@ categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
 entry, so write it for a reader of the release notes: imperative mood, one
 user-facing change.
 
-Versioning is SemVer, starting at `0.1.0`; `1.0.0` marks the production
-cutover. `feat!` / `BREAKING CHANGE` bumps major (minor while `0.x`).
+Release tags use UTC calendar dates. Cargo package versions stay at `0.4.0`;
+`feat!` and `BREAKING CHANGE` still appear in the breaking-changes notes but
+no longer choose a SemVer bump.
 
 ## Local development
 
@@ -110,9 +134,32 @@ The toolchain comes from `rust-toolchain.toml` (rustup and CI honour it):
 
 ```sh
 cargo fmt --all -- --check
+python3 scripts/generate_command_reference.py
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
+
+Generate `docs/generated/commands.md` before compiling workspace tests or
+all-targets Clippy: one test embeds the generated Markdown at compile time.
+On the persistent controller use `python3 scripts/generate_command_reference.py --controller`,
+which builds only the generator through bounded Cargo admission. The output is
+ignored; never commit generated registry rows. The authored
+[command-reference landing page](docs/commands.md) links to same-head CI artifacts.
+Normal reference-doc tests compare bytes without writing. Missing or stale output
+fails until explicit generation; tracked configuration drift still fails and is
+never automatically repaired.
+
+The ops-override DB acceptance test mutates process environment. With the test
+DB configured, run it separately from parallel workspace tests (CI does this in
+both the unit-test and coverage lanes):
+
+```sh
+cargo test --workspace --features two-bot-core/db --locked -- --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
+```
+
+Nextest already isolates each test in its own process. On the controller, use the
+bounded cache wrapper for both compiling commands, as required by `AGENTS.md`.
 
 ### Pre-push checklist
 
@@ -206,8 +253,29 @@ internal actions, and leveling are migrated; older suites retain their existing
 explicit opt-ins until migrated separately.
 
 The `wrangler/` Worker/DO wrapper has its own `npm ci`, `npm run typecheck`
-and `npm test`. Never commit secrets, `.env` files or `target/`. See
-[README.md](README.md) for the full service reference.
+and `npm test`. The `worker check` lane in `.github/workflows/check.yml` also
+runs `npm audit --audit-level=high --include=dev --json` from `wrangler/` before
+installation whenever worker inputs are selected (including full main and
+scheduled runs). It audits the committed lockfile, including dev tooling, and
+prints npm's machine-readable JSON report directly in the CI step log. High or
+critical advisories and registry errors fail the lane and therefore `ci-ok`;
+low/moderate advisories remain visible but do not fail it. There are no audit
+suppressions. Fix new high/critical findings before merging; any proposed
+exception needs an explicit tracking note and expiry, not a silent ignore.
+
+Rerun the audit and its offline pass/failure fixtures from the repository root
+with the existing npm and Python CI tools (no new local prerequisites):
+
+```sh
+npm --prefix wrangler audit --audit-level=high --include=dev --json
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_worker_npm_audit.py' -v
+```
+
+The offline fixtures stub npm and check the actual workflow command's exit-status
+and JSON-log propagation; the native audit above queries the registry's current
+advisories. Audits detect known advisories, not every supply-chain compromise.
+Never commit secrets, `.env` files or `target/`. See [README.md](README.md) for
+the full service reference.
 
 ### Secret-scan allowlists
 

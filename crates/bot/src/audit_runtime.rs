@@ -55,6 +55,10 @@ pub(crate) const CADENCE: Duration = Duration::from_secs(30);
 /// Below the cadence: a full batch at ~3 paced REST calls per row finishes in
 /// seconds, and a wedged sweep is cut before the next deadline.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(25);
+/// Stop history reads before the supervisor cancels the sweep, reserving time
+/// for the bounded cursor transaction and claim release. DB failure still
+/// leaves the original send evidence fenced for the next healthy owner.
+const CHECKPOINT_RESERVE: Duration = Duration::from_secs(2);
 
 /// Destination keys in `AuditChannelIds` order (audit, voice, moderation).
 const CHANNEL_KEYS: [&str; 3] = [
@@ -171,6 +175,7 @@ pub(crate) fn retry_job<M: AuditMirror + Clone + 'static>(
     Job {
         name: JOB,
         cadence: CADENCE,
+        cadence_source: None,
         startup_jitter,
         timeout: TIMEOUT,
         action: Arc::new(move || {
@@ -249,19 +254,28 @@ pub(crate) enum Sweep {
     Drained(DrainReport),
 }
 
+/// Coherent destination state: the revision the destinations were resolved
+/// from, plus the destinations themselves. One mutex so competing refreshes
+/// compare and apply them as a single transition; revision equality alone
+/// never skips repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationState {
+    revision: Option<i64>,
+    channels: AuditChannelIds,
+}
+
 pub(crate) struct AuditRuntime<M: AuditMirror> {
     /// Boot deployment values for the three destinations; the live snapshot
     /// layers over these on every refresh.
     deployment: HashMap<String, String>,
     guild: String,
     connect: Connect<M>,
-    /// Current destinations (boot, then live). Re-resolved whenever the
-    /// published snapshot moves; a malformed stored row keeps the last good
-    /// destinations rather than parking a running mirror.
-    channels: Mutex<AuditChannelIds>,
-    /// Published snapshot revision the destinations were last resolved from;
-    /// `None` before any live reader exists.
-    live_revision: Mutex<Option<i64>>,
+    /// Current destinations (boot, then live) plus the published revision they
+    /// were resolved from. Re-resolved whenever the published snapshot moves;
+    /// a malformed stored row keeps the last good destinations rather than
+    /// parking a running mirror, advancing the revision so the warn-once
+    /// transition is not repeated.
+    destinations: Mutex<DestinationState>,
     /// Connection parts (pool, mirror, bot id) built once on first success; a
     /// failed connect caches nothing. The service rebuilds only when the
     /// destinations move, so halt-transition memory survives idle sweeps.
@@ -301,46 +315,78 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             deployment,
             guild,
             connect,
-            channels: Mutex::new(channels),
-            live_revision: Mutex::new(None),
+            destinations: Mutex::new(DestinationState {
+                revision: None,
+                channels,
+            }),
             wired: AsyncMutex::new(None),
             halted: Mutex::new(None),
             metrics,
         })
     }
 
-    /// Re-resolve destinations when the published snapshot moved. Pure apart
+    /// Re-resolve destinations from one coherent published snapshot. Pure apart
     /// from the process-wide live reader; production passes the poller's
     /// snapshot, tests pass an explicit pair.
+    ///
+    /// The revision and the destination values come from the same snapshot
+    /// read and are compared and applied as one transition under a single
+    /// lock, so competing refreshes never leave the cached revision describing
+    /// a different snapshot from the installed destinations, and a
+    /// current-publication call repairs destinations even when the revision
+    /// already matches. Restored snapshots apply in either numeric direction;
+    /// there is no monotonic-only policy.
     pub(crate) fn refresh_channels_with(&self, live: Option<&LiveSettings>) {
-        let revision = live.map(LiveSettings::revision);
-        if *self.live_revision.lock().unwrap_or_else(|e| e.into_inner()) == revision {
-            return;
-        }
-        *self.live_revision.lock().unwrap_or_else(|e| e.into_inner()) = revision;
-        let vars = layered_vars(&self.deployment, &self.guild, live);
+        let (revision, vars) = match live {
+            Some(live) => {
+                let snapshot = live.snapshot();
+                let revision = snapshot.revision();
+                let mut vars = self.deployment.clone();
+                vars.extend(
+                    snapshot
+                        .env_snapshot(Some(&self.guild))
+                        .into_iter()
+                        .filter(|(key, _)| CHANNEL_KEYS.contains(&key.as_str())),
+                );
+                (Some(revision), vars)
+            }
+            None => (None, self.deployment.clone()),
+        };
         match resolve_channels(&vars) {
             Ok(next) => {
-                let mut current = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-                if *current != next {
-                    tracing::info!(job = JOB, "setting_changed: audit destinations");
-                    *current = next;
+                let mut state = self.destinations.lock().unwrap_or_else(|e| e.into_inner());
+                if state.revision == revision && state.channels == next {
+                    return;
                 }
+                if state.channels != next {
+                    tracing::info!(job = JOB, "setting_changed: audit destinations");
+                }
+                state.revision = revision;
+                state.channels = next;
             }
             Err("disabled") => {
                 let next = AuditChannelIds::default();
-                let mut current = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-                if *current != next {
-                    tracing::info!(job = JOB, "audit destinations disabled live");
-                    *current = next;
+                let mut state = self.destinations.lock().unwrap_or_else(|e| e.into_inner());
+                if state.revision == revision && state.channels == next {
+                    return;
                 }
+                if state.channels != next {
+                    tracing::info!(job = JOB, "audit destinations disabled live");
+                }
+                state.revision = revision;
+                state.channels = next;
             }
             Err(reason) => {
+                let mut state = self.destinations.lock().unwrap_or_else(|e| e.into_inner());
+                if state.revision == revision {
+                    return;
+                }
                 tracing::warn!(
                     job = JOB,
                     reason,
                     "audit destinations unusable; keeping the last good"
                 );
+                state.revision = revision;
             }
         }
     }
@@ -348,7 +394,11 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     /// Destinations for tests without a database or a poller.
     #[cfg(test)]
     pub(crate) fn channels_for_test(&self) -> AuditChannelIds {
-        self.channels.lock().unwrap().clone()
+        self.destinations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .channels
+            .clone()
     }
 
     /// Halt memory for tests: the state the previous sweep reported, `None`
@@ -393,9 +443,10 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         // Refresh outside the slot lock so a concurrent channel change lands
         // on the next call instead of racing this one.
         let current = self
-            .channels
+            .destinations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .channels
             .clone();
         let mut slot = self.wired.lock().await;
         match slot.as_ref() {
@@ -448,6 +499,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     /// staleness evaluation; an unreadable halt keeps the last reported
     /// state instead of fabricating a clear.
     pub(crate) async fn sweep(&self) -> Result<Sweep, ErrorClass> {
+        let deadline = tokio::time::Instant::now() + (TIMEOUT - CHECKPOINT_RESERVE);
         let wired = self.wired().await?;
         let Ok(halt) = wired.store.delivery_halt().await else {
             tracing::warn!(job = JOB, "audit_retry_halt_unreadable");
@@ -460,7 +512,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         }
         let report = wired
             .service
-            .drain_pending()
+            .drain_pending_until(deadline)
             .await
             .map_err(|_| ErrorClass::Database)?;
         log_report(&report);
@@ -483,7 +535,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
 /// Per-outcome counts, plus entry IDs for rows that need an operator:
 /// quarantines (with the bounded reason) and store failures (without text).
 fn log_report(report: &DrainReport) {
-    let mut counts = [0usize; 8];
+    let mut counts = [0usize; 9];
     for (entry_id, outcome) in &report.deliveries {
         let slot = match outcome {
             DeliverOutcome::Delivered { .. } => 0,
@@ -496,7 +548,8 @@ fn log_report(report: &DrainReport) {
                 tracing::warn!(job = JOB, entry_id = %entry_id, reason = ?reason, "audit_entry_quarantined");
                 6
             }
-            DeliverOutcome::Unclaimed => 7,
+            DeliverOutcome::ScanBoundReached => 7,
+            DeliverOutcome::Unclaimed => 8,
         };
         counts[slot] += 1;
     }
@@ -508,7 +561,7 @@ fn log_report(report: &DrainReport) {
         tracing::debug!(job = JOB, "audit_retry_idle");
         return;
     }
-    let [delivered, reconciled, held, deferred, rejected, ambiguous, quarantined, unclaimed] =
+    let [delivered, reconciled, held, deferred, rejected, ambiguous, quarantined, scan_bound_reached, unclaimed] =
         counts;
     tracing::info!(
         job = JOB,
@@ -520,6 +573,7 @@ fn log_report(report: &DrainReport) {
         rejected,
         ambiguous,
         quarantined,
+        scan_bound_reached,
         unclaimed,
         failed = report.failed.len(),
         "audit_retry_swept"

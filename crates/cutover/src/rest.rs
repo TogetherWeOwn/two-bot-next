@@ -2,10 +2,12 @@
 //!
 //! Ports `src/discord/rest.ts` onto twilight-http. Semantics preserved: a
 //! 110ms pacing floor between requests (Discord allows 50/s globally; the
-//! tools use far less), 403/404 are unreadable (not an abort), 429 backs
+//! tools use far less), 404 is unreadable (not an abort), 429 backs
 //! off, 5xx retries with exponential backoff (four retries). History scans
-//! retain partial pages and an explicit completion reason; other callers
-//! keep their legacy `None` on unreadable/exhausted pages.
+//! retain partial pages and an explicit completion reason. Single-model
+//! reads refuse lost access (403) and spent retry budgets as errors —
+//! only the archived-thread walk translates a refusal into its legacy
+//! walk-end, and only genuine absence reads as `None`.
 //! `requests` counts calls so each run reports its
 //! own Discord cost.
 //!
@@ -41,6 +43,11 @@ pub enum RestError {
     Body(#[from] serde_json::Error),
     #[error("discord send refused: {0}")]
     Wire(String),
+    /// Discord refused the read (lost access): the resource may exist but
+    /// this token cannot see it. Strict readers fail; the archived-thread
+    /// walk ends where it stands.
+    #[error("discord read refused: HTTP {status}")]
+    Refused { status: u16 },
     /// A full member page did not advance the `after` cursor (repeated or
     /// out-of-order page): traversal cannot be proven complete.
     #[error("member pagination stalled: page did not advance the cursor")]
@@ -276,7 +283,8 @@ impl RestClient {
     }
 
     /// Run one single-model request with the same transport-governed retry
-    /// semantics; a give-up page reads as `None` (legacy unreadable/absent).
+    /// semantics. Lost access (403) refuses and a spent 5xx budget errors —
+    /// never a silent `None`; only genuine absence (404) reads as `None`.
     async fn exec_one<T, F>(&self, make: F) -> Result<Option<T>, RestError>
     where
         T: serde::de::DeserializeOwned,
@@ -299,12 +307,15 @@ impl RestClient {
                 .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(Some(serde_json::from_slice(&res.body)?)),
-                403 | 404 => return Ok(None),
+                403 => return Err(RestError::Refused { status: 403 }),
+                404 => return Ok(None),
                 429 if attempt < 4 => {
                     tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await
                 }
                 500..=599 if attempt < 4 => tokio::time::sleep(backoff_duration(attempt)).await,
-                500..=599 => return Ok(None),
+                500..=599 => {
+                    return Err(RestError::Wire("HTTP 5xx retry exhausted".to_owned()));
+                }
                 _ => return Err(RestError::Wire(format!("HTTP {}", res.status))),
             }
         }
@@ -373,6 +384,40 @@ impl RestClient {
             }
         }
         Ok(Some(out))
+    }
+
+    /// One member-list page as raw JSON for the member-catch-up slice
+    /// (TOG-22941): `limit` is the caller's 1-1000 page size, `after` is the
+    /// resume cursor carried verbatim onto the wire. Rides the same governed
+    /// transport as every page (pacing, retries, `requests()` counting), so
+    /// the catch-up proof that every request passed through the rate-limit
+    /// client holds. An unreadable page (403/404) or a 5xx that is still
+    /// failing after the last retry is an error, never an empty page: only
+    /// a real `200 []` ends a walk, so a Discord outage mid-catch-up cannot
+    /// read as a finished walk. Strict traversal callers keep using
+    /// [`Self::fetch_all_members`].
+    pub async fn fetch_members_page_json(
+        &self,
+        guild_id: Id<GuildMarker>,
+        limit: u16,
+        after: Option<Id<UserMarker>>,
+    ) -> Result<Vec<serde_json::Value>, RestError> {
+        let page: ListPage<serde_json::Value> = self
+            .exec_list(|| {
+                let client = &self.inner.client;
+                let mut req = client.guild_members(guild_id).limit(limit);
+                if let Some(cursor) = after {
+                    req = req.after(cursor);
+                }
+                req.try_into_request()
+            })
+            .await?;
+        match page {
+            ListPage::Read(batch) => Ok(batch),
+            ListPage::Interrupted(reason) => Err(RestError::Wire(format!(
+                "member list page unreadable: {reason}"
+            ))),
+        }
     }
 
     /// Guild invites (attribution baseline / capture window counters).
@@ -449,7 +494,8 @@ impl RestClient {
         unreachable!("last attempt always returns")
     }
 
-    /// Guild fetch (vanity-URL presence for attribution).
+    /// Guild fetch (vanity-URL presence for attribution). Lost access and a
+    /// spent retry budget are errors; only genuine absence is `None`.
     pub async fn guild(&self, guild_id: Id<GuildMarker>) -> Result<Option<Guild>, RestError> {
         self.exec_one(|| {
             let client = &self.inner.client;
@@ -458,7 +504,8 @@ impl RestClient {
         .await
     }
 
-    /// Active threads in a guild (forum posts live in threads).
+    /// Active threads in a guild (forum posts live in threads). Lost access
+    /// and a spent retry budget are errors; only genuine absence is `None`.
     pub async fn active_threads(
         &self,
         guild_id: Id<GuildMarker>,
@@ -475,12 +522,13 @@ impl RestClient {
     /// Follows the listing's own continuation the way Discord documents it:
     /// each page carries `has_more`, and the next page passes `before` with
     /// the oldest thread's `archive_timestamp` (listings run newest-first).
-    /// Returns every thread exactly once by snowflake; an unreadable page
+    /// Returns every thread exactly once by snowflake; a refused first page
     /// reports `Ok(None)` (legacy: an unreadable channel is a normal
-    /// condition), while a repeated or non-progressing continuation and a
-    /// spent page budget report [`ArchivedThreadsOutcome::Incomplete`] with
-    /// the threads seen so far — never an infinite loop or a silently
-    /// complete result.
+    /// condition), while a refused later page, a repeated or
+    /// non-progressing continuation and a spent page budget report
+    /// [`ArchivedThreadsOutcome::Incomplete`] with the threads seen so
+    /// far — never an infinite loop or a silently complete result. A
+    /// spent 5xx budget propagates as an error.
     pub async fn public_archived_threads(
         &self,
         channel_id: Id<ChannelMarker>,
@@ -494,9 +542,11 @@ impl RestClient {
     /// Bounded archived-thread walk with explicit completion evidence.
     /// `max_pages` is the same hard cost ceiling [`Self::scan_channel`] uses:
     /// hitting it reports `incomplete` rather than dropping older threads
-    /// silently. Reports `Ok(None)` when the first page is unreadable, so
+    /// silently. Reports `Ok(None)` when the first page is refused, so
     /// the compat helper keeps the legacy no-listing contract; a later
-    /// unreadable page ends the walk with the threads seen so far.
+    /// refused page ends the walk [`ArchivedThreadsOutcome::Incomplete`]
+    /// with [`ArchiveIncompleteReason::AccessLost`] and the threads seen
+    /// so far, so the caller records the truncation.
     pub async fn list_all_archived_threads(
         &self,
         channel_id: Id<ChannelMarker>,
@@ -507,6 +557,7 @@ impl RestClient {
         let mut before: Option<String> = None;
         let mut pages = 0usize;
         let mut last_cursor: Option<String> = None;
+        let mut refused = false;
 
         loop {
             if pages >= max_pages {
@@ -515,7 +566,7 @@ impl RestClient {
                     reason: ArchiveIncompleteReason::PageBudget,
                 }));
             }
-            let page: Option<twilight_model::channel::thread::ThreadsListing> = self
+            let page: Option<twilight_model::channel::thread::ThreadsListing> = match self
                 .exec_one(|| {
                     let client = &self.inner.client;
                     match before.as_deref() {
@@ -530,13 +581,35 @@ impl RestClient {
                             .try_into_request(),
                     }
                 })
-                .await?;
+                .await
+            {
+                Ok(page) => page,
+                // Lost access ends the walk where it stands: no listing when
+                // the first page refuses (legacy walk-end), an incomplete
+                // walk with a refusal reason afterwards. A spent retry
+                // budget is transient sickness, not stable unreadability,
+                // so it propagates as an error.
+                Err(RestError::Refused { .. }) => {
+                    refused = true;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
             let Some(listing) = page else {
                 // Nothing was readable at all: stay `None`, exactly like the
-                // legacy single-page consumer. A later unreadable page ends
-                // the walk with the threads seen so far.
+                // legacy single-page consumer. A later refused page ends the
+                // walk incomplete — `has_more` never cleared, so reporting
+                // `Complete` would silently drop the unseen remainder. A
+                // later absent page (404: the channel is gone, not hidden)
+                // keeps the legacy complete-with-seen walk-end.
                 if threads.is_empty() {
                     return Ok(None);
+                }
+                if refused {
+                    return Ok(Some(ArchivedThreadsOutcome::Incomplete {
+                        threads,
+                        reason: ArchiveIncompleteReason::AccessLost,
+                    }));
                 }
                 return Ok(Some(ArchivedThreadsOutcome::Complete { threads }));
             };
@@ -611,10 +684,14 @@ impl RestClient {
                 Err(RestError::Body(_)) => break ScanCompletion::InvalidResponse,
                 Err(RestError::Twilight(_)) => break ScanCompletion::RequestFailed,
                 Err(RestError::Wire(_)) => break ScanCompletion::RequestFailed,
-                // Member-pagination errors never come from `exec_list`;
-                // propagate rather than mislabel a scan completion.
+                // Member-pagination errors and single-model refusals never come
+                // from `exec_list`; propagate rather than mislabel a scan
+                // completion. A refusal is lost access: failing the scan is
+                // fail-closed, never end-of-history.
                 Err(
-                    e @ (RestError::MemberCursorStalled | RestError::MemberCeilingExceeded { .. }),
+                    e @ (RestError::MemberCursorStalled
+                    | RestError::MemberCeilingExceeded { .. }
+                    | RestError::Refused { .. }),
                 ) => return Err(e),
             };
             if batch.is_empty() {
@@ -664,8 +741,37 @@ impl<T> ListPage<T> {
     }
 }
 
+/// Deterministic 5xx backoff base in millis: `500 * 2^attempt`, saturating
+/// the shift at 10 (512 s cap).
+fn backoff_base_ms(attempt: u32) -> u64 {
+    500u64.saturating_mul(1u64 << attempt.min(10))
+}
+
 fn backoff_duration(attempt: u32) -> Duration {
-    Duration::from_millis(500u64.saturating_mul(1 << attempt.min(10)))
+    Duration::from_millis(backoff_base_ms(attempt))
+}
+
+/// Deterministic 64-bit mixer (splitmix64) for seeded jitter without a
+/// global RNG: the same `(seed, attempt)` pair always yields the same draw,
+/// on every platform, with no clock and no `rand` dependency.
+fn jitter_draw(seed: u64, attempt: u32) -> u64 {
+    let mixed = seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9E3779B97F4A7C15));
+    let mut z = mixed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// 5xx backoff for `attempt` (0-based) with full jitter: a deterministic
+/// draw in `[1 ms, backoff_base_ms(attempt)]`, so concurrent scans retrying
+/// the same outage spread instead of re-hammering in lockstep. The
+/// deterministic base stays as the bound (the 512 s saturation cap and the
+/// four-retry budgets hold by construction); the same `seed` replays the
+/// same sample, so tests pin ranges without a clock or RNG.
+#[must_use]
+pub fn backoff_duration_jittered(attempt: u32, seed: u64) -> Duration {
+    let base_ms = backoff_base_ms(attempt);
+    Duration::from_millis(1 + (jitter_draw(seed, attempt) % base_ms))
 }
 
 /// ISO-8601 → epoch millis for scan bounds.
@@ -741,6 +847,9 @@ pub enum ArchiveIncompleteReason {
     PageBudget,
     /// The next cursor repeated or the listing offered no cursor to follow.
     NoProgress,
+    /// Discord refused a later page (403): access was lost after threads
+    /// were already collected, so the unseen remainder is unknown.
+    AccessLost,
 }
 
 /// Bounded archived-thread discovery outcome: either every page through
@@ -1168,9 +1277,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_second_page_ends_walk_with_threads_seen() {
+    async fn refused_second_page_ends_walk_incomplete_with_threads_seen() {
         // First page readable with `has_more`, second page 403: the walk
-        // ends `Complete` with page one's threads instead of failing.
+        // ends `Incomplete` with `AccessLost` and page one's threads, so
+        // the caller records the truncation instead of reading a partial
+        // walk as complete.
         let all = forum_130();
         let (mock, origin) = ArchiveMock::start_script(vec![
             Scripted::Page(page(all[..100].to_vec(), true)),
@@ -1185,16 +1296,23 @@ mod tests {
             .expect("partial walk is not an error")
             .expect("first page was readable");
 
-        assert!(outcome.is_complete());
-        assert_eq!(outcome.threads().len(), 100);
-        assert_eq!(mock.befores().len(), 2, "walked until unreadable");
+        assert_eq!(
+            outcome,
+            ArchivedThreadsOutcome::Incomplete {
+                threads: all[..100].to_vec(),
+                reason: ArchiveIncompleteReason::AccessLost,
+            }
+        );
+        assert!(!outcome.is_complete());
+        assert_eq!(mock.befores().len(), 2, "walked until refused");
         mock.shutdown();
     }
 
     #[tokio::test]
     async fn unreadable_forum_reports_no_listing_like_before() {
-        // `exec_one` maps 403/404 to `None`; the legacy consumer sees exactly
-        // what the old one-page call returned for an unreadable forum.
+        // The walk translates a 403 refusal into its legacy walk-end; the
+        // legacy consumer sees exactly what the old one-page call returned
+        // for an unreadable forum.
         let (mock, origin) = ArchiveMock::start_script(vec![
             Scripted::Status(403, "{}".to_owned()),
             Scripted::Status(403, "{}".to_owned()),
@@ -1221,6 +1339,25 @@ mod tests {
             mock.befores().len(),
             2,
             "one discovery page plus one compat call"
+        );
+        mock.shutdown();
+    }
+
+    #[tokio::test]
+    async fn non_refusal_errors_propagate_from_walk() {
+        // Only lost access ends the walk: a corrupt page (like a spent 5xx
+        // budget) is an error, never a silent walk-end.
+        let (mock, origin) =
+            ArchiveMock::start_script(vec![Scripted::Status(200, "not json".to_owned())]).await;
+        let rest = client_for(&origin);
+
+        let error = rest
+            .list_all_archived_threads(forum_id(), DEFAULT_ARCHIVED_THREAD_PAGES)
+            .await
+            .expect_err("a corrupt page fails the walk");
+        assert!(
+            error.to_string().contains("unreadable"),
+            "unexpected error: {error:?}"
         );
         mock.shutdown();
     }
@@ -1395,5 +1532,143 @@ mod tests {
             .connect_lazy_with(options);
         assert_eq!(pool.size(), 0);
         pool.close().await;
+    }
+
+    /// Loopback member list serving one scripted HTTP status per request
+    /// (consumed in order; repeats the last once the script is spent), so
+    /// failure-path tests never touch Discord.
+    struct StatusMock {
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl StatusMock {
+        async fn start(mut script: Vec<u16>) -> (Self, String) {
+            if script.is_empty() {
+                script.push(200);
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
+            let origin = format!("http://{}", listener.local_addr().expect("addr"));
+            let handle = tokio::spawn(async move {
+                let mut script = script.into_iter();
+                let mut last = 200u16;
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = Vec::with_capacity(1024);
+                    let header_end = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos;
+                        }
+                        if buf.len() > 64 * 1024 {
+                            break usize::MAX;
+                        }
+                        match stream.read_buf(&mut buf).await {
+                            Ok(0) => break usize::MAX,
+                            Ok(_) => continue,
+                            Err(_) => break usize::MAX,
+                        }
+                    };
+                    if header_end == usize::MAX {
+                        continue;
+                    }
+                    if let Some(next) = script.next() {
+                        last = next;
+                    }
+                    let (reason, body) = match last {
+                        200 => ("OK", "[]".to_owned()),
+                        403 => ("Forbidden", r#"{"message": "403"}"#.to_owned()),
+                        404 => ("Not Found", r#"{"message": "404"}"#.to_owned()),
+                        _ => ("Service Unavailable", r#"{"retry_after": 1}"#.to_owned()),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {last} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                }
+            });
+            (Self { handle }, origin)
+        }
+
+        fn shutdown(self) {
+            self.handle.abort();
+        }
+    }
+
+    /// Paperclip Review #927: a failed member page is an error, never an
+    /// empty page. A 403 refuses at once; a 5xx that is still failing after
+    /// the last retry surfaces as retry-exhausted. Either way the caller —
+    /// and the catch-up walker — must not read it as end of list.
+    #[tokio::test]
+    async fn failed_member_pages_are_errors_not_empty_pages() {
+        let (mock, origin) = StatusMock::start(vec![403]).await;
+        let rest = client_for(&origin);
+        let err = rest
+            .fetch_members_page_json(Id::new(2222), 1000, None)
+            .await
+            .expect_err("a 403 member page is an error, not end of list");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "unexpected error: {err:?}"
+        );
+        mock.shutdown();
+
+        // Five 503s (initial attempt plus four retries) exhaust the page
+        // budget: the sixth scripted status is never reached.
+        let (mock, origin) = StatusMock::start(vec![503, 503, 503, 503, 503, 200]).await;
+        let rest = client_for(&origin);
+        let err = rest
+            .fetch_members_page_json(Id::new(2222), 1000, None)
+            .await
+            .expect_err("an exhausted 5xx member page is an error, not end of list");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "unexpected error: {err:?}"
+        );
+        mock.shutdown();
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_base_and_replays_per_seed() {
+        for attempt in 0..5u32 {
+            let base = backoff_duration(attempt);
+            for seed in 0..8u64 {
+                let sample = backoff_duration_jittered(attempt, seed);
+                assert!(
+                    sample >= Duration::from_millis(1) && sample <= base,
+                    "attempt {attempt} seed {seed}: {sample:?} outside [1 ms, {base:?}]"
+                );
+            }
+        }
+        assert_eq!(
+            backoff_duration_jittered(3, 42),
+            backoff_duration_jittered(3, 42)
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_across_seeds() {
+        use std::collections::HashSet;
+        // Attempt 3 has a 4 s base: concurrent scans must not retry in phase.
+        let distinct: HashSet<Duration> = (0..32u64)
+            .map(|seed| backoff_duration_jittered(3, seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct delays across 32 seeds",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_never_exceeds_the_saturated_cap() {
+        let cap = Duration::from_secs(512);
+        assert_eq!(backoff_duration(u32::MAX), cap);
+        for seed in [0u64, 1, 42] {
+            let sample = backoff_duration_jittered(u32::MAX, seed);
+            assert!(
+                sample >= Duration::from_millis(1) && sample <= cap,
+                "seed {seed}: {sample:?} outside [1 ms, {cap:?}]"
+            );
+        }
     }
 }

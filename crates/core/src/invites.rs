@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::Snowflake;
+use crate::{EventType, FunnelEvent, Snowflake};
 
 /// One invite counter reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,25 @@ pub struct InviteState {
     pub uses: u64,
     pub inviter_id: Option<Snowflake>,
     pub channel_id: Option<Snowflake>,
+    /// Creation-time cap (`max_uses`; 0 = unlimited). Retained from the
+    /// `InviteCreate` witness so the seed baseline pins the code's terms;
+    /// attribution itself diffs only `uses`.
+    pub max_uses: u64,
+    /// Creation-time temporariness. Retained with `max_uses`, same reason.
+    pub temporary: bool,
+}
+
+/// Largest invite `uses` the `invite_snapshots.uses` INTEGER column can persist.
+///
+/// Discord counters are `u64`; every writer clamps to this bound instead of
+/// failing, and every diff compares in this clamped domain so a saturated
+/// baseline never reports growth forever.
+pub const MAX_INVITE_USES: u64 = i32::MAX as u64;
+
+/// Clamp a Discord-fed invite counter to [`MAX_INVITE_USES`].
+#[must_use]
+pub fn saturate_invite_uses(uses: u64) -> u64 {
+    uses.min(MAX_INVITE_USES)
 }
 
 /// How much each invite code was used between two counter readings.
@@ -154,6 +173,56 @@ pub fn summarize_attribution_split(rows: &[(&str, u64)]) -> AttributionSplit {
             AttributionCategory::Unknown => out.unknown += n,
             AttributionCategory::Other => {}
         }
+    }
+    out
+}
+
+/// Per-inviter referral counts over recorded join facts (referral-rewards
+/// seam): count `MemberJoin` rows by their `metadata["inviterId"]`.
+///
+/// Only singly-credited joins carry that key (`on_join` writes it exactly
+/// when `inviter_id` is `Some`), so `vanity`/`unknown`/`ambiguous` rows and
+/// non-join rows contribute nothing. An unparseable inviter id is ignored,
+/// never attributed.
+///
+/// Raw evidence, not credit decisions: each member counts at most once
+/// (first credited join wins, mirroring `referral_rewards` `DuplicateJoin`),
+/// and self-referrals (`member_id == inviter`) are skipped (mirroring
+/// `SelfReferral`). Consumers that award credit must evaluate through
+/// `referral_rewards::evaluate_referrals`; this seam never applies tenure or
+/// engagement rules.
+#[must_use]
+pub fn referral_counts(events: &[FunnelEvent]) -> HashMap<Snowflake, u64> {
+    let mut out: HashMap<Snowflake, u64> = HashMap::new();
+    let mut seen_members: HashSet<Snowflake> = HashSet::new();
+    for event in events {
+        if event.event_type != EventType::MemberJoin {
+            continue;
+        }
+        let Some(inviter) = event
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("inviterId"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    s.parse::<Snowflake>().ok()
+                } else {
+                    v.as_u64()
+                }
+            })
+        else {
+            continue;
+        };
+        let Some(member) = event.member_id else {
+            continue;
+        };
+        if member == inviter {
+            continue;
+        }
+        if !seen_members.insert(member) {
+            continue;
+        }
+        *out.entry(inviter).or_default() += 1;
     }
     out
 }
@@ -336,8 +405,14 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         let mut grew = Vec::new();
         if !stale {
             for inv in current {
+                // Compare in the clamped domain the column can persist: `load`
+                // returns at most `MAX_INVITE_USES`, so comparing raw live
+                // counters would credit a saturated code on every diff,
+                // forever. The store below persists (and warns on) the same
+                // clamp, so the comparison and the stored baseline agree.
+                let uses = saturate_invite_uses(inv.uses);
                 if let Some(before) = prev.get(&inv.code) {
-                    if inv.uses > *before {
+                    if uses > *before {
                         grew.push(inv.code.clone());
                     }
                 }
@@ -387,6 +462,8 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             uses: 0,
             inviter_id: old.inviter_id,
             channel_id: old.channel_id,
+            max_uses: old.max_uses,
+            temporary: old.temporary,
         };
         self.store
             .store_all(guild_id, std::slice::from_ref(&rotated));
@@ -401,6 +478,9 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
     }
 
     /// Attribution string for a join, given the codes that grew.
+    ///
+    /// Multi-code growth files `ambiguous:a+b` with the codes SORTED, so the
+    /// filed string never depends on the snapshot read order.
     #[must_use]
     pub fn attribute(&self, grew: &[String], guild_has_vanity: bool) -> String {
         match grew {
@@ -408,6 +488,7 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             [first, rest @ ..] => {
                 let mut codes = vec![first.as_str()];
                 codes.extend(rest.iter().map(String::as_str));
+                codes.sort_unstable();
                 format!("ambiguous:{}", codes.join("+"))
             }
             [] => {
@@ -483,6 +564,8 @@ mod tests {
             uses,
             inviter_id: Some(7),
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         }
     }
 
@@ -511,6 +594,65 @@ mod tests {
         assert!(grew.is_empty());
         let grew = t.diff_and_store(1, &[state("a", 6), state("new", 9)]);
         assert!(grew.is_empty());
+    }
+
+    #[test]
+    fn saturate_invite_uses_clamps_at_i32_max() {
+        assert_eq!(saturate_invite_uses(0), 0);
+        assert_eq!(saturate_invite_uses(MAX_INVITE_USES), MAX_INVITE_USES);
+        assert_eq!(saturate_invite_uses(MAX_INVITE_USES + 1), MAX_INVITE_USES);
+        assert_eq!(saturate_invite_uses(u64::MAX), MAX_INVITE_USES);
+    }
+
+    /// A store that persists the column's clamp, like `PgInviteSnapshots`:
+    /// `load` returns at most `MAX_INVITE_USES` while live counters stay raw.
+    struct ClampingSnapshots {
+        inner: MemSnapshots,
+    }
+
+    impl InviteSnapshotStore for ClampingSnapshots {
+        fn load(&self, guild_id: Snowflake) -> Vec<InviteState> {
+            self.inner.load(guild_id)
+        }
+
+        fn store_all(&self, guild_id: Snowflake, states: &[InviteState]) {
+            let clamped: Vec<InviteState> = states
+                .iter()
+                .map(|state| InviteState {
+                    uses: saturate_invite_uses(state.uses),
+                    ..state.clone()
+                })
+                .collect();
+            self.inner.store_all(guild_id, &clamped);
+        }
+
+        fn delete_missing(&self, guild_id: Snowflake, live_codes: &HashSet<String>) {
+            self.inner.delete_missing(guild_id, live_codes);
+        }
+    }
+
+    #[test]
+    fn saturated_counter_reports_growth_once_then_goes_quiet() {
+        let t = InviteTracker::new(ClampingSnapshots {
+            inner: MemSnapshots::new(),
+        });
+        // Baseline sits just below the clamp: the crossing below is genuine
+        // growth in the persisted domain (MAX-1 -> MAX), not an already
+        // saturated baseline (MAX -> MAX reads quiet, correctly).
+        assert!(t
+            .diff_and_store(1, &[state("a", MAX_INVITE_USES - 1)])
+            .is_empty());
+        // Genuine growth across the clamp reads once...
+        assert_eq!(
+            t.diff_and_store(1, &[state("a", MAX_INVITE_USES + 1)]),
+            vec!["a".to_owned()]
+        );
+        // ...then the saturated baseline stays quiet: the live counter is
+        // still above the clamp, but nothing moved since the last diff.
+        assert!(t
+            .diff_and_store(1, &[state("a", MAX_INVITE_USES + 1)])
+            .is_empty());
+        assert!(t.diff_and_store(1, &[state("a", u64::MAX)]).is_empty());
     }
 
     #[test]
@@ -668,5 +810,35 @@ mod tests {
         ];
         let c = count_downtime_unknown_joins(&w, &joins);
         assert_eq!(c[0].downtime_unknown, 1);
+    }
+
+    #[test]
+    fn referral_counts_dedupes_rejoins_and_skips_self_referrals() {
+        fn credited_join(member_id: u64, inviter_id: u64) -> FunnelEvent {
+            FunnelEvent {
+                guild_id: 1,
+                member_id: Some(member_id),
+                event_type: EventType::MemberJoin,
+                occurred_at: "2026-09-20T12:00:00.000Z".to_owned(),
+                source: "invite:a".to_owned(),
+                metadata: Some(serde_json::json!({ "inviterId": inviter_id.to_string() })),
+                dedupe_token: None,
+            }
+        }
+        // Review probe: three joins by member 5 plus a self-join by inviter 7
+        // must not read back as `{7: 4}`.
+        let events = vec![
+            credited_join(5, 7),
+            credited_join(5, 7),
+            credited_join(5, 7),
+            credited_join(7, 7),
+        ];
+        let counts = referral_counts(&events);
+        assert_eq!(
+            counts.get(&7),
+            Some(&1),
+            "first credited join wins; rejoins and self-referrals add nothing"
+        );
+        assert_eq!(counts.len(), 1);
     }
 }

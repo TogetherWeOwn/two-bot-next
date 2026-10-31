@@ -27,6 +27,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::analytics_family::AnalyticsCategory;
 use crate::funnel::{idempotency_key, now_iso, parse_iso_millis};
 use crate::{EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake};
 
@@ -57,21 +58,61 @@ pub const SOAK_LEDGER_RULE_ID: &str = "soak_expected_committed";
 /// derives its fired-packet names from the same spellings via `ruleFor`, so
 /// this list must stay identical to `RULES` in `wrangler/src/alert-rules.ts`;
 /// the table test below and the Worker test both pin every spelling.
-pub const ALERT_RULE_IDS: [&str; 14] = [
+pub const ALERT_RULE_IDS: [&str; 54] = [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
+    "rest_5xx_rate",
     "db_pool_saturated",
     "db_errors",
     "send_admission_blocked",
     "voice_failures",
     "gateway_missed_events",
     "gateway_unpaired_disconnect",
+    "gateway_not_ready",
     "ticker_stale",
     "receiver_refusals",
     "dispatch_drops",
     "job_unknown_stale",
     "gateway_checkpoint_failures",
+    "voice_join_fast_burn",
+    "voice_join_slow_burn",
+    "voice_creator_map_stale",
+    "community_facts_drain_failures",
+    "eventsub_post_failed_share",
+    "error_budget_fast_burn",
+    "error_budget_slow_burn",
+    "audit_delivery_halt",
+    "rest_admission_breaker_open",
+    "eventsub_tampered",
+    "eventsub_reconcile_failed",
+    "event_store_consumer_lag",
+    "prefix_trigger_verdict_refusals",
+    "voice_worker_halted",
+    "voice_live_self_heal",
+    "voice_live_not_ready",
+    "voice_queue_stall",
+    "retention_replay_needed",
+    "voice_dispatch_timeouts",
+    "voice_watchdog_stucks",
+    "voice_halt_recoveries",
+    "rest_breaker_opens",
+    "rest_global_pauses",
+    "gateway_latency_dead",
+    "gateway_reconnect_flapping",
+    "handler_duration_saturated",
+    "job_failure_share",
+    "rest_token_invalid",
+    "rest_refusal_surge",
+    "rest_global_responses_stuck",
+    "feed_fetch_failures",
+    "eventsub_receive_gap",
+    "eventsub_reconcile_prior_failed",
+    "automod_sanction_refused",
+    "moderation_enforcement_failures",
+    "voice_rest_stuck",
+    "voice_global_backoff_capped",
+    "gateway_drain_skips",
 ];
 
 /// Stamped packet filename carrying the producer identity:
@@ -729,8 +770,14 @@ impl<S: FunnelStore> FunnelStore for ReceiptingStore<S> {
         outcome
     }
 
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
-        self.inner.touch_activity(guild_id, member_id, at);
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    ) {
+        self.inner.touch_activity(guild_id, member_id, at, family);
     }
 
     fn next_message_rung(
@@ -940,17 +987,57 @@ mod tests {
                 "job_stale",
                 "job_consecutive_failures",
                 "rest_429_rate",
+                "rest_5xx_rate",
                 "db_pool_saturated",
                 "db_errors",
                 "send_admission_blocked",
                 "voice_failures",
                 "gateway_missed_events",
                 "gateway_unpaired_disconnect",
+                "gateway_not_ready",
                 "ticker_stale",
                 "receiver_refusals",
                 "dispatch_drops",
                 "job_unknown_stale",
                 "gateway_checkpoint_failures",
+                "voice_join_fast_burn",
+                "voice_join_slow_burn",
+                "voice_creator_map_stale",
+                "community_facts_drain_failures",
+                "eventsub_post_failed_share",
+                "error_budget_fast_burn",
+                "error_budget_slow_burn",
+                "audit_delivery_halt",
+                "rest_admission_breaker_open",
+                "eventsub_tampered",
+                "eventsub_reconcile_failed",
+                "event_store_consumer_lag",
+                "prefix_trigger_verdict_refusals",
+                "voice_worker_halted",
+                "voice_live_self_heal",
+                "voice_live_not_ready",
+                "voice_queue_stall",
+                "retention_replay_needed",
+                "voice_dispatch_timeouts",
+                "voice_watchdog_stucks",
+                "voice_halt_recoveries",
+                "rest_breaker_opens",
+                "rest_global_pauses",
+                "gateway_latency_dead",
+                "gateway_reconnect_flapping",
+                "handler_duration_saturated",
+                "job_failure_share",
+                "rest_token_invalid",
+                "rest_refusal_surge",
+                "rest_global_responses_stuck",
+                "feed_fetch_failures",
+                "eventsub_receive_gap",
+                "eventsub_reconcile_prior_failed",
+                "automod_sanction_refused",
+                "moderation_enforcement_failures",
+                "voice_rest_stuck",
+                "voice_global_backoff_capped",
+                "gateway_drain_skips",
             ]
         );
         // The soak ledger stamps its own ledger identity, not an alert rule.
@@ -1107,6 +1194,8 @@ mod tests {
             channel_class: ChannelClass::Human,
             capture_only: false,
             occurred_at: Some(T_MSG.to_owned()),
+            content_length: None,
+            has_embed_or_attachment: false,
         });
         let voice_start_out = handlers.on_voice_join(VoiceInput {
             guild_id: G,

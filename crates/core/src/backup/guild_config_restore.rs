@@ -232,6 +232,58 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
             }
         }
     }
+    // The guild-settings planner copies these fields verbatim into the guild
+    // PATCH. A mistyped value would 400 mid-plan after roles/channels already
+    // landed, so refuse it here. Absent fields stay valid; only present values
+    // must match the documented Discord-bound shape.
+    if let Some(value) = guild.get("name") {
+        if !nonempty_string(Some(value)) {
+            return Err(shape_error(
+                &format!("{label}.guild.name"),
+                "a nonempty string",
+            ));
+        }
+    }
+    if let Some(value) = guild.get("description") {
+        if !value.is_null() && !value.is_string() {
+            return Err(shape_error(
+                &format!("{label}.guild.description"),
+                "a string or null",
+            ));
+        }
+    }
+    for field in [
+        "verification_level",
+        "default_message_notifications",
+        "explicit_content_filter",
+        "afk_timeout",
+        "system_channel_flags",
+    ] {
+        if let Some(value) = guild.get(field) {
+            if value.as_i64().is_none_or(|value| value < 0) {
+                return Err(shape_error(
+                    &format!("{label}.guild.{field}"),
+                    "a nonnegative integer",
+                ));
+            }
+        }
+    }
+    if let Some(value) = guild.get("preferred_locale") {
+        if !nonempty_string(Some(value)) {
+            return Err(shape_error(
+                &format!("{label}.guild.preferred_locale"),
+                "a nonempty string",
+            ));
+        }
+    }
+    if let Some(value) = guild.get("premium_progress_bar_enabled") {
+        if !value.is_boolean() {
+            return Err(shape_error(
+                &format!("{label}.guild.premium_progress_bar_enabled"),
+                "a boolean",
+            ));
+        }
+    }
     for collection in ["roles", "channels", "emojis"] {
         let Some(value) = input.get(collection) else {
             continue;
@@ -277,6 +329,27 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
                     return Err(shape_error(&format!("{path}.position"), "an integer"));
                 }
             }
+            // `role_body` copies these verbatim into role create/patch bodies.
+            // Scoped to roles: a same-named additive field on another
+            // collection is intentionally ignored.
+            if collection == "roles" {
+                if let Some(value) = row.get("permissions") {
+                    if !decimal_mask(Some(value)) {
+                        return Err(shape_error(
+                            &format!("{path}.permissions"),
+                            "an unsigned decimal permission mask string",
+                        ));
+                    }
+                }
+                if let Some(value) = row.get("color") {
+                    if value.as_i64().is_none_or(|value| value < 0) {
+                        return Err(shape_error(
+                            &format!("{path}.color"),
+                            "a nonnegative integer",
+                        ));
+                    }
+                }
+            }
             if collection == "channels" {
                 if row
                     .get("type")
@@ -294,6 +367,29 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
                             &format!("{path}.parent_id"),
                             "null or a nonempty ID string",
                         ));
+                    }
+                }
+                // `channel_core_body` copies these verbatim into channel
+                // create/patch bodies. Absent channel-specific fields stay
+                // valid; null stays valid only for the nullable topic.
+                for field in ["bitrate", "user_limit", "rate_limit_per_user"] {
+                    if let Some(value) = row.get(field) {
+                        if value.as_i64().is_none_or(|value| value < 0) {
+                            return Err(shape_error(
+                                &format!("{path}.{field}"),
+                                "a nonnegative integer",
+                            ));
+                        }
+                    }
+                }
+                if let Some(value) = row.get("topic") {
+                    if !value.is_null() && !value.is_string() {
+                        return Err(shape_error(&format!("{path}.topic"), "a string or null"));
+                    }
+                }
+                if let Some(value) = row.get("nsfw") {
+                    if !value.is_boolean() {
+                        return Err(shape_error(&format!("{path}.nsfw"), "a boolean"));
                     }
                 }
                 if let Some(value) = row.get("permission_overwrites") {
@@ -1405,24 +1501,44 @@ pub async fn apply_restore_plan(
     api: &mut super::guild_config_api::GuildConfigDiscordApi,
     plan: &RestorePlan,
 ) -> Result<RestoreIdMaps, RestorePlanError> {
+    apply_restore_plan_with_progress(api, plan, |_| {})
+        .await
+        .map_err(|(err, _)| err)
+}
+
+/// [`apply_restore_plan`] with per-operation completion reporting: `on_landed`
+/// runs after each operation whose write succeeded with a valid receipt, and
+/// the error carries the count of landed operations so the caller can name
+/// landed vs pending operations. A failed write, an unresolvable reference,
+/// or a success with no Discord id receipt does not count as landed.
+pub async fn apply_restore_plan_with_progress(
+    api: &mut super::guild_config_api::GuildConfigDiscordApi,
+    plan: &RestorePlan,
+    mut on_landed: impl FnMut(&RestoreOperation),
+) -> Result<RestoreIdMaps, (RestorePlanError, usize)> {
     // Plans are public/mutable: defend the write boundary as well as planning.
-    validate_ordered_dependencies(plan)?;
+    validate_ordered_dependencies(plan).map_err(|err| (err, 0))?;
     let mut roles = plan.known_ids.roles.clone();
     let mut channels = plan.known_ids.channels.clone();
     let mut emojis = plan.known_ids.emojis.clone();
-    for op in &plan.operations {
-        let path = resolve_path(&op.path, &channels)?;
-        let body = resolve_value(&op.body, &roles, &channels)?;
+    for (landed, op) in plan.operations.iter().enumerate() {
+        let path = resolve_path(&op.path, &channels).map_err(|err| (err, landed))?;
+        let body = resolve_value(&op.body, &roles, &channels).map_err(|err| (err, landed))?;
         let result = api
             .write(&op.method, &path, body)
             .await
-            .map_err(|e| RestorePlanError(e.to_string()))?;
+            .map_err(|e| (RestorePlanError(e.to_string()), landed))?;
         if let Some((resource, source)) = &op.capture_id {
             let id = result
                 .as_ref()
                 .and_then(|b| b.get("id"))
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| RestorePlanError(format!("{} returned no Discord id.", op.label)))?;
+                .ok_or_else(|| {
+                    (
+                        RestorePlanError(format!("{} returned no Discord id.", op.label)),
+                        landed,
+                    )
+                })?;
             match resource.as_str() {
                 "role" => {
                     roles.insert(source.clone(), id.to_owned());
@@ -1435,6 +1551,7 @@ pub async fn apply_restore_plan(
                 }
             }
         }
+        on_landed(op);
     }
     Ok(RestoreIdMaps {
         roles,

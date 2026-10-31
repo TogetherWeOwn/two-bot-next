@@ -92,8 +92,8 @@ QUERY_PATH_RE = re.compile(r"/accounts/[0-9a-f]{32}/workers/observability/teleme
 # could carry free text, so it is dropped rather than scrubbed.
 FIELD_KEYS = (
     "msg", "target", "run_id", "error_class", "startup_phase", "phase", "class",
-    "step", "cause", "reason", "signal", "missing", "job", "code", "count", "revision",
-    "persist_class", "persist_op",
+    "step", "cause", "reason", "message_type", "signal", "missing", "job", "code",
+    "count", "revision", "persist_class", "persist_op",
 )
 
 # Ordered: URLs go first so a token inside one is not split by a later rule.
@@ -126,6 +126,25 @@ class Refused(Exception):
 
 class ReadFailed(Exception):
     """The read failed; the message is fixed vocabulary, never a response body."""
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 def redact(text):
@@ -161,15 +180,25 @@ def clean_value(key, value):
     """Redact one structured value; returns (value, replacements) or None to drop."""
     if isinstance(value, bool) or value is None:
         return (value, 0) if isinstance(value, bool) else None
-    if isinstance(value, int):
-        return value, 0
-    if not isinstance(value, str):
-        return None
     if key == "run_id":
         # Boot nanoseconds + PID: a correlation id, not a Discord snowflake.
+        # An integer cannot be the canonical "<ns>-<pid>" shape, so every
+        # numeric run_id is redacted; only the canonical string is kept.
+        if isinstance(value, int):
+            return REDACTED, 1
+        if not isinstance(value, str):
+            return None
         if RUN_ID_RE.fullmatch(value):
             return value, 0
         return REDACTED, 1
+    if isinstance(value, int):
+        # A snowflake-shaped integer (15-22 digits, like the string rule) is
+        # an identity value, not a counter; smaller magnitudes stay numeric.
+        if 15 <= len(str(abs(value))) <= 22:
+            return "[id]", 1
+        return value, 0
+    if not isinstance(value, str):
+        return None
     # A log line must not be able to drive the reader's terminal or transcript.
     value = _CONTROL.sub(" ", _ANSI.sub("", value))
     cut = len(value) > MAX_REDACT_CHARS
@@ -255,7 +284,7 @@ class HttpTransport:
         if status != 200:
             raise ReadFailed(status_class(status))
         try:
-            return json.loads(raw)
+            return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError):
             raise ReadFailed("bad_response") from None
 
@@ -321,6 +350,17 @@ def read(transport, service, minutes, end, limit, contains, account_id=None, que
     events = result.get("events", {}).get("events") if isinstance(result, dict) and isinstance(result.get("events"), dict) else None
     if answer.get("success") is not True or not isinstance(events, list):
         raise ReadFailed("bad_response")
+    if len(events) > limit:
+        # Never truncate or relabel: an over-limit answer is not the page asked for.
+        raise ReadFailed("bad_response")
+    start_ms, end_ms = body["timeframe"]["from"], body["timeframe"]["to"]
+    for raw in events:
+        stamp = raw.get("timestamp") if isinstance(raw, dict) else None
+        if (not isinstance(stamp, int) or isinstance(stamp, bool)
+                or not start_ms <= stamp <= end_ms):
+            # Malformed or outside the requested window (both edges inclusive):
+            # foreign-window evidence must not be published as this window's.
+            raise ReadFailed("bad_response")
     kept, redactions = [], 0
     for raw in events:
         event, replaced = sanitize_event(raw)

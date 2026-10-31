@@ -18,8 +18,11 @@ pub mod backfill_plan;
 pub mod cli;
 pub mod db;
 pub mod dedupe;
+pub mod deletion_intake;
+pub mod event_voice;
 pub mod gateway_session;
 pub mod ghost_cleanup;
+pub mod intake_cap;
 pub mod internal_settings;
 pub mod invite;
 pub mod invite_store;
@@ -30,6 +33,7 @@ pub mod legacy_verify;
 pub mod mee6_names;
 pub mod mee6_rewards;
 pub mod mee6_xp;
+pub mod member_catchup;
 pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
@@ -39,6 +43,7 @@ pub mod reengagement;
 pub mod rest;
 pub mod retention;
 pub mod rollback_delta;
+pub mod rollback_import;
 pub mod self_role_store;
 pub mod settings;
 pub mod staging_migrate;
@@ -60,17 +65,21 @@ pub use db::{
 pub use dedupe::{
     collapse_cross_source_duplicates, CollapseResult, DedupableEvent, DEFAULT_TOLERANCE_MS,
 };
+pub use intake_cap::{
+    over_cap_message, read_bytes_capped, read_string_capped, truncation_receipt, IntakeReadError,
+    INTAKE_CAP_BYTES, INTAKE_CAP_LABEL, MAX_KEPT_PROBLEMS,
+};
 pub use invite::{attribute_joins, attribute_single, invite_growth, InviteState, JoinAttribution};
 pub use mee6_names::{clean_mee6_name, translate_export, translate_mee6_template};
 pub use mee6_rewards::{
     parse_mee6_role_rewards, parse_roles_snapshot, plan_reward_role_import, LevelRoleReward,
     MappedReward, Mee6RewardExportError, Mee6RoleReward, RewardImportReport, RewardSkipReason,
-    SnapshotRole, UnmappedReward,
+    SnapshotRole, UnmappedReward, MAX_MEE6_REWARDS,
 };
 pub use mee6_xp::{
     apply_mee6_import, mee6_xp_inventory, parse_mee6_export, plan_mee6_import, run_mee6_import,
     ImportError, ImportManifest, ImportSummary, LevelInventory, Mee6ExportError, Mee6ImportRow,
-    SkipReason,
+    SkipReason, MAX_MEE6_PLAYERS,
 };
 pub use message_scan::{
     find_early_messages, fold_messages, is_conversation_channel, is_log_channel, offer_message,

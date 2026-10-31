@@ -9,6 +9,7 @@
   "workflow_head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "plan_run_id": "37110947190",
   "plan_manifest_sha256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
+  "store_plan_manifest_sha256": "37b4068df78c6e975a6fca576f109260be97c4aa5defa316380be3c0f5c4f593",
   "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "target": {
     "host": "staging.invalid",
@@ -18,6 +19,10 @@
   "expected_pending": [
     "1",
     "9007199254740993"
+  ],
+  "expected_store_pending": [
+    "400",
+    "9007199254740992"
   ],
   "recovery_evidence_ref": "recovery-review#decision",
   "acl_plan_ref": "acl-review#decision"

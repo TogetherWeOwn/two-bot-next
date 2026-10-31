@@ -1,0 +1,102 @@
+name: helix_token fuzz smoke
+
+# Manual, bounded 60 s libFuzzer smoke on a GitHub-hosted runner. Not scheduled
+# and not a required check. Uses only committed synthetic seeds and uploads its
+# execution receipt; it never writes generated inputs into the checkout.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialize manual fuzz runs per ref (nightly.yml shape): a queued dispatch
+# waits instead of racing a running smoke for the runner build cache.
+concurrency:
+  group: helix-token-fuzz-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  helix-token-smoke:
+    name: helix_token 60 s smoke
+    permissions:
+      contents: read
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'helix-token-smoke') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "nightly-2026-10-01"
+          components: rust-src
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fetch pinned fuzz dependencies (locked)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fetch --locked
+      - name: Record host and toolchain versions
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/helix-token-smoke
+        run: |
+          set -euo pipefail
+          mkdir -p "$FUZZ_OUTPUT_DIR/logs"
+          {
+            echo "git HEAD: $(git rev-parse HEAD)"
+            echo "runner: ${RUNNER_OS:-unknown} ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            uname -srm
+            grep PRETTY_NAME /etc/os-release
+            rustc +nightly-2026-10-01 -Vv
+            cargo +nightly-2026-10-01 -V
+            cargo fuzz --version
+            grep -A1 'name = "libfuzzer-sys"' fuzz/Cargo.lock
+          } | tee "$FUZZ_OUTPUT_DIR/logs/versions.txt"
+      - name: helix_token 60 s smoke
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/helix-token-smoke
+        run: |
+          set -euo pipefail
+          mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs" \
+            "$FUZZ_OUTPUT_DIR/corpus/helix_token" "$FUZZ_OUTPUT_DIR/artifacts/helix_token"
+          start=$(date +%s)
+          status=0
+          cargo +nightly-2026-10-01 fuzz run --target-dir "$FUZZ_OUTPUT_DIR/target" \
+            helix_token "$FUZZ_OUTPUT_DIR/corpus/helix_token" "fuzz/corpus/helix_token" -- \
+            -max_total_time=60 -max_len=131072 -rss_limit_mb=2048 -timeout=10 \
+            -artifact_prefix="$FUZZ_OUTPUT_DIR/artifacts/helix_token/" \
+            2>&1 | tee "$FUZZ_OUTPUT_DIR/logs/helix_token.log" || status=$?
+          end=$(date +%s)
+          echo "elapsed_seconds=$((end - start))" | tee -a "$FUZZ_OUTPUT_DIR/logs/versions.txt"
+          echo "exit_status=$status" | tee -a "$FUZZ_OUTPUT_DIR/logs/versions.txt"
+          exit "$status"
+      - name: Summarize smoke result
+        if: always()
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/helix-token-smoke
+        run: |
+          {
+            echo "### helix_token 60 s smoke"
+            echo '```'
+            cat "$FUZZ_OUTPUT_DIR/logs/versions.txt" || true
+            echo '```'
+            echo "#### log tail"
+            echo '```'
+            tail -n 40 "$FUZZ_OUTPUT_DIR/logs/helix_token.log" || true
+            echo '```'
+            echo "#### artifacts"
+            find "$FUZZ_OUTPUT_DIR/artifacts" -type f -printf '%P (%s bytes)\n' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: helix-token-fuzz-smoke
+          path: |
+            ${{ runner.temp }}/helix-token-smoke/logs
+            ${{ runner.temp }}/helix-token-smoke/artifacts
+            ${{ runner.temp }}/helix-token-smoke/corpus
+          if-no-files-found: warn
+          retention-days: 30

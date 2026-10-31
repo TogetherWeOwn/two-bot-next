@@ -45,6 +45,14 @@ within the budget (the last healthy sample is more than a budget before
 recovery), a readyz_ok with a non-200 status or a readyz_fail with status 200,
 and an outage that recurs within a budget of its recovery.
 
+Intake limits: the log read is bounded before any JSON decode. A path that is
+missing, not a regular file, or unreadable, a log over 1048576 bytes (1 MiB),
+a line over 65536 bytes (64 KiB, excluding its terminator), or a log over
+100000 lines is refused with ``{"verdict": "INVALID", "code": ...,
+"next_action": ...}`` on stdout and exit 2, never a traceback. Stored
+unknown intervals truncate past 1000 entries with ``"truncated": true``; the
+verdict still sees every record.
+
 Usage:
 
     python3 scripts/gate5_outage.py tick-log.jsonl --interval-start START --interval-end END
@@ -55,6 +63,7 @@ START and END are the UTC acceptance-interval bounds from the approved soak reco
 import argparse
 import json
 import math
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -68,6 +77,78 @@ SILENT_GAP_LIMIT_S = OUTAGE_BUDGET_S
 # Recovery signal; everything else that opens a window is a start signal.
 RECOVERY_EVENT = "readyz_ok"
 OUTAGE_START_EVENTS = ("readyz_fail", "tick_missed")
+
+# Intake bounds, enforced during the log read before any JSON decode. Each
+# refusal carries a fixed code and next_action; nothing echoes the log.
+MAX_INPUT_BYTES = 1024 * 1024
+MAX_LINE_BYTES = 64 * 1024
+MAX_RECORDS = 100_000
+
+# Stored-evidence bound. The parser keeps at most this many unknown
+# intervals; the verdict still sees every record (any unknown keeps the log
+# from passing), and a truncated summary carries "truncated": true. Valid
+# logs never truncate, so their summaries are byte-identical to before.
+MAX_UNKNOWN_INTERVALS = 1000
+
+NEXT_ACTION = {
+    "unreadable_input": "point the CLI at a readable log file and retry",
+    "input_too_large": "shrink the log below 1 MiB and retry",
+    "line_too_long": "split lines longer than 64 KiB and retry",
+    "too_many_records": "split the log into fewer than 100000 records and retry",
+}
+
+HELP_EPILOG = """intake limits (refused with {"verdict": "INVALID", ...} on stdout, exit 2):
+  unreadable_input  path is missing, not a regular file, or unreadable
+  input_too_large   log over 1048576 bytes (1 MiB)
+  line_too_long     any line over 65536 bytes (64 KiB, excluding its terminator)
+  too_many_records  log over 100000 lines
+stored unknown intervals truncate with "truncated": true past 1000 entries;
+the verdict still sees every record."""
+
+
+class IntakeRefused(Exception):
+    """The log was refused before parsing; carries a fixed INVALID code."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def _read_log_lines(path):
+    """Read the log as bounded text lines, refusing over-cap input first.
+
+    The byte, line-length and record budgets are enforced while streaming,
+    so a hostile log is refused before any line reaches the JSON decoder.
+    Decoding matches the previous byte-iteration behavior exactly (BOM
+    tolerated, undecodable lines kept as UNKNOWN), never a crash.
+    """
+    if not os.path.isfile(path):
+        raise IntakeRefused("unreadable_input")
+    try:
+        handle = open(path, "rb")
+    except OSError:
+        raise IntakeRefused("unreadable_input") from None
+    lines = []
+    total = 0
+    with handle:
+        # Two terminator bytes allow an exact-cap CRLF line. Never let a
+        # missing newline turn the line cap into an unbounded allocation.
+        while raw := handle.readline(MAX_LINE_BYTES + 2):
+            total += len(raw)
+            if total > MAX_INPUT_BYTES:
+                raise IntakeRefused("input_too_large")
+            content = raw[:-1] if raw.endswith(b"\n") else raw
+            if content.endswith(b"\r"):
+                content = content[:-1]
+            if len(content) > MAX_LINE_BYTES:
+                raise IntakeRefused("line_too_long")
+            if len(lines) + 1 > MAX_RECORDS:
+                raise IntakeRefused("too_many_records")
+            try:
+                lines.append(content.decode("utf-8-sig"))
+            except UnicodeDecodeError:
+                lines.append("\x00")  # not JSON, so the line is kept as UNKNOWN
+    return lines
 
 
 def parse_ts(value):
@@ -104,8 +185,13 @@ def summarize(lines, interval_start=None, interval_end=None):
     breach = False
     interval_ok = (interval_start is not None and interval_end is not None
                    and interval_end > interval_start)
+    truncated = False
 
     def note_unknown(start, end, reason):
+        nonlocal truncated
+        if len(unknowns) >= MAX_UNKNOWN_INTERVALS:
+            truncated = True
+            return
         unknowns.append({
             "start": start.isoformat() if start else None,
             "end": end.isoformat() if end else None,
@@ -222,7 +308,7 @@ def summarize(lines, interval_start=None, interval_end=None):
         verdict = "NOT VERIFIED"
     else:
         verdict = "PASS"
-    return {
+    summary = {
         "schema_version": SCHEMA_VERSION,
         "acceptance_interval": {
             "start": interval_start.isoformat() if interval_start else None,
@@ -241,26 +327,29 @@ def summarize(lines, interval_start=None, interval_end=None):
         "outage_budget_s": OUTAGE_BUDGET_S,
         "verdict": verdict,
     }
-
-
-def _decoded_lines(binary_handle):
-    for raw in binary_handle:
-        try:
-            yield raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            yield "\x00"  # not JSON, so the line is kept as UNKNOWN
+    if truncated:
+        summary["truncated"] = True
+    return summary
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=HELP_EPILOG,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("log", help="readiness tick log in JSONL format")
     parser.add_argument("--interval-start", type=parse_ts,
                         help="acceptance interval start, UTC ISO-8601")
     parser.add_argument("--interval-end", type=parse_ts,
                         help="acceptance interval end, UTC ISO-8601")
     args = parser.parse_args(argv)
-    with open(args.log, "rb") as handle:
-        summary = summarize(_decoded_lines(handle), args.interval_start, args.interval_end)
+    try:
+        lines = _read_log_lines(args.log)
+    except IntakeRefused as refused:
+        json.dump({"verdict": "INVALID", "code": refused.code,
+                   "next_action": NEXT_ACTION[refused.code]},
+                  sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 2
+    summary = summarize(lines, args.interval_start, args.interval_end)
     json.dump(summary, sys.stdout, indent=2)
     sys.stdout.write("\n")
     if summary["verdict"] != "PASS":

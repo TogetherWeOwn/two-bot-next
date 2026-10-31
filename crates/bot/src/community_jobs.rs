@@ -6,6 +6,12 @@
 //! produces no [`Job`]; its name comes back parked for the readyz status map
 //! and it writes nothing.
 //!
+//! Every tick then layers the five community keys from the poller-published
+//! snapshot over those boot values store-first ([`LIVE_KEYS`]): a stored row
+//! wins, a deleted or unparsable row falls back to boot, and a parked poller
+//! layers nothing. A live `0` on either enable gate skips that job's tick;
+//! only a boot-parked job needs a restart to start ticking.
+//!
 //! The scorecard reserves up to three attempts, five minutes apart, inside
 //! Monday's window. Reservations and completion live beside the scorecard
 //! runs in Postgres, so restarting cannot reset the budget. Inactivity is
@@ -28,6 +34,7 @@ use tokio::sync::Mutex;
 use two_bot_core::community_store::{
     mark_stream_coverage, run_closed_week, CommunityStoreError, ScorecardLoad,
 };
+use two_bot_core::settings::{to_env_string, LiveSettings};
 use two_bot_core::{
     bot_floor_due, decide_probe_cycle, decide_probe_lease, format_iso_millis, inactivity_store,
     now_iso, parse_inactivity_days, parse_iso_millis, presence_store, previous_closed_week,
@@ -51,6 +58,14 @@ mod scorecard_retry;
 #[cfg(test)]
 #[path = "community_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "community_scorecard_bounds_tests.rs"]
+mod bounds_tests;
+
+#[cfg(test)]
+#[path = "community_live_tick_tests.rs"]
+mod live_tick_tests;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Kind {
@@ -152,6 +167,111 @@ fn resolve_gates(vars: &HashMap<String, String>) -> (Gates, Vec<Parked>) {
     )
 }
 
+/// Community keys served from the live settings snapshot. Registration still
+/// reads the boot environment (parked semantics unchanged); every tick layers
+/// these over the boot values store-first, so a dashboard write applies
+/// within one poll without a restart.
+const LIVE_KEYS: [&str; 5] = [
+    "TWO_COMMUNITY_SCORECARD",
+    "TWO_COMMUNITY_RECOMMENDATIONS",
+    "TWO_COMMUNITY_CORRECTION_CYCLES",
+    "TWO_PRESENCE_PROBE",
+    "TWO_INACTIVITY_DAYS",
+];
+
+/// The poller-published snapshot, or `None` while the settings poll is parked
+/// or pre-first-poll. The single `settings_jobs::live` call site for these
+/// jobs, so the consumers table in `docs/configuration.md` cites one line.
+fn live_reader() -> Option<LiveSettings> {
+    crate::settings_jobs::live()
+}
+
+/// Scorecard gates with one guild's stored rows layered over the boot values
+/// (the automod `layered_vars` shape): stored rows win, deleted rows fall
+/// back to boot. A stored correction count the loader cannot parse keeps its
+/// boot value while the other stored rows still apply; only a wholly
+/// unresolvable map keeps the boot gates outright (belt-and-braces: the
+/// write guard refuses such values before any SQL).
+fn live_scorecard_gates_with(
+    boot: &ScorecardGates,
+    guild: &str,
+    live: Option<&LiveSettings>,
+) -> ScorecardGates {
+    let mut vars = HashMap::from([
+        (
+            "TWO_COMMUNITY_SCORECARD".to_owned(),
+            (if boot.enabled { "1" } else { "0" }).to_owned(),
+        ),
+        (
+            "TWO_COMMUNITY_RECOMMENDATIONS".to_owned(),
+            (if boot.recommendations_enabled {
+                "1"
+            } else {
+                "0"
+            })
+            .to_owned(),
+        ),
+        (
+            "TWO_COMMUNITY_CORRECTION_CYCLES".to_owned(),
+            boot.correction_cycles.to_string(),
+        ),
+    ]);
+    if let Some(live) = live {
+        for (key, value) in live.env_snapshot(Some(guild)) {
+            if !LIVE_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            // The only fallible key: a garbage count keeps boot, the other
+            // stored rows still apply.
+            if key == "TWO_COMMUNITY_CORRECTION_CYCLES" && value.parse::<u32>().is_err() {
+                continue;
+            }
+            vars.insert(key, value);
+        }
+    }
+    ScorecardGates::from_map(&vars).unwrap_or(*boot)
+}
+
+/// Production reader: the poller-published snapshot, if any.
+fn live_scorecard_gates(boot: &ScorecardGates, guild: &str) -> ScorecardGates {
+    live_scorecard_gates_with(boot, guild, live_reader().as_ref())
+}
+
+/// Presence gate with one guild's stored row layered over boot (on unless
+/// explicitly `0`, the registration semantics). The job only ticks when boot
+/// enabled it, so an absent row — or a parked poller — reads enabled.
+fn live_presence_enabled_with(guild: &str, live: Option<&LiveSettings>) -> bool {
+    let Some(live) = live else {
+        return true;
+    };
+    live.get(guild, "TWO_PRESENCE_PROBE")
+        .and_then(|value| to_env_string(&value))
+        .is_none_or(|rendered| rendered != "0")
+}
+
+/// Production reader: the poller-published snapshot, if any.
+fn live_presence_enabled(guild: &str) -> bool {
+    live_presence_enabled_with(guild, live_reader().as_ref())
+}
+
+/// Inactivity horizon with one guild's stored row layered over the boot value
+/// (the TOG-19027 `live_poll_seconds_with` shape): a stored count the loader
+/// cannot parse keeps boot, like a deleted row or a parked poller.
+fn live_inactivity_days_with(guild: &str, boot_days: u64, live: Option<&LiveSettings>) -> u64 {
+    let Some(live) = live else {
+        return boot_days;
+    };
+    live.get(guild, "TWO_INACTIVITY_DAYS")
+        .and_then(|value| to_env_string(&value))
+        .and_then(|rendered| parse_inactivity_days(Some(&rendered)).ok())
+        .unwrap_or(boot_days)
+}
+
+/// Production reader: the poller-published snapshot, if any.
+fn live_inactivity_days(guild: &str, boot_days: u64) -> u64 {
+    live_inactivity_days_with(guild, boot_days, live_reader().as_ref())
+}
+
 /// What registration produced: supervised jobs plus the gated names the caller
 /// must mark parked in the readyz status map.
 pub(crate) struct Registration {
@@ -210,6 +330,7 @@ pub(crate) fn register(context: Arc<Context>) -> Registration {
         out.push(Job {
             name,
             cadence,
+            cadence_source: None,
             startup_jitter: jobs::startup_jitter(cadence, rand::random()),
             timeout: Duration::from_secs(120),
             action: Arc::new(move || {
@@ -258,7 +379,7 @@ pub(crate) async fn run_once(
     match kind {
         Kind::PresenceProbe => presence_tick(pool, rest, guild, state, now_ms).await,
         Kind::Scorecard => scorecard_once(pool, guild, state, now_ms).await,
-        Kind::Inactivity => inactivity_tick(pool, state, now_ms).await,
+        Kind::Inactivity => inactivity_tick(pool, guild, state, now_ms).await,
     }
 }
 
@@ -274,6 +395,12 @@ async fn presence_tick(
     state: &State,
     now_ms: i64,
 ) -> Result<(), ErrorClass> {
+    // Live gate first: a stored `0` stops the probe within one poll, before
+    // any lease or REST call. A boot-parked job has no tick to re-enable.
+    if !live_presence_enabled(guild) {
+        tracing::debug!(job = "presence_probe", "presence_probe_live_disabled");
+        return Ok(());
+    }
     // Overlap guard (TOG-12142): decide and claim under one lock acquisition,
     // so two triggers can never both see a free lease, and skip before any
     // REST call, so a slow cycle cannot duplicate the daily roster scan. A
@@ -419,6 +546,17 @@ async fn scorecard_once(
     state: &State,
     now_ms: i64,
 ) -> Result<(), ErrorClass> {
+    // Live gates: a stored scorecard `0` stops the tick within one poll,
+    // before the lane or any reservation. A boot-parked job has no tick to
+    // re-enable.
+    let gates = live_scorecard_gates(&state.gates, guild);
+    if !gates.enabled {
+        tracing::debug!(
+            job = "community_scorecard",
+            "community_scorecard_live_disabled"
+        );
+        return Ok(());
+    }
     let Ok(_lane) = state.scorecard_lane.try_lock() else {
         return Ok(());
     };
@@ -457,15 +595,15 @@ async fn scorecard_once(
             week_end,
             watermark: 0,
             generated_at,
-            recommendations_enabled: state.gates.recommendations_enabled,
-            correction_cycles: state.gates.correction_cycles,
+            recommendations_enabled: gates.recommendations_enabled,
+            correction_cycles: gates.correction_cycles,
         },
     )
     .await
     .map_err(|error| match error {
-        CommunityStoreError::Build(_) | CommunityStoreError::UnknownFactType(_) => {
-            ErrorClass::Configuration
-        }
+        CommunityStoreError::Build(_)
+        | CommunityStoreError::UnknownFactType(_)
+        | CommunityStoreError::TooManyFacts { .. } => ErrorClass::Configuration,
         CommunityStoreError::Db(_) => ErrorClass::Database,
     })?;
     sqlx::query(
@@ -489,14 +627,21 @@ async fn scorecard_once(
 
 /// One quiet-member sweep (legacy `flagInactive`). Read-only: the outcome
 /// carries no channel/message/DM field, so it cannot feed a send path.
-async fn inactivity_tick(pool: &PgPool, state: &State, now_ms: i64) -> Result<(), ErrorClass> {
-    let outcome =
-        inactivity_store::run_sweep(pool, &format_iso_millis(now_ms), state.inactivity_days)
-            .await
-            .map_err(|_| ErrorClass::Database)?;
+async fn inactivity_tick(
+    pool: &PgPool,
+    guild: &str,
+    state: &State,
+    now_ms: i64,
+) -> Result<(), ErrorClass> {
+    // Live horizon: a stored row moves the cutoff within one poll; an
+    // absent or unparsable row keeps the boot value.
+    let days = live_inactivity_days(guild, state.inactivity_days);
+    let outcome = inactivity_store::run_sweep(pool, &format_iso_millis(now_ms), days)
+        .await
+        .map_err(|_| ErrorClass::Database)?;
     tracing::info!(
         job = "inactivity",
-        days = state.inactivity_days,
+        days,
         flagged = outcome.flagged.len(),
         "inactivity_scan"
     );

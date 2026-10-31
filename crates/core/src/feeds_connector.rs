@@ -102,6 +102,76 @@ pub enum FeedConnectError {
     UnsupportedEncoding(String),
 }
 
+impl FeedConnectError {
+    /// Bounded `error_class` for `two_bot_feed_fetch_errors_total` (TOG-28423).
+    /// Policy errors delegate to [`FetchError::metrics_error_class`]; every
+    /// other variant maps to a member of
+    /// [`crate::metrics::FEED_FETCH_ERROR_CLASSES`]. Transport strings,
+    /// encodings and io errors never become labels.
+    pub fn metrics_error_class(&self) -> &'static str {
+        match self {
+            Self::Policy(policy) => policy.metrics_error_class(),
+            Self::Resolve(_) => "resolve",
+            Self::Transport(_) => "transport",
+            Self::Deadline(_) => "deadline",
+            Self::UnsupportedEncoding(_) => "unsupported_encoding",
+        }
+    }
+
+    /// Bounded `outcome` for `two_bot_feed_fetches_total` (TOG-28423).
+    /// Policy outcomes delegate to [`FetchError::metrics_outcome`]; every
+    /// other connector failure is a generic failure.
+    pub fn metrics_outcome(&self) -> &'static str {
+        match self {
+            Self::Policy(policy) => policy.metrics_outcome(),
+            Self::Resolve(_)
+            | Self::Transport(_)
+            | Self::Deadline(_)
+            | Self::UnsupportedEncoding(_) => "failure",
+        }
+    }
+}
+
+/// Bounded outcome for one fetch result (TOG-28423): `success` for a 2xx
+/// fetch, the error's outcome for an `Err`, and `failure` for a completed
+/// non-2xx fetch. Per-outcome, never per-feed.
+pub fn feed_fetch_outcome(result: &Result<FetchedFeed, FeedConnectError>) -> &'static str {
+    match result {
+        Ok(fetched) if fetched.status.is_success() => "success",
+        Ok(_) => "failure",
+        Err(error) => error.metrics_outcome(),
+    }
+}
+
+/// Bounded error class for one fetch result, or `None` on success (TOG-28423).
+/// A completed non-2xx fetch reports `http_error`; successes record no error
+/// series. The returned value is always a member of
+/// [`crate::metrics::FEED_FETCH_ERROR_CLASSES`].
+pub fn feed_fetch_error_class(
+    result: &Result<FetchedFeed, FeedConnectError>,
+) -> Option<&'static str> {
+    match result {
+        Ok(fetched) if fetched.status.is_success() => None,
+        Ok(_) => Some("http_error"),
+        Err(error) => Some(error.metrics_error_class()),
+    }
+}
+
+/// Record one fetch against the existing metrics registry (TOG-28423): exactly
+/// one `two_bot_feed_fetches_total{outcome}` increment per call, plus exactly
+/// one `two_bot_feed_fetch_errors_total{error_class}` increment on failure.
+/// No source URL, host, header or body reaches a label; cardinality is the
+/// fixed outcome × error-class vocabulary.
+pub fn record_feed_fetch(
+    metrics: &crate::metrics::Metrics,
+    result: &Result<FetchedFeed, FeedConnectError>,
+) {
+    metrics.feed_fetch(feed_fetch_outcome(result));
+    if let Some(error_class) = feed_fetch_error_class(result) {
+        metrics.feed_fetch_error(error_class);
+    }
+}
+
 /// One decompressed-or-raw response body chunk, or a transport error that
 /// aborts the read. Production bodies come from hyper; tests inject their own.
 pub type FeedBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, FeedConnectError>> + Send>>;

@@ -20,15 +20,17 @@ test("alert input dimensions match the Rust always-emitted scrape contract", () 
   assert.ok(parseAlertScrape(valid));
 });
 
+const isOptionalLine = (line: string) => Object.hasOwn(ALERT_OPTIONAL_INPUT_LABELS, line.split(/[{ ]/)[0]!);
+
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !line.startsWith("two_bot_job_last_error_class"));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
 });
 
-test("older exposition without the optional error-class gauge still parses", () => {
-  const older = metricsBody(3).split("\n").filter((line) => !line.startsWith("two_bot_job_last_error_class")).join("\n");
+test("older exposition without the optional gauges still parses", () => {
+  const older = metricsBody(3).split("\n").filter((line) => !isOptionalLine(line)).join("\n");
   const samples = parseAlertScrape(older);
   assert.ok(samples);
   assert.equal(samples.find((s) => s.name === "two_bot_job_consecutive_failures" && s.labels.job === "rank")?.value, 3);
@@ -38,7 +40,16 @@ test("every consumed series rejects nonfinite, negative, fractional and nonnumer
   const lines = metricsLines();
   for (const name of Object.keys(validatedLabels)) {
     const index = lines.findIndex((line) => line.startsWith(`${name}{`) || line.startsWith(`${name} `));
-    for (const value of ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0.5", "0x10", "garbage", "1e20"]) {
+    // The lag gauge is a duration, not a counter: fractional positives are
+    // valid samples, while non-finite, negative and non-numeric stay rejected.
+    // The latency gauge additionally accepts NaN (no ACK yet on this
+    // connection); infinities, negatives and non-numeric stay rejected.
+    const values = name === "two_bot_event_store_consumer_lag_seconds"
+      ? ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0x10", "garbage", "1e20"]
+      : name === "two_bot_gateway_latency_seconds"
+        ? ["+Inf", "-Inf", "Infinity", "1e999", "-1", "0x10", "garbage", "1e20"]
+        : ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0.5", "0x10", "garbage", "1e20"];
+    for (const value of values) {
       const bad = [...lines];
       bad[index] = bad[index]!.replace(/ 0$/, ` ${value}`);
       assert.equal(parseAlertScrape(bad.join("\n")), null, `${name}: ${value}`);
@@ -84,7 +95,13 @@ test("additional series, new dimensions, reordered labels and unrelated NaN/Inf 
     + 'two_bot_internal_actions_total{family="new_family",outcome="new_outcome"} 0\n';
   const samples = parseAlertScrape(text);
   assert.ok(samples);
-  assert.ok(Number.isNaN(samples.find((s) => s.name === "two_bot_gateway_latency_seconds")?.value));
+  assert.equal(samples.find((s) => s.name === "two_bot_gateway_latency_seconds")?.value, 0);
+  // The validated latency gauge accepts its unknown marker and fractional
+  // seconds; both are ordinary exposition, not malformed rows.
+  const nanLatency = parseAlertScrape(valid.replace("two_bot_gateway_latency_seconds 0", "two_bot_gateway_latency_seconds NaN"));
+  assert.ok(nanLatency);
+  assert.ok(Number.isNaN(nanLatency.find((s) => s.name === "two_bot_gateway_latency_seconds")?.value));
+  assert.ok(parseAlertScrape(valid.replace("two_bot_gateway_latency_seconds 0", "two_bot_gateway_latency_seconds 0.012")));
   assert.equal(samples.find((s) => s.name === "future_metric")?.value, Infinity);
   assert.equal(samples.find((s) => s.name === "future_metric")?.labels.escaped, 'quote" brace} slash\\ newline\n');
   assert.ok(parseAlertScrape(valid.replace("two_bot_gateway_missed_events_total 0", "two_bot_gateway_missed_events_total 18446744073709551615")));

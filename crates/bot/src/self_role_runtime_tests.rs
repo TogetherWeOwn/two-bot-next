@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use std::sync::atomic::AtomicI64;
 use tracing::instrument::WithSubscriber;
 use two_bot_core::self_roles::{event_order_for_event_id, SelfRoleOption};
+use two_bot_core::Secret;
 
 const GUILD: &str = "100000000000000001";
 const USER: &str = "100000000000000002";
@@ -20,6 +21,21 @@ const MESSAGE: &str = "100000000000000008";
 const OLD_ROLE: &str = "100000000000000009";
 const NOW: i64 = 1_700_000_000_000;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+#[tokio::test(start_paused = true)]
+async fn store_errors_report_only_database_or_timeout_kind() {
+    let database = store_io(async { Err::<(), _>(StoreError::InvalidLease) }).await;
+    assert!(matches!(
+        database,
+        Err(RuntimeError::Store(StoreErrorKind::Database))
+    ));
+
+    let timeout = store_io(std::future::pending::<Result<(), StoreError>>()).await;
+    assert!(matches!(
+        timeout,
+        Err(RuntimeError::Store(StoreErrorKind::Timeout))
+    ));
+}
 
 fn panel(mode: PanelMode) -> SelfRolePanel {
     SelfRolePanel {
@@ -89,11 +105,95 @@ fn snapshot(held: &[&str]) -> Vec<ScriptedResponse> {
 }
 
 fn runtime(pool: &PgPool, clock: &Arc<AtomicI64>, mock: &MockRest) -> SelfRoleRuntime {
+    runtime_with_timeout(pool, clock, mock, RENDEZVOUS)
+}
+
+fn runtime_with_timeout(
+    pool: &PgPool,
+    clock: &Arc<AtomicI64>,
+    mock: &MockRest,
+    timeout: Duration,
+) -> SelfRoleRuntime {
     SelfRoleRuntime {
         store: SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone()).unwrap(),
-        executor: ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap(),
+        executor: ActionExecutor::with_proxy_and_moderation_timeout(
+            "fixture-token".into(),
+            Some(mock.origin()),
+            timeout,
+        )
+        .unwrap(),
         guild_id: GUILD.into(),
         bot_id: BOT.into(),
+    }
+}
+
+const TERMINAL_EXPIRY_SQL: &str = "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
+     (extract(epoch FROM p.processing_expires_at)*1000)::bigint
+     FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+     WHERE a.event_id=$1";
+
+const PROCESSING_EXPIRY_SQL: &str =
+    "SELECT (extract(epoch FROM a.processing_expires_at)*1000)::bigint,
+     (extract(epoch FROM p.processing_expires_at)*1000)::bigint
+     FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+     WHERE a.event_id=$1";
+
+const JOB_PROCESSING_EXPIRY_SQL: &str =
+    "SELECT COALESCE((extract(epoch FROM a.processing_expires_at)*1000)::bigint, -1),
+     (extract(epoch FROM p.processing_expires_at)*1000)::bigint
+     FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+     WHERE a.event_id=$1";
+
+const RENDEZVOUS: Duration = Duration::from_secs(30);
+
+/// Lease keepers renew on real timers, so poll the stored expiries until both
+/// have moved past `past_ms` (bounded), then let the caller's assertion decide.
+async fn await_expiries_past(
+    pool: &PgPool,
+    sql: &'static str,
+    event_id: &str,
+    past_ms: i64,
+) -> TestResult<(i64, i64)> {
+    let deadline = tokio::time::Instant::now() + RENDEZVOUS;
+    loop {
+        let expiry: (i64, i64) = sqlx::query_as(sql).bind(event_id).fetch_one(pool).await?;
+        if expiry.0 > past_ms && expiry.1 > past_ms {
+            return Ok(expiry);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "self-role expiries did not renew before the deadline",
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A renewal already sent before an aborted keeper can commit after the abort
+/// returns. Baseline only once two reads a tick apart agree.
+async fn settled_expiries(
+    pool: &PgPool,
+    sql: &'static str,
+    event_id: &str,
+) -> TestResult<(i64, i64)> {
+    let deadline = tokio::time::Instant::now() + RENDEZVOUS;
+    let mut previous: (i64, i64) = sqlx::query_as(sql).bind(event_id).fetch_one(pool).await?;
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let current: (i64, i64) = sqlx::query_as(sql).bind(event_id).fetch_one(pool).await?;
+        if current == previous {
+            return Ok(current);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "self-role expiries did not settle before the deadline",
+            )
+            .into());
+        }
+        previous = current;
     }
 }
 
@@ -253,7 +353,7 @@ async fn admission_fresh_reads_recovery_and_both_lease_renewals() -> TestResult 
         })
         .connect_with(options)
         .await?;
-    let result = exercise(&pool).await;
+    let result = Box::pin(exercise(&pool)).await;
     pool.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
@@ -262,7 +362,43 @@ async fn admission_fresh_reads_recovery_and_both_lease_renewals() -> TestResult 
     result
 }
 
+async fn stale_catalogue_admission_is_ignored_before_rest(pool: &PgPool) -> TestResult {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let feature = runtime(pool, &clock, &mock);
+    let request = request(
+        "stale-catalogue",
+        Selection::Button {
+            option_key: "new".into(),
+        },
+    );
+    assert!(matches!(
+        feature
+            .prepare_at_revision(&request, &panel(PanelMode::Button), -1)
+            .await?,
+        Admission::Ignored
+    ));
+    assert!(
+        mock.requests().is_empty(),
+        "retired input is not already being handled"
+    );
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM self_role_audit WHERE event_id=$1")
+        .bind(&request.event_id)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(count, 0);
+    mock.shutdown().await;
+    Ok(())
+}
+
 async fn exercise(pool: &PgPool) -> TestResult {
+    // The production service's fresh admission shares the settings revision
+    // lock. This fixture has no settings rows/poller, so its boot view is 0.
+    sqlx::raw_sql(
+        "CREATE TABLE guild_settings_revision (singleton BOOLEAN PRIMARY KEY CHECK (singleton), revision BIGINT NOT NULL); INSERT INTO guild_settings_revision VALUES (TRUE, 0)",
+    )
+    .execute(pool)
+    .await?;
     sqlx::raw_sql(include_str!("../../cutover/migrations/0200_self_roles.sql"))
         .execute(pool)
         .await?;
@@ -296,36 +432,48 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
-    processing_superseded_before_preparation(pool).await?;
-    terminal_restart_repairs_committed_target(pool).await?;
-    terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;
-    terminal_restart_preserves_inherited_pending(pool).await?;
-    terminal_restart_cancellation_preserves_journal(pool).await?;
-    terminal_partial_repair_exchange_outcomes(pool).await?;
-    processing_receipts_survive_generation_transfer(pool).await?;
-    repeated_processing_tickets_preserve_pending(pool).await?;
-    terminal_late_response_after_independent_transfer(pool).await?;
-    terminal_pacing_loss_is_definite_no_send(pool).await?;
-    terminal_post_journal_wait_is_definite_no_send(pool).await?;
-    mixed_terminal_processing_sweep_and_dry_run(pool).await?;
-    supervised_processing_recovery(pool).await?;
-    bounded_processing_sweep(pool).await?;
-    durable_processing_recovery_without_redelivery(pool).await?;
-    shared_reaction_dispatch_and_disabled_gate(pool).await?;
-    shared_component_orchestration(pool).await?;
-    dry_run_audits_without_mutation_or_target_publication(pool).await?;
-    execution_and_compensation(pool).await?;
-    stale_inflight_repairs_committed_target(pool).await?;
-    stale_handoff_preserves_unknown_and_refuses_other_owners(pool).await?;
-    service_continues_unknown_work_without_redelivery(pool).await?;
-    interrupted_exchange_cannot_settle(pool).await?;
-    unknown_target_is_not_empty(pool).await?;
-    dry_run_refuses_recovered_mutation(pool).await?;
-    recovery_and_renewal(pool).await?;
-    empty_select_recovery(pool).await?;
-    reaction_partial_and_duplicate(pool).await?;
-    exclusive_lane_before_reads(pool).await?;
-    lost_panel_lane_release_is_logged(pool).await?;
+    // Heap-pin each fixture step so the aggregate future and its poll frame stay
+    // bounded on the default test-thread stack. Execution remains sequential.
+    Box::pin(stale_catalogue_admission_is_ignored_before_rest(pool)).await?;
+    Box::pin(processing_superseded_before_preparation(pool)).await?;
+    Box::pin(terminal_restart_repairs_committed_target(pool)).await?;
+    Box::pin(terminal_restart_refuses_unknown_or_uninitialized_target(
+        pool,
+    ))
+    .await?;
+    Box::pin(terminal_restart_preserves_inherited_pending(pool)).await?;
+    Box::pin(terminal_restart_cancellation_preserves_journal(pool)).await?;
+    Box::pin(terminal_partial_repair_exchange_outcomes(pool)).await?;
+    Box::pin(processing_receipts_survive_generation_transfer(pool)).await?;
+    Box::pin(repeated_processing_tickets_preserve_pending(pool)).await?;
+    Box::pin(terminal_late_response_after_independent_transfer(pool)).await?;
+    Box::pin(terminal_pacing_loss_is_definite_no_send(pool)).await?;
+    Box::pin(terminal_post_journal_wait_is_definite_no_send(pool)).await?;
+    Box::pin(mixed_terminal_processing_sweep_and_dry_run(pool)).await?;
+    Box::pin(supervised_processing_recovery(pool)).await?;
+    Box::pin(bounded_processing_sweep(pool)).await?;
+    Box::pin(durable_processing_recovery_without_redelivery(pool)).await?;
+    Box::pin(shared_reaction_dispatch_and_disabled_gate(pool)).await?;
+    Box::pin(shared_component_orchestration(pool)).await?;
+    Box::pin(dry_run_audits_without_mutation_or_target_publication(pool)).await?;
+    Box::pin(execution_and_compensation(pool)).await?;
+    Box::pin(stale_inflight_repairs_committed_target(pool)).await?;
+    Box::pin(stale_handoff_preserves_unknown_and_refuses_other_owners(
+        pool,
+    ))
+    .await?;
+    Box::pin(service_continues_unknown_work_without_redelivery(pool)).await?;
+    Box::pin(interrupted_exchange_cannot_settle(pool)).await?;
+    Box::pin(unknown_target_is_not_empty(pool)).await?;
+    Box::pin(dry_run_refuses_recovered_mutation(pool)).await?;
+    Box::pin(recovery_and_renewal(pool)).await?;
+    Box::pin(empty_select_recovery(pool)).await?;
+    Box::pin(reaction_partial_and_duplicate(pool)).await?;
+    Box::pin(exclusive_lane_before_reads(pool)).await?;
+    Box::pin(lost_panel_lane_release_is_logged(pool)).await?;
+    Box::pin(zero_row_receipt_completion_is_unmatched_receipt(pool)).await?;
+    Box::pin(settlement_timeout_note_and_ambiguous_class(pool)).await?;
+    Box::pin(timeout_note_store_failure_stays_non_fatal(pool)).await?;
     Ok(())
 }
 
@@ -921,8 +1069,10 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
     let mut panel = panel(PanelMode::Select);
     panel.id = "terminal-cancel-delayed-repair".into();
     let mut script = snapshot(&[OLD_ROLE, OTHER]);
-    script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(5)));
-    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let delete_index = script.len();
+    script.push(ScriptedResponse::status(204));
+    let (mock, response_gate) =
+        MockRest::start_gated_at(script, ScriptedResponse::status(500), delete_index).await;
     let feature = Arc::new(runtime(pool, &clock, &mock));
     let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
     let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
@@ -936,27 +1086,15 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
         let panel = panel.clone();
         tokio::spawn(async move { feature.recover_terminal(&hint, &panel).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !mock.requests().iter().any(|r| r.method == "DELETE") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
+    tokio::time::timeout(RENDEZVOUS, response_gate.wait_for_request()).await?;
     clock.store(NOW + 100, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let renewed: (i64, i64) = sqlx::query_as(
-        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
-         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
-         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
-         WHERE a.event_id=$1",
-    )
-    .bind(&audit.event_id)
-    .fetch_one(pool)
-    .await?;
+    let renewed =
+        await_expiries_past(pool, TERMINAL_EXPIRY_SQL, &audit.event_id, NOW + 300).await?;
     assert!(renewed.0 > NOW + 300 && renewed.1 > NOW + 300);
     assert!(!owner.is_finished());
     owner.abort();
     assert!(owner.await.unwrap_err().is_cancelled());
+    response_gate.release();
     let effects = terminal_evidence(pool, &audit, true, false).await?;
     assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
     assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
@@ -969,30 +1107,17 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
     assert_eq!(receipts[0].4, "pending");
     assert_eq!(receipts[0].5, None);
     assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
-    let expiry: (i64, i64) = sqlx::query_as(
-        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
-         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
-         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
-         WHERE a.event_id=$1",
-    )
-    .bind(&audit.event_id)
-    .fetch_one(pool)
-    .await?;
+    let expiry = settled_expiries(pool, TERMINAL_EXPIRY_SQL, &audit.event_id).await?;
     let calls = mock.requests();
     clock.store(NOW + 200, Ordering::SeqCst); // both old leases are still live
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let after: (i64, i64) = sqlx::query_as(
-        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
-         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
-         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
-         WHERE a.event_id=$1",
-    )
-    .bind(&audit.event_id)
-    .fetch_one(pool)
-    .await?;
-    assert_eq!(expiry, after); // neither renewal keeper escaped its cancelled owner
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = settled_expiries(pool, TERMINAL_EXPIRY_SQL, &audit.event_id).await?;
+        assert_eq!(expiry, after); // neither renewal keeper escaped its cancelled owner
+        assert_eq!(calls.len(), mock.requests().len());
+    }
     assert_eq!(calls.len(), 5);
-    assert_eq!(calls.len(), mock.requests().len());
     assert_eq!(calls[4].method, "DELETE");
     assert!(calls[4].path.ends_with(OLD_ROLE));
     let after_effects = terminal_evidence(pool, &audit, true, false).await?;
@@ -1060,7 +1185,11 @@ async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult 
         script.push(failure); // only one add attempt, no executor retry
         script.extend(snapshot(&[NEW_ROLE, OTHER])); // later authoritative convergence
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-        let feature = runtime(pool, &clock, &mock);
+        let feature = if pending || case.starts_with("stalled-") {
+            runtime_with_timeout(pool, &clock, &mock, Duration::from_secs(5))
+        } else {
+            runtime(pool, &clock, &mock)
+        };
         let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
         let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
         let hint = feature
@@ -1231,9 +1360,12 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             panel.id = format!("processing-receipt-{exclusive}-{status}");
             panel.exclusive = exclusive;
             let mut script = snapshot(&[OLD_ROLE, OTHER]);
-            script.push(ScriptedResponse::status(status).delayed(Duration::from_secs(3)));
+            let response_index = script.len();
+            script.push(ScriptedResponse::status(status));
             script.extend(snapshot(&[OLD_ROLE, OTHER]));
-            let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+            let (mock, response_gate) =
+                MockRest::start_gated_at(script, ScriptedResponse::status(500), response_index)
+                    .await;
             let feature = runtime(pool, &clock, &mock);
             let request = request(
                 &panel.id,
@@ -1250,7 +1382,7 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             let mut step = Box::pin(feature.execute_step(&mut prepared, OLD_ROLE, false));
             tokio::select! {
                 result = step.as_mut() => panic!("step completed before transfer: {result:?}"),
-                result = tokio::time::timeout(Duration::from_secs(2), async {
+                result = tokio::time::timeout(RENDEZVOUS, async {
                     while !mock.requests().iter().any(|r| r.method == "DELETE") {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -1265,6 +1397,7 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             assert_eq!(replacement.generation, original.generation + 1);
             assert!(replacement.exchange_pending);
             let owner_state = exchange_owner_state(pool, &request.event_id).await?;
+            response_gate.release();
             assert!(matches!(step.await, Err(RuntimeError::Stale)));
             // The late response updates ONLY its receipt, not the replacement's
             // immutable intent, effect checkpoint, phase, claims or target.
@@ -1534,6 +1667,78 @@ async fn repeated_processing_tickets_preserve_pending(pool: &PgPool) -> TestResu
     Ok(())
 }
 
+/// A zero-row completion means the database answered successfully but no
+/// ticket matched. Driven through the real receipt path, it must surface as its
+/// own kind: never a database failure, deliberately never `Stale`.
+async fn zero_row_receipt_completion_is_unmatched_receipt(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mock = MockRest::start(snapshot(&[OLD_ROLE, OTHER]), ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "unmatched-receipt".into();
+    let request = request(
+        "unmatched-receipt-event",
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    let generation = prepared.event.generation;
+    let ticket = feature
+        .store
+        .journal_role_exchange(
+            &prepared.event,
+            prepared.panel.as_ref(),
+            &ExchangeIntent {
+                role_id: NEW_ROLE.into(),
+                adding: true,
+                compensating: false,
+            },
+        )
+        .await?
+        .unwrap();
+    let no_send = Err(SelfRoleRestError::InvalidId);
+    feature
+        .complete_step_receipt(&ticket, &no_send)
+        .await
+        .unwrap();
+    let completed = vec![(
+        generation,
+        NEW_ROLE.to_owned(),
+        true,
+        false,
+        "no_send".to_owned(),
+        None,
+    )];
+    assert_eq!(role_receipts(pool, &request.event_id).await?, completed);
+    // Exact replay is idempotent and still matches the ticket.
+    feature
+        .complete_step_receipt(&ticket, &no_send)
+        .await
+        .unwrap();
+
+    let contradicting = Ok(RoleExchange {
+        result: Ok(()),
+        owned_after: true,
+        response_received: true,
+        response_status: Some(204),
+    });
+    let error = feature
+        .complete_step_receipt(&ticket, &contradicting)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, RuntimeError::Store(StoreErrorKind::UnmatchedReceipt)),
+        "{error:?}"
+    );
+    assert_eq!(role_receipts(pool, &request.event_id).await?, completed);
+
+    feature.park(&mut prepared).await;
+    drop(prepared);
+    mock.shutdown().await;
+    Ok(())
+}
+
 async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> TestResult {
     for (status, evidence_transfer) in [
         (204, true),
@@ -1546,8 +1751,10 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
         let mut panel = panel(PanelMode::Select);
         panel.id = format!("terminal-late-transfer-{status}-{evidence_transfer}");
         let mut script = snapshot(&[OLD_ROLE, OTHER]);
-        script.push(ScriptedResponse::status(status).delayed(Duration::from_secs(3)));
-        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let response_index = script.len();
+        script.push(ScriptedResponse::status(status));
+        let (mock, response_gate) =
+            MockRest::start_gated_at(script, ScriptedResponse::status(500), response_index).await;
         let feature = runtime(pool, &clock, &mock);
         let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
         let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
@@ -1562,7 +1769,7 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
             Box::pin(feature.terminal_step(&mut owner, &lane, &mut snapshot, OLD_ROLE, false));
         tokio::select! {
             result = step.as_mut() => panic!("step completed before transfer: {result:?}"),
-            result = tokio::time::timeout(Duration::from_secs(2), async {
+            result = tokio::time::timeout(RENDEZVOUS, async {
                 while !mock.requests().iter().any(|r| r.method == "DELETE") {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1603,6 +1810,7 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
             assert!(feature.store.owns_superseded_claim(&evidence_claim).await?);
         }
         let owner_state = exchange_owner_state(pool, &audit.event_id).await?;
+        response_gate.release();
         assert!(matches!(step.await, Err(RuntimeError::Stale)));
         if evidence_transfer {
             assert_eq!(
@@ -1883,7 +2091,7 @@ async fn terminal_post_journal_wait_is_definite_no_send(pool: &PgPool) -> TestRe
             Box::pin(feature.terminal_step(&mut owner, &lane, &mut snapshot, OLD_ROLE, false));
         tokio::select! {
             result = step.as_mut() => panic!("step completed before journal wait: {result:?}"),
-            result = tokio::time::timeout(Duration::from_secs(2), async {
+            result = tokio::time::timeout(RENDEZVOUS, async {
                 loop {
                     let blocked: bool = sqlx::query_scalar(
                         "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
@@ -2089,16 +2297,19 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
         };
         let pending = matches!(case, "pending" | "timeout" | "stopped");
         let mut script = snapshot(&held);
+        let mut gated_response_index = None;
         if case == "timeout" {
-            script.push(
-                ScriptedResponse::json(200, json!({"user":{"id":USER},"roles":held}))
-                    .delayed(Duration::from_secs(5)),
-            );
+            gated_response_index = Some(script.len());
+            script.push(ScriptedResponse::json(
+                200,
+                json!({"user":{"id":USER},"roles":held}),
+            ));
         } else if case != "stopped" {
             script.extend(snapshot(&held)); // recovered admission
             script.extend(snapshot(&held)); // execution
             if case == "shutdown" {
-                script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(5)));
+                gated_response_index = Some(script.len());
+                script.push(ScriptedResponse::status(204));
             } else if case == "success" {
                 script.push(ScriptedResponse::status(204)); // DELETE old
                 script.extend(snapshot(&[OTHER]));
@@ -2107,7 +2318,16 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
                 script.extend(snapshot(&[NEW_ROLE, OTHER])); // settlement
             }
         }
-        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let (mock, response_gate) = if let Some(index) = gated_response_index {
+            let (mock, gate) =
+                MockRest::start_gated_at(script, ScriptedResponse::status(500), index).await;
+            (mock, Some(gate))
+        } else {
+            (
+                MockRest::start(script, ScriptedResponse::status(500)).await,
+                None,
+            )
+        };
         let feature = runtime(pool, &clock, &mock);
         let mut panel = panel(PanelMode::Button);
         panel.id = format!("supervised-recovery-{case}");
@@ -2160,14 +2380,13 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
             },
         ));
         if case == "shutdown" {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !mock.requests().iter().any(|r| r.method == "PUT") {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+            tokio::time::timeout(
+                RENDEZVOUS,
+                response_gate.as_ref().unwrap().wait_for_request(),
+            )
             .await?;
         } else if case != "stopped" {
-            tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::time::timeout(RENDEZVOUS, async {
                 loop {
                     let current = status.read().await[RECOVERY_JOB_NAME].clone();
                     if case == "timeout" {
@@ -2187,6 +2406,9 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
         }
         stop.send_replace(true);
         tokio::time::timeout(Duration::from_secs(2), owner).await???;
+        if let Some(gate) = &response_gate {
+            gate.release();
+        }
         let current = status.read().await[RECOVERY_JOB_NAME].clone();
         assert!(!current.running);
         if case == "stopped" {
@@ -2246,15 +2468,15 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
         );
         // Changing the DB clock while the old lease is still live would expose
         // any renewal keeper that escaped cancellation/join of its job owner.
-        let expiry: (Option<i64>, i64) = sqlx::query_as(
-            "SELECT (extract(epoch FROM a.processing_expires_at)*1000)::bigint,(extract(epoch FROM p.processing_expires_at)*1000)::bigint FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
-        ).bind(&request.event_id).fetch_one(pool).await?;
+        let expiry = settled_expiries(pool, JOB_PROCESSING_EXPIRY_SQL, &request.event_id).await?;
         clock.store(NOW + 600, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let after: (Option<i64>, i64) = sqlx::query_as(
-            "SELECT (extract(epoch FROM a.processing_expires_at)*1000)::bigint,(extract(epoch FROM p.processing_expires_at)*1000)::bigint FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
-        ).bind(&request.event_id).fetch_one(pool).await?;
-        assert_eq!(expiry, after);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let after =
+                settled_expiries(pool, JOB_PROCESSING_EXPIRY_SQL, &request.event_id).await?;
+            assert_eq!(expiry, after);
+        }
         assert_eq!(calls.len(), mock.requests().len());
         mock.shutdown().await;
     }
@@ -2606,7 +2828,7 @@ async fn shared_reaction_dispatch_and_disabled_gate(pool: &PgPool) -> TestResult
             command.dispatch(&event);
             if enabled {
                 // Only a bounded fixture wait for detached dispatch; no CI polling.
-                let rows = tokio::time::timeout(Duration::from_secs(8), async {
+                let rows = tokio::time::timeout(RENDEZVOUS, async {
                     loop {
                         let rows: Vec<(String, String)> = sqlx::query_as(
                             "SELECT event_id,outcome FROM self_role_audit WHERE panel_id=$1 ORDER BY event_order COLLATE \"C\"",
@@ -2767,7 +2989,10 @@ async fn shared_component_orchestration(pool: &PgPool) -> TestResult {
                 assert_eq!(mutations[1].method, "PUT");
             }
             let reply: serde_json::Value = serde_json::from_slice(&calls.last().unwrap().body)?;
-            assert!(reply["content"].as_str().unwrap().contains("already"));
+            assert_eq!(
+                reply["content"].as_str().unwrap(),
+                "This selection is already being handled or was handled earlier."
+            );
         } else {
             assert!(row.is_none());
             assert_eq!(mock.requests().len(), usize::from(enabled));
@@ -2942,7 +3167,11 @@ async fn execution_and_compensation(pool: &PgPool) -> TestResult {
             script.extend(snapshot(&[OLD_ROLE, OTHER])); // settlement revalidation
         }
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-        let runtime = runtime(pool, &clock, &mock);
+        let runtime = if body_fault == "stalled" {
+            runtime_with_timeout(pool, &clock, &mock, Duration::from_secs(5))
+        } else {
+            runtime(pool, &clock, &mock)
+        };
         let mut panel = panel(PanelMode::Select);
         panel.id = format!("execution-{status}-{body_fault}");
         let request = request(
@@ -3123,7 +3352,8 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
         let mut panel = panel(PanelMode::Select);
         panel.id = format!("stale-inflight-{empty}");
         let mut old_script = snapshot(&[OTHER]);
-        old_script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(4)));
+        let stale_put_index = old_script.len();
+        old_script.push(ScriptedResponse::status(204));
         let live = if empty {
             vec![OLD_ROLE, OTHER]
         } else {
@@ -3137,7 +3367,9 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
         old_script.extend(snapshot(&live)); // stale PUT applied AFTER winner settled
         old_script.push(ScriptedResponse::status(204)); // repair DELETE obsolete old
         old_script.extend(snapshot(&target));
-        let old_mock = MockRest::start(old_script, ScriptedResponse::status(500)).await;
+        let (old_mock, old_response_gate) =
+            MockRest::start_gated_at(old_script, ScriptedResponse::status(500), stale_put_index)
+                .await;
         let old_runtime = Arc::new(runtime(pool, &clock, &old_mock));
         let mut old_request = request(
             &format!("stale-old-{empty}"),
@@ -3154,12 +3386,8 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
                 (old, result)
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !old_mock.requests().iter().any(|r| r.method == "PUT") {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
+        tokio::time::timeout(RENDEZVOUS, old_response_gate.wait_for_request()).await?;
+        assert!(old_mock.requests().iter().any(|r| r.method == "PUT"));
         // Database expiry while the remote mutation is in flight. A different
         // worker/executor wins; the stale worker cannot cancel Discord's call.
         clock.store(NOW + 500, Ordering::SeqCst);
@@ -3187,9 +3415,11 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
             .unwrap();
         assert!(
             !inflight.is_finished(),
-            "winner must settle before old response arrives"
+            "old response stays gated until the winner settles"
         );
-        let (mut stale, result) = tokio::time::timeout(Duration::from_secs(6), inflight).await??;
+        old_response_gate.release();
+        tokio::time::timeout(RENDEZVOUS, old_response_gate.wait_for_completion()).await?;
+        let (mut stale, result) = tokio::time::timeout(RENDEZVOUS, inflight).await??;
         assert!(matches!(result, Err(RuntimeError::Stale)));
         assert!(!stale.event.exchange_pending); // received late 204, retained evidence
         old_runtime
@@ -3782,7 +4012,9 @@ async fn recovery_and_renewal(pool: &PgPool) -> TestResult {
     ));
     assert_eq!(mock.requests().len(), 4); // duplicate did not fetch/replan
     clock.store(NOW + 200, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let renewed =
+        await_expiries_past(pool, PROCESSING_EXPIRY_SQL, &request.event_id, NOW + 300).await?;
+    assert!(renewed.0 > NOW + 300 && renewed.1 > NOW + 300);
     clock.store(NOW + 300, Ordering::SeqCst);
     assert!(prepared.owns().await.unwrap()); // BOTH renewed past original expiry
     let old_event = prepared.event.clone();
@@ -3922,11 +4154,7 @@ async fn exclusive_lane_before_reads(pool: &PgPool) -> TestResult {
         .release_panel_claim(first.panel.as_ref().unwrap())
         .await?;
     drop(first);
-    let second = ready(
-        tokio::time::timeout(Duration::from_secs(3), contender)
-            .await??
-            .unwrap(),
-    );
+    let second = ready(tokio::time::timeout(RENDEZVOUS, contender).await??.unwrap());
     assert_eq!(second.event.desired_role_ids, [NEW_ROLE]);
     assert_eq!(mock.requests().len(), 8);
     drop(second);
@@ -3985,4 +4213,259 @@ async fn lost_panel_lane_release_is_logged(pool: &PgPool) -> TestResult {
     assert!(logs.contains("lost-lane-release-closed-store"), "{logs}");
     mock.shutdown().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn legacy_start_latches_loss_for_unusable_claim_shapes() {
+    // Offline: the lazy pool is closed before any use, so no socket opens and
+    // no database is touched. Unusable shapes must fail closed synchronously:
+    // no panic, loss latched, no renewal task spawned, drop a silent no-op.
+    let options = PgConnectOptions::new()
+        .host("127.0.0.1")
+        .port(1)
+        .username("offline_unused")
+        .database("offline_unused");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy_with(options);
+    pool.close().await;
+    let store = SelfRoleStore::new(pool);
+
+    let both = (
+        Some(EventClaim {
+            event_id: "keeper-offline-event".to_owned(),
+            token: Secret::new("keeper-offline-event-sentinel".to_owned()),
+            generation: 1,
+            recovered: false,
+            intent_initialized: true,
+            compensating: false,
+            exchange_pending: false,
+            effects: AuditEffects::default(),
+            desired_role_ids: Vec::new(),
+            pre_mutation_role_ids: Vec::new(),
+            renew_after_ms: 3_600_000,
+        }),
+        Some(PanelClaim::offline_fixture(3_600_000)),
+    );
+    for (label, event, panel) in [("neither", None, None), ("both", both.0, both.1)].into_iter() {
+        let lost = Arc::new(AtomicBool::new(false));
+        let keeper = LeaseKeeper::start(store.clone(), event, panel, Arc::clone(&lost));
+        assert!(
+            lost.load(Ordering::SeqCst),
+            "legacy start ({label}) must latch loss synchronously"
+        );
+        assert!(
+            keeper.0 .0.is_none(),
+            "a refused keeper ({label}) spawns no renewal task"
+        );
+        drop(keeper);
+        assert!(
+            lost.load(Ordering::SeqCst),
+            "dropping the refused keeper ({label}) is a silent no-op"
+        );
+    }
+}
+
+/// Settlement wiring through the live send path: a journaled send with no
+/// received response records `timeout_no_response` without completing the
+/// ticket, and a received ambiguous status persists `response_ambiguous`
+/// through completion. Runs last: it applies migration 0449 to the shared
+/// exercise schema, which earlier scenarios must not observe.
+async fn settlement_timeout_note_and_ambiguous_class(pool: &PgPool) -> TestResult {
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0449_self_role_ticket_acknowledgement.sql"
+    ))
+    .execute(pool)
+    .await?;
+    // Timeout: the mutation overruns the 5 s moderation timeout, so no
+    // response is received and the ticket stays pending with its timeout.
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "settlement-timeout-note".into();
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(6)));
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let feature = runtime_with_timeout(pool, &clock, &mock, Duration::from_secs(5));
+    let request = request(
+        &panel.id,
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    feature.checkpoint(&mut prepared).await.unwrap();
+    feature
+        .execute_step(&mut prepared, NEW_ROLE, true)
+        .await
+        .unwrap();
+    let timeout_row: (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT disposition, outcome_class, completed_at IS NULL \
+         FROM self_role_exchanges WHERE event_id = $1",
+    )
+    .bind(&request.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(timeout_row.0, "pending", "a timeout is not a receipt");
+    assert_eq!(
+        timeout_row.1.as_deref(),
+        Some("timeout_no_response"),
+        "a timed-out send must record its outcome"
+    );
+    assert!(timeout_row.2, "a timeout must not fabricate completion");
+    mock.shutdown().await;
+    // Ambiguous: a received 500 completes with its outcome class.
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut panel = self::panel(PanelMode::Select);
+    panel.id = "settlement-ambiguous-class".into();
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.push(ScriptedResponse::status(500));
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let request = self::request(
+        &panel.id,
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    feature.checkpoint(&mut prepared).await.unwrap();
+    feature
+        .execute_step(&mut prepared, NEW_ROLE, true)
+        .await
+        .unwrap();
+    let class_row: (String, Option<i16>, Option<String>) = sqlx::query_as(
+        "SELECT disposition, response_status, outcome_class \
+         FROM self_role_exchanges WHERE event_id = $1",
+    )
+    .bind(&request.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(class_row.0, "response");
+    assert_eq!(class_row.1, Some(500));
+    assert_eq!(
+        class_row.2.as_deref(),
+        Some("response_ambiguous"),
+        "an ambiguous receipt must persist its class"
+    );
+    mock.shutdown().await;
+    Ok(())
+}
+
+/// A failing timeout note must not abort the step. The ticket is already
+/// durably pending, so `complete_step_receipt` logs the store error and
+/// continues instead of returning it and skipping the checkpoint.
+async fn timeout_note_store_failure_stays_non_fatal(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mock = MockRest::start(snapshot(&[OLD_ROLE, OTHER]), ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "timeout-note-failure".into();
+    let request = request(
+        "timeout-note-failure-event",
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    let ticket = feature
+        .store
+        .journal_role_exchange(
+            &prepared.event,
+            prepared.panel.as_ref(),
+            &ExchangeIntent {
+                role_id: NEW_ROLE.into(),
+                adding: true,
+                compensating: false,
+            },
+        )
+        .await?
+        .unwrap();
+    // Every store call fails fast: the disposable test service refuses the
+    // unknown database on first use. The receipt only needs the ticket data.
+    let failing = PgPoolOptions::new().max_connections(1).connect_lazy_with(
+        PgConnectOptions::new()
+            .host("agent-testdb")
+            .port(5432)
+            .username("agent_test")
+            .database("self_role_note_failure_probe"),
+    );
+    let failing_feature = runtime(&failing, &clock, &mock);
+    let timeout = Ok(RoleExchange {
+        result: Err(SelfRoleRestError::Ambiguous),
+        owned_after: false,
+        response_received: false,
+        response_status: None,
+    });
+    assert!(
+        failing_feature
+            .complete_step_receipt(&ticket, &timeout)
+            .await
+            .is_ok(),
+        "a failed timeout note must not abort the receipt"
+    );
+    failing.close().await;
+    feature.park(&mut prepared).await;
+    drop(prepared);
+    mock.shutdown().await;
+    Ok(())
+}
+
+// --------------------------------------- contention-seed freshness pins --
+
+/// Call-site source for the freshness pins below: the production half of this
+/// file, above the test-module marker (the tests below also mention panel
+/// claims and must never satisfy these pins).
+const RUNTIME_SRC: &str = include_str!("self_role_runtime.rs");
+
+fn production_src() -> &'static str {
+    RUNTIME_SRC
+        .split_once("#[path = \"self_role_runtime_tests.rs\"]")
+        .expect("test-module marker moved; update these pins on the card")
+        .0
+}
+
+/// Both Busy arms must draw a fresh `contention_seed` per sleep: a fixed seed
+/// replays one delay and the lockstep this slice breaks returns. The adoption
+/// guard pins the jittered call; this pins the seed freshness it cannot see.
+#[test]
+fn both_busy_arms_seed_jitter_from_fresh_contention() {
+    let prod = production_src();
+    let mut arms = 0;
+    let mut rest = prod;
+    while let Some(at) = rest.find("PanelClaimResult::Busy if") {
+        let window: Vec<&str> = rest[at..].lines().take(14).collect();
+        assert!(
+            window.iter().any(|line| line.contains("contention_seed(")),
+            "Busy arm sleeps a fixed seed: pass contention_seed(&key, contention) \
+             so simultaneous contenders spread"
+        );
+        arms += 1;
+        rest = &rest[at + "PanelClaimResult::Busy if".len()..];
+    }
+    assert_eq!(arms, 2, "expected exactly the two Busy arms");
+}
+
+/// The seed helper itself spreads: identical inputs on consecutive calls draw
+/// different seeds (process-wide sequence), so one claimant's retries and
+/// simultaneous contenders never share a delay stream.
+#[test]
+fn contention_seeds_differ_across_consecutive_sleeps() {
+    let key = PanelKey {
+        guild_id: GUILD.to_owned(),
+        member_id: USER.to_owned(),
+        panel_id: "games".to_owned(),
+    };
+    let first = super::contention_seed(&key, 0);
+    let second = super::contention_seed(&key, 0);
+    assert_ne!(first, second, "consecutive sleeps must not share a seed");
+    let other = PanelKey {
+        guild_id: GUILD.to_owned(),
+        member_id: OTHER.to_owned(),
+        panel_id: "games".to_owned(),
+    };
+    assert_ne!(
+        super::contention_seed(&other, 0),
+        super::contention_seed(&key, 0),
+        "simultaneous contenders must not share a seed"
+    );
 }

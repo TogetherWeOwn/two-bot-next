@@ -361,7 +361,8 @@ def parked_readyz_body():
                 "counter", "rank", "scheduled_events", "settings", "presence_probe",
                 "community_scorecard", "inactivity", "audit_retry",
                 "self_role_recovery", "scheduled_messages", "feeds",
-                "member_unban_sweep",
+                "member_unban_sweep", "retention", "lfg_sweep", "giveaway_countdown",
+                "giveaway_draw",
             )}}
 
 
@@ -568,7 +569,7 @@ class ContainerSmokeTests(unittest.TestCase):
         self.fixture.image_size = 142437143
         self.fixture.binary_size = 10287160
         self.assertEqual(smoke.IMAGE_MAX_BYTES, 112 * smoke.MIB)
-        self.assertEqual(smoke.BINARY_MAX_BYTES, 16 * smoke.MIB)
+        self.assertEqual(smoke.BINARY_MAX_BYTES, 18 * smoke.MIB)
         self.assert_rejected("image exceeds size budget")
         self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
 
@@ -656,13 +657,13 @@ class ContainerSmokeTests(unittest.TestCase):
         body = parked_readyz_body()
         del body["jobs"]
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all twelve jobs parked")
+        self.assert_rejected("all sixteen jobs parked")
 
     def test_readyz_without_jobs_map_fails(self):
         body = parked_readyz_body()
         body["jobs"] = {}
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all twelve jobs parked")
+        self.assert_rejected("all sixteen jobs parked")
 
     def test_readyz_with_missing_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -670,13 +671,13 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 del body["jobs"][name]
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all twelve jobs parked")
+                self.assert_rejected("all sixteen jobs parked")
 
     def test_readyz_with_unexpected_job_fails(self):
         body = parked_readyz_body()
         body["jobs"]["unexpected"] = dict(PARKED_JOB)
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all twelve jobs parked")
+        self.assert_rejected("all sixteen jobs parked")
 
     def test_readyz_with_running_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -684,7 +685,7 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 body["jobs"][name] = dict(PARKED_JOB, running=True)
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all twelve jobs parked")
+                self.assert_rejected("all sixteen jobs parked")
 
     def test_readyz_with_started_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -692,7 +693,7 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 body["jobs"][name] = dict(PARKED_JOB, parked=False, last_start=100)
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all twelve jobs parked")
+                self.assert_rejected("all sixteen jobs parked")
 
     def test_readyz_with_wrong_components_fails(self):
         body = parked_readyz_body()
@@ -821,6 +822,144 @@ class ContainerSmokeTests(unittest.TestCase):
         self.fixture.oom = True
         self.assert_rejected("shut down cleanly")
 
+    def test_cleanup_guard_failure_matrix_preserves_primary_and_bounds_output(self):
+        name = "two-bot-smoke-" + "a" * 32
+        sentinel = "uncontrolled Docker detail"
+        failures = (
+            subprocess.CompletedProcess([], 1, sentinel, sentinel),
+            subprocess.TimeoutExpired([sentinel], 30, output=sentinel, stderr=sentinel),
+            OSError(sentinel),
+            subprocess.CalledProcessError(1, [sentinel], output=sentinel, stderr=sentinel),
+        )
+        for stage in ("measurement", "health-probe", "main"):
+            for failure in failures:
+                for primary in (None, RuntimeError("primary smoke failure")):
+                    with self.subTest(stage=stage, failure=type(failure), primary=primary):
+                        def remove(*args, **kwargs):
+                            if isinstance(failure, BaseException):
+                                raise failure
+                            return failure
+                        with patch.object(smoke, "docker", side_effect=remove) as docker, \
+                                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                                contextlib.redirect_stdout(io.StringIO()) as output:
+                            with self.assertRaises(RuntimeError) as caught:
+                                with smoke.owned_container(name, stage):
+                                    if primary is not None:
+                                        raise primary
+                        docker.assert_called_once_with("rm", "--force", name, timeout=30, check=False)
+                        if primary is not None:
+                            self.assertIs(caught.exception, primary)
+                        else:
+                            self.assertIsInstance(caught.exception, smoke.CleanupFailure)
+                            self.assertIsNone(caught.exception.__cause__)
+                            self.assertTrue(caught.exception.__suppress_context__)
+                        self.assertIn(f"FAIL cleanup {stage}:", output.getvalue())
+                        self.assertNotIn(sentinel, output.getvalue() + str(caught.exception))
+                        self.assertLess(len(output.getvalue()), 300)
+
+    def test_failed_log_collection_does_not_mask_primary_or_skip_cleanup(self):
+        fixture = self.fixture
+        self.http = lambda url: (500, {})
+        for error in (OSError("log process unavailable"), subprocess.TimeoutExpired("docker logs", 30)):
+            with self.subTest(error=type(error)):
+                fixture.calls.clear()
+                def docker(*args, **kwargs):
+                    if args[0] == "logs":
+                        raise error
+                    return fixture(*args, **kwargs)
+                self.fixture = docker
+                self.assert_rejected("/health did not return 200")
+                self.assertEqual(len(fixture.removals()), 2)
+
+    def test_cleanup_only_failure_does_not_collect_runtime_logs(self):
+        fixture = self.fixture
+        def docker(*args, **kwargs):
+            if args[:2] == ("rm", "--force") and args[2].endswith("-probe"):
+                fixture.calls.append((args, kwargs))
+                return subprocess.CompletedProcess(args, 1, "", "")
+            return fixture(*args, **kwargs)
+        self.fixture = docker
+        self.assert_rejected("cleanup health-probe")
+        self.assertEqual(len(fixture.removals()), 3)
+        self.assertFalse(any(args[0] == "logs" for args, _ in fixture.calls))
+
+    def test_cleanup_report_io_failure_preserves_arbitrated_exception(self):
+        name = "two-bot-smoke-" + "a" * 32
+        for stage in ("measurement", "health-probe", "main"):
+            for error in (OSError(28, "summary disk full"), BrokenPipeError("stdout closed")):
+                for primary in (None, RuntimeError("primary smoke failure")):
+                    with self.subTest(stage=stage, error=type(error), primary=primary):
+                        with patch.object(smoke, "docker", return_value=subprocess.CompletedProcess([], 1)), \
+                                patch.object(smoke, "report", side_effect=error) as report:
+                            with self.assertRaises(RuntimeError) as caught:
+                                with smoke.owned_container(name, stage):
+                                    if primary is not None:
+                                        raise primary
+                        report.assert_called_once_with(f"FAIL cleanup {stage}: nonzero removal exit")
+                        if primary is not None:
+                            self.assertIs(caught.exception, primary)
+                        else:
+                            self.assertIsInstance(caught.exception, smoke.CleanupFailure)
+                            self.assertEqual(str(caught.exception), f"FAIL cleanup {stage}: nonzero removal exit")
+
+    def test_cleanup_summary_write_failure_does_not_collect_runtime_logs(self):
+        real_report = smoke.report
+        for stage in ("measurement", "health-probe", "main"):
+            with self.subTest(stage=stage):
+                fixture = DockerFixture()
+                def docker(*args, **kwargs):
+                    result = fixture(*args, **kwargs)
+                    if args[:2] == ("rm", "--force"):
+                        name = args[2]
+                        actual = "measurement" if name.startswith("two-bot-measure-") else (
+                            "health-probe" if name.endswith("-probe") else "main")
+                        if actual == stage:
+                            result.returncode = 1
+                    return result
+                self.fixture = docker
+                def report(message):
+                    if message.startswith("FAIL cleanup"):
+                        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": "fixture-summary"}), \
+                                patch.object(smoke.Path, "open", side_effect=OSError(28, "summary disk full")):
+                            real_report(message)
+                    else:
+                        real_report(message)
+                with patch.object(smoke, "report", side_effect=report):
+                    with self.assertRaises(smoke.CleanupFailure) as caught:
+                        self.run_smoke()
+                self.assertEqual(str(caught.exception), f"FAIL cleanup {stage}: nonzero removal exit")
+                self.assertEqual(len(fixture.removals()), 1 if stage == "measurement" else 3)
+                self.assertFalse(any(args[0] == "logs" for args, _ in fixture.calls))
+                with patch.object(smoke, "smoke", side_effect=caught.exception), \
+                        patch.object(sys, "argv", ["container-smoke.py", "two-bot:fixture"]):
+                    with self.assertRaises(SystemExit) as exit_result:
+                        smoke.main()
+                self.assertEqual(exit_result.exception.code,
+                                 f"FAIL container smoke: FAIL cleanup {stage}: nonzero removal exit")
+
+    def test_unavailable_log_report_io_failure_preserves_primary(self):
+        real_report = smoke.report
+        for error in (OSError(28, "summary disk full"), BrokenPipeError("stdout closed")):
+            with self.subTest(error=type(error)):
+                fixture = DockerFixture()
+                primary = RuntimeError("primary smoke failure")
+                def docker(*args, **kwargs):
+                    if args[0] == "logs":
+                        raise OSError("log process unavailable")
+                    return fixture(*args, **kwargs)
+                def http(url):
+                    raise primary
+                def report(message):
+                    if message == "FAIL container smoke: diagnostic logs unavailable":
+                        raise error
+                    real_report(message)
+                self.fixture, self.http = docker, http
+                with patch.object(smoke, "report", side_effect=report):
+                    with self.assertRaises(RuntimeError) as caught:
+                        self.run_smoke()
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(len(fixture.removals()), 2)
+
     def test_summary_records_measurements(self):
         scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
         with tempfile.TemporaryDirectory(dir=scratch) as directory:
@@ -829,6 +968,68 @@ class ContainerSmokeTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 smoke.report("image: 115343360 bytes")
             self.assertEqual(path.read_text(), "image: 115343360 bytes\n\n")
+
+
+class MalformedInspectRegressionTests(unittest.TestCase):
+    """Review regression: malformed `image inspect` FAILs clean, never tracebacks."""
+
+    def run_cli(self, stdout):
+        calls = []
+
+        def docker(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("image", "inspect"):
+                return subprocess.CompletedProcess(args, 0, stdout, "")
+            raise AssertionError(f"unexpected docker call: {args!r}")
+
+        with patch.object(smoke, "docker", docker), \
+                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                patch.object(sys, "argv", ["container-smoke.py", "two-bot:fixture"]), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit) as caught:
+            smoke.main()
+        return caught.exception, out.getvalue(), err.getvalue(), calls
+
+    def test_malformed_inspect_fails_clean_without_containers(self):
+        for stdout, label in (
+            ("[]", "empty-array"),
+            ("[null]", "null-element"),
+            ("123", "non-list"),
+            ("[[]]", "nested-array"),
+            ('["hi"]', "string-element"),
+            ("{}", "non-list-object"),
+            ("not json", "non-json"),
+            (json.dumps([{"Size": 1}]), "missing-id"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64}]), "missing-size"),
+            # A wrong-typed Id must not reach subprocess argv (TypeError
+            # traceback): it fails at validation before any history call.
+            # Each fixture carries a valid Config so the Id require is the
+            # only line stopping the history call (individually pinned).
+            (json.dumps([{"Id": 123, "Size": 1, "Config": {}}]), "numeric-id"),
+            (json.dumps([{"Id": None, "Size": 1, "Config": {}}]), "null-id"),
+            (json.dumps([{"Id": ["sha256:" + "b" * 64], "Size": 1,
+                          "Config": {}}]), "list-id"),
+            (json.dumps([{"Id": "", "Size": 1, "Config": {}}]), "empty-id"),
+            # A missing or wrong-typed Config (or Healthcheck) must fail at
+            # validation too, not as AttributeError at config.get below.
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1}]),
+             "missing-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": None}]), "null-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": "x"}]), "string-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": {"User": "65532:65532",
+                                     "Healthcheck": "x"}}]),
+             "string-healthcheck"),
+        ):
+            with self.subTest(label=label):
+                error, out, err, calls = self.run_cli(stdout)
+                self.assertIsInstance(error.code, str, label)
+                self.assertTrue(error.code.startswith("FAIL container smoke:"), label)
+                self.assertNotIn("Traceback", out + err, label)
+                self.assertEqual(calls, [("image", "inspect", "two-bot:fixture")], label)
 
 
 if __name__ == "__main__":

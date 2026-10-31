@@ -44,10 +44,13 @@ library code with no Discord dependency and can start immediately.
   the store and live category channels are protected too. Boot process inputs
   `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
   `TWO_TEMP_VOICE_CATEGORY_ID` and comma-separated `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`
-  supply additional protection; malformed IDs disable the voice runtime. Stored
-  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600, read
-  at boot) sets the empty grace; unset keeps 60 seconds. `0` deletes a room on
-  the next tick after its last human leaves, matching the interim voice bot.
+  supply additional protection; malformed IDs disable the voice runtime. A stored
+  per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row (0 to 600 whole seconds)
+  overrides the boot value live without a restart; out-of-range rows fail closed
+  to the boot value with an `out_of_range` warning. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
+  (0 to 600, read at boot) sets the empty grace; unset keeps 60 seconds. `0`
+  deletes a room on the next tick after its last human leaves, matching the
+  interim voice bot.
 - If the member can't be moved in (missing Move Members, or they left first), the
   bot deletes the room immediately.
 - Create admission (Auto-Voice parity): one room per member, 40 per guild, no
@@ -84,8 +87,10 @@ library code with no Discord dependency and can start immediately.
   still there. It also lets a member claim a room whose owner has left.
 - `/transfer member`: hands the room to a member who is in it. The recipient also
   becomes the original creator.
-- Owner-only commands refuse everyone else. Guild admins may use owner commands
-  in any tracked room; channel-scoped grants never provide that override.
+- Owner-only commands refuse everyone else, and guild admins act on their own
+  tracked room first: only `/transfer` from an admin with no tracked room of
+  their own falls back to the recipient's tracked room. Channel-scoped grants
+  never provide that override.
 - Succession, reclaim and transfer persist a room-scoped recipient journal before
   issuing any owner grant. The overwrite rewrite removes owner-grant bits from
   all recorded former recipients and installs the current owner's grant; unrelated
@@ -182,7 +187,12 @@ library code with no Discord dependency and can start immediately.
 - The name is recalculated on join or leave, activity changes, and limit or
   privacy changes.
 - Evaluation order: conditionals (innermost first) → token substitution →
-  styling → trim → truncate to 100 characters → fallback name if empty.
+  styling → trim → emoji separator → truncate to 100 characters → fallback
+  name if empty.
+- A rendered name that opens with an emoji joins it to the rest with `〢`
+  (U+3022) and no spaces (`👾 WARDOGS deep dive` → `👾〢WARDOGS deep dive`);
+  an already-separated name is left alone, never doubled. The legacy
+  `{username}` create path applies the same separator.
 
 **Numbering**
 

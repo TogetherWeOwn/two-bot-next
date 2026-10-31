@@ -602,6 +602,26 @@ impl MockRest {
         )
     }
 
+    /// Hold the scripted response at `index` until the caller releases its gate.
+    pub async fn start_gated_at(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+        index: usize,
+    ) -> (Self, Arc<ResponseGate>) {
+        let mut queue = ungated(script);
+        let gate = Arc::new(ResponseGate::default());
+        assert!(
+            index < queue.len(),
+            "gated response index {index} must exist in script of length {}",
+            queue.len()
+        );
+        queue[index].1 = Some(Arc::clone(&gate));
+        (
+            Self::start_inner(queue, default, Some(Duration::ZERO), None).await,
+            gate,
+        )
+    }
+
     async fn start_inner(
         script: VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>,
         default: ScriptedResponse,

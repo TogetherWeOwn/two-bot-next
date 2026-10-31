@@ -1,7 +1,42 @@
 //! Join-risk runtime acceptance against the mock Discord double. The worker
 //! test is ignored and runs only on agent-testdb / the CI service container.
 
+use crate::hotpath_settings_test_support as hotpath_scope;
+
+#[tokio::test]
+async fn join_risk_runtime_hotpath_settings_reads_are_guild_scoped() {
+    use hotpath_scope::queries::Queries;
+    use two_bot_cutover::settings::SettingsStore;
+    let key = "TWO_JOIN_RISK_THRESHOLD";
+    let db = hotpath_scope::database(key).await;
+    let mut source =
+        join_risk_runtime::StoreSettings::new(db.pool().clone(), 22, vars(&[(key, "7")]));
+    let (cold, reads) = Queries::capture(source.current()).await;
+    assert_eq!(cold.unwrap().tuning.threshold(), 3.0);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    source.expire_for_tests();
+    let (warm, reads) = Queries::capture(source.current()).await;
+    assert_eq!(warm.unwrap().tuning.threshold(), 3.0);
+    hotpath_scope::assert_reads(&reads, None, true);
+    let store = SettingsStore::new(db.pool());
+    store
+        .set("22", key, Some(serde_json::json!(5)), "fixture")
+        .await
+        .unwrap();
+    source.expire_for_tests();
+    let (changed, reads) = Queries::capture(source.current()).await;
+    assert_eq!(changed.unwrap().tuning.threshold(), 5.0);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    store.set("22", key, None, "fixture").await.unwrap();
+    source.expire_for_tests();
+    let (fallback, reads) = Queries::capture(source.current()).await;
+    assert_eq!(fallback.unwrap().tuning.threshold(), 7.0);
+    hotpath_scope::assert_reads(&reads, Some(1), true);
+    db.close().await.unwrap();
+}
+
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +53,9 @@ use two_bot_discord::{ActionExecutor, JoinObservation, JoinObserver};
 
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::gateway::ensure_crypto_provider;
-use crate::join_risk_runtime::{self, AntiNukeFences, Fanout, JoinRiskSettings, SettingsSource};
+use crate::join_risk_runtime::{
+    self, AntiNukeFences, Fanout, JoinRiskSettings, JoinRiskTuningRefusal, SettingsSource,
+};
 
 const GUILD: u64 = 22;
 const CHANNEL: &str = "12";
@@ -83,7 +120,9 @@ fn join_risk_armed_needs_explicit_dry_run_zero_outside_session_mode() {
 
 #[test]
 fn join_risk_settings_defaults_and_bad_values() {
-    let defaults = JoinRiskSettings::from_vars(&vars(&[]));
+    // Absent keys keep the shipped defaults.
+    let defaults =
+        JoinRiskSettings::try_from_vars(&vars(&[])).expect("absent keys are not a refusal");
     assert_eq!(
         defaults.tuning,
         RaidTuning::new(60.0, 5.0).unwrap(),
@@ -92,30 +131,63 @@ fn join_risk_settings_defaults_and_bad_values() {
     assert_eq!(defaults.bulk_join_window_until_ms, None);
     assert_eq!(defaults.staff_channel, None);
 
-    let set = JoinRiskSettings::from_vars(&vars(&[
+    let set = JoinRiskSettings::try_from_vars(&vars(&[
         ("TWO_JOIN_RISK_THRESHOLD", "8"),
         ("TWO_JOIN_RISK_WINDOW_SECONDS", "30.5"),
         ("TWO_BULK_JOIN_WINDOW_UNTIL", "1790780400000"),
         ("DISCORD_STAFF_ALERT_CHANNEL_ID", "123456789012345678"),
-    ]));
+    ]))
+    .expect("valid present values read");
     assert_eq!(set.tuning, RaidTuning::new(30.5, 8.0).unwrap());
     assert_eq!(set.bulk_join_window_until_ms, Some(1_790_780_400_000));
     assert_eq!(set.staff_channel.as_deref(), Some("123456789012345678"));
 
-    // Unusable numbers never disable scoring or invent a bulk window.
-    for bad in ["0", "-3", "abc", "NaN", "inf"] {
-        let parsed = JoinRiskSettings::from_vars(&vars(&[
-            ("TWO_JOIN_RISK_THRESHOLD", bad),
-            ("TWO_JOIN_RISK_WINDOW_SECONDS", bad),
-            ("TWO_BULK_JOIN_WINDOW_UNTIL", bad),
-        ]));
-        assert_eq!(parsed.tuning, RaidTuning::new(60.0, 5.0).unwrap(), "{bad}");
-        assert_eq!(parsed.bulk_join_window_until_ms, None, "{bad}");
+    // Present-but-unusable values refuse with the refusing key named, never
+    // silent defaults. The refusal Display names the key without echoing it.
+    let refused = |pairs: &[(&str, &str)]| -> JoinRiskTuningRefusal {
+        let err = JoinRiskSettings::try_from_vars(&vars(pairs))
+            .expect_err("present-but-unusable tuning must refuse, not default");
+        assert!(
+            format!("{err}").contains(err.key()),
+            "refusal Display must name the key: {err}"
+        );
+        err
+    };
+    for bad in ["0", "-3", "abc", "NaN", "inf", "-inf", "1e999"] {
+        assert_eq!(
+            refused(&[("TWO_JOIN_RISK_WINDOW_SECONDS", bad)]).key(),
+            "TWO_JOIN_RISK_WINDOW_SECONDS",
+            "window {bad:?} refuses, never defaults to 60s"
+        );
+        assert_eq!(
+            refused(&[("TWO_JOIN_RISK_THRESHOLD", bad)]).key(),
+            "TWO_JOIN_RISK_THRESHOLD",
+            "threshold {bad:?} refuses, never defaults to 5.0"
+        );
     }
-    for bad in ["not-a-channel", "1234567890123456789012"] {
-        let parsed = JoinRiskSettings::from_vars(&vars(&[("DISCORD_STAFF_ALERT_CHANNEL_ID", bad)]));
-        assert_eq!(parsed.staff_channel, None, "{bad}");
+    for bad in ["abc", "0", "-3", "1.5", "NaN"] {
+        assert_eq!(
+            refused(&[("TWO_BULK_JOIN_WINDOW_UNTIL", bad)]).key(),
+            "TWO_BULK_JOIN_WINDOW_UNTIL",
+            "bulk-until {bad:?} refuses, never reads as no bulk window"
+        );
     }
+    for bad in ["not-a-channel", "123", "1234567890123456789012"] {
+        assert_eq!(
+            refused(&[("DISCORD_STAFF_ALERT_CHANNEL_ID", bad)]).key(),
+            "DISCORD_STAFF_ALERT_CHANNEL_ID",
+            "channel {bad:?} refuses, never reads as log-only"
+        );
+    }
+    // Both tuning numbers unusable: the window (evaluated first) is named.
+    assert_eq!(
+        refused(&[
+            ("TWO_JOIN_RISK_WINDOW_SECONDS", "0"),
+            ("TWO_JOIN_RISK_THRESHOLD", "-1")
+        ])
+        .key(),
+        "TWO_JOIN_RISK_WINDOW_SECONDS"
+    );
 }
 
 #[test]
@@ -257,8 +329,8 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 struct Scripted(JoinRiskSettings);
 
 impl SettingsSource for Scripted {
-    async fn current(&mut self) -> JoinRiskSettings {
-        self.0.clone()
+    async fn current(&mut self) -> Result<JoinRiskSettings, JoinRiskTuningRefusal> {
+        Ok(self.0.clone())
     }
 }
 
@@ -322,6 +394,22 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
         .collect()
 }
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "tog10430_risk_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -329,11 +417,16 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
+        // PID + counter + nanos: wall-clock nanos can repeat across parallel
+        // tests on a coarse clock (run 39175965289 attempt 1: duplicate
+        // schema `tog10430_risk_*` -> 23505). The counter keeps same-tick
+        // names distinct, the PID separates test binaries, and nanos keeps a
+        // leaked schema plus PID reuse from ever repeating a name.
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("tog10430_risk_{stamp}");
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = schema_name_at(nanos);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

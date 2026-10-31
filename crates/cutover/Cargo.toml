@@ -21,6 +21,9 @@ workspace = true
 # sqlx is already a direct dependency, so no new driver burden.
 two-bot-core = { version = "0.4.0", path = "../core", features = ["db"] }
 two-bot-discord = { version = "0.4.0", path = "../discord" }
+# Store chain source of truth: the migrate runner plans/applies/verifies the
+# store migrations under their own ledger without re-implementing the set.
+two-bot-store = { version = "0.4.0", path = "../store" }
 hex = { workspace = true }
 serde = { workspace = true }
 # Preserve JSON syntax kinds and exact numeric tokens during parity checks.
@@ -102,6 +105,10 @@ path = "src/bin/gateway_force_identify.rs"
 [[bin]]
 name = "reengagement-list"
 path = "src/bin/reengagement_list.rs"
+
+[[bin]]
+name = "game-activity-report"
+path = "src/bin/game_activity_report.rs"
 
 [[bin]]
 name = "rollback-delta"

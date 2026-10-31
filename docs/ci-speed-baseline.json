@@ -1,0 +1,6 @@
+{
+  "minutes_per_merged_pr": 16.0,
+  "source": "check.yml lane comment: the old single check job ran the offline guards, fmt, clippy, every non-ignored test target and ~30 serial --ignored database steps in one container (p50 ~16 min)",
+  "measured_at": "pre-pilot estimate 2026-10-15",
+  "status": "estimate; replaced by ledger means once record rows exist on both sides of the rollout (see docs/ci-speed-rollout.md)"
+}

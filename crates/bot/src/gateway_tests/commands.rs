@@ -1,5 +1,10 @@
 //! Real shard + runtime composition, with only loopback Discord traffic and
 //! the parent's guarded, isolated TestDb. All database tests are opt-in.
+#[path = "feed_list_pages_acceptance.rs"]
+mod feed_list_pages_acceptance;
+#[path = "help_detail_snapshot_acceptance.rs"]
+mod help_detail_snapshot_acceptance;
+
 use super::*;
 
 use std::collections::HashMap;
@@ -35,7 +40,8 @@ async fn bootstrap(
     rest: &MockRest,
     vars: &HashMap<String, String>,
 ) -> Arc<crate::command_runtime::CommandRuntime> {
-    let config = GatewayCommandConfig::from_map(2222, vars).expect("command config");
+    let config =
+        GatewayCommandConfig::from_map_for_activation(2222, vars, true).expect("command config");
     let executor = ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap();
     let commands = tokio::time::timeout(
         BOUND,
@@ -478,7 +484,9 @@ async fn help_tracks_confirmed_ready_add_and_remove_publications() {
     gateway.stop().await;
     rest.shutdown().await;
     drop(runtime);
+    let detail = help_detail_snapshot_acceptance::capture(&db).await;
     db.close().await;
+    detail.assert_expected();
 }
 
 #[tokio::test]
@@ -531,16 +539,21 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
         // both the defer callback and the completion edit before asserting.
         wait_requests(&rest, 3 + (index + 1) * 2).await;
         let requests = rest.requests();
+        let seen: Vec<String> = requests
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
         let callback = format!("/interactions/{id}/custom-command-fixture/callback");
         assert_eq!(
             requests
                 .iter()
                 .filter(|r| r.path.ends_with(&callback))
                 .count(),
-            1
+            1,
+            "one defer callback for {id}; requests: {seen:#?}"
         );
         let patches: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
-        assert_eq!(patches.len(), index + 1);
+        assert_eq!(patches.len(), index + 1, "requests: {seen:#?}");
         let body: Value = serde_json::from_slice(&patches.last().unwrap().body).unwrap();
         assert_ne!(
             body["content"],
@@ -549,7 +562,12 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
     }
     wait_connected(&state).await;
     assert_registry(&rest); // No competing builtin-only publisher erased faq.
-    assert_eq!(rest.requests().len(), 11);
+    let seen: Vec<String> = rest
+        .requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(rest.requests().len(), 11, "requests: {seen:#?}");
     runner.abort();
     let _ = runner.await;
     gateway.stop().await;

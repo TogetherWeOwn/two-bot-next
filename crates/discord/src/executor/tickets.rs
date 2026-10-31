@@ -40,21 +40,18 @@ pub struct TicketChannelRequest<'a> {
 pub enum TicketMessage<'a> {
     Panel,
     Controls { opener_id: &'a str },
+    Claimed { staff_id: &'a str },
 }
 
-impl ActionExecutor {
-    pub async fn create_ticket_channel(
-        &self,
-        input: &TicketChannelRequest<'_>,
-    ) -> Result<String, DiscordError> {
-        let guild = snowflake(input.guild_id)?;
-        let category = snowflake(input.category_id)?;
-        let opener = snowflake(input.opener_id)?;
-        let staff = snowflake(input.staff_role_id)?;
-        let bot = snowflake(input.bot_id)?;
-        if input.reservation_id.is_empty()
-            || input.guild_id == input.staff_role_id
-            || input.bot_id == input.opener_id
+impl TicketChannelRequest<'_> {
+    fn permission_overwrites(&self) -> Result<[ChannelPermissionOverwrite; 4], DiscordError> {
+        let guild: Id<GuildMarker> = snowflake(self.guild_id)?;
+        let opener = snowflake(self.opener_id)?;
+        let staff = snowflake(self.staff_role_id)?;
+        let bot = snowflake(self.bot_id)?;
+        if self.reservation_id.is_empty()
+            || self.guild_id == self.staff_role_id
+            || self.bot_id == self.opener_id
         {
             return Err(DiscordError::Rejected(
                 "invalid ticket reservation or permission targets".into(),
@@ -69,7 +66,7 @@ impl ActionExecutor {
             allow,
             deny,
         };
-        let overwrites = [
+        Ok([
             overwrite(
                 guild.cast(),
                 ChannelPermissionOverwriteType::Role,
@@ -94,7 +91,70 @@ impl ActionExecutor {
                 common,
                 Permissions::empty(),
             ),
-        ];
+        ])
+    }
+
+    /// Prove the complete creation contract, not privacy from administrators.
+    /// Conservative by design: incomplete evidence and unrequested overwrites
+    /// are uncertain. This never fetches, repairs permissions, or deletes.
+    pub fn verify_receipt(&self, doc: &Value) -> Result<String, DiscordError> {
+        let id =
+            ticket_evidence_id(&doc["id"]).map_err(|_| invalid_ticket_receipt("channel_id"))?;
+        for (field, expected) in [("guild_id", self.guild_id), ("parent_id", self.category_id)] {
+            ticket_evidence_id(&doc[field]).map_err(|_| invalid_ticket_receipt(field))?;
+            if doc[field].as_str() != Some(expected) {
+                return Err(invalid_ticket_receipt(field));
+            }
+        }
+        if doc["type"].as_u64() != Some(0) {
+            return Err(invalid_ticket_receipt("channel_type"));
+        }
+        if doc["topic"].as_str() != Some(format!("two-ticket:{}", self.reservation_id).as_str()) {
+            return Err(invalid_ticket_receipt("reservation_topic"));
+        }
+        let expected = self
+            .permission_overwrites()
+            .map_err(|_| invalid_ticket_receipt("permission_targets"))?;
+        let rows = doc["permission_overwrites"]
+            .as_array()
+            .filter(|rows| rows.len() == expected.len())
+            .ok_or_else(|| invalid_ticket_receipt("permission_overwrites"))?;
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let id = ticket_evidence_id(&row["id"])
+                .map_err(|_| invalid_ticket_receipt("overwrite_id"))?;
+            let kind = match row["type"].as_u64() {
+                Some(0) => ChannelPermissionOverwriteType::Role,
+                Some(1) => ChannelPermissionOverwriteType::Member,
+                _ => return Err(invalid_ticket_receipt("overwrite_type")),
+            };
+            let target = expected
+                .iter()
+                .find(|target| target.id.get() == id && target.kind == kind)
+                .ok_or_else(|| invalid_ticket_receipt("unexpected_overwrite"))?;
+            if !seen.insert((row["type"].as_u64(), id)) {
+                return Err(invalid_ticket_receipt("duplicate_overwrite"));
+            }
+            let allow = ticket_permission_bits(&row["allow"])
+                .map_err(|_| invalid_ticket_receipt("overwrite_bits"))?;
+            let deny = ticket_permission_bits(&row["deny"])
+                .map_err(|_| invalid_ticket_receipt("overwrite_bits"))?;
+            if allow != target.allow.bits() || deny != target.deny.bits() {
+                return Err(invalid_ticket_receipt("overwrite_permissions"));
+            }
+        }
+        Ok(id.to_string())
+    }
+}
+
+impl ActionExecutor {
+    pub async fn create_ticket_channel(
+        &self,
+        input: &TicketChannelRequest<'_>,
+    ) -> Result<String, DiscordError> {
+        let guild = snowflake(input.guild_id)?;
+        let category = snowflake(input.category_id)?;
+        let overwrites = input.permission_overwrites()?;
         let name = ticket_channel_name(input.username);
         let topic = format!("two-ticket:{}", input.reservation_id);
         let req = Self::request_of(
@@ -107,15 +167,9 @@ impl ActionExecutor {
                 .permission_overwrites(&overwrites),
         )?;
         let res = self.call_once_raw_paced(req, &[200, 201]).await?;
-        let doc = ticket_json(&res)?;
-        let id = doc
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| DiscordError::Unavailable("ticket create omitted channel id".into()))?;
-        // Missing/malformed success evidence is uncertain, never a safe retry.
-        snowflake::<ChannelMarker>(id)
-            .map_err(|_| DiscordError::Unavailable("invalid ticket channel id".into()))?;
-        Ok(id.to_owned())
+        let doc = ticket_json(&res).map_err(|_| invalid_ticket_receipt("malformed_document"))?;
+        // No fallback fetch: missing or contradictory 2xx evidence stays uncertain.
+        input.verify_receipt(&doc)
     }
 
     /// A successful guild-wide query is required before orphan absence is inferred.
@@ -323,8 +377,22 @@ impl ActionExecutor {
                     Some(opener_id),
                 )
             }
+            TicketMessage::Claimed { staff_id } => {
+                snowflake::<UserMarker>(staff_id)?;
+                (
+                    format!("<@{staff_id}> claimed this ticket."),
+                    json!([]),
+                    None,
+                )
+            }
         };
-        let mut body = json!({"content":content,"components":[{"type":1,"components":buttons}]});
+        let mut body = json!({"content":content});
+        if buttons
+            .as_array()
+            .is_some_and(|buttons| !buttons.is_empty())
+        {
+            body["components"] = json!([{"type":1,"components":buttons}]);
+        }
         crate::message_safety::sanitize_message(&mut body);
         // The ONLY notification opt-in: a validated opener id in a fixed template.
         // No caller-supplied content or parse/role policy crosses this boundary.
@@ -358,6 +426,17 @@ struct TicketOverwrite {
     kind: u64,
     allow: u64,
     deny: u64,
+}
+
+fn invalid_ticket_receipt(reason: &'static str) -> DiscordError {
+    tracing::warn!(
+        reason,
+        next_action = "inspect_ticket_creation",
+        retryable = false,
+        "ticket creation receipt unproven"
+    );
+    // A response was received after mutation: never classify it as proven unsent.
+    DiscordError::Unavailable(format!("unproven ticket creation receipt: {reason}"))
 }
 
 fn invalid_ticket_permissions() -> DiscordError {

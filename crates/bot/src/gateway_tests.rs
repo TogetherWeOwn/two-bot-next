@@ -27,15 +27,19 @@ use crate::gateway::{
     build_pipeline, ensure_crypto_provider, load_boot_session, run_shard, GatewayState,
 };
 
+mod backpressure_acceptance;
 mod commands;
 mod custom_composition;
 mod deadline;
+mod dispatch_cause;
+mod duplicate_refusal;
 mod force_identify;
 mod member_journey;
 mod onboarding;
 mod persistent;
 mod recovery;
 mod rsvp;
+mod supervised_reconnect;
 mod voice;
 
 const GUILD: &str = "2222";
@@ -507,6 +511,19 @@ async fn spawn_runner_until_shutdown(
     JoinHandle<Result<(), sqlx::Error>>,
     Arc<RwLock<GatewayState>>,
 ) {
+    spawn_runner_with_automod_until_shutdown(db, url, commands, None, shutdown).await
+}
+
+async fn spawn_runner_with_automod_until_shutdown(
+    db: &TestDb,
+    url: &str,
+    commands: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    Arc<RwLock<GatewayState>>,
+) {
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store)
         .await
@@ -529,7 +546,7 @@ async fn spawn_runner_until_shutdown(
         None,
         None,
         commands,
-        None,
+        automod,
         None,
         shutdown,
     ));

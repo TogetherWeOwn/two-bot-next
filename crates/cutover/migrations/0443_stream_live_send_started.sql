@@ -1,0 +1,49 @@
+-- 0443_stream_live_send_started: fence ambiguous Discord sends for stale-claim recovery.
+--
+-- `stream_live_claims` (0440) never expires, so a crash after `claim_live`
+-- but before the Discord POST suppresses EventSub retries forever. Recovery
+-- must reclaim provably-unsent claims without double-posting a send that may
+-- already have reached Discord while `mark_live_delivered` failed. The two
+-- outcomes are indistinguishable from `delivered_at IS NULL` alone, and
+-- `release_live` deletes any unstamped row, so bulk-deleting stale
+-- unstamped rows is forbidden.
+--
+-- This migration adds `send_started_at`, committed by the receiver BEFORE
+-- the first Discord POST (`mark_live_send_started`, mirroring
+-- `automod_delivery_claims.mutation_started`: no lease automatically retries
+-- a mutation whose Discord outcome is uncertain). State machine:
+-- claimed (`send_started_at IS NULL`, `delivered_at IS NULL`) -> sending
+-- (`send_started_at NOT NULL`) -> delivered (`delivered_at NOT NULL`).
+-- Stale takeover (`reclaim_stale_live`) only rewrites claimed rows whose
+-- `claimed_at` is older than the bounded lease (see
+-- `STALE_CLAIM_LEASE_SECS`): atomic single-statement UPDATE with
+-- `delivered_at IS NULL AND send_started_at IS NULL`, so concurrent retries
+-- cannot both win and delivered/ambiguous rows are never reclaimed.
+-- `release_live` keeps its shape for the same-process provably-unsent path
+-- (`SendFailed` disposition) and must never be used as stale recovery.
+--
+-- This migration also adds `claim_token`, the ownership fence: a fresh
+-- insert generates a token and a takeover rotates it, and
+-- `mark_live_send_started` / `mark_live_delivered` / `release_live` only
+-- act on the row whose token they present (mirroring
+-- `automod_delivery_claims.claim_token`). Without it a timed-out-but-
+-- running original owner could still start, stamp or release the row a
+-- takeover gave to a new owner. `release_live` also refuses started rows,
+-- so a stamp failure can never free a possibly-posted claim. Existing
+-- rows stay tokenless (NULL) until a takeover rotates a token in; no
+-- receiver holds a token for them yet, so no owner is locked out.
+-- One-row-per-go-live retention is unchanged: delivered rows are kept
+-- indefinitely as dedup fences; this slice adds no purge.
+-- No member identity (same shape as 0440), so the member erasure plan needs
+-- no entry. Additive only: two nullable columns, no backfill (existing rows
+-- stay NULL = never-started and tokenless, hence reclaimable once stale,
+-- matching their pre-recovery meaning). `IF NOT EXISTS` throughout,
+-- matching the S6 convention. Rollback is `ALTER TABLE stream_live_claims
+-- DROP COLUMN IF EXISTS send_started_at, DROP COLUMN IF EXISTS
+-- claim_token` (in-flight sending markers and ownership tokens are lost;
+-- delivered fences survive).
+-- Bot schema range: 0001-0999. Database tests use test containers only.
+
+ALTER TABLE IF EXISTS stream_live_claims
+    ADD COLUMN IF NOT EXISTS send_started_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS claim_token TEXT;
