@@ -172,8 +172,10 @@ head commit, with no approving review. The single
 `ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
 cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
 (including the runbook command-drift test). The agent that did the work
-squash-merges once the checks are green; a merge to `main` that changes runtime
-paths deploys production, so it also needs the owner's approval. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
+squash-merges once every required check is green and each review finding is fixed
+or answered with evidence. A merge to `main` that touches a path outside the
+`paths-ignore` list in `deploy-staging.yml` (CI scripts and workflows included)
+deploys production, so it also needs the owner's approval. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
 workspace toolchain is pinned in `rust-toolchain.toml`.
 
 Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
