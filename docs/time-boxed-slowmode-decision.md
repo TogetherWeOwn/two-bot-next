@@ -216,7 +216,7 @@ is involved. No Cargo build is needed for this documentation-only outcome.
 The author recommends **no new automatic authority** and cannot independently
 approve an authored capability request. Independent review must assess these
 exact document bytes and the no-build boundary, not approve a hypothetical
-executor. Normal exact-head CI and independent Paperclip Review remain required
+executor. Normal exact-head CI, CodeRabbit and Devin Review remain required
 for publication; they do not constitute new guild-host intent or activation.
 
 Only reconsider on materially new evidence: demonstrated incremental value,

@@ -418,8 +418,8 @@ erasure-wide replay fence. The author cannot accept that boundary. Record exact
 file commit/hash and task-document revision for both paths; changed intent needs
 fresh disposition. No new privilege, credential, routine approval hop or spend.
 Later authorized code still needs test-first protected fixtures, exact-head
-required checks and independent Paperclip Review 5/5, controller-managed squash
-auto-merge and normal staging/health/rollback gates; never a manual merge bypass.
+required checks (including CodeRabbit and Devin Review), squash merge by the
+authoring agent and normal staging/health/rollback gates; never a manual merge bypass.
 
 Review by 2026-11-02: metric is 16/16 scenario rows with agreed future assertions
 and explicit intent/security disposition, not registrations or measured demand.

@@ -45,7 +45,7 @@ REQUIRED_SECTIONS = [
     # (heading, minimum real items, skipped for LIGHT_TYPES)
     # Pipeline review 2026-10-10: only what a reviewer or a deterministic gate needs. The tracked card or
     # issue, and the test evidence. Thinking Path, What Changed, Risks, Model Used and the checklist ticks
-    # are optional prose; the Paperclip Review reads the diff itself.
+    # are optional prose; the reviewers read the diff itself.
     ("Linked Issues or Issue Description", 1, True),
     ("Verification", 1, False),
 ]
