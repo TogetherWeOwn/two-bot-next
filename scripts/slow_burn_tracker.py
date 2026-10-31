@@ -360,6 +360,32 @@ def gh(args, repo, token_env):
     return completed.stdout
 
 
+def gh_with_body(args, body, repo, token_env):
+    """Run one `gh issue` command whose `--body-file` lives in private scratch.
+
+    The body file never touches the working directory, so a run (or a test)
+    from a checkout leaves the tree clean.
+    """
+    try:
+        scratch = tempfile.TemporaryDirectory(prefix="slow-burn-gh-body-")
+    except OSError:
+        raise TrackError("issue reconcile failed: body scratch I/O failed")
+    try:
+        body_path = Path(scratch.name) / "body.md"
+        try:
+            body_path.write_text(body, encoding="utf-8")
+        except OSError:
+            raise TrackError("issue reconcile failed: body scratch I/O failed")
+        return gh(args + ["--body-file", str(body_path)], repo, token_env)
+    finally:
+        try:
+            scratch.cleanup()
+        except OSError:
+            # gh may already have accepted the write; a leftover scratch
+            # directory must not turn that into a failure with no receipt.
+            pass
+
+
 def open_tracking_issues(repo, token, label, prefix):
     try:
         raw = gh(["list", "--state", "open", "--label", label,
@@ -446,11 +472,9 @@ def reconcile(*, repo, token, label, prefix, origin, run_url, now,
             if dry_run:
                 print(f"dry-run: would create issue {title!r} with label {label!r}")
                 return "would-create", None
-            body_path = Path("tracker-issue-body.md")
-            body_path.write_text(
-                issue_body(origin, run_url, now, fast_also), encoding="utf-8")
-            out = gh(["create", "--title", title, "--body-file", str(body_path),
-                      "--label", label], repo, token)
+            out = gh_with_body(["create", "--title", title, "--label", label],
+                               issue_body(origin, run_url, now, fast_also),
+                               repo, token)
             match = re.search(r"/issues/(\d+)\s*$", out.strip())
             number = int(match.group(1)) if match else None
             return "created", number
@@ -461,13 +485,10 @@ def reconcile(*, repo, token, label, prefix, origin, run_url, now,
         if dry_run:
             print(f"dry-run: would refresh comment on issue #{number}")
             return "would-refresh", number
-        comment_path = Path("tracker-refresh-body.md")
-        comment_path.write_text(refresh_comment(run_url), encoding="utf-8")
-        gh(["comment", str(number), "--body-file", str(comment_path)], repo, token)
-        body_path = Path("tracker-issue-body.md")
-        body_path.write_text(
-            with_marker(issue.get("body") or "", now), encoding="utf-8")
-        gh(["edit", str(number), "--body-file", str(body_path)], repo, token)
+        gh_with_body(["comment", str(number)], refresh_comment(run_url),
+                     repo, token)
+        gh_with_body(["edit", str(number)],
+                     with_marker(issue.get("body") or "", now), repo, token)
         return "refreshed", number
     if not tracked:
         return "none-open", None
@@ -476,9 +497,7 @@ def reconcile(*, repo, token, label, prefix, origin, run_url, now,
     if dry_run:
         print(f"dry-run: would resolve and close issue #{number}")
         return "would-close", number
-    comment_path = Path("tracker-resolve-body.md")
-    comment_path.write_text(resolve_comment(run_url), encoding="utf-8")
-    gh(["comment", str(number), "--body-file", str(comment_path)], repo, token)
+    gh_with_body(["comment", str(number)], resolve_comment(run_url), repo, token)
     gh(["close", str(number), "--reason", "completed"], repo, token)
     return "closed", number
 
