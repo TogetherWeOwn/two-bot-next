@@ -1682,7 +1682,7 @@ export class TwoBotContainer extends Container<Env> {
       // config arms it; production and unarmed staging evaluate the scraped
       // samples untouched. Never logged: the switches never leave this gate.
       const faulted = applyStagingFaultInjection(samples, previous, this.env);
-      const { firing, state } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
+      const { firing, state, voiceLiveNotReadyEvidence } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
@@ -1725,7 +1725,13 @@ export class TwoBotContainer extends Container<Env> {
       try {
         const stored = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
         const nowSeconds = Math.floor(Date.now() / 1000);
-        const remediation = evaluateRemediation(firing, sanitizeRemediationState(stored, nowSeconds), nowSeconds);
+        // A retained `voice_live_not_ready` (the age gauge was missing or
+        // malformed this scrape, so the alert merely holds its previous
+        // firing state) keeps the alert held but must not advance that
+        // scope's action/failure progression — freeze it until a current
+        // age sample arrives.
+        const retainedFiring = voiceLiveNotReadyEvidence ? [] : ["voice_live_not_ready"];
+        const remediation = evaluateRemediation(firing, sanitizeRemediationState(stored, nowSeconds), nowSeconds, retainedFiring);
         await this.ctx.storage.put(REMEDIATION_KEY, remediation.state);
         for (const message of remediation.messages) {
           const content = `${message.text}.${alertContextSuffix(context)}`;

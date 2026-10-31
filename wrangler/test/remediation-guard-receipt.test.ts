@@ -75,6 +75,7 @@ test("suppressed firing without a message is quiet, not recovery", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "takeover-recommended", consecutiveFailures: 2, suppressed: true, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -87,6 +88,7 @@ test("firing inside the global cooldown without a message is held", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "reload-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -99,6 +101,7 @@ test("quiet tick on a non-idle guard is the sustained-clear hold-down", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "takeover-recommended", consecutiveFailures: 1, suppressed: false, clearSinceSeconds: NOW + 60 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -106,11 +109,31 @@ test("quiet tick on a non-idle guard is the sustained-clear hold-down", () => {
   assert.equal(decision, "clear-hold");
 });
 
+test("a hold-down on the deaf scope alone is a clear-hold, not an idle reset", () => {
+  // Every scope must be checked: a guard where only the newest scope holds a
+  // hold-down would otherwise be reported `idle`, claiming a reset that did
+  // not happen.
+  const liveHold: RemediationState = {
+    lastRecommendedAtSeconds: NOW,
+    scopes: {
+      "voice-stall": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "takeover-recommended", consecutiveFailures: 1, suppressed: false, clearSinceSeconds: NOW + 60 },
+      "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+    },
+  };
+  assert.equal(remediationReceiptDecision([], [], liveHold, NOW + 120).decision, "clear-hold");
+  // Fully reset still reports idle.
+  const allIdle = structuredClone(liveHold) as RemediationState & { scopes: Record<string, unknown> };
+  (allIdle.scopes as Record<string, unknown>)["voice-live"] = { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 };
+  assert.equal(remediationReceiptDecision([], [], allIdle, NOW + 120).decision, "idle");
+});
+
 test("success receipt reflects the persisted read-back with exact correlation", () => {
   const expected: RemediationState = {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "reload-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
@@ -134,6 +157,7 @@ test("mismatched read-back is a failure receipt, never a false success", () => {
     lastRecommendedAtSeconds: NOW,
     scopes: {
       "voice-stall": { phase: "reload-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
