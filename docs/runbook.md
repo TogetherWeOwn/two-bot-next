@@ -918,12 +918,16 @@ not-ready together (gateway-side, not one guild's view) — the fix belongs
 to the on-call engineer, not another redeploy.
 
 Guarded remediation recommends alongside this alert, in its own scope so it
-cannot spend the creator-map scope's window: `dispatch-retry` first (the bot's
-own dispatch republishes a not-ready view from the gateway cache on every voice
-frame, so a self-healing view can clear with no step at all), then one
-same-SHA-takeover Operator card if the alert survives that window (see
+cannot spend the creator-map scope's window. The alert's own 120 s bound is
+already the in-process repair window: while the age climbs, the bot's dispatch
+republishes the not-ready view from the gateway cache on every voice frame
+(`two_bot_voice_live_self_heal_total` counts the repairs), so by the time the
+alert pages the expired self-heal counts as attempt one and the first
+recommendation is already one same-SHA-takeover Operator card (see
 [auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
-The restart above is that takeover card, not an ad-hoc host action.
+The restart above is that takeover card, not an ad-hoc host action. A retained
+alert (the gauge missing or malformed in a scrape) keeps this alert held but
+freezes the scope's progression until a current age sample arrives.
 
 #### Alert: voice queue stall
 
@@ -2180,16 +2184,16 @@ existing deploy workflow. No new endpoint, credential, spend, or authority.
 
 Each scope owns its phase/failure guard: `voice_creator_map_stale` (merges not
 landing) and `voice_live_not_ready` (a deaf live view on a connected gateway)
-are different faults with different first steps, so a shared guard would let
-either spend the other's cooldown window and failure count. The 30-minute
-cooldown below is global and still caps the whole table.
+are different faults, so a shared guard would let either spend the other's
+cooldown window and failure count. The 30-minute cooldown below is global and
+still caps the whole table.
 
 Trigger table (a recommendation fires only while its trigger key fires):
 
 | Scope | Trigger firing key | R1 (first) | R2 (escalation) |
 |---|---|---|---|
 | `voice-stall` | `voice_creator_map_stale` | `creator-map-reload`: the bot's maintenance tick retries the merge every 5 minutes; no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
-| `voice-live` | `voice_live_not_ready` | `dispatch-retry`: the bot's own dispatch republishes a not-ready live view from the gateway cache on every voice frame (`voice_live_self_heal_total` counts the repairs); no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
+| `voice-live` | `voice_live_not_ready` | skipped: the alert's 120 s bound is already the bot's self-heal window — the dispatch republishes the not-ready view from the gateway cache every voice frame while it climbs (`voice_live_self_heal_total` counts the repairs), so the expired self-heal counts as attempt one | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
 | `crash-loop` | `gateway_unpaired_disconnect` | skipped: no in-process reload can fix a gateway that never came back | `same-sha-takeover`: one Operator card, same path as above |
 
 Guard state (persisted in DO storage next to the alert state):
@@ -2200,6 +2204,15 @@ Guard state (persisted in DO storage next to the alert state):
   others each wait for their own next window.
 - A recommendation while a prior one for the same scope did not clear the
   alert counts as one consecutive failure for that scope.
+- A trigger key can also be *retained*: its alert holds the previous firing
+  state when the scrape carries no current evidence (the gauge is missing or
+  malformed — e.g. an older container). The held alert stays firing and
+  untouched, but a retained key never advances its scope — no new
+  recommendation, no failure increment, no hold-down reset, and it never
+  consumes the global window — until a current sample arrives. Today the only
+  retained-capable trigger is `voice_live_not_ready`; the caller passes the
+  scrape's `voiceLiveNotReadyEvidence` flag so progression only ever runs on a
+  current age reading.
 - After 2 consecutive failures the scope goes quiet and the Worker pages the
   CEO card once, on the same best-effort webhook path as the alerts
   themselves: if forwarding is off or delivery fails, the scope still goes
@@ -2220,7 +2233,7 @@ Guard state (persisted in DO storage next to the alert state):
 Operator card shape for `same-sha-takeover`: name the firing key, the build
 revision from the alert line, and the deploy workflow run to dispatch at that
 same SHA. File a host-action card only from a `same-sha-takeover` line: the
-first step (`creator-map-reload` or `dispatch-retry`) is never card authority.
+first step (`creator-map-reload`) is never card authority.
 File exactly one
 card per host step; act only while the alert is firing. A repeated takeover
 line for the same still-firing alert is the escalation retry, not a second
