@@ -278,6 +278,34 @@ class TrackerUnitTests(unittest.TestCase):
                                     for body in fake.bodies))
                 self.assertEqual(sorted(os.listdir(cwd)), [])
 
+    def test_body_scratch_io_failure_is_a_track_error(self):
+        # Scratch setup or write faults must reach main()'s TrackError path,
+        # which writes the failure receipt, not escape as a raw OSError.
+        faults = {
+            "setup": mock.patch.object(tracker.tempfile, "TemporaryDirectory",
+                                       side_effect=OSError("no space")),
+            "write": mock.patch.object(tracker.Path, "write_text",
+                                       side_effect=OSError("no space")),
+        }
+        for name, fault in faults.items():
+            fake = FakeGh()
+            with self.subTest(name), mock.patch("subprocess.run", fake), fault:
+                with self.assertRaises(tracker.TrackError) as caught:
+                    tracker.gh_with_body(["comment", "7"], "body", REPO, "t")
+                self.assertEqual(str(caught.exception),
+                                 "issue reconcile failed: body scratch I/O failed")
+                self.assertEqual(fake.calls, [])
+
+    def test_body_scratch_cleanup_failure_keeps_the_completed_write(self):
+        # gh has already accepted the write; a cleanup fault must not turn
+        # that into a failure with no receipt for the completed action.
+        fake = FakeGh()
+        with mock.patch("subprocess.run", fake), \
+                mock.patch.object(tracker.tempfile.TemporaryDirectory, "cleanup",
+                                  side_effect=OSError("busy")):
+            tracker.gh_with_body(["comment", "7"], "body", REPO, "t")
+        self.assertEqual(fake.bodies, ["body"])
+
     def test_ignored_runtime_outputs_are_not_tracked(self):
         # A tracked copy of an ignored runtime output is rewritten by every
         # run, and a tracked coverage seed defeats the cache-miss warm-up.
@@ -286,13 +314,12 @@ class TrackerUnitTests(unittest.TestCase):
                  "slow-burn-ring-prev.json", "slow-burn-tracker-evidence.json",
                  "slow-burn-exposition.prom", "tracker-refresh-body.md",
                  "tracker-issue-body.md", "tracker-resolve-body.md"]
-        try:
-            listed = subprocess.run(
-                ["git", "-C", str(root), "ls-files", "--", *names],
-                capture_output=True, text=True, timeout=30, check=True).stdout
-        except (OSError, subprocess.SubprocessError):
-            self.skipTest("git checkout unavailable")
-        self.assertEqual(listed.split(), [])
+        # No skip on a git failure: an unrunnable guard must fail, not pass.
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", *names],
+            capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(listed.stdout.split(), [])
+        self.assertIn("did not match any file", listed.stderr)
 
     def test_held_verdict_decides_nothing(self):
         evidence = str(self.dir / "evidence.json")

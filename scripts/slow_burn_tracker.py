@@ -366,10 +366,24 @@ def gh_with_body(args, body, repo, token_env):
     The body file never touches the working directory, so a run (or a test)
     from a checkout leaves the tree clean.
     """
-    with tempfile.TemporaryDirectory(prefix="slow-burn-gh-body-") as scratch:
-        body_path = Path(scratch) / "body.md"
-        body_path.write_text(body, encoding="utf-8")
+    try:
+        scratch = tempfile.TemporaryDirectory(prefix="slow-burn-gh-body-")
+    except OSError:
+        raise TrackError("issue reconcile failed: body scratch I/O failed")
+    try:
+        body_path = Path(scratch.name) / "body.md"
+        try:
+            body_path.write_text(body, encoding="utf-8")
+        except OSError:
+            raise TrackError("issue reconcile failed: body scratch I/O failed")
         return gh(args + ["--body-file", str(body_path)], repo, token_env)
+    finally:
+        try:
+            scratch.cleanup()
+        except OSError:
+            # gh may already have accepted the write; a leftover scratch
+            # directory must not turn that into a failure with no receipt.
+            pass
 
 
 def open_tracking_issues(repo, token, label, prefix):
