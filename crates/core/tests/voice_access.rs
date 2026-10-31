@@ -178,7 +178,6 @@ fn command_list_covers_every_spec_command() {
         "kick",
         "limit",
         "logging",
-        "myroom",
         "name",
         "nick",
         "ping",

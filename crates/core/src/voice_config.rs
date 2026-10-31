@@ -266,7 +266,7 @@ pub fn validate_command_role_change(
         Some(role) if Some(role) == previous.settings.command_role_id.as_deref() => Ok(()),
         Some(_) => Err(invalid(
             "settings.command_role_id",
-            "cannot be imported: this guild-wide role is not enforced by any command gate; restrict a single command with settings.command_roles, or use /access in Discord",
+            "cannot be imported: this guild-wide role is not enforced by any command gate; set the role gate with /access in Discord",
         )),
     }
 }
@@ -455,8 +455,9 @@ pub fn validate_configuration(
     for (i, restriction) in settings.command_roles.iter().enumerate() {
         let path = format!("settings.command_roles[{i}]");
         // Config import writes voice_command_roles, not the live access-policy
-        // store used by /myroom. Do not accept a restriction it cannot enforce.
-        if restriction.command == "myroom" || !is_voice_command(&restriction.command) {
+        // store. Only names from the restrictable vocabulary (`VOICE_COMMANDS`)
+        // may be imported; `myroom` is not in it and refuses here.
+        if !is_voice_command(&restriction.command) {
             return Err(invalid(
                 &format!("{path}.command"),
                 "must be a restrictable voice command",

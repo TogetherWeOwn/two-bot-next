@@ -16,7 +16,11 @@ pub type RoleId = Snowflake;
 /// Every voice slash command (without the leading slash) that a guild-level
 /// per-command role restriction may name, taken from `docs/voice-rooms.md`.
 /// Matching is exact lowercase; anything else is refused by
-/// [`validate_access_controls`].
+/// [`validate_access_controls`]. `/myroom` is deliberately absent: the member
+/// discovery read has no per-command role policy, so admitting the name here
+/// would persist a restriction no gate can enforce (and a rollback image
+/// could not decode). The guild-wide `required_role` gate still applies to
+/// it through [`may_use_command`].
 pub const VOICE_COMMANDS: &[&str] = &[
     "alias",
     "alwaysprivate",
@@ -31,7 +35,6 @@ pub const VOICE_COMMANDS: &[&str] = &[
     "kick",
     "limit",
     "logging",
-    "myroom",
     "name",
     "nick",
     "ping",

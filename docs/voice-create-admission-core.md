@@ -140,36 +140,26 @@ staging readiness (staging proof stays on the voice acceptance card).
 ## Private owned-room discovery and rollback
 
 `/myroom` replies once, ephemerally, with the invoker's current owned live
-rooms. Readiness, channel presence and the observed `@everyone` Connect ACL
-come from one live snapshot. An unavailable worker or unknown ACL returns an
-availability notice, not a guessed public room. A deleted channel is omitted.
-The persisted private flag may remain set after Connect opens if Join-channel
-cleanup fails; discovery reports the observed ACL without changing that retry
-state. Large lists stop at complete rows below the completion limit and state
-how many rooms were omitted. The read does not change rooms or permissions.
+rooms as channel mentions only. The requester is the authenticated invoker;
+readiness and channel presence come from one live snapshot of the connected,
+unhalted worker. Another member's rooms are never shown, and a channel
+already gone from the snapshot is omitted. An unavailable worker or
+unready snapshot returns a transient notice, not a guessed room. An empty
+answer means the snapshot found no owned live room — never that the worker
+is missing — and appends the join guidance only when creation is actually
+open (creation enabled and a creator channel exists). Large lists stop at
+complete rows below the completion limit and state how many rooms were
+omitted. The read performs no room, permission or policy write.
 
-Runtime `/access restrict command:myroom` is supported. Configuration import
-rejects `settings.command_roles` entries for `myroom`, including empty role
-lists: that import writes a different policy store and cannot enforce this
-command's restriction. Exporting or importing configuration is **not** proof
-that the runtime access-policy store is clear.
-
-**Before reverting to an image from before `/myroom`:** while the compatible
-new image is still running, an authorized guild administrator must perform the
-following in **every affected guild**:
-
-1. Run `/access show` and retain the current runtime policy read-back.
-2. If `myroom` is restricted, run `/access unrestrict command:myroom`.
-3. Run `/access show` again. Verify `myroom` is absent and every unrelated
-   restriction is preserved. Retain this read-back with the rollback evidence.
-4. Only after all affected guilds have verified cleanup, revert the image
-   through the existing governed rollout procedure and verify health.
-
-The preceding strict policy reader rejects the unknown `myroom` key; reverting
-first can make the entire runtime policy unreadable. If cleanup or read-back
-fails, stop that rollback: do not bypass the validator or clear the policy
-store. Restore the compatible image if necessary to complete authorized
-cleanup. There is no schema migration to reverse.
+`/myroom` carries no per-command role policy and no persisted vocabulary:
+the restrictable list (`VOICE_COMMANDS`) excludes it, so `/access restrict
+command:myroom` is refused truthfully without a write, configuration import
+rejects `settings.command_roles` entries for it, and no other writer can
+save the key. The guild-wide `required_role` gate still applies to it
+through the normal invocation gate. Because no `myroom` key can be
+persisted, the preceding strict policy reader never meets one and the
+automatic image rollback needs no cleanup step — there is also no schema
+migration to reverse.
 
 Existing saved custom `myroom` definitions remain publishable and executable
 with voice off, and support same-name edits and pause/resume. Fresh custom
@@ -178,6 +168,19 @@ precedence; the custom text trigger remains distinct. Custom catalog and
 import capacity count actual all-enabled publication slots: 67 builtins plus
 33 noncolliding customs fit the 100-command ceiling. The unpublished assistant
 reserves its name but does not consume another slot.
+
+**Historical catalogs beyond the ceiling:** when the complete valid
+baseline (gate-constrained builtins plus every persisted enabled custom
+row) would fit at 100 but adding `/myroom` alone would overflow, the
+serialized registry owner publishes the baseline without only that
+builtin — e.g. `66 builtins + 34 customs` stays bootable rather than
+failing at `67 + 34 = 101`. No custom row is truncated, disabled or
+deleted, an invalid baseline still fails, and the next serialized
+registry sync re-evaluates: `/myroom` is admitted by a normal republish
+once capacity allows. When withheld, the publish log records the deferral
+and the confirmed command set (help/discovery included) does not
+advertise it; a stale invocation still obeys the application/guild/voice
+and builtin-precedence fences.
 
 ## Hermetic verification
 

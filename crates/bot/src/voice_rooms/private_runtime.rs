@@ -232,22 +232,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .map(|channel| channel.permission_overwrites.clone().unwrap_or_default())
     }
 
-    /// Fence `room`'s cached ACL at the revision it holds now. A privacy write
-    /// whose outcome was never observed may already have landed, so the cached
-    /// set is not evidence until Discord (or the retry's own successful write)
-    /// advances the channel revision past this point.
-    pub(super) fn fence_ambiguous_overwrites(&mut self, room: Snowflake) {
-        let revision = self
-            .live
-            .read_state()
-            .channel_revisions
-            .get(&room)
-            .copied()
-            .unwrap_or(0);
-        self.ambiguous_overwrites.insert(room, revision);
-    }
-
-    pub(super) fn live_everyone_denies_connect(&self, room: Snowflake) -> bool {
+    fn live_everyone_denies_connect(&self, room: Snowflake) -> bool {
         self.live_overwrites(room).is_some_and(|overwrites| {
             overwrites.iter().any(|overwrite| {
                 overwrite.kind == PermissionOverwriteType::Role
@@ -617,14 +602,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Err(RoomHttpError::UnknownOutcome) => {
                 // Both writes replace a whole entry and the Join delete treats
                 // a missing channel as done, so a retry is safe.
-                //
-                // The retry is only safe for the WRITE. The result may have
-                // landed, so the cached ACL this attempt started from is now
-                // ambiguous: it may still read "private" while the room is
-                // already open. Fence it until Discord reports a different set
-                // (`/myroom` then reports the room unavailable rather than
-                // labelling it from evidence it can no longer trust).
-                self.fence_ambiguous_overwrites(room);
                 self.mark_failed_observed(
                     action,
                     "Discord privacy write outcome unknown".to_owned(),

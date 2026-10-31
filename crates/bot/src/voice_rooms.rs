@@ -3162,11 +3162,6 @@ pub struct GuildRoomWorker<S, H> {
     privacy: HashMap<Snowflake, PrivateRoom>,
     /// Rooms whose in-memory privacy state is not yet durable.
     privacy_dirty: HashSet<Snowflake>,
-    /// Rooms whose cached ACL a lost-reply privacy write may already have
-    /// replaced, mapped to the channel revision it was fenced at. Until the
-    /// revision advances, the cached ACL is not evidence and `/myroom` reports
-    /// the room unavailable instead of labelling it from a possibly stale set.
-    ambiguous_overwrites: HashMap<Snowflake, u64>,
     /// Join channel ids this worker created or loaded from its own store:
     /// the only ones a `DeleteJoinChannel` may delete.
     join_deletable: HashSet<Snowflake>,
@@ -3524,7 +3519,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             denied: HashMap::new(),
             privacy,
             privacy_dirty: HashSet::new(),
-            ambiguous_overwrites: HashMap::new(),
             join_deletable,
             join: join_requests::JoinRequests::new(),
             failures: VecDeque::new(),
@@ -3943,68 +3937,39 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         rooms
     }
 
-    /// `owned_rooms` for the `/myroom` read: `None` unless live evidence is
+    /// The member's currently owned live rooms for `/myroom`, as channel
+    /// references in channel order. `None` unless live evidence is
     /// authoritative (gateway connected, snapshot ready, worker not halted),
-    /// matching `kick_room_of`. A disconnected or just-loaded worker may track
-    /// rooms Discord no longer has, so it must not call them live.
-    pub fn live_owned_rooms(&self, member: Snowflake) -> Option<Vec<(Snowflake, bool)>> {
+    /// matching `kick_room_of`: a disconnected or just-loaded worker may
+    /// track rooms Discord no longer has, so it must not call them live.
+    /// Ownership is the current `owner_id`, never the original creator; a
+    /// channel absent from this one live snapshot (already deleted on
+    /// Discord) is excluded. Channel references only — no privacy label or
+    /// ACL classification is part of this read.
+    /// Pure in-memory read: no store, queue or Discord touch.
+    pub fn live_owned_rooms(&self, member: Snowflake) -> Option<Vec<Snowflake>> {
         let live = self.live.read_state();
         if !live.ready || self.halted {
             return None;
         }
-        let mut rooms = Vec::new();
-        for (id, room) in &self.rooms {
-            if room.owner_id != member {
-                continue;
-            }
-            // Gateway removal precedes reconciliation of tracked rows. Ready,
-            // presence and ACL evidence must all belong to this one snapshot.
-            let Some(channel) = live.channels.get(id) else {
-                continue;
-            };
-            let overwrites = channel.permission_overwrites.as_ref()?;
-            // A lost-reply privacy write may already have landed. Its cached
-            // ACL is not evidence until the channel revision moves past the
-            // fence, so report the room unavailable rather than label it from
-            // a set that may be stale.
-            if let Some(fenced) = self.ambiguous_overwrites.get(id) {
-                if live.channel_revisions.get(id).copied().unwrap_or(0) <= *fenced {
-                    return None;
-                }
-            }
-            // The persisted private flag can outlive a successful Connect-open
-            // write when Join cleanup fails. It is retry state, not ACL proof.
-            let private = overwrites.iter().any(|overwrite| {
-                overwrite.kind == PermissionOverwriteType::Role
-                    && overwrite.id.get() == self.live.guild_id
-                    && overwrite.deny.contains(Permissions::CONNECT)
-            });
-            rooms.push((*id, private));
-        }
+        let mut rooms: Vec<Snowflake> = self
+            .rooms
+            .iter()
+            .filter(|(channel, room)| {
+                room.owner_id == member && live.channels.contains_key(channel)
+            })
+            .map(|(channel, _)| *channel)
+            .collect();
         rooms.sort_unstable();
         Some(rooms)
     }
 
-    /// The member's currently owned tracked rooms as `(room channel, runtime
-    /// private)` pairs in channel order. Ownership is the current
-    /// `owner_id`, never the original creator. Privacy is the effective
-    /// closed state: the live worker flag, or Connect denied to @everyone
-    /// on Discord (an `/alwaysprivate` creator closes rooms the flag still
-    /// reads as public). Pure in-memory read: no store, queue or Discord
-    /// touch.
-    pub fn owned_rooms(&self, member: Snowflake) -> Vec<(Snowflake, bool)> {
-        let mut rooms: Vec<(Snowflake, bool)> = self
-            .rooms
-            .iter()
-            .filter(|(_, room)| room.owner_id == member)
-            .map(|(channel, _)| {
-                let private = self.privacy.get(channel).is_some_and(|room| room.private)
-                    || self.live_everyone_denies_connect(*channel);
-                (*channel, private)
-            })
-            .collect();
-        rooms.sort_unstable();
-        rooms
+    /// Whether joining a creator channel could currently start a room: the
+    /// guild-wide creation switch is on and at least one creator channel is
+    /// live. `/myroom` shows the join guidance only when this is true, so an
+    /// empty reply never points at an unavailable path.
+    pub fn creation_available(&self) -> bool {
+        may_create_room(&self.access) && !self.live.read_state().creator_channels.is_empty()
     }
 
     /// Replace the caps and cooldown used by the durable create admission
@@ -7969,13 +7934,22 @@ enum ActorCommand {
         decision: JoinDecisionCommand,
         reply: oneshot::Sender<JoinReply>,
     },
-    /// Read-only `/myroom`: the member's currently owned live rooms as
-    /// `(room channel, runtime private)` pairs in channel order. Answered
-    /// from live worker state only; never touches the store.
+    /// Read-only `/myroom`: the member's currently owned live room channel
+    /// references plus whether room creation is open for guidance text.
+    /// Answered from live worker state only; never touches the store.
     MyRooms {
         member: Snowflake,
-        reply: oneshot::Sender<Option<Vec<(Snowflake, bool)>>>,
+        reply: oneshot::Sender<Option<MyRoomsReply>>,
     },
+}
+
+/// One `/myroom` worker answer: owned live channel references in channel
+/// order plus whether room creation is open, so the empty reply's join
+/// guidance is shown only when a creator lobby could actually be joined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MyRoomsReply {
+    pub rooms: Vec<Snowflake>,
+    pub creation_available: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -8984,15 +8958,10 @@ where
     }
 
     /// Read one member's currently owned live rooms (`/myroom`) from the
-    /// live worker as `(room channel, runtime private)` pairs. `None` when
-    /// the guild has no live actor, when its inbox already drained, when no
-    /// answer arrived within `WORKER_ACK_WAIT`, or when the worker's live
-    /// evidence is not ready.
-    pub async fn run_myrooms(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Option<Vec<(Snowflake, bool)>> {
+    /// live worker. `None` when the guild has no live actor, when its inbox
+    /// already drained, when no answer arrived within `WORKER_ACK_WAIT`, or
+    /// when the worker's live evidence is not ready.
+    pub async fn run_myrooms(&self, guild: Snowflake, member: Snowflake) -> Option<MyRoomsReply> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -10542,7 +10511,10 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             let _ = reply.send(worker.apply_join_decision(decision));
         }
         ActorCommand::MyRooms { member, reply } => {
-            let _ = reply.send(worker.live_owned_rooms(member));
+            let _ = reply.send(worker.live_owned_rooms(member).map(|rooms| MyRoomsReply {
+                rooms,
+                creation_available: worker.creation_available(),
+            }));
         }
     }
     accepted_join
@@ -13856,6 +13828,15 @@ async fn execute_access<S: RoomPersistence>(
             access_required_role_ack(role)
         }
         AccessAction::Restrict { command, roles } => {
+            // `/myroom` is a real voice command but carries no per-command
+            // role policy: refuse truthfully without a write so a rollback
+            // image never meets a saved key it cannot decode. The guild-wide
+            // `required_role` gate still applies to it.
+            if command == "myroom" {
+                return format!(
+                    "/{command} cannot be restricted with /access, so nothing was changed."
+                );
+            }
             if !is_voice_command(&command) {
                 return format!("/{command} is not a voice-room command, so nothing was changed.");
             }
@@ -14136,7 +14117,7 @@ where
             let text = runtime
                 .run_myrooms(guild_id, actor_id)
                 .await
-                .map(|rooms| myroom_render(&rooms))
+                .map(|answer| myroom_render(&answer.rooms, answer.creation_available))
                 .unwrap_or_else(|| {
                     // A known worker that never answered is a transient
                     // failure, not a cold cache.

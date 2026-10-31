@@ -14,10 +14,12 @@
 //!   as opaque tokens: only charset/length-validated codes are rendered, full
 //!   URLs and other malformed input are refused, and refused input is never
 //!   echoed back (a stale code may be a rotated secret).
-//! - [`myroom_render`] turns the caller's owned live rooms into one line per
-//!   room channel with its runtime privacy word, or into [`MYROOM_EMPTY`]
-//!   when they own nothing live. The caller supplies the pairs from live
-//!   worker state; only the caller's own rooms may be passed in.
+//! - [`myroom_render`] turns the caller's owned live rooms into one channel
+//!   mention per room, or into [`MYROOM_EMPTY`] plus the join guidance when
+//!   room creation is actually open. The caller supplies the channel list
+//!   from live worker state; only the caller's own rooms may be passed in.
+//!   Channel references only: no public/private label, ACL classification or
+//!   privacy-confidence claim is part of this reply.
 
 use crate::Snowflake;
 
@@ -92,23 +94,34 @@ pub fn invite_render(guild_invite_code: Option<&str>) -> String {
     }
 }
 
-/// Reply when the `/myroom` caller owns no live room: truthful, with the
-/// next action (join a creator lobby).
-pub const MYROOM_EMPTY: &str =
-    "You own no live voice room right now. Join a creator lobby to start one.";
+/// Reply when the `/myroom` caller owns no live room: truthful, with no
+/// implied promise. [`MYROOM_CREATION_GUIDANCE`] is appended only when the
+/// caller reports room creation is actually open, so the empty reply never
+/// points at a creator lobby that does not exist or cannot be joined.
+pub const MYROOM_EMPTY: &str = "You own no live voice room right now.";
+
+/// The next-action clause for [`MYROOM_EMPTY`], shown only when creation is
+/// available (the guild creation switch is on and a creator channel exists).
+pub const MYROOM_CREATION_GUIDANCE: &str = " Join a creator lobby to start one.";
 
 /// Owned-room listing for `/myroom`.
 ///
-/// `rooms` carries `(room channel, runtime private)` pairs in channel order
-/// from live worker state. Each owned room renders on its own line with its
-/// privacy word; an empty list renders [`MYROOM_EMPTY`]. Long lists omit only
-/// whole rows and state the omitted count, staying below 2000 scalars before
-/// the completion adapter. The function performs no lookup of its own, so it
-/// can neither leak another member's rooms nor invent channels.
+/// `rooms` carries the caller's owned live channel references in channel
+/// order from live worker state. Each owned room renders one channel mention
+/// per line — no privacy word or ACL classification. An empty list renders
+/// [`MYROOM_EMPTY`], with [`MYROOM_CREATION_GUIDANCE`] appended only when
+/// `creation_available`. Long lists omit only whole rows and state the
+/// omitted count, staying below 2000 scalars before the completion adapter.
+/// The function performs no lookup of its own, so it can neither leak
+/// another member's rooms nor invent channels.
 #[must_use]
-pub fn myroom_render(rooms: &[(Snowflake, bool)]) -> String {
+pub fn myroom_render(rooms: &[Snowflake], creation_available: bool) -> String {
     if rooms.is_empty() {
-        return MYROOM_EMPTY.to_owned();
+        let mut text = MYROOM_EMPTY.to_owned();
+        if creation_available {
+            text.push_str(MYROOM_CREATION_GUIDANCE);
+        }
+        return text;
     }
     let mut out = if rooms.len() == 1 {
         "You own 1 live voice room:\n".to_owned()
@@ -116,15 +129,14 @@ pub fn myroom_render(rooms: &[(Snowflake, bool)]) -> String {
         format!("You own {} live voice rooms:\n", rooms.len())
     };
     // Reserve the largest possible omission footer before adding whole rows.
-    // The completion adapter's 2000-scalar clamp must never split a room label.
+    // The completion adapter's 2000-scalar clamp must never split a mention.
     let footer_bound = format!("{} more rooms omitted.", rooms.len())
         .chars()
         .count();
     let mut shown = 0;
     let mut length = out.chars().count();
-    for (channel, private) in rooms {
-        let state = if *private { "private" } else { "public" };
-        let line = format!("<#{channel}> — {state}\n");
+    for channel in rooms {
+        let line = format!("<#{channel}>\n");
         let line_length = line.chars().count();
         if length + line_length + footer_bound > 2000 {
             break;
