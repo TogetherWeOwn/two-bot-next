@@ -22,6 +22,7 @@ SPEC.loader.exec_module(inputs)
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_YML = ROOT / ".github/workflows/check.yml"
+DOCS_PREFIX = inputs.DOCS_PREFIX
 RUST, WORKER, PARITY = inputs.RUST, inputs.WORKER, inputs.PARITY
 SUPPLY, DOCS = inputs.SUPPLY, inputs.DOCS
 
@@ -457,8 +458,11 @@ class ReaderCoverageTests(unittest.TestCase):
 
         include_str! resolves from the source file; every other literal
         resolves from the crate's CARGO_MANIFEST_DIR and, when it does not
-        climb with ``../``, from the repo root. Only literals that land on
-        an existing repo file count, so prose and identifiers drop out.
+        climb with ``../``, from the repo root. Outside docs/ only literals
+        that land on an existing repo file count, so prose and identifiers
+        drop out; docs/*.md|json count even when absent, because ignored
+        generated docs (docs/generated/commands.md) do not exist when the
+        selector regressions run.
         """
         text = "\n".join(line for line in text.splitlines()
                          if not line.strip().startswith("//"))
@@ -471,10 +475,14 @@ class ReaderCoverageTests(unittest.TestCase):
                 candidates.append((ROOT / literal).resolve())
         readers = set()
         for resolved in candidates:
-            if resolved.is_file() and resolved.is_relative_to(ROOT):
-                relative = resolved.relative_to(ROOT).as_posix()
-                if not relative.startswith(cls.RUST_ROOTS):
-                    readers.add(relative)
+            if not resolved.is_relative_to(ROOT):
+                continue
+            relative = resolved.relative_to(ROOT).as_posix()
+            is_doc = relative.startswith(DOCS_PREFIX) and \
+                resolved.suffix in (".md", ".json")
+            if (is_doc or resolved.is_file()) and \
+                    not relative.startswith(cls.RUST_ROOTS):
+                readers.add(relative)
         return readers
 
     def test_reader_scan_resolves_relative_literal_shapes(self):
@@ -494,7 +502,12 @@ class ReaderCoverageTests(unittest.TestCase):
             with self.subTest(shape=text):
                 self.assertEqual(self.rust_content_readers(source, text), {want})
                 self.assertIn(RUST, inputs.classify(want), want)
-        for text in ('"../../docs/no-such-file.md"', '// "docs/README.md"',
+        # Ignored generated docs are absent on CI but stay in the scan.
+        self.assertEqual(
+            self.rust_content_readers(
+                source, '.join("../../docs/generated/not-generated.md")'),
+            {"docs/generated/not-generated.md"})
+        for text in ('"../../wrangler/no-such-file.ts"', '// "docs/README.md"',
                      '"src/lib.rs"', '"not a path"'):
             with self.subTest(ignored=text):
                 self.assertEqual(self.rust_content_readers(source, text), set())
