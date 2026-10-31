@@ -9,37 +9,41 @@ from pathlib import Path
 import re
 import unittest
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
-DENY_USES = re.compile(r"^(?P<indent>[ ]*)(?:-[ ]+)?uses:[ ]*EmbarkStudios/cargo-deny-action@")
-ARGUMENTS = re.compile(r"^[ ]*arguments:[ ]*(?P<value>.*)$")
+DENY_ACTION = "EmbarkStudios/cargo-deny-action@"
 
 
 def deny_step_arguments(text):
-    """Return the `with.arguments` value of each cargo-deny step, or None."""
-    lines = text.splitlines()
+    """Return the `with.arguments` input of each cargo-deny step, or None.
+
+    Only `with` supplies an action input; the same key under `env` does not.
+    """
+    workflow = yaml.safe_load(text) or {}
     found = []
-    for index, line in enumerate(lines):
-        match = DENY_USES.match(line)
-        if match is None:
-            continue
-        step_col = len(match.group("indent"))
-        value = None
-        for follow in lines[index + 1 :]:
-            if not follow.strip() or follow.lstrip().startswith("#"):
+    for job in (workflow.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            if not str(step.get("uses", "")).startswith(DENY_ACTION):
                 continue
-            indent = len(follow) - len(follow.lstrip(" "))
-            if indent < step_col or (indent == step_col and follow.lstrip().startswith("- ")):
-                break
-            arguments = ARGUMENTS.match(follow)
-            if arguments:
-                value = arguments.group("value").split(" #", 1)[0].strip()
-        found.append(value)
+            arguments = (step.get("with") or {}).get("arguments")
+            found.append(None if arguments is None else str(arguments))
     return found
 
 
 def unscoped_steps(text):
     return [args for args in deny_step_arguments(text) if "--workspace" not in (args or "").split()]
+
+
+def deny_step(with_block="", env_block=""):
+    return (
+        "jobs:\n"
+        "  check:\n"
+        "    steps:\n"
+        "      - uses: EmbarkStudios/cargo-deny-action@0000000000000000000000000000000000000000\n"
+        f"{env_block}{with_block}"
+    )
 
 
 class CargoDenyScopeTests(unittest.TestCase):
@@ -62,11 +66,23 @@ class CargoDenyScopeTests(unittest.TestCase):
     def test_removing_the_flag_is_caught(self):
         for name in ("check.yml", "nightly.yml"):
             text = (WORKFLOWS / name).read_text()
-            mutated = text.replace("arguments: --workspace --all-features", "arguments: --all-features")
+            mutated = re.sub(r"(?m)^([ ]*arguments:.*?)--workspace[ ]*", r"\1", text)
             self.assertNotEqual(mutated, text, name)
             self.assertTrue(unscoped_steps(mutated), name)
-            dropped = re.sub(r"(?m)^[ ]*arguments: --workspace --all-features\n", "", text)
+            dropped = re.sub(r"(?m)^[ ]*arguments:.*--workspace.*\n", "", text)
+            self.assertNotEqual(dropped, text, name)
             self.assertEqual(unscoped_steps(dropped), [None], name)
+
+    def test_flag_outside_with_is_caught(self):
+        env_only = deny_step(env_block="        env:\n          arguments: --workspace --all-features\n")
+        self.assertEqual(unscoped_steps(env_only), [None])
+        both = deny_step(
+            env_block="        env:\n          arguments: --workspace\n",
+            with_block="        with:\n          arguments: --all-features\n",
+        )
+        self.assertEqual(unscoped_steps(both), ["--all-features"])
+        scoped = deny_step(with_block="        with:\n          arguments: --workspace --all-features\n")
+        self.assertEqual(unscoped_steps(scoped), [])
 
 
 if __name__ == "__main__":
