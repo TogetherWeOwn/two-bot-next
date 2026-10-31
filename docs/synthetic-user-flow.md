@@ -133,7 +133,8 @@ duplicate and comments on the lowest. RECOVERY closes every open issue for
 its key, so a duplicate the race left behind closes too. Synthetic history from before this sink (post step
 `Alert the ops channel on incident transition`) counts a Discord alert as
 undelivered: an outage that only reached Discord re-alerts into an issue on
-its next failed probe.
+its next failed probe. A healthy probe whose Discord post succeeded reads as
+closed, so a recovered Discord-era incident cannot mute the next outage.
 
 Authentication is the job-scoped `GITHUB_TOKEN` with `issues: write`; no
 secret or environment is needed. Requests go only to `api.github.com`;

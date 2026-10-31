@@ -280,6 +280,28 @@ class RollbackProofTests(unittest.TestCase):
                     with self.assertRaisesRegex(proof.ProofError, "daily_proof_stale"):
                         proof.check_freshness(now=NOW)
 
+    def test_a_newer_failed_manual_proof_keeps_the_incident_open(self):
+        scheduled = run(proof.PROOF_WORKFLOW, "schedule", "success")
+        scheduled["created_at"] = (NOW - timedelta(hours=2)).isoformat()
+        evidence = {"schema_version": 1, "verdict": "pass", "environment": "staging",
+                    "child_conclusion": "failure", "child_run_id": 456}
+        for conclusion, newer, passes in (("failure", True, False), ("failure", False, True),
+                                          ("success", True, True), ("cancelled", True, True),
+                                          (None, True, True)):
+            manual = dict(run(proof.PROOF_WORKFLOW, "workflow_dispatch", conclusion), id=124)
+            manual["created_at"] = (NOW - timedelta(hours=1 if newer else 3)).isoformat()
+
+            def fake_gh(path, scheduled=scheduled, manual=manual):
+                return {"workflow_runs": [scheduled if "event=schedule" in path else manual]}
+
+            with self.subTest(conclusion=conclusion, newer=newer), patch.object(proof, "gh", side_effect=fake_gh), \
+                    patch.object(proof, "artifact_files", return_value={"proof.json": evidence}):
+                if passes:
+                    self.assertEqual(proof.check_freshness(now=NOW)["verdict"], "pass")
+                else:
+                    with self.assertRaisesRegex(proof.ProofError, "newer_proof_failed"):
+                        proof.check_freshness(now=NOW)
+
     def test_watch_files_only_on_a_finding_closes_on_pass_and_delivery_failure_is_red(self):
         for error in (None, proof.ProofError("daily_proof_missing"), ValueError("private-body")):
             with patch.dict(os.environ, ENV), \

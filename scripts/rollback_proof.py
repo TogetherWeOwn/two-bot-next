@@ -234,6 +234,15 @@ def check_freshness(*, now=None):
             and evidence.get("child_conclusion") == "failure"
             and type(evidence.get("child_run_id")) is int and evidence["child_run_id"] > 0,
             "daily_proof_evidence_invalid")
+    # A manual proof shares the incident issue: if one failed after the graded
+    # scheduled proof, that older pass must not close the issue it opened.
+    latest = gh(f"repos/{REPO}/actions/workflows/staging-rollback-drill.yml/runs"
+                "?branch=main&per_page=1").get("workflow_runs") or []
+    require(len(latest) == 1 and isinstance(latest[0], dict), "daily_proof_missing")
+    require(latest[0].get("id") == run["id"]
+            or latest[0].get("conclusion") != "failure"
+            or moment(latest[0].get("created_at")) <= moment(run.get("created_at")),
+            "newer_proof_failed")
     return {"verdict": "pass", "proof_run_id": run["id"], "child_run_id": evidence["child_run_id"]}
 
 

@@ -146,6 +146,15 @@ class RolloverAcceptanceTests(unittest.TestCase):
         self.assertIsNone(self.decide(fake, "failure"))
         self.assertEqual(self.decide(fake, "success"), "recovery")
 
+    def test_a_recovered_discord_incident_does_not_mute_the_next_outage(self):
+        legacy = ([("success", "skipped"), ("failure", "skipped"), ("failure", "success"),
+                   ("success", "success")])
+        fake = FakeGitHub(legacy + [("success", "skipped"), ("failure", "skipped")],
+                          legacy_runs=len(legacy))
+        self.assertEqual(self.decide(fake, "failure"), "alert")
+        fake = FakeGitHub(legacy, legacy_runs=len(legacy))
+        self.assertIsNone(self.decide(fake, "success"))
+
     def test_discord_era_first_failure_still_needs_a_second(self):
         fake = FakeGitHub([("success", "skipped"), ("failure", "skipped")],
                           legacy_runs=2)
