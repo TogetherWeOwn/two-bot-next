@@ -2196,8 +2196,8 @@ Guard state (persisted in DO storage next to the alert state):
 
 - At most one recommendation per 30 minutes across all scopes. Triggers are
   visited in table order and the first eligible one consumes the window, so
-  when both scopes fire at once the table order is the priority and the other
-  scope waits for the next window.
+  when several scopes fire at once the table order is the priority and the
+  others each wait for their own next window.
 - A recommendation while a prior one for the same scope did not clear the
   alert counts as one consecutive failure for that scope.
 - After 2 consecutive failures the scope goes quiet and the Worker pages the
@@ -2229,7 +2229,7 @@ the alert, never while that action is still in flight. When the CEO page
 lands, the on-call pages the CEO card and stops filing takeover cards for
 that scope until the alert stays clear for one cooldown window.
 
-Known limits of v1: the triggers stay pinned to the two keys in the table
+Known limits of v1: the triggers stay pinned to the three keys in the table
 above. A stuck-gateway rule (non-ready `/readyz` gateway component with no
 disconnect edge) is not a trigger in v1; wiring it into the crash-loop scope
 is follow-up work once that rule lands, not part of this slice. Sustained
