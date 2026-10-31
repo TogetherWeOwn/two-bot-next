@@ -27,6 +27,10 @@ API = "https://api.github.com"
 LABEL = "incident"
 KEY = re.compile(r"[a-z0-9][a-z0-9:._-]{0,79}")
 MAX_RESPONSE_BYTES = 1 << 20
+PAGE_SIZE = 100
+# A bounded search: past this many open incident issues, fail closed rather
+# than miss the keyed one and open a duplicate.
+MAX_PAGES = 10
 MAX_TITLE = 200
 MAX_BODY = 6000
 TIMEOUT_SECONDS = 10
@@ -96,21 +100,32 @@ def _request(method, path, token, body=None):
         raise IncidentError(f"incident issue {method} response is not valid JSON") from None
 
 
+def _open_keyed(env, key):
+    """Ascending numbers of every open `incident` issue carrying this key."""
+    token, repo = _context(env)
+    tag = marker(key)
+    matches = []
+    for page in range(1, MAX_PAGES + 1):
+        query = urllib.parse.urlencode({"state": "open", "labels": LABEL,
+                                        "per_page": PAGE_SIZE, "page": page})
+        issues = _request("GET", f"/repos/{repo}/issues?{query}", token)
+        if not isinstance(issues, list) or len(issues) > PAGE_SIZE or any(
+                not isinstance(issue, dict) or type(issue.get("number")) is not int
+                or issue["number"] <= 0
+                or (issue.get("body") is not None and not isinstance(issue["body"], str))
+                for issue in issues):
+            raise IncidentError("incident issue list is malformed")
+        matches += [issue["number"] for issue in issues
+                    if "pull_request" not in issue and tag in (issue.get("body") or "")]
+        if len(issues) < PAGE_SIZE:
+            return sorted(matches)
+    raise IncidentError("too many open incident issues to search")
+
+
 def find_open(env, key):
     """Lowest-numbered open `incident` issue carrying this key, or None."""
-    token, repo = _context(env)
-    query = urllib.parse.urlencode({"state": "open", "labels": LABEL, "per_page": 100})
-    issues = _request("GET", f"/repos/{repo}/issues?{query}", token)
-    if not isinstance(issues, list) or any(
-            not isinstance(issue, dict) or type(issue.get("number")) is not int
-            or issue["number"] <= 0
-            or (issue.get("body") is not None and not isinstance(issue["body"], str))
-            for issue in issues):
-        raise IncidentError("incident issue list is malformed")
-    tag = marker(key)
-    matches = [issue["number"] for issue in issues
-               if "pull_request" not in issue and tag in (issue.get("body") or "")]
-    return min(matches) if matches else None
+    matches = _open_keyed(env, key)
+    return matches[0] if matches else None
 
 
 def _clip(text, limit):
@@ -138,26 +153,41 @@ def open_incident(env, key, title, body):
     number = created.get("number") if isinstance(created, dict) else None
     if type(number) is not int or number <= 0:
         raise IncidentError("incident issue create returned no issue number")
+    # Two runs can both find no issue and both create one. Each re-reads
+    # after creating; whichever is not the lowest closes itself, so racers
+    # converge on one open issue without a workflow-level lock.
+    first = find_open(env, key)
+    if first is not None and first < number:
+        _request("POST", f"/repos/{repo}/issues/{number}/comments", token,
+                 {"body": f"Duplicate of #{first}, opened by a concurrent run."})
+        _request("PATCH", f"/repos/{repo}/issues/{number}", token,
+                 {"state": "closed", "state_reason": "duplicate"})
+        _request("POST", f"/repos/{repo}/issues/{first}/comments", token,
+                 {"body": _clip("Still failing.\n\n" + body, MAX_BODY)})
+        return "commented", first
     return "opened", number
 
 
 def close_incident(env, key, body):
-    """RECOVERY: comment on and close the open issue for `key`.
+    """RECOVERY: comment on and close every open issue for `key`.
 
-    Returns ("closed", number), or ("none-open", None) when no issue is open
-    (for example an agent already closed it): nothing is left to resolve.
+    Closing all of them also clears a duplicate that a race left open.
+    Returns ("closed", lowest number), or ("none-open", None) when no issue
+    is open (for example an agent already closed it): nothing is left to
+    resolve.
     """
     if not KEY.fullmatch(key or ""):
         raise IncidentError("refusing: invalid incident key")
     token, repo = _context(env)
-    number = find_open(env, key)
-    if number is None:
+    numbers = _open_keyed(env, key)
+    if not numbers:
         return "none-open", None
-    _request("POST", f"/repos/{repo}/issues/{number}/comments", token,
-             {"body": _clip(body, MAX_BODY)})
-    _request("PATCH", f"/repos/{repo}/issues/{number}", token,
-             {"state": "closed", "state_reason": "completed"})
-    return "closed", number
+    for number in numbers:
+        _request("POST", f"/repos/{repo}/issues/{number}/comments", token,
+                 {"body": _clip(body, MAX_BODY)})
+        _request("PATCH", f"/repos/{repo}/issues/{number}", token,
+                 {"state": "closed", "state_reason": "completed"})
+    return "closed", numbers[0]
 
 
 def run_link(env=None):

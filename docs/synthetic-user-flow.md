@@ -125,6 +125,16 @@ already closed it), recovery is a no-op. A `force_fail` dispatch is not
 scheduled history, so a healthy scheduled sample that finds its key's issue
 still open decides RECOVERY and closes it.
 
+The lookup reads every page of open `incident` issues (100 per page, up to
+10 pages) and fails closed past that bound rather than miss the keyed issue
+and open a duplicate. Two runs that race to open the same key both re-read
+after creating; the one that is not the lowest number closes its issue as a
+duplicate and comments on the lowest. RECOVERY closes every open issue for
+its key, so a duplicate the race left behind closes too. Synthetic history from before this sink (post step
+`Alert the ops channel on incident transition`) counts a Discord alert as
+undelivered: an outage that only reached Discord re-alerts into an issue on
+its next failed probe.
+
 Authentication is the job-scoped `GITHUB_TOKEN` with `issues: write`; no
 secret or environment is needed. Requests go only to `api.github.com`;
 HTTP 301, 302, 303, 307, and 308 responses are refused and no redirect is

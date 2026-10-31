@@ -31,7 +31,7 @@ alert = importlib.import_module("synthetic_alert")
 TOKEN_SENTINEL = "synthetic-token-not-a-secret"
 ENV = {"GITHUB_TOKEN": TOKEN_SENTINEL, "GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next"}
 LIST_URL = ("https://api.github.com/repos/TogetherWeOwn/two-bot-next/issues"
-            "?state=open&labels=incident&per_page=100")
+            "?state=open&labels=incident&per_page=100&page=1")
 CREATE_URL = "https://api.github.com/repos/TogetherWeOwn/two-bot-next/issues"
 EVIL = "https://evil.example/collect"
 BODY_SENTINEL = "response-body-must-never-leak"
@@ -213,11 +213,13 @@ class RedirectRefusalTests(unittest.TestCase):
 
     def test_valid_responses_open_one_labelled_issue_with_a_timeout(self):
         transport = FakeTransport([(200, headers_for(), b"[]"),
-                                   (201, headers_for(), b'{"number": 5}')])
+                                   (201, headers_for(), b'{"number": 5}'),
+                                   (200, headers_for(), b'[{"number": 5, "body": null}]')])
         self.assertEqual(self.run_post(transport), "opened #5")
-        self.assertEqual(len(transport.requests), 2, transport.requests)
-        (_s1, _h1, method1, selector1, _b1, _t1), (scheme, host, method, selector, body, timeout) = transport.requests
-        self.assertEqual((method1, f"https://api.github.com{selector1}"), ("GET", LIST_URL))
+        self.assertEqual(len(transport.requests), 3, transport.requests)
+        first, (scheme, host, method, selector, body, timeout), last = transport.requests
+        for _s, _h, read, read_selector, _b, _t in (first, last):
+            self.assertEqual((read, f"https://api.github.com{read_selector}"), ("GET", LIST_URL))
         self.assertEqual(f"{scheme}://{host}{selector}", CREATE_URL)
         self.assertEqual(method, "POST")
         payload = json.loads(body.decode())

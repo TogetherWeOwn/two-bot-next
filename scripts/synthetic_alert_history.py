@@ -390,6 +390,12 @@ def _run_outcome(repo, run, environment, token):
             # failure or an already-delivered incident; replaying two in a
             # row rules the first failure out (see _advance).
             delivery = "open"
+        if (alert is legacy and outcome == "failure"
+                and delivery in ("success", "open")):
+            # A Discord alert reached no agent, so an outage it delivered
+            # stays undelivered: the next failed probe re-alerts into an
+            # incident issue instead of waiting for recovery.
+            delivery = "failure"
         return outcome, delivery
     return None
 

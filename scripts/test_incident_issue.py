@@ -4,6 +4,7 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_
 """
 
 import importlib
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -28,7 +29,8 @@ class FakeGitHub:
         assert token == ENV["GITHUB_TOKEN"]
         self.calls.append((method, path, body))
         if method == "GET":
-            return self.open_issues
+            page = int(re.search(r"[?&]page=(\d+)", path).group(1))
+            return self.open_issues[(page - 1) * 100:page * 100]
         if path.endswith("/issues"):
             return self.created
         return {}
@@ -42,8 +44,8 @@ class IncidentIssueTests(unittest.TestCase):
     def test_alert_opens_one_labelled_issue_with_the_key_marker(self):
         fake = FakeGitHub()
         self.assertEqual(self.run_with(fake, sink.open_incident, KEY, "title", "body"), ("opened", 9))
-        (get, _get_path, _), (post, path, body) = fake.calls
-        self.assertEqual((get, post), ("GET", "POST"))
+        (get, _get_path, _), (post, path, body), (reread, _, _) = fake.calls
+        self.assertEqual((get, post, reread), ("GET", "POST", "GET"))
         self.assertIn("labels=incident", _get_path)
         self.assertEqual(path, "/repos/owner/repo/issues")
         self.assertEqual(body["labels"], ["incident"])
@@ -61,6 +63,46 @@ class IncidentIssueTests(unittest.TestCase):
         self.assertEqual(self.run_with(fake, sink.open_incident, KEY, "title", "body"), ("commented", 12))
         self.assertEqual(fake.calls[1][:2], ("POST", "/repos/owner/repo/issues/12/comments"))
         self.assertEqual(len(fake.calls), 2)
+
+    def test_alert_finds_an_older_keyed_issue_past_the_first_page(self):
+        newer = [{"number": 500 - n, "body": sink.marker("other:check")} for n in range(150)]
+        fake = FakeGitHub(newer + [{"number": 7, "body": sink.marker(KEY)}])
+        self.assertEqual(self.run_with(fake, sink.open_incident, KEY, "title", "body"), ("commented", 7))
+        self.assertEqual([call[0] for call in fake.calls], ["GET", "GET", "POST"])
+
+    def test_search_past_the_page_bound_fails_closed_without_writing(self):
+        fake = FakeGitHub([{"number": n + 1, "body": None} for n in range(100 * sink.MAX_PAGES)])
+        with self.assertRaises(sink.IncidentError):
+            self.run_with(fake, sink.open_incident, KEY, "title", "body")
+        self.assertTrue(all(call[0] == "GET" for call in fake.calls))
+        self.assertEqual(len(fake.calls), sink.MAX_PAGES)
+
+    def test_alert_that_lost_a_create_race_closes_its_duplicate(self):
+        class Racing(FakeGitHub):
+            def __call__(self, method, path, token, body=None):
+                result = super().__call__(method, path, token, body)
+                if method == "POST" and path.endswith("/issues"):
+                    # The concurrent run's issue #8 became visible meanwhile.
+                    self.open_issues = [{"number": 8, "body": sink.marker(KEY)},
+                                        {"number": 9, "body": sink.marker(KEY)}]
+                return result
+
+        fake = Racing()
+        self.assertEqual(self.run_with(fake, sink.open_incident, KEY, "title", "body"), ("commented", 8))
+        self.assertEqual([call[:2] for call in fake.calls[2:]], [
+            ("GET", "/repos/owner/repo/issues?state=open&labels=incident&per_page=100&page=1"),
+            ("POST", "/repos/owner/repo/issues/9/comments"),
+            ("PATCH", "/repos/owner/repo/issues/9"),
+            ("POST", "/repos/owner/repo/issues/8/comments")])
+        self.assertEqual(fake.calls[4][2], {"state": "closed", "state_reason": "duplicate"})
+
+    def test_recovery_closes_every_open_issue_for_the_key(self):
+        fake = FakeGitHub([{"number": 12, "body": sink.marker(KEY)},
+                           {"number": 5, "body": sink.marker(KEY)},
+                           {"number": 6, "body": sink.marker("other:check")}])
+        self.assertEqual(self.run_with(fake, sink.close_incident, KEY, "healthy"), ("closed", 5))
+        self.assertEqual([call[:2] for call in fake.calls[1:] if call[0] == "PATCH"], [
+            ("PATCH", "/repos/owner/repo/issues/5"), ("PATCH", "/repos/owner/repo/issues/12")])
 
     def test_recovery_comments_then_closes_and_tolerates_no_open_issue(self):
         fake = FakeGitHub([{"number": 12, "body": sink.marker(KEY)}])

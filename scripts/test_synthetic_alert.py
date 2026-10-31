@@ -583,7 +583,8 @@ class SyntheticAlertTests(unittest.TestCase):
                 mock.patch.object(urllib.request, "build_opener", return_value=opener):
             code = alert.main(["--env", "staging", "--evidence", self.evidence])
         self.assertEqual(code, 0)
-        self.assertEqual([call[0] for call in calls], ["GET", "POST"])
+        # The final GET re-reads the list to catch a concurrent duplicate.
+        self.assertEqual([call[0] for call in calls], ["GET", "POST", "GET"])
         self.assertIn("labels=incident", calls[0][1])
         created = calls[1][2]
         self.assertTrue(calls[1][1].endswith("/repos/TogetherWeOwn/two-bot-next/issues"))
