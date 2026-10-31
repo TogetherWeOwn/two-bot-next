@@ -32,7 +32,9 @@ jobs:
       TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
       TWO_DATABASE_TLS: local-only
-      FAKE_AT: '@2027-10-31 12:00:00'
+      # A shared offset, not an absolute start: '@' restarts each process's clock
+      # at launch, skewing the test binaries against the long-running Postgres.
+      FAKE_AT: '+365d'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
