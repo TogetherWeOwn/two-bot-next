@@ -85,39 +85,154 @@ def workflow_toolchain_errors(root):
     return errors
 
 
+# --- Bounded Dockerfile instruction walker -----------------------------------
+#
+# This guard covers exactly two files (`DOCKERFILES`), so it deliberately
+# accepts a documented subset of the Docker language and fails closed on
+# everything else. Silent omission is the one outcome that is never allowed:
+# a stage the walker cannot classify is an error, not an unchecked stage.
+#
+# Accepted: ordinary instructions, `#` comments, blank lines, single physical
+# FROM lines, and the default backslash line continuation used by RUN/LABEL/
+# HEALTHCHECK. Refused explicitly: escape directives (active directive region
+# only; a late `escape=` comment is an ordinary comment), a BOM, vertical
+# tab/form feed/NUL separators, heredocs, continued FROM instructions and
+# non-`docker.io`/`library`/`rust` image references.
+
+_DEFAULT_ESCAPE = "\\"
+_DIRECTIVE = re.compile(r"(?im)^[ \t]*#[ \t]*([A-Za-z][A-Za-z0-9_.-]*)[ \t]*=[ \t]*(.*?)[ \t]*\r?$")
+_UNSUPPORTED_SEPARATORS = ("\x00", "\x0b", "\x0c")
+_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)[A-Za-z0-9_.-]+\1")
+_RUST_REFERENCE = re.compile(r"rust(?::[^@\s]+)?(?:@[^\s]*)?")
+_STAGE_FLAG = re.compile(r"--\S+")
+
+
+def _refuse(detail):
+    return ValueError(f"unsupported Dockerfile syntax; {detail}")
+
+
+def _logical_instructions(text):
+    """`(instruction, continued, malformed)` for every Dockerfile instruction.
+
+    Continuations are resolved with Docker's own rule: a logical line
+    continues only when its physical line ends in an ODD number of escape
+    characters. An even run carries an escaped backslash, so the instruction
+    ends there and a following FROM is a real stage instead of data joined
+    onto an earlier RUN. A continued logical line that reaches EOF without a
+    final instruction is reported as malformed rather than silently dropped.
+    """
+    pending = ""
+    continued = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or line.lstrip().startswith("#"):
+            continue
+        trailing = len(line) - len(line.rstrip(_DEFAULT_ESCAPE))
+        if trailing % 2:
+            pending += line[: len(line) - 1] + " "
+            continued = True
+            continue
+        yield pending + stripped, continued, False
+        pending = ""
+        continued = False
+    if pending.strip():
+        yield pending, continued, True
+
+
+def _active_directives(text):
+    """Parser directives from Docker's initial directive region only.
+
+    Docker stops reading directives at the first instruction or any comment
+    that is not a `key = value` parser directive, so `# escape=` after a FROM
+    is an ordinary comment and must not change how the file parses.
+    """
+    directives = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("#"):
+            break
+        match = _DIRECTIVE.fullmatch(line)
+        if not match:
+            break
+        directives.append((match.group(1).lower(), match.group(2)))
+    return directives
+
+
+def _normalize_reference(reference):
+    """Strip the registry/image-name prefixes the two covered files never need."""
+    body = reference
+    for host in ("docker.io/library/", "index.docker.io/library/", "library/"):
+        if body.startswith(host):
+            return body[len(host):]
+    return body
+
+
+def _stage_reference(reference, original):
+    """Normalize an accepted image reference; refuse anything outside the subset."""
+    body = _normalize_reference(reference)
+    if not _RUST_REFERENCE.fullmatch(body):
+        raise _refuse(f"unnormalizable image reference {original!r}; name it as rust:<tag>[:@sha256:<digest>]")
+    name, _, digest = body.partition("@")
+    tag = name.partition(":")[2]
+    pinned = re.fullmatch(r"sha256:([0-9a-f]{64})", digest)
+    return tag, (pinned.group(1) if pinned else None)
+
+
 def _rust_stages(text):
     """Every `FROM [flags] rust:<tag>[@sha256:<digest>]` stage, in file order.
 
-    Tag and digest are read from the SAME line in one pass, so a later rust
-    stage can never supply the digest for an earlier stage's tag (or vice
-    versa) once this file grows a second rust stage. Optional `FROM` flags
-    such as `--platform=$BUILDPLATFORM` are skipped so flagged rust stages
-    stay covered instead of silently invisible to the tag and digest checks.
-    Continued FROM instructions and non-default escape directives are deliberately
-    unsupported: refuse them instead of silently omitting a logical Rust stage.
+    Tag and digest are read from the SAME instruction, so a later rust stage
+    can never supply the digest for an earlier stage's tag (or vice versa)
+    once this file grows a second rust stage. Optional `FROM` flags such as
+    `--platform=$BUILDPLATFORM` are skipped so flagged rust stages stay
+    covered instead of silently invisible to the tag and digest checks.
     """
-    for escape in re.findall(r"(?im)^[ \t]*#[ \t]*escape[ \t]*=([^\r\n]*)", text):
-        if escape.strip() != "\\":
-            raise ValueError("unsupported Docker escape directive; use the default backslash escape")
-    instruction = ""
-    continued = False
-    for line in text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
+    if text.startswith("\ufeff"):
+        raise _refuse("byte order mark before the first instruction; save the file as plain UTF-8")
+    if "\r" in text.replace("\r\n", ""):
+        raise _refuse("bare carriage return in the source; use LF or CRLF line endings")
+    for character in _UNSUPPORTED_SEPARATORS:
+        if character in text:
+            raise _refuse(f"vertical tab, form feed or NUL separator {character!r} before an instruction")
+    for key, value in _active_directives(text):
+        if key == "escape":
+            if value != _DEFAULT_ESCAPE:
+                raise _refuse("unsupported Docker escape directive; use the default backslash escape")
             continue
-        instruction += line
-        if line.rstrip().endswith("\\"):
-            instruction = instruction.rstrip()[:-1]
-            continued = True
-            continue
-        if continued and re.match(r"(?i)^[ \t]*FROM\b", instruction):
-            raise ValueError("unsupported Docker FROM continuation; keep each FROM on one physical line")
-        instruction = ""
-        continued = False
+        raise _refuse(f"unsupported Docker parser directive #{key}={value}; keep the default grammar")
     stages = []
-    for reference in re.findall(r"(?im)^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(rust:\S+)", text):
-        tag, _, digest = reference.removeprefix("rust:").partition("@")
-        pinned = re.fullmatch(r"sha256:([0-9a-f]{64})", digest)
-        stages.append((tag, pinned.group(1) if pinned else None))
+    for instruction, continued, malformed in _logical_instructions(text):
+        if _HEREDOC.search(instruction):
+            raise _refuse("heredoc instruction content is not covered by this guard")
+        keyword = instruction.split(None, 1)
+        if not keyword or keyword[0].upper() != "FROM":
+            if malformed:
+                raise _refuse("line continuation runs past the end of the file")
+            continue
+        if continued or malformed:
+            raise _refuse(
+                "unsupported Docker FROM continuation; keep each FROM on one "
+                "physical line (escape= and multi-row images are not supported)"
+            )
+        tokens = keyword[1].split() if len(keyword) > 1 else []
+        while tokens and _STAGE_FLAG.fullmatch(tokens[0]):
+            tokens.pop(0)
+        if not tokens:
+            raise _refuse("FROM instruction without an image reference")
+        original = tokens[0]
+        normalized = _normalize_reference(original)
+        if "$" in normalized:
+            raise _refuse(
+                f"variable-backed image reference {original!r}; write the Rust image "
+                "literally so its pin is visible to this guard"
+            )
+        if not re.fullmatch(r"rust(?::.*)?", normalized):
+            # Aliased earlier stages (`FROM builder AS again`) carry no pin of
+            # their own; only Rust images are this guard's business.
+            continue
+        stages.append(_stage_reference(normalized, original))
     return stages
 
 
