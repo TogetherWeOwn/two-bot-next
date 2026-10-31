@@ -825,6 +825,19 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
     const FIX_OTHER: &str = "1545644954272137298";
     const FIX_USER: &str = "123456789012345678";
     const FIX_USER_2: &str = "123456789012345679";
+    // This runs the full retention job, so unrelated surviving-guild events
+    // must be fresh enough not to expire under the independent raw-event TTL.
+    // Keep the shared fixture and dedicated old-event expiry controls unchanged.
+    let refreshed = sqlx::query("UPDATE event_store SET event_time = now() WHERE guild_id = $1")
+        .bind(FIX_OTHER)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.rows_affected(),
+        10,
+        "the surviving guild must start with all ten fresh event_store rows"
+    );
     for guild in [FIX_GONE, FIX_OTHER] {
         sqlx::query(
             "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count, bot_floor)
