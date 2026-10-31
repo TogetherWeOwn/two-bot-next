@@ -382,10 +382,14 @@ jobs:
       # includes the advisory scan, and the deny image carries its own
       # toolchain, so this also reports advisories on docs-only PRs for the
       # cost of one advisory-DB fetch. Advisory findings fail the PR (HARD).
+      # `--workspace` is required: the root manifest is also a package, so
+      # without it the graph holds only `two-bot-next` and every check
+      # passes on one crate with no dependencies.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+          arguments: --workspace --all-features
 
       - name: Install Rust toolchain
         id: toolchain
