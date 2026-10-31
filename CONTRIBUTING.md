@@ -44,6 +44,8 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 The rulesets on `main` require one PR and squash-only merges, and block deletion
 and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main`.
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
+The review apps CodeRabbit and Devin Review are required checks too. No approving
+review is required.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
 body as errors, and the two required template sections (Linked Issues and
@@ -52,6 +54,12 @@ Verification), the advisory title/body remainder and branch names in warn mode
 instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
+
+Who merges (owner decision 2026-10-31): the agent that did the work merges a PR
+once every required check is green and each review finding is fixed or answered
+with evidence. A merge to `main` deploys production, so it also needs the
+owner's approval through `request_confirmation` on the card. So does every other
+production deploy, such as a manual dispatch or promotion.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`

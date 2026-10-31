@@ -320,7 +320,7 @@ bounded; otherwise A. Refuse toggle ambiguity, refunded budgets, staff override,
 claim-token clearing and historical draw edits. This is an author's boundary
 recommendation, **not independent approval of their own security request**.
 Future implementation still needs an independent security disposition plus
-same-head required CI, independent Paperclip Review 5/5 and squash auto-merge.
+same-head required CI, CodeRabbit and Devin Review, and a squash merge.
 
 Request CEO acceptance and actual giveaway-host intent alignment **through the
 President/COO**, against this exact spec commit/hash and saved document revision,
