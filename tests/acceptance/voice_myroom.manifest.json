@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "purpose": "Protected test-only review correction for owned-room discovery: observed ACL privacy, context-free refusal diagnostics, fail-closed imports, rollback cleanup and existing custom-command compatibility",
-  "baseCommit": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
+  "baseCommit": "3301618ab2be73b737fa2a2909ceb26152682b56",
   "originalFeatureBase": "9e0b03f428463b9b167501ffb91bc2a8e9d9a808",
   "branch": "feat/myroom-owned-rooms",
   "protectedFiles": [
@@ -36,15 +36,15 @@
     },
     {
       "path": "crates/discord/tests/custom_command_toggle_acceptance.rs",
-      "sha256": "2612095f12cd352f2d57f50f3512ab55dba7cf3077d78d31e22737c2d4bff0ea",
+      "sha256": "f028cb69dbb22aac0033036e3b3e96d8ef07cce6ebe0fb140be2c8d46bf70f63",
       "tests": 24,
-      "change": "Author correction: legal stored capacity is independently 33 because only 67 definitions publish; the reservation-only assistant name does not consume a publication slot. The 34th-row overflow control remains strict. Adds parser/planner/service/publication coverage and grandfathered myroom maintenance, fresh-name reservation and voice-precedence controls. Existing faq reply checks retain the same named assertions through a shared helper."
+      "change": "Author correction: legal stored capacity is independently 33 because only 67 definitions publish; the reservation-only assistant name does not consume a publication slot. The 34th-row overflow control remains strict. Adds parser/planner/service/publication coverage and grandfathered myroom maintenance, fresh-name reservation and voice-precedence controls. Existing faq reply checks retain the same named assertions through a shared helper. Teardown hygiene: capture voice-off results and the fresh-collision query before closing the owned database, then check the same predicates and expected values only after awaited explicit teardown."
     },
     {
       "path": "crates/bot/src/custom_command_toggle_acceptance.rs",
-      "sha256": "41f3e4399c55dbb477ea4bc303297bde66ac6a2e9344c821cc761a8a4c30944d",
+      "sha256": "f5a09c725e2653f48544441100f6d546f12503462ee5a7e619e2d513430b7b15",
       "tests": 2,
-      "change": "Adds production gateway dispatch coverage for saved custom myroom with voice off and voice-sink precedence with voice on; existing toggle test is unchanged."
+      "change": "Adds production gateway dispatch coverage for saved custom myroom with voice off and voice-sink precedence with voice on; existing toggle test is unchanged. Teardown hygiene: the two voice-off completion checks and no-publication check now run after awaited explicit database teardown, with unchanged predicates and expected values."
     },
     {
       "path": "crates/bot/src/internal_action_http/tests/automations.rs",
@@ -62,10 +62,11 @@
     {
       "path": "crates/core/src/automation_transfer.rs",
       "function": "union_capacity_fails_the_whole_diff",
-      "cfgTestModuleLine": 395,
-      "startLine": 641,
-      "endLine": 706,
+      "cfgTestModuleLine": 410,
+      "startLine": 682,
+      "endLine": 747,
       "sha256": "735a8954abcdec0a1274c7c0f0b78d57bd124b3d4b22a0014542e2c272d54a60",
+      "lineAnchorNote": "Current line anchors reflect intervening feature changes; the protected test bytes and SHA-256 are unchanged. Baseline spans and outside-region hash below remain historical revision-6 evidence, not a hash of the current production code.",
       "baselineStartLine": 641,
       "baselineEndLine": 706,
       "unchangedOutsideRegionSha256": "4f9b8e1c6cb1b3ba95c33ce38d4b74418dea1f1401c7fcc714e2294170bb8c07",
@@ -158,7 +159,7 @@
     "note": "The expected lists are historical predictions, not extra observed failures. Observed predecessor baseline summaries are recorded separately above: six Rust-job and seven nextest assertion failures. No source-fix-head or corrected-test-head GREEN is established by that evidence."
   },
   "boundaries": {
-    "source": "Relative to exact delivered head 4e6f84f8515ba2fce5fae9a327b72f3cb83bddad, the only Rust change is unwrap() to expect(\"33 legal rows publish\") inside the protected cfg(test) publication-capacity assertion. Its value remains 100 and every other assertion/control is unchanged. All nine protected files, the other inline region, and every byte outside the changed function are byte-identical. Only that test function and this manifest change; no production, main sync, gate/rule, hook, workflow, dependency, budget, generated pin, configuration or documentation change.",
+    "source": "Relative to exact delivered head 3301618ab2be73b737fa2a2909ceb26152682b56, only two existing voice-off test functions and this manifest change. Captured observations are checked after awaited explicit database teardown; all 20 assertion macros retain their predicates and expected values, with the same fresh-collision query captured before teardown and a contextual expect in place of unwrap. All other bytes of both test files, seven other protected files and both inline protected regions are unchanged. No production, main sync, gate/rule, hook, workflow, dependency, budget, generated pin, configuration or documentation change.",
     "externalServices": "No database, live Discord, staging or production mutation during authoring. Database-backed cases require the repository-guarded disposable TestDatabase service; HTTP effects use existing local doubles.",
     "runtime": "Real parsing, role/access gates, actor command dispatch, service/transaction/import/replay paths and response rendering; command-only actors exclude unrelated timer maintenance.",
     "readOnly": "Current owner versus original creator, one ephemeral reply, poisoned room-store reads, durable and runtime room/privacy snapshots, queue, create claims, overwrite writes and effect traces remain pinned."
@@ -174,6 +175,30 @@
     "responseBound": "61 private rooms with 19-digit IDs produce a completion input of at most 2000 scalars with complete rows and explicit omitted-room accounting, or an inspectable bounded complete UTF-8 room-list attachment. Exactly one private response and no room mutations remain required."
   },
   "authorVerification": {
+    "teardownHygieneCorrection": {
+      "baseCommit": "3301618ab2be73b737fa2a2909ceb26152682b56",
+      "orderingBefore": {
+        "exit": 1,
+        "violations": 10
+      },
+      "orderingAfter": {
+        "exit": 0,
+        "violations": 0,
+        "botAssertionMacrosPreserved": 9,
+        "discordAssertionMacrosPreserved": 11,
+        "unrelatedTestBytesUnchanged": true
+      },
+      "orderingLimit": "Static source-order and assertion-inventory verification, not a Rust execution or an injected-panic database-lifecycle test. The verifier and logs are delivered with the author handoff.",
+      "referencePrerequisite": {
+        "command": "python3 scripts/generate_command_reference.py --controller",
+        "exit": 75,
+        "reason": "no idle, below-budget slot; no per-worktree fallback",
+        "additionalFinding": "pool_provisioning_mismatch",
+        "bashTimeoutMs": 600000
+      },
+      "focusedRustExecuted": false,
+      "focusedRustLimit": "The generated-reference prerequisite refused admission; neither edited Rust test was started. No new-head Rust GREEN or CI/review verdict is claimed."
+    },
     "passed": [
       "cargo fmt --all -- --check",
       "git diff --check",
@@ -249,9 +274,9 @@
     "Native pre-implementation assertion RED and passing controls are recorded; local cache refusal is not additional RED proof. Verify corrected-head GREEN when compilation is admitted. This handoff does not waive any test, CI, review or shipping requirement."
   ],
   "revision": {
-    "version": 6,
-    "supersedes": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
-    "baseCommit": "4e6f84f8515ba2fce5fae9a327b72f3cb83bddad",
-    "reason": "HARD-gate correction only: replace the reflowed pre-existing unwrap with expect(\"33 legal rows publish\") in the protected publication-capacity assertion. Its expected 100, 33rd-row admission, same-name maintenance, genuine 34-row refusal and every other assertion stay unchanged. The nine protected files and the other inline region remain byte-identical; no production or gate/rule change."
+    "version": 7,
+    "supersedes": "99ce504420707ed2ddbea4c0dd70a2dcf52a637f",
+    "baseCommit": "3301618ab2be73b737fa2a2909ceb26152682b56",
+    "reason": "Teardown hygiene only: move the existing gateway voice-off completion/publication checks and Discord voice-off catalog/dispatch/collision checks after awaited explicit disposable-database teardown. Capture observations before teardown and preserve every predicate and expected value, including empty fresh-collision rows, with a contextual expect. Refresh only the two changed protected-file hashes; seven other files and both inline regions remain unchanged. The intervening feature-branch test-fixture correction is preserved without editing it; no production or gate/rule change."
   }
 }

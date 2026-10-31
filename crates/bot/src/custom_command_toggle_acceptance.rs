@@ -406,20 +406,6 @@ async fn toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice
     drop(guard_off);
     drop(runtime_off);
     mock_off.shutdown().await;
-    assert_eq!(
-        custom_completion(&off_requests, 8201),
-        "Legacy member in Test guild",
-        "off runs the grandfathered myroom row"
-    );
-    assert_eq!(
-        custom_completion(&off_requests, 8202),
-        "Fresh member",
-        "fresh names run off"
-    );
-    assert!(
-        !off_requests.iter().any(|request| request.method == "PUT"),
-        "custom runs never publish"
-    );
     let on_gates = RouterGates {
         voice: true,
         ..gates(true, false)
@@ -448,6 +434,23 @@ async fn toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice
     db.close()
         .await
         .expect("explicit teardown before behavioral assertions");
+    // Voice-off observations assert after teardown so a failure cannot leave
+    // the disposable database behind (CONTRIBUTING.md: never rely on
+    // panic/runtime-shutdown cleanup).
+    assert_eq!(
+        custom_completion(&off_requests, 8201),
+        "Legacy member in Test guild",
+        "off runs the grandfathered myroom row"
+    );
+    assert_eq!(
+        custom_completion(&off_requests, 8202),
+        "Fresh member",
+        "fresh names run off"
+    );
+    assert!(
+        !off_requests.iter().any(|request| request.method == "PUT"),
+        "custom runs never publish"
+    );
     assert!(
         !on_requests
             .iter()

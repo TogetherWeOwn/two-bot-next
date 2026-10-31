@@ -1880,35 +1880,7 @@ async fn grandfathered_myroom_publishes_dispatches_edits_and_toggles_with_voice_
     let rows = store::list_commands(db.pool(), "2222")
         .await
         .expect("stored grandfathered rows");
-    assert_eq!(rows.len(), 2);
-    let customs: Vec<CustomCommand> = rows.iter().map(StoredCommand::registry_entry).collect();
-    let published = InteractionRouter::new(automation_voice_gates(false))
-        .publish_set(&customs)
-        .expect("off publishes");
-    let myroom = published
-        .iter()
-        .find(|definition| definition.name == "myroom")
-        .expect("off publishes the grandfathered row");
-    assert_eq!(myroom.description, "Saved description");
-    assert!(
-        published
-            .iter()
-            .any(|definition| definition.name == "freshsafe"),
-        "fresh names publish off"
-    );
     let slash = observe(&runtime, &mock, &interaction(2001, "myroom", 0, vec![])).await;
-    assert!(
-        matches!(slash.result, Ok(true)),
-        "off runs myroom: {:?}",
-        slash.result
-    );
-    let completion = slash
-        .requests
-        .iter()
-        .find(|request| request.method == "PATCH")
-        .expect("myroom slash completes");
-    assert_eq!(body(completion)["content"], "Legacy tester in Test guild");
-    no_mentions(&body(completion));
     let prefix = runtime
         .handle_message(
             &prefix_with(2002, 3333, "!myroom ordinary arguments"),
@@ -1917,9 +1889,7 @@ async fn grandfathered_myroom_publishes_dispatches_edits_and_toggles_with_voice_
             Some("Test guild"),
         )
         .await;
-    assert!(matches!(prefix, Ok(TextCommandOutcome::Delivered)));
     let fresh_slash = observe(&runtime, &mock, &interaction(2003, "freshsafe", 0, vec![])).await;
-    assert!(matches!(fresh_slash.result, Ok(true)));
     // The same-name maintenance exception must not make the newly reserved
     // name available for a fresh write, even while voice is off.
     let fresh_collision = service::put(
@@ -1937,19 +1907,7 @@ async fn grandfathered_myroom_publishes_dispatches_edits_and_toggles_with_voice_
         AT,
     )
     .await;
-    assert!(
-        matches!(
-            fresh_collision,
-            Err(service::ServiceError::Validation(
-                CommandError::ReservedName(_)
-            ))
-        ),
-        "fresh myroom stays reserved: {fresh_collision:?}"
-    );
-    assert!(store::list_commands(db.pool(), "2233")
-        .await
-        .unwrap()
-        .is_empty());
+    let fresh_collision_rows = store::list_commands(db.pool(), "2233").await;
     let updated = service::put(
         db.pool(),
         true,
@@ -1988,6 +1946,49 @@ async fn grandfathered_myroom_publishes_dispatches_edits_and_toggles_with_voice_
     drop(executor);
     mock.shutdown().await;
     db.close().await.expect("drop only the owned test database");
+    // Assert captured voice-off observations only after explicit teardown.
+    assert_eq!(rows.len(), 2);
+    let customs: Vec<CustomCommand> = rows.iter().map(StoredCommand::registry_entry).collect();
+    let published = InteractionRouter::new(automation_voice_gates(false))
+        .publish_set(&customs)
+        .expect("off publishes");
+    let myroom = published
+        .iter()
+        .find(|definition| definition.name == "myroom")
+        .expect("off publishes the grandfathered row");
+    assert_eq!(myroom.description, "Saved description");
+    assert!(
+        published
+            .iter()
+            .any(|definition| definition.name == "freshsafe"),
+        "fresh names publish off"
+    );
+    assert!(
+        matches!(slash.result, Ok(true)),
+        "off runs myroom: {:?}",
+        slash.result
+    );
+    let completion = slash
+        .requests
+        .iter()
+        .find(|request| request.method == "PATCH")
+        .expect("myroom slash completes");
+    assert_eq!(body(completion)["content"], "Legacy tester in Test guild");
+    no_mentions(&body(completion));
+    assert!(matches!(prefix, Ok(TextCommandOutcome::Delivered)));
+    assert!(matches!(fresh_slash.result, Ok(true)));
+    assert!(
+        matches!(
+            fresh_collision,
+            Err(service::ServiceError::Validation(
+                CommandError::ReservedName(_)
+            ))
+        ),
+        "fresh myroom stays reserved: {fresh_collision:?}"
+    );
+    assert!(fresh_collision_rows
+        .expect("fresh-name collision rows")
+        .is_empty());
     assert!(
         updated.is_ok(),
         "off allows same-name edits to the grandfathered row: {updated:?}"
