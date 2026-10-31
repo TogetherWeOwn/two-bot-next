@@ -62,10 +62,10 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        decode_configuration, export_configuration, validate_configuration,
-        validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory,
-        RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
-        VOICE_CONFIG_VERSION,
+        decode_configuration, export_configuration, validate_command_role_change,
+        validate_configuration, validate_time_zone_change, ChannelKind, ChannelReference,
+        GuildInventory, RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration,
+        MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, render_review_preview,
@@ -3162,6 +3162,11 @@ pub struct GuildRoomWorker<S, H> {
     privacy: HashMap<Snowflake, PrivateRoom>,
     /// Rooms whose in-memory privacy state is not yet durable.
     privacy_dirty: HashSet<Snowflake>,
+    /// Rooms whose cached ACL a lost-reply privacy write may already have
+    /// replaced, mapped to the channel revision it was fenced at. Until the
+    /// revision advances, the cached ACL is not evidence and `/myroom` reports
+    /// the room unavailable instead of labelling it from a possibly stale set.
+    ambiguous_overwrites: HashMap<Snowflake, u64>,
     /// Join channel ids this worker created or loaded from its own store:
     /// the only ones a `DeleteJoinChannel` may delete.
     join_deletable: HashSet<Snowflake>,
@@ -3519,6 +3524,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             denied: HashMap::new(),
             privacy,
             privacy_dirty: HashSet::new(),
+            ambiguous_overwrites: HashMap::new(),
             join_deletable,
             join: join_requests::JoinRequests::new(),
             failures: VecDeque::new(),
@@ -3957,6 +3963,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 continue;
             };
             let overwrites = channel.permission_overwrites.as_ref()?;
+            // A lost-reply privacy write may already have landed. Its cached
+            // ACL is not evidence until the channel revision moves past the
+            // fence, so report the room unavailable rather than label it from
+            // a set that may be stale.
+            if let Some(fenced) = self.ambiguous_overwrites.get(id) {
+                if live.channel_revisions.get(id).copied().unwrap_or(0) <= *fenced {
+                    return None;
+                }
+            }
             // The persisted private flag can outlive a successful Connect-open
             // write when Join cleanup fails. It is retry state, not ACL proof.
             let private = overwrites.iter().any(|overwrite| {
@@ -11857,6 +11872,7 @@ pub fn plan_import_preview(
     let (remaining, _) = skip_unknown_channels(&incoming, inventory);
     if let Err(error) = validate_configuration(&remaining, inventory)
         .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+        .and_then(|()| validate_command_role_change(current, &remaining))
     {
         return ImportDecision::Refuse {
             message: format!("Could not import that file: {error} Nothing was changed."),
@@ -11923,6 +11939,7 @@ pub fn plan_import_confirm(
     let (remaining, _) = skip_unknown_channels(candidate, inventory);
     if let Err(error) = validate_configuration(&remaining, inventory)
         .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+        .and_then(|()| validate_command_role_change(current, &remaining))
     {
         return ImportDecision::Refuse {
             message: format!(

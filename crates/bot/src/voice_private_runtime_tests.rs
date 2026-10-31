@@ -1278,3 +1278,46 @@ async fn myroom_read_excludes_deleted_channels_before_reconciliation() {
     assert!(worker.rooms.contains_key(&ROOM));
     assert_eq!(worker.live_owned_rooms(OWNER), Some(Vec::new()));
 }
+
+#[tokio::test]
+async fn myroom_private_state_requires_the_guild_everyone_deny() {
+    // An unrelated role's Connect deny says nothing about the room's state.
+    // Only the guild (@everyone) entry does, so this pair distinguishes the
+    // guild check from "any role deny at all" — deleting the guild-id guard
+    // would flip the second case to private while the first stays green.
+    let (live, store, http, _) = parts();
+    set_room_overwrites(
+        &live,
+        vec![role_overwrite(
+            201,
+            Permissions::empty(),
+            Permissions::CONNECT,
+        )],
+    );
+    let worker = GuildRoomWorker::load(live.clone(), store.clone(), http.clone())
+        .await
+        .unwrap();
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![(ROOM, false)]));
+    // The matching everyone deny is what makes the room private.
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![(ROOM, true)]));
+}
+
+#[tokio::test]
+async fn myroom_read_fails_closed_after_an_ambiguous_privacy_write() {
+    // A `/public` whose HTTP result was never observed may already have taken
+    // effect. The cached ACL it started from is then no longer evidence, so
+    // the read must report the room unavailable rather than call it private.
+    let (live, store, http, _) = parts();
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![(ROOM, true)]));
+    worker.fence_ambiguous_overwrites(ROOM);
+    assert_eq!(worker.live_owned_rooms(OWNER), None);
+    // A different ACL arriving from Discord resolves the ambiguity.
+    set_room_overwrites(&live, bot_and_everyone_overwrites(false));
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![(ROOM, false)]));
+}
