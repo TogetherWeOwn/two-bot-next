@@ -28,6 +28,11 @@ mod reopen_dispatch_review_acceptance_tests;
 mod leveling_ack_ordering_acceptance_tests;
 #[path = "leveling_ack_visibility_acceptance_tests.rs"]
 mod leveling_ack_visibility_acceptance_tests;
+#[path = "live_feed_command_consumer_acceptance_tests.rs"]
+mod live_feed_command_consumer_acceptance_tests;
+#[path = "live_self_role_consumer_acceptance_tests.rs"]
+mod live_self_role_consumer_acceptance_tests;
+
 #[path = "member_authority_cause_acceptance.rs"]
 mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
@@ -113,6 +118,7 @@ use twilight_model::oauth::{ApplicationFlags, ApplicationIntegrationMap, Partial
 use twilight_model::user::{CurrentUser, User};
 use twilight_model::util::Timestamp;
 use two_bot_core::funnel::now_millis_for_test;
+use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
 use two_bot_core::sticky::{store, ActivityOutcome, PutSticky};
 use two_bot_core::{
     RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
@@ -126,6 +132,7 @@ use crate::command_runtime::{
     router_with_commands, sticky_options_strict, CommandRuntime, FeedListPage, HelpSubcommand,
     RegistrySyncError,
 };
+use crate::feed_jobs::ANNOUNCEMENTS_KEY;
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
 use crate::privacy_command::{deletion_request_id, privacy_action, PrivacyAction};
@@ -3900,6 +3907,152 @@ async fn feed_commands_from_other_guilds_are_silent() {
         mock.requests().is_empty(),
         "wrong-guild interactions get silence, not a refusal"
     );
+    mock.shutdown().await;
+}
+
+fn announcements_row(guild: &str, value: serde_json::Value) -> SettingRow {
+    SettingRow {
+        guild_id: guild.to_owned(),
+        key: ANNOUNCEMENTS_KEY.to_owned(),
+        value,
+        version: 1,
+    }
+}
+
+#[tokio::test]
+async fn feed_commands_refuse_with_disabled_reply_while_live_announcements_off() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // Boot ON in the router gates, but a stored `0` for this guild: every
+    // feed invocation refuses with the disabled reply, before any defer.
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let (mut writer, live) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![announcements_row(GUILD_S, serde_json::json!(0))],
+    });
+    for name in ["feed-add", "feed-remove", "feed-list"] {
+        runtime
+            .on_interaction_with_live(&slash(name, Some(CHANNEL), Vec::new()), Some(&live))
+            .await;
+    }
+    let requests = mock.requests();
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 3, "one ephemeral refusal per command");
+    assert_eq!(requests.len(), 3, "no defer, no edit: {requests:?}");
+    for callback in &callbacks {
+        let json: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback json");
+        assert_eq!(json["type"], 4);
+        assert_eq!(json["data"]["content"], ANNOUNCEMENTS_DISABLED_REPLY);
+        assert_eq!(json["data"]["flags"], 64, "ephemeral");
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_commands_fall_back_to_boot_when_live_row_absent_or_deleted() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let (mut writer, live) = live_channel();
+    // Option-less `feed-add`: the planner refuses the missing kind before
+    // any store work, so admitted invocations stay pool-free while the defer
+    // still proves the live overlay let them through.
+    let admitted = || slash("feed-add", Some(CHANNEL), Vec::new());
+    // Absent row: an empty snapshot executes through the boot-on value ...
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![],
+    });
+    runtime
+        .on_interaction_with_live(&admitted(), Some(&live))
+        .await;
+    // ... and so does a deleted row: store `0`, then delete it.
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![announcements_row(GUILD_S, serde_json::json!(0))],
+    });
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![],
+    });
+    runtime
+        .on_interaction_with_live(&admitted(), Some(&live))
+        .await;
+    // ... as does no snapshot at all (pre-first-poll).
+    runtime.on_interaction_with_live(&admitted(), None).await;
+    // All three invocations deferred (type 5): admitted, never refused.
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 3, "one defer per invocation");
+    for callback in &callbacks {
+        let json: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback json");
+        assert_eq!(json["type"], 5, "deferred, not refused");
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_commands_ignore_live_rows_for_other_guilds() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let (mut writer, live) = live_channel();
+    // Another guild's stored `0` never refuses this guild's invocations ...
+    // (option-less `feed-add` keeps the admitted path pool-free; see above).
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![announcements_row("other-guild", serde_json::json!(0))],
+    });
+    runtime
+        .on_interaction_with_live(&slash("feed-add", Some(CHANNEL), Vec::new()), Some(&live))
+        .await;
+    // ... while this guild's stored `0` refuses beside another guild's `1`.
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![
+            announcements_row(GUILD_S, serde_json::json!(0)),
+            announcements_row("other-guild", serde_json::json!(1)),
+        ],
+    });
+    runtime
+        .on_interaction_with_live(&slash("feed-list", Some(CHANNEL), Vec::new()), Some(&live))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 2, "one answer per invocation");
+    let first: serde_json::Value =
+        serde_json::from_slice(&callbacks[0].body).expect("callback json");
+    assert_eq!(first["type"], 5, "foreign row executes");
+    let second: serde_json::Value =
+        serde_json::from_slice(&callbacks[1].body).expect("callback json");
+    assert_eq!(second["type"], 4, "own row refuses");
+    assert_eq!(
+        second["data"]["content"], ANNOUNCEMENTS_DISABLED_REPLY,
+        "refusal names the host setting"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_commands_stay_refused_when_boot_off_despite_stored_one() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // Boot OFF: the surface was never registered, so a stored `1` cannot
+    // enable it — enabling still needs a restart. Refuse-only by design.
+    let runtime = runtime_without_db(gates(true, false), true, origin);
+    let (mut writer, live) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![announcements_row(GUILD_S, serde_json::json!(1))],
+    });
+    runtime
+        .on_interaction_with_live(&slash("feed-list", Some(CHANNEL), Vec::new()), Some(&live))
+        .await;
+    let requests = mock.requests();
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one ephemeral refusal");
+    assert_eq!(requests.len(), 1, "no defer, no edit: {requests:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&callbacks[0].body).expect("callback json");
+    assert_eq!(json["type"], 4);
+    assert_eq!(json["data"]["content"], ANNOUNCEMENTS_DISABLED_REPLY);
     mock.shutdown().await;
 }
 

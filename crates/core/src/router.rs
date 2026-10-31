@@ -327,6 +327,41 @@ pub enum SlashOutcome {
     Ignore,
 }
 
+/// Per-dispatch live overlay for the announcements command surface: while the
+/// resolved announcements bit is off, the five live-gated commands (feed add,
+/// remove and list, RSVP and RSVP totals) refuse with the same disabled reply
+/// the boot-off router produces. Callers pass the already-resolved bit (live
+/// snapshot store-first over boot), so an absent row executes through the
+/// boot value before this helper ever runs. Refuse-only: boot-off rows were
+/// already refused upstream and pass through, so enabling from a boot-off
+/// deployment still needs a restart (no registration exists to dispatch
+/// through).
+///
+/// LFG stays boot-gated by design: `/lfg` and `/lfg-close` share their
+/// execution arm with the LFG signup buttons, which answer boot-off with
+/// silence rather than a refusal, so live-gating the slash half alone would
+/// split one surface across two semantics. Scorecard `attendance` answers to
+/// its own gate, not this one.
+#[must_use]
+pub fn live_gate_announcements_slash(
+    outcome: SlashOutcome,
+    announcements_live: bool,
+) -> SlashOutcome {
+    match outcome {
+        SlashOutcome::Handled {
+            handler:
+                HandlerId::FeedAdd
+                | HandlerId::FeedRemove
+                | HandlerId::FeedList
+                | HandlerId::Rsvp
+                | HandlerId::RsvpAttendance,
+        } if !announcements_live => SlashOutcome::Refuse {
+            refusal: RouterRefusal::AnnouncementsDisabled,
+        },
+        other => other,
+    }
+}
+
 /// Component / modal-submit routing outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentOutcome {
@@ -1175,6 +1210,66 @@ mod tests {
                 handler: HandlerId::Rank
             }
         );
+    }
+
+    #[test]
+    fn live_gate_refuses_only_the_live_announcement_surface() {
+        // The per-dispatch live overlay: a stored `0` refuses the five
+        // live-gated announcement commands with the same disabled reply the
+        // boot-off router produces; LFG (slash and signup share one arm) and
+        // the scorecard surface stay boot-gated.
+        for handler in [
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
+        ] {
+            assert_eq!(
+                live_gate_announcements_slash(SlashOutcome::Handled { handler }, false),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AnnouncementsDisabled
+                },
+                "{handler:?} refuses while live-off"
+            );
+            assert_eq!(
+                live_gate_announcements_slash(SlashOutcome::Handled { handler }, true),
+                SlashOutcome::Handled { handler },
+                "{handler:?} executes while live-on"
+            );
+        }
+        // Boot-gated surface passes through untouched either way.
+        for handler in [
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::ScorecardAttendance,
+            HandlerId::Rank,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash(SlashOutcome::Handled { handler }, live),
+                    SlashOutcome::Handled { handler },
+                    "{handler:?} ignores the live bit"
+                );
+            }
+        }
+        // Non-handled outcomes pass through: the router already refused
+        // boot-off rows, and silence/unknown are not announcements business.
+        for outcome in [
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::AnnouncementsDisabled,
+            },
+            SlashOutcome::Unknown,
+            SlashOutcome::Ignore,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash(outcome, live),
+                    outcome,
+                    "{outcome:?} passes through"
+                );
+            }
+        }
     }
 
     #[test]

@@ -19,6 +19,9 @@ impl duplicate_acceptance_tests::ObserveAdd for store::FeedAddOutcome {
     }
 }
 
+#[path = "live_feed_job_consumer_acceptance_tests.rs"]
+mod live_feed_job_consumer_acceptance_tests;
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
