@@ -72,8 +72,9 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
 
 
-# Strings are skipped whole, so brackets inside them never count.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
@@ -85,9 +86,11 @@ def _loads_bounded(raw, **kwargs):
     and decodes 10,000 levels, so the bound no longer depends on the
     interpreter: existing RecursionError refusals keep working unchanged.
     """
-    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    # Decode bytes exactly as json.loads would, then scan and parse that text.
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
     depth = 0
-    for match in JSON_TOKEN.finditer(text):
+    for match in JSON_TOKEN.finditer(raw):
         token = match.group()
         if token in "[{":
             depth += 1

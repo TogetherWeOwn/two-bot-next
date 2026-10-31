@@ -160,8 +160,9 @@ def _unique_object(pairs):
 # it is refused up front with an explicit stack instead of recursing.
 MAX_RECORD_DEPTH = 100
 
-# Strings are skipped whole, so brackets inside them never count.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 
 
 def _json_depth_exceeds(text, limit):

@@ -156,7 +156,7 @@ class RollbackClient(base.Client):
                     for item in envelope.get("errors", [])
                     if isinstance(item, dict) and type(item.get("code")) is int
                 ][:4]
-            except (OSError, ValueError, AttributeError, TypeError):
+            except (OSError, ValueError, AttributeError, TypeError, RecursionError):
                 pass
             raise GateError(
                 "api_http_failure", f"status={error.code} codes={','.join(codes) or 'none'}"

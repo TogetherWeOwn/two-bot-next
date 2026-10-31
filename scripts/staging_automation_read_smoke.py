@@ -92,8 +92,9 @@ SLASH_COMMAND_TYPE = 1
 NOT_REGISTERED = "not registered in the staging guild"
 
 
-# Strings are skipped whole, so brackets inside them never count.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
@@ -105,9 +106,11 @@ def _loads_bounded(raw, **kwargs):
     and decodes 10,000 levels, so the bound no longer depends on the
     interpreter: existing RecursionError refusals keep working unchanged.
     """
-    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    # Decode bytes exactly as json.loads would, then scan and parse that text.
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
     depth = 0
-    for match in JSON_TOKEN.finditer(text):
+    for match in JSON_TOKEN.finditer(raw):
         token = match.group()
         if token in "[{":
             depth += 1
