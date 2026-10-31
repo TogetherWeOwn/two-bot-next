@@ -50,7 +50,7 @@ JOB_INVENTORY = {
                               "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
                            "pinned-history-guard", "certify-promotion"},
-    "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
+    "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep", "sweep-result"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): one vYYYY.MM.DD tag per day,
