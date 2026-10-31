@@ -4,6 +4,7 @@
 import http.client
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,6 +61,32 @@ JOB_NAMES = {
 RUNS_PAGE_SIZE = 15
 MAX_HISTORY_RUNS = 200
 MAX_RESPONSE_BYTES = 1 << 20
+
+
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
 
 
 class HistoryError(Exception):
@@ -297,7 +324,7 @@ def _get(path, token):
         raise HistoryError("could not read recent synthetic workflow history "
                            "(response exceeds the size cap)")
     try:
-        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, RecursionError) as error:
         raise HistoryError("could not read recent synthetic workflow history ("
                            + error.__class__.__name__ + ")") from None

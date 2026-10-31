@@ -92,6 +92,32 @@ SLASH_COMMAND_TYPE = 1
 NOT_REGISTERED = "not registered in the staging guild"
 
 
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 class SmokeError(Exception):
     """A check's one-line failure reason (fixed vocabulary only)."""
 
@@ -197,7 +223,7 @@ def get_json(fetch_fn, url):
     if len(body) > BODY_CAP:
         raise SmokeError("interactions endpoint answered over the body cap")
     try:
-        value = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        value = _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise SmokeError("interactions endpoint answered 200 with duplicate JSON keys")
     except (ValueError, UnicodeDecodeError, RecursionError):

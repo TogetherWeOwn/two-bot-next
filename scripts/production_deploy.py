@@ -39,6 +39,27 @@ MAX_READYZ_BYTES = 64 * 1024
 # than this is refused up front with an explicit stack instead of recursing.
 MAX_READYZ_DEPTH = 100
 
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+
+
+def _json_depth_exceeds(text, limit):
+    """Lexical nesting pre-scan, run before json.loads.
+
+    The decoder's own RecursionError is no longer a reliable bound: newer
+    CPython sizes it from the real C stack and decodes 10,000 levels.
+    """
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif token in "]}":
+            depth -= 1
+    return False
+
 
 class DuplicateKeyError(ValueError):
     """A JSON object repeats a key; the message never carries key/value data."""
@@ -202,14 +223,14 @@ def readyz(args):
         # verdicts, without decoding or echoing any oversized remote input.
         if len(raw) > MAX_READYZ_BYTES:
             return reject("/readyz answered over the body cap")
-        report = json.loads(
-            raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
-        )
+        text = raw.decode("utf-8")
+        if _json_depth_exceeds(text, MAX_READYZ_DEPTH):
+            return reject("/readyz JSON is too deeply nested")
+        report = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         return reject("/readyz carries duplicate JSON object keys")
     except RecursionError:
-        # Decoder-level backstop: input deeper than the C decoder's own
-        # stack raises here before _too_deeply_nested ever sees it.
+        # Decoder-level backstop behind the lexical pre-scan above.
         return reject("/readyz JSON is too deeply nested")
     except (OSError, ValueError):
         return reject("/readyz did not return JSON")

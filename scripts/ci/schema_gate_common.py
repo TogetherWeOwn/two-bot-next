@@ -29,6 +29,32 @@ RESULTS = {
 }
 
 
+# Strings are skipped whole, so brackets inside them never count.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 class Refused(ValueError):
     """A bounded, non-secret refusal; never include rejected input in errors."""
 
@@ -146,7 +172,7 @@ def run_plan(argv, run):
         raise GateFailure("plan_process_failed")
     require(isinstance(proc.stdout, str), "plan manifest is not valid JSON")
     try:
-        return json.loads(proc.stdout.strip().splitlines()[-1],
+        return _loads_bounded(proc.stdout.strip().splitlines()[-1],
                           object_pairs_hook=unique_object, parse_constant=invalid_constant,
                           parse_float=finite_float)
     except Refused:
