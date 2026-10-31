@@ -1,0 +1,96 @@
+name: future-clock probe (temporary)
+
+# TEMPORARY evidence job for the fixture clock audit. Runs the DB-backed suite
+# with both Postgres and the test binaries under libfaketime at 2027-10-31.
+# Removed before merge; never a required check.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: future-clock-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    if: github.head_ref == 'test/fixture-relative-clocks'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      TWO_DATABASE_TLS: local-only
+      FAKE_AT: '@2027-10-31 12:00:00'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install libfaketime and psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends faketime libfaketime postgresql-client >/dev/null
+          ls /usr/lib/x86_64-linux-gnu/faketime/
+
+      - name: Start faketime'd Postgres as agent-testdb
+        run: |
+          cat > /tmp/pg.Dockerfile <<'EOF'
+          FROM postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+          RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends libfaketime && rm -rf /var/lib/apt/lists/*
+          EOF
+          docker build -q -t pg-faketime -f /tmp/pg.Dockerfile /tmp
+          docker network create probe
+          docker run -d --name agent-testdb --network probe -p 127.0.0.1:5432:5432 \
+            --tmpfs /var/lib/postgresql:rw,size=2147483648 \
+            -e POSTGRES_USER=agent_test -e POSTGRES_DB=agent_test -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -e LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketimeMT.so.1 \
+            -e FAKETIME="$FAKE_AT" -e FAKETIME_DONT_FAKE_MONOTONIC=1 \
+            pg-faketime
+          ip="$(docker inspect -f '{{(index .NetworkSettings.Networks "probe").IPAddress}}' agent-testdb)"
+          echo "$ip agent-testdb" | sudo tee -a /etc/hosts
+          for i in $(seq 1 60); do pg_isready -q -h agent-testdb -U agent_test -d agent_test && break; sleep 1; done
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -At -c 'SELECT now()'
+          for db in two_bot_test_ci two_next_backup_ci two_next_backup_publication_ci; do
+            createdb -h agent-testdb -U agent_test "$db"
+          done
+
+      - name: Build test binaries (real clock)
+        run: |
+          python3 scripts/generate_command_reference.py
+          cargo test --workspace --lib --bins --tests --features two-bot-core/db --locked --no-run
+
+      - name: Run suite at 2027-10-31
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
+        run: |
+          set +e
+          export FAKETIME_DONT_FAKE_MONOTONIC=1
+          ft() { faketime -m -f "$FAKE_AT" "$@"; }
+          ft date -u
+          status=0
+          ft cargo test --workspace --lib --bins --features two-bot-core/db --locked --no-fail-fast -- \
+            --skip ticket_runtime::cursor_budget --skip settings_jobs::tests::ops_overrides_acceptance_tests:: || status=1
+          ft cargo test --workspace --test '*' --features two-bot-core/db --locked --no-fail-fast -- \
+            --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
+            --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only \
+            --skip uses_one_above_i32_max_saturates_and_write_proceeds \
+            --skip uses_u64_max_saturates_at_i32_max \
+            --skip saturated_write_warns_with_identifiers_and_no_raw_counter \
+            --skip normal_uses_round_trip_byte_identical \
+            --skip exact_i32_max_writes_without_saturation_warn || status=1
+          exit $status
