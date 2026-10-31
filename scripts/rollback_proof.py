@@ -234,16 +234,8 @@ def check_freshness(*, now=None):
             and evidence.get("child_conclusion") == "failure"
             and type(evidence.get("child_run_id")) is int and evidence["child_run_id"] > 0,
             "daily_proof_evidence_invalid")
-    # A manual proof shares the incident issue: if one failed after the graded
-    # scheduled proof, that older pass must not close the issue it opened.
-    latest = gh(f"repos/{REPO}/actions/workflows/staging-rollback-drill.yml/runs"
-                "?branch=main&per_page=1").get("workflow_runs") or []
-    require(len(latest) == 1 and isinstance(latest[0], dict), "daily_proof_missing")
-    require(latest[0].get("id") == run["id"]
-            or latest[0].get("conclusion") != "failure"
-            or moment(latest[0].get("created_at")) <= moment(run.get("created_at")),
-            "newer_proof_failed")
-    return {"verdict": "pass", "proof_run_id": run["id"], "child_run_id": evidence["child_run_id"]}
+    return {"verdict": "pass", "proof_run_id": run["id"], "child_run_id": evidence["child_run_id"],
+            "proof_completed_at": moment(run.get("updated_at")).isoformat()}
 
 
 INCIDENT_KEY = "staging-rollback-proof"
@@ -266,11 +258,16 @@ def alert(code):
         raise ProofError("alert_delivery_failed") from None
 
 
-def resolve():
+def resolve(proof_completed_at):
+    # Every failed proof (scheduled or manual) alerts on this issue, so
+    # activity after the graded proof completed means a newer failure: hold
+    # the issue open rather than close it on an older pass.
+    quiet_since = moment(proof_completed_at)
     client = incident_client()
     try:
         client.close_incident(os.environ, INCIDENT_KEY,
-                              f"Daily staging rollback proof is green again. Watch run: {client.run_link()}")
+                              f"Daily staging rollback proof is green again. Watch run: {client.run_link()}",
+                              quiet_since=quiet_since)
     except client.IncidentError:
         raise ProofError("incident_close_failed") from None
 
@@ -301,7 +298,7 @@ def main(argv=None):
                 code = str(error) if isinstance(error, ProofError) else "daily_proof_unreadable"
                 alert(code)
                 raise ProofError(code) from None
-            resolve()
+            resolve(evidence.get("proof_completed_at"))
         print(json.dumps(evidence, sort_keys=True))
         return 0
     except (ProofError, ValueError, TypeError, KeyError, AttributeError, OSError) as error:

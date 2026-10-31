@@ -54,6 +54,8 @@ DIGEST = "sha256:" + "a" * 64
 ENV = {"GITHUB_REPOSITORY": proof.REPO, "GITHUB_REF": "refs/heads/main"}
 
 
+PASS = {"verdict": "pass", "proof_completed_at": NOW.isoformat()}
+
 def run(workflow=proof.WORKFLOW, event="workflow_dispatch", conclusion="failure"):
     return {"id": 123, "display_title": "staging rollback proof", "path": workflow, "event": event, "head_branch": "main",
             "repository": {"full_name": proof.REPO}, "head_repository": {"full_name": proof.REPO},
@@ -280,32 +282,10 @@ class RollbackProofTests(unittest.TestCase):
                     with self.assertRaisesRegex(proof.ProofError, "daily_proof_stale"):
                         proof.check_freshness(now=NOW)
 
-    def test_a_newer_failed_manual_proof_keeps_the_incident_open(self):
-        scheduled = run(proof.PROOF_WORKFLOW, "schedule", "success")
-        scheduled["created_at"] = (NOW - timedelta(hours=2)).isoformat()
-        evidence = {"schema_version": 1, "verdict": "pass", "environment": "staging",
-                    "child_conclusion": "failure", "child_run_id": 456}
-        for conclusion, newer, passes in (("failure", True, False), ("failure", False, True),
-                                          ("success", True, True), ("cancelled", True, True),
-                                          (None, True, True)):
-            manual = dict(run(proof.PROOF_WORKFLOW, "workflow_dispatch", conclusion), id=124)
-            manual["created_at"] = (NOW - timedelta(hours=1 if newer else 3)).isoformat()
-
-            def fake_gh(path, scheduled=scheduled, manual=manual):
-                return {"workflow_runs": [scheduled if "event=schedule" in path else manual]}
-
-            with self.subTest(conclusion=conclusion, newer=newer), patch.object(proof, "gh", side_effect=fake_gh), \
-                    patch.object(proof, "artifact_files", return_value={"proof.json": evidence}):
-                if passes:
-                    self.assertEqual(proof.check_freshness(now=NOW)["verdict"], "pass")
-                else:
-                    with self.assertRaisesRegex(proof.ProofError, "newer_proof_failed"):
-                        proof.check_freshness(now=NOW)
-
     def test_watch_files_only_on_a_finding_closes_on_pass_and_delivery_failure_is_red(self):
         for error in (None, proof.ProofError("daily_proof_missing"), ValueError("private-body")):
             with patch.dict(os.environ, ENV), \
-                    patch.object(proof, "check_freshness", side_effect=error, return_value={"verdict": "pass"}), \
+                    patch.object(proof, "check_freshness", side_effect=error, return_value=PASS), \
                     patch.object(incident_issue, "open_incident") as opened, \
                     patch.object(incident_issue, "close_incident") as closed, \
                     patch.object(incident_issue, "run_link", return_value="https://example.test/run/123"), \
@@ -316,6 +296,7 @@ class RollbackProofTests(unittest.TestCase):
                 opened.assert_not_called()
                 closed.assert_called_once()
                 self.assertEqual(closed.call_args.args[1], "staging-rollback-proof")
+                self.assertEqual(closed.call_args.kwargs["quiet_since"], NOW)
             else:
                 finding = "daily_proof_missing" if isinstance(error, proof.ProofError) else "daily_proof_unreadable"
                 opened.assert_called_once_with(os.environ, "staging-rollback-proof",
@@ -332,12 +313,29 @@ class RollbackProofTests(unittest.TestCase):
         self.assertNotIn("private-body", stderr.getvalue())
         # A passing watch that cannot close the issue is red, never silent.
         with patch.dict(os.environ, ENV), \
-                patch.object(proof, "check_freshness", return_value={"verdict": "pass"}), \
+                patch.object(proof, "check_freshness", return_value=PASS), \
                 patch.object(incident_issue, "close_incident",
                              side_effect=incident_issue.IncidentError("private-body")), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(proof.main(["watch"]), 1)
         self.assertEqual(json.loads(stderr.getvalue())["code"], "incident_close_failed")
+
+    def test_watch_without_a_readable_proof_completion_time_closes_nothing(self):
+        for completed in (None, "", "not-a-time", "2026-10-31T03:20:00"):
+            with self.subTest(completed=completed), patch.dict(os.environ, ENV), \
+                    patch.object(proof, "check_freshness", return_value=dict(PASS, proof_completed_at=completed)), \
+                    patch.object(incident_issue, "close_incident") as closed, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(proof.main(["watch"]), 1)
+            closed.assert_not_called()
+
+    def test_freshness_reports_when_the_graded_proof_completed(self):
+        good = run(proof.PROOF_WORKFLOW, "schedule", "success")
+        evidence = {"schema_version": 1, "verdict": "pass", "environment": "staging",
+                    "child_conclusion": "failure", "child_run_id": 456}
+        with patch.object(proof, "gh", return_value={"workflow_runs": [good]}), \
+                patch.object(proof, "artifact_files", return_value={"proof.json": evidence}):
+            self.assertEqual(proof.check_freshness(now=NOW)["proof_completed_at"], NOW.isoformat())
 
     @staticmethod
     def alert_text(code):

@@ -472,8 +472,10 @@ GitHub issue labelled `incident`; Paperclip turns it into an agent task. Indepen
 `rollback-proof-watch` job checks the newest scheduled drill and its artifact,
 even if the digest fails. Missing, failed, cancelled, stuck, unreadable or
 older-than-30-hour proof alerts and fails the watcher. An older successful proof
-cannot hide a newer failed one, including a failed manual dispatch: that also
-alerts and fails the watcher instead of closing its issue. A healthy check comments on and closes any open issue. This independent
+cannot hide a newer failed one. A healthy check comments on and closes any open issue
+with no activity since the graded proof completed. Every failed proof, scheduled
+or manual, alerts on that issue, so later activity holds it open until a newer
+scheduled proof passes. This independent
 schedule catches a missed drill trigger; an outage of GitHub Actions itself is
 outside these two scheduled checks.
 

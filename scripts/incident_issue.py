@@ -22,6 +22,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 API = "https://api.github.com"
 LABEL = "incident"
@@ -100,8 +101,17 @@ def _request(method, path, token, body=None):
         raise IncidentError(f"incident issue {method} response is not valid JSON") from None
 
 
+def _updated(issue):
+    """The issue's last-activity time, or None when absent or unreadable."""
+    try:
+        value = datetime.fromisoformat(issue["updated_at"].replace("Z", "+00:00"))
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return None
+    return value if value.tzinfo is not None else None
+
+
 def _open_keyed(env, key):
-    """Ascending numbers of every open `incident` issue carrying this key."""
+    """Every open `incident` issue carrying this key, lowest number first."""
     token, repo = _context(env)
     tag = marker(key)
     matches = []
@@ -115,17 +125,17 @@ def _open_keyed(env, key):
                 or (issue.get("body") is not None and not isinstance(issue["body"], str))
                 for issue in issues):
             raise IncidentError("incident issue list is malformed")
-        matches += [issue["number"] for issue in issues
+        matches += [issue for issue in issues
                     if "pull_request" not in issue and tag in (issue.get("body") or "")]
         if len(issues) < PAGE_SIZE:
-            return sorted(matches)
+            return sorted(matches, key=lambda issue: issue["number"])
     raise IncidentError("too many open incident issues to search")
 
 
 def find_open(env, key):
     """Lowest-numbered open `incident` issue carrying this key, or None."""
     matches = _open_keyed(env, key)
-    return matches[0] if matches else None
+    return matches[0]["number"] if matches else None
 
 
 def _clip(text, limit):
@@ -168,26 +178,36 @@ def open_incident(env, key, title, body):
     return "opened", number
 
 
-def close_incident(env, key, body):
+def close_incident(env, key, body, quiet_since=None):
     """RECOVERY: comment on and close every open issue for `key`.
 
-    Closing all of them also clears a duplicate that a race left open.
-    Returns ("closed", lowest number), or ("none-open", None) when no issue
-    is open (for example an agent already closed it): nothing is left to
-    resolve.
+    Closing all of them also clears a duplicate that a race left open. With
+    `quiet_since` (an aware datetime), an issue with activity after it, or
+    no readable activity time, is held open instead: an alert after that
+    moment means the check failed again since the evidence of health.
+    Returns ("closed", lowest closed), ("held", lowest held) when every open
+    issue was held, or ("none-open", None) when no issue is open (for
+    example an agent already closed it): nothing is left to resolve.
     """
     if not KEY.fullmatch(key or ""):
         raise IncidentError("refusing: invalid incident key")
     token, repo = _context(env)
-    numbers = _open_keyed(env, key)
-    if not numbers:
+    issues = _open_keyed(env, key)
+    if not issues:
         return "none-open", None
-    for number in numbers:
+    closed, held = [], []
+    for issue in issues:
+        number = issue["number"]
+        updated = _updated(issue)
+        if quiet_since is not None and (updated is None or updated > quiet_since):
+            held.append(number)
+            continue
         _request("POST", f"/repos/{repo}/issues/{number}/comments", token,
                  {"body": _clip(body, MAX_BODY)})
         _request("PATCH", f"/repos/{repo}/issues/{number}", token,
                  {"state": "closed", "state_reason": "completed"})
-    return "closed", numbers[0]
+        closed.append(number)
+    return ("closed", closed[0]) if closed else ("held", held[0])
 
 
 def run_link(env=None):

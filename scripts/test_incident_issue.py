@@ -104,6 +104,24 @@ class IncidentIssueTests(unittest.TestCase):
         self.assertEqual([call[:2] for call in fake.calls[1:] if call[0] == "PATCH"], [
             ("PATCH", "/repos/owner/repo/issues/5"), ("PATCH", "/repos/owner/repo/issues/12")])
 
+    def test_recovery_holds_an_issue_with_activity_after_the_evidence_of_health(self):
+        from datetime import datetime, timezone
+        passed = datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+        for updated, outcome in (("2026-10-31T03:59:59Z", ("closed", 12)),
+                                 ("2026-10-31T04:00:00Z", ("closed", 12)),
+                                 # A proof that failed after the pass alerted here.
+                                 ("2026-10-31T04:10:00Z", ("held", 12)),
+                                 (None, ("held", 12)), ("garbage", ("held", 12)),
+                                 ("2026-10-31T04:10:00", ("held", 12))):
+            issue = {"number": 12, "body": sink.marker(KEY)}
+            if updated is not None:
+                issue["updated_at"] = updated
+            fake = FakeGitHub([issue])
+            with self.subTest(updated=updated), mock.patch.object(sink, "_request", side_effect=fake):
+                self.assertEqual(sink.close_incident(ENV, KEY, "healthy", quiet_since=passed), outcome)
+            writes = [call for call in fake.calls if call[0] != "GET"]
+            self.assertEqual(len(writes), 2 if outcome[0] == "closed" else 0)
+
     def test_recovery_comments_then_closes_and_tolerates_no_open_issue(self):
         fake = FakeGitHub([{"number": 12, "body": sink.marker(KEY)}])
         self.assertEqual(self.run_with(fake, sink.close_incident, KEY, "healthy"), ("closed", 12))
