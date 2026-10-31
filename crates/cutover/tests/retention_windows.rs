@@ -825,20 +825,24 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
     const FIX_OTHER: &str = "1545644954272137298";
     const FIX_USER: &str = "123456789012345678";
     const FIX_USER_2: &str = "123456789012345679";
-    // This runs the full retention job, so unrelated surviving-guild events
-    // must be fresh enough not to expire under the independent raw-event TTL.
-    // Keep the shared fixture and dedicated old-event expiry controls unchanged.
-    let refreshed = sqlx::query("UPDATE event_store SET event_time = now() WHERE guild_id = $1")
-        .bind(FIX_OTHER)
-        .execute(pool)
+    // Every shared-fixture capture must start inside both raw-event TTLs,
+    // with its receipt timestamp and timestamp-bearing replay key aligned.
+    // Dedicated raw-expiry tests seed their own deliberately old captures.
+    for guild in [FIX_GONE, FIX_OTHER] {
+        let fresh_captures: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_store WHERE guild_id = $1
+             AND event_time > now() + interval '15 minutes' - interval '30 days'
+             AND event_time <= now() AND received_at = event_time
+             AND right(dedup_key, 20) = to_char(event_time AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+        )
+        .bind(guild)
+        .fetch_one(pool)
         .await
         .unwrap();
-    assert_eq!(
-        refreshed.rows_affected(),
-        10,
-        "the surviving guild must start with all ten fresh event_store rows"
-    );
-    for guild in [FIX_GONE, FIX_OTHER] {
+        assert_eq!(
+            fresh_captures, 10,
+            "guild {guild} must start with ten fresh captures and matching receipt times/replay keys"
+        );
         sqlx::query(
             "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count, bot_floor)
              VALUES ($1, to_char(now() - interval '1 day', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 10, NULL)",

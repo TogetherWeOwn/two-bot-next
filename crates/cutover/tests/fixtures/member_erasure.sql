@@ -6,6 +6,9 @@ DECLARE
   u TEXT;
   k TEXT;
   intent BIGINT;
+  -- Identity fixtures stay inside retention; expiry tests seed their own old rows.
+  capture_at TIMESTAMPTZ := date_trunc('second', now() - interval '10 days');
+  capture_stamp TEXT := to_char(capture_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"');
 BEGIN
   FOR g IN SELECT unnest(ARRAY['1545644954272137297', '1545644954272137298']) LOOP
     FOR u IN SELECT unnest(ARRAY['123456789012345678', '123456789012345679']) LOOP
@@ -20,11 +23,11 @@ BEGIN
       -- expect five event_store rows per member. Voice columns stay NULL
       -- here; the backup seed covers the S4 voice, S5 message/reaction and
       -- S6 thread shapes.
-      INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
+      INSERT INTO event_store (event_type, guild_id, user_id, event_time, received_at, dedup_key,
         presence_status, activity_type, application_id, nick_changed, roles,
         channel_id, message_id)
-        VALUES ('PRESENCE_UPDATE', g, u, '2026-10-01T00:00:00Z',
-        'PRESENCE_UPDATE:' || g || ':' || u || ':2026-10-01T00:00:00Z',
+        VALUES ('PRESENCE_UPDATE', g, u, capture_at, capture_at,
+        'PRESENCE_UPDATE:' || g || ':' || u || ':' || capture_stamp,
         'online', 0, NULL, FALSE, '[]', 'c-' || k, 'm-' || k);
       INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, updated_at)
         VALUES (g, u, 1, u, now());
@@ -212,33 +215,32 @@ BEGIN
          actor_id, target_id, user_id, event_time, received_at, dedup_key)
         VALUES ('audit_log_entry', g, 'stage-actor-' || k, 1, 'interaction-actor-' || k,
           1, 'app-' || k, 'cmd-' || k, 'audit-actor-' || k, 1,
-          u, NULL, NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
-          'AUDIT_LOG_ENTRY:' || g || ':audit-actor-' || k || ':2026-10-01T00:00:00Z');
+          u, NULL, NULL, capture_at, capture_at,
+          'AUDIT_LOG_ENTRY:' || g || ':audit-actor-' || k || ':' || capture_stamp);
       INSERT INTO event_store
         (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
          interaction_type, application_id, command_id, audit_log_entry_id, action_type,
          actor_id, target_id, user_id, event_time, received_at, dedup_key)
         VALUES ('audit_log_entry', g, 'stage-target-' || k, 1, 'interaction-target-' || k,
           1, 'app-' || k, 'cmd-' || k, 'audit-target-' || k, 1,
-          NULL, u, NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
-          'AUDIT_LOG_ENTRY:' || g || ':audit-target-' || k || ':2026-10-01T00:00:00Z');
+          NULL, u, NULL, capture_at, capture_at,
+          'AUDIT_LOG_ENTRY:' || g || ':audit-target-' || k || ':' || capture_stamp);
       INSERT INTO event_store
         (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
          interaction_type, application_id, command_id, audit_log_entry_id, action_type,
          actor_id, target_id, user_id, event_time, received_at, dedup_key)
         VALUES ('audit_log_entry', g, 'stage-user-' || k, 1, 'interaction-user-' || k,
           1, 'app-' || k, 'cmd-' || k, 'audit-user-' || k, 1,
-          NULL, NULL, u, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
-          'AUDIT_LOG_ENTRY:' || g || ':audit-user-' || k || ':2026-10-01T00:00:00Z');
+          NULL, NULL, u, capture_at, capture_at,
+          'AUDIT_LOG_ENTRY:' || g || ':audit-user-' || k || ':' || capture_stamp);
       INSERT INTO event_store
         (event_type, guild_id, channel_id, invite_code_hash, inviter_id,
          actor_id, target_id, user_id, event_time, received_at, dedup_key)
         VALUES ('INVITE_CREATE', g, 'c-' || k,
           repeat(md5('invite-' || k), 2),
-          u, NULL, NULL, NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
+          u, NULL, NULL, NULL, capture_at, capture_at,
           'INVITE_CREATE:' || g || ':c-' || k || ':' ||
-            repeat(md5('invite-' || k), 2) ||
-            ':2026-10-01T00:00:00Z');
+            repeat(md5('invite-' || k), 2) || ':' || capture_stamp);
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);
