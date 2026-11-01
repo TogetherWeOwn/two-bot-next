@@ -227,6 +227,12 @@ class MigrationFindingTests(unittest.TestCase):
         self.assertEqual(self.findings(self.repo.commit("unparseable"))[1],
                          [{"migration": "0002_drop.sql", "code": "unparseable_migration"}])
 
+    def test_padded_marker_reason_must_be_ten_characters(self):
+        self.repo.write("crates/store/migrations/0002_drop.sql",
+                        "-- rollback-compatible: x         \nDROP TABLE x;\n")
+        self.assertEqual(self.findings(self.repo.commit("padded"))[1],
+                         [{"migration": "0002_drop.sql", "code": "drop_object"}])
+
     def test_rewritten_or_deleted_migration_refuses(self):
         self.repo.write("crates/store/migrations/0001_base.sql", "CREATE TABLE t (id int);\n")
         self.assertEqual(self.findings(self.repo.commit("rewrite"))[1],

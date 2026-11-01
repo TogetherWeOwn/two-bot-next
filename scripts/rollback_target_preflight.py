@@ -66,7 +66,9 @@ MIGRATION = re.compile(r"crates/[a-z0-9_-]+/migrations/[0-9]{4}_[a-z][a-z0-9_]*\
 # against this schema. At least a short sentence, never an empty marker.
 # The reason must stay on the marker's own line: \s would also span the
 # newline, letting an empty marker claim the next statement as its reason.
-OVERRIDE = re.compile(r"^--[ \t]*rollback-compatible:[ \t]*(\S[^\r\n]{9,})\r?$", re.MULTILINE)
+# It must start and end with a non-space character, so padding cannot fake
+# the ten-character minimum; trailing spaces after the reason are allowed.
+OVERRIDE = re.compile(r"^--[ \t]*rollback-compatible:[ \t]*(\S[^\r\n]{8,}\S)[ \t]*\r?$", re.MULTILINE)
 # Statements the previous build cannot survive after a rollback, matched on
 # lexed SQL (comments removed, literals and quoted identifiers blanked). The
 # code names the first match. PostgreSQL keywords that may be omitted
