@@ -42,9 +42,9 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Same E402-safe convention as the other scripts/ tools.
-import staging_rollout as base  # noqa: E402
-import worker_container_rollback as wcr  # noqa: E402
-from production_deploy import MAX_READYZ_BYTES, _gateway_ready  # noqa: E402
+import staging_rollout as base
+import worker_container_rollback as wcr
+from production_deploy import MAX_READYZ_BYTES, _gateway_ready
 
 GateError = base.GateError
 WORKER = wcr.WORKERS["production"]

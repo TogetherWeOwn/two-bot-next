@@ -16,9 +16,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # E402-safe by convention: every scripts/ test adds its own directory first.
-import staging_rollout as base  # noqa: E402
-import post_deploy_watch as watcher  # noqa: E402
-from test_worker_container_rollback import FakeClient  # noqa: E402
+import staging_rollout as base
+import post_deploy_watch as watcher
+from test_worker_container_rollback import FakeClient
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 VERSION = "11111111-1111-4111-8111-111111111111"
