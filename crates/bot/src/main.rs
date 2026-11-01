@@ -517,16 +517,16 @@ async fn run(cli_args: &[String]) {
     // Inert unless TWO_VOICE=1 with token + database present; any failure
     // degrades to voice-off with a warn, never a boot failure.
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
-    let (voice, flush_task) = match build_voice_runtime(
-        &config,
-        VoiceGates::from_env().enabled,
-        shutdown.subscribe(),
-    )
-    .await
-    {
-        Some((sink, flush)) => (Some(sink), Some(flush)),
-        None => (None, None),
-    };
+    // The game-activity flush runs its final pass on its own latch, sent only
+    // once the gateway task (its only producer) has joined, never on the
+    // service watch: frames the draining writer still applies, and the spans
+    // its voice guard closes on exit, must land before that pass.
+    let (activity_drained, activity_drain) = tokio::sync::watch::channel(false);
+    let (voice, flush_task) =
+        match build_voice_runtime(&config, VoiceGates::from_env().enabled, activity_drain).await {
+            Some((sink, flush)) => (Some(sink), Some(flush)),
+            None => (None, None),
+        };
 
     // M3.3 reconcile: once at startup plus a bounded interval while
     // `TWO_EVENTSUB` is exactly `1`. The loop shares the bound receiver's
@@ -554,10 +554,8 @@ async fn run(cli_args: &[String]) {
     // containment), filled by the gateway task below and joined after the
     // supervisor drains: retaining them here is what holds the process open
     // for the worker drains instead of aborting them with the runtime.
-    // The game-activity flush loop joins here too: its trailing flush on the
-    // shutdown latch must finish before the process exits.
     let worker_supervisors: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-        Arc::new(std::sync::Mutex::new(flush_task.into_iter().collect()));
+        Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
@@ -956,6 +954,11 @@ async fn run(cli_args: &[String]) {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
+    // The gateway task has joined, so nothing feeds the game-activity
+    // collector anymore: release its final flush now so it runs concurrently
+    // with the joins below. After a drain-deadline cut the writer may still
+    // be running; the pass is then best effort within the remaining budget.
+    activity_drained.send_replace(true);
     // Both branches latch the shutdown watch before returning (the gateway
     // supervisor sends it before its drain; the HTTP/job serve path sends
     // it before joining its supervisor), so the reconcile task has been
@@ -983,6 +986,8 @@ async fn run(cli_args: &[String]) {
         .drain(..)
         .collect::<Vec<_>>();
     join_worker_supervisors(supervisors, &latch_mark).await;
+    // Same remaining deadline for the game-activity flush released above.
+    join_worker_supervisors(flush_task.into_iter().collect(), &latch_mark).await;
     if result.is_err() {
         tracing::error!(
             msg = "shutdown_failed",

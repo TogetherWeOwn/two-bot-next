@@ -122,7 +122,13 @@ def prepare():
             raise ValueError(f"missing or duplicate adapter marker {marker}")
         template = template.replace(marker, source)
     TARGET.write_text(template)
-    subprocess.run(["rustfmt", "--edition", "2021", str(TARGET)], check=True)
+    try:
+        subprocess.run(["rustfmt", "--edition", "2021", str(TARGET)], check=True)
+    except BaseException:
+        # A half-prepared target would block every retry and leak into the
+        # ordinary workspace integration run.
+        TARGET.unlink()
+        raise
     print(f"Prepared {TARGET.relative_to(ROOT)} from current production source", flush=True)
 
 

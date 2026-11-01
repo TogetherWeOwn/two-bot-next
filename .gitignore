@@ -18,3 +18,5 @@ __pycache__/
 /tracker-refresh-body.md
 /tracker-issue-body.md
 /tracker-resolve-body.md
+# Generated from live source by tests/gateway_lifecycle/prepare.py; never commit.
+/crates/bot/tests/gateway_lifecycle_generated.rs

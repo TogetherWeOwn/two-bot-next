@@ -2399,12 +2399,13 @@ pub async fn build_persistent_pipeline(
 /// with a warn; the gateway and /readyz keep working. Secrets never appear
 /// in the logs.
 ///
-/// The returned handle is the game-activity flush loop: the caller joins it
-/// after `shutdown` latches so the trailing flush finishes before exit.
+/// The returned handle is the game-activity flush loop. The caller latches
+/// `drained` once the gateway task has joined, so no producer is left, and
+/// then joins the handle so the trailing flush finishes before exit.
 pub async fn build_voice_runtime(
     config: &Config,
     voice_enabled: bool,
-    shutdown: tokio::sync::watch::Receiver<bool>,
+    drained: tokio::sync::watch::Receiver<bool>,
 ) -> Option<(Arc<dyn VoiceEventSink>, tokio::task::JoinHandle<()>)> {
     if !voice_enabled {
         return None;
@@ -2451,13 +2452,14 @@ pub async fn build_voice_runtime(
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             // Hourly guild-aggregate persist for the game-activity collector
-            // fed by the presence/voice frames below. The caller joins the
-            // handle after shutdown latches; the loop then runs one trailing
-            // flush of the buffered partial interval, never double-counting.
+            // fed by the presence/voice frames below. The caller latches
+            // `drained` after the gateway joins; the loop then runs one
+            // trailing flush of the buffered partial interval, never
+            // double-counting.
             let flush = tokio::spawn(two_bot::voice_rooms::game_activity::flush_loop(
                 db.pool().clone(),
                 runtime.runtime().game_activity_collector().clone(),
-                shutdown,
+                drained,
             ));
             Some((Arc::new(runtime), flush))
         }

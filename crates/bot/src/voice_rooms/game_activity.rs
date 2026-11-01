@@ -1207,23 +1207,51 @@ pub async fn flush_due_guilds(
     }
 }
 
+/// Attempts per guild for the shutdown flush; there is no next tick to retry.
+const SHUTDOWN_FLUSH_ATTEMPTS: u32 = 3;
+/// Pause between shutdown flush attempts, kept far inside the drain deadline.
+const SHUTDOWN_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Persist whatever every guild has buffered, due or not.
 ///
 /// Shutdown-only counterpart of [`flush_due_guilds`]: the final partial
 /// interval is not yet "due", so the hourly gate would skip it. Each guild
 /// goes through the same drain-then-persist path, so a guild the hourly tick
 /// already flushed contributes only what arrived since and is never counted
-/// twice. A gate failure leaves the buffers intact and is not retried: the
-/// process is exiting.
+/// twice. A failed persist leaves its buffers in the collector (a gate
+/// failure before the drain, a write failure after a requeue), so the guild
+/// is retried up to [`SHUTDOWN_FLUSH_ATTEMPTS`] times. Guilds still failing
+/// are logged as `game_activity_shutdown_flush_failed` and returned as a
+/// count: their buffered interval is lost when the process exits.
 pub async fn flush_remaining_guilds(
     pool: &sqlx::PgPool,
     collector: &GameActivityCollector,
     now_ms: i64,
     gap_timeout_ms: i64,
-) {
+) -> usize {
+    let mut failed = 0;
     for guild in collector.guilds() {
-        let _ = persist_guild(pool, collector, guild, gap_timeout_ms, now_ms).await;
+        let mut attempt = 1;
+        while persist_guild(pool, collector, guild, gap_timeout_ms, now_ms)
+            .await
+            .is_err()
+        {
+            if attempt == SHUTDOWN_FLUSH_ATTEMPTS {
+                failed += 1;
+                break;
+            }
+            attempt += 1;
+            tokio::time::sleep(SHUTDOWN_FLUSH_RETRY_DELAY).await;
+        }
     }
+    if failed > 0 {
+        tracing::error!(
+            failed_guilds = failed,
+            attempts = SHUTDOWN_FLUSH_ATTEMPTS,
+            "game_activity_shutdown_flush_failed"
+        );
+    }
+    failed
 }
 
 fn now_ms() -> i64 {
@@ -1244,6 +1272,11 @@ fn now_ms() -> i64 {
 /// caller can join it. A persist already in flight is never cancelled: the
 /// latch is observed only between ticks, and the trailing flush reads the
 /// already-drained buffers, so the interval is counted once.
+///
+/// The caller must latch `shutdown` only after every producer has stopped
+/// (the gateway task joined, its voice guard closed the open spans), not on
+/// the service shutdown watch: activity written after the trailing flush
+/// would never be persisted.
 pub async fn flush_loop(
     pool: sqlx::PgPool,
     collector: Arc<GameActivityCollector>,
@@ -1268,7 +1301,8 @@ pub async fn flush_loop(
         )
         .await;
     }
-    flush_remaining_guilds(&pool, &collector, now_ms(), GAME_ACTIVITY_GAP_TIMEOUT_MS).await;
+    // A failure is logged inside; the count matters only to direct callers.
+    let _ = flush_remaining_guilds(&pool, &collector, now_ms(), GAME_ACTIVITY_GAP_TIMEOUT_MS).await;
 }
 
 #[cfg(test)]
@@ -2448,6 +2482,75 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flush_retries_then_reports_a_failed_guild_with_buffers_kept() {
+        // Unreachable database: every attempt fails at `pool.begin()`, the
+        // gate path that returns before the drain, so the buffers survive.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy("postgres://two@127.0.0.1:1/unreachable")
+            .expect("lazy pool");
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let before = collector.buffered_counts(7);
+        let started = tokio::time::Instant::now();
+        let failed = flush_remaining_guilds(&pool, &collector, T0, 60 * MIN).await;
+        assert_eq!(failed, 1, "the failing guild is reported, not swallowed");
+        assert_eq!(
+            collector.buffered_counts(7),
+            before,
+            "a failed shutdown persist keeps the buffered interval"
+        );
+        assert!(
+            started.elapsed() >= SHUTDOWN_FLUSH_RETRY_DELAY * (SHUTDOWN_FLUSH_ATTEMPTS - 1),
+            "every attempt after the first waits the retry delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn latched_flush_loop_persists_the_partial_interval_and_returns() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!(
+                "SKIP game-activity shutdown flush integration: TWO_TEST_DATABASE_URL is not set"
+            );
+            return;
+        };
+        let fixture = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = fixture.pool();
+        let collector = Arc::new(GameActivityCollector::new());
+        let start = now_ms() - 30 * MIN;
+        collector.observe_presence(
+            8,
+            presence_delta(&update(json!([playing_activity("Apex")])), start),
+        );
+        // Latched before the loop starts: the first poll must not wait an
+        // interval, and the not-yet-due partial interval must still persist.
+        let (_drained, latched) = tokio::sync::watch::channel(true);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            flush_loop(pool.clone(), Arc::clone(&collector), latched),
+        )
+        .await
+        .expect("a latched flush loop returns after its trailing flush");
+        let rows = two_bot_core::game_activity_store::read_guild_aggregates(pool, "8")
+            .await
+            .expect("trailing flush wrote");
+        assert_eq!(rows.len(), 1, "the partial interval persisted once");
+        assert_eq!(collector.buffered_counts(8).0, 0, "the buffers drained");
     }
 
     #[test]
