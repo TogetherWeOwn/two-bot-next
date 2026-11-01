@@ -2960,6 +2960,21 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             json!(false),
             "month {month}: ban ownership evidence present"
         );
+        assert_eq!(
+            receipt["translated_voice_command_roles"],
+            json!(4),
+            "month {month}: legacy restrictions translated"
+        );
+        assert_eq!(
+            receipt["translated_voice_command_role_members"],
+            json!(3),
+            "month {month}: legacy restriction members translated"
+        );
+        assert_eq!(
+            receipt["voice_access_controls_added"],
+            json!(1),
+            "month {month}: translation inserted one guild controls row"
+        );
         assert!(
             receipt["restored"].as_object().is_some(),
             "month {month}: receipt reports per-table restored counts"
@@ -2990,7 +3005,60 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                 }
             }
         }
-        assert_eq!(after, expected, "month {month}: every archived row");
+        assert_eq!(
+            after["voice_command_roles"].rows.len(),
+            0,
+            "month {month}: the 0469 replay empties the legacy tables"
+        );
+        assert_eq!(after["voice_command_role_members"].rows.len(), 0);
+        let controls_before = before["voice_access_controls"].rows.len();
+        assert_eq!(
+            after["voice_access_controls"].rows.len(),
+            controls_before + 1,
+            "month {month}: the 0469 replay adds the legacy-only guild"
+        );
+        let command_roles: Vec<(String, String)> = sqlx::query_as(
+            "SELECT guild_id, command_roles::text FROM voice_access_controls \
+             ORDER BY guild_id COLLATE \"C\"",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let command_roles: Vec<(String, Value)> = command_roles
+            .into_iter()
+            .map(|(guild, roles)| (guild, serde_json::from_str(&roles).unwrap()))
+            .collect();
+        assert_eq!(
+            command_roles,
+            vec![
+                (
+                    "100000000000000001".to_owned(),
+                    json!({"kick": ["100000000000000041", "100000000000000042"],
+                           "limit": [], "template": []}),
+                ),
+                ("100000000000000002".to_owned(), json!({})),
+                (
+                    "100000000000000003".to_owned(),
+                    json!({"private": ["100000000000000044"]}),
+                ),
+            ],
+            "month {month}: the 0469 replay merges legacy restrictions"
+        );
+        for (table, expected_table) in &expected {
+            if [
+                "voice_access_controls",
+                "voice_command_roles",
+                "voice_command_role_members",
+            ]
+            .contains(&table.as_str())
+            {
+                continue;
+            }
+            assert_eq!(
+                &after[table], expected_table,
+                "month {month}: every archived row in {table}"
+            );
+        }
         assert_fresh_cas_tokens(&pool, cas_before).await;
         assert_eq!(
             triggers(&pool).await,
