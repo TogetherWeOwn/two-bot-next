@@ -6,7 +6,8 @@
 // out exactly as in `rest_5xx_rate`. The promotion regression gate
 // (scripts/promotion_regression_gate.py) compares staging's soak counters
 // (the staging process starts at the candidate's deploy) with production's
-// baseline counters.
+// baseline counters, and carries the process identity so the gate can tell
+// a restarted staging process (reset counters) from a clean soak.
 //
 // Same destination fence, bearer floor, redirect refusal, body cap and
 // fixed failure vocabulary as wrangler/scripts/promotion-error-gate.mjs,
@@ -16,7 +17,7 @@
 // a pass. Scrape failures exit 1 (fail closed). The receipt carries integers
 // and fixed tokens only, never the bearer or the exposition body.
 import { writeFileSync } from "node:fs";
-import { EMPTY_STATE, evaluateMetrics } from "../src/alert-rules.ts";
+import { EMPTY_STATE, evaluateMetrics, processIncarnation } from "../src/alert-rules.ts";
 import {
   allowedOriginsFromEnv,
   fetchExposition,
@@ -44,10 +45,19 @@ export function parseArgs(argv) {
   return config;
 }
 
-/** Cumulative REST counters from one parsed exposition. */
+/**
+ * Cumulative REST counters from one parsed exposition, plus the process
+ * identity (`two_bot_process_incarnation`) when the container reports one.
+ * The promotion regression gate compares the identity across the soak: a
+ * changed identity means the process restarted, which resets the cumulative
+ * counters and breaks the judged window.
+ */
 export function countersFrom(samples) {
   const { state } = evaluateMetrics(samples, EMPTY_STATE, 0);
-  return { restTotal: state.restTotal, rest5xx: state.rest5xx ?? 0 };
+  const receipt = { restTotal: state.restTotal, rest5xx: state.rest5xx ?? 0 };
+  const incarnation = processIncarnation(samples.filter((s) => s.name === "two_bot_process_incarnation"));
+  if (incarnation !== undefined) receipt.incarnation = incarnation;
+  return receipt;
 }
 
 export async function runCli(argv, env, deps = {}) {

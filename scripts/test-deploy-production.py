@@ -634,6 +634,16 @@ class StaticGuardTests(unittest.TestCase):
             self.assertIn(needle, condition)
         self.assertNotIn("concurrency", children(JOBS["soak"][1:], 4))
         self.assertIn("GREEN_AT: ${{ needs.guard.outputs.green_at }}", soak_job)
+        # The judged soak window starts at the baseline sample the soak job
+        # records before sleeping, through the staging Environment bearer.
+        self.assertIn("baseline: ${{ steps.baseline.outputs.receipt }}", soak_job)
+        self.assertIn("name: staging", soak_job)
+        self.assertIn("deployment: false", soak_job)
+        baseline = inline_script("Record the soak-baseline REST counters")
+        for needle in ("set -euo pipefail", "wrangler/scripts/rest-5xx-counters.mjs",
+                       'METRICS_SCRAPE_TOKEN', "receipt=$(cat "):
+            self.assertIn(needle, soak_job if needle in ("METRICS_SCRAPE_TOKEN", "receipt=$(cat ") else baseline)
+        self.assertNotIn("${{", baseline)
         soak = inline_script("Wait out the remainder of the 30-minute post-staging soak")
         self.assertIn("SOAK_SECONDS - int(time.time() - green_at)", soak)
         self.assertIn("time.sleep(remaining)", soak)
@@ -711,8 +721,18 @@ class StaticGuardTests(unittest.TestCase):
         staging = inline_script("Read the candidate's staging journeys and soak REST counters")
         for needle in ("set -euo pipefail", '--expected-sha "$SHA"', 'if [ "$probe" -gt 1 ]',
                        "wrangler/scripts/rest-5xx-counters.mjs",
-                       'promotion_regression_gate.py staging', '--auto "$AUTO"'):
+                       "deploy-staging.yml/runs", "-f branch=main",
+                       'promotion_regression_gate.py staging', '--auto "$AUTO"',
+                       '--run-id "$RUN_ID"', '--attempt "$RUN_ATTEMPT"',
+                       '--staging-runs "$RUNNER_TEMP/staging-runs.json"',
+                       '"${baseline_args[@]}"'):
             self.assertIn(needle, staging)
+        # The run binding, the runs listing and the baseline all arrive here.
+        for needle in ("RUN_ID: ${{ needs.guard.outputs.staging_run_id }}",
+                       "RUN_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}",
+                       "BASELINE: ${{ needs.soak.outputs.baseline }}"):
+            self.assertIn(needle, text)
+        self.assertIn("actions: read # deploy-staging runs", text)
         # Production leg: before the artifact admission and the deploy, ordinary promotions only.
         names = [step[0].split("name: ", 1)[-1] for step in steps(JOBS["production"])]
         gate = names.index("Gate on regression against the production baseline")

@@ -1032,17 +1032,50 @@ jobs:
   # never queued behind — or displaced by — a sleeping promotion. The
   # remainder is recomputed here from the staging-green timestamp the guard
   # reported, not carried from guard time, so the gate builds and any
-  # Environment approval wait do not extend the soak.
+  # Environment approval wait do not extend the soak. The job first records
+  # the soak-baseline REST counters (the judged soak window starts at that
+  # sample), then sleeps.
   soak:
     name: post-staging soak (automatic runs only)
     needs: guard
     if: needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.soak_seconds != '0'
     permissions:
       contents: read
+    environment:
+      name: staging
+      deployment: false
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'soak') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 35
+    outputs:
+      baseline: ${{ steps.baseline.outputs.receipt }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed tooling from the workflow's own commit, never the guarded SHA.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Record the soak-baseline REST counters
+        id: baseline
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The judged soak window starts here: the regression gate compares
+          # this baseline with the post-soak sample and records
+          # `insufficient_data` when the process identity changed between
+          # them (a restart resets the cumulative counters). A missing
+          # bearer records no data (exit 0); a failed scrape fails the soak
+          # closed.
+          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
+            --out "$RUNNER_TEMP/staging-soak-baseline.json"
+          echo "receipt=$(cat "$RUNNER_TEMP/staging-soak-baseline.json")" >> "$GITHUB_OUTPUT"
       - name: Wait out the remainder of the 30-minute post-staging soak
         env:
           GREEN_AT: ${{ needs.guard.outputs.green_at }}
@@ -1068,13 +1101,16 @@ jobs:
 
   # Promotion regression gate, staging leg (docs/production-deploy.md,
   # "Regression gate against production"). After the soak, it reads the
-  # candidate on staging: the user-flow probe pinned to the guarded SHA and
-  # staging's cumulative REST counters (the staging process starts at the
-  # candidate's deploy, so they cover its soak). The `production` job compares
-  # them with production's own probe and counters before any mutation.
-  # Staging serving another build cannot be judged: an automatic run skips
-  # green (`staging-superseded`: the newer build promotes itself), a manual
-  # run refuses. `deployment: false` reads the staging scrape bearer without
+  # candidate on staging: the user-flow probe (pinned to the guarded SHA and
+  # bound to the guarded run-attempt build: a same-SHA redeploy no longer
+  # proves the candidate soaked) and staging's cumulative REST counters,
+  # judged against the soak-baseline sample the `soak` job recorded. The
+  # `production` job compares them with production's own probe and counters
+  # before any mutation. Staging serving another build cannot be judged: an
+  # automatic run skips green when a main-branch staging run still promotes
+  # that build (`staging-superseded`: the newer build promotes itself) and
+  # refuses when nothing promotes it (the promotion stalled); a manual run
+  # refuses. `deployment: false` reads the staging scrape bearer without
   # writing a staging deployment record. Rollback and live-SHA redeploys skip it.
   staging-soak-evidence:
     name: staging soak evidence for the regression gate
@@ -1082,6 +1118,7 @@ jobs:
     if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped')"
     permissions:
       contents: read
+      actions: read # deploy-staging runs: which build the serving revision still promotes
     environment:
       name: staging
       deployment: false
@@ -1109,6 +1146,10 @@ jobs:
           METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
           SHA: ${{ needs.guard.outputs.sha }}
           AUTO: ${{ needs.guard.outputs.auto }}
+          RUN_ID: ${{ needs.guard.outputs.staging_run_id }}
+          RUN_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}
+          BASELINE: ${{ needs.soak.outputs.baseline }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Exit 1 is a recorded journey failure the comparison judges;
@@ -1122,9 +1163,25 @@ jobs:
           fi
           node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
             --out "$RUNNER_TEMP/staging-soak-counters.json"
+          # Which main-branch staging runs still promote the serving
+          # revision: a serving build nothing promotes means the promotion
+          # stalled, which refuses instead of skipping. A failed listing
+          # fails closed here. The soak was already over before this run
+          # started when the soak skipped, so no baseline is expected then.
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs" \
+            -f branch=main -f per_page=100 \
+            -q '.workflow_runs[] | {head_sha, head_branch, status, conclusion}' \
+            > "$RUNNER_TEMP/staging-runs.json"
+          baseline_args=()
+          if [ -n "$BASELINE" ]; then
+            printf '%s\n' "$BASELINE" > "$RUNNER_TEMP/staging-soak-baseline.json"
+            baseline_args=(--baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json")
+          fi
           python3 scripts/promotion_regression_gate.py staging \
             --probe "$RUNNER_TEMP/staging-soak-probe.json" --counters "$RUNNER_TEMP/staging-soak-counters.json" \
-            --sha "$SHA" --auto "$AUTO" --out "$RUNNER_TEMP/staging-soak-evidence.json"
+            --sha "$SHA" --auto "$AUTO" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" \
+            --staging-runs "$RUNNER_TEMP/staging-runs.json" "${baseline_args[@]}" \
+            --out "$RUNNER_TEMP/staging-soak-evidence.json"
 
   # Pre-deploy recheck for automatic runs: the guard's hold and live checks
   # go stale while the gates build, the Environment approval waits and the

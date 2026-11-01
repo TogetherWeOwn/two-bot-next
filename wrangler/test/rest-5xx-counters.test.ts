@@ -60,7 +60,25 @@ test("one scrape records the cumulative REST total and 5xx counters", async () =
   assert.equal(receipt.available, true);
   assert.equal(receipt.rest5xx, 20);
   assert.equal(receipt.restTotal, 200);
+  assert.equal(receipt.incarnation, "0".repeat(24) + "00000001");
   assert.ok(!lines.join("\n").includes(TOKEN));
+});
+
+test("a scrape without the identity metric records counters with no incarnation", async () => {
+  const calls: unknown[][] = [];
+  const fetchImpl = async (...args: unknown[]) => {
+    calls.push(args);
+    const body = restBody(180, 20).split("\n")
+      .filter((line) => !line.startsWith("two_bot_process_incarnation")).join("\n");
+    return { ok: true, status: 200, text: async () => body };
+  };
+  const { code, receipt } = await run(
+    { STAGING_WORKER_URL: ORIGIN, METRICS_SCRAPE_TOKEN: TOKEN },
+    fetchImpl,
+  );
+  assert.equal(code, 0);
+  assert.equal(receipt.available, true);
+  assert.ok(!("incarnation" in receipt));
 });
 
 test("a missing or short bearer records no data, never a pass", async () => {

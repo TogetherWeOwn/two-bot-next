@@ -2781,7 +2781,9 @@ def production_errors(workflow):
     for required in ("SOAK_SECONDS - int(time.time() - green_at)", "time.sleep(remaining)"):
         if required not in soak_script:
             errors.append(f"{name}:soak: must recompute the remainder from the staging-green time")
-    soak_env = str((soak.get("steps") or [{}])[0].get("env", ""))
+    # The soak job records the soak-baseline counters before it sleeps, so
+    # GREEN_AT may live on the sleep step rather than the first step.
+    soak_env = "\n".join(str(step.get("env", "")) for step in soak.get("steps", []))
     if "GREEN_AT" not in soak_env or "needs.guard.outputs.green_at" not in soak_env:
         errors.append(f"{name}:soak: must read the staging-green timestamp from the guard")
     expected_recheck_if = (
@@ -2801,9 +2803,9 @@ def production_errors(workflow):
     evidence_job = jobs.get("staging-soak-evidence", {})
     if evidence_job.get("needs") != ["guard", "soak"] \
             or evidence_job.get("environment") != {"name": "staging", "deployment": "false"} \
-            or evidence_job.get("permissions") != {"contents": "read"}:
-        errors.append(f"{name}:staging-soak-evidence: must follow the soak with contents:read and the "
-                      "staging Environment (deployment: false)")
+            or evidence_job.get("permissions") != {"contents": "read", "actions": "read"}:
+        errors.append(f"{name}:staging-soak-evidence: must follow the soak with contents:read plus "
+                      "actions:read and the staging Environment (deployment: false)")
     evidence_text = str(evidence_job)
     if re.findall(r"secrets\.[A-Z_]+", evidence_text) != ["secrets.STAGING_METRICS_SCRAPE_TOKEN"] \
             or "PRODUCTION_" in evidence_text:
@@ -8899,6 +8901,10 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
+                        expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "staging-soak-evidence"):
+                        # Reads deploy-staging runs to tell a promoted newer
+                        # build (skip green) from a stalled promotion (refuse).
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the
