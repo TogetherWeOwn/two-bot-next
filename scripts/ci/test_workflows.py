@@ -8715,6 +8715,15 @@ class WorkflowTests(unittest.TestCase):
         # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
         self.assertEqual(job.get("timeout-minutes"), "45")
 
+    def test_nightly_sweep_timeout_ceilings_are_pinned(self):
+        # Schedule/dispatch get 180 minutes for the serial ignored sweep; a PR
+        # run keeps 45. The pin forces a reviewed change to either ceiling.
+        job = self.workflows["nightly.yml"]["jobs"]["sweep"]
+        self.assertEqual(
+            job.get("timeout-minutes"),
+            "${{ github.event_name == 'pull_request' && 45 || 180 }}",
+        )
+
     def test_nextest_container_pins_disposable_database_service_address(self):
         # Same hardening as the check.yml lanes: the shared lane runs the
         # workspace lib/bins against the same disposable service, so it pins
