@@ -7,16 +7,27 @@
  * tick emits one public-safe recommendation line (Worker log plus the same
  * optional webhook the alert itself uses) and records the guard state in DO
  * storage. Execution stays inside the existing machine contract: the bot's
- * own in-process creator-map reload (maintenance tick, no host action), then
- * — if the alert is still firing — one Operator host-action card for a
- * same-SHA deployment-takeover via the existing deploy workflow, never a new
- * endpoint, credential, or spend. See docs/runbook.md#auto-remediation-guarded-stall-and-crash-loop-response.
+ * own in-process load (creator-map merge, or live-view republish from the
+ * gateway cache — no host action), then — if the alert is still firing — one
+ * Operator host-action card for a same-SHA deployment-takeover via the
+ * existing deploy workflow, never a new endpoint, credential, or spend. See
+ * docs/runbook.md#auto-remediation-guarded-stall-and-crash-loop-response.
+ *
+ * One scope per distinct fault: `voice_creator_map_stale` (merges not landing)
+ * and `voice_live_not_ready` (a deaf live view on a connected gateway) are
+ * different failures, and a shared guard would let either spend the other's
+ * cooldown window and failure count. Each scope owns its phase/failure guard,
+ * and the global cooldown still caps the whole table. Where a scope has a real
+ * in-process first step it is tried first; where the alert's own firing bound
+ * already is the in-process repair window (a deaf live view's 120 s bound is
+ * spent while the bot's dispatch self-heals), the first recommendation is
+ * already the takeover — a text-only step would just burn a window.
  */
 
 import { RUNBOOK_BASE_URL } from "./alert-rules.ts";
 
 /** Independent remediation domains; each owns its phase/failure guard. */
-export type RemediationScope = "voice-stall" | "crash-loop";
+export type RemediationScope = "voice-stall" | "voice-live" | "crash-loop";
 
 /** Remediation steps, weakest first. */
 export type RemediationAction = "creator-map-reload" | "same-sha-takeover";
@@ -59,9 +70,17 @@ export const EMPTY_REMEDIATION_STATE: RemediationState = {
   lastRecommendedAtSeconds: 0,
   scopes: {
     "voice-stall": { ...IDLE_GUARD },
+    "voice-live": { ...IDLE_GUARD },
     "crash-loop": { ...IDLE_GUARD },
   },
 };
+
+/** Scopes in persisted-guard order; a new scope must enter this list. */
+export const REMEDIATION_SCOPES: readonly RemediationScope[] = [
+  "voice-stall",
+  "voice-live",
+  "crash-loop",
+];
 
 const REMEDIATION_PHASES: readonly RemediationPhase[] = [
   "idle",
@@ -119,21 +138,54 @@ export function sanitizeRemediationState(stored: unknown, nowSeconds: number): R
   if (!isScopeGuard(guards["voice-stall"]) || !isScopeGuard(guards["crash-loop"])) {
     return EMPTY_REMEDIATION_STATE;
   }
-  return stored as RemediationState;
+  // A guard persisted before a later scope was added must not be wiped: a
+  // full reset would drop a live cooldown and a two-failure stop, so an
+  // unknown-but-valid missing scope is filled from the idle default while
+  // every stored guard survives.
+  const known: Record<string, unknown> = {};
+  for (const scope of REMEDIATION_SCOPES) {
+    const guard = guards[scope];
+    known[scope] = isScopeGuard(guard) ? guard : { ...IDLE_GUARD };
+  }
+  return {
+    lastRecommendedAtSeconds,
+    scopes: known,
+  } as RemediationState;
 }
 
 export interface TriggerDef {
   scope: RemediationScope;
   /** Exact firing key from `evaluateMetrics` (these rules carry no subject). */
   firingKey: string;
-  /** First step for this scope; escalation is always `same-sha-takeover`. */
+  /**
+   * First recommendation for this scope; escalation is always
+   * `same-sha-takeover`. Scopes whose alert bound already is the bot's
+   * in-process repair window start at the takeover itself.
+   */
   firstAction: RemediationAction;
   /** Anchor inside docs/runbook.md. */
   runbook: string;
   summary: string;
 }
 
+// Table order is the priority when several triggers fire in one window. The
+// deaf live view goes first: its takeover restarts the whole process, which
+// also re-runs the creator-map merge and re-pairs the gateway, so it must never
+// wait a window behind the stall scope's no-host-action line.
 export const REMEDIATION_TRIGGERS: readonly TriggerDef[] = [
+  {
+    scope: "voice-live",
+    firingKey: "voice_live_not_ready",
+    // The alert's own 120 s bound is already the in-process attempt: while it
+    // climbs, the bot's dispatch republishes the view from the gateway cache
+    // (`two_bot_voice_live_self_heal_total` counts the repairs). By the time
+    // the alert pages, that self-heal window has expired — it counts as
+    // attempt one, so the first recommendation is the takeover itself rather
+    // than a text-only step that would spend one more cooldown window.
+    firstAction: "same-sha-takeover",
+    runbook: "runbook.md#alert-voice-live-not-ready",
+    summary: "a guild's live view stays not ready on a connected gateway past its self-heal window, so its creator joins drop with no accept or refusal line",
+  },
   {
     scope: "voice-stall",
     firingKey: "voice_creator_map_stale",
@@ -155,11 +207,12 @@ export function remediationRunbookUrl(trigger: TriggerDef): string {
   return `${RUNBOOK_BASE_URL}${trigger.runbook}`;
 }
 
-/** Operator instruction carried by each recommendation; no host action for R1. */
+/** Operator instruction carried by each recommendation; only the in-process first step is no-host-action. */
 export function operatorInstruction(action: RemediationAction): string {
-  return action === "creator-map-reload"
-    ? "No host action: the bot's maintenance tick retries the creator-map merge every 5 minutes. If this alert is still firing at the next remediation window, a same-sha-takeover line follows; file a host-action card only from that line."
-    : "Operator: file one host-action card for a same-SHA deployment-takeover through the existing deploy workflow; one card per host step.";
+  if (action === "creator-map-reload") {
+    return "No host action: the bot's maintenance tick retries the creator-map merge every 5 minutes. If this alert is still firing at the next remediation window, a same-sha-takeover line follows; file a host-action card only from that line.";
+  }
+  return "Operator: file one host-action card for a same-SHA deployment-takeover through the existing deploy workflow; one card per host step.";
 }
 
 export type RemediationMessageKind = "recommend" | "ceo-page";
@@ -206,11 +259,23 @@ export interface RemediationEvaluation {
  * alert that flaps between firing and resolved still reaches the two-failure
  * stop. Callers must pass stored guard state through
  * `sanitizeRemediationState` first.
+ *
+ * `unobserved` lists trigger keys the scrape carried no current evidence for
+ * (the gauge is missing or malformed, e.g. an older container). A firing
+ * unobserved key is only the alert holding its previous state: the held alert
+ * is untouched, but the key never advances its scope — no new recommendation,
+ * no failure increment, no hold-down reset, and it never consumes the global
+ * window. A quiet unobserved key is not a clear either: unobserved wall time
+ * never counts toward recovery, so it restarts that scope's hold-down while
+ * the phase, failure count and suppression stay latched, and the next
+ * observed clear starts a fresh full window. Progression resumes from the
+ * same stored guard once a current sample arrives.
  */
 export function evaluateRemediation(
   firing: string[],
   prev: RemediationState,
   nowSeconds: number,
+  unobserved: readonly string[] = [],
 ): RemediationEvaluation {
   // Callers pass `Date.now() / 1000`, which is fractional (e.g. 1760001860.13).
   // The persisted guard requires integer seconds, so normalize once here: a
@@ -221,19 +286,20 @@ export function evaluateRemediation(
   const messages: RemediationMessage[] = [];
   const scopes: Record<RemediationScope, ScopeGuard> = {
     "voice-stall": { ...prev.scopes["voice-stall"] },
+    "voice-live": { ...prev.scopes["voice-live"] },
     "crash-loop": { ...prev.scopes["crash-loop"] },
   };
   let lastRecommendedAtSeconds = prev.lastRecommendedAtSeconds;
   for (const trigger of REMEDIATION_TRIGGERS) {
     let guard = scopes[trigger.scope]!;
+    const observed = !unobserved.includes(trigger.firingKey);
     if (!firing.includes(trigger.firingKey)) {
-      const isIdle =
-        guard.phase === "idle" &&
-        guard.consecutiveFailures === 0 &&
-        !guard.suppressed &&
-        guard.clearSinceSeconds === 0;
-      if (isIdle) continue;
-      if (guard.clearSinceSeconds === 0) {
+      if (isIdleGuard(guard)) continue;
+      if (!observed) {
+        // No evidence is not a clear: restart the hold-down so recovery
+        // needs a full window of observed quiet after the gap.
+        scopes[trigger.scope] = { ...guard, clearSinceSeconds: 0 };
+      } else if (guard.clearSinceSeconds === 0) {
         scopes[trigger.scope] = { ...guard, clearSinceSeconds: nowSeconds };
       } else if (nowSeconds - guard.clearSinceSeconds >= REMEDIATION_COOLDOWN_SECONDS) {
         scopes[trigger.scope] = { ...IDLE_GUARD };
@@ -242,6 +308,10 @@ export function evaluateRemediation(
       }
       continue;
     }
+    // A retained firing key freezes the whole guard as stored: the alert
+    // stays held (it is still in `firing`), but nothing about this scope's
+    // action/failure progression moves until evidence returns.
+    if (!observed) continue;
     if (guard.clearSinceSeconds !== 0) {
       guard = { ...guard, clearSinceSeconds: 0 };
       scopes[trigger.scope] = guard;
@@ -268,7 +338,7 @@ export function evaluateRemediation(
       });
     } else {
       scopes[trigger.scope] = {
-        phase: action === "creator-map-reload" ? "reload-recommended" : "takeover-recommended",
+        phase: action === "same-sha-takeover" ? "takeover-recommended" : "reload-recommended",
         consecutiveFailures,
         suppressed: false,
         clearSinceSeconds: 0,
@@ -284,6 +354,22 @@ export function evaluateRemediation(
     lastRecommendedAtSeconds = nowSeconds;
   }
   return { messages, state: { lastRecommendedAtSeconds, scopes } };
+}
+
+/**
+ * A failed or rejected scrape observed nothing, so it is not recovery: restart
+ * every scope's clear hold-down while phases, failure counts, suppression and
+ * the global recommendation timestamp stay latched. The next observed quiet
+ * tick then starts a fresh full window. Returns the input (same reference)
+ * when no scope was holding down, so the caller can skip the write.
+ */
+export function interruptRemediationHoldDown(state: RemediationState): RemediationState {
+  if (REMEDIATION_SCOPES.every((scope) => state.scopes[scope].clearSinceSeconds === 0)) return state;
+  const scopes = { ...state.scopes };
+  for (const scope of REMEDIATION_SCOPES) {
+    scopes[scope] = { ...scopes[scope], clearSinceSeconds: 0 };
+  }
+  return { lastRecommendedAtSeconds: state.lastRecommendedAtSeconds, scopes };
 }
 
 /**
@@ -303,6 +389,7 @@ export type RemediationReceiptDecision =
   | "recommend"
   | "ceo-page"
   | "held-cooldown"
+  | "held-evidence"
   | "suppressed-quiet"
   | "clear-hold"
   | "idle";
@@ -326,21 +413,26 @@ function isIdleGuard(guard: ScopeGuard): boolean {
 }
 
 function isIdleState(state: RemediationState): boolean {
-  return isIdleGuard(state.scopes["voice-stall"]) && isIdleGuard(state.scopes["crash-loop"]);
+  // Every scope must be idle: omitting one would report `clear-hold` on a
+  // fully reset guard whenever that scope alone held a hold-down.
+  return REMEDIATION_SCOPES.every((scope) => isIdleGuard(state.scopes[scope]));
 }
 
 /**
  * Pure decision for the receipt: which bucket the tick falls in. Messages win
  * (recommend / ceo-page); otherwise a firing trigger on a suppressed scope is
- * quiet, a firing trigger inside the global window is held, a quiet tick on a
- * non-idle guard is the sustained-clear hold-down, and a quiet tick on an idle
- * guard is the pre-drill baseline / reset.
+ * quiet, firing triggers that are all unobserved (retained alerts with no
+ * current sample) are an evidence hold, a firing trigger inside the global
+ * window is held, a quiet tick on a non-idle guard is the sustained-clear
+ * hold-down, and a quiet tick on an idle guard is the pre-drill baseline /
+ * reset.
  */
 export function remediationReceiptDecision(
   messages: RemediationMessage[],
   firing: string[],
   state: RemediationState,
   nowSeconds: number,
+  unobserved: readonly string[] = [],
 ): { decision: RemediationReceiptDecision; action?: RemediationAction | undefined } {
   const [first] = messages;
   if (first?.kind === "recommend" && first.action !== undefined) {
@@ -356,11 +448,11 @@ export function remediationReceiptDecision(
       return scope !== undefined && state.scopes[scope]?.suppressed === true;
     });
     if (suppressed) return { decision: "suppressed-quiet" };
-    if (Math.floor(nowSeconds) - state.lastRecommendedAtSeconds < REMEDIATION_COOLDOWN_SECONDS) {
-      return { decision: "held-cooldown" };
+    // Every firing trigger is a retained alert with no current sample: the
+    // evaluator froze those scopes, whatever the window says.
+    if (triggerFiring.every((key) => unobserved.includes(key))) {
+      return { decision: "held-evidence" };
     }
-    // Firing outside the window with no message only happens when a sibling
-    // scope consumed the single window first; it is still a hold, never idle.
     return { decision: "held-cooldown" };
   }
   return isIdleState(state) ? { decision: "idle" } : { decision: "clear-hold" };
@@ -414,6 +506,8 @@ export function buildRemediationGuardReceipt(input: {
   firing: string[];
   messages: RemediationMessage[];
   nowSeconds: number;
+  /** Trigger keys with no current sample this tick; same list the evaluator got. */
+  unobserved?: readonly string[];
 } & RemediationReceiptCorrelation): RemediationGuardReceipt {
   const nowSeconds = Math.floor(input.nowSeconds);
   const firing = remediationTriggerFiring(input.firing);
@@ -439,6 +533,7 @@ export function buildRemediationGuardReceipt(input: {
     input.firing,
     sanitized,
     nowSeconds,
+    input.unobserved,
   );
   return {
     ...base,

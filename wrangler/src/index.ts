@@ -121,6 +121,7 @@ import { parseAlertScrape } from "./metrics-scrape.ts";
 import {
   buildRemediationGuardReceipt,
   evaluateRemediation,
+  interruptRemediationHoldDown,
   remediationTriggerFiring,
   sanitizeRemediationState,
   type RemediationState,
@@ -1662,6 +1663,17 @@ export class TwoBotContainer extends Container<Env> {
           interruptPrefixVerdictRefusals(interruptAuditHalt(interruptCommunityFactsDrain(interruptDispatchDrops(previous)))),
         );
         await this.ctx.storage.put(SCRAPE_LOSS_KEY, { streak, firing });
+        // Nor is it remediation recovery: unobserved time must not run down
+        // a scope's clear hold-down. A corrupt guard is left for the next
+        // evaluated tick to sanitize, and never blocks the alert path.
+        try {
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          const guard = sanitizeRemediationState(await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY), nowSeconds);
+          const interrupted = interruptRemediationHoldDown(guard);
+          if (interrupted !== guard) await this.ctx.storage.put(REMEDIATION_KEY, interrupted);
+        } catch {
+          console.warn("two-bot remediation hold-down interrupt failed; alerts already recorded");
+        }
         if (justFired) {
           const content = scrapeLossFiringMessage(context);
           console.warn(JSON.stringify({
@@ -1682,7 +1694,7 @@ export class TwoBotContainer extends Container<Env> {
       // config arms it; production and unarmed staging evaluate the scraped
       // samples untouched. Never logged: the switches never leave this gate.
       const faulted = applyStagingFaultInjection(samples, previous, this.env);
-      const { firing, state } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
+      const { firing, state, voiceLiveNotReadyEvidence } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
@@ -1725,7 +1737,13 @@ export class TwoBotContainer extends Container<Env> {
       try {
         const stored = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
         const nowSeconds = Math.floor(Date.now() / 1000);
-        const remediation = evaluateRemediation(firing, sanitizeRemediationState(stored, nowSeconds), nowSeconds);
+        // No current age sample this scrape (the gauge was missing or
+        // malformed): a firing `voice_live_not_ready` is only the alert
+        // holding its previous state, and a quiet one is not an observed
+        // clear. Either way that scope's progression and recovery clock
+        // must not move until a current age sample arrives.
+        const unobserved = voiceLiveNotReadyEvidence ? [] : ["voice_live_not_ready"];
+        const remediation = evaluateRemediation(firing, sanitizeRemediationState(stored, nowSeconds), nowSeconds, unobserved);
         await this.ctx.storage.put(REMEDIATION_KEY, remediation.state);
         for (const message of remediation.messages) {
           const content = `${message.text}.${alertContextSuffix(context)}`;
@@ -1763,6 +1781,7 @@ export class TwoBotContainer extends Container<Env> {
               firing,
               messages: remediation.messages,
               nowSeconds,
+              unobserved,
               buildRevision: context?.buildRevision ?? "unknown",
               release: releaseTag(this.lastRelease),
               workerVersion: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
