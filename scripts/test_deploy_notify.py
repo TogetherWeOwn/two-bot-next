@@ -171,6 +171,14 @@ class FromWorkflowTests(unittest.TestCase):
         self.assertEqual(derived[:2], ("deploy", "rolled_back"))
         self.assertEqual(derived[5], "auto-rollback after the post-deploy watch breached (readiness:health_not_200)")
 
+    def test_a_failed_watch_rollback_reports_the_failed_restore(self):
+        event, outcome, *_, reason = self.derive(
+            JOB_STATUS="failure", GATE_OUTCOME="success", AUTO_ROLLBACK_OUTCOME="skipped",
+            WATCH_ROLLBACK_OUTCOME="failure", WATCH_REASON="readiness:health_not_200")
+        self.assertEqual((event, outcome), ("deploy", "failed"))
+        self.assertIn("post-deploy-watch rollback also failed", reason)
+        self.assertIn("readiness:health_not_200", reason)
+
     def test_every_generated_reason_survives_the_allowlist(self):
         # A reason the allowlist drops would reach the release log as null.
         cases = [
@@ -183,6 +191,8 @@ class FromWorkflowTests(unittest.TestCase):
             {"JOB_STATUS": "failure", "GATE_OUTCOME": "failure", "AUTO_ROLLBACK_OUTCOME": "failure"},
             {"JOB_STATUS": "failure", "ERROR_GATE_OUTCOME": "failure", "AUTO_ROLLBACK_OUTCOME": "success"},
             {"JOB_STATUS": "failure", "WATCH_ROLLBACK_OUTCOME": "success", "WATCH_REASON": "rest_5xx"},
+            {"JOB_STATUS": "failure", "WATCH_ROLLBACK_OUTCOME": "failure",
+             "WATCH_REASON": "readiness:health_not_200"},
         ]
         for env in cases:
             with self.subTest(env=env):

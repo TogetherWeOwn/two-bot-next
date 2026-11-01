@@ -130,6 +130,10 @@ def from_workflow(env):
             # mode so the release log can tell that apart from missing data.
             return "deploy", "success", version, image, previous, "live-SHA recovery"
         return "deploy", "success", version, image, previous, ""
+    if env.get("WATCH_ROLLBACK_OUTCOME") == "failure":
+        return ("deploy", "failed", version, image, previous,
+                f"post-deploy watch breached ({env.get('WATCH_REASON') or 'unknown'}); "
+                "the post-deploy-watch rollback also failed")
     if env.get("AUTO_ROLLBACK_OUTCOME") == "failure":
         return ("deploy", "failed", version, image, previous,
                 f"{failed or 'a step after the deploy'} failed; the automatic rollback also failed")
