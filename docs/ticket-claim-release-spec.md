@@ -368,7 +368,7 @@ is acceptable; an actor-equality-only toggle, override release, silent generatio
 upgrade, new permission effect or migrationless activation is refused. This is
 an assessment of the proposal, **not independent approval of our own request**.
 An independent boundary disposition remains required for future security-sensitive
-implementation, alongside exact-head CI and independent Paperclip Review 5/5.
+implementation, alongside exact-head CI, CodeRabbit and Devin Review.
 
 Request CEO acceptance and actual staff-host intent alignment on this exact
 spec through the President/COO, not directly from the owner. The decision must

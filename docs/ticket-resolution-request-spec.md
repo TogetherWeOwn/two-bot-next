@@ -365,7 +365,7 @@ contract, not deliver the member feature or resolve the retention gap. Its kill
 rule is no accepted host demand or no bounded implementation path: retain A,
 without creating further cards from this proposal. No build card is created now.
 Any later live proposal needs a newly bounded plan and exact intent/security
-records; exact-head CI, independent Paperclip Review 5/5, relevant security gate
+records; exact-head CI, CodeRabbit and Devin Review, relevant security gate
 and existing authorized staging/rollback/deploy contracts still apply.
 
 Review metric by 2026-11-02: all 28 matrix rows accepted/revised, exact host/CEO

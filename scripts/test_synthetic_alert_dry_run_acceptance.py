@@ -5,28 +5,28 @@ Protected acceptance file: the implementation change must satisfy these
 tests without editing them. Test defects are corrected here, not by
 weakening assertions in the build.
 
-Contract under test (``scripts/synthetic_alert.py`` validates the webhook
-shape only inside ``post()`` immediately before sending, and ``summarize()``
-flows evidence check names/shapes into Discord content with only
-``isinstance(str)`` plus length caps):
+Contract under test (``scripts/synthetic_alert.py`` writes the incident
+issue only inside ``post()``, and ``summarize()`` flows evidence check
+names/shapes into the issue text with only ``isinstance(str)`` plus length
+caps):
 
 * ``python3 scripts/synthetic_alert.py --env ENV --evidence FILE --dry-run``
   exits 0 and prints a stable plan to stdout naming the environment, the
-  evidence receipt, the decided event and the webhook validity, without
+  evidence receipt, the decided event and the issue sink readiness, without
   sending anything.
 * The plan is stable: two invocations print byte-identical stdout.
 * Zero mutations: no ``post()``, no opener/network call of any kind, even
   when history reports a live alert transition.
-* The plan reflects webhook shape before any send: the valid-webhook plan
-  differs from the invalid-webhook plan, while neither echoes the URL.
-* A missing webhook or a missing probe sample still exits 0 (a preview is
+* The plan reflects sink readiness before any write: the plan with a token
+  differs from the plan without one, while neither echoes the token.
+* A missing token or a missing probe sample still exits 0 (a preview is
   not a delivery).
 * Crafted evidence control characters render inert: built alert content is
   printable-only and stays within the content cap.
 * Well-formed runs pass through byte-identically (controls).
 
-The webhook history read is mocked (it is a network read); every network
-entry point refuses. No sockets, no subprocess, no Discord.
+The workflow history read is mocked (it is a network read); every network
+entry point refuses. No sockets, no subprocess, no GitHub writes.
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_dry_run_acceptance.py' -v
 """
@@ -39,14 +39,15 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 alert = importlib.import_module("synthetic_alert")
 
-# Obviously fake webhook shape; never a real credential.
-HOOK = "https://discord.com/api/webhooks/234567890123456789/dry-run-plan-token-not-a-secret"
+# Obviously fake token; never a real credential.
+TOKEN = "dry-run-plan-token-not-a-secret"
 TOKEN_FRAGMENT = "dry-run-plan-token"
 
 EVIDENCE = {
@@ -111,9 +112,10 @@ def no_network(history=()):
     with (
         patch.object(alert, "previous_probe_outcomes", return_value=list(history)),
         patch.object(alert, "post", side_effect=AssertionError("post() during --dry-run")),
-        patch.object(alert.urllib.request, "build_opener",
+        patch.object(alert, "open_issue_without_incident", return_value=False),
+        patch.object(urllib.request, "build_opener",
                      side_effect=AssertionError("network opener during --dry-run")),
-        patch.object(alert.urllib.request, "urlopen",
+        patch.object(urllib.request, "urlopen",
                      side_effect=AssertionError("urlopen during --dry-run")),
     ):
         yield
@@ -121,7 +123,7 @@ def no_network(history=()):
 
 def base_env(**over):
     env = {
-        "SYNTHETIC_ALERT_WEBHOOK_URL": HOOK,
+        "GITHUB_TOKEN": TOKEN,
         "RUN_ID": "999",
         "GITHUB_RUN_ID": "999",
         "PROBE_OUTCOME": "failure",
@@ -155,37 +157,36 @@ class DryRunPlanTests(unittest.TestCase):
         self.assertNotEqual(out1.strip(), "", "plan must print something to stdout")
         self.assertEqual(out1, out2, "dry-run plan must be byte-identical across runs")
         lowered = out1.lower()
-        for token in ("staging", "evidence", "event", "webhook", "dry"):
+        for token in ("staging", "evidence", "event", "sink", "dry"):
             self.assertIn(token, lowered, f"plan must name {token!r}")
         self.assertIn("alert", lowered, "plan must name the decided alert event")
-        self.assertNotIn(HOOK, out1, "plan must never echo the webhook URL")
-        self.assertNotIn(TOKEN_FRAGMENT, out1, "plan must never echo webhook token material")
+        self.assertNotIn(TOKEN_FRAGMENT, out1, "plan must never echo token material")
 
-    def test_dry_run_without_webhook_still_exits_zero(self):
+    def test_dry_run_without_token_still_exits_zero(self):
         env = base_env()
-        del env["SYNTHETIC_ALERT_WEBHOOK_URL"]
+        del env["GITHUB_TOKEN"]
         with no_network(history=[("failure", "success")]):
             code, out, err = run_alert(self.argv(), env)
         self.assertEqual(
             code, 0,
-            f"a preview is not a delivery; a missing webhook must not fail it, "
+            f"a preview is not a delivery; a missing token must not fail it, "
             f"got {code}: {err[-300:]!r}",
         )
         self.assertIn("staging", out.lower(), "plan must still name the environment")
 
-    def test_dry_run_plan_reflects_webhook_shape_before_any_send(self):
+    def test_dry_run_plan_reflects_sink_readiness_before_any_write(self):
+        missing = base_env()
+        del missing["GITHUB_TOKEN"]
         with no_network(history=[("failure", "success")]):
             code_valid, plan_valid, err_valid = run_alert(self.argv(), base_env())
-            code_invalid, plan_invalid, err_invalid = run_alert(
-                self.argv(), base_env(SYNTHETIC_ALERT_WEBHOOK_URL="https://evil.invalid/hook/1"))
-        self.assertEqual(code_valid, 0, f"valid-webhook plan exited {code_valid}: {err_valid[-200:]!r}")
-        self.assertEqual(code_invalid, 0, f"invalid-webhook plan exited {code_invalid}: {err_invalid[-200:]!r}")
+            code_invalid, plan_invalid, err_invalid = run_alert(self.argv(), missing)
+        self.assertEqual(code_valid, 0, f"ready-sink plan exited {code_valid}: {err_valid[-200:]!r}")
+        self.assertEqual(code_invalid, 0, f"missing-token plan exited {code_invalid}: {err_invalid[-200:]!r}")
         self.assertNotEqual(
             plan_valid, plan_invalid,
-            "the plan must surface webhook validity before any send, "
+            "the plan must surface sink readiness before any write, "
             "not only inside post()",
         )
-        self.assertNotIn(HOOK, plan_valid, "plan must never echo the webhook URL")
         self.assertNotIn(TOKEN_FRAGMENT, plan_valid, "plan must never echo token material")
 
     def test_dry_run_without_probe_sample_exits_zero(self):
@@ -283,21 +284,20 @@ class WellformedControls(unittest.TestCase):
     def test_decide_only_without_sample_stays_green_with_empty_event(self):
         env = base_env()
         del env["PROBE_OUTCOME"]
-        del env["SYNTHETIC_ALERT_WEBHOOK_URL"]
+        del env["GITHUB_TOKEN"]
         with no_network():
             code, out, _ = run_alert(["--env", "staging", "--evidence", self.evidence,
                                       "--decide-only"], env)
         self.assertEqual(code, 0, "decide-only with no sample must stay green")
         self.assertIn("event=", out, "decide-only must still write the event line")
 
-    def test_post_still_refuses_non_discord_without_network(self):
-        with patch.object(alert.urllib.request, "build_opener",
+    def test_post_still_refuses_without_a_token_and_without_network(self):
+        with patch.object(urllib.request, "build_opener",
                           side_effect=AssertionError("network during refusal")):
-            for bad in ("", None, "https://evil.invalid/hook/1",
-                        "http://discord.com/api/webhooks/1/x"):
-                with self.assertRaises(alert.AlertError, msg=f"webhook {bad!r} must refuse"):
-                    alert.post(bad, "content")
-
+            for env in ({}, {"GITHUB_TOKEN": TOKEN},
+                        {"GITHUB_TOKEN": TOKEN, "GITHUB_REPOSITORY": "not a repo"}):
+                with self.assertRaises(alert.AlertError, msg=f"sink env {sorted(env)} must refuse"):
+                    alert.post(env, "staging", "alert", "content")
 
 if __name__ == "__main__":
     unittest.main()

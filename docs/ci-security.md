@@ -112,9 +112,10 @@ fall back to raw `max_connections` and label the ceiling as such.
 [Worker-version rollback](runbook.md#worker-version-rollback) option. The daily
 proof is described in [production-deploy.md](production-deploy.md#daily-staging-proof):
 only the fixed staging dispatch gets `actions: write`; the dispatcher has no
-Cloudflare or ownership credentials. Failed proofs alert through the existing
-`synthetic-alerts` environment. An independent daily read-only watcher catches
-missing/stale scheduled proof; healthy checks post nothing.
+Cloudflare or ownership credentials. Failed proofs open the `staging-rollback-proof`
+GitHub issue labelled `incident` with the job-scoped `GITHUB_TOKEN`
+(`issues: write`). An independent daily read-only watcher catches
+missing/stale scheduled proof; a healthy check closes any open issue.
 
 For the manual Worker-only option, pass a named, previously served
 `target_version` (never "latest"). It is an optional string with empty default:

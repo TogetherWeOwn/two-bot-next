@@ -25,7 +25,7 @@ use two_bot_core::{
     custom_commands::{
         accepted_text_trigger, builtin_command_names, escape_inspect_text,
         format_command_list_page, format_draft_preview, format_inspect_miss,
-        format_inspect_preview, format_inspect_summary, format_inspect_template,
+        format_inspect_preview, format_inspect_summary_with_gate, format_inspect_template,
         inspect_preview_context_unavailable, invalid_inspect_option_reply,
         invalid_inspect_view_reply, render_template, validate_inspect_name, validate_template,
         AuditRecord, AutomationMessageAcceptance, EditOutcome, EditPatch, InspectView,
@@ -119,6 +119,10 @@ pub struct CustomCommandRuntime {
     /// Exact merged set from the last confirmed full-registry PUT. Clones share
     /// this snapshot; committed DB changes alone must not advance discovery.
     published_commands: Arc<RwLock<PublishedCommands>>,
+    /// The gateway's effective `TWO_TEXT_COMMANDS` flag, when the owner
+    /// threaded it in. `None` keeps inspection honest ("unknown") instead of
+    /// guessing a gate this runtime cannot read.
+    text_commands: Option<bool>,
 }
 
 impl CustomCommandRuntime {
@@ -141,7 +145,17 @@ impl CustomCommandRuntime {
             registry: Arc::new(Mutex::new(())),
             text_cooldowns: Arc::new(Mutex::new(ActorCooldowns::default())),
             published_commands: Arc::new(RwLock::new(None)),
+            text_commands: None,
         }
+    }
+
+    /// Thread the same effective text-command flag the text path receives, so
+    /// `/command-inspect` reports current prefix eligibility from it. Never a
+    /// second environment read.
+    #[must_use]
+    pub fn with_text_commands(mut self, text_commands_enabled: bool) -> Self {
+        self.text_commands = Some(text_commands_enabled);
+        self
     }
 
     /// Clone the last confirmed publication without a DB read or a lock held
@@ -804,7 +818,11 @@ impl CustomCommandRuntime {
             return format_inspect_miss(&name);
         };
         match view {
-            InspectView::Summary => format_inspect_summary(&row),
+            InspectView::Summary => format_inspect_summary_with_gate(
+                &row,
+                self.text_commands
+                    .map(|text| text && self.router.gates().automations),
+            ),
             InspectView::Template => format_inspect_template(&row),
             InspectView::Preview => match context() {
                 Some(context) => format_inspect_preview(&row, &context),
@@ -1399,7 +1417,13 @@ mod inspect_regressions {
         let summary = fixture
             .reply(&inspect(6001, "SETUP", "summary"), Some("TWO"))
             .await;
-        assert_eq!(summary, "Summary /setup\nDescription: Saved response\nStatus: Enabled\nText trigger: !setup\nSaved template: /command-inspect name:setup view:template\nPrivate preview: /command-inspect name:setup view:preview\nReplace the definition: /command name:setup template:...");
+        assert!(summary.starts_with(
+            "Summary /setup\nDescription: Saved response\nSaved definition \u{2014} Status: Enabled\nText trigger: !setup\nText-trigger eligibility: Unknown ("
+        ));
+        assert!(summary.ends_with(
+            "\nSaved template: /command-inspect name:setup view:template\nPrivate preview: /command-inspect name:setup view:preview\nRecreate under a different name: /command name:another-name template:..."
+        ));
+        assert!(!summary.contains("Replace the definition: /command name:setup"));
         assert_eq!(
             fixture
                 .reply(&inspect(6002, "setup", "template"), Some("TWO"))

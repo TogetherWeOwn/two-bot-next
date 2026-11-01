@@ -167,11 +167,15 @@ failure. CI generates before consumers, then runs these read-only tests.
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `ci-ok`, `gitleaks` and `pr-lint` on the exact head commit. The single
+require `ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit` and `Devin Review` on the exact
+head commit, with no approving review. The single
 `ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
 cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
-(including the runbook command-drift test). The approving non-author reviewer
-squash-merges. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
+(including the runbook command-drift test). The agent that did the work
+squash-merges once every required check is green and each review finding is fixed
+or answered with evidence. A merge to `main` that touches a path outside the
+`paths-ignore` list in `deploy-staging.yml` (CI scripts and workflows included)
+deploys production, so it also needs the owner's approval. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
 workspace toolchain is pinned in `rust-toolchain.toml`.
 
 Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),

@@ -203,7 +203,7 @@ No claimed silence benefit may substitute for the shared-channel limitation.
 No implementation or acceptance-test/build subtasks before **new design acceptance
 AND recorded host alignment**, then separate COO admission, test-first execution,
 independent non-author CISO disposition where required, exact-head `pr-lint`,
-`ci-ok`, `gitleaks` and independent Paperclip Review 5/5. The baseline recommends
+`ci-ok`, `gitleaks`, `CodeRabbit` and `Devin Review`. The baseline recommends
 no implementation even if this design record is accepted. Any later feature needs
 a new evidenced design disposition, not automatic continuation of either alternative.
 No live send, preference/DB change, retention-policy change, access grant,

@@ -38,17 +38,17 @@ facts, not deployed-state or demand measurements.
 
 | Seam | Evidence and constraint |
 | --- | --- |
-| Warnings | [`0110`](crates/cutover/migrations/0110_moderation_member.sql#L18-L28): `id, guild_id, user_id, actor_id, reason, request_id, created_at`. No expiry, no display flag, no redaction column. Indexed by `(guild_id, user_id, created_at)`. Warn never touches Discord ([execute](crates/core/src/member_moderation.rs#L1455-L1468)) |
-| Ban ownership | [`0111`](crates/cutover/migrations/0111_moderation_ban_ownership.sql) plus [domain](docs/member-moderation.md): prepared/accepted/rejected intents with durable generations; only the newest accepted generation owns the member; older undispatched expiries supersede on confirmation |
-| Tempban expiry | [Staging](crates/core/src/member_moderation.rs#L1406-L1440) persists `execute_at` with the prepared intent before Discord; [schema](crates/cutover/migrations/0110_moderation_member.sql#L30-L49) carries `staged/pending/running/done/superseded/cancelled/quarantined` states. Tempban bounds are 60 s–365 d ([domain](docs/member-moderation.md)) |
-| Kick/timeout | Discord mutation only; no durable rows besides the audit ([execute](crates/core/src/member_moderation.rs#L1441-L1454)). The timeout `until` is passed to Discord and never stored, so **no stored "active timeout" fact exists** |
-| Audit | All five verbs write `moderation_audit` (actor, action, target, reason, outcome, metadata): bans at the PUT boundary, others post-effect ([service](crates/core/src/member_moderation.rs#L1352-L1360)). Indexed by `(guild_id, target_id, created_at)` ([schema](crates/cutover/migrations/0110_moderation_member.sql#L66-L67)) |
-| Audit outcomes | Accepted outcomes are `banned`, `temporarily_banned`, `kicked`, `timed_out`, `warned`, `unbanned` ([vocabulary](crates/core/src/member_moderation.rs#L92-L99)). Refusals write `denied` on `{request}:denied` ([refusal](crates/core/src/member_moderation.rs#L1132-L1152)); failures write `{request}:{outcome}` with `failed` or `in_progress` ([failure](crates/core/src/member_moderation.rs#L1156-L1176)); sweep failures write `unban_failed` ([sweep](crates/core/src/member_moderation.rs#L1639-L1658)); `ban_reconcile`/`accepted_historical` is operator reconciliation evidence, not a member event ([reconcile](crates/core/src/member_moderation.rs#L441-L460)) |
-| Self-serve precedent | `/privacy` is invoker-only with no target option, ephemeral completion, a fixed `member:self-serve` actor label and a member cooldown ([handler](crates/bot/src/privacy_command.rs#L1-L21), [label](crates/bot/src/privacy_command.rs#L38-L41), [cooldown](crates/bot/src/privacy_command.rs#L52-L57)) |
-| Reply privacy | Visibility is fixed at the initial ACK, never at edit ([lifecycle](docs/interaction-replies.md)). A private read must defer ephemeral, not repair a public placeholder |
-| Actor budget | Member verbs share a process-local 5 s per-actor cooldown, 1024 actors, monotonic clock ([domain](docs/member-moderation.md)). Malformed invocations never consume it |
-| Registry ceiling | Guild limit is 100 merged commands; builtins can shadow custom rows ([registry](crates/core/src/commands.rs#L24-L24), [merge](crates/core/src/commands.rs#L410-L410)). A new name must prove no collision and no silent drop |
-| Erasure | The ordered manifest deletes all six moderation tables for the subject (`moderation_warnings`, `moderation_audit`, `moderation_member_bans`, `moderation_scheduled_unbans`, plus channel/idempotency rows) ([manifest](crates/cutover/src/member_erasure_plan.json)). Analytics opt-out explicitly excludes moderation rows ([privacy](docs/privacy.md)) |
+| Warnings | [`0110`](../crates/cutover/migrations/0110_moderation_member.sql#L18-L28): `id, guild_id, user_id, actor_id, reason, request_id, created_at`. No expiry, no display flag, no redaction column. Indexed by `(guild_id, user_id, created_at)`. Warn never touches Discord ([execute](../crates/core/src/member_moderation.rs#L1455-L1468)) |
+| Ban ownership | [`0111`](../crates/cutover/migrations/0111_moderation_ban_ownership.sql) plus [domain](member-moderation.md): prepared/accepted/rejected intents with durable generations; only the newest accepted generation owns the member; older undispatched expiries supersede on confirmation |
+| Tempban expiry | [Staging](../crates/core/src/member_moderation.rs#L1406-L1440) persists `execute_at` with the prepared intent before Discord; [schema](../crates/cutover/migrations/0110_moderation_member.sql#L30-L49) carries `staged/pending/running/done/superseded/cancelled/quarantined` states. Tempban bounds are 60 s–365 d ([domain](member-moderation.md)) |
+| Kick/timeout | Discord mutation only; no durable rows besides the audit ([execute](../crates/core/src/member_moderation.rs#L1441-L1454)). The timeout `until` is passed to Discord and never stored, so **no stored "active timeout" fact exists** |
+| Audit | All five verbs write `moderation_audit` (actor, action, target, reason, outcome, metadata): bans at the PUT boundary, others post-effect ([service](../crates/core/src/member_moderation.rs#L1352-L1360)). Indexed by `(guild_id, target_id, created_at)` ([schema](../crates/cutover/migrations/0110_moderation_member.sql#L66-L67)) |
+| Audit outcomes | Accepted outcomes are `banned`, `temporarily_banned`, `kicked`, `timed_out`, `warned`, `unbanned` ([vocabulary](../crates/core/src/member_moderation.rs#L92-L99)). Refusals write `denied` on `{request}:denied` ([refusal](../crates/core/src/member_moderation.rs#L1132-L1152)); failures write `{request}:{outcome}` with `failed` or `in_progress` ([failure](../crates/core/src/member_moderation.rs#L1156-L1176)); sweep failures write `unban_failed` ([sweep](../crates/core/src/member_moderation.rs#L1639-L1658)); `ban_reconcile`/`accepted_historical` is operator reconciliation evidence, not a member event ([reconcile](../crates/core/src/member_moderation.rs#L441-L460)) |
+| Self-serve precedent | `/privacy` is invoker-only with no target option, ephemeral completion, a fixed `member:self-serve` actor label and a member cooldown ([handler](../crates/bot/src/privacy_command.rs#L1-L21), [label](../crates/bot/src/privacy_command.rs#L38-L41), [cooldown](../crates/bot/src/privacy_command.rs#L52-L57)) |
+| Reply privacy | Visibility is fixed at the initial ACK, never at edit ([lifecycle](interaction-replies.md)). A private read must defer ephemeral, not repair a public placeholder |
+| Actor budget | Member verbs share a process-local 5 s per-actor cooldown, 1024 actors, monotonic clock ([domain](member-moderation.md)). Malformed invocations never consume it |
+| Registry ceiling | Guild limit is 100 merged commands; builtins can shadow custom rows ([registry](../crates/core/src/commands.rs#L24-L24), [merge](../crates/core/src/commands.rs#L410-L410)). A new name must prove no collision and no silent drop |
+| Erasure | The ordered manifest deletes all six moderation tables for the subject (`moderation_warnings`, `moderation_audit`, `moderation_member_bans`, `moderation_scheduled_unbans`, plus channel/idempotency rows) ([manifest](../crates/cutover/src/member_erasure_plan.json)). Analytics opt-out explicitly excludes moderation rows ([privacy](privacy.md)) |
 | Appeal | A case-insensitive search for "appeal" across `crates/` and `docs/` at the base returns no implementation, store or spec. Appeal states, entry points and content rules are owned by the separate appeal design, not this spec |
 | Staff history | No member-history read path exists in-repo at the base. The staff warning-history read is a separate design; this spec grants no staff capability and reads no staff surface |
 
@@ -125,7 +125,7 @@ or API. No build or behavior-test card before the gates in §14.
   in fixed ASCII formats; the remaining bytes split evenly across rendered
   rows as the per-reason share; each reason truncates on a character
   boundary to its share with a trailing `…` when cut. Reasons arrive up to
-  512 UTF-16 units ([cap](docs/member-moderation.md#L20-L22)), so truncation
+  512 UTF-16 units ([cap](member-moderation.md#L20-L22)), so truncation
   is the rule, not the exception. Precedence is fixed: all 25 rows always
   render, and the reply never exceeds 1800 bytes. Truncation never splits a
   code point, so the reply is always valid UTF-8 (SS-F18). Shaping order is
@@ -175,11 +175,11 @@ is required or permitted in this read path.
   survive. Masked links and bare URLs are defanged just as
   deterministically: `](` becomes `]` + U+200B + `(` and `://` becomes `:`
   + U+200B + `//`, the same zero-width-split precedent as the reply-slot
-  sanitizer ([sanitizer](crates/bot/src/member_runtime.rs#L802-L810)).
+  sanitizer ([sanitizer](../crates/bot/src/member_runtime.rs#L802-L810)).
   Masked links render as literal text and bare URLs never autolink, so no
   clickable link survives. Raw snowflake digit-strings inside prose are **not** detected or
   masked: there is no general personal-data recognizer here (same boundary as
-  [privacy](docs/privacy.md)), and guessing would both miss and over-redact.
+  [privacy](privacy.md)), and guessing would both miss and over-redact.
   Staff guidance on reason wording is out of scope; the structural guarantee
   is own-rows-only plus mention-syntax neutralization. Neutralization always
   precedes byte fitting (§3): the fitted, capped text is the neutralized
@@ -199,7 +199,7 @@ identifying the reader.** Identity-free aggregate invocation counters and
 telemetry may still move (SS-F15), so the claim is scoped: no audit row, no
 per-reader record, no sanction-table write. Unlike an opt-out purge the read
 needs no accountability receipt; the purge receipt exists because data was
-deleted ([privacy](docs/privacy.md)). Reasons:
+deleted ([privacy](privacy.md)). Reasons:
 
 1. A per-read log would create a new sensitive dataset (which member checked
    their record, when) with its own retention, erasure and access rules,
@@ -244,7 +244,7 @@ This spec defines only the hookup contract the self-view must satisfy:
 ## 8. Opt-out, retention and purge interplay
 
 - **Analytics opt-out changes nothing.** Moderation rows are explicitly
-  outside the opt-out purge ([privacy](docs/privacy.md)); opting out,
+  outside the opt-out purge ([privacy](privacy.md)); opting out,
   opting in or staying opted out leaves the self-view byte-identical. One
   line in command help says so; routine replies do not editorialize.
 - **"Recent" is a display window, not deletion.** Warnings, audit and the ban
@@ -394,7 +394,7 @@ are authored here.
 All fixtures below are **planned, not executed runtime tests**. Use synthetic
 identities, unique channels per case, an injected clock, independent
 disposable test-DB connections and the shared recording Discord double
-([transport](crates/discord/tests/common/mod.rs#L368-L368)). For each row
+([transport](../crates/discord/tests/common/mod.rs#L368-L368)). For each row
 collect bounded result state plus table/audit/message counters; never capture
 private text in evidence. Timing bounds are acceptance targets, not SLAs.
 
