@@ -292,12 +292,16 @@ async fn audit_insert_failure_on_rsvp_rewrite_preserves_exact_prior_state() {
     assert_eq!(counts(fixture.pool()).await, (1, 1, 0));
     mock.shutdown().await;
 
-    // Success control: with the fault removed, the rewrite lands and its
-    // audit row appends after the preserved history.
+    // Success control: with the fault removed, the going -> interested rewrite
+    // lands with the changed receipt, and its audit row appends after the
+    // preserved history.
     remove_audit_fault(fixture.pool()).await;
     let mock = live_mock().await;
     run(fixture.pool(), &mock, &rsvp(912, "interested")).await;
-    assert_eq!(last_edit_content(&mock), "RSVP saved: interested.");
+    assert_eq!(
+        last_edit_content(&mock),
+        "RSVP saved: interested (changed from going)."
+    );
     let stored = stored_response(fixture.pool())
         .await
         .expect("the control rewrite stored a response");

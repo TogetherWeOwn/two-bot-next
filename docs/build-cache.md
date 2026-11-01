@@ -22,10 +22,12 @@ the next acquire, while over-budget or live-group leases stay for Operator
 inspection.
 
 Choose the smallest useful target. The wrapper adds `--offline --locked`, uses
+a per-worktree subdirectory (`ws-<hash>`) under
 `/paperclip/.cache/two-bot-next-bounded/slot-N/target`, and overrides inherited
 `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, including
 values pointing to container `/tmp`. It sets `TMPDIR`, `TMP` and `TEMP` to the
-same lease's `slot-N/scratch`, for cooperative compiler/build/test temporary files.
+same worktree's `slot-N/scratch/ws-<hash>`, for cooperative compiler/build/test
+temporary files.
 It disables incremental compilation and dev/test debuginfo **only in the child
 environment**. It rejects
 output/config overrides and manifests outside the current workspace. It neither
@@ -34,8 +36,16 @@ changes agent environments/rosters nor release profiles. `cargo fmt --all --
 their existing Cargo commands on ephemeral runners, outside this controller pool.
 
 There are **two independent leases**, not one global Cargo lock. Each lease gives
-one Cargo invocation exclusive use of a stable target directory, preserving
-artifacts for later worktrees. A third concurrent invocation exits 75 immediately;
+one Cargo invocation exclusive use of the slot. Cargo dep-info uses relative
+paths and freshness is mtime-only, so two worktrees sharing one target
+directory could reuse each other's artifacts (duplicate-crate `E0631`). Each
+worktree therefore gets its own `ws-<hash>` subdirectory under `target/` and
+`scratch/`. On acquire, with the slot lock held, other worktrees' subdirectories
+are evicted to preserve the slot byte budget, and a legacy shared layout is
+migrated after the same build-output-only check retention uses. Protected,
+foreign, mixed, symlinked or unreadable contents refuse that slot unchanged
+(the next slot is tried). Re-running in the same worktree keeps its warm
+artifacts. A third concurrent invocation exits 75 immediately;
 it does not queue indefinitely, create another target, or fall back to a local
 `target/`. Retain/continue the card rather than evading the limit. A missing pool,
 quota receipt, scratch-coverage receipt, low filesystem headroom, bad policy,
@@ -150,11 +160,22 @@ Until then rollout remains **not deployed/unresolved**; do not fill the field wi
 a placeholder. No environment/roster changes, mount/service operations, archive
 pruning or new spend are authorized by this gate.
 
+Each run also prints a `pool_provisioning_mismatch` JSON finding on stderr when
+`min_available_bytes + slots * slot_budget_bytes` or `hard_limit_bytes` exceeds
+the pool filesystem's total size. It is a warning only: admission continues
+unchanged, and `retain` never emits it. It tells the Operator that the installed
+policy assumes a larger backing filesystem than exists.
+
 ## Offline verification
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_pool_capacity_acceptance.py' -v
 ```
+
+`test_pool_capacity_acceptance.py` pins the provisioning warning (including the
+strict exact-fit boundary and `f_frsize` scaling) and the floor/receipt
+behavior.
 
 The suite launches fake compilers that write 4 KiB to target and 4 KiB to scratch
 each and block on tiny fixture markers. It proves two isolated invocations run

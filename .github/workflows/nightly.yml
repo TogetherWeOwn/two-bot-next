@@ -87,10 +87,12 @@ jobs:
           persist-credentials: false
       # Fetch current RustSec data even when Cargo.lock has not changed.
       # cargo-deny reads the lockfile; no token-writing/reporting steps.
+      # `--workspace`: see the cargo-deny step in check.yml.
       - name: cargo deny check advisories
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories
+          arguments: --workspace --all-features
 
   sweep:
     name: nightly ignored tests and docs
@@ -172,7 +174,10 @@ jobs:
       # used by TestDatabase suites. Skip only those tests here, then run ALL of
       # those suites below with their accepted URL.
       # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
-      # regenerate_reference_docs is a manual regen: it rewrites docs/commands.md and
+      - name: Generate command reference before workspace compilation
+        run: python3 scripts/generate_command_reference.py
+
+      # regenerate_reference_docs is a manual regen: it rewrites docs/generated/commands.md and
       # docs/configuration.md in the checkout, so later tests would compare against
       # regenerated docs and hide drift. It is skipped here on purpose.
       # Quarantine (TOG-34944): the 15 red backfill acceptance tests below run

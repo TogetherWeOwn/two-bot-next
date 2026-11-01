@@ -2,9 +2,9 @@
 
 Failing-first acceptance for `synthetic_alert.load_evidence`: bare
 `json.load` parses duplicate object keys last-wins, so a corrupted evidence
-receipt can mask a failing check name in a Discord alert. A refused receipt
+receipt can mask a failing check name in an incident issue. A refused receipt
 must exit nonzero without posting; a missing or malformed (non-duplicate)
-receipt keeps the existing unknown-build post. Offline only: the webhook
+receipt keeps the existing unknown-build post. Offline only: the issue
 post is mocked, no network, no credentials.
 """
 
@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -22,7 +23,6 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 alert = importlib.import_module("synthetic_alert")
 
-HOOK = "https://discord.com/api/webhooks/123456789012345678/synthetic-token-not-a-secret"
 EXPECTED_STDERR = "synthetic_alert: evidence refused: duplicate JSON object key"
 # Accepted seam shapes at load_evidence: the wrapped AlertError, or the raw
 # hook ValueError when the builder converts it in post_event instead.
@@ -71,7 +71,7 @@ def duplicate_bodies():
 
 class EvidenceDuplicateKeyAcceptanceTests(unittest.TestCase):
     def setUp(self):
-        guard = mock.patch.object(alert.urllib.request, "build_opener",
+        guard = mock.patch.object(urllib.request, "build_opener",
                                   side_effect=AssertionError(
                                       "offline acceptance must not post"))
         guard.start()
@@ -90,7 +90,7 @@ class EvidenceDuplicateKeyAcceptanceTests(unittest.TestCase):
         return str(path)
 
     def base_env(self):
-        return {"SYNTHETIC_ALERT_WEBHOOK_URL": HOOK, "RUN_ID": "999",
+        return {"RUN_ID": "999",
                 "GITHUB_RUN_ID": "999", "GITHUB_TOKEN": "test-token",
                 "PROBE_OUTCOME": "failure", "FORCE_FAIL": "false",
                 "GIT_SHA": "deadbeef", "GITHUB_SERVER_URL": "https://github.com",
@@ -192,7 +192,7 @@ class EvidenceDuplicateKeyAcceptanceTests(unittest.TestCase):
                     code = alert.post_event(self.base_env(), "staging", path, "alert")
                 self.assertEqual(code, 0)
                 post.assert_called_once()
-                content = post.call_args.args[1]
+                content = post.call_args.args[3]
                 self.assertIn("unknown", content)
                 self.assertEqual(out.getvalue(), content + "\n")
 
@@ -208,7 +208,7 @@ class EvidenceDuplicateKeyAcceptanceTests(unittest.TestCase):
                     mock.patch.object(alert, "post") as post:
                 code = alert.post_event(self.base_env(), "staging", path, "alert")
             self.assertEqual(code, 0)
-            content = post.call_args.args[1]
+            content = post.call_args.args[3]
             posted.append(content)
             self.assertEqual(out.getvalue(), content + "\n")
         self.assertEqual(posted[0], posted[1])

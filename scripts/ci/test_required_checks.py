@@ -73,7 +73,8 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(agg["name"], "ci-ok")
         self.assertIn("always()", agg["if"])
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
-                    "patch-coverage", "ignored-db-stores", "ignored-db-runtime", "worker",
+                    "coverage-plan", "coverage-shard", "patch-coverage",
+                    "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
                     "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile",
                     "nextest"):
@@ -87,6 +88,7 @@ class RequiredChecksReportTests(unittest.TestCase):
                        "SELF_ROLE_RESULT", "COMMUNITY_DB_RESULT",
                        "FEEDS_DB_RESULT", "TICKETS_RESULT",
                        "MODERATION_DB_RESULT", "RUST_TESTS_RESULT",
+                       "COVERAGE_PLAN_RESULT", "COVERAGE_SHARD_RESULT",
                        "PATCH_COVERAGE_RESULT",
                        "IGNORED_DB_STORES_RESULT", "IGNORED_DB_RUNTIME_RESULT",
                        "FUZZ_COMPILE_RESULT", "NEXTEST_RESULT"):
@@ -260,7 +262,8 @@ class RequiredChecksReportTests(unittest.TestCase):
     def test_aggregators_accept_a_skip_only_when_the_selector_deselected_the_job(self):
         # Docs-only PRs: selector-gated jobs skip, always-run selectors and
         # lint still pass. Docs changes continue to select the worker lane.
-        gated = {"rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime", "self-role-store",
+        gated = {"rust-tests", "coverage-plan", "coverage-shard", "patch-coverage",
+                 "ignored-db-stores", "ignored-db-runtime", "self-role-store",
                  "community-db", "feeds-db", "tickets-postgres", "moderation-db",
                  "parity-docs", "supply-chain", "fuzz-compile", "nextest"}
         for name in AGGREGATORS:

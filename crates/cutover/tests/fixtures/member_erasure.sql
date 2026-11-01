@@ -6,6 +6,12 @@ DECLARE
   u TEXT;
   k TEXT;
   intent BIGINT;
+  -- Raw presence captures expire after 30 days (PRESENCE_RAW_RETENTION_DAYS),
+  -- so a fixed date ages out of the window and the retention sweep deletes
+  -- the rows. Today at UTC midnight stays inside every window and keeps the
+  -- dedup_key's second-precision `...Z` shape.
+  presence_at TEXT := to_char(date_trunc('day', now() AT TIME ZONE 'UTC'),
+    'YYYY-MM-DD"T"HH24:MI:SS"Z"');
 BEGIN
   FOR g IN SELECT unnest(ARRAY['1545644954272137297', '1545644954272137298']) LOOP
     FOR u IN SELECT unnest(ARRAY['123456789012345678', '123456789012345679']) LOOP
@@ -23,8 +29,8 @@ BEGIN
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
         presence_status, activity_type, application_id, nick_changed, roles,
         channel_id, message_id)
-        VALUES ('PRESENCE_UPDATE', g, u, '2026-10-01T00:00:00Z',
-        'PRESENCE_UPDATE:' || g || ':' || u || ':2026-10-01T00:00:00Z',
+        VALUES ('PRESENCE_UPDATE', g, u, presence_at::timestamptz,
+        'PRESENCE_UPDATE:' || g || ':' || u || ':' || presence_at,
         'online', 0, NULL, FALSE, '[]', 'c-' || k, 'm-' || k);
       INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, updated_at)
         VALUES (g, u, 1, u, now());

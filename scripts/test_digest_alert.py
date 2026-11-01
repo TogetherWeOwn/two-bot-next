@@ -17,7 +17,6 @@ spec = importlib.util.spec_from_file_location(
 alert = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(alert)
 
-HOOK = "https://discord.com/api/webhooks/123/abcDEF_-123"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 RUN_LINK = "https://github.com/o/r/actions/runs/1"
 
@@ -41,53 +40,46 @@ class BuildContentTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
-    def run_main(self, args, env):
+    def run_main(self, args, env, side_effect=None):
         with patch.dict(os.environ, env, clear=False):
-            for key in ("SYNTHETIC_ALERT_WEBHOOK_URL", "RUN_ID", "GITHUB_RUN_ID",
+            for key in ("GITHUB_TOKEN", "RUN_ID", "GITHUB_RUN_ID",
                         "GITHUB_REPOSITORY", "GITHUB_SERVER_URL"):
                 os.environ.pop(key, None)
             os.environ.update(env)
-            with patch.object(alert, "post") as posted:
+            with patch.object(alert.incident_issue, "open_incident",
+                              return_value=("opened", 7),
+                              side_effect=side_effect) as opened:
                 code = alert.main(args)
-        return code, posted
+        return code, opened
 
-    def test_delivers_on_missing_digest(self):
-        code, posted = self.run_main(
+    def test_opens_incident_issue_on_missing_digest(self):
+        code, opened = self.run_main(
             ["--live-sha", SHA, "--prev-tag", "v2026.10.20"],
-            {"SYNTHETIC_ALERT_WEBHOOK_URL": HOOK, "RUN_ID": "1",
-             "GITHUB_REPOSITORY": "o/r"})
+            {"GITHUB_TOKEN": "fixture", "RUN_ID": "1", "GITHUB_REPOSITORY": "o/r"})
         self.assertEqual(code, 0)
-        posted.assert_called_once()
-        url, content = posted.call_args.args
-        self.assertEqual(url, HOOK)
-        self.assertIn("ALERT daily-digest", content)
+        opened.assert_called_once()
+        _env, key, title, body = opened.call_args.args
+        self.assertEqual(key, "daily-digest")
+        self.assertIn("daily-digest", title)
+        self.assertIn("ALERT daily-digest", body)
 
-    def test_missing_webhook_fails(self):
-        code, posted = self.run_main(["--live-sha", SHA], {"RUN_ID": "1"})
+    def test_unwritable_issue_fails_closed(self):
+        code, opened = self.run_main(
+            ["--live-sha", SHA], {"RUN_ID": "1"},
+            side_effect=alert.incident_issue.IncidentError("incident sink context is missing"))
         self.assertEqual(code, 1)
-        posted.assert_not_called()
+        opened.assert_called_once()
 
     def test_bad_sha_refuses(self):
-        code, posted = self.run_main(
-            ["--live-sha", "short"],
-            {"SYNTHETIC_ALERT_WEBHOOK_URL": HOOK})
+        code, opened = self.run_main(["--live-sha", "short"], {"GITHUB_TOKEN": "fixture"})
         self.assertEqual(code, 1)
-        posted.assert_not_called()
+        opened.assert_not_called()
 
     def test_bad_prev_tag_refuses(self):
-        code, posted = self.run_main(
-            ["--live-sha", SHA, "--prev-tag", "v1.2.3"],
-            {"SYNTHETIC_ALERT_WEBHOOK_URL": HOOK})
+        code, opened = self.run_main(
+            ["--live-sha", SHA, "--prev-tag", "v1.2.3"], {"GITHUB_TOKEN": "fixture"})
         self.assertEqual(code, 1)
-        posted.assert_not_called()
-
-    def test_non_discord_webhook_refuses(self):
-        from synthetic_alert import AlertError
-        with patch.dict(os.environ, {"SYNTHETIC_ALERT_WEBHOOK_URL": "https://example.invalid/hook",
-                                      "RUN_ID": "1", "GITHUB_REPOSITORY": "o/r"}):
-            with patch.object(alert, "post", side_effect=AlertError("refusing")) as posted:
-                self.assertEqual(alert.main(["--live-sha", SHA]), 1)
-            posted.assert_called_once()
+        opened.assert_not_called()
 
 
 if __name__ == "__main__":
