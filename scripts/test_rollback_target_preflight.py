@@ -214,6 +214,25 @@ class MigrationFindingTests(unittest.TestCase):
         self.assertEqual(self.findings(self.repo.commit("short"))[1],
                          [{"migration": "0002_drop.sql", "code": "truncate"}])
 
+    def test_an_empty_marker_cannot_claim_the_next_line(self):
+        self.repo.write("crates/store/migrations/0002_drop.sql",
+                        "-- rollback-compatible:\nDROP TABLE x;\n")
+        self.assertEqual(self.findings(self.repo.commit("newline"))[1],
+                         [{"migration": "0002_drop.sql", "code": "drop_object"}])
+
+    def test_an_override_cannot_waive_an_unreadable_migration(self):
+        self.repo.write("crates/store/migrations/0002_drop.sql",
+                        "-- rollback-compatible: reviewed and this is fine\n"
+                        "INSERT INTO t VALUES ('oops); DROP TABLE t;\n")
+        self.assertEqual(self.findings(self.repo.commit("unparseable"))[1],
+                         [{"migration": "0002_drop.sql", "code": "unparseable_migration"}])
+
+    def test_padded_marker_reason_must_be_ten_characters(self):
+        self.repo.write("crates/store/migrations/0002_drop.sql",
+                        "-- rollback-compatible: x         \nDROP TABLE x;\n")
+        self.assertEqual(self.findings(self.repo.commit("padded"))[1],
+                         [{"migration": "0002_drop.sql", "code": "drop_object"}])
+
     def test_rewritten_or_deleted_migration_refuses(self):
         self.repo.write("crates/store/migrations/0001_base.sql", "CREATE TABLE t (id int);\n")
         self.assertEqual(self.findings(self.repo.commit("rewrite"))[1],

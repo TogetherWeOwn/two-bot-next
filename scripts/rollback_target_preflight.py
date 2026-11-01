@@ -64,7 +64,11 @@ COMMAND_OUTPUT_CAP = 1024 * 1024
 MIGRATION = re.compile(r"crates/[a-z0-9_-]+/migrations/[0-9]{4}_[a-z][a-z0-9_]*\.sql")
 # A reviewed exception: the author states why the serving build still runs
 # against this schema. At least a short sentence, never an empty marker.
-OVERRIDE = re.compile(r"^--\s*rollback-compatible:\s*(\S.{9,})$", re.MULTILINE)
+# The reason must stay on the marker's own line: \s would also span the
+# newline, letting an empty marker claim the next statement as its reason.
+# It must start and end with a non-space character, so padding cannot fake
+# the ten-character minimum; trailing spaces after the reason are allowed.
+OVERRIDE = re.compile(r"^--[ \t]*rollback-compatible:[ \t]*(\S[^\r\n]{8,}\S)[ \t]*\r?$", re.MULTILINE)
 # Statements the previous build cannot survive after a rollback, matched on
 # lexed SQL (comments removed, literals and quoted identifiers blanked). The
 # code names the first match. PostgreSQL keywords that may be omitted
@@ -260,7 +264,10 @@ def migration_findings(repo, serving_sha, sha, git_fn=git):
         sql = git_fn(repo, "show", f"{sha}:{path}").decode("utf-8", "replace")
         checked.append(name)
         code = incompatible_code(sql)
-        if code is not None and not OVERRIDE.search(sql):
+        # A marker vouches only for statements the lexer could read. An
+        # unreadable migration never passes (docs/migrations.md), so the
+        # marker must not waive unparseable_migration.
+        if code is not None and (code == "unparseable_migration" or not OVERRIDE.search(sql)):
             refusals.append({"migration": name, "code": code})
     return checked, refusals
 
