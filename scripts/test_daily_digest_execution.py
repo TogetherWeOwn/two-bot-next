@@ -84,7 +84,7 @@ class DigestExecutionTest(unittest.TestCase):
             env[key] = str(value).lower() if isinstance(value, bool) else str(value)
         result = subprocess.run(["bash", "-euc", step["run"]], cwd=ROOT, env=env,
                                 capture_output=True, text=True, timeout=30)
-        outputs = {}
+        outputs = {f"steps.{step_id}.outcome": "success" if result.returncode == 0 else "failure"}
         for line in out.read_text().splitlines():
             key, _, value = line.partition("=")
             outputs[f"steps.{step_id}.outputs.{key}"] = value
@@ -102,6 +102,20 @@ class DigestExecutionTest(unittest.TestCase):
                               env={**self.env, "TAGS": tags}, capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def file_incident(self, needs):
+        """Run the real alert handler with the alert step's own env bindings."""
+        alert_context = {"needs.digest.outputs.live_sha": SHA,
+                         "needs.digest.outputs.prev_tag": needs["needs.digest.outputs.prev_tag"],
+                         "github.run_id": "1", "secrets.GITHUB_TOKEN": "fixture"}
+        env = {key: alert_context[value.removeprefix("${{").removesuffix("}}").strip()]
+               for key, value in WORKFLOW["jobs"]["alert"]["steps"][-1]["env"].items()}
+        with patch.dict(os.environ, env), \
+                patch.object(ALERT.incident_issue, "open_incident", return_value=("opened", 3)) as opened:
+            self.assertEqual(ALERT.main(["--live-sha", env["LIVE_SHA"], "--prev-tag", env["PREV_TAG"]]), 0)
+        opened.assert_called_once()
+        self.assertEqual(opened.call_args.args[1], "daily-digest")
+        return opened.call_args.args[3]
 
     def job_outputs(self, context):
         return {f"needs.digest.outputs.{name}": gate(value, context)
@@ -162,17 +176,24 @@ class DigestExecutionTest(unittest.TestCase):
         self.assertFalse(self.alerts(needs, cancelled=True))
         self.assertFalse(self.alerts(needs, dry_run=True))
         self.assertFalse(gate(DISPATCH["if"], context))
-        alert_context = {"needs.digest.outputs.live_sha": SHA,
-                         "needs.digest.outputs.prev_tag": needs["needs.digest.outputs.prev_tag"],
-                         "github.run_id": "1", "secrets.GITHUB_TOKEN": "fixture"}
-        env = {key: alert_context[value.removeprefix("${{").removesuffix("}}").strip()]
-               for key, value in WORKFLOW["jobs"]["alert"]["steps"][-1]["env"].items()}
-        with patch.dict(os.environ, env), \
-                patch.object(ALERT.incident_issue, "open_incident", return_value=("opened", 3)) as opened:
-            self.assertEqual(ALERT.main(["--live-sha", env["LIVE_SHA"], "--prev-tag", env["PREV_TAG"]]), 0)
-        opened.assert_called_once()
-        self.assertEqual(opened.call_args.args[1], "daily-digest")
-        self.assertIn(SHA[:7], opened.call_args.args[3])
+        self.assertIn(SHA[:7], self.file_incident(needs))
+
+    def test_failed_publication_keeps_latest_sbom_dispatch(self):
+        # Latest lacks assets and today's publish fails: the alert fires and
+        # the Latest redispatch still runs.
+        self.env["GH_FIXTURES"] = json.dumps({"release view --json tagName,assets,publishedAt": {
+            "tagName": "v2026.1031.0", "assets": ASSETS[:1], "publishedAt": "2026-10-31T12:00:00Z"}})
+        context = self.planned()
+        self.assertEqual(context["steps.digest.outputs.publish"], "true")
+        context["steps.publish.outcome"] = "failure"
+        self.assertFalse(gate(STEPS["record"]["if"], context))
+        self.assertTrue(self.alerts(self.job_outputs(context)))
+        self.assertTrue(gate(DISPATCH["if"], context))
+        self.assertFalse(gate(DISPATCH["if"], context, cancelled=True))
+        self.assertEqual([call[-1] for call in self.dispatch(context)], ["release_tag=v2026.1031.0"])
+        # A failed adapt step owes nothing it could prove: no dispatch.
+        context["steps.digest.outcome"] = "failure"
+        self.assertFalse(gate(DISPATCH["if"], context))
 
     def test_fresh_release_records_and_dispatches_sbom(self):
         context = self.planned()
@@ -237,7 +258,7 @@ class DigestExecutionTest(unittest.TestCase):
         today = time.gmtime()
         tag = f"v{today.tm_year}.{today.tm_mon}{today.tm_mday:02d}.0"
         frozen = {"schema": "calver-plan-v1", "sha": "a" * 40, "policy": "live-digest",
-                  "tag": tag, "previousStableTag": "v2026.10.23", "id": "y"}
+                  "tag": tag, "previousStableTag": "v2026.1031.0", "id": "y"}
         self.env["GH_FIXTURES"] = json.dumps({
             f"api repos/o/r/git/matching-refs/tags/{tag[:-1]}": [
                 {"ref": f"refs/tags/{tag}", "object": {"type": "tag", "sha": "f" * 40}}],
@@ -257,8 +278,9 @@ class DigestExecutionTest(unittest.TestCase):
         # A failed repair is owed work: it reaches the alert gate.
         needs = self.job_outputs(context)
         self.assertEqual(needs["needs.digest.outputs.prod_changed"], "true")
-        self.assertEqual(needs["needs.digest.outputs.prev_tag"], "v2026.10.23")
+        self.assertEqual(needs["needs.digest.outputs.prev_tag"], "v2026.1031.0")
         self.assertTrue(self.alerts(needs))
+        self.assertIn("prev v2026.1031.0", self.file_incident(needs))
         # A successful repair of an existing tag records and dispatches SBOM.
         context.update({"steps.publish.outputs.created": "true", "steps.publish.outputs.tag": tag})
         result, outputs, _ = self.step("record", context)

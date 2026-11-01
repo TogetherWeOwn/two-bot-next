@@ -25,7 +25,8 @@ publish steps pin the action to one full commit SHA. The bot adapter
   treats the day as a skip too and never re-publishes it.
 - **SBOM reconciliation:** every non-dry run checks the Latest release (and a
   replayed or repaired digest) for its SBOM assets and redispatches the
-  idempotent SBOM chain once per tag that lacks them, so a green rerun the
+  idempotent SBOM chain once per tag that lacks them (even when the day's
+  publication then fails), so a green rerun the
   next morning restores the inventories no later run would backfill. A
   lookup failure stays green without dispatching.
 - **Stalled production:** on a quiet day where the Latest release is more

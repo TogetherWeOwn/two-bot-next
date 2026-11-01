@@ -122,8 +122,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: node .github/scripts/daily-digest.cjs record
+      # Runs even when publication failed: the Latest release's owed SBOM
+      # dispatch (from adapt) must not be lost with the new digest.
       - name: Dispatch the SBOM chain for each owed digest tag
-        if: steps.record.outputs.sbom_tags != '' || steps.digest.outputs.sbom_tags != ''
+        if: ${{ !cancelled() && steps.digest.outcome == 'success' && (steps.record.outputs.sbom_tags != '' || steps.digest.outputs.sbom_tags != '') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
