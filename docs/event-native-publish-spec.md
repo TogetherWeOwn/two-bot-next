@@ -1,11 +1,12 @@
 # Events: one-shot publish to Discord native scheduled events
 
-Status: **Proposed — design only**, 2026-10-26; review by **2026-11-02**.
-This is the single editable repository contract; the task spec mirrors its exact
-commit and SHA-256. Merge is not acceptance, host/CEO intent alignment, CISO
-disposition, build approval or activation. No runtime, acceptance-test,
-migration, permission, credential, publication, deployment or spending change
-is included.
+Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit with the
+events-and-RSVP theme; no build until then. Original proposal: written
+2026-10-26. This is the single editable repository contract; the task spec
+mirrors its exact commit and SHA-256. Merge is not acceptance, host/CEO intent
+alignment, CISO disposition, build approval or activation. No runtime,
+acceptance-test, migration, permission, credential, publication, deployment or
+spending change is included.
 
 ## 1. Decision and baseline
 

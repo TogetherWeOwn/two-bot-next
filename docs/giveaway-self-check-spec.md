@@ -1,9 +1,11 @@
 # Giveaways: private self-only requirements snapshot
 
-Status: **proposed, design only**. Written 2026-10-25; review by 2026-10-31.
-No runtime, command registration, sensitive read, schema or activation changes.
-Merge publishes a proposal, not permission to build. This file is the single
-repository contract; intent review binds its exact commit and SHA-256.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-25. No runtime, command registration, sensitive read, schema or
+activation changes. Merge publishes a proposal, not permission to build. This
+file is the single repository contract; intent review binds its exact commit and
+SHA-256.
 
 ## 1. Decision and demand uncertainty
 

@@ -1,10 +1,12 @@
 # Dashboard scheduled-post parity contract
 
-Status: **Proposed; design only**, 2026-10-26. Review target: 2026-11-02.
-No browser code, endpoint, migration, grant, build card, deployment or activation.
-This is the repository source for the proposal and its offline document checks.
-Inventory baseline: `cdf33be676858f72f5874c000cd0e63efda6a02a`.
-Source-shipped below means present at that commit, **not verified deployed**.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: written 2026-10-26. No browser code, endpoint, migration, grant, build
+card, deployment or activation. This is the repository source for the proposal
+and its offline document checks. Inventory baseline:
+`cdf33be676858f72f5874c000cd0e63efda6a02a`. Source-shipped below means present
+at that commit, **not verified deployed**.
 
 ## Decision and alternatives
 

@@ -1,10 +1,11 @@
 # Member sanction self-view with redacted attribution
 
-Status: **proposed; design only**. Written 2026-10-26; review by **2026-11-02**.
-No command, store seam, migration, Discord read, audit write, deployment or
-activation is added. This file is the authoritative editable repository spec;
-decision records bind its exact commit and SHA-256. Merge is not acceptance,
-host alignment, build approval or activation.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. No command, store seam, migration, Discord read, audit write,
+deployment or activation is added. This file is the authoritative editable
+repository spec; decision records bind its exact commit and SHA-256. Merge is
+not acceptance, host alignment, build approval or activation.
 
 ## 1. Decision and alternatives
 

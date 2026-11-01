@@ -1,8 +1,10 @@
 # Private ticket subjects and channel-name boundaries
 
-Status: **proposed; design only**. Written 2026-10-25; review by **2026-11-01**.
-No runtime, migration, command, channel mutation, permission, production action
-or activation is added. This file is the authoritative editable repository spec;
+Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit then, or
+earlier if a host names a need and an M2 slot opens. Bundle with [ticket
+priority](ticket-priority-spec.md). Original proposal: written 2026-10-25. No
+runtime, migration, command, channel mutation, permission, production action or
+activation is added. This file is the authoritative editable repository spec;
 the issue document records its exact commit/hash and review disposition.
 
 ## Decision and evidence

@@ -1,11 +1,13 @@
 # Dashboard ticket configuration contract
 
-Status: **proposed; design only**. Written 2026-10-25; intent review by
-2026-10-31. This proposal adds no runtime, page, migration, permission, live write
-or activation. Publication is not implementation or production approval.
-This file is the single repository source, including the manifest and fixture
-oracle. It extends neither the voice/moderation pages nor the separate
-[onboarding/self-role proposal](dashboard-onboarding-self-roles-spec.md).
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: written 2026-10-25. This proposal adds no runtime, page, migration,
+permission, live write or activation. Publication is not implementation or
+production approval. This file is the single repository source, including the
+manifest and fixture oracle. It extends neither the voice/moderation pages nor
+the separate [onboarding/self-role
+proposal](dashboard-onboarding-self-roles-spec.md).
 
 ## Decision
 

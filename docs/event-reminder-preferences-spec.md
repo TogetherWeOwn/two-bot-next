@@ -1,11 +1,13 @@
 # Existing event reminders: no-new-preference baseline
 
-Status: **revised proposal, design only**. Revised 2026-10-24; review by
-**2026-10-31**. Recommendation: stop the new reminder-preference proposal and
-retain the existing reminder behavior. No runtime, schema, command, endpoint,
-permission, configuration or retention-policy change. Merge records this analysis,
-not design acceptance, host alignment, activation or proof of production behavior.
-This file is the sole editable spec; disposition records bind its commit and SHA-256.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: revised
+2026-10-24. Recommendation: stop the new reminder-preference proposal and retain
+the existing reminder behavior. No runtime, schema, command, endpoint,
+permission, configuration or retention-policy change. Merge records this
+analysis, not design acceptance, host alignment, activation or proof of
+production behavior. This file is the sole editable spec; disposition records
+bind its commit and SHA-256.
 
 ## 1. Decision and evidence
 

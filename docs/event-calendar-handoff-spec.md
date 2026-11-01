@@ -1,10 +1,12 @@
 # Events: one private add-to-calendar handoff
 
-Status: **proposed, design only**. Written 2026-10-24; review by 2026-10-31.
-No commands, components, attachments, storage, migrations, endpoints,
-permissions, sends or runtime tests are added, and no export is created.
-Merge publishes a proposal, not permission to implement or activate it. This file
-is the single repository contract; review requests bind its commit and SHA-256.
+Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit with the
+events-and-RSVP theme; no build until then. Original proposal: written
+2026-10-24. No commands, components, attachments, storage, migrations,
+endpoints, permissions, sends or runtime tests are added, and no export is
+created. Merge publishes a proposal, not permission to implement or activate it.
+This file is the single repository contract; review requests bind its commit and
+SHA-256.
 
 ## 1. Decision and evidence
 

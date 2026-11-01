@@ -1,9 +1,15 @@
 # Dashboard event and RSVP configuration contract
 
-Status: **Proposed; design only**, 2026-10-26. Intent review target: 2026-11-02.
-Source inventory: `cdf33be676858f72f5874c000cd0e63efda6a02a`. No page, API,
-runtime/store change, migration, credential, activation or live write is added.
-Merging this document is not approval to build or deploy its proposed contracts.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Revisit
+together with the 2026-12 RSVP-policy review. Since this decision,
+registration cutoff and withdrawal are not separate designs; both are detailed
+records under [RSVP capacity](rsvp-capacity-spec.md), the single RSVP-policy
+spec. Original proposal: written
+2026-10-26. Source inventory: `cdf33be676858f72f5874c000cd0e63efda6a02a`. No
+page, API, runtime/store change, migration, credential, activation or live write
+is added. Merging this document is not approval to build or deploy its proposed
+contracts.
 
 ## Decision and no-build alternative
 

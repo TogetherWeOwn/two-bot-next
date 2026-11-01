@@ -1,9 +1,11 @@
 # Staff-set ticket priority labels with honest queue ordering
 
-Status: **proposed; design only**. Written 2026-10-26; review by **2026-11-02**.
-No runtime, migration, command, queue, message, permission, production action
-or activation is added. This file is the authoritative editable repository spec;
-the issue document records its exact commit/hash and review disposition.
+Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit then, or
+earlier if a host names a need and an M2 slot opens. First pick (B0) for the
+free M2 slot. Original proposal: written 2026-10-26. No runtime, migration,
+command, queue, message, permission, production action or activation is added.
+This file is the authoritative editable repository spec; the issue document
+records its exact commit/hash and review disposition.
 
 ## Decision and evidence
 
