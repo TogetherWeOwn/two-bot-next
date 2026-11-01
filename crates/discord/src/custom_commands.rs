@@ -884,10 +884,11 @@ impl CustomCommandRuntime {
             saved.name
         );
         if self.publish_locked().await.is_err() {
+            // The clone is committed and a durable pending marker is saved.
+            // Report the saved-but-not-yet-synchronized state with the same
+            // automatic-recovery suffix as every other management mutation.
             tracing::error!("custom-command clone committed but registry publication failed");
-            return Ok(format!(
-                "{reply} The command picker is not synchronized. Ask a bot administrator to resynchronize the registry; do not clone again."
-            ));
+            return Ok(format!("{reply} {PENDING_RESYNC_SUFFIX}"));
         }
         Ok(reply)
     }
