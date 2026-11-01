@@ -143,6 +143,7 @@ pub enum HandlerId {
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
+    LockdownPreview,
     TempbanList,
     ModerationRecent,
 }
@@ -284,6 +285,7 @@ pub enum RouterRefusal {
     ModerationPermission(ModerationAction),
     PurgePreviewPermission,
     ChannelInspectPermission,
+    LockdownPreviewPermission,
     TempbanListPermission,
     ModerationRecentPermission,
 }
@@ -303,6 +305,7 @@ impl RouterRefusal {
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::LockdownPreviewPermission => "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ModerationRecentPermission => "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
@@ -414,6 +417,7 @@ impl InteractionRouter {
             }
             register(HandlerId::PurgePreview);
             register(HandlerId::ChannelInspect);
+            register(HandlerId::LockdownPreview);
             register(HandlerId::ModerationRecent);
         }
         if gates.automations {
@@ -594,6 +598,12 @@ impl InteractionRouter {
             "channel-inspect" => Some((
                 HandlerId::ChannelInspect,
                 RouterRefusal::ChannelInspectPermission,
+            )),
+            // Dark until the publication slice: routed and adjudicated like
+            // the other channel reads, but with no published definition.
+            "lockdown-preview" => Some((
+                HandlerId::LockdownPreview,
+                RouterRefusal::LockdownPreviewPermission,
             )),
             "moderation-recent" => Some((
                 HandlerId::ModerationRecent,
@@ -1036,6 +1046,7 @@ mod tests {
             ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
             ("purge-preview", HandlerId::PurgePreview),
             ("channel-inspect", HandlerId::ChannelInspect),
+            ("lockdown-preview", HandlerId::LockdownPreview),
             ("moderation-recent", HandlerId::ModerationRecent),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
@@ -1246,6 +1257,8 @@ mod tests {
              "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
             ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
              "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
+            ("lockdown-preview", 16, HandlerId::LockdownPreview, RouterRefusal::LockdownPreviewPermission,
+             "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it."),
             ("moderation-recent", 1_099_511_627_776, HandlerId::ModerationRecent, RouterRefusal::ModerationRecentPermission,
              "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it."),
         ] {
