@@ -203,6 +203,7 @@ python3 scripts/test-docker-deps.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 python3 scripts/check_soak_checklist.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v
 python3 tests/voice_templates/validate.py
 python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 ```
