@@ -207,6 +207,13 @@ def _rust_stages(text):
         if _HEREDOC.search(instruction):
             raise _refuse("heredoc instruction content is not covered by this guard")
         keyword = instruction.split(None, 1)
+        # Docker joins continued lines without a separator, so `FR\` + `OM`
+        # is a real FROM even though the joined keyword here reads `FR OM`.
+        if continued and "".join(instruction.split()).upper().startswith("FROM"):
+            raise _refuse(
+                "unsupported Docker FROM continuation; keep each FROM on one "
+                "physical line (escape= and multi-row images are not supported)"
+            )
         if not keyword or keyword[0].upper() != "FROM":
             if malformed:
                 raise _refuse("line continuation runs past the end of the file")
@@ -757,8 +764,12 @@ class ToolchainParityTests(unittest.TestCase):
 
     def test_split_from_keyword_is_explicitly_refused(self):
         first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
-        source = first + "FROM" + chr(92) + "\n rust:1.99-trixie AS extra\n"
-        self.assert_docker_contract(source, ("unsupported", "FROM continuation"))
+        for split in ("FROM" + chr(92) + "\n ", "FR" + chr(92) + "\nOM ",
+                      "F" + chr(92) + "\n# comment\nROM ", "fro" + chr(92) + "\nm "):
+            for reference in ("1.99-trixie", f"1.98-trixie@sha256:{PINNED_DIGEST}"):
+                with self.subTest(split=split, reference=reference):
+                    source = first + split + f"rust:{reference} AS extra\n"
+                    self.assert_docker_contract(source, ("unsupported", "FROM continuation"))
 
     def test_canonical_rust_image_prefixes_pass_and_still_check_later_stages(self):
         first = PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST)
