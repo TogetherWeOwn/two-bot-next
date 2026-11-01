@@ -68,6 +68,20 @@ class LocalTestDbParity(unittest.TestCase):
                 with self.subTest(step=step.get("name")):
                     self.assertIn(run, mirrored)
 
+    def test_steps_run_under_the_jobs_default_shell(self):
+        # A step with no `shell:` runs as `bash -e {0}` on GitHub.
+        for step in self.job["steps"]:
+            if re.search(r"(^| )cargo (test|run) ", words(step.get("run", ""))):
+                with self.subTest(step=step.get("name")):
+                    self.assertNotIn("shell", step)
+        self.assertEqual(self.harness.SHELL, ("bash", "-e", "-c"))
+
+    def test_failed_cargo_fails_the_property_budget_step(self):
+        command = dict((name, command) for name, _, command in self.harness.STEPS)["property budget"]
+        stubbed = "cargo() { return 101; }\n" + command
+        result = subprocess.run([*self.harness.SHELL, stubbed], capture_output=True)
+        self.assertEqual(result.returncode, 101)
+
     def test_bootstrap_databases_match_prepare_step(self):
         prepare = next(step["run"] for step in self.job["steps"]
                        if step.get("id") == "prepare_test_databases")

@@ -105,6 +105,9 @@ STEPS = (
     ("docs", {}, "cargo test --workspace --doc --features two-bot-core/db --locked"),
     ("metrics RSS", {}, "cargo run -p two-bot-core --example metrics_rss --locked"),
 )
+# rust-tests steps set no `shell:`, so GitHub runs them as `bash -e {0}`; a
+# failing command inside a multi-line step (property budget) must fail it here too.
+SHELL = ("bash", "-e", "-c")
 RESULT = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored")
 
 
@@ -246,7 +249,7 @@ def run_step(env, command):
     merged = dict(RUNNER_ENV, **JOB_ENV, **env)
     flags = [arg for key, value in merged.items() for arg in ("-e", f"{key}={value}")]
     process = subprocess.Popen(
-        ["docker", "exec", "-u", user, "-w", str(ROOT), *flags, RUNNER, "bash", "-c", command],
+        ["docker", "exec", "-u", user, "-w", str(ROOT), *flags, RUNNER, *SHELL, command],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     totals = [0, 0, 0]
     for line in process.stdout:
