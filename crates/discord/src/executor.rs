@@ -36,7 +36,9 @@
 //!   ping `@everyone`), via client-level
 //!   `default_allowed_mentions(AllowedMentions { parse: vec![], .. })`.
 
+mod lockdown_preview_reads;
 mod tickets;
+pub use lockdown_preview_reads::PreviewChannel;
 pub use tickets::{ChannelPresence, TicketChannelRequest, TicketMessage};
 
 use crate::ratelimit_guard::{process_guard, GuardError, RateLimitGuard};
