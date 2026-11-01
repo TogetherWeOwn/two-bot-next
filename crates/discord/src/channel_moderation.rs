@@ -233,8 +233,10 @@ impl ChannelModerationRuntime {
                 .map(|user| user.id.get())
                 .unwrap_or_default();
             let components = vec![Component::ActionRow(ActionRow {
+                id: None,
                 components: vec![
                     Component::Button(Button {
+                        id: None,
                         custom_id: Some(confirm_custom_id(actor, &digest32)),
                         disabled: false,
                         emoji: None,
@@ -244,6 +246,7 @@ impl ChannelModerationRuntime {
                         sku_id: None,
                     }),
                     Component::Button(Button {
+                        id: None,
                         custom_id: Some(cancel_custom_id(actor, &digest32)),
                         disabled: false,
                         emoji: None,
@@ -695,23 +698,24 @@ impl ChannelModerationRuntime {
         // re-insert above, so its Confirm collapses to PREVIEW_EXPIRED
         // (fail closed, re-preview recovers) instead of running on a
         // mismatched audit row.
-        let unwind_own_entry = |store: &Mutex<PendingStore>| {
-            store
-                .lock()
-                .map(|mut pending| pending.cancel_owned(pending_key, &interaction_id, now))
-        };
         let recorded = match self.store.try_record_audit(&row).await {
             Ok(recorded) => recorded,
             Err(error) => {
                 if plan.armed {
-                    let _removed = unwind_own_entry(&self.preview_pending);
+                    let _removed = self
+                        .preview_pending
+                        .lock()
+                        .map(|mut pending| pending.cancel_owned(pending_key, &interaction_id, now));
                 }
                 return Err(error.into());
             }
         };
         if !recorded {
             if plan.armed {
-                let _removed = unwind_own_entry(&self.preview_pending);
+                let _removed = self
+                    .preview_pending
+                    .lock()
+                    .map(|mut pending| pending.cancel_owned(pending_key, &interaction_id, now));
             }
             return Ok(ChannelReply::refused(
                 "Could not record the preview audit row; try again. Nothing was rendered and nothing was changed.",
