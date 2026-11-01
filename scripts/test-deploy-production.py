@@ -721,7 +721,8 @@ class StaticGuardTests(unittest.TestCase):
         staging = inline_script("Read the candidate's staging journeys and soak REST counters")
         for needle in ("set -euo pipefail", '--expected-sha "$SHA"', 'if [ "$probe" -gt 1 ]',
                        "wrangler/scripts/rest-5xx-counters.mjs",
-                       "deploy-staging.yml/runs", "-f branch=main",
+                       "deploy-staging.yml/runs", "--method GET", "-f branch=main",
+                       "-q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]'",
                        'promotion_regression_gate.py staging', '--auto "$AUTO"',
                        '--run-id "$RUN_ID"', '--attempt "$RUN_ATTEMPT"',
                        '--staging-runs "$RUNNER_TEMP/staging-runs.json"',

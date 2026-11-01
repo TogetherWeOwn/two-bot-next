@@ -211,9 +211,9 @@ class SoakCoverageTests(unittest.TestCase):
         self.assertEqual(evidence["rest_5xx"]["coverage"], "bookended")
 
     def test_a_restart_between_baseline_and_sample_is_insufficient_never_a_pass(self):
-        # 50 post-restart 5xx of 100 would refuse on a bookended window; the
-        # restart means the soak's own errors may have vanished with it.
-        staging = bookended(counters=(50, 100))
+        # A clean post-restart window cannot vouch for the soak: the
+        # restart may have hidden its errors.
+        staging = bookended(counters=(1, 200))
         staging["baseline"] = {"rest5xx": 20, "restTotal": 1000, "incarnation": NEW_INC}
         staging["rest"]["incarnation"] = OLD_INC
         evidence = gate.compare(staging, probe(), rest(0, 1000))
@@ -221,11 +221,21 @@ class SoakCoverageTests(unittest.TestCase):
         self.assertEqual(evidence["rest_5xx"]["verdict"], "insufficient_data")
         self.assertEqual(evidence["verdict"], "pass")
         # Journeys still judge: a restart hides counters, not a broken build.
-        staging = bookended({"health": "fail"}, counters=(50, 100))
+        staging = bookended({"health": "fail"}, counters=(1, 200))
         staging["baseline"] = {"rest5xx": 20, "restTotal": 1000, "incarnation": NEW_INC}
         staging["rest"]["incarnation"] = OLD_INC
         evidence = gate.compare(staging, probe(), rest(0, 1000))
         self.assertEqual((evidence["verdict"], evidence["code"]), ("fail", "journey_regression"))
+
+    def test_a_measured_regression_refuses_even_across_a_restart(self):
+        # 50 post-restart 5xx of 100 refuses: the post-restart counters are
+        # themselves a valid window, and the restart must not launder them.
+        staging = bookended(counters=(50, 100))
+        staging["baseline"] = {"rest5xx": 20, "restTotal": 1000, "incarnation": NEW_INC}
+        staging["rest"]["incarnation"] = OLD_INC
+        evidence = gate.compare(staging, probe(), rest(0, 1000))
+        self.assertEqual(evidence["rest_5xx"]["coverage"], "incarnation_changed")
+        self.assertEqual((evidence["verdict"], evidence["code"]), ("fail", "rest_5xx_regression"))
 
     def test_a_missing_baseline_or_identity_names_its_coverage(self):
         evidence = gate.compare(staged(counters=(6, 100)), probe(), rest(0, 1000))

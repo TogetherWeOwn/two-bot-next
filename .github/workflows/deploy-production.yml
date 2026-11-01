@@ -1168,9 +1168,12 @@ jobs:
           # stalled, which refuses instead of skipping. A failed listing
           # fails closed here. The soak was already over before this run
           # started when the soak skipped, so no baseline is expected then.
-          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs" \
+          # gh api switches to POST when -f fields are passed, but the
+          # runs listing is a GET endpoint: request GET explicitly. The jq
+          # filter wraps the rows in one JSON array, which read_runs needs.
+          gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs" \
             -f branch=main -f per_page=100 \
-            -q '.workflow_runs[] | {head_sha, head_branch, status, conclusion}' \
+            -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' \
             > "$RUNNER_TEMP/staging-runs.json"
           baseline_args=()
           if [ -n "$BASELINE" ]; then

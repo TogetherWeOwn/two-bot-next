@@ -27,8 +27,10 @@ Two steps in deploy-production, both before any production mutation:
             requests (or without a bearer) falls back to the floor alone.
             A process restart between the baseline and the post-soak sample
             (different `two_bot_process_incarnation`) breaks the cumulative
-            window, so the ratio records `insufficient_data` too: the
-            restart may have hidden the soak's errors.
+            window: a measured regression in the post-restart counters still
+            refuses, while a clean or thin post-restart window records
+            `insufficient_data` instead of a pass, since the restart may
+            have hidden the soak's errors.
 
 Receipts carry check names, verdicts, integers, ratios, build/run
 identities and fixed codes only: never probe bodies, URLs or credentials.
@@ -257,14 +259,18 @@ def compare(staging, prod_probe, prod_rest):
     coverage = soak_coverage(rest, base)
     prod_ratio = ratio(prod_pair) if prod_pair and prod_pair[1] >= MIN_REQUESTS else None
     threshold = max(RATIO_MARGIN * prod_ratio, FLOOR_RATIO) if prod_ratio is not None else FLOOR_RATIO
-    if coverage == "incarnation_changed":
-        # The process restarted mid-soak: the cumulative counts after the
-        # restart no longer cover the soak, so the ratio cannot be judged.
-        rate_verdict = "insufficient_data"
-    elif staging_pair is None or staging_pair[1] < MIN_REQUESTS:
+    if staging_pair is None or staging_pair[1] < MIN_REQUESTS:
         rate_verdict = "insufficient_data"
     elif staging_pair[0] >= MIN_5XX and ratio(staging_pair) > threshold:
+        # A measured regression refuses even across a restart: the
+        # post-restart counters are themselves a valid window, and the
+        # restart must not launder them.
         rate_verdict = "fail"
+    elif coverage == "incarnation_changed":
+        # The process restarted mid-soak and the post-restart window is
+        # clean or thin: the cumulative counts after the restart no longer
+        # cover the soak, so the ratio cannot be judged.
+        rate_verdict = "insufficient_data"
     else:
         rate_verdict = "pass"
     failed = bool(regressions) or rate_verdict == "fail"
