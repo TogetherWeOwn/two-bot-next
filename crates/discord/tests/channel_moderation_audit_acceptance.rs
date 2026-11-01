@@ -25,12 +25,12 @@ extern crate self as two_bot_core;
 extern crate two_bot_core as real_core;
 
 pub use real_core::{
-    channel_moderation, metrics, ChannelAuditRow, HandlerId, InteractionHandler, InteractionRouter,
-    LockdownRecord, ModerationAction, RouterGates, SlashOutcome,
+    channel_moderation, lockdown_preview, metrics, ChannelAuditRow, HandlerId, InteractionHandler,
+    InteractionRouter, LockdownRecord, ModerationAction, RouterGates, SlashOutcome,
 };
 pub use two_bot_discord::{
-    route_interaction, ChannelCall, ChannelCallOutcome, DiscordError, EveryoneOverwrite,
-    RoutedInteraction,
+    lockdown_preview, route_interaction, ChannelCall, ChannelCallOutcome, DiscordError,
+    EveryoneOverwrite, RoutedInteraction,
 };
 
 // --- offline sqlx boundary -------------------------------------------------
@@ -294,6 +294,21 @@ impl ChannelModerationStore {
         Ok(())
     }
 
+    /// Insert-or-nothing mirror of the production `try_record_audit`
+    /// (`ON CONFLICT (request_id) DO NOTHING`): the preview arms only when
+    /// exactly one row is created, so a redelivered retry reports `false`.
+    pub async fn try_record_audit(&self, row: &ChannelAuditRow) -> Result<bool, Error> {
+        let mut state = self.state.lock().expect("offline store");
+        if state.closed {
+            return Err(Error::closed());
+        }
+        if state.audits.iter().any(|r| r.request_id == row.request_id) {
+            return Ok(false);
+        }
+        state.audits.push(row.clone());
+        Ok(true)
+    }
+
     pub async fn finish(
         &self,
         ticket: &ChannelClaimTicket,
@@ -477,6 +492,31 @@ impl ActionExecutor {
         _content: &str,
     ) -> Result<(), DiscordError> {
         panic!("read-command replies are outside this offline acceptance slice")
+    }
+
+    pub async fn edit_interaction_response_with_components(
+        &self,
+        _application_id: u64,
+        _interaction_token: &str,
+        _content: &str,
+        _components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        panic!("preview renders are outside this offline acceptance slice")
+    }
+
+    pub async fn read_preview_channel(
+        &self,
+        _channel_id: &str,
+        _guild_id: &str,
+    ) -> Result<two_bot_discord::executor::PreviewChannel, DiscordError> {
+        panic!("lockdown preview reads are outside this offline acceptance slice")
+    }
+
+    pub async fn read_preview_roles(
+        &self,
+        _guild_id: &str,
+    ) -> Result<Vec<real_core::lockdown_preview::RoleSnapshot>, DiscordError> {
+        panic!("lockdown preview reads are outside this offline acceptance slice")
     }
 
     pub async fn fetch_channel_document(
