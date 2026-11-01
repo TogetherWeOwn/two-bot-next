@@ -22,6 +22,9 @@ use two_bot_core::backup::dump_file::{
     DumpTableInfo, SequenceMark, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION,
     EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES,
 };
+use two_bot_core::voice_access::{
+    may_use_command, AccessControls, AccessDecision, AccessDenyReason, AccessMember,
+};
 use two_bot_testsupport::TestDatabase;
 
 // Frozen released v13: the voice pair and token registry, before starboard.
@@ -1045,7 +1048,134 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         report.quarantined_unbans, 0,
         "terminal expiries stay terminal"
     );
-    assert_eq!(snapshot(pool, &tables).await, before);
+    // The seed's legacy voice_command_roles rows are the pre-0469 shape:
+    // restore replays the 0469 translation instead of round-tripping them
+    // into tables nothing reads. Every other table matches the archive
+    // exactly; the three voice tables get the translated state asserted
+    // below, and that state is the baseline for the restores that follow.
+    assert_eq!(report.translated_voice_command_roles, 4);
+    assert_eq!(report.translated_voice_command_role_members, 3);
+    assert_eq!(report.voice_access_controls_added, 1);
+    let command_roles: Vec<(String, String)> = sqlx::query_as(
+        "SELECT guild_id, command_roles::text FROM voice_access_controls \
+         ORDER BY guild_id COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let command_roles: Vec<(String, Value)> = command_roles
+        .into_iter()
+        .map(|(guild, roles)| (guild, serde_json::from_str(&roles).unwrap()))
+        .collect();
+    assert_eq!(
+        command_roles,
+        vec![
+            (
+                "100000000000000001".to_owned(),
+                // 'kick' keeps the enforced list over the legacy one,
+                // 'limit' moves across empty, 'notavoicecommand' is dropped,
+                // 'template' was only ever in the enforced store.
+                json!({"kick": ["100000000000000041", "100000000000000042"],
+                       "limit": [], "template": []}),
+            ),
+            ("100000000000000002".to_owned(), json!({})),
+            (
+                "100000000000000003".to_owned(),
+                json!({"private": ["100000000000000044"]}),
+            ),
+        ],
+        "0469 replay merges legacy restrictions into the enforced store"
+    );
+    let inserted_defaults: (bool, Option<String>) = sqlx::query_as(
+        "SELECT room_creation_enabled, required_role_id FROM voice_access_controls \
+         WHERE guild_id = '100000000000000003'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        inserted_defaults,
+        (true, None),
+        "a guild inserted by the translation takes the column defaults"
+    );
+    // The translated restrictions are what the command gate enforces: decode
+    // the restored rows into gate controls and evaluate a non-admin member.
+    let gate_controls = |guild: &str| AccessControls {
+        room_creation_enabled: true,
+        required_role: None,
+        command_roles: command_roles
+            .iter()
+            .find(|(g, _)| g == guild)
+            .unwrap()
+            .1
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(command, ids)| {
+                (
+                    command.clone(),
+                    ids.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_str().unwrap().parse::<u64>().unwrap())
+                        .collect(),
+                )
+            })
+            .collect(),
+    };
+    let roleless = AccessMember {
+        is_admin: false,
+        roles: Vec::new(),
+    };
+    assert_eq!(
+        may_use_command(&gate_controls("100000000000000003"), &roleless, "private"),
+        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
+        "the legacy-only restriction is enforced after restore"
+    );
+    assert_eq!(
+        may_use_command(
+            &gate_controls("100000000000000003"),
+            &AccessMember {
+                is_admin: false,
+                roles: vec![100_000_000_000_000_044],
+            },
+            "private",
+        ),
+        AccessDecision::Allow,
+        "the translated member role still admits its holders"
+    );
+    assert_eq!(
+        may_use_command(&gate_controls("100000000000000001"), &roleless, "limit"),
+        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
+        "a legacy restriction with no member roles denies every non-admin"
+    );
+    for legacy in ["voice_command_roles", "voice_command_role_members"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(legacy)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "the replay empties legacy {legacy}");
+    }
+    let restored_snapshot = snapshot(pool, &tables).await;
+    for (table, expected) in &before {
+        if [
+            "voice_access_controls",
+            "voice_command_roles",
+            "voice_command_role_members",
+        ]
+        .contains(&table.as_str())
+        {
+            continue;
+        }
+        assert_eq!(
+            &restored_snapshot[table], expected,
+            "{table} round-trips exactly"
+        );
+    }
+    let before = restored_snapshot;
     assert_fresh_cas_tokens(pool, cas_before).await;
     assert_eq!(triggers(pool).await, guard_before);
     assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
@@ -1087,6 +1217,9 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             .await
             .expect("restore must ignore manifest and row block order");
         assert!(report.ok);
+        assert_eq!(report.translated_voice_command_roles, 4);
+        assert_eq!(report.translated_voice_command_role_members, 3);
+        assert_eq!(report.voice_access_controls_added, 1);
         assert!(report.dropped_columns.is_empty());
         assert!(report.initialized_tables.is_empty());
         assert_eq!(
