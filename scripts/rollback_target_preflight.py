@@ -80,6 +80,13 @@ INCOMPATIBLE = (
 # A top-level DROP is safe only for an index; anything else (table, type,
 # view, function, trigger, policy, ...) refuses conservatively.
 TOP_LEVEL_DROP = re.compile(r"(?:^|\b(?:BEGIN|THEN|ELSE|LOOP|DO)\s+)DROP\s+(?!INDEX\b)", re.I)
+# CREATE TRIGGER ... BEFORE|AFTER|INSTEAD OF <events> ON: TRUNCATE here names
+# a trigger event, not an executed truncate, so incompatible_code blanks it
+# before judging (a WHEN clause or EXECUTE FUNCTION target cannot truncate).
+TRIGGER_HEAD = re.compile(
+    r"(^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP\s+|TEMPORARY\s+)?TRIGGER\s+\S+\s+"
+    r"(?:BEFORE|AFTER|INSTEAD\s+OF)\s+)(.*?)(\s+ON\b)", re.I | re.S)
+TRIGGER_EVENT_TRUNCATE = re.compile(r"\bTRUNCATE\b", re.I)
 ALTER_TABLE = re.compile(r"\bALTER\s+TABLE\b", re.I)
 # ALTER TABLE actions: DROP [COLUMN] <name> removes a column; dropping a
 # constraint, NOT NULL, identity or expression only loosens the schema.
@@ -91,14 +98,28 @@ DEFAULT = re.compile(r"\bDEFAULT\b", re.I)
 DOLLAR_TAG = re.compile(r"\$[A-Za-z_]*\$")
 
 
+# An unterminated literal, comment or dollar-quoted body blanks the rest:
+# incompatible_code refuses on this sentinel (fail closed), never passing a
+# migration whose text could not be fully judged.
+UNTERMINATED = chr(0)
+
+
+def is_escape_string(sql, i):
+    """Whether the quote at `i` opens a PostgreSQL E'...' escape string."""
+    return (sql[i] == "'" and i > 0 and sql[i - 1] in "Ee"
+            and (i < 2 or (not sql[i - 2].isalnum() and sql[i - 2] != "_")))
+
+
 def lex(sql):
     """SQL with comments removed and literals/quoted identifiers blanked.
 
     One left-to-right pass, so a `--` inside a string never hides the
     statement after it and a `;` inside a literal never splits a statement.
-    Handles '...' (with '' escapes), "...", -- and /* */; $tag$ delimiters
-    are dropped and their bodies lexed like any other SQL.
-    An unterminated literal or comment blanks the rest: never a pass.
+    Handles '...' (with '' escapes), E'...' (with backslash escapes),
+    "...", -- and /* */. A $tag$ body is lexed recursively and spliced
+    back in, so a DO block that runs one still refuses on a DROP inside;
+    an apostrophe that leaves a body (or any literal) unterminated blanks
+    the rest with UNTERMINATED, which refuses fail-closed.
     """
     out, i, n = [], 0, len(sql)
     while i < n:
@@ -109,25 +130,47 @@ def lex(sql):
             out.append(" ")
         elif sql.startswith("/*", i):
             end = sql.find("*/", i + 2)
-            i = n if end < 0 else end + 2
-            out.append(" ")
+            if end < 0:
+                out.append(UNTERMINATED)
+                i = n
+            else:
+                i = end + 2
+                out.append(" ")
         elif char in "'\"":
-            j = i + 1
+            escape = is_escape_string(sql, i)
+            j, closed = i + 1, False
             while j < n:
+                if escape and sql[j] == "\\":
+                    j += 2
+                    continue
                 if sql[j] == char:
                     if j + 1 < n and sql[j + 1] == char:
                         j += 2
                         continue
+                    closed = True
                     break
                 j += 1
-            i = j + 1
-            out.append(" '' " if char == "'" else " q ")
+            if not closed:
+                out.append(UNTERMINATED)
+                i = n
+            else:
+                i = j + 1
+                out.append(" '' " if char == "'" else " q ")
         elif char == "$" and DOLLAR_TAG.match(sql, i):
             # Dollar-quoted bodies stay visible: a DO block runs them, so a
             # DROP inside one must still refuse (a function body that only
             # defines one is a reviewed rollback-compatible exception).
-            i += len(DOLLAR_TAG.match(sql, i).group(0))
-            out.append(" ")
+            # The body is lexed recursively, so an apostrophe that starts a
+            # literal the body never closes refuses instead of swallowing
+            # the statements after the body.
+            tag = DOLLAR_TAG.match(sql, i).group(0)
+            close = sql.find(tag, i + len(tag))
+            if close < 0:
+                out.append(UNTERMINATED)
+                i = n
+            else:
+                out.append(" " + lex(sql[i + len(tag):close]) + " ")
+                i = close + len(tag)
         else:
             out.append(char)
             i += 1
@@ -141,7 +184,11 @@ def statements(sql):
 
 def actions(statement):
     """The comma-separated actions of an ALTER TABLE statement (top level only)."""
-    body = re.sub(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\S+\s*", "", statement, flags=re.I)
+    # The relation name may be schema-qualified (public.t, or "public"."t"
+    # which lexes to q . q): consume the optional qualifier so the first
+    # action is never mistaken for the table name.
+    body = re.sub(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
+                  r"\S+(?:\s*\.\s*\S+)?\s*", "", statement, flags=re.I)
     parts, depth, current = [], 0, []
     for char in body:
         depth += char == "("
@@ -155,9 +202,19 @@ def actions(statement):
     return [part for part in parts if part]
 
 
+def without_trigger_events(statement):
+    """A CREATE TRIGGER statement with TRUNCATE blanked from its event clause."""
+    def blank(match):
+        return match.group(1) + TRIGGER_EVENT_TRUNCATE.sub("EVENT", match.group(2)) + match.group(3)
+    return TRIGGER_HEAD.sub(blank, statement, count=1)
+
+
 def incompatible_code(sql):
     """The first backward-incompatible statement's code, or None."""
+    if UNTERMINATED in lex(sql):
+        return "unparseable_migration"
     for statement in statements(sql):
+        statement = without_trigger_events(statement)
         if TOP_LEVEL_DROP.search(statement):
             return "drop_object"
         for code, pattern in INCOMPATIBLE:

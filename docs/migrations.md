@@ -113,9 +113,14 @@ promotion: `DROP TABLE`/`COLUMN`/`TYPE`/`VIEW`/`SCHEMA`/`FUNCTION`/`SEQUENCE`,
 `COLUMN` may be omitted, as PostgreSQL allows; any top-level `DROP` other than
 `DROP INDEX` refuses; statements inside `DO` and function bodies are checked
 too. Comments and string literals are lexed out first, so a `--` or `;` in a
-literal hides nothing. Dynamic SQL inside an `EXECUTE '...'` string is not
-visible to the scan: keep it out of migrations, or annotate the file. A
-rewritten or deleted migration always refuses.
+literal hides nothing; quoted identifiers (including schema-qualified ones
+like `"public"."members"`) and `E'...'` backslash escapes are handled the
+same way. A literal, comment or dollar-quoted body the lexer cannot close
+refuses as `unparseable_migration`: an unreadable migration never passes.
+`TRUNCATE` in a `CREATE TRIGGER ... BEFORE|AFTER|INSTEAD OF` event clause is
+not an executed truncate and does not refuse. Dynamic SQL inside an
+`EXECUTE '...'` string is not visible to the scan: keep it out of migrations,
+or annotate the file. A rewritten or deleted migration always refuses.
 
 Ship expand first, contract later: the contract migration lands only after
 every build that still reads the old shape has left production. When a

@@ -130,6 +130,19 @@ class IncompatibleCodeTests(unittest.TestCase):
             "DROP POLICY p ON t;": "drop_object",
             # A DO block runs its dollar-quoted body.
             "DO $$ BEGIN ALTER TABLE t DROP COLUMN c; END $$;": "drop_object",
+            "DO $$BEGIN TRUNCATE t; END$$;": "truncate",
+            # Schema-qualified quoted relations still expose their actions.
+            'ALTER TABLE "public"."members" DROP COLUMN legacy_id;': "drop_object",
+            'ALTER TABLE "public"."members" ADD COLUMN c bigint NOT NULL;':
+                "add_not_null_column_without_default",
+            "ALTER TABLE public.members DROP COLUMN legacy_id;": "drop_object",
+            # Backslash escapes in E-strings do not end the literal.
+            "INSERT INTO logs VALUES (E'it\\'s'); DROP TABLE members;": "drop_object",
+            # An unterminated literal, comment or dollar body refuses
+            # fail-closed instead of silently passing the migration.
+            "INSERT INTO t VALUES ('oops); DROP TABLE t;": "unparseable_migration",
+            "SELECT 1 /* DROP TABLE t;": "unparseable_migration",
+            "COMMENT ON TABLE t IS $$it's legacy$$; DROP TABLE t;": "unparseable_migration",
         }
         for sql, code in cases.items():
             with self.subTest(sql=sql):
@@ -151,6 +164,12 @@ class IncompatibleCodeTests(unittest.TestCase):
             "ALTER TABLE t ALTER COLUMN c SET DEFAULT 0, ADD COLUMN d int NOT NULL DEFAULT 1;",
             'CREATE TABLE "drop" (id bigint);',
             "DROP INDEX CONCURRENTLY IF EXISTS t_old;",
+            # A TRUNCATE trigger event truncates nothing: defining the
+            # trigger must not block a promotion.
+            "CREATE TRIGGER watch BEFORE TRUNCATE ON members FOR EACH STATEMENT "
+            "EXECUTE FUNCTION log_change();",
+            "CREATE TRIGGER watch AFTER INSERT OR TRUNCATE ON members FOR EACH ROW "
+            "EXECUTE FUNCTION log_change();",
         ):
             with self.subTest(sql=sql):
                 self.assertIsNone(preflight.incompatible_code(sql))
