@@ -1339,6 +1339,10 @@ async fn myroom_empty_reply_shows_join_guidance_only_when_creation_is_open() {
     // The guild-wide creation switch off hides it even with a lobby wired.
     worker.access.room_creation_enabled = false;
     assert!(!worker.creation_available());
+    // A deleted lobby keeps its configured id but is no longer joinable.
+    worker.access.room_creation_enabled = true;
+    worker.live.remove_channel(CREATOR);
+    assert!(!worker.creation_available());
     assert_eq!(
         myroom_render(&[], true),
         format!(

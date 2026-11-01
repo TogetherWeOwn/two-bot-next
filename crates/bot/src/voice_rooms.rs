@@ -3965,11 +3965,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// Whether joining a creator channel could currently start a room: the
-    /// guild-wide creation switch is on and at least one creator channel is
-    /// live. `/myroom` shows the join guidance only when this is true, so an
-    /// empty reply never points at an unavailable path.
+    /// guild-wide creation switch is on and at least one configured creator
+    /// channel is present in the live snapshot (a deleted lobby keeps its id
+    /// in `creator_channels`). `/myroom` shows the join guidance only when
+    /// this is true, so an empty reply never points at an unavailable path.
     pub fn creation_available(&self) -> bool {
-        may_create_room(&self.access) && !self.live.read_state().creator_channels.is_empty()
+        if !may_create_room(&self.access) {
+            return false;
+        }
+        let live = self.live.read_state();
+        live.creator_channels
+            .iter()
+            .any(|channel| live.channels.contains_key(channel))
     }
 
     /// Replace the caps and cooldown used by the durable create admission
