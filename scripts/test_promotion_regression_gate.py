@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # E402-safe by convention: every scripts/ test adds its own directory first.
-import promotion_regression_gate as gate  # noqa: E402
+import promotion_regression_gate as gate
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 NEWER = "f" * 40
