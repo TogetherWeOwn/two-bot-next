@@ -1743,12 +1743,16 @@ jobs:
           # The takeover steps below pin to the single version serving 100% of
           # traffic. Anything else (split traffic, unreadable status) refuses
           # the takeover rather than handing ownership to an unknown version.
+          # The release notification also needs the published version ID on a
+          # cutover hold (takeover=false still publishes a new Worker), so
+          # export it for every deploy that leaves one version at 100%.
+          if mode == "deploy" and len(after) == 1 and after[0][1] == 100:
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+                  env_file.write(f"NEW_VERSION={after[0][0]}\n")
           if takeover:
               if len(after) != 1 or after[0][1] != 100:
                   print("::error::takeover requested but no single Worker version serves 100% of traffic")
                   sys.exit(1)
-              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-                  env_file.write(f"NEW_VERSION={after[0][0]}\n")
       # P2/P3 (docs/cutover-production-takeover-design.md): read control state
       # without starting, then take over at exactly the read epoch. Both run
       # only when the dispatch requested the takeover; a routine deploy leaves
@@ -2118,3 +2122,31 @@ jobs:
           path: ${{ runner.temp }}/post-deploy-watch
           if-no-files-found: ignore
           retention-days: 14
+      # Deploy-notify (docs/production-deploy.md, "Deploy notifications"): the
+      # final step reports every production change (a deploy, its automatic
+      # rollback, or an operator rollback) to the release-verification
+      # webhook as one HMAC-signed record: SHA, Worker version, image digest,
+      # outcome, reason and run URL. Never a gate: continue-on-error, a short
+      # timeout, and a notice when the bindings are unset. The daily release
+      # audit cross-checks GitHub runs, so a missed delivery is still caught.
+      - name: Notify the release log of this production change
+        if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success' || steps.rollback.outcome == 'failure')
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAPERCLIP_DEPLOY_WEBHOOK_URL: ${{ vars.PAPERCLIP_DEPLOY_WEBHOOK_URL }}
+          PAPERCLIP_DEPLOY_WEBHOOK_SECRET: ${{ secrets.PAPERCLIP_DEPLOY_WEBHOOK_SECRET }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+          ALLOW_UNSTAGED: ${{ env.ALLOW_UNSTAGED }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          PROMOTION_OUTCOME: ${{ steps.promotion_recheck.outcome }}
+          ERROR_GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
+          AUTO_ROLLBACK_OUTCOME: ${{ steps.auto_rollback.outcome }}
+          WATCH_ROLLBACK_OUTCOME: ${{ steps.watch_rollback.outcome }}
+          WATCH_REASON: ${{ steps.watch.outputs.reason }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/deploy_notify.py --from-workflow --sha "$SHA" --run-url "$RUN_URL"
