@@ -562,10 +562,20 @@ INSERT INTO voice_guild_settings (guild_id, creation_enabled, unique_names, no_g
   text_viewer_role_id, command_role_id)
 VALUES ('100000000000000001', TRUE, TRUE, 'General', FALSE, TRUE, 'Europe/London',
         'voice-chat', NULL, '100000000000000043');
+-- Legacy per-command restrictions (0229), pre-0469 shape: restore replays
+-- the 0469 translation over these rows, so they exercise every merge case
+-- against the voice_access_controls rows above. Guild ...001: 'kick' is
+-- restricted in both stores (the enforced list wins), 'limit' only here
+-- (added, empty member list), 'notavoicecommand' is not a voice command
+-- (dropped). Guild ...003 has no voice_access_controls row at all, so the
+-- translation inserts one. After restore both legacy tables are empty.
 INSERT INTO voice_command_roles (guild_id, command)
-VALUES ('100000000000000001', 'kick'), ('100000000000000001', 'limit');
+VALUES ('100000000000000001', 'kick'), ('100000000000000001', 'limit'),
+       ('100000000000000001', 'notavoicecommand'), ('100000000000000003', 'private');
 INSERT INTO voice_command_role_members (guild_id, command, role_id)
-VALUES ('100000000000000001', 'kick', '100000000000000043');
+VALUES ('100000000000000001', 'kick', '100000000000000043'),
+       ('100000000000000001', 'notavoicecommand', '100000000000000043'),
+       ('100000000000000003', 'private', '100000000000000044');
 -- Vote-kick audit trail (0417): a started and a finished vote with progress,
 -- plus a refusal and an enforcement row that carry none.
 INSERT INTO voice_vote_kick_audit (guild_id, vote_id, event, room_id, initiator_id,

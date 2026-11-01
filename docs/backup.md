@@ -354,6 +354,20 @@ outcomes/order, and records expiry dispositions before any activation. Consumer
 shutdown alone is not remote reconciliation. No automatic release or
 destructive in-place override is provided by this slice.
 
+### Pre-0469 voice command restrictions
+
+Backups taken before migration 0469 can hold per-command voice restrictions
+only in the legacy `voice_command_roles` / `voice_command_role_members`
+tables. The command gate reads only `voice_access_controls.command_roles`,
+so after loading the rows restore replays the 0469 translation over them —
+same recognised-command filter (unknown legacy command names are dropped)
+and same merge rule (a command already restricted in
+`voice_access_controls` keeps its enforced role list) — then empties the
+legacy tables so the move happens once. The row-count check expects the
+legacy tables empty and any inserted `voice_access_controls` guild rows on
+top of the manifest count; the CLI names the translation in both dry-run
+and apply output.
+
 ### Migration-backed regression suite
 
 `crates/core/tests/backup_schema_roundtrip.rs` creates uniquely named isolated

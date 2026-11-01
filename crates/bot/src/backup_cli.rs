@@ -637,7 +637,11 @@ async fn cmd_restore(args: &[String]) -> i32 {
                     table.name,
                     table.count,
                     got,
-                    if got == table.count { "ok" } else { "MISMATCH" }
+                    if got == report.expected_count(&table.name) {
+                        "ok"
+                    } else {
+                        "MISMATCH"
+                    }
                 );
             }
             for (table, count) in &report.initialized_tables {
@@ -652,6 +656,14 @@ async fn cmd_restore(args: &[String]) -> i32 {
                 eprintln!(
                     "restore: {} imported expiries quarantined (including accepted snapshots); moderation must remain off until authoritative reconciliation",
                     report.quarantined_unbans
+                );
+            }
+            if report.translated_voice_command_roles > 0
+                || report.translated_voice_command_role_members > 0
+            {
+                eprintln!(
+                    "restore: replayed the 0469 translation for {} legacy voice command restriction(s) into voice_access_controls.command_roles ({} guild row(s) added; unknown command names dropped); legacy voice_command_roles tables emptied",
+                    report.translated_voice_command_roles, report.voice_access_controls_added
                 );
             }
             for (table, cols) in &report.dropped_columns {
@@ -711,6 +723,12 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
         .any(|table| table.name == "moderation_member_bans")
     {
         eprintln!("restore: old v3 has no member-ban ownership; apply does not infer acceptance; keep moderation off pending reconciliation");
+    }
+    if contents.manifest.tables.iter().any(|table| {
+        (table.name == "voice_command_roles" || table.name == "voice_command_role_members")
+            && table.count > 0
+    }) {
+        eprintln!("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) and emptying the legacy voice_command_roles tables");
     }
     println!(
         "restore: migrations in dump: {}",
