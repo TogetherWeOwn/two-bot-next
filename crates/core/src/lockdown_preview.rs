@@ -69,7 +69,7 @@ pub struct PreviewSnapshot {
     pub overwrites: Vec<OverwriteSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PreviewError {
     #[error("lockdown preview supports text and announcement channels only")]
     UnsupportedChannel,
@@ -658,5 +658,53 @@ mod tests {
         assert_eq!(plan_preview(&voice), Err(PreviewError::UnsupportedChannel));
         voice.channel_type = 5;
         assert!(plan_preview(&voice).is_ok());
+        // The caps are inclusive: exactly 250 roles and 100 overwrites pass.
+        let at_caps = snapshot(
+            (10..260).map(|id| role(id, 0, 0)).collect(),
+            (0..100).map(|id| ow(1, 1000 + id, 0, 0)).collect(),
+        );
+        assert_eq!(plan_preview(&at_caps).expect("plans").roles_evaluated, 250);
+    }
+
+    #[test]
+    fn digest_covers_saved_lockdown_state_and_every_digest_scope_edge() {
+        let base = snapshot(
+            vec![role(10, 0, VIEW | SEND)],
+            vec![ow(0, 10, 0, 0), ow(1, 99, 0, 0)],
+        );
+        let digest = plan_preview(&base).expect("plans").digest;
+        let edits: [fn(&mut PreviewSnapshot); 5] = [
+            // Saved seed appears / its generation rotates (LP-07).
+            |snap| snap.saved_present = true,
+            |snap| {
+                snap.saved_present = true;
+                snap.saved_generation = "gen-2".to_owned();
+            },
+            // An INTEREST member-overwrite allow (LP-09).
+            |snap| snap.overwrites[1].allow = SEND,
+            // An @everyone lockdown bit (LP-08) and a non-INTEREST @everyone
+            // bit: prior masks are digested unmasked, so both are stale.
+            |snap| snap.overwrites[0].deny = SEND,
+            |snap| snap.overwrites[0].allow = EMBED,
+        ];
+        for edit in edits {
+            let mut changed = base.clone();
+            edit(&mut changed);
+            assert_ne!(digest, plan_preview(&changed).expect("plans").digest);
+        }
+    }
+
+    #[test]
+    fn json_escaping_matches_python_for_controls_quotes_and_brackets() {
+        let mut out = String::new();
+        escape_json_string("a\"b\\c\td\u{1}\u{7f}e[", &mut out);
+        assert_eq!(out, "\"a\\\"b\\\\c\\td\\u0001\\u007fe[\"");
+        // A string ending in '[' must not suppress the next field's comma.
+        let mut snap = snapshot(vec![role(10, 0, 0)], vec![]);
+        snap.reason = "ends[".to_owned();
+        let bytes = canonical_bytes(&snap, false, 0, 0, 0, LOCKDOWN_BITS);
+        assert!(String::from_utf8(bytes)
+            .expect("ascii bytes")
+            .contains("\"ends[\",\"0\""));
     }
 }
