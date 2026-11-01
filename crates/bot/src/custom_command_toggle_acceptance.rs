@@ -398,9 +398,11 @@ async fn toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice
     );
     let guard_off = runtime_off.dispatch_guard();
     runtime_off.initialize_custom_commands_for_test(config());
-    assert!(runtime_off.dispatch(&interaction_event(custom_invocation(8201, "myroom"))));
+    let off_myroom_claimed =
+        runtime_off.dispatch(&interaction_event(custom_invocation(8201, "myroom")));
     settle(&runtime_off).await;
-    assert!(runtime_off.dispatch(&interaction_event(custom_invocation(8202, "freshsafe"))));
+    let off_fresh_claimed =
+        runtime_off.dispatch(&interaction_event(custom_invocation(8202, "freshsafe")));
     settle(&runtime_off).await;
     let off_requests = mock_off.requests();
     drop(guard_off);
@@ -421,11 +423,10 @@ async fn toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice
     );
     let guard_on = runtime_on.dispatch_guard();
     runtime_on.initialize_custom_commands_for_test(config());
-    assert!(
-        runtime_on.dispatch(&interaction_event(custom_invocation(8203, "myroom"))),
-        "on claims myroom for the voice sink"
-    );
-    assert!(runtime_on.dispatch(&interaction_event(custom_invocation(8204, "freshsafe"))));
+    let on_myroom_claimed =
+        runtime_on.dispatch(&interaction_event(custom_invocation(8203, "myroom")));
+    let on_fresh_claimed =
+        runtime_on.dispatch(&interaction_event(custom_invocation(8204, "freshsafe")));
     settle(&runtime_on).await;
     let on_requests = mock_on.requests();
     drop(guard_on);
@@ -437,6 +438,10 @@ async fn toggle_acceptance_gateway_myroom_off_runs_custom_and_on_yields_to_voice
     // Voice-off observations assert after teardown so a failure cannot leave
     // the disposable database behind (CONTRIBUTING.md: never rely on
     // panic/runtime-shutdown cleanup).
+    assert!(off_myroom_claimed);
+    assert!(off_fresh_claimed);
+    assert!(on_myroom_claimed, "on claims myroom for the voice sink");
+    assert!(on_fresh_claimed);
     assert_eq!(
         custom_completion(&off_requests, 8201),
         "Legacy member in Test guild",

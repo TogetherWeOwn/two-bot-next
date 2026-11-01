@@ -296,6 +296,42 @@ mod tests {
     }
 
     #[test]
+    fn a_new_or_changed_global_command_role_is_refused() {
+        let document_with = |role: Option<u64>| {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&empty_document(GUILD)).unwrap();
+            document["settings"]["command_role_id"] =
+                serde_json::json!(role.map(|id| id.to_string()));
+            serde_json::to_vec(&document).unwrap()
+        };
+        let current_with =
+            |role: Option<u64>| decode_configuration(&document_with(role)).expect("decodes");
+        // The role exists in the inventory, so only the change guard refuses.
+        assert!(matches!(
+            plan_apply(&empty_config(), &document_with(Some(GUILD)), &inventory()),
+            ApplyPlan::Refuse { message }
+                if message.contains("settings.command_role_id") && message.contains("not enforced")
+        ));
+        // The stored role re-imports unchanged, and clearing it is always allowed.
+        let mut kept: serde_json::Value =
+            serde_json::from_slice(&document_with(Some(GUILD))).unwrap();
+        kept["settings"]["creation_enabled"] = serde_json::json!(false);
+        let kept = serde_json::to_vec(&kept).unwrap();
+        assert!(!matches!(
+            plan_apply(&current_with(Some(GUILD)), &kept, &inventory()),
+            ApplyPlan::Refuse { .. }
+        ));
+        assert!(!matches!(
+            plan_apply(
+                &current_with(Some(GUILD)),
+                &document_with(None),
+                &inventory()
+            ),
+            ApplyPlan::Refuse { .. }
+        ));
+    }
+
+    #[test]
     fn oversized_file_is_refused_before_decoding() {
         let bytes = vec![b' '; MAX_IMPORT_BYTES + 1];
         assert!(matches!(

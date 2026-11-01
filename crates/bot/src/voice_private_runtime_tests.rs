@@ -1354,3 +1354,57 @@ async fn myroom_empty_reply_shows_join_guidance_only_when_creation_is_open() {
         two_bot_core::voice_utilities::MYROOM_EMPTY
     );
 }
+
+#[test]
+fn import_preview_and_confirm_refuse_a_new_or_changed_global_command_role() {
+    let refused = |current: &VoiceConfiguration, candidate: &VoiceConfiguration| {
+        let bytes = serde_json::to_vec(candidate).unwrap();
+        for decision in [
+            plan_import_preview(current, &bytes, &config_inventory()),
+            plan_import_confirm(
+                current,
+                candidate,
+                &config_inventory(),
+                &diff_content_hash(current, candidate),
+            ),
+        ] {
+            match decision {
+                ImportDecision::Refuse { message } => assert!(
+                    message.contains("settings.command_role_id")
+                        && message.contains("not enforced"),
+                    "{message}"
+                ),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+    };
+    let accepted = |current: &VoiceConfiguration, candidate: &VoiceConfiguration| {
+        let bytes = serde_json::to_vec(candidate).unwrap();
+        assert!(!matches!(
+            plan_import_preview(current, &bytes, &config_inventory()),
+            ImportDecision::Refuse { .. }
+        ));
+        assert!(matches!(
+            plan_import_confirm(
+                current,
+                candidate,
+                &config_inventory(),
+                &diff_content_hash(current, candidate),
+            ),
+            ImportDecision::Apply { .. }
+        ));
+    };
+    let with_role = |role: Option<u64>| {
+        let mut config = full_config();
+        config.settings.command_role_id = role.map(|id| id.to_string());
+        config
+    };
+    // Both roles exist in the inventory, so only the change guard refuses.
+    refused(&with_role(None), &with_role(Some(MENTION_ROLE)));
+    refused(&with_role(Some(GUILD)), &with_role(Some(MENTION_ROLE)));
+    // The stored role re-imports unchanged, and clearing it is always allowed.
+    let mut kept = with_role(Some(MENTION_ROLE));
+    kept.settings.creation_enabled = !kept.settings.creation_enabled;
+    accepted(&with_role(Some(MENTION_ROLE)), &kept);
+    accepted(&with_role(Some(MENTION_ROLE)), &with_role(None));
+}

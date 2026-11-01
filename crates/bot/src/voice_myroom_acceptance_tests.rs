@@ -9,6 +9,22 @@ use super::*;
 const OTHER: u64 = 301;
 type Worker = GuildRoomWorker<Arc<Store>, Http>;
 
+/// The read result's channel references; the creation flag is pinned by the
+/// empty-reply cases.
+fn room_ids(reply: Option<MyRoomsReply>) -> Option<Vec<u64>> {
+    reply.map(|reply| reply.rooms)
+}
+
+/// Discovery returns channel references only: no privacy word or ACL
+/// classification may appear in a listed row.
+fn assert_unlabelled(row: &str) {
+    let lower = row.to_ascii_lowercase();
+    assert!(
+        !lower.contains("public") && !lower.contains("private"),
+        "channel reference only, no privacy label: {row}"
+    );
+}
+
 fn owned(channel_id: u64, owner: u64, original: u64) -> VoiceRoom {
     let mut row = room(channel_id);
     row.owner_id = owner;
@@ -178,7 +194,7 @@ async fn read_fixture() -> ReadFixture {
         .extend([500, 501, 502, 598, 701].into_iter().map(|id| {
             let mut room = channel(id, 2, Some(CATEGORY));
             if id == 501 {
-                // Privacy is an observed Connect deny, not retained retry bookkeeping.
+                // An observed Connect deny must not leak into the listing.
                 room.permission_overwrites = Some(vec![PermissionOverwrite {
                     id: Id::new(GUILD),
                     kind: PermissionOverwriteType::Role,
@@ -195,7 +211,7 @@ async fn read_fixture() -> ReadFixture {
         .unwrap();
 
     // Persistence now contradicts the loaded live worker. A database census
-    // would omit a live room, invent room 599 and report the wrong privacy.
+    // would omit a live room or invent room 599.
     store.rooms.lock().unwrap().remove(&500);
     store
         .rooms
@@ -337,21 +353,20 @@ async fn assert_read_only(fixture: ReadFixture) {
 }
 
 #[tokio::test]
-async fn myroom_lists_all_owned_live_channels_with_their_runtime_privacy_outside_voice() {
-    // Break caught: current-channel-only lookup, persistence census, omitted
-    // privacy, or using original creation rather than current ownership.
+async fn myroom_lists_all_owned_live_channels_outside_voice() {
+    // Break caught: current-channel-only lookup, persistence census, a leaked
+    // privacy label, or using original creation rather than current ownership.
     let fixture = read_fixture().await;
+    let rooms = fixture.runtime.run_myrooms(GUILD, MEMBER).await;
     let response = read(&fixture.runtime, MEMBER).await;
     let text = response_text(&response).to_ascii_lowercase();
-    for (mention, state) in [("<#500>", "public"), ("<#501>", "private")] {
+    assert_eq!(room_ids(rooms), Some(vec![500, 501]), "channel order");
+    for mention in ["<#500>", "<#501>"] {
         let row = text
             .lines()
             .find(|line| line.contains(mention))
             .unwrap_or_else(|| panic!("missing owned channel {mention}: {text}"));
-        assert!(
-            row.contains(state),
-            "missing runtime privacy {state}: {row}"
-        );
+        assert_unlabelled(row);
     }
     for excluded in ["<#502>", "<#598>", "<#599>", "<#701>"] {
         assert!(
@@ -436,9 +451,9 @@ async fn drain_read_worker(worker: &mut Worker) {
 }
 
 #[tokio::test]
-async fn myroom_partial_public_delete_refusal_reports_observed_open_acl_without_retiring_retry() {
-    // Break caught: retry bookkeeping overrides Discord's accepted Connect-open
-    // overwrite, so the member is told an actually open room is private.
+async fn myroom_partial_public_delete_refusal_still_lists_the_room_without_retiring_retry() {
+    // Break caught: retry bookkeeping hides or relabels an owned room, or the
+    // read retires the pending Join-channel retry.
     let (live, store, http, trace) = owned_room();
     let store = Arc::new(store);
     *http.next_id.lock().unwrap() = 700;
@@ -538,19 +553,19 @@ async fn myroom_partial_public_delete_refusal_reports_observed_open_acl_without_
         "myroom is read-only even after public refusal"
     );
     assert_eq!(
-        rooms,
-        Some(vec![(500, false)]),
-        "ACL, not retry bookkeeping, is public"
+        room_ids(rooms),
+        Some(vec![500]),
+        "retry bookkeeping never hides the owned room"
     );
     let row = text
         .lines()
         .find(|line| line.contains("<#500>"))
         .expect("owned room row");
-    assert!(row.contains("public") && !row.contains("private"), "{row}");
+    assert_unlabelled(row);
 }
 
 #[tokio::test]
-async fn myroom_queued_read_disconnects_before_dispatch_then_reconnect_uses_new_acl() {
+async fn myroom_queued_read_disconnects_before_dispatch_then_reconnect_reads_new_generation() {
     // Deterministic actor-boundary fence: no sleeps or scheduling lottery.
     // This does not claim to interleave two synchronous read-lock acquisitions.
     let trace = Trace::default();
@@ -593,9 +608,9 @@ async fn myroom_queued_read_disconnects_before_dispatch_then_reconnect_uses_new_
         apply_command(&mut worker, command, 0, &backpressure);
     });
     assert_eq!(
-        initial_rooms,
-        Some(vec![(500, true)]),
-        "closed initial generation"
+        room_ids(initial_rooms),
+        Some(vec![500]),
+        "closed initial generation is still listed"
     );
 
     let (disconnected_response, ()) = tokio::join!(read(&runtime, MEMBER), async {
@@ -613,8 +628,8 @@ async fn myroom_queued_read_disconnects_before_dispatch_then_reconnect_uses_new_
     );
 
     runtime.gateway_now_connected();
-    // The new generation is explicitly open. The earlier Connect deny must
-    // not be spliced into this ready/present channel's read result.
+    // The new generation is explicitly open. Nothing from the earlier
+    // generation's Connect deny may surface in this read result.
     let mut replacement = command_snapshot();
     replacement.channels.push(channel(500, 2, Some(CATEGORY)));
     live.publish(replacement);
@@ -630,15 +645,15 @@ async fn myroom_queued_read_disconnects_before_dispatch_then_reconnect_uses_new_
     });
     let new_text = response_text(&new_response).to_ascii_lowercase();
     assert_eq!(
-        new_rooms,
-        Some(vec![(500, false)]),
-        "new ACL, never stale private"
+        room_ids(new_rooms),
+        Some(vec![500]),
+        "fresh read after reconnect"
     );
     let row = new_text
         .lines()
         .find(|line| line.contains("<#500>"))
         .unwrap();
-    assert!(row.contains("public") && !row.contains("private"), "{row}");
+    assert_unlabelled(row);
     drop(runtime);
     assert!(
         rx.recv().await.is_none(),
@@ -663,14 +678,14 @@ async fn control_myroom_deleted_channel_is_omitted_without_reconciling_away_the_
     let response = read(&fixture.runtime, MEMBER).await;
     let text = response_text(&response).to_owned();
     assert_read_only(fixture).await;
-    assert_eq!(rooms, Some(vec![(500, false)]));
+    assert_eq!(room_ids(rooms), Some(vec![500]));
     assert!(
         text.contains("<#500>") && !text.contains("<#501>"),
         "{text}"
     );
 }
 
-fn complete_private_rows(text: &str, expected: &BTreeSet<u64>) -> BTreeSet<u64> {
+fn complete_rows(text: &str, expected: &BTreeSet<u64>) -> BTreeSet<u64> {
     let mut shown = BTreeSet::new();
     for line in text.lines().filter(|line| line.contains("<#")) {
         let (_, mention) = line.split_once("<#").unwrap();
@@ -678,20 +693,16 @@ fn complete_private_rows(text: &str, expected: &BTreeSet<u64>) -> BTreeSet<u64> 
         let id = id.parse::<u64>().expect("complete decimal room id");
         assert!(expected.contains(&id), "only owned room ids: {line}");
         assert!(shown.insert(id), "no duplicate room: {line}");
-        let lower = line.to_ascii_lowercase();
-        assert!(
-            lower.contains("private") && !lower.contains("public"),
-            "no partial/mislabeled private row: {line}"
-        );
+        assert_unlabelled(line);
     }
     shown
 }
 
 #[tokio::test]
-async fn myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitted_accounting() {
+async fn myroom_many_long_ids_complete_at_whole_row_boundary_with_omitted_accounting() {
     // The real completion adapter takes only 2000 scalars. The responder must
-    // hand it an already bounded, complete message, not 2041 scalars whose
-    // 60th room/privacy label will be cut mid-row. RoomHttp's private loopback
+    // hand it an already bounded, complete message, not one whose last room
+    // mention will be cut mid-row. RoomHttp's private loopback
     // constructor is not accessible here: this pins its real responder input,
     // not an observed RoomHttp transport request.
     let ids: BTreeSet<u64> = (0..61)
@@ -765,7 +776,7 @@ async fn myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitte
         "completion must not silently clamp a row: {} scalars",
         text.chars().count()
     );
-    let shown = complete_private_rows(&text, &ids);
+    let shown = complete_rows(&text, &ids);
     let attachments = response
         .data
         .as_ref()
@@ -783,9 +794,9 @@ async fn myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitte
         );
         let body = std::str::from_utf8(&attachment.file).expect("inspectable UTF-8 room list");
         assert_eq!(
-            complete_private_rows(body, &ids),
+            complete_rows(body, &ids),
             ids,
-            "attachment contains every room/privacy row"
+            "attachment contains every room row"
         );
         let lower = text.to_ascii_lowercase();
         assert!(
@@ -797,7 +808,7 @@ async fn myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitte
         let omitted = ids.len() - shown.len();
         assert!(
             omitted > 0,
-            "61 long private rows require bounded omission or attachment"
+            "61 long rows require bounded omission or attachment"
         );
         let footer = text
             .lines()
@@ -820,8 +831,10 @@ async fn myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitte
 }
 
 #[tokio::test]
-async fn myroom_unknown_overwrites_are_unavailable_through_facade_and_handler() {
-    // Break caught: treating absent ACL evidence as an explicitly public room.
+async fn myroom_unknown_overwrites_still_list_the_present_channel() {
+    // Break caught: making presence depend on ACL evidence. Discovery reads
+    // channel presence only, so a ready channel with no overwrite snapshot is
+    // still an owned live room and nothing classifies its access.
     let fixture = read_fixture().await;
     let mut unknown = channel(501, 2, Some(CATEGORY));
     unknown.permission_overwrites = None;
@@ -830,35 +843,24 @@ async fn myroom_unknown_overwrites_are_unavailable_through_facade_and_handler() 
     let response = read(&fixture.runtime, MEMBER).await;
     let text = response_text(&response).to_ascii_lowercase();
     assert_read_only(fixture).await;
-    assert_eq!(
-        rooms, None,
-        "a ready channel with unknown ACL is not public"
-    );
-    assert!(
-        text.contains("try again") || text.contains("unavailable") || text.contains("unknown"),
-        "missing unavailable/unknown read result: {text}"
-    );
-    assert!(
-        !text.contains("<#501>"),
-        "the bool-only room facade cannot label unknown evidence: {text}"
-    );
+    assert_eq!(room_ids(rooms), Some(vec![500, 501]));
+    let row = text.lines().find(|line| line.contains("<#501>")).unwrap();
+    assert_unlabelled(row);
 }
 
 #[tokio::test]
-async fn control_myroom_explicit_empty_overwrites_are_known_public_evidence() {
+async fn control_myroom_explicit_empty_overwrites_list_the_room_unlabelled() {
     let fixture = read_fixture().await;
     let rooms = fixture.runtime.run_myrooms(GUILD, MEMBER).await;
     let response = read(&fixture.runtime, MEMBER).await;
     let text = response_text(&response).to_ascii_lowercase();
     assert_read_only(fixture).await;
     assert!(
-        rooms
-            .as_ref()
-            .is_some_and(|rooms| rooms.contains(&(500, false))),
-        "an explicitly empty overwrite vector is known, not unavailable: {rooms:?}"
+        room_ids(rooms.clone()).is_some_and(|rooms| rooms.contains(&500)),
+        "an explicitly empty overwrite vector is a listed room: {rooms:?}"
     );
     let row = text.lines().find(|line| line.contains("<#500>")).unwrap();
-    assert!(row.contains("public") && !row.contains("private"), "{row}");
+    assert_unlabelled(row);
 }
 
 #[tokio::test]

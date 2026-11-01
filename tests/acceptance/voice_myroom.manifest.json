@@ -7,9 +7,9 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/voice_myroom_acceptance_tests.rs",
-      "sha256": "4b4e675ac1607183390aaa55faac00b68cc792578700fd10bd202cc1f09db32f",
+      "sha256": "85f9e0aec858d8f8d3a637d0f3a180faa355d13535c41e66da00ba564d60c7a4",
       "tests": 16,
-      "change": "Room 501 now has an observed guild @everyone Connect deny. All original refusal, owner identity, ephemeral reply, poisoned-store and pre/post no-write assertions remain. Adds genuine partial-public failure, unknown ACL, controlled reconnect, deleted/disconnected controls and bounded long-response cases."
+      "change": "Room 501 has an observed guild @everyone Connect deny that must not leak into the listing. All original refusal, owner identity, ephemeral reply, poisoned-store and pre/post no-write assertions remain. Adds genuine partial-public failure, unknown ACL, controlled reconnect, deleted/disconnected controls and bounded long-response cases. Narrowed-contract amendment (channel references only): the read result is MyRoomsReply rooms, so oracles compare channel ids instead of (channel, private) pairs; rows must carry no privacy word; a ready channel with no overwrite snapshot is still listed; partial-public, reconnect, deleted, disconnected, long-list and read-only assertions are otherwise unchanged."
     },
     {
       "path": "crates/core/tests/voice_myroom_acceptance.rs",
@@ -36,15 +36,15 @@
     },
     {
       "path": "crates/discord/tests/custom_command_toggle_acceptance.rs",
-      "sha256": "f028cb69dbb22aac0033036e3b3e96d8ef07cce6ebe0fb140be2c8d46bf70f63",
+      "sha256": "6bee02050554d027099a3f588c0c8ceb374354b2ef0271820eda4580af537e3f",
       "tests": 24,
-      "change": "Author correction: legal stored capacity is independently 33 because only 67 definitions publish; the reservation-only assistant name does not consume a publication slot. The 34th-row overflow control remains strict. Adds parser/planner/service/publication coverage and grandfathered myroom maintenance, fresh-name reservation and voice-precedence controls. Existing faq reply checks retain the same named assertions through a shared helper. Teardown hygiene: capture voice-off results and the fresh-collision query before closing the owned database, then check the same predicates and expected values only after awaited explicit teardown."
+      "change": "Author correction: legal stored capacity is independently 33 because only 67 definitions publish; the reservation-only assistant name does not consume a publication slot. The 34th-row overflow control remains strict. Adds parser/planner/service/publication coverage and grandfathered myroom maintenance, fresh-name reservation and voice-precedence controls. Existing faq reply checks retain the same named assertions through a shared helper. Teardown hygiene: capture voice-off results and the fresh-collision query before closing the owned database, then check the same predicates and expected values only after awaited explicit teardown. Teardown hygiene: voice-on precedence observations are captured first and asserted only after awaited explicit teardown, with unchanged predicates."
     },
     {
       "path": "crates/bot/src/custom_command_toggle_acceptance.rs",
-      "sha256": "f5a09c725e2653f48544441100f6d546f12503462ee5a7e619e2d513430b7b15",
+      "sha256": "d966d7609bbc53e6276155099e173038b90a87c13e731de05ce892ce2aa37d73",
       "tests": 2,
-      "change": "Adds production gateway dispatch coverage for saved custom myroom with voice off and voice-sink precedence with voice on; existing toggle test is unchanged. Teardown hygiene: the two voice-off completion checks and no-publication check now run after awaited explicit database teardown, with unchanged predicates and expected values."
+      "change": "Adds production gateway dispatch coverage for saved custom myroom with voice off and voice-sink precedence with voice on; existing toggle test is unchanged. Teardown hygiene: the two voice-off completion checks and no-publication check now run after awaited explicit database teardown, with unchanged predicates and expected values. Teardown hygiene: the four dispatch-claim checks are captured and asserted after awaited teardown, with unchanged predicates."
     },
     {
       "path": "crates/bot/src/internal_action_http/tests/automations.rs",

@@ -2038,35 +2038,11 @@ async fn voice_on_retains_myroom_precedence_and_collision_safety() {
         .await
         .expect("stored grandfathered rows");
     let customs: Vec<CustomCommand> = rows.iter().map(StoredCommand::registry_entry).collect();
-    let published = InteractionRouter::new(automation_voice_gates(true))
-        .publish_set(&customs)
-        .expect("on publishes");
-    let myroom = published
-        .iter()
-        .find(|definition| definition.name == "myroom")
-        .expect("voice myroom publishes");
-    assert_ne!(
-        myroom.description, "Saved description",
-        "on withholds the custom definition"
-    );
-    assert!(
-        published
-            .iter()
-            .any(|definition| definition.name == "freshsafe"),
-        "fresh names still publish on"
-    );
+    // Observe everything first; assert only after awaited teardown so a red
+    // path never leaves the owned database behind.
+    let published = InteractionRouter::new(automation_voice_gates(true)).publish_set(&customs);
     let yielded = observe(&runtime, &mock, &interaction(2101, "myroom", 0, vec![])).await;
-    assert!(
-        matches!(yielded.result, Ok(false)) && yielded.requests.is_empty(),
-        "on yields myroom to the voice sink: {:?}",
-        yielded.result
-    );
     let fresh = observe(&runtime, &mock, &interaction(2102, "freshsafe", 0, vec![])).await;
-    assert!(
-        matches!(fresh.result, Ok(true)),
-        "fresh still runs on: {:?}",
-        fresh.result
-    );
     let fresh_prefix = runtime
         .handle_message(
             &prefix_with(2103, 3333, "!freshsafe hello"),
@@ -2075,7 +2051,6 @@ async fn voice_on_retains_myroom_precedence_and_collision_safety() {
             Some("Test guild"),
         )
         .await;
-    assert!(matches!(fresh_prefix, Ok(TextCommandOutcome::Delivered)));
     let myroom_prefix = runtime
         .handle_message(
             &prefix_with(2104, 3334, "!myroom hello"),
@@ -2084,10 +2059,6 @@ async fn voice_on_retains_myroom_precedence_and_collision_safety() {
             Some("Test guild"),
         )
         .await;
-    assert!(
-        matches!(myroom_prefix, Ok(TextCommandOutcome::Delivered)),
-        "voice has no prefix counterpart, so !myroom still delivers on"
-    );
     let fresh_voice_name = service::put(
         db.pool(),
         true,
@@ -2103,6 +2074,42 @@ async fn voice_on_retains_myroom_precedence_and_collision_safety() {
         AT,
     )
     .await;
+    let disabled = observe(&runtime, &mock, &toggle(2105, false, "myroom")).await;
+    drop(runtime);
+    drop(executor);
+    mock.shutdown().await;
+    db.close().await.expect("drop only the owned test database");
+
+    let published = published.expect("on publishes");
+    let myroom = published
+        .iter()
+        .find(|definition| definition.name == "myroom")
+        .expect("voice myroom publishes");
+    assert_ne!(
+        myroom.description, "Saved description",
+        "on withholds the custom definition"
+    );
+    assert!(
+        published
+            .iter()
+            .any(|definition| definition.name == "freshsafe"),
+        "fresh names still publish on"
+    );
+    assert!(
+        matches!(yielded.result, Ok(false)) && yielded.requests.is_empty(),
+        "on yields myroom to the voice sink: {:?}",
+        yielded.result
+    );
+    assert!(
+        matches!(fresh.result, Ok(true)),
+        "fresh still runs on: {:?}",
+        fresh.result
+    );
+    assert!(matches!(fresh_prefix, Ok(TextCommandOutcome::Delivered)));
+    assert!(
+        matches!(myroom_prefix, Ok(TextCommandOutcome::Delivered)),
+        "voice has no prefix counterpart, so !myroom still delivers on"
+    );
     assert!(
         matches!(
             fresh_voice_name,
@@ -2112,10 +2119,5 @@ async fn voice_on_retains_myroom_precedence_and_collision_safety() {
         ),
         "fresh voice names stay refused on: {fresh_voice_name:?}"
     );
-    let disabled = observe(&runtime, &mock, &toggle(2105, false, "myroom")).await;
     changed_named_reply(&disabled, false, "myroom");
-    drop(runtime);
-    drop(executor);
-    mock.shutdown().await;
-    db.close().await.expect("drop only the owned test database");
 }
