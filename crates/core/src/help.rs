@@ -85,6 +85,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
             "command-disable",
             "command-enable",
             "schedule",
@@ -907,12 +908,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 45 non-voice commands (7 core + 25 feature + 9 moderation + 4 reads),
-        // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
+        // 46 non-voice commands (7 core + 26 feature + 9 moderation + 4 reads),
+        // including inspection, clone, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
         // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 21 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (66 live)"));
+        assert!(text.contains("**Server commands** (67 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -1039,12 +1040,12 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 45 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
+        // 46 non-voice names, including inspection, clone, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
         // and moderation-recent, plus
         // 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 66);
+        assert_eq!(grouped.len(), 67);
         for name in [
             "rank",
             "leaderboard",
@@ -1058,6 +1059,7 @@ mod tests {
             "command-disable",
             "command-enable",
             "command-inspect",
+            "command-clone",
             "schedule-list",
             "sticky-remove",
             "rsvp",

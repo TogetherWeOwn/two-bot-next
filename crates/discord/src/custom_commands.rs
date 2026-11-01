@@ -28,8 +28,9 @@ use two_bot_core::{
         format_inspect_preview, format_inspect_summary_with_gate, format_inspect_template,
         inspect_preview_context_unavailable, invalid_inspect_option_reply,
         invalid_inspect_view_reply, render_template, validate_inspect_name, validate_template,
-        AuditRecord, AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand,
-        TemplateContext, ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        AuditRecord, AutomationMessageAcceptance, CloneCommandInput, CommandError, InspectView,
+        PutCommandInput, StoredCommand, TemplateContext, ToggleOutcome, INVALID_COMMAND_LIST_PAGE,
+        MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -274,6 +275,7 @@ impl CustomCommandRuntime {
                 | "command-remove"
                 | "command-list"
                 | "command-inspect"
+                | "command-clone"
                 | "command-disable"
                 | "command-enable"
         );
@@ -829,6 +831,68 @@ impl CustomCommandRuntime {
         }
     }
 
+    async fn clone_saved(
+        &self,
+        interaction: &Interaction,
+        data: &CommandData,
+        guild: &str,
+        actor: &str,
+    ) -> Result<String, CustomCommandError> {
+        // Forged options must not silently select a partial value or add a
+        // template, state or trigger override to this deliberately narrow API.
+        if data
+            .options
+            .iter()
+            .any(|option| !matches!(option.name.as_str(), "source" | "destination"))
+        {
+            return Ok("Only source and destination name options are supported.".to_owned());
+        }
+        let (SingleOption::Value(source), SingleOption::Value(destination)) = (
+            single_string_option(data, "source"),
+            single_string_option(data, "destination"),
+        ) else {
+            return Ok("Provide one source name and one new destination name as text.".to_owned());
+        };
+        let _guard = self.registry.lock().await;
+        let saved = match service::clone_command(
+            &self.pool,
+            self.router.gates().automations,
+            guild,
+            actor,
+            &CloneCommandInput {
+                source: source.to_owned(),
+                destination: destination.to_owned(),
+            },
+            &format!("custom:manage:{}", interaction.id),
+            &two_bot_core::now_iso(),
+        )
+        .await
+        {
+            Ok(saved) => saved,
+            Err(service::ServiceError::Storage(_)) => return Err(CustomCommandError::Storage),
+            Err(service::ServiceError::Validation(CommandError::InvalidTemplate(_))) => {
+                return Ok(
+                    "Saved source template is invalid. Inspect and correct it before cloning."
+                        .to_owned(),
+                );
+            }
+            Err(error) => return Ok(error.to_string()),
+        };
+        let state = if saved.enabled { "enabled" } else { "disabled" };
+        let reply = format!(
+            "Saved /{} as {state}. The source text trigger was not copied; the source is unchanged.",
+            saved.name
+        );
+        if self.publish_locked().await.is_err() {
+            // The clone is committed and a durable pending marker is saved.
+            // Report the saved-but-not-yet-synchronized state with the same
+            // automatic-recovery suffix as every other management mutation.
+            tracing::error!("custom-command clone committed but registry publication failed");
+            return Ok(format!("{reply} {PENDING_RESYNC_SUFFIX}"));
+        }
+        Ok(reply)
+    }
+
     async fn manage(
         &self,
         interaction: &Interaction,
@@ -846,6 +910,9 @@ impl CustomCommandRuntime {
             .author_id()
             .ok_or(CustomCommandError::Context)?
             .to_string();
+        if data.name == "command-clone" {
+            return self.clone_saved(interaction, data, guild, &actor).await;
+        }
         if data.name == "command-list" {
             // Routing already enforced guild/application, ManageGuild and the
             // feature gate. Reject forged types/duplicates before a store read.

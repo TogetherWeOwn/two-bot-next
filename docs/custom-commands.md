@@ -194,7 +194,7 @@ remaining gateway/accepted-prefix work:
 
 ## Pending registry resync
 
-A define, remove or toggle commits its saved definition (and its one audit
+A define, clone, remove or toggle commits its saved definition (and its one audit
 fact) before the full registry is republished. If that publication fails —
 for example Discord refuses the replace-all PUT during an outage — the
 picker would otherwise stay stale until a restart. Instead, the failed
@@ -219,6 +219,38 @@ clears another guild's pending row. The marker is best-effort recovery
 state around the publication outcome (recording or clearing it never masks
 that outcome), holds no member data, and is excluded from backups: a
 recovered process republishes the full set on boot anyway.
+
+## Clone a saved response
+
+Use `/command-clone source:faq destination:faq-new` to start a related response
+without replacing anything. This management command requires Manage Server and
+the automations feature in the configured guild. Both names are required,
+lowercased, and validated against the existing 1–32 character name rules and
+all reserved names (including voice names while voice is off). Missing sources
+and existing destinations, including cloning a name onto itself, refuse without
+publishing or changing definitions.
+
+The destination copies the saved template, description and **enabled or disabled
+state**, with fresh creator/updater provenance for the invoking admin. It does
+**not** copy the unique text trigger. The private confirmation explains both
+choices. Disabled clones remain absent from the command picker and cannot run;
+cloning never enables them. Source fields, source run history and delivery/replay
+fences remain unchanged. Invalid saved templates/descriptions must be corrected
+before cloning. No overwrite, cross-guild, state or trigger override is supported.
+
+The existing guild transaction lock serializes source/destination checks,
+capacity (including disabled rows), create-only insertion and one content-free
+`command.create` audit. An insertion or audit failure leaves no destination or
+success fact. A competing writer cannot turn cloning into a replacement.
+Successful saves republish the complete enabled registry under the existing
+runtime serialization, not just the new command.
+
+If Discord publication fails after the save, the confirmation says **Saved** and
+that **the command picker is not yet synchronized**: synchronization is pending
+and will resync automatically on the next publication, so no further action is
+needed. Do not clone again: a repeated clone is a no-op that does not republish.
+Confirmed help discovery advances only after successful publication;
+resynchronization adds no clone or run audit fact.
 
 ## Slash-run audit replay
 

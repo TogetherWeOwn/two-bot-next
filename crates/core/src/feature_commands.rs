@@ -171,9 +171,30 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .max_length(MAX_TEMPLATE_CHARS as u32),
         ]),
+        CommandDefinition::new(
+            "command-clone",
+            "Clone a saved custom command under a new name",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "source",
+                "Saved source command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+            CommandOption::new(
+                "destination",
+                "New absent destination name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+        ]),
         // Next-only saved-response lifecycle (parity rows 40-41): pause and
         // resume one definition without deleting it. Published immediately
-        // after `command-inspect`; automation-gated and `ManageGuild`-gated
+        // after `command-clone`; automation-gated and `ManageGuild`-gated
         // like the other admin commands. Reserved builtin names, never
         // dynamic fallthrough: a stored row under either name can neither
         // execute nor be re-enabled, and `/command` cannot write them.
@@ -742,7 +763,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
-        assert_eq!(automation_commands().len(), 12);
+        assert_eq!(automation_commands().len(), 13);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -751,6 +772,7 @@ mod tests {
                 "command-remove",
                 "command-list",
                 "command-inspect",
+                "command-clone",
                 "command-disable",
                 "command-enable",
                 "schedule",
@@ -778,8 +800,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 7 core + 1 scorecard + 12 automation + 12 announcements.
-        assert_eq!(merged.len(), 32);
+        // 7 core + 1 scorecard + 13 automation + 12 announcements.
+        assert_eq!(merged.len(), 33);
         assert_eq!(
             &names(&merged)[..8],
             [
@@ -814,6 +836,7 @@ mod tests {
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
             "command-disable",
             "command-enable",
             "schedule",
@@ -864,6 +887,8 @@ mod tests {
             ("command-remove", 0, 32),
             ("command-inspect", 0, 32),
             ("command-inspect", 2, 500),
+            ("command-clone", 0, 32),
+            ("command-clone", 1, 32),
             ("command-disable", 0, 32),
             ("command-enable", 0, 32),
             ("schedule", 0, 2000),
@@ -1130,21 +1155,22 @@ mod tests {
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
         // Saved-response inspection publishes after `command-list`, the
-        // pause/resume lifecycle immediately after inspection, and giveaway
-        // after sticky-remove; all three shift the announcement slice later.
+        // clone immediately after inspection, then pause/resume, and giveaway
+        // after sticky-remove; none replaces an existing command.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
-        assert_eq!(json[5]["name"], "command-disable");
-        assert_eq!(json[5]["default_member_permissions"], "32");
-        assert_eq!(json[5]["options"].as_array().expect("options").len(), 1);
-        assert_eq!(json[6]["name"], "command-enable");
+        assert_eq!(json[5]["name"], "command-clone");
+        assert_eq!(json[6]["name"], "command-disable");
         assert_eq!(json[6]["default_member_permissions"], "32");
         assert_eq!(json[6]["options"].as_array().expect("options").len(), 1);
-        assert_eq!(json[12]["name"], "giveaway");
-        assert_eq!(json[12]["default_member_permissions"], "32");
-        assert_eq!(json[14]["name"], "rsvp-attendance");
-        assert!(json[14].get("default_member_permissions").is_none());
-        assert_eq!(json[14]["options"][0]["name"], "event-id");
+        assert_eq!(json[7]["name"], "command-enable");
+        assert_eq!(json[7]["default_member_permissions"], "32");
+        assert_eq!(json[7]["options"].as_array().expect("options").len(), 1);
+        assert_eq!(json[13]["name"], "giveaway");
+        assert_eq!(json[13]["default_member_permissions"], "32");
+        assert_eq!(json[15]["name"], "rsvp-attendance");
+        assert!(json[15].get("default_member_permissions").is_none());
+        assert_eq!(json[15]["options"][0]["name"], "event-id");
     }
 
     #[test]
