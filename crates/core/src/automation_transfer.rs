@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::GUILD_COMMAND_LIMIT;
 use super::custom_commands::{
-    error_code, max_custom_commands, reserved_command_names, validate_put_input, CommandError,
-    PutCommandInput, StoredCommand,
+    error_code, max_custom_commands, validate_put_input, CommandError, PutCommandInput,
+    StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
 
@@ -400,6 +400,7 @@ pub struct ImportOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_commands::reserved_command_names;
     use serde_json::json;
 
     fn builtins() -> HashSet<String> {
