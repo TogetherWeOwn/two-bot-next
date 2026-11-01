@@ -1084,13 +1084,17 @@ async fn committed_clone_with_failed_publication_reports_saved_and_safe_recovery
         "truthful partial outcome: {reply}"
     );
     assert!(
-        reply.contains("sync")
-            && (reply.contains("retry")
-                || reply.contains("try")
-                || reply.contains("ask")
-                || reply.contains("restart")),
-        "include a safe next action, not just a failure label: {reply}"
+        reply.contains("pending")
+            && reply.contains("automatically")
+            && reply.contains("no further action"),
+        "automatic-recovery suffix, not just a failure label: {reply}"
     );
+    for manual in ["restart", "ask a bot", "resynchronize", "manual"] {
+        assert!(
+            !reply.contains(manual),
+            "no manual recovery advice: {reply}"
+        );
+    }
     for lie in ["no change", "not saved", "rolled back", "try cloning again"] {
         assert!(!reply.contains(lie));
     }

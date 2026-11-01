@@ -194,7 +194,7 @@ remaining gateway/accepted-prefix work:
 
 ## Pending registry resync
 
-A define, remove or toggle commits its saved definition (and its one audit
+A define, clone, remove or toggle commits its saved definition (and its one audit
 fact) before the full registry is republished. If that publication fails —
 for example Discord refuses the replace-all PUT during an outage — the
 picker would otherwise stay stale until a restart. Instead, the failed
@@ -246,12 +246,11 @@ Successful saves republish the complete enabled registry under the existing
 runtime serialization, not just the new command.
 
 If Discord publication fails after the save, the confirmation says **Saved** and
-**the command picker is not synchronized**. Do not clone again: use
-`/command-inspect name:faq-new` to check the saved definition and ask a bot
-administrator to resynchronize the registry using the existing
-[publication procedure](command-publish.md). A normal runtime restart/READY also
-rebuilds the complete registry. Confirmed help discovery advances only after
-successful publication; resynchronization adds no clone or run audit fact.
+that **the command picker is not yet synchronized**: synchronization is pending
+and will resync automatically on the next publication, so no further action is
+needed. Do not clone again: a repeated clone is a no-op that does not republish.
+Confirmed help discovery advances only after successful publication;
+resynchronization adds no clone or run audit fact.
 
 ## Slash-run audit replay
 
