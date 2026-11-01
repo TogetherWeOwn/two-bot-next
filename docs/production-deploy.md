@@ -311,6 +311,47 @@ bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
 it. The daily `staging-rollback-drill` keeps exercising the restore path
 itself on staging.
 
+## Regression gate against production
+
+Before any production mutation, every ordinary promotion compares the
+soaked candidate on staging with production as it serves now:
+
+- The `soak` job first records a soak-baseline `/ops/metrics` scrape
+  (`wrangler/scripts/rest-5xx-counters.mjs`, same `staging` Environment
+  bearer), so the judged soak window starts at that sample, then sleeps out
+  the remainder of the 30 minutes past the staging-green time.
+- The `staging-soak-evidence` job runs after the soak (outside the lane,
+  `staging` Environment with `deployment: false` for the scrape bearer). It
+  runs the staging user-flow probe pinned to the guarded SHA and bound to
+  the guarded run-attempt build (a same-SHA redeploy no longer proves the
+  candidate soaked), one `/ops/metrics` scrape, and a read-only listing of
+  the main-branch `deploy-staging` runs. If staging now serves another
+  build, an automatic run skips green when a staging run still promotes
+  that build (`staging-superseded`: that build promotes itself) and refuses
+  when nothing promotes it (the promotion stalled: the serving build has no
+  newer green or in-flight staging run behind it); a manual run refuses. The
+  scrape receipts carry the process identity
+  (`two_bot_process_incarnation`): when the identity changed between the
+  baseline and the post-soak sample, the process restarted mid-soak and the
+  cumulative counters after the restart no longer cover the soak, so the
+  ratio records `insufficient_data` instead of a pass. No baseline is
+  expected when the soak skipped (it was already over before the run
+  started).
+- The `production` job then runs the passive production probe and the same
+  scrape against production as the baseline (production's counters since its
+  process started, normally a day or more of traffic), and
+  `scripts/promotion_regression_gate.py compare` refuses when a journey
+  (`health`, `readyz`, `build`) passes on production but failed on staging,
+  or when staging's REST 5xx ratio exceeds max(1.5 × production's ratio, 5%)
+  with at least 3 staging 5xx responses. Fewer than 10 judged staging
+  requests (or no bearer) records `insufficient_data` with a warning, never a
+  pass; a production baseline below 10 requests falls back to the 5% floor.
+
+A failing production journey lowers the baseline, never the bar: the gate
+only asks that the candidate is no worse than what serves now. The
+`transport` result stays out of the 5xx count, as in `rest_5xx_rate`. Rollback
+and the live-SHA redeploy skip both legs.
+
 ## Production error-rate gate
 
 The `production` job ends with the same REST 5xx promotion gate staging

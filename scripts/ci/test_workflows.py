@@ -46,7 +46,7 @@ JOB_INVENTORY = {
                   # Promoted nextest lane (shared reusable), gated by ci-ok
                   # like the Rust lanes.
                   "nextest"},
-    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
+    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "user-flow-synthetic",
                            "pinned-history-guard", "certify-promotion"},
@@ -2747,12 +2747,13 @@ def production_errors(workflow):
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
         "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
         "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
-        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
+        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
+        "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     )
     if production.get("environment") != "production" \
-            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate"}:
+            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence"}:
         errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
-                      "the schema gate, the roles gate and the protected Environment")
+                      "the schema gate, the roles gate, the staging soak evidence and the protected Environment")
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
                       "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
@@ -2766,7 +2767,7 @@ def production_errors(workflow):
     if jobs.get("production", {}).get("concurrency") != {"group": "deploy-production",
                                                          "cancel-in-progress": "false"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
-    for job_id in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
+    for job_id in ("guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck"):
         if "concurrency" in jobs.get(job_id, {}):
             errors.append(f"{name}:{job_id}: must not hold the deploy lane")
     expected_soak_if = ("needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' "
@@ -2780,20 +2781,38 @@ def production_errors(workflow):
     for required in ("SOAK_SECONDS - int(time.time() - green_at)", "time.sleep(remaining)"):
         if required not in soak_script:
             errors.append(f"{name}:soak: must recompute the remainder from the staging-green time")
-    soak_env = str((soak.get("steps") or [{}])[0].get("env", ""))
+    # The soak job records the soak-baseline counters before it sleeps, so
+    # GREEN_AT may live on the sleep step rather than the first step.
+    soak_env = "\n".join(str(step.get("env", "")) for step in soak.get("steps", []))
     if "GREEN_AT" not in soak_env or "needs.guard.outputs.green_at" not in soak_env:
         errors.append(f"{name}:soak: must read the staging-green timestamp from the guard")
     expected_recheck_if = (
         "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && "
         "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
-        "needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'"
+        "needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
+        "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''"
     )
-    if recheck.get("needs") != ["guard", "soak", "schema-gate", "roles-gate"]:
+    if recheck.get("needs") != ["guard", "soak", "schema-gate", "roles-gate", "staging-soak-evidence"]:
         errors.append(f"{name}:recheck: must wait for the guard, the soak and both gates "
                       "(the fresh read happens after the last long build)")
     if recheck.get("if") != expected_recheck_if:
         errors.append(f"{name}:recheck: must recheck only automatic deploys after the soak and both gates")
+    # The regression gate's staging leg reads only the staging scrape bearer,
+    # writes no deployment record and holds no lane; its skip never deploys.
+    evidence_job = jobs.get("staging-soak-evidence", {})
+    if evidence_job.get("needs") != ["guard", "soak"] \
+            or evidence_job.get("environment") != {"name": "staging", "deployment": "false"} \
+            or evidence_job.get("permissions") != {"contents": "read", "actions": "read"}:
+        errors.append(f"{name}:staging-soak-evidence: must follow the soak with contents:read plus "
+                      "actions:read and the staging Environment (deployment: false)")
+    evidence_text = str(evidence_job)
+    if re.findall(r"secrets\.[A-Z_]+", evidence_text) != ["secrets.STAGING_METRICS_SCRAPE_TOKEN"] \
+            or "PRODUCTION_" in evidence_text:
+        errors.append(f"{name}:staging-soak-evidence: must read only the staging scrape bearer")
+    if (evidence_job.get("outputs") or {}) != {"skip": "${{ steps.judge.outputs.skip }}",
+                                               "evidence": "${{ steps.judge.outputs.evidence }}"}:
+        errors.append(f"{name}:staging-soak-evidence: must publish the skip and evidence outputs")
     if (recheck.get("outputs") or {}).get("skip") != "${{ steps.recheck.outputs.skip }}":
         errors.append(f"{name}:recheck: must publish the skip output for production")
     recheck_text = str(recheck)
@@ -8882,6 +8901,10 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
+                        expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "staging-soak-evidence"):
+                        # Reads deploy-staging runs to tell a promoted newer
+                        # build (skip green) from a stalled promotion (refuse).
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the

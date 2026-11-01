@@ -16,7 +16,10 @@ a request is sent. No Gatus or third-party monitor is used.
 Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
 `synthetic-prod-<run>.json`, 14-day artifacts) and fails on any check FAIL
 or fence refusal. Production is passive: the prod job observes and alerts
-only, and never blocks a deploy.
+only, and never blocks a deploy. The production promotion reuses the same
+probe once as a baseline (see
+[production-deploy.md](production-deploy.md#regression-gate-against-production)):
+a journey failing on production lowers that baseline, it never blocks a deploy.
 
 ### Promotion prerequisite
 
