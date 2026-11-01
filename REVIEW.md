@@ -23,10 +23,8 @@ at the reviewed commit.
 
 Severity is impact times confidence, after the disproof pass below:
 
-- **Severe (red):** production-reachable wrong or duplicated moderation of a
-  member, token/secret disclosure, authorization bypass on a privileged
-  command or signed internal action, shared-database corruption, or a
-  gateway crash/poison loop — with the mechanism verified.
+- **Severe (red):** only an outcome listed under "What counts as Severe"
+  below, with the mechanism verified.
 - **Non-severe:** a real defect with limited blast radius or a narrow trigger.
 - **Investigate/flag, not a bug:** the mechanism depends on an assumption you
   could not verify against this code or the pinned Twilight/Discord contract.
@@ -35,6 +33,34 @@ Severity is impact times confidence, after the disproof pass below:
   Do not describe a suspected vulnerability, exposed secret, or sensitive
   data publicly: post only a non-sensitive notice that a private report under
   `SECURITY.md` is required.
+
+## What counts as Severe
+
+Severe only when merging the change would cause one of these:
+
+- **Data loss or corruption:** a write in `crates/store` that drops the
+  predicate it read, so a replayed event applies a funnel effect twice, or an
+  edit to an applied migration.
+- **Security or auth/authz weakness:** a privileged command that skips its
+  row in `crates/core/src/command_permissions.rs`, or a token reaching logs
+  or `Debug` output.
+- **Production breakage or a broken deploy/rollback gate:** a poison event
+  that crash-loops the gateway runner, a `sql/web_v1.sql` change that breaks
+  the website's reads, or a `deploy-production.yml` rollback that cannot
+  restore the previous image.
+- **Wrong user-visible behavior with no workaround:** automod acting on a
+  trusted or protected executor that `docs/containment.md` excludes.
+- **A test or gate that can no longer fail:** `scripts/check-secret-debug.py`
+  or `scripts/check-migrations.py` gaining an early exit that passes every
+  input.
+
+Not Severe (use Non-severe): missing edge-case tests (no empty-argument
+case for a custom command), naming (a function name in `crates/core`), docs
+drift (`docs/commands.md` lagging a command change), refactor suggestions
+(splitting `crates/bot/src/dispatch.rs`), performance without a measured
+regression ("this lookup may be slow" with no event-rate path), and
+defensive checks for states the callers already prevent (re-checking a
+permission the router already enforced).
 
 ## Disproof pass (before posting any finding)
 
