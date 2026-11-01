@@ -259,8 +259,12 @@ impl ChannelModerationRuntime {
                     }),
                 ],
             })];
+            // Blocked-retry like every other channel reply: a Blocked
+            // attempt never reached the wire, so retrying it cannot repeat
+            // an accepted edit, and the moderator is not left on a stuck
+            // deferred reply under admission contention.
             self.executor
-                .edit_interaction_response_with_components(
+                .edit_interaction_response_with_components_and_blocked_retry(
                     interaction.application_id.get(),
                     &interaction.token,
                     text,
@@ -506,6 +510,23 @@ impl ChannelModerationRuntime {
         Ok(Some(reply))
     }
 
+    /// Unwind a failed `/lockdown-preview` replacement: drop this attempt's
+    /// pending entry only while it still owns the key, restoring the preview
+    /// it displaced so the earlier Confirm survives. A newer same-key
+    /// preview keeps its entry and row.
+    fn unwind_preview_replacement(
+        &self,
+        key: (u64, u64, u64),
+        preview_request_id: &str,
+        prior: Option<PendingEntry>,
+        now: i64,
+    ) {
+        let _unwound = self
+            .preview_pending
+            .lock()
+            .map(|mut pending| pending.unwind_replacement(key, preview_request_id, prior, now));
+    }
+
     /// Render one `/lockdown-preview`: validate, rate-limit, read once each,
     /// plan, audit, and arm. Anything before the audit insert refuses with no
     /// row and no pending entry; a redelivered interaction (zero new audit
@@ -651,33 +672,42 @@ impl ChannelModerationRuntime {
         );
         // Arm the pending entry before the audit row would double-count a
         // redelivery: a new key at cap refuses PREVIEW_BUSY with no audit
-        // row, while a same-key replacement succeeds atomically. Audit
-        // failure after a successful insert unwinds only this attempt's own
-        // entry, so a newer same-key preview that superseded it keeps its row.
+        // row, while a same-key replacement succeeds atomically. The
+        // displaced prior entry is held aside so a failed replacement
+        // (audit error or redelivery) restores it instead of leaving the
+        // earlier Confirm dead; only a newer same-key preview that
+        // superseded this attempt keeps the slot.
         let digest32 = plan.digest32().to_owned();
         let pending_key = (guild_id.get(), channel_num, actor.id.get());
         let interaction_id = interaction.id.to_string();
+        let mut displaced: Option<PendingEntry> = None;
         if plan.armed {
-            let inserted = self
+            let replacement = self
                 .preview_pending
                 .lock()
                 .map(|mut pending| {
-                    pending.insert(
-                        pending_key,
-                        PendingEntry {
-                            digest: plan.digest.clone(),
-                            reason: snapshot.reason.clone(),
-                            preview_request_id: interaction_id.clone(),
-                            expires_at,
-                        },
-                        now,
-                    )
+                    let prior = pending.peek(pending_key, now);
+                    pending
+                        .insert(
+                            pending_key,
+                            PendingEntry {
+                                digest: plan.digest.clone(),
+                                reason: snapshot.reason.clone(),
+                                preview_request_id: interaction_id.clone(),
+                                expires_at,
+                            },
+                            now,
+                        )
+                        .map(|()| prior)
                 })
                 .unwrap_or(Err(crate::lockdown_preview::PendingFull));
-            if inserted.is_err() {
-                return Ok(ChannelReply::refused(
-                    "Too many live lockdown previews; wait for one to expire and try again. Nothing was changed.",
-                ));
+            match replacement {
+                Ok(prior) => displaced = prior,
+                Err(_) => {
+                    return Ok(ChannelReply::refused(
+                        "Too many live lockdown previews; wait for one to expire and try again. Nothing was changed.",
+                    ));
+                }
             }
         }
         let row = ChannelAuditRow {
@@ -694,30 +724,23 @@ impl ChannelModerationRuntime {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
         };
-        // Unwind only this attempt's own entry, matched by request id. A
-        // newer same-key preview that lands after this unwind keeps its
-        // entry; one that landed before was already superseded by the
-        // re-insert above, so its Confirm collapses to PREVIEW_EXPIRED
-        // (fail closed, re-preview recovers) instead of running on a
-        // mismatched audit row.
+        // Unwind only this attempt's own entry, matched by request id, and
+        // restore the preview it displaced so the earlier Confirm survives
+        // the failed replacement. A newer same-key preview that superseded
+        // this attempt keeps its entry and row: the ownership check fails
+        // and nothing is restored.
         let recorded = match self.store.try_record_audit(&row).await {
             Ok(recorded) => recorded,
             Err(error) => {
                 if plan.armed {
-                    let _removed = self
-                        .preview_pending
-                        .lock()
-                        .map(|mut pending| pending.cancel_owned(pending_key, &interaction_id, now));
+                    self.unwind_preview_replacement(pending_key, &interaction_id, displaced, now);
                 }
                 return Err(error.into());
             }
         };
         if !recorded {
             if plan.armed {
-                let _removed = self
-                    .preview_pending
-                    .lock()
-                    .map(|mut pending| pending.cancel_owned(pending_key, &interaction_id, now));
+                self.unwind_preview_replacement(pending_key, &interaction_id, displaced, now);
             }
             return Ok(ChannelReply::refused(
                 "Could not record the preview audit row; try again. Nothing was rendered and nothing was changed.",

@@ -141,6 +141,48 @@ impl PendingStore {
         }
     }
 
+    /// Clone the live entry for `key`, if any. `execute_preview` peeks before
+    /// a same-key replacement so a failed replacement can restore what it
+    /// displaced (see [`PendingStore::unwind_replacement`]).
+    pub fn peek(&mut self, key: ActorKey, now: i64) -> Option<PendingEntry> {
+        self.sweep(now);
+        self.entries.get(&key).cloned()
+    }
+
+    /// Unwind a failed same-key replacement: drop this attempt's entry only
+    /// when it still owns `key`, then restore the displaced `prior` (when it
+    /// is still live) in the same critical section, so the earlier Confirm
+    /// survives a failed replacement. A newer same-key preview that
+    /// superseded this attempt keeps its entry and row: the ownership check
+    /// fails and nothing is restored. Returns whether this attempt owned
+    /// the entry.
+    pub fn unwind_replacement(
+        &mut self,
+        key: ActorKey,
+        preview_request_id: &str,
+        prior: Option<PendingEntry>,
+        now: i64,
+    ) -> bool {
+        self.sweep(now);
+        let owned = self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.preview_request_id == preview_request_id);
+        if !owned {
+            return false;
+        }
+        self.entries.remove(&key);
+        if let Some(entry) = prior {
+            // Cap-safe without re-checking: this key's slot just freed, no
+            // await intervenes while the store lock is held, and an expired
+            // prior stays swept away instead of being restored dead.
+            if entry.expires_at > now {
+                self.entries.insert(key, entry);
+            }
+        }
+        true
+    }
+
     #[must_use]
     pub fn len(&self, now: i64) -> usize {
         self.entries
@@ -504,6 +546,90 @@ mod tests {
             .expect("inserts");
         assert!(store.cancel_owned(key, "333", 5));
         assert_eq!(store.len(5), 0);
+    }
+
+    #[test]
+    fn unwind_replacement_restores_the_displaced_prior() {
+        let mut store = PendingStore::new();
+        let key = (1, 2, 3);
+        store
+            .insert(key, owned_entry('a', "111"), 1)
+            .expect("inserts");
+        let prior = store.peek(key, 2);
+        assert_eq!(
+            prior
+                .as_ref()
+                .map(|entry| entry.preview_request_id.as_str()),
+            Some("111"),
+            "peek clones the live entry without consuming it"
+        );
+        // A replacement supersedes the prior entry...
+        store
+            .insert(key, owned_entry('b', "222"), 2)
+            .expect("replaces");
+        assert!(store.take(key, &"a".repeat(32), 2).is_none());
+        // ...then its audit fails: the failed attempt unwinds and the prior
+        // preview's Confirm survives.
+        assert!(store.unwind_replacement(key, "222", prior, 3));
+        assert!(store.take(key, &"a".repeat(32), 3).is_some());
+        assert_eq!(store.len(3), 0);
+    }
+
+    #[test]
+    fn unwind_replacement_spares_a_superseding_preview() {
+        let mut store = PendingStore::new();
+        let key = (1, 2, 3);
+        store
+            .insert(key, owned_entry('a', "111"), 1)
+            .expect("inserts");
+        let prior = store.peek(key, 2);
+        store
+            .insert(key, owned_entry('b', "222"), 2)
+            .expect("replaces");
+        // A newer same-key preview supersedes the failed attempt before its
+        // unwind runs: the unwind restores nothing and keeps the newer entry.
+        store
+            .insert(key, owned_entry('c', "333"), 3)
+            .expect("replaces");
+        assert!(!store.unwind_replacement(key, "222", prior, 4));
+        assert_eq!(store.len(4), 1);
+        assert!(store.take(key, &"c".repeat(32), 4).is_some());
+        assert_eq!(store.len(4), 0);
+    }
+
+    #[test]
+    fn unwind_replacement_without_prior_removes_only_its_own_entry() {
+        let mut store = PendingStore::new();
+        let key = (1, 2, 3);
+        assert!(store.peek(key, 1).is_none());
+        store
+            .insert(key, owned_entry('b', "222"), 2)
+            .expect("inserts");
+        assert!(store.unwind_replacement(key, "222", None, 3));
+        assert_eq!(store.len(3), 0);
+        // A foreign request id unwinds nothing.
+        store
+            .insert(key, owned_entry('b', "222"), 4)
+            .expect("inserts");
+        assert!(!store.unwind_replacement(key, "999", None, 5));
+        assert_eq!(store.len(5), 1);
+    }
+
+    #[test]
+    fn unwind_replacement_drops_an_expired_prior() {
+        let mut store = PendingStore::new();
+        let key = (1, 2, 3);
+        let mut short_lived = owned_entry('a', "111");
+        short_lived.expires_at = 100;
+        store.insert(key, short_lived, 1).expect("inserts");
+        let prior = store.peek(key, 2);
+        store
+            .insert(key, owned_entry('b', "222"), 2)
+            .expect("replaces");
+        // The prior expired while the replacement was in flight: the unwind
+        // removes the failed entry but restores nothing dead.
+        assert!(store.unwind_replacement(key, "222", prior, 150));
+        assert_eq!(store.len(150), 0);
     }
 
     #[test]

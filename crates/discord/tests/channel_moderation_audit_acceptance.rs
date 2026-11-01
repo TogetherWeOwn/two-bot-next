@@ -507,7 +507,7 @@ impl ActionExecutor {
         panic!("read-command replies are outside this offline acceptance slice")
     }
 
-    pub async fn edit_interaction_response_with_components(
+    pub async fn edit_interaction_response_with_components_and_blocked_retry(
         &self,
         _application_id: u64,
         _interaction_token: &str,

@@ -108,6 +108,13 @@ pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this s
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
 pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 
+/// Slash names routed while dark (unpublished until their slice lands).
+/// Dispatch shadows each name (see `route_slash`), so a custom row under
+/// one could publish yet never execute. [`crate::custom_commands::reserved_command_names`]
+/// mirrors this set on the write path (`/command`, imports), so writes
+/// refuse the names instead of accepting rows that can never publish.
+pub const DARK_RESERVED_NAMES: &[&str] = &["lockdown-preview"];
+
 // --- handler identity ----------------------------------------------------------
 
 /// Which feature slice owns a routed slash command (parity §1 row).
@@ -910,10 +917,10 @@ impl InteractionRouter {
             reserved.extend(voice_command_names().iter().cloned());
         }
         reserved.insert("templateassistant".to_owned());
-        // `/lockdown-preview` is routed but dark until its publish slice
-        // lands: dispatch shadows the name (see `route_slash`), so a custom
-        // row under it could publish yet never execute.
-        reserved.insert("lockdown-preview".to_owned());
+        // Dark routed names (see [`DARK_RESERVED_NAMES`]): dispatch shadows
+        // each one until its publish slice lands, so a custom row under it
+        // could publish yet never execute.
+        reserved.extend(DARK_RESERVED_NAMES.iter().map(|name| (*name).to_owned()));
         reserved
     }
 

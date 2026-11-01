@@ -453,7 +453,8 @@ async fn preview_redelivered_interaction_refuses_without_second_row() {
     assert_eq!(reply.outcome, "lockdown_preview");
     assert_eq!(db.audit_count().await, 1);
     // Same interaction id redelivered: same reads, zero new audit rows, and
-    // the pending entry the first attempt armed is unwound.
+    // the failed replacement unwinds its own entry while restoring the
+    // first attempt's entry, so its Confirm survives the redelivery.
     let second = interaction(111, reason_options(), MANAGE_CHANNELS);
     let reply = handled(
         runtime.execute(&router, &second).await.unwrap(),
@@ -462,9 +463,10 @@ async fn preview_redelivered_interaction_refuses_without_second_row() {
     assert_eq!(reply.outcome, "refused");
     assert!(reply.digest32.is_none(), "redelivery renders nothing");
     assert_eq!(db.audit_count().await, 1, "redelivery writes no second row");
-    // A newer preview between the arming and the redelivery is superseded by
-    // the redelivery's re-insert, so its Confirm would expire fail-closed;
-    // the store itself stays clean and arms the next preview.
+    // A newer preview between the arming and the redelivery survives the
+    // redelivery's unwind: the redelivery restores the entry it displaced,
+    // so the newer Confirm keeps working; the store itself stays clean and
+    // arms the next preview.
     let newer = interaction(112, reason_options(), MANAGE_CHANNELS);
     let reply = handled(
         runtime.execute(&router, &newer).await.unwrap(),
@@ -540,6 +542,174 @@ async fn preview_rate_budget_refuses_without_reads_or_rows() {
         10,
         "the refused attempt audits nothing"
     );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn preview_respond_armed_attaches_confirm_and_cancel_buttons() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, armed_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+            ScriptedResponse::json(200, json!({"id": CHANNEL})),
+            ScriptedResponse::json(200, armed_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let request = interaction(140, reason_options(), MANAGE_CHANNELS);
+    assert_eq!(
+        runtime.respond(&router(true), &request).await,
+        Ok(true),
+        "an armed preview completes the ephemeral lifecycle"
+    );
+    let requests = mock.requests();
+    assert_eq!(requests[0].method, "POST");
+    assert!(requests[0].path.ends_with("/callback"));
+    let defer: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"], 64);
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(
+        edits.len(),
+        1,
+        "exactly one @original edit: {:?}",
+        requests
+            .iter()
+            .map(|r| (r.method.clone(), r.path.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        edits[0].path.contains("/webhooks/") && edits[0].path.ends_with("/messages/@original"),
+        "edit targets the interaction webhook: {}",
+        edits[0].path
+    );
+    let edit: Value = serde_json::from_slice(&edits[0].body).unwrap();
+    let content = edit["content"].as_str().unwrap();
+    assert!(content.contains("Lockdown preview"), "{content}");
+    assert!(content.contains("nothing was changed"), "{content}");
+    assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
+    // The armed edit carries exactly one action row with the Confirm and
+    // Cancel buttons. A text-only edit here would send no `components` at
+    // all, so this fails if the button wiring is reverted.
+    let components = edit["components"]
+        .as_array()
+        .expect("armed preview edit carries buttons");
+    assert_eq!(components.len(), 1, "one action row");
+    assert_eq!(components[0]["type"], 1);
+    let buttons = components[0]["components"]
+        .as_array()
+        .expect("the action row carries the buttons");
+    assert_eq!(buttons.len(), 2);
+    assert_eq!(buttons[0]["type"], 2);
+    assert_eq!(buttons[0]["label"], "Confirm lockdown");
+    assert_eq!(buttons[0]["style"], 4);
+    assert_eq!(buttons[1]["type"], 2);
+    assert_eq!(buttons[1]["label"], "Cancel");
+    assert_eq!(buttons[1]["style"], 2);
+    let confirm_id = buttons[0]["custom_id"]
+        .as_str()
+        .expect("confirm carries a custom id");
+    let cancel_id = buttons[1]["custom_id"]
+        .as_str()
+        .expect("cancel carries a custom id");
+    let confirm_digest = confirm_id
+        .strip_prefix(&format!("lockdown-preview:confirm:{ACTOR}:"))
+        .expect("confirm id names the actor");
+    let cancel_digest = cancel_id
+        .strip_prefix(&format!("lockdown-preview:cancel:{ACTOR}:"))
+        .expect("cancel id names the actor");
+    for digest in [confirm_digest, cancel_digest] {
+        assert_eq!(digest.len(), 32, "button carries digest32");
+        assert!(
+            digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "button digest is hex: {digest}"
+        );
+    }
+    assert_eq!(
+        confirm_digest, cancel_digest,
+        "both buttons address the same pending entry"
+    );
+    // The digest is deterministic over actor, channel, reason and live
+    // state (never the interaction id), so a second preview of the same
+    // channel arms the same digest: the buttons address the entry the
+    // planner armed.
+    let second = interaction(141, reason_options(), MANAGE_CHANNELS);
+    let reply = handled(
+        runtime.execute(&router(true), &second).await.unwrap(),
+        "lockdown-preview",
+    );
+    assert_eq!(
+        reply.digest32.as_deref(),
+        Some(confirm_digest),
+        "buttons address the armed pending entry"
+    );
+    assert_eq!(db.audit_count().await, 2);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn preview_respond_unarmed_and_refused_carry_no_buttons() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, unarmed_channel_doc()),
+            ScriptedResponse::json(200, everyone_only_roles_doc()),
+            ScriptedResponse::json(200, json!({"id": CHANNEL})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": CHANNEL})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    // Unarmed previews audit but arm nothing, so the edit is text-only.
+    let unarmed = interaction(142, reason_options(), MANAGE_CHANNELS);
+    assert_eq!(
+        runtime.respond(&router(true), &unarmed).await,
+        Ok(true),
+        "an unarmed preview completes the ephemeral lifecycle"
+    );
+    // A refused preview (no ManageChannels) reads nothing and edits text-only.
+    let refused = interaction(143, reason_options(), MANAGE_MESSAGES_ONLY);
+    assert_eq!(
+        runtime.respond(&router(true), &refused).await,
+        Ok(true),
+        "a refused preview still completes the deferred reply"
+    );
+    let requests = mock.requests();
+    assert_eq!(
+        requests.iter().filter(|r| r.method == "GET").count(),
+        2,
+        "only the unarmed preview reads: {:?}",
+        requests
+            .iter()
+            .map(|r| (r.method.clone(), r.path.clone()))
+            .collect::<Vec<_>>()
+    );
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(edits.len(), 2);
+    for edit_request in &edits {
+        let edit: Value = serde_json::from_slice(&edit_request.body).unwrap();
+        assert!(
+            edit.get("components").is_none(),
+            "unarmed and refused edits carry no buttons: {edit}"
+        );
+        assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
+    }
+    let refused_edit: Value = serde_json::from_slice(&edits[1].body).unwrap();
+    assert!(
+        contains_ci(refused_edit["content"].as_str().unwrap(), "manage channels"),
+        "refusal names the missing permission: {refused_edit}"
+    );
+    assert_eq!(db.audit_count().await, 1, "only the unarmed preview audits");
     mock.shutdown().await;
     db.close().await;
 }
