@@ -48,7 +48,7 @@ JOB_INVENTORY = {
                   "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
                               "production"},
-    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
+    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "user-flow-synthetic",
                            "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
@@ -844,11 +844,11 @@ def staging_pinned_sha_errors(workflows):
     it, enforces a full 40-hex shape and refuses anything that is not an
     ancestor of origin/main. Each SHA step refuses exactly four ways (shape,
     length, checkout equality, ancestry), pinned by exit count so no refusal
-    can go green. Exactly eight reads exist (three checkout refs, three
-    SHA-step envs, the schema gate's --source-sha env, the history guard's
-    comparison env): seven use the pinned expression and the eighth is the
-    guard's raw pin-vs-head comparison, so no other step can resolve or judge
-    a different commit. Build identity and provenance then follow the
+    can go green. Exactly nine reads exist (three checkout refs, three
+    SHA-step envs, the schema gate's --source-sha env, the user-flow
+    synthetic's expected SHA, the history guard's comparison env): eight use
+    the pinned expression and the ninth is the guard's raw pin-vs-head
+    comparison, so no other step can resolve or judge a different commit. Build identity and provenance then follow the
     validated SHA through the deploy job's DEPLOY_SHA export, pinned by
     staging_deploy_identity_errors. Every other workflow must not mention the
     switch at all, except deploy-production, which carries its own reviewed
@@ -862,11 +862,11 @@ def staging_pinned_sha_errors(workflows):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.sha") != 8:
-        errors.append("deploy-staging.yml: sha must be read exactly eight times "
+    if text.count("inputs.sha") != 9:
+        errors.append("deploy-staging.yml: sha must be read exactly nine times "
                       "(three checkouts, three SHA steps, the schema gate env, "
-                      "the history guard comparison)")
-    if text.count(DEPLOY_SHA_EXPRESSION) != 7:
+                      "the user-flow synthetic expected SHA, the history guard comparison)")
+    if text.count(DEPLOY_SHA_EXPRESSION) != 8:
         errors.append("deploy-staging.yml: every sha read but the history guard comparison "
                       "must use the pinned dispatch-or-head expression")
     jobs = staging.get("jobs") or {}
@@ -992,6 +992,62 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
                       "1 for unparsable/over-long/armed")
     if "uses" in step or "${{" in run:
         errors.append(f"{name}:soak-hold: step must use the environment only, never an inline expression")
+    return errors
+
+
+def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
+    """The exact-SHA user-flow synthetic gates promotion, read-only.
+
+    One job runs after the deploy with no Environment, no secret and no
+    write grant: it checks out the reviewed probe from the workflow head and
+    runs the read-only staging health-contract probe pinned to the deployed
+    dispatch-or-head SHA, refusing when the staging origin is unset.
+    certify-promotion needs it, so a red or skipped synthetic certifies no
+    bytes, and the production guard refuses a staging attempt without a
+    successful job of this exact name (scripts/test-deploy-production.py).
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("user-flow-synthetic") or {}
+    if job.get("name") != "staging user-flow synthetic (exact SHA)":
+        errors.append(f"{name}:user-flow-synthetic: job identity changed (the production guard reads it by name)")
+    if job.get("needs") != "deploy":
+        errors.append(f"{name}:user-flow-synthetic: must run after the deploy")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:user-flow-synthetic: must keep contents:read only")
+    if not runner_allowed("user-flow-synthetic", job.get("runs-on")):
+        errors.append(f"{name}:user-flow-synthetic: must use the routed runner expression "
+                      "for job 'user-flow-synthetic'")
+    for key in ("if", "uses", "environment", "services", "container",
+                "continue-on-error", "strategy", "concurrency"):
+        if key in job:
+            errors.append(f"{name}:user-flow-synthetic: must not set {key}")
+    text = str(job).lower()
+    if "secrets." in text or any(marker in text for marker in DEPLOY_MARKERS[:4]):
+        errors.append(f"{name}:user-flow-synthetic: must never read a secret or deploy")
+    steps = job.get("steps") or []
+    probes = [step for step in steps
+              if "staging_health_contract_probe.py" in str(step.get("run", ""))]
+    if len(probes) != 1 or any(key in probes[0] for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:user-flow-synthetic: must run the probe in exactly one unconditional step")
+    else:
+        probe = probes[0]
+        run = str(probe.get("run", ""))
+        if probe.get("env") != {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+                                "EXPECTED_SHA": DEPLOY_SHA_EXPRESSION}:
+            errors.append(f"{name}:user-flow-synthetic: probe must bind exactly the staging origin "
+                          "and the deployed dispatch-or-head SHA")
+        if '--expected-sha "$EXPECTED_SHA"' not in run or "set -euo pipefail" not in run:
+            errors.append(f"{name}:user-flow-synthetic: probe must enforce the exact deployed SHA")
+        if '[ -z "$STAGING_WORKER_URL" ]' not in run or "exit 1" not in run:
+            errors.append(f"{name}:user-flow-synthetic: an unset staging origin must fail, never pass empty")
+    checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+    if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != "${{ github.sha }}" \
+            or (checkouts[0].get("with") or {}).get("persist-credentials") != "false":
+        errors.append(f"{name}:user-flow-synthetic: must check out the reviewed workflow head without credentials")
+    certify = jobs.get("certify-promotion") or {}
+    if "user-flow-synthetic" not in (certify.get("needs") or []):
+        errors.append(f"{name}:certify-promotion: must need the user-flow synthetic")
     return errors
 
 
@@ -3830,6 +3886,7 @@ def workflow_policy_errors(workflows):
             errors.extend(staging_deploy_id_errors(workflow))
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
+            errors.extend(user_flow_synthetic_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
             errors.extend(roles_gate_errors(workflow))
         if name == "release.yml":
@@ -3931,6 +3988,8 @@ def workflow_policy_errors(workflows):
                 continue  # push-deferral gate: pinned by soak_hold_errors above
             if name == "deploy-staging.yml" and job_id == "pinned-history-guard":
                 continue  # pinned-drill verdict: pinned by pinned_history_guard_errors above
+            if name == "deploy-staging.yml" and job_id == "user-flow-synthetic":
+                continue  # read-only exact-SHA probe: pinned by user_flow_synthetic_errors above
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
@@ -6283,6 +6342,33 @@ class WorkflowTests(unittest.TestCase):
                     or roles_gate_errors(changed["deploy-staging.yml"]),
                     label,
                 )
+                self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_user_flow_synthetic_gates_certification_on_the_exact_sha(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        probe = lambda w: next(step for step in w["jobs"]["user-flow-synthetic"]["steps"]
+                               if "staging_health_contract_probe.py" in str(step.get("run", "")))
+        mutations = {
+            "renamed": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__("name", "synthetic"),
+            "conditional": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__("if", "false"),
+            "tolerated": lambda w: probe(w).__setitem__("continue-on-error", "true"),
+            "head sha only": lambda w: probe(w)["env"].__setitem__("EXPECTED_SHA", "${{ github.sha }}"),
+            "no sha pin": lambda w: probe(w).__setitem__(
+                "run", probe(w)["run"].replace('--expected-sha "$EXPECTED_SHA" ', "")),
+            "empty origin passes": lambda w: probe(w).__setitem__(
+                "run", probe(w)["run"].replace("exit 1", "exit 0")),
+            "secret read": lambda w: probe(w)["env"].__setitem__("TOKEN", "${{ secrets.X }}"),
+            "write grant": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__(
+                "permissions", {"contents": "write"}),
+            "certify ignores it": lambda w: w["jobs"]["certify-promotion"].__setitem__(
+                "needs", ["deploy", "voice-synthetic", "pinned-history-guard"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(self.workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(user_flow_synthetic_errors(changed["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
 
     def test_soak_hold_shell_behaves(self):

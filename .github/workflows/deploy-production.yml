@@ -19,7 +19,8 @@ name: deploy-production
 # triggering staging run did not succeed. The guard job refuses
 # a SHA that is not on main with a successful full `ci-ok` verdict and
 # `worker check` from the latest check.yml run/current attempt, plus a
-# successful deploy-staging run, except that a rollback (Worker version +
+# successful deploy-staging run whose exact-SHA user-flow synthetic job
+# succeeded in the same attempt, except that a rollback (Worker version +
 # container image) never needs staging history, and a live-SHA takeover
 # redeploy (`allow_unstaged` with `takeover`) waives it when the operator
 # confirms the SHA is live. A pre-deploy schema gate then runs the
@@ -570,6 +571,26 @@ jobs:
               staging_run = max(staging_runs, key=lambda run: (run["run_number"], run["id"]))
               if staging_run.get("status") != "completed" or staging_run.get("conclusion") != "success":
                   refuse(f"the latest deploy-staging run on {sha} is not a completed success")
+              # The exact-SHA user-flow synthetic is a promotion prerequisite,
+              # not only a scheduled check: a green run whose synthetic job
+              # was skipped, renamed or ran in another attempt certifies nothing.
+              staging_attempt = staging_run.get("run_attempt")
+              if type(staging_attempt) is not int or staging_attempt <= 0:
+                  refuse(f"the latest deploy-staging run on {sha} carries no verifiable attempt")
+              staging_jobs = collection(
+                  f"repos/{repo}/actions/runs/{staging_run['id']}/attempts/{staging_attempt}/jobs",
+                  "the latest deploy-staging attempt's jobs", "jobs",
+              )
+              synthetic = [job for job in staging_jobs
+                           if job.get("name") == "staging user-flow synthetic (exact SHA)"]
+              if len(synthetic) != 1 or any(
+                  job.get("run_id") != staging_run["id"] or job.get("run_attempt") != staging_attempt
+                  or job.get("head_sha") != sha
+                  or job.get("status") != "completed" or job.get("conclusion") != "success"
+                  for job in synthetic
+              ):
+                  refuse(f"the staging user-flow synthetic has no successful run on {sha} "
+                         "in the latest deploy-staging attempt")
 
           SNAPSHOT_ARTIFACT = "production-rollback-snapshot"
           SNAPSHOT_FILE = SNAPSHOT_ARTIFACT + ".json"
@@ -813,6 +834,11 @@ jobs:
                   + ("; deploy-staging green" if needs_staging else "; staging history waived")
                   + ")\n"
                   f"- Full CI: check.yml run `{ci['id']}`, attempt `{ci['run_attempt']}` (latest, completed/success)\n"
+                  + (
+                      f"- Staging user-flow synthetic: green on `{sha}` in deploy-staging run "
+                      f"`{staging_run['id']}`, attempt `{staging_run['run_attempt']}`\n"
+                      if staging_run else ""
+                  )
                   + (
                       f"- Approval: automated (PRODUCTION_AUTO_APPROVE), latest deploy-staging run `{staging_run['id']}` green\n"
                       if auto_approve and needs_staging else ""

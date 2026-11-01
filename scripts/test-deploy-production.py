@@ -169,6 +169,7 @@ def green():
         "worker check": {"check_runs": [check_run("worker check")]},
         "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]},
         "staging-all": {"total_count": 1, "workflow_runs": [staging_run()]},
+        "staging-jobs": {"total_count": 1, "jobs": [staging_synthetic_job()]},
         "environment": {
             "name": "production",
             "protection_rules": [
@@ -188,6 +189,16 @@ def staging_run(run_id=501, number=5, attempt=2, status="completed", conclusion=
     # fixed, and the guard forwards it verbatim as staging_attempt.
     return {"id": run_id, "run_number": number, "run_attempt": attempt,
             "head_sha": sha, "status": status, "conclusion": conclusion}
+
+
+STAGING_SYNTHETIC_JOB = "staging user-flow synthetic (exact SHA)"
+
+
+def staging_synthetic_job(run_id=501, attempt=2, sha=SHA, status="completed", conclusion="success",
+                          name=STAGING_SYNTHETIC_JOB):
+    """The exact-SHA user-flow synthetic job of the latest deploy-staging attempt."""
+    return {"name": name, "run_id": run_id, "run_attempt": attempt, "head_sha": sha,
+            "status": status, "conclusion": conclusion}
 
 
 SNAPSHOT_RUN_ID = 9100
@@ -766,6 +777,9 @@ class GuardBehaviourTests(unittest.TestCase):
                 key = "snapshot-run"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+", path):
                 key = "ci-run"
+            elif path == f"repos/{REPO}/actions/runs/501/attempts/2/jobs":
+                # The forwarded staging run (501, attempt 2): its user-flow synthetic job.
+                key = "staging-jobs"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+/attempts/[0-9]+/jobs", path):
                 key = "ci-jobs"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "head_sha" not in query:
@@ -1469,6 +1483,50 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs["staging_run_id"], "501")
         self.assertEqual(outputs["staging_attempt"], "2")
+
+    def test_promotion_requires_the_exact_sha_user_flow_synthetic(self):
+        # The synthetic job of the exact forwarded staging attempt must have
+        # succeeded: a green run whose synthetic was skipped, failed, renamed,
+        # duplicated or recorded against another attempt or SHA refuses.
+        code, _, summary, calls, _ = self.guard(auto="true")
+        self.assertEqual(code, 0)
+        self.assertIn((f"repos/{REPO}/actions/runs/501/attempts/2/jobs", {"per_page": "100", "page": "1"}),
+                      calls)
+        self.assertIn("Staging user-flow synthetic: green", summary)
+        cases = {
+            "missing": [],
+            "skipped": [staging_synthetic_job(conclusion="skipped")],
+            "failed": [staging_synthetic_job(conclusion="failure")],
+            "still running": [staging_synthetic_job(status="in_progress", conclusion=None)],
+            "renamed": [staging_synthetic_job(name="staging user-flow synthetic")],
+            "duplicated": [staging_synthetic_job(), staging_synthetic_job()],
+            "other attempt": [staging_synthetic_job(attempt=1)],
+            "other run": [staging_synthetic_job(run_id=500)],
+            "other sha": [staging_synthetic_job(sha="f" * 40)],
+        }
+        for name, jobs in cases.items():
+            with self.subTest(name=name):
+                result = self.guard(auto="true",
+                                    **{"staging-jobs": {"total_count": len(jobs), "jobs": jobs}})
+                self.assertRefused(result, "staging user-flow synthetic has no successful run")
+
+    def test_promotion_refuses_a_staging_run_without_a_verifiable_attempt(self):
+        for attempt in (None, 0, "2"):
+            with self.subTest(attempt=attempt):
+                run = {**staging_run(), "run_attempt": attempt}
+                result = self.guard(**{"staging-all": {"total_count": 1, "workflow_runs": [run]}})
+                self.assertRefused(result, "carries no verifiable attempt")
+
+    def test_waived_staging_history_never_reads_the_synthetic(self):
+        # Rollback and the live-SHA redeploy waive staging history, so the
+        # synthetic prerequisite never blocks recovery.
+        for kwargs in ({"rollback": VERSION, "sha": SHA},
+                       {"allow_unstaged": "true", "takeover": "true"}):
+            with self.subTest(**kwargs):
+                _, _, _, calls, _ = self.guard(
+                    **kwargs, **{"staging-jobs": failed_call()})
+                self.assertNotIn(f"repos/{REPO}/actions/runs/501/attempts/2/jobs",
+                                 [path for path, _ in calls])
 
     def test_reviewers_stay_required_unless_auto_approve_is_exactly_true(self):
         environment = {**green()["environment"], "protection_rules": []}
