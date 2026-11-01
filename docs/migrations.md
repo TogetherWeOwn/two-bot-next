@@ -110,7 +110,12 @@ candidate. A statement the serving build may not survive refuses the
 promotion: `DROP TABLE`/`COLUMN`/`TYPE`/`VIEW`/`SCHEMA`/`FUNCTION`/`SEQUENCE`,
 `RENAME`, `ALTER COLUMN ... TYPE`, `SET NOT NULL`, `DROP DEFAULT`,
 `TRUNCATE`, `REVOKE`, and `ADD COLUMN ... NOT NULL` without a `DEFAULT`.
-A rewritten or deleted migration always refuses.
+`COLUMN` may be omitted, as PostgreSQL allows; any top-level `DROP` other than
+`DROP INDEX` refuses; statements inside `DO` and function bodies are checked
+too. Comments and string literals are lexed out first, so a `--` or `;` in a
+literal hides nothing. Dynamic SQL inside an `EXECUTE '...'` string is not
+visible to the scan: keep it out of migrations, or annotate the file. A
+rewritten or deleted migration always refuses.
 
 Ship expand first, contract later: the contract migration lands only after
 every build that still reads the old shape has left production. When a

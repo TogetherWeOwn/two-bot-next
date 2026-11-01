@@ -115,6 +115,21 @@ class IncompatibleCodeTests(unittest.TestCase):
             "TRUNCATE t;": "truncate",
             "REVOKE SELECT ON t FROM app;": "revoke",
             "ALTER TABLE t ADD COLUMN c bigint NOT NULL;": "add_not_null_column_without_default",
+            # PostgreSQL lets COLUMN be omitted.
+            "ALTER TABLE t DROP c;": "drop_object",
+            "ALTER TABLE ONLY t DROP IF EXISTS c CASCADE;": "drop_object",
+            "ALTER TABLE t ADD c text NOT NULL;": "add_not_null_column_without_default",
+            "ALTER TABLE t ALTER c TYPE text;": "column_type_change",
+            "ALTER TABLE t ADD COLUMN a int, DROP COLUMN b;": "drop_object",
+            # A comment marker or semicolon inside a literal hides nothing.
+            "INSERT INTO config VALUES ('--'); ALTER TABLE t DROP COLUMN c;": "drop_object",
+            "INSERT INTO config VALUES ('/*'); ALTER TABLE t DROP c; -- */": "drop_object",
+            "INSERT INTO config VALUES ('a;b'); TRUNCATE t;": "truncate",
+            # Top-level DROP of anything but an index refuses conservatively.
+            "DROP TRIGGER t_audit ON t;": "drop_object",
+            "DROP POLICY p ON t;": "drop_object",
+            # A DO block runs its dollar-quoted body.
+            "DO $$ BEGIN ALTER TABLE t DROP COLUMN c; END $$;": "drop_object",
         }
         for sql, code in cases.items():
             with self.subTest(sql=sql):
@@ -131,6 +146,11 @@ class IncompatibleCodeTests(unittest.TestCase):
             "GRANT SELECT ON t TO app;",
             "-- DROP TABLE t; only a comment\nSELECT 1;",
             "/* RENAME later */ INSERT INTO t VALUES ('DROP TABLE x; TRUNCATE y');",
+            "ALTER TABLE t ADD CONSTRAINT c_pos CHECK (c > 0) NOT VALID;",
+            "ALTER TABLE t ADD PRIMARY KEY (id), DROP CONSTRAINT old_pk;",
+            "ALTER TABLE t ALTER COLUMN c SET DEFAULT 0, ADD COLUMN d int NOT NULL DEFAULT 1;",
+            'CREATE TABLE "drop" (id bigint);',
+            "DROP INDEX CONCURRENTLY IF EXISTS t_old;",
         ):
             with self.subTest(sql=sql):
                 self.assertIsNone(preflight.incompatible_code(sql))

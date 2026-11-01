@@ -65,40 +65,110 @@ MIGRATION = re.compile(r"crates/[a-z0-9_-]+/migrations/[0-9]{4}_[a-z][a-z0-9_]*\
 # A reviewed exception: the author states why the serving build still runs
 # against this schema. At least a short sentence, never an empty marker.
 OVERRIDE = re.compile(r"^--\s*rollback-compatible:\s*(\S.{9,})$", re.MULTILINE)
-# Statements the previous build cannot survive after a rollback. Matched per
-# statement after comments are stripped; the code names the first match.
+# Statements the previous build cannot survive after a rollback, matched on
+# lexed SQL (comments removed, literals and quoted identifiers blanked). The
+# code names the first match. PostgreSQL keywords that may be omitted
+# (`COLUMN` in ALTER TABLE actions) are optional here too.
 INCOMPATIBLE = (
-    ("drop_object", re.compile(
-        r"\bDROP\s+(TABLE|COLUMN|TYPE|VIEW|MATERIALIZED\s+VIEW|SCHEMA|FUNCTION|SEQUENCE)\b", re.I)),
     ("rename", re.compile(r"\bRENAME\b", re.I)),
-    ("column_type_change", re.compile(r"\bALTER\s+COLUMN\s+\S+\s+(SET\s+DATA\s+)?TYPE\b", re.I)),
+    ("column_type_change", re.compile(r"\bALTER\s+(?:COLUMN\s+)?\S+\s+(?:SET\s+DATA\s+)?TYPE\b", re.I)),
     ("set_not_null", re.compile(r"\bSET\s+NOT\s+NULL\b", re.I)),
     ("drop_default", re.compile(r"\bDROP\s+DEFAULT\b", re.I)),
     ("truncate", re.compile(r"\bTRUNCATE\b", re.I)),
     ("revoke", re.compile(r"\bREVOKE\b", re.I)),
 )
-ADD_COLUMN = re.compile(r"\bADD\s+COLUMN\b", re.I)
+# A top-level DROP is safe only for an index; anything else (table, type,
+# view, function, trigger, policy, ...) refuses conservatively.
+TOP_LEVEL_DROP = re.compile(r"(?:^|\b(?:BEGIN|THEN|ELSE|LOOP|DO)\s+)DROP\s+(?!INDEX\b)", re.I)
+ALTER_TABLE = re.compile(r"\bALTER\s+TABLE\b", re.I)
+# ALTER TABLE actions: DROP [COLUMN] <name> removes a column; dropping a
+# constraint, NOT NULL, identity or expression only loosens the schema.
+DROP_COLUMN = re.compile(r"^DROP\s+(?!CONSTRAINT\b|NOT\s+NULL\b|DEFAULT\b|IDENTITY\b|EXPRESSION\b)", re.I)
+# ADD [COLUMN] adds a column unless it adds a table constraint.
+ADD_COLUMN = re.compile(r"^ADD\s+(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|EXCLUDE\b)", re.I)
 NOT_NULL = re.compile(r"\bNOT\s+NULL\b", re.I)
 DEFAULT = re.compile(r"\bDEFAULT\b", re.I)
+DOLLAR_TAG = re.compile(r"\$[A-Za-z_]*\$")
+
+
+def lex(sql):
+    """SQL with comments removed and literals/quoted identifiers blanked.
+
+    One left-to-right pass, so a `--` inside a string never hides the
+    statement after it and a `;` inside a literal never splits a statement.
+    Handles '...' (with '' escapes), "...", -- and /* */; $tag$ delimiters
+    are dropped and their bodies lexed like any other SQL.
+    An unterminated literal or comment blanks the rest: never a pass.
+    """
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        char = sql[i]
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end < 0 else end
+            out.append(" ")
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            out.append(" ")
+        elif char in "'\"":
+            j = i + 1
+            while j < n:
+                if sql[j] == char:
+                    if j + 1 < n and sql[j + 1] == char:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = j + 1
+            out.append(" '' " if char == "'" else " q ")
+        elif char == "$" and DOLLAR_TAG.match(sql, i):
+            # Dollar-quoted bodies stay visible: a DO block runs them, so a
+            # DROP inside one must still refuse (a function body that only
+            # defines one is a reviewed rollback-compatible exception).
+            i += len(DOLLAR_TAG.match(sql, i).group(0))
+            out.append(" ")
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
 
 
 def statements(sql):
-    """SQL statements with comments and quoted literals blanked out."""
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
-    sql = re.sub(r"--[^\n]*", " ", sql)
-    sql = re.sub(r"'(?:[^']|'')*'", "''", sql)
-    return [part.strip() for part in sql.split(";") if part.strip()]
+    """Lexed statements, whitespace-normalized."""
+    return [" ".join(part.split()) for part in lex(sql).split(";") if part.strip()]
+
+
+def actions(statement):
+    """The comma-separated actions of an ALTER TABLE statement (top level only)."""
+    body = re.sub(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\S+\s*", "", statement, flags=re.I)
+    parts, depth, current = [], 0, []
+    for char in body:
+        depth += char == "("
+        depth -= char == ")"
+        if char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current).strip())
+    return [part for part in parts if part]
 
 
 def incompatible_code(sql):
     """The first backward-incompatible statement's code, or None."""
     for statement in statements(sql):
+        if TOP_LEVEL_DROP.search(statement):
+            return "drop_object"
         for code, pattern in INCOMPATIBLE:
             if pattern.search(statement):
                 return code
-        if ADD_COLUMN.search(statement) and NOT_NULL.search(statement) \
-                and not DEFAULT.search(statement):
-            return "add_not_null_column_without_default"
+        for alter in ALTER_TABLE.finditer(statement):
+            for action in actions(statement[alter.start():]):
+                if DROP_COLUMN.search(action):
+                    return "drop_object"
+                if ADD_COLUMN.search(action) and NOT_NULL.search(action) and not DEFAULT.search(action):
+                    return "add_not_null_column_without_default"
     return None
 
 
