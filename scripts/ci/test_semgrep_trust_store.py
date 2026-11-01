@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import ssl
 import subprocess
 import sys
@@ -117,6 +118,29 @@ class SemgrepTrustStoreTests(unittest.TestCase):
         self.assertIn("check", workflow["jobs"]["ci-ok"]["needs"])
         self.assertTrue(any("unittest discover -s scripts/ci -p 'test_*.py'" in s.get("run", "")
                             for s in lane["steps"]))
+
+    def test_requirements_lockfile_keeps_every_package_hash_pinned(self):
+        # The HARD lane installs with --require-hashes: a regenerated lockfile
+        # that drops a hash, duplicates a package or regresses the certifi
+        # GHSA-6q48-6c7w-9gw2 floor must fail here, before CI installs it.
+        text = (ROOT / "scripts/ci/semgrep-requirements.txt").read_text()
+        entries = re.findall(
+            r"^([A-Za-z0-9_.-]+)==(\S+) \\\n(?: {4}--hash=sha256:[0-9a-f]{64} ?\\\n)*"
+            r" {4}--hash=sha256:([0-9a-f]{64})$",
+            text, re.M)
+        self.assertGreaterEqual(len(entries), 60)
+        body = [line for line in text.splitlines()
+                if line.strip() and not line.startswith("#")]
+        # Two lines per entry (pin + final hash line); extra hash lines belong
+        # to their entry, so count entry headers instead of raw lines.
+        headers = [line for line in body if not line.startswith(" ")]
+        self.assertEqual(len(headers), len(entries))
+        names = [re.sub(r"[-_.]+", "-", name).lower() for name, _, _ in entries]
+        self.assertEqual(len(names), len(set(names)), "duplicate package in lockfile")
+        versions = dict(zip(names, (version for _, version, _ in entries)))
+        self.assertIn("semgrep", versions)
+        certifi = tuple(int(part) for part in versions["certifi"].split("."))
+        self.assertGreaterEqual(certifi, (2026, 10, 19))
 
 
 if __name__ == "__main__":

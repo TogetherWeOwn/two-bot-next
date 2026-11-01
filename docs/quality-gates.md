@@ -106,11 +106,13 @@ lint-only `check` lane.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
-## Scanner dependency triage (review by 2026-10-29)
+## Scanner dependency triage (review by 2026-11-16)
 
 The hash-pinned `scripts/ci/semgrep-requirements.txt` targets CI's CPython 3.11
 on Linux x86_64 in the Bookworm job container, not the bot or Worker runtime.
-Certifi 2026.10.19 fixes [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2).
+Certifi 2026.10.19 fixes [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2);
+the pin stays at or above that release (2026.10.23 as of the 2026-11-01
+regeneration below).
 After the hash-checked install, the HARD Semgrep step runs
 `python3 scripts/ci/check-semgrep-trust-store.py` against that installed
 `certifi.where()` bundle before scanning. It rejects the compromised emSign ECC
@@ -136,21 +138,64 @@ CI always uses the default installed bundle so reverting the dependency pin
 restores G3 and fails the required lane. This is a targeted trust-anchor regression,
 not a general Python dependency advisory audit.
 
-As of 2026-10-23, Semgrep 1.180.0 and the latest release, 1.182.1, both require
-`mcp==1.29.0` and `opentelemetry-api~=1.37.0`. Those constraints exclude the
-fixes for the two medium advisories:
-[MCP GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv)
-(fixed in 1.30.0) and
+Rechecked 2026-11-01: the latest Semgrep release, 1.183.0, still requires
+`mcp==1.29.0` and `opentelemetry-api~=1.37.0`. A resolver proof
+(`uv pip compile` with `semgrep>=1.180.0` plus the patched `mcp` or
+`opentelemetry-api` pin) fails as unsatisfiable, and forcing either patch
+backtracks to Semgrep 1.136.0/1.79.0, so no current Semgrep admits a patched
+graph. Five medium Dependabot alerts therefore stay open against this CI-only
+lockfile: MCP
+[GHSA-w4fh-qvv9-3v23](https://github.com/advisories/GHSA-w4fh-qvv9-3v23),
+[GHSA-5h93-6whr-6q8j](https://github.com/advisories/GHSA-5h93-6whr-6q8j),
+[GHSA-rwrf-2pqf-9j8j](https://github.com/advisories/GHSA-rwrf-2pqf-9j8j) and
+[GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv)
+(all fixed in `mcp` 1.30.0) and
 [OpenTelemetry GHSA-xcq7-p3pf-p88h](https://github.com/advisories/GHSA-xcq7-p3pf-p88h)
-(fixed in 1.45.1). Keep both alerts visible; do not override dependency
-constraints or remove hashes to force an incompatible graph.
+(fixed in `opentelemetry-api` 1.45.1). Upstream tracks the same dead end in
+semgrep/semgrep#11992 and #12018; the bump PR #12020 closed unmerged on
+2026-10-29. Keep the alerts visible; do not override dependency constraints
+or remove hashes to force an incompatible graph.
+
+Regenerating the lockfile (CPython 3.11 / Linux x86_64, Bookworm glibc):
+
+```sh
+# 1. Resolve the newest Semgrep-compatible graph. The certifi floor keeps the
+#    GHSA-6q48-6c7w-9gw2 fix even if an older Semgrep is ever resolved.
+printf 'semgrep\ncertifi>=2026.10.19\n' > "$SCRATCH/in.txt"
+uv pip compile --python-version 3.11 --only-binary :all: --no-emit-index-url \
+  "$SCRATCH/in.txt" -o "$SCRATCH/versions.txt"
+# Keep only the bare name==version lines as the download input.
+
+# 2. Download the exact wheels. Bookworm ships glibc 2.36, so cap the
+#    manylinux tiers there or pip plans wheels CI cannot install.
+python3 -m pip --isolated --disable-pip-version-check --no-cache-dir download \
+  --only-binary=:all: --python-version 3.11 --implementation cp \
+  --abi cp311 --abi abi3 --abi none \
+  --platform manylinux_2_17_x86_64 --platform manylinux_2_28_x86_64 \
+  --platform manylinux_2_31_x86_64 --platform manylinux_2_34_x86_64 \
+  --platform manylinux_2_35_x86_64 --platform manylinux_2_36_x86_64 \
+  --platform linux_x86_64 \
+  --requirement "$SCRATCH/versions.txt" --dest "$SCRATCH/wheels"
+
+# 3. Emit one --hash per package: SHA-256 of the downloaded wheel for a changed
+#    version. For an unchanged version keep the existing hash: packages with
+#    several manylinux tiers (and protobuf, which also has a pure wheel) make
+#    an off-CI download pick a different tier than CI's pip.
+# 4. Cross-check every emitted hash against the PyPI JSON metadata for that
+#    release, then replay the CI install itself with a CPython 3.11
+#    interpreter (for example `uv python install 3.11`):
+python3.11 -m pip --isolated --disable-pip-version-check --no-cache-dir install \
+  --only-binary=:all: --require-hashes \
+  --requirement scripts/ci/semgrep-requirements.txt --target "$SCRATCH/installed"
+PYTHONPATH="$SCRATCH/installed" python3.11 scripts/ci/check-semgrep-trust-store.py
+```
 
 Bounded mitigation: use this environment only for the existing one-shot
 `semgrep scan` with vendored rules. Do not start an MCP/Streamable HTTP server
 or an inbound instrumented HTTP service with it. Those are the inbound paths
 these advisories require; this is a reachability assessment, not a claim that
 the packages are patched. CI maintainers must re-check upstream constraints by
-**2026-10-29** and upgrade the compatible graph when available. Reassess sooner
+**2026-11-16** and upgrade the compatible graph when available. Reassess sooner
 if scanner invocation or advisory scope changes. No scan gate or permission
 is relaxed by this mitigation.
 
