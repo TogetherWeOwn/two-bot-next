@@ -8,7 +8,7 @@
 mod cases;
 
 use two_bot_core::automation_transfer::{diff_import, max_import_entries, parse_import_document};
-use two_bot_core::custom_commands::reserved_command_names;
+use two_bot_core::custom_commands::{max_custom_commands, reserved_command_names};
 
 fn assert_case(name: &str) {
     let case = cases::cases()
@@ -80,7 +80,7 @@ planner_case!(valid_control_same_content_converges_without_overwrite);
 #[test]
 fn capacity_counts_unique_accepted_names_not_duplicate_occurrences() {
     let existing = vec![cases::row("seed", "S", None, true)];
-    let max = max_import_entries();
+    let max = max_custom_commands(reserved_command_names().len());
     // One existing row + max-1 new names fits. The last occurrence converges
     // with fresh-0 instead of consuming another command slot.
     let mut commands: Vec<_> = (0..max - 1)
@@ -100,7 +100,7 @@ fn capacity_counts_unique_accepted_names_not_duplicate_occurrences() {
 #[test]
 fn capacity_refuses_one_more_unique_name_at_the_reserved_boundary() {
     let existing = vec![cases::row("seed", "S", None, true)];
-    let max = max_import_entries();
+    let max = max_custom_commands(reserved_command_names().len());
     let commands: Vec<_> = (0..max)
         .map(|i| cases::command(&format!("fresh-{i}"), "T", None))
         .collect();

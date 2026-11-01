@@ -2857,7 +2857,7 @@ fn import_parse_error(error: ImportParseError) -> ActionError {
             "automation_import_entries_not_array",
         ),
         ImportParseError::TooManyEntries { .. } => (
-            "import holds more entries than the guild budget allows",
+            "import holds more entries than the guild command limit allows",
             "automation_import_too_many_entries",
         ),
         ImportParseError::BadOverwrite => (

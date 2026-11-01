@@ -458,10 +458,33 @@ pub const REOPEN_DESCRIPTION: &str =
 /// First definition wins on a repeated name (legacy silently let the last
 /// writer win — see the `/attendance` collision note above), reserved names
 /// shadow custom commands, and the Discord 100-command ceiling is enforced.
+/// Custom commands past the ceiling are withheld (see [`merge_registry`]).
 pub fn merge_commands(
     additional_builtins: &[Vec<CommandDefinition>],
     custom: &[CustomCommand],
 ) -> Result<Vec<CommandDefinition>, RegistryError> {
+    merge_registry(additional_builtins, custom).map(|merged| merged.commands)
+}
+
+/// A merged guild registry plus the enabled custom commands that did not fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedRegistry {
+    pub commands: Vec<CommandDefinition>,
+    /// Enabled custom names left out because the ceiling was reached, in
+    /// input order. Empty whenever every enabled custom command fits.
+    pub withheld: Vec<String>,
+}
+
+/// [`merge_commands`] with the overflow reported. Builtins always publish; a
+/// builtin set over the ceiling is a build defect and fails. Custom commands
+/// fill the remaining slots in input order (the store lists them by name), and
+/// the rest are withheld instead of failing the whole sync. A guild that
+/// stored the old maximum before a release added a builtin therefore still
+/// publishes the new builtin, and the same rows are withheld on every sync.
+pub fn merge_registry(
+    additional_builtins: &[Vec<CommandDefinition>],
+    custom: &[CustomCommand],
+) -> Result<MergedRegistry, RegistryError> {
     let mut merged: Vec<CommandDefinition> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -478,16 +501,21 @@ pub fn merge_commands(
     }
 
     let mut custom_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut withheld = Vec::new();
     for cmd in custom.iter().filter(|c| c.enabled) {
         if seen.contains(&cmd.name) || !custom_seen.insert(cmd.name.clone()) {
             continue;
         }
+        if merged.len() >= GUILD_COMMAND_LIMIT {
+            withheld.push(cmd.name.clone());
+            continue;
+        }
         merged.push(CommandDefinition::new(&cmd.name, &cmd.description).options(Vec::new()));
     }
-    if merged.len() > GUILD_COMMAND_LIMIT {
-        return Err(RegistryError::TotalLimit(merged.len()));
-    }
-    Ok(merged)
+    Ok(MergedRegistry {
+        commands: merged,
+        withheld,
+    })
 }
 
 /// A DB-backed custom command (two-bot `/command` builder rows).
@@ -503,8 +531,6 @@ pub struct CustomCommand {
 pub enum RegistryError {
     #[error("built-in commands ({0}) exceed Discord's guild limit of 100")]
     BuiltinLimit(usize),
-    #[error("merged command set ({0}) exceeds Discord's guild limit of 100")]
-    TotalLimit(usize),
 }
 
 #[cfg(test)]
@@ -653,21 +679,26 @@ mod tests {
                     expected.push(CommandDefinition::new(&cmd.name, &cmd.description));
                 }
             }
-            let actual = merge_commands(&[builtins, duplicates], &custom);
+            let actual = merge_registry(&[builtins, duplicates], &custom);
             // 7 core (rank, leaderboard, help, privacy, reopen, welcome-preview,
             // game-mix) plus generated builtins; duplicates add no new names.
             if builtin_count + 7 > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 7)));
-            } else if expected.len() > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
+                // Overflow keeps the builtins and the first customs in input
+                // order; the rest are reported, never silently dropped.
+                let withheld = expected.split_off(expected.len().min(100))
+                    .into_iter().map(|d| d.name).collect::<Vec<_>>();
                 // Explicit first-wins pin on the forced pair: a last-wins
                 // implementation would surface "second-payload" here.
                 if let Ok(ref merged) = actual {
-                    let pinned = merged.iter().find(|d| d.name == "zzpropdup").unwrap();
-                    prop_assert_eq!(&pinned.description, "first-payload");
+                    if let Some(pinned) = merged.commands.iter().find(|d| d.name == "zzpropdup") {
+                        prop_assert_eq!(&pinned.description, "first-payload");
+                    } else {
+                        prop_assert!(merged.withheld.iter().any(|name| name == "zzpropdup"));
+                    }
                 }
-                prop_assert_eq!(actual, Ok(expected));
+                prop_assert_eq!(actual, Ok(MergedRegistry { commands: expected, withheld }));
             }
         }
     }
@@ -766,6 +797,44 @@ mod tests {
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");
         assert!(matches!(err, RegistryError::BuiltinLimit(101)));
+    }
+
+    #[test]
+    fn new_builtin_withholds_custom_overflow_instead_of_failing() {
+        // A guild filled the old budget (7 core + 3 builtins + 90 custom); the
+        // next release adds one builtin. It still publishes, at exactly 100,
+        // and the last custom command in store order is reported, not lost.
+        let builtins = |count: usize| {
+            (0..count)
+                .map(|i| CommandDefinition::new(&format!("builtin-{i}"), "builtin"))
+                .collect::<Vec<_>>()
+        };
+        let custom: Vec<CustomCommand> = (0..90)
+            .map(|i| CustomCommand {
+                name: format!("custom-{i:02}"),
+                description: "custom".to_owned(),
+                enabled: true,
+            })
+            .collect();
+        let before = merge_registry(&[builtins(3)], &custom).expect("old budget fits");
+        assert_eq!(before.commands.len(), 100);
+        assert!(before.withheld.is_empty());
+
+        let after = merge_registry(&[builtins(4)], &custom).expect("overflow still publishes");
+        assert_eq!(after.commands.len(), 100);
+        assert!(after.commands.iter().any(|d| d.name == "builtin-3"));
+        assert_eq!(after.withheld, ["custom-89"]);
+        assert_eq!(
+            merge_registry(&[builtins(4)], &custom).expect("repeat"),
+            after,
+            "the same rows are withheld on every sync"
+        );
+        // Paused rows take no slot, so pausing one brings the overflow back.
+        let mut paused = custom.clone();
+        paused[0].enabled = false;
+        let healed = merge_registry(&[builtins(4)], &paused).expect("fits again");
+        assert!(healed.withheld.is_empty());
+        assert!(healed.commands.iter().any(|d| d.name == "custom-89"));
     }
 
     #[test]
