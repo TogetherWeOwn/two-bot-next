@@ -28,6 +28,7 @@
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
+const path = require("node:path");
 
 const SKIP_REASONS = new Set(["quiet-day", "rollback", "digest-already-published"]);
 // release.yml uploads these to every digest; sbom.yml names the two inventories.
@@ -105,11 +106,28 @@ function aheadOfLive(sha) {
 	}
 }
 
+// The bot's note sections live in release-please-config.json (Common
+// Changelog headings, `security` under Fixed); the shared releaser
+// validates and freezes them into the plan. Fail closed on a missing or
+// malformed list instead of silently falling back to built-in headings.
+function changelogSections() {
+	const config = JSON.parse(
+		fs.readFileSync(path.join(__dirname, "..", "..", "release-please-config.json"), "utf8"),
+	);
+	const sections = config.packages?.["."]?.["changelog-sections"];
+	if (!Array.isArray(sections) || sections.length === 0)
+		throw new Error("release-please-config.json must list changelog-sections for the digest notes");
+	return sections;
+}
+
 function request() {
 	const sha = prodSha();
 	const plan = {
 		phase: "plan",
-		input: { channel: "stable", policy: "live-digest", sha, operation: `daily-digest/${sha}` },
+		input: {
+			channel: "stable", policy: "live-digest", sha,
+			operation: `daily-digest/${sha}`, sections: changelogSections(),
+		},
 	};
 	output({ request: JSON.stringify(plan) });
 }

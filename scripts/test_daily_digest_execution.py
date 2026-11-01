@@ -118,6 +118,11 @@ class DigestExecutionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         request = json.loads(outputs["steps.request.outputs.request"])
         self.assertEqual(request["input"]["sha"], SHA)
+        config = json.loads((ROOT / "release-please-config.json").read_text())
+        self.assertEqual(request["input"]["sections"],
+                         config["packages"]["."]["changelog-sections"])
+        self.assertIn({"type": "security", "section": "Fixed"},
+                      request["input"]["sections"])
         plan = {"schema": "calver-plan-v1", "sha": SHA, "policy": "live-digest", "tag": "v2026.1101.0"}
         context.update({"steps.plan.outputs.plan": json.dumps(plan),
                         "steps.plan.outputs.previous-stable-tag": "v2026.10.23"})

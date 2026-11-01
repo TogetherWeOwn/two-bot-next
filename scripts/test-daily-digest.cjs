@@ -71,13 +71,25 @@ assert.equal(assetsMissing({ assets: partial }), true);
 assert.equal(assetsMissing({}), true);
 
 // request: the live-digest plan binds the SHA as its operation, so a retry
-// for the same build recovers the frozen plan.
+// for the same build recovers the frozen plan. It also carries the bot's
+// changelog sections from release-please-config.json, so the shared
+// releaser keeps the Common Changelog headings (security under Fixed).
+const CONFIG_SECTIONS = JSON.parse(
+  fs.readFileSync(path.join(__dirname, '..', 'release-please-config.json'), 'utf8'),
+).packages['.']['changelog-sections'];
 let r = run('request');
 assert.equal(r.status, 0, r.stderr);
 assert.deepEqual(JSON.parse(r.outputs.request), {
   phase: 'plan',
-  input: { channel: 'stable', policy: 'live-digest', sha: SHA, operation: `daily-digest/${SHA}` },
+  input: {
+    channel: 'stable', policy: 'live-digest', sha: SHA,
+    operation: `daily-digest/${SHA}`, sections: CONFIG_SECTIONS,
+  },
 });
+assert.deepEqual(
+  JSON.parse(r.outputs.request).input.sections.find(s => s.type === 'security'),
+  { type: 'security', section: 'Fixed' },
+);
 assert.deepEqual(r.calls, []);
 for (const bad of ['', 'abc', 'z'.repeat(40), `${SHA}0`]) {
   r = run('request', { PROD_SHA: bad });

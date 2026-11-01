@@ -80,11 +80,12 @@ CI and review on `main`.
   (`chore`, `ci`, ...); its notes say there are no user-facing changes.
 - A new digest becomes "Latest" only when no numerically later stable tag
   exists; repairs never move Latest backwards.
-- Notes use the shared releaser's sections: Features (`feat`), Bug Fixes
-  (`fix`), Performance Improvements (`perf`), Reverts (`revert`) and
-  Documentation (`docs`), plus `BREAKING CHANGE` footers. The releaser does
-  not yet read `release-please-config.json` (`changelog-sections`), so
-  `security` commits no longer appear in the notes.
+- Notes use the bot's own sections: the adapter passes the
+  `changelog-sections` from `release-please-config.json` in the plan request,
+  and the shared releaser freezes them into the plan. The headings stay
+  Common Changelog: Changed (`perf`, `revert`), Added (`feat`) and Fixed
+  (`fix`, `security`), plus `BREAKING CHANGE` footers; the config's hidden
+  types stay out. To retitle a heading, edit that config, not the releaser.
 - Notes use only commit subjects (plus `BREAKING CHANGE:` footers), so a PR body
   can no longer drop a note. The `pr-lint` commit-parse guard
   (`.github/scripts/commit-parse-guard.cjs`, `.github/release-parse-exceptions.txt`)
