@@ -547,6 +547,22 @@ class StaticGuardTests(unittest.TestCase):
         self.assertNotIn("--expected-sha", rollback_script)
         self.assertNotIn("${{", watch_script + rollback_script)
         self.assertGreaterEqual(int(value(children(JOBS["production"][1:], 4)["timeout-minutes"])), 150)
+    def test_deploy_notify_is_the_final_non_blocking_step(self):
+        production_steps = steps(JOBS["production"])
+        last = production_steps[-1]
+        self.assertEqual(last[0], "      - name: Notify the release log of this production change")
+        lines = [line.strip() for line in last]
+        # Never a gate: a Paperclip outage cannot fail or block a deploy or rollback.
+        self.assertIn("continue-on-error: true", lines)
+        self.assertIn("timeout-minutes: 2", lines)
+        self.assertIn("if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success' "
+                      "|| steps.rollback.outcome == 'failure')", lines)
+        text = "\n".join(last)
+        self.assertIn("PAPERCLIP_DEPLOY_WEBHOOK_SECRET: ${{ secrets.PAPERCLIP_DEPLOY_WEBHOOK_SECRET }}", text)
+        self.assertIn("PAPERCLIP_DEPLOY_WEBHOOK_URL: ${{ vars.PAPERCLIP_DEPLOY_WEBHOOK_URL }}", text)
+        script = inline_script("Notify the release log of this production change")
+        self.assertIn("../tooling/scripts/deploy_notify.py --from-workflow", script)
+        self.assertNotIn("${{", script)
 
     def test_pre_freeze_candidate_requires_the_full_latest_ci_verdict(self):
         row = next(line for line in (ROOT / "docs/cutover-sequence.md").read_text().splitlines()

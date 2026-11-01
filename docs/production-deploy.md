@@ -386,6 +386,29 @@ record is written before the watch; a watch rollback shows in the run
 summary and its evidence artifact. As after a manual rollback, set
 `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` after a watch rollback, or the next
 automatic run re-promotes the same build.
+## Deploy notifications
+
+The final step of the `production` job reports every production change to
+the release-verification webhook, which opens a verification card for the
+release manager and feeds the release log. One HMAC-SHA256-signed JSON
+record per run (`scripts/deploy_notify.py`):
+
+| Field | Value |
+| --- | --- |
+| `event` | `deploy`, or `rollback` for an operator rollback dispatch |
+| `outcome` | `success`, `rolled_back` (a gate failed and the in-run auto-rollback restored the snapshot) or `failed` |
+| `sha`, `versionId`, `imageDigest`, `previousVersionId` | the guarded SHA, the new (or restored) Worker version, the promoted image digest, the snapshot's previous version |
+| `runUrl`, `startedAt`, `finishedAt` | this run |
+| `reason` | for a rollback or failure: which gate failed |
+
+Bindings: repository variable `PAPERCLIP_DEPLOY_WEBHOOK_URL` (https) and
+secret `PAPERCLIP_DEPLOY_WEBHOOK_SECRET`. Headers `X-Paperclip-Timestamp` and
+`X-Paperclip-Signature: sha256=<HMAC(secret, "<timestamp>." + body)>`; the
+receiver allows 300 s of clock skew. The step is never a gate: it runs with
+`continue-on-error`, a 2-minute timeout, and only a notice when the bindings
+are unset. The daily release audit cross-checks GitHub runs, so a lost
+delivery is still caught. Values outside their allowlisted shapes are sent as
+`null`; the step never prints the secret, the signature or the response.
 
 ## Production error-rate gate
 
