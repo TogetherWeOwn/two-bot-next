@@ -62,10 +62,10 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        decode_configuration, export_configuration, validate_configuration,
-        validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory,
-        RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
-        VOICE_CONFIG_VERSION,
+        decode_configuration, drop_deleted_command_roles, export_configuration,
+        validate_configuration, validate_time_zone_change, ChannelKind, ChannelReference,
+        GuildInventory, RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration,
+        MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, render_review_preview,
@@ -14620,7 +14620,7 @@ where
                 return true;
             }
             let (store, _) = runtime.make_pair();
-            let config = match store.config_snapshot(guild_id).await {
+            let mut config = match store.config_snapshot(guild_id).await {
                 Ok(config) => config,
                 Err(error) => {
                     log_admin_store_failure("export_read", guild_id, error);
@@ -14631,11 +14631,20 @@ where
                     return true;
                 }
             };
+            let dropped = drop_deleted_command_roles(&mut config, inventory);
+            let dropped_note = if dropped == 0 {
+                String::new()
+            } else {
+                format!(
+                    " Left out {dropped} deleted role(s) from /access command restrictions; \
+                     the restrictions still apply."
+                )
+            };
             match export_configuration(&config, inventory) {
                 Ok(bytes) => {
                     reply(export_file_response(
                         &format!(
-                            "Voice configuration for this server (v{}). Re-import it with /import.",
+                            "Voice configuration for this server (v{}). Re-import it with /import.{dropped_note}",
                             VOICE_CONFIG_VERSION
                         ),
                         export_filename(guild_id),

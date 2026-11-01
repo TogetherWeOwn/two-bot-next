@@ -65,9 +65,9 @@ proptest! {
 use two_bot_core::voice_access::VOICE_COMMANDS;
 use two_bot_core::voice_alias::MAX_ALIASES_PER_GUILD;
 use two_bot_core::voice_config::{
-    decode_configuration, export_configuration, import_configuration, validate_configuration,
-    ChannelKind, ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_LISTS,
-    MAX_LIST_CHOICES, MAX_LIST_TEXT_CHARS,
+    decode_configuration, drop_deleted_command_roles, export_configuration, import_configuration,
+    validate_configuration, ChannelKind, ChannelReference, GuildInventory, VoiceConfigError,
+    VoiceConfiguration, MAX_LISTS, MAX_LIST_CHOICES, MAX_LIST_TEXT_CHARS,
 };
 
 // Synthetic IDs only. Exercise every version-1 field without Discord or a DB.
@@ -608,6 +608,24 @@ fn duplicates_and_creator_standalone_overlap_are_rejected() {
         import_value(&value, &inventory),
         Err(VoiceConfigError::Invalid { .. })
     ));
+}
+
+#[test]
+fn export_drops_deleted_command_roles_and_keeps_the_restriction() {
+    let (config, inventory) = fixture();
+    let mut stale = config.clone();
+    stale.settings.command_roles[0].role_ids.push("999".into());
+    assert!(export_configuration(&stale, &inventory).is_err());
+    assert_eq!(drop_deleted_command_roles(&mut stale, &inventory), 1);
+    assert_eq!(stale, config);
+    // Every role deleted: the command stays restricted to admins.
+    let mut emptied = config.clone();
+    let command = emptied.settings.command_roles[0].command.clone();
+    emptied.settings.command_roles[0].role_ids = vec!["999".into(), "998".into()];
+    assert_eq!(drop_deleted_command_roles(&mut emptied, &inventory), 2);
+    assert_eq!(emptied.settings.command_roles[0].command, command);
+    assert!(emptied.settings.command_roles[0].role_ids.is_empty());
+    assert!(export_configuration(&emptied, &inventory).is_ok());
 }
 
 #[test]

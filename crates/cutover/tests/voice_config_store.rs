@@ -6,10 +6,13 @@ use serde_json::json;
 use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use two_bot_core::voice_access::{may_use_command, AccessDecision, AccessDenyReason, AccessMember};
+use two_bot_core::voice_access::{
+    may_use_command, AccessControls, AccessDecision, AccessDenyReason, AccessMember, VOICE_COMMANDS,
+};
 use two_bot_core::voice_config::{
     export_configuration, import_configuration, ChannelKind, ChannelReference, ChannelTemplates,
-    CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition, VoiceConfiguration,
+    CommandRoles, CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition,
+    VoiceConfiguration,
 };
 use two_bot_core::voice_rooms::{CreatorChannel, TextCompanion, VoiceRoom};
 use two_bot_core::voice_text_channel::TextChannelSettings;
@@ -322,16 +325,20 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(store.snapshot(GUILD).await?, stored);
 
     // 0469 backfill: a legacy-only restriction moves into the gate's store,
-    // an enforced one keeps its roles, and the legacy tables empty.
+    // an enforced one keeps its roles, a name the gate refuses is dropped
+    // (else the whole guild's row would fail to decode), and the legacy
+    // tables empty.
     sqlx::query(
         "INSERT INTO voice_command_roles (guild_id, command) VALUES
-           ('44','kick'), ('44','limit'), ('45','transfer')",
+           ('44','kick'), ('44','limit'), ('44','retired'), ('45','transfer'),
+           ('46','retired')",
     )
     .execute(pool)
     .await?;
     sqlx::query(
         "INSERT INTO voice_command_role_members (guild_id, command, role_id) VALUES
-           ('44','kick','2010'), ('44','kick','201'), ('45','transfer','7')",
+           ('44','kick','2010'), ('44','kick','201'), ('44','retired','3'),
+           ('45','transfer','7'), ('46','retired','3')",
     )
     .execute(pool)
     .await?;
@@ -356,6 +363,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         rooms.access_controls(45).await?.command_roles,
         BTreeMap::from([("transfer".to_owned(), vec![7])])
     );
+    assert_eq!(rooms.access_controls(46).await?, AccessControls::default());
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT (SELECT count(*) FROM voice_command_roles)
@@ -445,6 +453,25 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         .mention_member_ids = vec!["0301".to_owned()];
     let mut bad_settings = alternate(&config);
     bad_settings.settings.time_zone = "  ".to_owned(); // CHECK non-blank
+                                                       // The store refuses what the gate cannot read, even from a caller that
+                                                       // skipped the planner: an unknown command, or one command twice (the
+                                                       // JSON map would keep only the later entry).
+    let mut bad_command = alternate(&config);
+    bad_command.settings.command_roles = vec![CommandRoles {
+        command: "retired".to_owned(),
+        role_ids: vec!["201".to_owned()],
+    }];
+    let mut duplicate_command = alternate(&config);
+    duplicate_command.settings.command_roles = vec![
+        CommandRoles {
+            command: "kick".to_owned(),
+            role_ids: vec!["201".to_owned()],
+        },
+        CommandRoles {
+            command: "kick".to_owned(),
+            role_ids: Vec::new(),
+        },
+    ];
     let mut wrong_guild = alternate(&config);
     wrong_guild.guild_id = "43".to_owned();
     let mut wrong_version = alternate(&config);
@@ -457,6 +484,8 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         ("list blank choice", &bad_list),
         ("logging snowflake", &bad_logging),
         ("settings time zone", &bad_settings),
+        ("unknown command restriction", &bad_command),
+        ("duplicate command restriction", &duplicate_command),
         ("guild mismatch", &wrong_guild),
         ("version", &wrong_version),
     ] {
@@ -496,6 +525,23 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(store.snapshot(77).await?, concurrent);
     assert_eq!(rooms.creator_for(77, 7).await?, Some(creator));
     Ok(())
+}
+
+/// 0469 moves only names the gate accepts; its literal list must be
+/// `VOICE_COMMANDS` as of that migration.
+#[test]
+fn backfill_moves_exactly_the_gate_commands() {
+    let sql = include_str!("../migrations/0469_voice_command_roles_authority.sql");
+    let list = sql
+        .split_once("WHERE c.command IN (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("0469 filters by command")
+        .0;
+    let named: Vec<&str> = list
+        .split(',')
+        .map(|name| name.trim().trim_matches('\''))
+        .collect();
+    assert_eq!(named, VOICE_COMMANDS);
 }
 
 #[tokio::test]

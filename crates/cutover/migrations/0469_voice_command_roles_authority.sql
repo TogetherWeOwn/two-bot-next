@@ -12,7 +12,11 @@
 -- its enforced role list; a command only the legacy tables restrict is added.
 -- So the backfill never loosens a gate that is enforced today, and a legacy
 -- command with no member rows lands as an empty list (deny every non-admin),
--- the same meaning both stores give it. Role lists are canonical (numeric
+-- the same meaning both stores give it. Only names in
+-- `voice_access::VOICE_COMMANDS` move: the gate refuses a row holding any
+-- other name, which would block every voice command for the guild. The
+-- legacy tables accepted any non-blank name and the gate never read them, so
+-- dropping an unknown one loosens nothing. Role lists are canonical (numeric
 -- order). The deletes make a re-run a no-op. Backout: deploy the previous
 -- binary; the moved restrictions stay enforced, but its `/export` and
 -- `/import` no longer see them until they are re-imported. No member PII.
@@ -28,6 +32,12 @@ SELECT c.guild_id,
              WHERE m.guild_id = c.guild_id AND m.command = c.command),
            '[]'::jsonb))
   FROM voice_command_roles c
+ WHERE c.command IN (
+      'alias', 'alwaysprivate', 'channelinfo', 'create', 'defaultlimit',
+      'export', 'group', 'import', 'inheritpermissions', 'invite', 'kick',
+      'limit', 'logging', 'name', 'nick', 'ping', 'position', 'private',
+      'public', 'reclaim', 'setup', 'template', 'templateassistant',
+      'textchannels', 'transfer', 'unlimit')
  GROUP BY c.guild_id
 ON CONFLICT (guild_id) DO UPDATE
   SET command_roles = EXCLUDED.command_roles || voice_access_controls.command_roles;

@@ -281,6 +281,27 @@ pub fn export_configuration(
     Ok(compact)
 }
 
+/// Remove role IDs the guild no longer has from `settings.command_roles`
+/// and return how many went. `/access restrict` stores live role IDs and
+/// nothing prunes them when Discord deletes a role, so without this `/export`
+/// would refuse the whole guild. Enforcement is unchanged: nobody holds a
+/// deleted role, and a restriction left with no roles still denies every
+/// non-admin, which is what it did before.
+pub fn drop_deleted_command_roles(
+    config: &mut VoiceConfiguration,
+    inventory: &GuildInventory,
+) -> usize {
+    let mut dropped = 0;
+    for restriction in &mut config.settings.command_roles {
+        let before = restriction.role_ids.len();
+        restriction
+            .role_ids
+            .retain(|role| inventory.roles.get(role) == Some(&inventory.guild_id));
+        dropped += before - restriction.role_ids.len();
+    }
+    dropped
+}
+
 pub fn validate_configuration(
     config: &VoiceConfiguration,
     inventory: &GuildInventory,
