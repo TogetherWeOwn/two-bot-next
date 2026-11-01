@@ -3651,9 +3651,9 @@ jobs:
         run: python3 ../scripts/test-commit-parse-guard-ci.py
       - name: Verify the daily digest release (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        # Digest tags, notes, quiet-day and rollback skips, off-main refusal
-        # and the 200-commit ENOBUFS regression against a throwaway git
-        # repository (no network, no token).
+        # CalVer adapter modes: plan/publish requests, classified skips, SBOM
+        # redispatch and the stalled-production warning against a mocked gh
+        # (no network, no token).
         run: node ../scripts/test-daily-digest.cjs
       - name: Verify the production digest resolver (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_resolve.py -v

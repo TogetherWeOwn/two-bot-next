@@ -1,15 +1,19 @@
 name: daily-digest
 
-# Daily digest release (docs/releases.md): one tag vYYYY.MM.DD per day,
-# covering the live production commit with notes from Conventional Commit
-# subjects since the previous digest. Quiet days and rollbacks get no tag.
-# A failed cut or repair retains its owed-digest outputs so `alert` can open
-# the `daily-digest` incident issue for an agent. Dry runs never alert.
+# Daily digest release (docs/releases.md): at most one stable CalVer tag
+# vYYYY.MDD.P a day (P stays 0), covering the live production commit, cut by
+# the shared releaser's `live-digest` policy (TogetherWeOwn/.github
+# actions/calver, plan and publish steps pinned to the same commit). The
+# shared planner classifies quiet days, rollbacks and an already-issued day
+# as green skips with no tag. The bot adapter (.github/scripts/daily-digest.cjs)
+# keeps the live-SHA proof, the missing-digest alert outputs, Release repair
+# and the SBOM dispatch/redispatch. A failed publish retains its owed-digest
+# outputs so `alert` can open the `daily-digest` incident issue for an agent.
+# Dry runs plan and publish with zero writes and never alert.
 #
 # Resolve the live /readyz build revision through PRODUCTION_WORKER_URL,
 # falling back to the newest successful recorded production Deployment.
-# Fail closed if neither source is readable. Dispatch release.yml for both
-# fresh and existing digest releases, reconciling a lost SBOM dispatch.
+# Fail closed if neither source is readable.
 
 on:
   schedule:
@@ -51,7 +55,7 @@ jobs:
   digest:
     name: cut the daily digest tag and release
     permissions:
-      contents: write # Create the vYYYY.MM.DD tag and its GitHub Release.
+      contents: write # Create the vYYYY.MDD.P tag and its GitHub Release.
       deployments: read # Read recorded production Deployments when /readyz is unreadable.
       actions: write # Dispatch release.yml (GITHUB_TOKEN dispatches do start runs).
     if: github.ref == 'refs/heads/main'
@@ -59,8 +63,8 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'digest') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     outputs:
-      released: ${{ steps.digest.outputs.released }}
-      tag_name: ${{ steps.digest.outputs.tag_name }}
+      released: ${{ steps.record.outputs.released || steps.digest.outputs.released }}
+      tag_name: ${{ steps.record.outputs.tag_name || steps.digest.outputs.tag_name }}
       prod_changed: ${{ steps.digest.outputs.prod_changed }}
       live_sha: ${{ steps.resolve.outputs.live_sha }}
       prev_tag: ${{ steps.digest.outputs.prev_tag }}
@@ -68,9 +72,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          # Full history and tags: note ranges and origin/main ancestry guard.
-          fetch-depth: 0
-          fetch-tags: true
+          # Adapter scripts only: the shared releaser reads tags and history
+          # through the API and never checks out the tagged commit.
+          fetch-depth: 1
           persist-credentials: false
       - name: Resolve the live production SHA
         id: resolve
@@ -78,28 +82,60 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
         run: python3 scripts/digest_resolve.py
-      - name: Cut the digest tag and publish its release
+      - name: Build the live-digest plan request
+        id: request
+        env:
+          PROD_SHA: ${{ steps.resolve.outputs.live_sha }}
+        run: node .github/scripts/daily-digest.cjs request
+      - name: Plan the CalVer digest (read-only)
+        id: plan
+        uses: TogetherWeOwn/.github/actions/calver@f9529e6d493148ae7e3b8c9f2c5f40cf808ca354
+        with:
+          runs-on-json: '"ubuntu-latest"'
+          request: ${{ steps.request.outputs.request }}
+      - name: Classify the plan and persist the owed digest
         id: digest
         env:
           PROD_SHA: ${{ steps.resolve.outputs.live_sha }}
+          SKIPPED: ${{ steps.plan.outputs.skipped }}
+          REASON: ${{ steps.plan.outputs.reason }}
+          PLAN: ${{ steps.plan.outputs.plan }}
+          PREV_TAG: ${{ steps.plan.outputs.previous-stable-tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run }}
-        run: node .github/scripts/daily-digest.cjs
+        run: node .github/scripts/daily-digest.cjs adapt
+      - name: Publish the CalVer tag and Release
+        id: publish
+        if: steps.digest.outputs.publish == 'true'
+        uses: TogetherWeOwn/.github/actions/calver@f9529e6d493148ae7e3b8c9f2c5f40cf808ca354
+        with:
+          runs-on-json: '"ubuntu-latest"'
+          request: ${{ steps.digest.outputs.publish_request }}
+      - name: Record the published digest
+        id: record
+        if: steps.publish.outcome == 'success'
+        env:
+          CREATED: ${{ steps.publish.outputs.created }}
+          TAG: ${{ steps.publish.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: node .github/scripts/daily-digest.cjs record
       - name: Dispatch the SBOM chain for the digest tag
-        if: steps.digest.outputs.released == 'true'
+        if: steps.record.outputs.sbom_tag != '' || steps.digest.outputs.sbom_tag != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.digest.outputs.tag_name }}
+          TAG: ${{ steps.record.outputs.sbom_tag || steps.digest.outputs.sbom_tag }}
         run: gh workflow run release.yml --ref main -f release_tag="$TAG"
 
   alert:
     name: alert on a missing digest
     needs: digest
-    # The script emits prod_changed=true/released=false before fallible cut
-    # or repair work, then overwrites released on success. Consume outputs
-    # even when that step failed; SBOM-only failures have released=true.
+    # The adapter emits prod_changed=true/released=false before the publish
+    # step; record overwrites released on success. Consume outputs even when
+    # publication failed; SBOM-only failures have released=true.
     # Quiet days, rollbacks, already-cut releases and dry runs never alert.
     if: ${{ !cancelled() && needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true' && inputs.dry_run != true }}
     permissions:

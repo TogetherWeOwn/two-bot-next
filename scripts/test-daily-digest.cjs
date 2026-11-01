@@ -1,221 +1,179 @@
 #!/usr/bin/env node
 'use strict';
 
-// Offline tests for daily-digest.cjs: parsing, note rendering, quiet-day skip,
-// rollback guard, off-main refusal, invalid dates, and the 1 MiB ENOBUFS
-// regression (a 200-commit range above 1 MiB must not crash).
-//
-// Dry runs against a throwaway git repository, plus one non-dry-run fresh cut
-// against a mocked gh (no network, no live gh calls).
+// Offline tests for the daily-digest adapter around the shared CalVer
+// releaser: the plan request, skip classification, owed-digest outputs,
+// SBOM redispatch, the stalled-production warning and dry runs. gh is a
+// mock on PATH; no network and no live gh calls.
 
 const assert = require('node:assert/strict');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
 const SCRIPT = process.env.DAILY_DIGEST || path.join(__dirname, '..', '.github', 'scripts', 'daily-digest.cjs');
-const { parseCommit, parseDigestTag, parseTag, renderNotes, LOG_MAX_BUFFER } = require(SCRIPT);
+const { SBOM_ASSETS, assetsMissing } = require(SCRIPT);
 
-const c = (subject, body = '') => parseCommit('a'.repeat(40), subject, body);
+const SHA = 'b'.repeat(40);
+const dir = fs.mkdtempSync(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || os.tmpdir(), 'daily-digest-'));
+const ghLog = path.join(dir, 'gh-calls.log');
+fs.writeFileSync(path.join(dir, 'gh'), [
+  '#!/bin/sh',
+  `echo "$@" >> "${ghLog}"`,
+  'if [ "$1" = "release" ] && [ "$2" = "view" ]; then',
+  '  [ -n "$RELEASE_VIEW_JSON" ] || exit 1',
+  '  printf "%s" "$RELEASE_VIEW_JSON"; exit 0',
+  'fi',
+  'if [ "$1" = "api" ]; then [ -n "$AHEAD_BY" ] || exit 1; echo "$AHEAD_BY"; exit 0; fi',
+  'exit 1',
+  '',
+].join('\n'));
+fs.chmodSync(path.join(dir, 'gh'), 0o755);
 
-// Parsing (reused rendering).
-assert.deepEqual(c('feat(voice): add rooms (#12)'),
-  { sha: 'a'.repeat(40), type: 'feat', scope: 'voice', breaking: false, desc: 'add rooms', pr: 12 });
-assert.equal(c('fix!: drop legacy flag').breaking, true);
-assert.equal(c('fix: x', 'BREAKING CHANGE: removed y').breaking, true);
-assert.equal(c('Merge branch main'), null);
-assert.equal(c('feat(): empty scope'), null);
-
-// Digest tag parsing: real calendar dates only.
-assert.equal(parseDigestTag('v2026.10.21'), 'v2026.10.21');
-assert.equal(parseDigestTag('v2026.02.29'), null, '2026 is not a leap year');
-assert.equal(parseDigestTag('v2024.02.29'), 'v2024.02.29');
-assert.equal(parseDigestTag('v2026.13.01'), null);
-assert.equal(parseDigestTag('v1.2.3'), null, 'semver is not a digest');
-assert.equal(parseDigestTag('v2026.1.1'), null, 'unpadded is not canonical');
-assert.deepEqual(parseTag('v1.2.3'), [1, 2, 3]);
-
-// The log buffer covers ~20x the 1.36 MB range that crashed the 1 MiB default.
-assert.ok(LOG_MAX_BUFFER >= 20 * 1024 * 1024, `LOG_MAX_BUFFER=${LOG_MAX_BUFFER}`);
-
-// Notes: digest title, visible sections only, scope-sorted, hidden dropped.
-const sections = [
-  { type: 'feat', section: 'Added' }, { type: 'fix', section: 'Fixed' },
-  { type: 'security', section: 'Fixed' }, { type: 'chore', section: 'Miscellaneous', hidden: true },
-];
-const notes = renderNotes({
-  tag: 'v2026.10.21', prevTag: 'v2026.10.20', date: '2026-10-21', sections, repoUrl: 'https://github.com/o/r',
-  commits: [c('fix(b): second (#2)'), c('feat(z): last (#3)'), c('fix(a): first'), c('chore: hidden (#9)'), c('security: patch')],
-});
-assert.match(notes, /^## \[v2026\.10\.21\]\(https:\/\/github\.com\/o\/r\/compare\/v2026\.10\.20\.\.\.v2026\.10\.21\) \(2026-10-21\)/);
-assert.ok(notes.indexOf('### Added') < notes.indexOf('### Fixed'));
-assert.ok(notes.indexOf('**a:** first') < notes.indexOf('**b:** second'));
-assert.ok(notes.includes('* patch ([aaaaaaa]'));
-assert.ok(notes.includes('([#2](https://github.com/o/r/issues/2))'));
-assert.ok(!notes.includes('hidden'));
-assert.ok(!notes.includes('BREAKING'));
-assert.match(renderNotes({ tag: 'v2026.10.21', prevTag: 'v2026.10.20', date: 'd', sections, repoUrl: 'u', commits: [c('chore: x')] }),
-  /No user-facing changes/);
-assert.match(renderNotes({ tag: 'v2026.10.21', prevTag: 'v2026.10.20', date: 'd', sections, repoUrl: 'u', commits: [c('feat!: x')] }),
-  /### ⚠ BREAKING CHANGES\n\n\* x/);
-
-// Dry runs on a real repository: fresh cut, quiet day, rollback guard,
-// already-cut today, semver continuity, off-main refusal.
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-digest-'));
-const g = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' }).trim();
-g('init', '-q', '-b', 'main');
-g('config', 'user.email', 't@example.invalid');
-g('config', 'user.name', 't');
-fs.writeFileSync(path.join(dir, 'release-please-config.json'), JSON.stringify({
-  packages: { '.': { 'changelog-sections': sections } },
-}));
-const commit = (msg, body = '') => {
-  const args = ['commit', '-q', '--allow-empty', '-m', msg];
-  if (body) args.push('-m', body);
-  g(...args);
-  return g('rev-parse', 'HEAD');
-};
-g('add', '.');
-const first = commit('chore(main): release 0.4.0 (#1)');
-g('tag', 'v0.4.0');
-const fixSha = commit('fix(voice): retry renames (#2)');
-g('tag', 'v2026.10.20', fixSha);
-const featSha = commit('feat(voice): name pools (#3)');
-g('update-ref', 'refs/remotes/origin/main', featSha);
-g('checkout', '-q', '-b', 'side', first);
-const offMain = commit('feat: not on main');
-g('checkout', '-q', 'main');
-
-const run = (sha, extra = {}) => {
-  const out = path.join(dir, `out-${sha.slice(0, 7)}-${Math.random().toString(36).slice(2)}`);
+function run(mode, env = {}) {
+  const out = path.join(dir, 'outputs');
+  const sum = path.join(dir, 'summary');
   fs.writeFileSync(out, '');
-  const res = spawnSync('node', [SCRIPT], {
-    cwd: dir, encoding: 'utf8',
+  fs.writeFileSync(sum, '');
+  fs.writeFileSync(ghLog, '');
+  // Never inherit a host credential, GITHUB_OUTPUT or DRY_RUN.
+  const result = spawnSync('node', [SCRIPT, mode], {
+    encoding: 'utf8',
     env: {
-      ...process.env, PROD_SHA: sha, GH_REPO: 'o/r', DRY_RUN: 'true',
-      DIGEST_DATE: '2026-10-21', GITHUB_OUTPUT: out, ...extra,
+      PATH: `${dir}${path.delimiter}${process.env.PATH}`, HOME: dir,
+      GH_REPO: 'o/r', GITHUB_OUTPUT: out, GITHUB_STEP_SUMMARY: sum, PROD_SHA: SHA, ...env,
     },
   });
-  return { ...res, out: fs.readFileSync(out, 'utf8') };
-};
-let r = run(featSha);
-assert.equal(r.status, 0, r.stderr);
-assert.match(r.stdout, /## \[v2026\.10\.21\]/);
-assert.match(r.stdout, /### Added\n\n\* \*\*voice:\*\* name pools/);
-assert.match(r.stdout, /prod_changed=true/);
-assert.match(r.out, /prod_changed=true/);
-assert.match(r.out, /released=false/);
-// Quiet day: production already matches the last digest.
-g('tag', 'v2026.10.21', featSha);
-r = run(featSha);
-assert.equal(r.status, 0, r.stderr);
-assert.match(r.stdout, /already exists|quiet day/, 'today cut or quiet skips');
-assert.match(r.out, /prod_changed=false/);
-g('tag', '-d', 'v2026.10.21');
-// Rollback: production serves an older commit than the last digest.
-r = run(first);
-assert.equal(r.status, 0, r.stderr);
-assert.match(r.stdout, /rollback serving, no new tag/);
-assert.match(r.out, /prod_changed=false/);
-// Off-main and invalid SHAs refuse.
-r = run(offMain);
-assert.notEqual(r.status, 0);
-assert.match(r.stderr, /not on origin\/main/);
-r = run('deadbeef');
-assert.notEqual(r.status, 0);
-assert.match(r.stderr, /PROD_SHA must be a full 40-character/);
-r = run(featSha, { DIGEST_DATE: '21-10-2026' });
-assert.notEqual(r.status, 0);
-assert.match(r.stderr, /DIGEST_DATE must be YYYY-MM-DD/);
-// Semver continuity: with no digest tag, notes range from the latest vX.Y.Z.
-g('tag', '-d', 'v2026.10.20');
-r = run(featSha);
-assert.equal(r.status, 0, r.stderr);
-assert.match(r.stdout, /compare\/v0\.4\.0\.\.\.v2026\.10\.21/);
-g('tag', 'v2026.10.20', fixSha);
-
-// ENOBUFS regression: a 200-commit range above 1 MiB must not crash.
-// Node's default maxBuffer is 1 MiB; the retired script crashed on a 1.36 MB
-// range. Each commit carries a 7 KiB body, so the range exceeds 1.4 MB.
-const big = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-digest-big-'));
-const gb = (...a) => execFileSync('git', ['-C', big, ...a], { encoding: 'utf8' }).trim();
-gb('init', '-q', '-b', 'main');
-gb('config', 'user.email', 't@example.invalid');
-gb('config', 'user.name', 't');
-fs.writeFileSync(path.join(big, 'release-please-config.json'), JSON.stringify({
-  packages: { '.': { 'changelog-sections': sections } },
-}));
-gb('add', '.');
-gb('commit', '-q', '--allow-empty', '-m', 'chore: seed');
-gb('tag', 'v2026.10.20');
-const filler = 'x'.repeat(7 * 1024);
-for (let i = 0; i < 200; i += 1) {
-  gb('commit', '-q', '--allow-empty', '-m', `fix(scope): change ${i} (#${1000 + i})`, '-m', filler);
+  const outputs = Object.fromEntries(fs.readFileSync(out, 'utf8').split('\n').filter(Boolean)
+    .map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+  const calls = fs.readFileSync(ghLog, 'utf8').split('\n').filter(Boolean);
+  return { ...result, outputs, calls, summary: fs.readFileSync(sum, 'utf8') };
 }
-const bigHead = gb('rev-parse', 'HEAD');
-gb('update-ref', 'refs/remotes/origin/main', bigHead);
-const raw = execFileSync('git', ['-C', big, 'log', '--format=%H%x1f%s%x1f%b%x1e', 'v2026.10.20..HEAD'],
-  { encoding: 'utf8', maxBuffer: LOG_MAX_BUFFER });
-assert.ok(Buffer.byteLength(raw, 'utf8') > 1024 * 1024,
-  `regression range must exceed 1 MiB, got ${Buffer.byteLength(raw, 'utf8')}`);
-const bigOut = path.join(big, 'out-big');
-fs.writeFileSync(bigOut, '');
-const bigRes = spawnSync('node', [SCRIPT], {
-  cwd: big, encoding: 'utf8',
-  env: {
-    ...process.env, PROD_SHA: bigHead, GH_REPO: 'o/r', DRY_RUN: 'true',
-    DIGEST_DATE: '2026-10-21', GITHUB_OUTPUT: bigOut,
-  },
-});
-assert.equal(bigRes.status, 0, bigRes.stderr);
-assert.match(bigRes.stdout, /## \[v2026\.10\.21\]/);
-assert.match(fs.readFileSync(bigOut, 'utf8'), /prod_changed=true/);
 
-// Non-dry-run fresh cut against a mocked gh: pins the single release create
-// call's target and its --latest flag.
-const mockBin = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-digest-gh-'));
-const ghLog = path.join(mockBin, 'gh-calls.log');
-fs.writeFileSync(path.join(mockBin, 'gh'),
-  `#!/bin/sh\necho "$@" >> "${ghLog}"\nif [ "$1" = "release" ] && [ "$2" = "view" ]; then exit 1; fi\nexit 0\n`);
-fs.chmodSync(path.join(mockBin, 'gh'), 0o755);
-const cutOut = path.join(dir, 'out-cut');
-fs.writeFileSync(cutOut, '');
-const cut = spawnSync('node', [SCRIPT], {
-  cwd: dir, encoding: 'utf8',
-  env: {
-    ...process.env, PROD_SHA: featSha, GH_REPO: 'o/r', DIGEST_DATE: '2026-10-21',
-    GITHUB_OUTPUT: cutOut, RUNNER_TEMP: dir,
-    PATH: `${mockBin}${path.delimiter}${process.env.PATH}`,
-  },
-});
-assert.equal(cut.status, 0, cut.stderr);
-const calls = fs.readFileSync(ghLog, 'utf8');
-assert.match(calls, new RegExp(`release create v2026\\.10\\.21 --target ${featSha} --title v2026\\.10\\.21 --notes-file .* --latest`));
-assert.match(fs.readFileSync(cutOut, 'utf8'), /tag_name=v2026\.10\.21/);
-assert.match(fs.readFileSync(cutOut, 'utf8'), /released=true/);
+const full = { assets: SBOM_ASSETS.map(name => ({ name })) };
+const view = (extra = {}) => JSON.stringify({ tagName: 'v2026.1101.0', publishedAt: new Date().toISOString(), ...full, ...extra });
 
-// Repair of a missing Release runs before the quiet-day skip, even when
-// production already serves the tag's SHA, and ranges its notes from the
-// previous digest rather than the tag against itself.
-g('tag', 'v2026.10.21', featSha);
-fs.writeFileSync(ghLog, '');
-const repairOut = path.join(dir, 'out-repair');
-fs.writeFileSync(repairOut, '');
-const repair = spawnSync('node', [SCRIPT], {
-  cwd: dir, encoding: 'utf8',
-  env: {
-    ...process.env, PROD_SHA: featSha, GH_REPO: 'o/r', DIGEST_DATE: '2026-10-21',
-    GITHUB_OUTPUT: repairOut, RUNNER_TEMP: dir,
-    PATH: `${mockBin}${path.delimiter}${process.env.PATH}`,
-  },
-});
-assert.equal(repair.status, 0, repair.stderr);
-assert.match(repair.stdout, /compare\/v2026\.10\.20\.\.\.v2026\.10\.21/);
-assert.doesNotMatch(repair.stdout, /compare\/v2026\.10\.21\.\.\.v2026\.10\.21/);
-const repairCalls = fs.readFileSync(ghLog, 'utf8');
-assert.match(repairCalls, new RegExp(`release create v2026\\.10\\.21 --target ${featSha} --title v2026\\.10\\.21 --notes-file .* --latest`));
-assert.match(fs.readFileSync(repairOut, 'utf8'), /tag_name=v2026\.10\.21/);
-assert.match(fs.readFileSync(repairOut, 'utf8'), /released=true/);
+// Asset completeness.
+assert.equal(assetsMissing(full), false);
+assert.equal(assetsMissing({ assets: [{ name: 'SHA256SUMS' }] }), true);
+assert.equal(assetsMissing({}), true);
 
-console.log('daily-digest: all tests passed');
+// request: the live-digest plan binds the SHA as its operation, so a retry
+// for the same build recovers the frozen plan.
+let r = run('request');
+assert.equal(r.status, 0, r.stderr);
+assert.deepEqual(JSON.parse(r.outputs.request), {
+  phase: 'plan',
+  input: { channel: 'stable', policy: 'live-digest', sha: SHA, operation: `daily-digest/${SHA}` },
+});
+assert.deepEqual(r.calls, []);
+for (const bad of ['', 'abc', 'z'.repeat(40), `${SHA}0`]) {
+  r = run('request', { PROD_SHA: bad });
+  assert.notEqual(r.status, 0, `refuses PROD_SHA=${bad}`);
+  assert.match(r.stderr, /PROD_SHA must be a full 40-character commit SHA/);
+  assert.deepEqual(r.outputs, {});
+}
+r = run('bogus');
+assert.notEqual(r.status, 0);
+assert.match(r.stderr, /usage/);
+
+// adapt, planned: owed state before publication, publish request carries the
+// exact plan, repair, and the dry-run flag.
+const plan = { schema: 'calver-plan-v1', sha: SHA, policy: 'live-digest', tag: 'v2026.1101.0', id: 'x' };
+for (const dry of [false, true]) {
+  r = run('adapt', { PLAN: JSON.stringify(plan), PREV_TAG: 'v2026.10.23', DRY_RUN: String(dry) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.outputs.publish, 'true');
+  assert.equal(r.outputs.prod_changed, 'true');
+  assert.equal(r.outputs.released, 'false');
+  assert.equal(r.outputs.prev_tag, 'v2026.10.23');
+  assert.equal(r.outputs.sbom_tag, '');
+  assert.deepEqual(JSON.parse(r.outputs.publish_request), { phase: 'publish', plan, dryRun: dry, repair: true });
+  assert.deepEqual(r.calls, []);
+}
+// A plan for another SHA or policy, or no plan at all, refuses.
+for (const bad of [{ ...plan, sha: 'c'.repeat(40) }, { ...plan, policy: 'staged-promotion' }]) {
+  r = run('adapt', { PLAN: JSON.stringify(bad) });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /does not bind the live production SHA/);
+}
+r = run('adapt', {});
+assert.notEqual(r.status, 0);
+assert.match(r.stderr, /neither a skip nor a JSON plan/);
+
+// adapt, skipped: every classified reason is a green no-tag day.
+for (const reason of ['quiet-day', 'rollback', 'digest-already-published']) {
+  r = run('adapt', { SKIPPED: 'true', REASON: reason, RELEASE_VIEW_JSON: view() });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.outputs.publish, 'false');
+  assert.equal(r.outputs.prod_changed, 'false');
+  assert.equal(r.outputs.released, 'false');
+  assert.equal(r.outputs.prev_tag, 'v2026.1101.0');
+  assert.equal(r.outputs.sbom_tag, '', 'complete assets: no dispatch');
+  assert.match(r.summary, new RegExp(`skipped: ${reason}`));
+}
+r = run('adapt', { SKIPPED: 'true', REASON: 'surprise' });
+assert.notEqual(r.status, 0);
+assert.match(r.stderr, /unclassified skip reason/);
+// Missing inventories on the Latest release redispatch the SBOM chain.
+r = run('adapt', { SKIPPED: 'true', REASON: 'rollback', RELEASE_VIEW_JSON: view({ assets: [{ name: 'SHA256SUMS' }] }) });
+assert.equal(r.status, 0, r.stderr);
+assert.equal(r.outputs.sbom_tag, 'v2026.1101.0');
+assert.ok(r.calls.includes('release view --json tagName,assets,publishedAt'));
+// A failed lookup stays green with no dispatch.
+r = run('adapt', { SKIPPED: 'true', REASON: 'quiet-day' });
+assert.equal(r.status, 0, r.stderr);
+assert.equal(r.outputs.sbom_tag, '');
+assert.equal(r.outputs.prev_tag, '');
+// A dry-run skip makes no gh calls at all.
+r = run('adapt', { SKIPPED: 'true', REASON: 'quiet-day', DRY_RUN: 'true', RELEASE_VIEW_JSON: view({ assets: [] }) });
+assert.equal(r.status, 0, r.stderr);
+assert.equal(r.outputs.sbom_tag, '');
+assert.deepEqual(r.calls, []);
+
+// Stalled production: a quiet day on a digest older than 3 days while main
+// moved ahead warns (green). Fresh digests, a level main and failed lookups
+// stay silent; only quiet days check.
+const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+r = run('adapt', { SKIPPED: 'true', REASON: 'quiet-day', RELEASE_VIEW_JSON: view({ publishedAt: old }), AHEAD_BY: '42' });
+assert.equal(r.status, 0, r.stderr);
+assert.match(r.stdout, /::warning title=daily-digest stalled production::Production still serves bbbbbbb \(v2026\.1101\.0, 8 days old\) while main is 42 commits ahead/);
+assert.match(r.summary, /### Stalled production/);
+assert.ok(r.calls.includes(`api repos/o/r/compare/${SHA}...main --jq .ahead_by`));
+for (const env of [
+  { REASON: 'quiet-day', RELEASE_VIEW_JSON: view(), AHEAD_BY: '42' },
+  { REASON: 'quiet-day', RELEASE_VIEW_JSON: view({ publishedAt: old }), AHEAD_BY: '0' },
+  { REASON: 'quiet-day', RELEASE_VIEW_JSON: view({ publishedAt: old }) },
+  { REASON: 'rollback', RELEASE_VIEW_JSON: view({ publishedAt: old }), AHEAD_BY: '42' },
+]) {
+  r = run('adapt', { SKIPPED: 'true', ...env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /::warning/, JSON.stringify(env));
+}
+
+// record: a fresh Release always dispatches SBOM; a replay only when its
+// inventories are incomplete; a dry run records nothing.
+r = run('record', { CREATED: 'true', TAG: 'v2026.1101.0' });
+assert.equal(r.status, 0, r.stderr);
+assert.deepEqual(r.outputs, { tag_name: 'v2026.1101.0', released: 'true', sbom_tag: 'v2026.1101.0' });
+assert.deepEqual(r.calls, []);
+r = run('record', { CREATED: 'false', TAG: 'v2026.1101.0', RELEASE_VIEW_JSON: view() });
+assert.deepEqual(r.outputs, { tag_name: 'v2026.1101.0', released: 'true', sbom_tag: '' });
+assert.deepEqual(r.calls, ['release view v2026.1101.0 --json tagName,assets,publishedAt']);
+r = run('record', { CREATED: 'false', TAG: 'v2026.1101.0', RELEASE_VIEW_JSON: view({ assets: [] }) });
+assert.equal(r.outputs.sbom_tag, 'v2026.1101.0');
+r = run('record', { CREATED: 'false', TAG: 'v2026.1101.0' });
+assert.equal(r.status, 0, r.stderr);
+assert.equal(r.outputs.sbom_tag, '', 'lookup failure stays green without dispatch');
+r = run('record', { CREATED: 'false', TAG: 'v2026.1101.0', DRY_RUN: 'true' });
+assert.deepEqual(r.outputs, { tag_name: '', released: 'false', sbom_tag: '' });
+assert.deepEqual(r.calls, []);
+for (const tag of ['', 'v2026.1101.0-canary.0', 'canary/v2026.1101.0']) {
+  r = run('record', { CREATED: 'true', TAG: tag });
+  assert.notEqual(r.status, 0, `refuses TAG=${tag}`);
+  assert.deepEqual(r.outputs, {});
+}
+
+fs.rmSync(dir, { recursive: true, force: true });
+console.log('daily-digest adapter: ok');

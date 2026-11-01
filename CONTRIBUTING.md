@@ -123,23 +123,27 @@ issue. Blank issues are off. Report a vulnerability privately; see
 
 ## Releases
 
-The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`
-when production has moved forward since the last digest, and publishes a GitHub
-Release from Conventional Commit subjects. Deploys never create version tags.
+The daily `daily-digest` workflow tags the live production commit with a
+stable CalVer version `vYYYY.MDD.P` (for example `v2026.1101.0`) when
+production has moved forward since the last digest, and publishes a GitHub
+Release from Conventional Commit subjects. The shared releaser in
+`TogetherWeOwn/.github` (`actions/calver`, `live-digest` policy) cuts it, at
+most once a day, so `P` stays 0. Deploys never create version tags.
 There is no release PR or freeze. One digest tag covers the whole repository,
-not one release per crate. See [`docs/releases.md`](docs/releases.md) for repair
-and dry-run dispatches. Never tag or release by hand.
+not one release per crate. Legacy `vYYYY.MM.DD` and `vX.Y.Z` tags stay as they
+are. See [`docs/releases.md`](docs/releases.md) for repair and dry-run
+dispatches. Never tag or release by hand.
 
-Release notes use the [Common Changelog](https://common-changelog.org/)
-categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
-**Fixed** (`fix`). `chore`, `docs`, `test`, `ci`, `build`, `refactor` and
-`style` stay out of the notes. Each squash-merged PR title becomes one
-entry, so write it for a reader of the release notes: imperative mood, one
-user-facing change.
+Release notes use the shared releaser's sections: **Features** (`feat`),
+**Bug Fixes** (`fix`), **Performance Improvements** (`perf`), **Reverts**
+(`revert`) and **Documentation** (`docs`). `chore`, `test`, `ci`, `build`,
+`refactor`, `style` and, for now, `security` stay out of the notes. Each
+squash-merged PR title becomes one entry, so write it for a reader of the
+release notes: imperative mood, one user-facing change.
 
-Release tags use UTC calendar dates. Cargo package versions stay at `0.4.0`;
-`feat!` and `BREAKING CHANGE` still appear in the breaking-changes notes but
-no longer choose a SemVer bump.
+Release tags use the UTC date the release was planned. Cargo package versions
+stay at `0.4.0`; `feat!` and `BREAKING CHANGE` still appear in the
+breaking-changes notes but never choose a version bump.
 
 ## Local development
 
