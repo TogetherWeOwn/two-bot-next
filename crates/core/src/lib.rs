@@ -101,6 +101,7 @@ pub mod lfg;
 pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
+pub mod lockdown_preview;
 pub mod mac;
 pub mod mee6;
 pub mod member_leave_gap;
