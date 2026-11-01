@@ -293,9 +293,16 @@ pub fn export_configuration(
 /// list. Without it the role cache is not loaded and an absent role may be
 /// live, so export keeps refusing rather than writing a backup that would
 /// drop a live role on re-import.
+///
+/// The inventory is a snapshot taken when the `/export` interaction arrived,
+/// before the configuration is read. A role created after that snapshot and
+/// saved by `/access` in between is absent yet live, so only roles whose
+/// snowflake predates `snapshot_id` (the interaction ID) are pruned. A newer
+/// absent role, or one that is not a snowflake, is kept, and export refuses.
 pub fn drop_deleted_command_roles(
     config: &mut VoiceConfiguration,
     inventory: &GuildInventory,
+    snapshot_id: u64,
 ) -> usize {
     if inventory.roles.get(&inventory.guild_id) != Some(&inventory.guild_id) {
         return 0;
@@ -303,9 +310,10 @@ pub fn drop_deleted_command_roles(
     let mut dropped = 0;
     for restriction in &mut config.settings.command_roles {
         let before = restriction.role_ids.len();
-        restriction
-            .role_ids
-            .retain(|role| inventory.roles.get(role) == Some(&inventory.guild_id));
+        restriction.role_ids.retain(|role| {
+            inventory.roles.get(role) == Some(&inventory.guild_id)
+                || !role.parse::<u64>().is_ok_and(|id| id < snapshot_id)
+        });
         dropped += before - restriction.role_ids.len();
     }
     dropped

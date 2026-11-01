@@ -14631,7 +14631,7 @@ where
                     return true;
                 }
             };
-            let dropped = drop_deleted_command_roles(&mut config, inventory);
+            let dropped = drop_deleted_command_roles(&mut config, inventory, interaction.id.get());
             let dropped_note = if dropped == 0 {
                 String::new()
             } else {

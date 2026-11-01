@@ -616,13 +616,19 @@ fn export_drops_deleted_command_roles_and_keeps_the_restriction() {
     let mut stale = config.clone();
     stale.settings.command_roles[0].role_ids.push("999".into());
     assert!(export_configuration(&stale, &inventory).is_err());
-    assert_eq!(drop_deleted_command_roles(&mut stale, &inventory), 1);
+    assert_eq!(
+        drop_deleted_command_roles(&mut stale, &inventory, u64::MAX),
+        1
+    );
     assert_eq!(stale, config);
     // Every role deleted: the command stays restricted to admins.
     let mut emptied = config.clone();
     let command = emptied.settings.command_roles[0].command.clone();
     emptied.settings.command_roles[0].role_ids = vec!["999".into(), "998".into()];
-    assert_eq!(drop_deleted_command_roles(&mut emptied, &inventory), 2);
+    assert_eq!(
+        drop_deleted_command_roles(&mut emptied, &inventory, u64::MAX),
+        2
+    );
     assert_eq!(emptied.settings.command_roles[0].command, command);
     assert!(emptied.settings.command_roles[0].role_ids.is_empty());
     assert!(export_configuration(&emptied, &inventory).is_ok());
@@ -635,15 +641,38 @@ fn export_keeps_command_roles_when_the_role_cache_is_not_loaded() {
     // missing role may be live. Nothing is pruned and export still refuses.
     inventory.roles.clear();
     let mut unloaded = config.clone();
-    assert_eq!(drop_deleted_command_roles(&mut unloaded, &inventory), 0);
+    assert_eq!(
+        drop_deleted_command_roles(&mut unloaded, &inventory, u64::MAX),
+        0
+    );
     assert_eq!(unloaded, config);
     assert!(export_configuration(&unloaded, &inventory).is_err());
     // A partial set without @everyone is treated the same way.
     inventory
         .roles
         .insert("999".to_owned(), inventory.guild_id.clone());
-    assert_eq!(drop_deleted_command_roles(&mut unloaded, &inventory), 0);
+    assert_eq!(
+        drop_deleted_command_roles(&mut unloaded, &inventory, u64::MAX),
+        0
+    );
     assert_eq!(unloaded, config);
+}
+
+#[test]
+fn export_keeps_command_roles_created_after_the_inventory_snapshot() {
+    let (config, inventory) = fixture();
+    // Role 999 is absent from the snapshot taken for interaction 999: it may
+    // have been created and saved by /access after the snapshot, so it stays
+    // and export refuses instead of dropping a live role.
+    let mut newer = config.clone();
+    newer.settings.command_roles[0].role_ids.push("999".into());
+    let expected = newer.clone();
+    assert_eq!(drop_deleted_command_roles(&mut newer, &inventory, 999), 0);
+    assert_eq!(newer, expected);
+    assert!(export_configuration(&newer, &inventory).is_err());
+    // The same role is pruned once a later interaction proves it is gone.
+    assert_eq!(drop_deleted_command_roles(&mut newer, &inventory, 1000), 1);
+    assert_eq!(newer, config);
 }
 
 #[test]
