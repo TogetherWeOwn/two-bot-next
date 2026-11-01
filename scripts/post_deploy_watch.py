@@ -53,8 +53,10 @@ DURATION_SECONDS = 1800
 POLL_SECONDS = 10
 MISS_LIMIT = 18  # consecutive missed polls (~3 min), the deploy gate's stability window
 VERSION_EVERY_SECONDS = 60
-GATE_WINDOW_SECONDS = 300
-GATE_SAMPLE_SECONDS = 240  # two scrapes inside each window, with slack for retries
+GATE_SAMPLE_SECONDS = 240  # seconds between a window's two scrapes
+SCRAPE_SLACK_SECONDS = 45  # scrape retries and node start-up per window
+MIN_FINAL_SAMPLE_SECONDS = 30  # the shortest window: the last one may end past the deadline
+FINAL_GRACE_SECONDS = 120  # how long past the deadline the last window may finish
 GATE_ERROR_LIMIT = 2
 SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -102,13 +104,13 @@ class Gate:
         self.url, self.sha, self.workdir, self.tooling = url, sha, Path(workdir), Path(tooling)
         self.child, self.index, self.errors = None, 0, 0
 
-    def start(self):
+    def start(self, sample_seconds=GATE_SAMPLE_SECONDS):
         self.index += 1
         self.evidence = self.workdir / f"watch-error-rate-{self.index}.json"
         self.child = subprocess.Popen(
             ["node", str(self.tooling / "wrangler/scripts/promotion-error-gate.mjs"),
              "--metrics-url", self.url, "--evidence", str(self.evidence), "--sha", self.sha,
-             "--sample-interval-seconds", str(GATE_SAMPLE_SECONDS), "--user-agent", USER_AGENT],
+             "--sample-interval-seconds", str(sample_seconds), "--user-agent", USER_AGENT],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def poll(self):
@@ -134,22 +136,40 @@ def watch(*, url, sha, version, client, gate, now=time.monotonic, sleep=time.sle
     started = now()
     evidence = {"sha": sha, "version": version, "polls": 0, "misses": 0, "max_miss_streak": 0,
                 "gate_windows": [], "verdict": "clean", "reason": "no_breach"}
-    streak, last_version_check, gate_started = 0, None, None
+    streak, last_version_check, running = 0, None, False
 
     def finish(verdict, reason):
         gate.stop()
         evidence.update(verdict=verdict, reason=reason, watched_seconds=int(now() - started))
         return evidence
 
-    while now() - started < duration:
+    def serving():
+        try:
+            return wcr.deployments(client, WORKER)[0]
+        except GateError:
+            return None
+
+    def breach(reason):
+        # Re-read immediately before reporting: a breach rolls back, so it
+        # must still be the promoted version that is serving.
+        current = serving()
+        if current is None:
+            return finish("error", "cloudflare_unreadable")
+        if current != version:
+            return finish("superseded", "version_no_longer_serving")
+        return finish("breach", reason)
+
+    # The last error-rate window may start late with a shorter sample, and
+    # the watch waits up to FINAL_GRACE_SECONDS past the deadline for it, so
+    # the final minutes are judged too.
+    while now() - started < duration or (running and now() - started < duration + FINAL_GRACE_SECONDS):
         moment = now()
         if last_version_check is None or moment - last_version_check >= VERSION_EVERY_SECONDS:
             last_version_check = moment
-            try:
-                serving = wcr.deployments(client, WORKER)[0]
-            except GateError:
+            current = serving()
+            if current is None:
                 return finish("error", "cloudflare_unreadable")
-            if serving != version:
+            if current != version:
                 return finish("superseded", "version_no_longer_serving")
         passed, reason = ready(url, sha, fetch_fn)
         evidence["polls"] += 1
@@ -160,20 +180,29 @@ def watch(*, url, sha, version, client, gate, now=time.monotonic, sleep=time.sle
             evidence["misses"] += 1
             evidence["max_miss_streak"] = max(evidence["max_miss_streak"], streak)
             if streak >= MISS_LIMIT:
-                return finish("breach", f"readiness:{reason}")
-        if gate_started is None and duration - (moment - started) >= GATE_WINDOW_SECONDS:
-            gate.start()
-            gate_started = moment
-        verdict = gate.poll() if gate_started is not None else None
+                return breach(f"readiness:{reason}")
+        remaining = duration - (moment - started)
+        if not running and remaining > 0:
+            gate.start(int(max(MIN_FINAL_SAMPLE_SECONDS,
+                               min(GATE_SAMPLE_SECONDS, remaining - SCRAPE_SLACK_SECONDS))))
+            running = True
+        verdict = gate.poll() if running else None
         if verdict is not None:
-            gate_started = None
+            running = False
             evidence["gate_windows"].append(verdict)
             if verdict == "fail":
-                return finish("breach", "rest_5xx")
+                return breach("rest_5xx")
             gate.errors = gate.errors + 1 if verdict == "error" else 0
             if gate.errors >= GATE_ERROR_LIMIT:
-                return finish("breach", "rest_5xx_unreadable")
+                return breach("rest_5xx_unreadable")
         sleep(POLL_SECONDS)
+    if running:
+        # The final window overran its grace: it counts as an unscrapeable
+        # window, so it breaches only after another unscrapeable one.
+        evidence["gate_windows"].append("unfinished")
+        if gate.errors + 1 >= GATE_ERROR_LIMIT:
+            return breach("rest_5xx_unreadable")
+        return finish("clean", "no_breach_final_window_unfinished")
     return finish("clean", "no_breach")
 
 

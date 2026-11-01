@@ -67,20 +67,30 @@ HEALTHY = {"health": (200, b"{}"), "readyz": (200, readyz())}
 
 
 class StubGate:
-    def __init__(self, verdicts=()):
-        self.verdicts = list(verdicts)
-        self.started, self.stopped, self.running, self.errors = 0, 0, False, 0
+    """A gate whose windows finish `sample` scripted seconds after they start.
 
-    def start(self):
+    `verdict_at(start)` decides each window's verdict from its start time;
+    `verdicts` (a list) is consumed in order when given instead.
+    """
+
+    def __init__(self, verdicts=None, verdict_at=None):
+        self.verdicts = list(verdicts) if verdicts is not None else None
+        self.verdict_at = verdict_at or (lambda start: "pass")
+        self.started, self.stopped, self.errors, self.windows = 0, 0, 0, []
+        self.clock, self.window = None, None
+
+    def start(self, sample_seconds):
         self.started += 1
-        self.running = True
+        self.window = (self.clock.t, sample_seconds)
+        self.windows.append(self.window)
 
     def poll(self):
-        # Each window finishes on the poll after it starts.
-        if not self.running:
+        if self.window is None or self.clock.t < self.window[0] + self.window[1]:
             return None
-        self.running = False
-        return self.verdicts.pop(0) if self.verdicts else "pass"
+        start, self.window = self.window[0], None
+        if self.verdicts is not None:
+            return self.verdicts.pop(0) if self.verdicts else "pass"
+        return self.verdict_at(start)
 
     def stop(self):
         self.stopped += 1
@@ -89,6 +99,7 @@ class StubGate:
 def run(answers=None, versions=(VERSION,), gate=None, duration=watcher.DURATION_SECONDS):
     clock = Clock()
     gate = gate or StubGate()
+    gate.clock = clock
     evidence = watcher.watch(url=URL, sha=SHA, version=VERSION, client=FakeClient(serving(versions)),
                              gate=gate, now=clock.now, sleep=clock.sleep,
                              fetch_fn=fetcher(answers or HEALTHY), duration=duration)
@@ -119,9 +130,14 @@ class WatchTests(unittest.TestCase):
         evidence, gate, clock = run()
         self.assertEqual((evidence["verdict"], evidence["reason"]), ("clean", "no_breach"))
         self.assertGreaterEqual(clock.t, watcher.DURATION_SECONDS)
-        self.assertEqual(evidence["polls"], watcher.DURATION_SECONDS // watcher.POLL_SECONDS)
-        # Error-rate windows keep running back to back through the watch.
-        self.assertGreaterEqual(gate.started, 100)
+        # Readiness keeps polling while the final window finishes.
+        self.assertGreaterEqual(evidence["polls"], watcher.DURATION_SECONDS // watcher.POLL_SECONDS)
+        self.assertLessEqual(clock.t, watcher.DURATION_SECONDS + watcher.FINAL_GRACE_SECONDS)
+        # Error-rate windows run back to back, the last one shortened so it
+        # still ends near the deadline: no unjudged final minutes.
+        self.assertGreaterEqual(gate.started, 7)
+        last_start, last_sample = gate.windows[-1]
+        self.assertGreaterEqual(last_start + last_sample, watcher.DURATION_SECONDS - watcher.SCRAPE_SLACK_SECONDS)
         self.assertEqual(gate.stopped, 1)
 
     def test_sustained_readiness_misses_breach_and_a_blip_does_not(self):
@@ -160,6 +176,29 @@ class WatchTests(unittest.TestCase):
         evidence, _, _ = run(gate=StubGate(["skip"] * 20 + ["insufficient_data"] * 20))
         self.assertEqual(evidence["verdict"], "clean")
 
+    def test_a_failure_in_the_final_minutes_is_still_caught(self):
+        late = watcher.DURATION_SECONDS - 250
+        evidence, _, clock = run(gate=StubGate(verdict_at=lambda start: "fail" if start >= late else "pass"))
+        self.assertEqual((evidence["verdict"], evidence["reason"]), ("breach", "rest_5xx"))
+        self.assertLessEqual(clock.t, watcher.DURATION_SECONDS + watcher.FINAL_GRACE_SECONDS)
+
+    def test_a_breach_rechecks_the_serving_version_before_reporting(self):
+        # The version moved between the periodic checks: never roll that back.
+        reads = {"n": 0}
+
+        def moved():
+            reads["n"] += 1
+            version = VERSION if reads["n"] == 1 else OTHER
+            return {"success": True, "result": {"deployments": [
+                {"versions": [{"version_id": version, "percentage": 100}]}]}}
+        clock = Clock()
+        gate = StubGate(["fail"])
+        gate.clock = clock
+        routes = {("GET", f"/workers/scripts/{watcher.WORKER}/deployments"): moved}
+        evidence = watcher.watch(url=URL, sha=SHA, version=VERSION, client=FakeClient(routes), gate=gate,
+                                 now=clock.now, sleep=clock.sleep, fetch_fn=fetcher(HEALTHY))
+        self.assertEqual((evidence["verdict"], evidence["reason"]), ("superseded", "version_no_longer_serving"))
+
     def test_a_moved_version_stops_the_watch_without_a_breach(self):
         # A newer deploy or an operator rollback took over: never roll that back.
         evidence, _, _ = run(answers={**HEALTHY, "readyz": (200, readyz(revision="f" * 40))},
@@ -174,6 +213,8 @@ class WatchTests(unittest.TestCase):
 class MainTests(unittest.TestCase):
     def run_main(self, *, versions=(VERSION,), answers=None, gate=None, argv=None):
         clock = Clock()
+        gate = gate or StubGate()
+        gate.clock = clock
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             out, summary = Path(tmp) / "out", Path(tmp) / "summary"
             evidence = Path(tmp) / "watch.json"
@@ -185,7 +226,7 @@ class MainTests(unittest.TestCase):
                     argv or ["--worker-url", URL, "--sha", SHA, "--version", VERSION,
                              "--evidence", str(evidence)],
                     client_factory=lambda account, token: FakeClient(serving(versions)),
-                    gate_factory=lambda *args: gate or StubGate(),
+                    gate_factory=lambda *args: gate,
                     now=clock.now, sleep=clock.sleep, fetch_fn=fetcher(answers or HEALTHY))
             outputs = dict(line.split("=", 1) for line in out.read_text().splitlines()) if out.exists() else {}
             return code, outputs, stdout.getvalue(), json.loads(evidence.read_text()) if evidence.exists() else None
