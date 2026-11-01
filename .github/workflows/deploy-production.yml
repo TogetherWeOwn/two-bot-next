@@ -98,7 +98,7 @@ on:
 permissions: {}
 
 # No workflow-level concurrency: only the `production` job below holds the
-# `deploy-production` lane. The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
+# `deploy-production` lane (through its post-deploy watch). The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
 # operator rollback behind it. The lane keeps the default single pending
 # slot, so the `recheck` job skips an automatic run while an operator
 # dispatch is active — otherwise the automatic `production` job would enter
@@ -1397,10 +1397,11 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # Sized for the worst case: a ~442 s deploy, a failing readyz gate
     # (~15 min of polls), the error-rate gate (~4 min of live scrapes) and
-    # the auto-rollback budget (600 s image + 900 s gate). The 30 min soak
-    # sleeps in its own job, outside this cap. A 60 min cap can cancel the
-    # run mid-rollback and leave production fenced.
-    timeout-minutes: 90
+    # the auto-rollback budget (600 s image + 900 s gate), then the 30 min
+    # post-deploy watch (plus its final-window grace) and a second rollback
+    # budget. The 30 min soak sleeps in its own job, outside this cap. A
+    # tighter cap can cancel the run mid-rollback and leave production fenced.
+    timeout-minutes: 150
     # The human gate: this job waits for the Environment's required
     # reviewers. The guard job refused to get here without them, unless
     # vars.PRODUCTION_AUTO_APPROVE is true and either the latest staging
@@ -2065,3 +2066,55 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+      # Post-deploy watch (docs/production-deploy.md, "Post-deploy watch"):
+      # the gates above judge minutes; these steps keep judging /health,
+      # /readyz (200, gateway ready, the promoted revision) and the REST 5xx
+      # promotion gate for 30 minutes after an ordinary takeover promotion.
+      # They run inside this job, so the deploy-production lane stays held
+      # from the deploy to the end of the watch: no newer deploy lands
+      # mid-watch, and no separate job re-enters the single pending slot. A
+      # breach re-reads the serving version and restores the pre-deploy
+      # snapshot (Worker version AND container image) only if the promoted
+      # version still serves; the run then fails red. Cancel the run to free
+      # the lane for an urgent operator dispatch.
+      - name: Watch production for 30 minutes after the promotion
+        id: watch
+        if: success() && env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && env.TAKEOVER == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/post-deploy-watch"
+          python3 ../tooling/scripts/post_deploy_watch.py --worker-url "$PRODUCTION_WORKER_URL" \
+            --sha "$SHA" --version "$NEW_VERSION" --evidence "$RUNNER_TEMP/post-deploy-watch/watch.json"
+      - name: Auto-roll back Worker version and container image after a watch breach
+        id: watch_rollback
+        if: failure() && steps.watch.outputs.verdict == 'breach'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          ROLLBACK_ACTOR: github-actions:${{ github.run_id }}:${{ needs.guard.outputs.sha }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/worker_container_rollback.py rollback \
+            --variant production \
+            --worker-url "$PRODUCTION_WORKER_URL" \
+            --staging-url "$STAGING_WORKER_URL" \
+            --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" \
+            --actor "$ROLLBACK_ACTOR" \
+            --evidence "$RUNNER_TEMP/post-deploy-watch/rollback.json"
+          echo "- Post-deploy watch auto-rollback: restored the pre-deploy Worker version and container image with takeover (the run still fails)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the post-deploy watch evidence
+        if: always() && steps.watch.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-post-deploy-watch
+          path: ${{ runner.temp }}/post-deploy-watch
+          if-no-files-found: ignore
+          retention-days: 14

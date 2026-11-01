@@ -352,6 +352,41 @@ only asks that the candidate is no worse than what serves now. The
 `transport` result stays out of the 5xx count, as in `rest_5xx_rate`. Rollback
 and the live-SHA redeploy skip both legs.
 
+## Post-deploy watch
+
+The in-run gates judge a few minutes. After an ordinary takeover promotion
+passes them, the last steps of the `production` job keep watching production
+for 30 minutes (`scripts/post_deploy_watch.py`):
+
+- every 10 s: `/health` 200 and `/readyz` 200 with gateway ready and the
+  promoted build revision. 18 consecutive misses (~3 min, the deploy gate's
+  stability window) is a breach; a single blip is not;
+- back-to-back REST 5xx windows through the same
+  `promotion-error-gate.mjs` verdict as the deploy gate. The last window
+  starts late with a shorter sample and may finish up to 2 minutes past the
+  deadline, so the final minutes are judged too. A failing window is a
+  breach; two unscrapeable windows in a row are a breach; a quiet window
+  never is. A missing bearer records one `skip` window and starts no more:
+  the token cannot appear mid-run, so respawning a window every poll only
+  wastes processes;
+- every minute, and again right before reporting a breach: the promoted
+  Worker version still serves 100%. If not (an operator rollback, a manual
+  Cloudflare change, or a traffic split moved traffic), the watch stops
+  without touching anything.
+
+On a breach the job restores the pre-deploy snapshot (Worker version AND
+container image, with takeover) through the same reviewed
+`worker_container_rollback.py` as the in-run auto-rollback, and the run fails
+red. If the watch cannot read Cloudflare it fails red without rolling back.
+Because the watch runs inside the `production` job, the `deploy-production`
+lane stays held from the deploy to the end of the watch: no newer deploy
+lands mid-watch and no separate job re-enters the single pending slot. An
+operator who needs the lane sooner cancels the run. The GitHub Deployment
+record is written before the watch; a watch rollback shows in the run
+summary and its evidence artifact. As after a manual rollback, set
+`PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` after a watch rollback, or the next
+automatic run re-promotes the same build.
+
 ## Production error-rate gate
 
 The `production` job ends with the same REST 5xx promotion gate staging

@@ -520,6 +520,34 @@ class StaticGuardTests(unittest.TestCase):
             ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'"],
         )
 
+    def test_post_deploy_watch_runs_inside_the_lane_and_rolls_back_on_a_breach(self):
+        names = [step[0].split("name: ", 1)[-1] for step in steps(JOBS["production"])]
+        watch = names.index("Watch production for 30 minutes after the promotion")
+        rollback = names.index("Auto-roll back Worker version and container image after a watch breach")
+        # Inside the production job, after every in-run gate and record: the
+        # deploy-production lane stays held from the deploy to the watch's end.
+        self.assertGreater(watch, names.index("Upload immutable production promotion evidence"))
+        self.assertEqual(rollback, watch + 1)
+        conditions = {step[0]: [line.strip() for line in step if line.strip().startswith("if:")]
+                      for step in steps(JOBS["production"])}
+        self.assertEqual(conditions["      - name: Watch production for 30 minutes after the promotion"],
+                         ["if: success() && env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' "
+                          "&& env.TAKEOVER == 'true'"])
+        self.assertEqual(
+            conditions["      - name: Auto-roll back Worker version and container image after a watch breach"],
+            ["if: failure() && steps.watch.outputs.verdict == 'breach'"])
+        watch_script = inline_script("Watch production for 30 minutes after the promotion")
+        for needle in ("set -euo pipefail", "../tooling/scripts/post_deploy_watch.py",
+                       '--sha "$SHA" --version "$NEW_VERSION"'):
+            self.assertIn(needle, watch_script)
+        rollback_script = inline_script("Auto-roll back Worker version and container image after a watch breach")
+        for needle in ("../tooling/scripts/worker_container_rollback.py rollback", "--variant production",
+                       '--snapshot "$RUNNER_TEMP/production-rollback-snapshot.json"'):
+            self.assertIn(needle, rollback_script)
+        self.assertNotIn("--expected-sha", rollback_script)
+        self.assertNotIn("${{", watch_script + rollback_script)
+        self.assertGreaterEqual(int(value(children(JOBS["production"][1:], 4)["timeout-minutes"])), 150)
+
     def test_pre_freeze_candidate_requires_the_full_latest_ci_verdict(self):
         row = next(line for line in (ROOT / "docs/cutover-sequence.md").read_text().splitlines()
                    if line.startswith("| 0.1 |"))
