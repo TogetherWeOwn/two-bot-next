@@ -296,6 +296,47 @@ class AttestationFloor(unittest.TestCase):
             f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
             self.assertIn(("error", "Attestation"), levels(f), body[-200:])
 
+    def test_missing_claims_or_tests_fails(self):
+        base = GOOD_BODY + FULL_ATTESTATION
+        no_claims = base.replace("### Claims\n\n- C1: rollback refuses an unqualified DELETE\n",
+                                 "### Claims\n\n")
+        f = ps.evaluate(env(BODY=no_claims, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        no_tests = base.replace(
+            "### Tests\n\n- C1 | test=scripts/test_rollback.py::test_refuses_bare_delete | "
+            "failed_before=not-run | proof=python3 scripts/test_rollback.py 5 OK\n",
+            "### Tests\n\n")
+        f = ps.evaluate(env(BODY=no_tests, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_code_spans_generics_and_autolinks_are_not_placeholders(self):
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed `Vec<u8>` payloads rejected, see <https://example.com/spec>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_generated_exemption_needs_a_bot_author(self):
+        # A human branch wearing the release-please-- prefix still hits the gate.
+        f = ps.evaluate(env(BODY=GOOD_BODY, HEAD_REF="release-please--branches--main",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        # Automation-authored release PRs stay exempt.
+        f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="release-please[bot]",
+                            HEAD_REF="release-please--branches--main",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_dependency_bot_t0_path_still_needs_attestation(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="dependabot[bot]",
+                            TITLE="chore(deps): bump x",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        f = ps.evaluate(env(BODY=GOOD_BODY + FULL_ATTESTATION, AUTHOR="dependabot[bot]",
+                            TITLE="chore(deps): bump x",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
     def test_rename_from_a_t0_path_counts(self):
         # Renames carry both paths; the old T0 path keeps the floor at T0.
         # Deleting a T0 file is still T0.

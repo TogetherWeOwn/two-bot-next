@@ -4050,9 +4050,12 @@ class WorkflowTests(unittest.TestCase):
     def test_pr_lint_feeds_changed_files_to_the_t0_gate(self):
         # The T0 attestation floor in pr_standards.py needs the PR file list.
         # Pin the step and its wiring so the gate cannot be silently starved.
+        # The step runs on PR events only: on push there is no PR number and
+        # the numeric guard would fail every main commit.
         steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
         listed = next(s for s in steps if s.get("name") == "List changed files")
-        self.assertEqual(listed["if"], "github.event_name != 'merge_group'")
+        self.assertEqual(listed["if"],
+                         "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
         self.assertIn("pulls/", listed["run"])
         self.assertIn("previous_filename", listed["run"])
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")

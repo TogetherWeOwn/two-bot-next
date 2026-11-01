@@ -27,8 +27,11 @@ Title format, an empty body and a missing required card reference are always err
 standard the org already enforces. On a public repo the strict title/body subset (tracker ids,
 instance UI links, the internal host) is also always an error, regardless of PR_STANDARDS_MODE.
 A PR whose changed paths hit the T0 risk floor must carry a complete T0 attestation
-(`risk_tier: T0`, checked D1–D8, no leftover placeholders): that too is always an error,
-regardless of PR_STANDARDS_MODE, the same way internal references already are.
+(`risk_tier: T0`, non-empty Claims and Tests subsections, checked D1–D8, no leftover
+placeholders): that too is always an error, regardless of PR_STANDARDS_MODE, the same
+way internal references already are. The floor runs before the dependency-bot exemption,
+so bot PRs touching T0 paths need a human-written attestation; only generated release
+PRs authored by a bot are exempt.
 Only the required template sections (beyond an empty body), the advisory title/body remainder
 (agent links, localhost, private-network addresses, tailnet names), branch names and commit
 history follow PR_STANDARDS_MODE, so a repo can land the gate in warn mode, clear its open
@@ -103,7 +106,18 @@ T0_PATH_PATTERNS = (
 T0_DOC_SUFFIXES = (".md", ".rst", ".txt")
 T0_RISK_TIER = re.compile(r"^risk_tier:\s*(T0|T1|T2)\s*$", re.I | re.M)
 T0_CHECK_ITEM = re.compile(r"^-\s*\[( |x|X)\]\s*(D[1-8]):\s*(.+?)\s*$")
-T0_PLACEHOLDER = re.compile(r"<[^<>\n]+>")
+# Template placeholders always carry a space, a pipe or a slash
+# (<secret sinks, ...>, <T0|T1|T2>, <path/to/test_file>); bare generics such
+# as Vec<u8> or Option<T> do not. Inline code and autolinks are stripped
+# before matching so evidence like `Vec<u8>` never counts as a placeholder.
+T0_PLACEHOLDER = re.compile(r"<[^<>\n]*[ |/][^<>\n]*>")
+T0_CODE_SPAN = re.compile(r"`[^`\n]+`")
+T0_AUTOLINK = re.compile(r"<https?://[^<>\s]+>")
+
+
+def t0_visible_text(text):
+    """Attestation prose minus inline code spans and autolinks, for placeholder scans."""
+    return T0_AUTOLINK.sub("", T0_CODE_SPAN.sub("", text or ""))
 
 
 def t0_path_words(component):
@@ -130,10 +144,13 @@ def is_t0_path(path):
 
 def attestation_findings(body, paths):
     """T0 attestation gate. Empty unless a changed path hits the T0 floor, in
-    which case the body must declare `risk_tier: T0` and carry all of D1–D8
+    which case the body must declare `risk_tier: T0`, carry non-empty
+    `### Claims` and `### Tests` subsections, and carry all of D1–D8
     checked with real evidence (no leftover `<placeholder>` text anywhere in
     the Attestation section). Every finding is an error: declaring a higher
-    tier than the floor is fine, understating it is not."""
+    tier than the floor is fine, understating it is not. The gate checks the
+    shape and presence of the claim-to-test mapping, not test execution or
+    the truth of claims."""
     t0_paths = sorted({p for p in paths if is_t0_path(p)})
     if not t0_paths:
         return []
@@ -153,6 +170,14 @@ def attestation_findings(body, paths):
                            f"{', …' if len(t0_paths) > 3 else ''}) but does not declare "
                            "`risk_tier: T0`. The floor is a minimum: declaring T0 for "
                            "a critical change on any path is always fine."))
+    for heading in ("Claims", "Tests"):
+        m = re.search(rf"^###\s*{heading}\s*$", att, flags=re.M | re.I)
+        chunk = re.split(r"^###\s+", att[m.end():], flags=re.M)[0] if m else ""
+        if m is None or real_items(t0_visible_text(chunk)) < 1:
+            out.append(Finding("error", "Attestation",
+                               f"T0 PRs need a non-empty '### {heading}' subsection: "
+                               f"one behavior claim per C-number and one test-mapping "
+                               f"line per claim."))
     items = {}
     for line in att.splitlines():
         m = T0_CHECK_ITEM.match(line.strip())
@@ -161,7 +186,7 @@ def attestation_findings(body, paths):
     bad = [f"D{i}" for i in range(1, 9)
            if f"D{i}" not in items or not items[f"D{i}"][0]
            or not items[f"D{i}"][1].strip()
-           or T0_PLACEHOLDER.search(items[f"D{i}"][1])]
+           or T0_PLACEHOLDER.search(t0_visible_text(items[f"D{i}"][1]))]
     if bad:
         out.append(Finding("error", "Attestation",
                            f"T0 PRs need all of D1–D8 checked with evidence, not "
@@ -170,7 +195,7 @@ def attestation_findings(body, paths):
     # the risk_tier and D-lines report their own findings above.
     rest = T0_RISK_TIER.sub("", re.sub(r"^-\s*\[[ xX]\]\s*D[1-8]:.*$", "", att,
                                             flags=re.M | re.I))
-    if T0_PLACEHOLDER.search(rest):
+    if T0_PLACEHOLDER.search(t0_visible_text(rest)):
         out.append(Finding("error", "Attestation",
                            "The Attestation section still holds placeholder text "
                            "(<...>). Replace every placeholder with evidence or "
@@ -284,6 +309,16 @@ def check_pull_request(env):
     head_ref = env.get("HEAD_REF") or ""
     out = []
 
+    # T0 attestation floor first: it runs before the dependency-bot early
+    # return, so a bot PR touching a T0 path still needs a (human-written)
+    # attestation. Generated release PRs authored by a bot stay exempt
+    # (automation cannot attest); a human branch wearing the release-please--
+    # prefix is not exempt, since the caller controls the branch name.
+    generated_release = head_ref.startswith("release-please--") and author.endswith("[bot]")
+    if not generated_release:
+        changed = [line.strip() for line in (env.get("CHANGED_FILES") or "").splitlines()
+                   if line.strip()]
+        out.extend(attestation_findings(body, changed))
     if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
         if header_errors(title):
             out.append(Finding("warning", "PR title", f"{author} title '{title}' is not conventional; set "
@@ -313,13 +348,6 @@ def check_pull_request(env):
             if real_items(content) < minimum:
                 need = f"at least {minimum} items" if minimum > 1 else "real content"
                 out.append(Finding(mode, "PR template", f"'## {heading}' needs {need}."))
-
-    if not generated:
-        # T0 attestation floor: always an error, regardless of PR_STANDARDS_MODE.
-        # Release automation cannot write attestations, so generated PRs are exempt.
-        changed = [line.strip() for line in (env.get("CHANGED_FILES") or "").splitlines()
-                   if line.strip()]
-        out.extend(attestation_findings(body, changed))
 
     if private:
         if not generated and not re.search(r"\bTOG-\d+\b", body):

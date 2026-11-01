@@ -213,9 +213,11 @@ jobs:
       # both the new and the previous name (deleting or moving a T0 file stays
       # T0); deletes arrive with status removed and are included like any other
       # change. An empty or missing list fails the job, so a PR cannot reach
-      # the gate without one.
+      # the gate without one. Push and merge_group runs skip this step: a push
+      # carries no PR number (the step would fail every main commit) and the
+      # check step lints the commit subjects instead.
       - name: List changed files
-        if: github.event_name != 'merge_group'
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         id: changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
