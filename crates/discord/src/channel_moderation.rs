@@ -647,20 +647,22 @@ impl ChannelModerationRuntime {
         // Arm the pending entry before the audit row would double-count a
         // redelivery: a new key at cap refuses PREVIEW_BUSY with no audit
         // row, while a same-key replacement succeeds atomically. Audit
-        // failure after a successful insert unwinds the entry, so a stored
-        // entry always has its row.
+        // failure after a successful insert unwinds only this attempt's own
+        // entry, so a newer same-key preview that superseded it keeps its row.
         let digest32 = plan.digest32().to_owned();
+        let pending_key = (guild_id.get(), channel_num, actor.id.get());
+        let interaction_id = interaction.id.to_string();
         if plan.armed {
             let inserted = self
                 .preview_pending
                 .lock()
                 .map(|mut pending| {
                     pending.insert(
-                        (guild_id.get(), channel_num, actor.id.get()),
+                        pending_key,
                         PendingEntry {
                             digest: plan.digest.clone(),
                             reason: snapshot.reason.clone(),
-                            preview_request_id: interaction.id.to_string(),
+                            preview_request_id: interaction_id.clone(),
                             expires_at,
                         },
                         now,
@@ -674,28 +676,42 @@ impl ChannelModerationRuntime {
             }
         }
         let row = ChannelAuditRow {
-            request_id: interaction.id.to_string(),
+            request_id: interaction_id.clone(),
             guild_id: guild,
             actor_id: actor.id.to_string(),
             action: ModerationAction::Lockdown.action_name().to_owned(),
             channel_id: Some(channel_id),
             reason: String::new(),
             outcome: "lockdown_preview".to_owned(),
-            idempotency_key: interaction.id.to_string(),
+            idempotency_key: interaction_id.clone(),
             metadata_json: preview_audit_metadata(&plan),
             created_at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
         };
+        // Unwind only this attempt's own entry, matched by request id. A
+        // newer same-key preview that lands after this unwind keeps its
+        // entry; one that landed before was already superseded by the
+        // re-insert above, so its Confirm collapses to PREVIEW_EXPIRED
+        // (fail closed, re-preview recovers) instead of running on a
+        // mismatched audit row.
+        let unwind_own_entry = |store: &Mutex<PendingStore>| {
+            store
+                .lock()
+                .map(|mut pending| pending.cancel_owned(pending_key, &interaction_id, now))
+        };
         let recorded = match self.store.try_record_audit(&row).await {
             Ok(recorded) => recorded,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                if plan.armed {
+                    let _removed = unwind_own_entry(&self.preview_pending);
+                }
+                return Err(error.into());
+            }
         };
         if !recorded {
             if plan.armed {
-                let _removed = self.preview_pending.lock().map(|mut pending| {
-                    pending.cancel((guild_id.get(), channel_num, actor.id.get()), now)
-                });
+                let _removed = unwind_own_entry(&self.preview_pending);
             }
             return Ok(ChannelReply::refused(
                 "Could not record the preview audit row; try again. Nothing was rendered and nothing was changed.",

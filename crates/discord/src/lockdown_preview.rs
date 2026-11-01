@@ -18,6 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use two_bot_core::lockdown_preview::PreviewPlan;
+use two_bot_core::message_safety::neutralize_mentions;
 
 /// Seconds a rendered armed preview stays consumable (spec section 5).
 pub const PREVIEW_TTL_SECS: i64 = 300;
@@ -95,14 +96,19 @@ impl PendingStore {
     }
 
     /// Consume the entry for `key` whose digest starts with `digest32`.
-    /// A foreign digest, a forged digest, a double press or an expired entry
-    /// yields `None` (the collapsed `PREVIEW_EXPIRED` reply).
+    /// The button carries exactly 32 hex characters; anything shorter,
+    /// longer or non-hex refuses without consuming, so a malformed press
+    /// collapses to `PREVIEW_EXPIRED` instead of eating a live entry. A
+    /// foreign digest, a double press or an expired entry also yields `None`.
     pub fn take(&mut self, key: ActorKey, digest32: &str, now: i64) -> Option<PendingEntry> {
         self.sweep(now);
-        let matches = self
-            .entries
-            .get(&key)
-            .is_some_and(|entry| entry.digest.starts_with(digest32) && !digest32.is_empty());
+        let well_formed =
+            digest32.len() == 32 && digest32.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let matches = well_formed
+            && self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.digest.starts_with(digest32));
         if matches {
             self.entries.remove(&key)
         } else {
@@ -115,6 +121,24 @@ impl PendingStore {
     pub fn cancel(&mut self, key: ActorKey, now: i64) -> bool {
         self.sweep(now);
         self.entries.remove(&key).is_some()
+    }
+
+    /// Drop the entry for `key` only when it still belongs to
+    /// `preview_request_id`. A redelivered attempt whose entry was superseded
+    /// by a newer same-key preview (different request id, audited
+    /// successfully) must unwind nothing: the newer entry keeps its row.
+    pub fn cancel_owned(&mut self, key: ActorKey, preview_request_id: &str, now: i64) -> bool {
+        self.sweep(now);
+        let owned = self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.preview_request_id == preview_request_id);
+        if owned {
+            self.entries.remove(&key);
+            true
+        } else {
+            false
+        }
     }
 
     #[must_use]
@@ -202,6 +226,14 @@ pub fn preview_audit_metadata(plan: &PreviewPlan) -> String {
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+/// Length Discord will actually receive: the interaction edit applies
+/// `message_safety::content`, which inserts one zero-width space per mass
+/// mention (`@everyone`/`@here`). The render carries four `@everyone`
+/// tokens, so the wire form is up to four units longer than the raw text.
+fn wire_len(value: &str) -> usize {
+    utf16_len(&neutralize_mentions(value))
 }
 
 fn channel_kind(channel_type: u64) -> &'static str {
@@ -298,7 +330,11 @@ pub fn render_preview(
         plan.member_overwrite_allows,
         plan.administrator_roles,
     );
-    if utf16_len(&full) <= MAX_RENDER_UTF16 {
+    // Measure the neutralized wire form, not the raw text: the four
+    // `@everyone` tokens each gain one unit on the way out. The keeper
+    // names the fallback drops are never mass mentions, so the fallback is
+    // always strictly shorter on the wire than the full render it replaces.
+    if wire_len(&full) <= MAX_RENDER_UTF16 {
         return full;
     }
     let count_only = format!(
@@ -369,15 +405,17 @@ mod tests {
             .insert((1, 2, 9), pending(&"9".repeat(64), 301), 1)
             .expect("same-key replacement succeeds at cap");
         assert_eq!(store.len(1), 64);
-        // The superseded digest no longer consumes.
-        assert!(store.take((1, 2, 9), &"0".repeat(32), 1).is_none());
-        assert!(store.take((1, 2, 9), &"9".repeat(32), 1).is_some());
         // A new key at cap refuses and keeps every live entry.
         assert_eq!(
             store.insert((1, 2, 64), pending(&"4".repeat(64), 301), 1),
             Err(PendingFull)
         );
         assert_eq!(store.len(1), 64);
+        // The superseded digest no longer consumes; the consume is separate
+        // from the at-cap refusal above.
+        assert!(store.take((1, 2, 9), &"0".repeat(32), 1).is_none());
+        assert!(store.take((1, 2, 9), &"9".repeat(32), 1).is_some());
+        assert_eq!(store.len(1), 63);
     }
 
     #[test]
@@ -410,6 +448,61 @@ mod tests {
         assert!(store.cancel((1, 2, 3), 2));
         assert!(!store.cancel((1, 2, 3), 2));
         assert_eq!(store.len(2), 0);
+    }
+
+    fn owned_entry(digest_char: char, request_id: &str) -> PendingEntry {
+        PendingEntry {
+            digest: digest_char.to_string().repeat(64),
+            reason: "raid".to_owned(),
+            preview_request_id: request_id.to_owned(),
+            expires_at: 300,
+        }
+    }
+
+    #[test]
+    fn take_rejects_malformed_keys_without_consuming() {
+        let mut store = PendingStore::new();
+        store
+            .insert((1, 2, 3), owned_entry('a', "7"), 1)
+            .expect("inserts");
+        // Short, long, empty and non-hex prefixes all refuse.
+        for malformed in [
+            "a".repeat(31),
+            "a".repeat(33),
+            String::new(),
+            "g".repeat(32),
+            "A".repeat(31) + "!",
+        ] {
+            assert!(
+                store.take((1, 2, 3), &malformed, 2).is_none(),
+                "malformed key must not consume: {malformed:?}"
+            );
+        }
+        assert_eq!(store.len(2), 1, "refusals consume nothing");
+        assert!(store.take((1, 2, 3), &"a".repeat(32), 2).is_some());
+    }
+
+    #[test]
+    fn cancel_owned_spares_a_superseding_preview() {
+        let mut store = PendingStore::new();
+        let key = (1, 2, 3);
+        store
+            .insert(key, owned_entry('a', "111"), 1)
+            .expect("inserts");
+        // A newer same-key preview supersedes the redelivered attempt's entry.
+        store
+            .insert(key, owned_entry('a', "222"), 2)
+            .expect("replaces");
+        // The stale attempt's unwind must not delete the newer entry.
+        assert!(!store.cancel_owned(key, "111", 3));
+        assert_eq!(store.len(3), 1);
+        assert!(store.take(key, &"a".repeat(32), 3).is_some());
+        // An owner-matched unwind removes its own entry.
+        store
+            .insert(key, owned_entry('b', "333"), 4)
+            .expect("inserts");
+        assert!(store.cancel_owned(key, "333", 5));
+        assert_eq!(store.len(5), 0);
     }
 
     #[test]
@@ -522,5 +615,73 @@ mod tests {
         );
         assert!(utf16_len(&count_only) <= MAX_RENDER_UTF16);
         assert!(count_only.contains("would keep: 12"));
+    }
+
+    /// Adversarial snapshot: 250 evaluated roles, maximum-width ids and
+    /// masks, saved state present. The interaction edit neutralizes the
+    /// four `@everyone` tokens (+1 unit each), so the bound applies to the
+    /// wire form, not the raw render.
+    fn adversarial_snapshot(keepers: usize, id_base: u64) -> PreviewSnapshot {
+        let mut roles = vec![RoleSnapshot {
+            id: 7,
+            position: 0,
+            permissions: VIEW,
+        }];
+        roles.extend((0..keepers).map(|index| RoleSnapshot {
+            id: id_base + index as u64,
+            position: index as i64 + 1,
+            permissions: VIEW | SEND,
+        }));
+        roles.extend((keepers..249).map(|index| RoleSnapshot {
+            id: 1_000_000 + index as u64,
+            position: index as i64 + 1,
+            permissions: 0,
+        }));
+        PreviewSnapshot {
+            guild_id: 7,
+            channel_id: u64::MAX,
+            channel_type: 5,
+            parent_id: Some(u64::MAX),
+            actor_id: 9,
+            reason: "raid".to_owned(),
+            saved_present: true,
+            saved_generation: "3".to_owned(),
+            roles,
+            overwrites: vec![OverwriteSnapshot {
+                kind: 0,
+                id: 7,
+                allow: 0,
+                deny: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn render_wire_form_after_neutralization_fits_the_bound() {
+        // Maximum width everywhere: 20-digit ids, u64 masks, 249 keepers.
+        let widest = adversarial_snapshot(249, 10_000_000_000_000_000_000);
+        let plan = two_bot_core::lockdown_preview::plan_preview(&widest).expect("plans");
+        assert!(plan.armed);
+        let text = render_preview(&plan, u64::MAX, 5, Some(u64::MAX), true, 1_800_000_300);
+        assert!(
+            text.contains("names withheld"),
+            "the widest shape must take the count-only fallback"
+        );
+        assert!(
+            wire_len(&text) <= MAX_RENDER_UTF16,
+            "wire form exceeds the bound: {} units",
+            wire_len(&text)
+        );
+        // Truncation edge and narrow shapes stay on the wire bound too.
+        for keepers in [0, 1, 10, 11] {
+            let snap = adversarial_snapshot(keepers, 999_999_999_999_999_999);
+            let plan = two_bot_core::lockdown_preview::plan_preview(&snap).expect("plans");
+            let text = render_preview(&plan, 3_333, 0, None, false, 1_800_000_300);
+            assert!(
+                wire_len(&text) <= MAX_RENDER_UTF16,
+                "{keepers} keepers wire to {} units",
+                wire_len(&text)
+            );
+        }
     }
 }

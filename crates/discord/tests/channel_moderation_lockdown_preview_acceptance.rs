@@ -437,16 +437,12 @@ async fn preview_store_outage_is_an_error_not_a_row() {
 #[tokio::test]
 async fn preview_redelivered_interaction_refuses_without_second_row() {
     let db = Database::open().await;
-    let mock = MockRest::start(
-        vec![
-            ScriptedResponse::json(200, armed_channel_doc()),
-            ScriptedResponse::json(200, roles_doc()),
-            ScriptedResponse::json(200, armed_channel_doc()),
-            ScriptedResponse::json(200, roles_doc()),
-        ],
-        ScriptedResponse::status(500),
-    )
-    .await;
+    let mut script = Vec::new();
+    for _ in 0..5 {
+        script.push(ScriptedResponse::json(200, armed_channel_doc()));
+        script.push(ScriptedResponse::json(200, roles_doc()));
+    }
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
     let runtime = runtime(&db, &mock);
     let router = router(true);
     let first = interaction(111, reason_options(), MANAGE_CHANNELS);
@@ -466,6 +462,34 @@ async fn preview_redelivered_interaction_refuses_without_second_row() {
     assert_eq!(reply.outcome, "refused");
     assert!(reply.digest32.is_none(), "redelivery renders nothing");
     assert_eq!(db.audit_count().await, 1, "redelivery writes no second row");
+    // A newer preview between the arming and the redelivery is superseded by
+    // the redelivery's re-insert, so its Confirm would expire fail-closed;
+    // the store itself stays clean and arms the next preview.
+    let newer = interaction(112, reason_options(), MANAGE_CHANNELS);
+    let reply = handled(
+        runtime.execute(&router, &newer).await.unwrap(),
+        "lockdown-preview",
+    );
+    assert_eq!(reply.outcome, "lockdown_preview");
+    let stale = interaction(111, reason_options(), MANAGE_CHANNELS);
+    let reply = handled(
+        runtime.execute(&router, &stale).await.unwrap(),
+        "lockdown-preview",
+    );
+    assert_eq!(reply.outcome, "refused");
+    assert_eq!(
+        db.audit_count().await,
+        2,
+        "only the two live attempts audit"
+    );
+    let recovery = interaction(113, reason_options(), MANAGE_CHANNELS);
+    let reply = handled(
+        runtime.execute(&router, &recovery).await.unwrap(),
+        "lockdown-preview",
+    );
+    assert_eq!(reply.outcome, "lockdown_preview");
+    assert!(reply.digest32.is_some(), "the store rearms cleanly");
+    assert_eq!(db.audit_count().await, 3);
     mock.shutdown().await;
     db.close().await;
 }
