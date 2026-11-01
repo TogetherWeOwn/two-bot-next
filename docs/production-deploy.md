@@ -287,6 +287,30 @@ resolved: otherwise the next automatic run re-selects the staged build that
 was just rolled back and redeploys it (the live check only skips builds the
 live revision already contains, and a rolled-back target is newer than live).
 
+## Rollback-target preflight
+
+Every ordinary promotion proves its rollback target before anything in
+production changes. Right after the pre-deploy snapshot, the `production` job
+runs `scripts/rollback_target_preflight.py`, which refuses the promotion
+(the run fails red, nothing is deployed) unless:
+
+- the snapshot names a complete receipt: a previous serving Worker version,
+  the Git SHA it was deployed from and its container image digest (a first
+  deploy, an unstamped version or split traffic has none);
+- live Cloudflare state still binds that receipt, with reads only: the same
+  check the rollback runs before any restore;
+- the registry still holds the image digest (`docker manifest inspect` with
+  a 15-minute pull-only credential);
+- no migration added since the serving SHA is backward-incompatible, and the
+  serving SHA is an ancestor of the candidate (see
+  [migrations.md](migrations.md#rollback-compatibility-at-promotion)).
+
+Its receipt (version, image, SHA, the migrations it checked, refusal codes)
+goes to the log and the run summary; it never carries SQL text or API
+bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
+it. The daily `staging-rollback-drill` keeps exercising the restore path
+itself on staging.
+
 ## Production error-rate gate
 
 The `production` job ends with the same REST 5xx promotion gate staging

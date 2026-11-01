@@ -3538,6 +3538,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_dry_run_acceptance.py -v
       - name: Verify worker-container rollback dry-run pins (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_dry_run_pins.py -v
+      - name: Verify production rollback-target preflight (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_rollback_target_preflight.py -v
       - name: Verify staging container backout/restore drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging container drill duplicate-key refusal (offline fixtures)

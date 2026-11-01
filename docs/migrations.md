@@ -99,6 +99,42 @@ so the same script can be adopted 1:1 by a central reusable workflow called
 from every repo. The remaining org rollout follow-up is a central repo plus
 an org-ruleset required workflow; `--strict` is already enabled here.
 
+## Rollback compatibility at promotion
+
+A production rollback restores the previous Worker version and container
+image, never the schema. Before every production promotion,
+`scripts/rollback_target_preflight.py` (see
+[production-deploy.md](production-deploy.md#rollback-target-preflight))
+scans each migration added between the serving build's SHA and the
+candidate. A statement the serving build may not survive refuses the
+promotion: `DROP TABLE`/`COLUMN`/`TYPE`/`VIEW`/`SCHEMA`/`FUNCTION`/`SEQUENCE`,
+`RENAME`, `ALTER COLUMN ... TYPE`, `SET NOT NULL`, `DROP DEFAULT`,
+`TRUNCATE`, `REVOKE`, and `ADD COLUMN ... NOT NULL` without a `DEFAULT`.
+`COLUMN` may be omitted, as PostgreSQL allows; any top-level `DROP` other than
+`DROP INDEX` refuses; statements inside `DO` and function bodies are checked
+too. Comments and string literals are lexed out first, so a `--` or `;` in a
+literal hides nothing; quoted identifiers (including schema-qualified ones
+like `"public"."members"`) and `E'...'` backslash escapes are handled the
+same way. A literal, comment or dollar-quoted body the lexer cannot close
+refuses as `unparseable_migration`: an unreadable migration never passes.
+`TRUNCATE` in a `CREATE TRIGGER ... BEFORE|AFTER|INSTEAD OF` event clause is
+not an executed truncate and does not refuse. Dynamic SQL inside an
+`EXECUTE '...'` string is not visible to the scan: keep it out of migrations,
+or annotate the file. A rewritten or deleted migration always refuses.
+
+Ship expand first, contract later: the contract migration lands only after
+every build that still reads the old shape has left production. When a
+flagged statement is safe anyway (for example it drops a table no shipped
+build ever read), say why in the file, reviewed like any other line:
+
+```sql
+-- rollback-compatible: no build since 0412 reads guild_legacy_flags
+DROP TABLE IF EXISTS guild_legacy_flags;
+```
+
+The reason must be at least ten characters. The marker covers the whole
+file, so keep a reviewed contract migration in its own file.
+
 ## Existing migration changes
 
 Prefer an **additive new migration**, especially after a migration has shipped.
