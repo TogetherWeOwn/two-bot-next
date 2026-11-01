@@ -113,7 +113,9 @@ T0_CHECK_ITEM = re.compile(r"^-\s*\[( |x|X)\]\s*(D[1-8]):\s*(.+?)\s*$")
 # non-identifier boundary before the `<`. Autolinks are stripped before
 # matching so evidence links never count as placeholders; inline code is kept
 # visible so backticked placeholders still fail while `Vec<u8>` passes via
-# the boundary rule.
+# the boundary rule. Spaced generics such as `Result<T, E>` are excluded by
+# the comma-blank shape; template placeholders always carry a blank inside
+# a phrase.
 T0_PLACEHOLDER = re.compile(r"<[^<>\n]*[ |/][^<>\n]*>")
 T0_BARE_PLACEHOLDER = re.compile(r"(?<![A-Za-z0-9_])<[A-Za-z][A-Za-z0-9_]*>")
 T0_AUTOLINK = re.compile(r"<https?://[^<>\s]+>")
@@ -126,11 +128,22 @@ def t0_visible_text(text):
     return T0_AUTOLINK.sub("", text or "")
 
 
+def _looks_like_generic_list(content):
+    """True for comma-separated type lists such as `T, E`: a comma is present
+    and every blank sits right after one. Template placeholders always carry
+    a blank inside a phrase (`<secret sinks, ...>`), so they never match."""
+    blanks = [m.start() for m in re.finditer(r"\s", content)]
+    return bool(blanks) and "," in content and all(
+        content[pos - 1] == "," for pos in blanks)
+
+
 def t0_has_placeholder(text):
     """True when visible attestation text still holds a template placeholder."""
     visible = t0_visible_text(text)
-    return bool(T0_PLACEHOLDER.search(visible)
-                or T0_BARE_PLACEHOLDER.search(visible))
+    for match in T0_PLACEHOLDER.finditer(visible):
+        if not _looks_like_generic_list(match.group(0)[1:-1]):
+            return True
+    return bool(T0_BARE_PLACEHOLDER.search(visible))
 
 
 def t0_path_words(component):

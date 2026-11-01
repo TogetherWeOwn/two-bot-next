@@ -333,6 +333,15 @@ class AttestationFloor(unittest.TestCase):
         f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
         self.assertIn(("error", "Attestation"), levels(f))
 
+    def test_spaced_generics_are_not_placeholders(self):
+        # `Result<T, E>` is evidence: every blank sits right after a comma,
+        # which template placeholders never do.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed payloads rejected, `Result<T, E>` handled")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
     def test_unfenced_generics_are_not_placeholders(self):
         # Option<T> outside code spans is evidence: the `<` is glued to an
         # identifier, which bare template tokens never are.
