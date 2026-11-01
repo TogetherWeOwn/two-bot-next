@@ -292,7 +292,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     controls
         .command_roles
         .insert("unlimit".to_owned(), vec![2010, 201]);
-    rooms.save_access_controls(GUILD, &controls).await?;
+    rooms.save_access_controls(GUILD, &gated, &controls).await?;
     let with_access = store.snapshot(GUILD).await?;
     let unlimit = with_access
         .settings
@@ -310,8 +310,15 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         .command_roles
         .insert("unlimit".to_owned(), vec![201, 2010]);
     assert_eq!(rooms.access_controls(GUILD).await?, sorted);
+    // An `/access` save from a read taken before that import refuses
+    // instead of reverting it: same advisory lock, compare-and-swap.
+    assert!(matches!(
+        rooms.save_access_controls(GUILD, &controls, &gated).await,
+        Err(sqlx::Error::RowNotFound)
+    ));
+    assert_eq!(rooms.access_controls(GUILD).await?, sorted);
     // Restore the fixture's restrictions (and the default switches).
-    rooms.save_access_controls(GUILD, &gated).await?;
+    rooms.save_access_controls(GUILD, &sorted, &gated).await?;
     assert_eq!(store.snapshot(GUILD).await?, stored);
 
     // 0469 backfill: a legacy-only restriction moves into the gate's store,

@@ -236,10 +236,13 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<AccessControls, StoreError>> + Send;
-    /// Replace the guild's controls (validated before the write).
+    /// Replace the guild's controls (validated before the write) while they
+    /// still equal `expected`, the value read for this change: `/import`
+    /// writes the same row, so a change in between is `Conflict`.
     fn save_access_controls(
         &self,
         guild: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// The guild's V10a logging settings; an unconfigured guild reads as the defaults.
@@ -524,11 +527,16 @@ impl RoomPersistence for PgRoomStore {
     async fn save_access_controls(
         &self,
         guild: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
-        self.save_access_controls(guild, controls)
-            .await
-            .map_err(store_error)
+        match self.save_access_controls(guild, expected, controls).await {
+            Ok(()) => Ok(()),
+            // The store's compare-and-swap sentinel: an import changed the
+            // controls between the `/access` read and this write.
+            Err(sqlx::Error::RowNotFound) => Err(StoreError::Conflict),
+            Err(error) => Err(store_error(error)),
+        }
     }
 
     async fn logging_settings(&self, guild: Snowflake) -> Result<LoggingSettings, StoreError> {
@@ -13692,7 +13700,8 @@ fn access_unrestrict_ack(command: &str) -> String {
 
 /// Apply one `/access` action: read, change, validate, save, then hand the
 /// saved controls to `on_saved` (the live actor). A failed read or write
-/// changes nothing and says so.
+/// changes nothing and says so; so does a save that finds the controls
+/// changed since the read (a confirmed import), instead of reverting it.
 async fn execute_access<S: RoomPersistence>(
     store: &S,
     guild_id: Snowflake,
@@ -13711,7 +13720,7 @@ async fn execute_access<S: RoomPersistence>(
     if show_page_invalid {
         return access_page_refusal();
     }
-    let mut controls = match store.access_controls(guild_id).await {
+    let read = match store.access_controls(guild_id).await {
         Ok(controls) => controls,
         Err(error) => {
             log_admin_store_failure("access_read", guild_id, error);
@@ -13719,6 +13728,7 @@ async fn execute_access<S: RoomPersistence>(
                 .to_owned();
         }
     };
+    let mut controls = read.clone();
     let ack = match action {
         AccessAction::Show { page } => {
             let Some(number) = page.number() else {
@@ -13758,10 +13768,15 @@ async fn execute_access<S: RoomPersistence>(
     if validate_access_controls(&controls).is_err() {
         return "Those settings are not valid, so nothing was changed.".to_owned();
     }
-    match store.save_access_controls(guild_id, &controls).await {
+    match store.save_access_controls(guild_id, &read, &controls).await {
         Ok(()) => {
             on_saved(controls);
             ack
+        }
+        Err(StoreError::Conflict) => {
+            "The voice-room settings changed while this was saving (an import was confirmed). \
+             Nothing was changed; check /access show and try again."
+                .to_owned()
         }
         Err(error) => {
             log_admin_store_failure("access_save", guild_id, error);

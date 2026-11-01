@@ -1096,24 +1096,20 @@ impl PgRoomStore {
         &self,
         guild_id: Snowflake,
     ) -> Result<AccessControls, sqlx::Error> {
-        sqlx::query(
-            "SELECT room_creation_enabled, required_role_id, command_roles::text AS command_roles
-             FROM voice_access_controls WHERE guild_id = $1",
-        )
-        .bind(guild_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .as_ref()
-        .map(decode_access_controls)
-        .transpose()
-        .map(Option::unwrap_or_default)
+        read_access_controls(&self.pool, guild_id).await
     }
 
-    /// Replace the guild's access controls atomically (one upsert). Refuses
+    /// Replace the guild's access controls, but only while they still equal
+    /// `expected` (the value the caller read and modified). `/import` writes
+    /// `command_roles` too (0469), from the bot and the operator CLI, so the
+    /// compare runs under the same per-guild advisory lock
+    /// `PgVoiceConfigStore::apply` takes: a change in between is
+    /// `RowNotFound`, never a silent revert of a confirmed import. Refuses
     /// unknown command names and zero role IDs before touching the database.
     pub async fn save_access_controls(
         &self,
         guild_id: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), sqlx::Error> {
         validate_access_controls(controls).map_err(invalid_argument)?;
@@ -1128,6 +1124,14 @@ impl PgRoomStore {
             })
             .collect();
         let command_roles = serde_json::to_string(&command_roles).map_err(invalid_argument)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("voice_config:{guild_id}"))
+            .execute(&mut *tx)
+            .await?;
+        if read_access_controls(&mut *tx, guild_id).await? != *expected {
+            return Err(sqlx::Error::RowNotFound);
+        }
         sqlx::query(
             "INSERT INTO voice_access_controls
              (guild_id, room_creation_enabled, required_role_id, command_roles)
@@ -1141,9 +1145,9 @@ impl PgRoomStore {
         .bind(controls.room_creation_enabled)
         .bind(controls.required_role.map(|role| role.to_string()))
         .bind(command_roles)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await
     }
 
     /// The guild's logging settings, or the defaults when never configured.
@@ -1191,6 +1195,25 @@ impl PgRoomStore {
         .await?;
         Ok(())
     }
+}
+
+/// The guild's access controls through `executor`, or the defaults when never
+/// configured.
+async fn read_access_controls<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    guild_id: Snowflake,
+) -> Result<AccessControls, sqlx::Error> {
+    sqlx::query(
+        "SELECT room_creation_enabled, required_role_id, command_roles::text AS command_roles
+         FROM voice_access_controls WHERE guild_id = $1",
+    )
+    .bind(guild_id.to_string())
+    .fetch_optional(executor)
+    .await?
+    .as_ref()
+    .map(decode_access_controls)
+    .transpose()
+    .map(Option::unwrap_or_default)
 }
 
 fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {

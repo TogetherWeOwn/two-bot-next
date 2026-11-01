@@ -253,7 +253,7 @@ impl RoomPersistence for Store {
     store_refuses!(prepare_owner_grants(_room: &VoiceRoom, _previous: u64) -> OwnerGrantIntent);
     store_refuses!(update_ownership(_room: &VoiceRoom, _revision: &str) -> bool);
     store_refuses!(save_custom_name(_guild: u64, _channel: u64, _name: Option<&str>) -> bool);
-    store_refuses!(save_access_controls(_guild: u64, _controls: &AccessControls) -> ());
+    store_refuses!(save_access_controls(_guild: u64, _expected: &AccessControls, _controls: &AccessControls) -> ());
     store_refuses!(save_logging_settings(_guild: u64, _settings: &LoggingSettings) -> ());
     store_refuses!(config_apply(_guild: u64, _config: &VoiceConfiguration, _expected: &VoiceConfiguration) -> ());
     store_refuses!(forget(_guild: u64, _channel: u64) -> ());
