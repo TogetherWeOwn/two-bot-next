@@ -116,10 +116,11 @@ JOB_INVENTORY = {
     # Advisory PR-size labels (org reusable, advisory only, never required):
     # thin caller to the central labeller + weekly tally.
     "pr-size.yml": {"pr-size", "pr-size-weekly"},
-    # Weekly DORA delivery metrics (docs/dora-metrics.md): reads 30 days of
-    # production Deployments and commits one JSON file plus a markdown
-    # summary to ops/metrics/ on the automation branch with the job token.
-    "dora-metrics.yml": {"metrics"},
+    # Weekly DORA delivery metrics (docs/dora-metrics.md): the read-only
+    # compute job reads 30 days of production Deployments; the main-only
+    # publish job commits one JSON file plus a markdown summary to
+    # ops/metrics/ on the automation branch with its own job token.
+    "dora-metrics.yml": {"metrics", "publish"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -8966,16 +8967,58 @@ class WorkflowTests(unittest.TestCase):
                         # proofs under the test label).
                         expected = {"contents": "read", "issues": "write"}
                     elif (name, job_id) == ("dora-metrics.yml", "metrics"):
-                        # Weekly DORA file: commits the JSON and summary to
-                        # the automation branch, reads the production
+                        # Weekly DORA compute: reads the production
                         # Deployments history and verifies each recorded
-                        # deploy's Actions run.
-                        expected = {"contents": "write", "deployments": "read",
+                        # deploy's Actions run. It executes the checked-out
+                        # scoring script (the dry run admits any ref), so it
+                        # holds read grants only.
+                        expected = {"contents": "read", "deployments": "read",
                                     "actions": "read"}
+                    elif (name, job_id) == ("dora-metrics.yml", "publish"):
+                        # Weekly DORA publish: commits the computed JSON and
+                        # summary to the automation branch. This main-only
+                        # job is the workflow's sole write grant.
+                        expected = {"contents": "write"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
                             self.assertEqual(step["with"]["persist-credentials"], "false")
+
+    def test_dora_compute_is_read_only_and_publish_is_main_only(self):
+        # The dry run admits any ref and executes that ref's scoring script,
+        # so the compute job's token stays read-only. The write grant lives
+        # in the separate publish job: it needs the compute job, runs only
+        # for a live main run, and copies the two files out of the compute
+        # artifact instead of executing checked-out code.
+        workflow = self.workflows["dora-metrics.yml"]
+        self.assertEqual(set(workflow["jobs"]), {"metrics", "publish"})
+        compute = workflow["jobs"]["metrics"]
+        publish = workflow["jobs"]["publish"]
+        self.assertEqual(compute["permissions"],
+                         {"contents": "read", "deployments": "read",
+                          "actions": "read"})
+        self.assertEqual(compute["if"],
+                         "github.ref == 'refs/heads/main' || inputs.dry_run == true")
+        self.assertEqual(compute["outputs"],
+                         {"week": "${{ steps.metrics.outputs.week }}"})
+        compute_runs = "\n".join(step.get("run", "") for step in compute["steps"])
+        self.assertIn("scripts/dora_metrics.py", compute_runs)
+        self.assertNotIn("git push", compute_runs)
+        self.assertEqual(publish["permissions"], {"contents": "write"})
+        self.assertEqual(publish["needs"], "metrics")
+        self.assertEqual(publish["if"],
+                         "inputs.dry_run != true && github.ref == 'refs/heads/main'")
+        publish_runs = "\n".join(step.get("run", "") for step in publish["steps"])
+        self.assertNotIn("dora_metrics.py", publish_runs)
+        downloads = [step for step in publish["steps"]
+                     if str(step.get("uses", "")).startswith("actions/download-artifact@")]
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(downloads[0]["with"]["name"],
+                         "dora-metrics-${{ github.run_id }}")
+        self.assertEqual(downloads[0]["with"]["path"], "ops/metrics")
+        commit = next(step for step in publish["steps"]
+                      if step.get("name") == "Commit the weekly DORA file")
+        self.assertEqual(commit["env"]["WEEK"], "${{ needs.metrics.outputs.week }}")
 
     def test_every_job_declares_a_timeout(self):
         # Direct jobs state a ceiling instead of burning the six-hour default.
