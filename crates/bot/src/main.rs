@@ -956,8 +956,10 @@ async fn run(cli_args: &[String]) {
     };
     // The gateway task has joined, so nothing feeds the game-activity
     // collector anymore: release its final flush now so it runs concurrently
-    // with the joins below. After a drain-deadline cut the writer may still
-    // be running; the pass is then best effort within the remaining budget.
+    // with the joins below. After a drain-deadline cut, or a fatal queue
+    // worker return that drops the writer unjoined (`run_shard`), the writer
+    // may still be running; the pass is then best effort within the remaining
+    // budget, and the fatal path restarts the container anyway.
     activity_drained.send_replace(true);
     // Both branches latch the shutdown watch before returning (the gateway
     // supervisor sends it before its drain; the HTTP/job serve path sends
