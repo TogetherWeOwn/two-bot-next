@@ -57,7 +57,7 @@ use std::sync::OnceLock;
 
 use super::command_permissions::command_permission;
 use super::commands::{
-    core_commands, merge_commands, CommandDefinition, CustomCommand, RegistryError,
+    core_commands, merge_registry, CommandDefinition, CustomCommand, RegistryError,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -908,7 +908,7 @@ impl InteractionRouter {
     /// announcement, moderation, then the voice set — then DB custom
     /// commands). `/templateassistant` stays unpublished until its slice
     /// lands with a handler: no published command may lack one. First-wins
-    /// dedupe and the 100-command ceiling come from `merge_commands`; voice
+    /// dedupe and the 100-command ceiling come from `merge_registry`; voice
     /// `kick` loses to moderation `/kick` there.
     ///
     /// Two publish/routing agreements keep a published command executable:
@@ -956,7 +956,20 @@ impl InteractionRouter {
         } else {
             Vec::new()
         };
-        merge_commands(&extra, &visible)
+        let merged = merge_registry(&extra, &visible)?;
+        if !merged.withheld.is_empty() {
+            // Operator signal for a guild whose stored custom commands no
+            // longer fit beside the builtins (for example after a release adds
+            // one). Names are validated slash names, never member content.
+            tracing::warn!(
+                target: "two_bot_core::command_registry",
+                guild_id = self.gates.configured_guild.map(|id| id.to_string()),
+                withheld_count = merged.withheld.len(),
+                withheld = ?merged.withheld,
+                "custom_commands_withheld_over_guild_limit"
+            );
+        }
+        Ok(merged.commands)
     }
 }
 
