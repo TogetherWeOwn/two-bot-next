@@ -296,21 +296,17 @@ fn gated_app(ledger: Arc<GateLedger>, sender: Arc<GateSender>) -> Router {
     )))
 }
 
-fn bind_config() -> EventsubReceiverConfig {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
-    let port = listener.local_addr().expect("reserved port").port();
-    drop(listener);
-
-    let mut vars = std::collections::HashMap::new();
-    vars.insert("TWO_EVENTSUB".to_owned(), "1".to_owned());
-    vars.insert("TWO_EVENTSUB_BIND".to_owned(), format!("127.0.0.1:{port}"));
-    vars.insert(
-        "TWO_TWITCH_WEBHOOK_SECRET".to_owned(),
-        test_secret().to_owned(),
-    );
-    EventsubReceiverConfig::from_map(&vars)
-        .unwrap()
-        .expect("enabled")
+/// Bound receiver on a retained ephemeral loopback listener. The port is
+/// never released between reservation and bind, so a parallel socket cannot
+/// take it and fail the bind spuriously.
+async fn bind_gated(deps: DeliveryDeps) -> BoundEventsubReceiver {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback bind");
+    BoundEventsubReceiver {
+        listener,
+        state: Arc::new(ReceiverState::with_delivery(&config(), Some(deps))),
+    }
 }
 
 async fn send_raw_request(
@@ -847,12 +843,7 @@ async fn receiver_shutdown_joins_admitted_child_before_serve_returns() {
 
     let ledger = GateLedger::new();
     let sender = GateSender::scripted(vec![Ok("msg-join-1".to_owned())]);
-    let bound = bind_with_delivery(
-        bind_config(),
-        Some(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))),
-    )
-    .await
-    .expect("loopback bind");
+    let bound = bind_gated(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))).await;
     let addr = bound.listener.local_addr().expect("bound port");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serve = tokio::spawn(bound.serve(shutdown_rx));
@@ -933,12 +924,7 @@ async fn receiver_shutdown_reports_deadline_exhaustion_without_abandoning_fences
     let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
     let ledger = GateLedger::new();
     let sender = GateSender::scripted(vec![Ok("msg-exhaust-1".to_owned())]);
-    let bound = bind_with_delivery(
-        bind_config(),
-        Some(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))),
-    )
-    .await
-    .expect("loopback bind");
+    let bound = bind_gated(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))).await;
     let addr = bound.listener.local_addr().expect("bound port");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serve = tokio::spawn(bound.serve(shutdown_rx));
@@ -993,12 +979,7 @@ async fn receiver_shutdown_admits_no_new_children() {
     let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
     let ledger = GateLedger::new();
     let sender = GateSender::scripted(vec![Ok("msg-admit-1".to_owned())]);
-    let bound = bind_with_delivery(
-        bind_config(),
-        Some(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))),
-    )
-    .await
-    .expect("loopback bind");
+    let bound = bind_gated(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))).await;
     let addr = bound.listener.local_addr().expect("bound port");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let serve = tokio::spawn(bound.serve(shutdown_rx));

@@ -485,9 +485,12 @@ async fn handle_notification(
         // Reap finished joins; each child reports its own failure.
         while children.try_join_next().is_some() {}
         let child_span = tracing::Span::current();
+        // Armed before the block so a child dropped before its first poll
+        // still reports its cancellation.
+        let failure = ChildFailureReport { armed: true };
         children.spawn(
             async move {
-                let mut failure = ChildFailureReport { armed: true };
+                let mut failure = failure;
                 let _permit = permit;
                 let delivery = deliver_go_live(
                     task_deps.ledger.as_ref(),
