@@ -524,6 +524,10 @@
     "crates/cutover/migrations/0468_custom_command_registry_resync.sql": {
       "sha256": "cb185447276adc89c206ad789c506a619403664dfde5a23bdf1544031f3d1777",
       "justification": "Add the one-row-per-guild durable pending marker recorded when a committed custom-command mutation's registry publication fails, so the next successful full-set publication resyncs the picker without a bot restart or a mutation replay; runtime state only, cutover chain only."
+    },
+    "crates/cutover/migrations/0469_voice_command_roles_authority.sql": {
+      "sha256": "6c88997753233f4fd733e209f36da16d8bae4d8de8137d3dce757ac9a0eb0f8b",
+      "justification": "Move legacy /import per-command voice restrictions into voice_access_controls.command_roles, the column the command gate enforces, keeping any role list already enforced there, and empty the legacy tables; data move only, no DDL."
     }
   }
 }

@@ -6,6 +6,7 @@ use serde_json::json;
 use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use two_bot_core::voice_access::{may_use_command, AccessDecision, AccessDenyReason, AccessMember};
 use two_bot_core::voice_config::{
     export_configuration, import_configuration, ChannelKind, ChannelReference, ChannelTemplates,
     CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition, VoiceConfiguration,
@@ -184,8 +185,7 @@ async fn config_rows(pool: &PgPool, guild: &str) -> Result<i64, sqlx::Error> {
               + (SELECT count(*) FROM voice_logging_mention_members WHERE guild_id = $1)
               + (SELECT count(*) FROM voice_logging_mention_roles WHERE guild_id = $1)
               + (SELECT count(*) FROM voice_guild_settings WHERE guild_id = $1)
-              + (SELECT count(*) FROM voice_command_roles WHERE guild_id = $1)
-              + (SELECT count(*) FROM voice_command_role_members WHERE guild_id = $1)",
+              + (SELECT count(*) FROM voice_access_controls WHERE guild_id = $1)",
     )
     .bind(guild)
     .fetch_one(pool)
@@ -250,6 +250,114 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     let again = store.snapshot(GUILD).await?;
     assert_eq!(again, stored);
     assert_eq!(export_configuration(&again, &inventory)?, exported);
+
+    // The imported restrictions are the ones the command gate enforces: the
+    // gate reads `PgRoomStore::access_controls`, the store adapter behind
+    // `RoomPersistence::access_controls`.
+    let gated = rooms.access_controls(GUILD).await?;
+    assert_eq!(
+        gated.command_roles,
+        BTreeMap::from([
+            ("kick".to_owned(), vec![201, 2010]),
+            ("limit".to_owned(), vec![]),
+        ])
+    );
+    let member = |roles: Vec<u64>| AccessMember {
+        is_admin: false,
+        roles,
+    };
+    let restricted = AccessDecision::Deny(AccessDenyReason::CommandRestricted);
+    assert_eq!(
+        may_use_command(&gated, &member(vec![999]), "kick"),
+        restricted
+    );
+    assert_eq!(
+        may_use_command(&gated, &member(vec![2010]), "kick"),
+        AccessDecision::Allow
+    );
+    assert_eq!(
+        may_use_command(&gated, &member(vec![201]), "limit"),
+        restricted
+    );
+    assert_eq!(
+        may_use_command(&gated, &member(vec![999]), "unlimit"),
+        AccessDecision::Allow
+    );
+
+    // `/access` writes the same store: its restriction exports, an import
+    // round trip keeps it, and apply leaves the `/access`-only switches alone.
+    let mut controls = gated.clone();
+    controls.required_role = Some(201);
+    controls.room_creation_enabled = false;
+    controls
+        .command_roles
+        .insert("unlimit".to_owned(), vec![2010, 201]);
+    rooms.save_access_controls(GUILD, &controls).await?;
+    let with_access = store.snapshot(GUILD).await?;
+    let unlimit = with_access
+        .settings
+        .command_roles
+        .iter()
+        .find(|entry| entry.command == "unlimit")
+        .expect("an /access restriction is exported");
+    assert_eq!(unlimit.role_ids, ["201", "2010"]);
+    let reimported =
+        import_configuration(&export_configuration(&with_access, &inventory)?, &inventory)?;
+    store.apply(GUILD, &reimported, &with_access).await?;
+    assert_eq!(store.snapshot(GUILD).await?, with_access);
+    let mut sorted = controls.clone();
+    sorted
+        .command_roles
+        .insert("unlimit".to_owned(), vec![201, 2010]);
+    assert_eq!(rooms.access_controls(GUILD).await?, sorted);
+    // Restore the fixture's restrictions (and the default switches).
+    rooms.save_access_controls(GUILD, &gated).await?;
+    assert_eq!(store.snapshot(GUILD).await?, stored);
+
+    // 0469 backfill: a legacy-only restriction moves into the gate's store,
+    // an enforced one keeps its roles, and the legacy tables empty.
+    sqlx::query(
+        "INSERT INTO voice_command_roles (guild_id, command) VALUES
+           ('44','kick'), ('44','limit'), ('45','transfer')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO voice_command_role_members (guild_id, command, role_id) VALUES
+           ('44','kick','2010'), ('44','kick','201'), ('45','transfer','7')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO voice_access_controls (guild_id, required_role_id, command_roles)
+         VALUES ('44', '9', '{\"kick\": [\"5\"]}'::jsonb)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0469_voice_command_roles_authority.sql"
+    ))
+    .execute(pool)
+    .await?;
+    let backfilled = rooms.access_controls(44).await?;
+    assert_eq!(backfilled.required_role, Some(9));
+    assert_eq!(
+        backfilled.command_roles,
+        BTreeMap::from([("kick".to_owned(), vec![5]), ("limit".to_owned(), vec![])])
+    );
+    assert_eq!(
+        rooms.access_controls(45).await?.command_roles,
+        BTreeMap::from([("transfer".to_owned(), vec![7])])
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT count(*) FROM voice_command_roles)
+                  + (SELECT count(*) FROM voice_command_role_members)"
+        )
+        .fetch_one(pool)
+        .await?,
+        0
+    );
 
     // Another guild is independent of this one.
     let mut neighbour = config.clone();
