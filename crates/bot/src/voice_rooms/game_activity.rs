@@ -1220,7 +1220,7 @@ const SHUTDOWN_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// already flushed contributes only what arrived since and is never counted
 /// twice. A failed persist leaves its buffers in the collector (a gate
 /// failure before the drain, a write failure after a requeue), so the guild
-/// is retried up to [`SHUTDOWN_FLUSH_ATTEMPTS`] times. Guilds still failing
+/// is retried up to `SHUTDOWN_FLUSH_ATTEMPTS` times. Guilds still failing
 /// are logged as `game_activity_shutdown_flush_failed` and returned as a
 /// count: their buffered interval is lost when the process exits.
 pub async fn flush_remaining_guilds(
