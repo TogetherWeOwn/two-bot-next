@@ -634,6 +634,51 @@ jobs:
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
 
+  # Promotion prerequisite (docs/synthetic-user-flow.md): the same read-only
+  # user-flow probe the five-minute synthetic runs, pinned to the exact SHA
+  # this run deployed. A failure fails this run, certify-promotion needs it,
+  # and the production guard refuses a staging attempt whose job of this name
+  # did not succeed, so the scheduled synthetic is no longer the only check.
+  # Workflow concurrency serializes staging runs, so staging still serves this
+  # SHA while the probe reads it. The job never alerts: the scheduled
+  # synthetic keeps the incident-issue path.
+  user-flow-synthetic:
+    name: staging user-flow synthetic (exact SHA)
+    needs: deploy
+    permissions:
+      contents: read
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'user-flow-synthetic') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed probe from the workflow's own commit, like the deploy
+          # job's tooling checkout: a pinned drill deploys an older SHA.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Probe the staging user flow on the exact deployed SHA
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$STAGING_WORKER_URL" ]; then
+            echo "::error::STAGING_WORKER_URL is unset; the user-flow synthetic has zero samples, refusing to certify"
+            exit 1
+          fi
+          python3 scripts/staging_health_contract_probe.py --expected-sha "$EXPECTED_SHA" \
+            --evidence "$RUNNER_TEMP/staging-user-flow-synthetic.json"
+      - name: Upload the user-flow synthetic evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-user-flow-synthetic
+          path: ${{ runner.temp }}/staging-user-flow-synthetic.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Pinned-drill history guard: the production guard keys staging runs by head
   # SHA, so a dispatch that deploys a pinned SHA below the workflow head must
   # not read as staging history for the head. This job runs after the voice
@@ -670,7 +715,7 @@ jobs:
   # run that passed every downstream gate can publish these immutable bytes.
   certify-promotion:
     name: certify immutable staging bytes
-    needs: [deploy, voice-synthetic, pinned-history-guard]
+    needs: [deploy, voice-synthetic, user-flow-synthetic, pinned-history-guard]
     if: success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'certify-promotion') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5

@@ -438,9 +438,12 @@ class WorkflowFilesTests(unittest.TestCase):
 class CertifyGraphTests(WorkflowFilesTests):
     def test_certify_runs_downstream_of_deploy_voice_and_pinned_history(self):
         job = self.staging["jobs"]["certify-promotion"]
-        self.assertEqual(job["needs"], ["deploy", "voice-synthetic", "pinned-history-guard"])
+        self.assertEqual(job["needs"], ["deploy", "voice-synthetic", "user-flow-synthetic",
+                                        "pinned-history-guard"])
         voice = self.staging["jobs"]["voice-synthetic"]
         self.assertEqual(voice["needs"], "deploy")
+        synthetic = self.staging["jobs"]["user-flow-synthetic"]
+        self.assertEqual(synthetic["needs"], "deploy")
         guard = self.staging["jobs"]["pinned-history-guard"]
         self.assertEqual(guard["needs"], "voice-synthetic")
 

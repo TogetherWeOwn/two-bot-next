@@ -237,8 +237,11 @@ same commit (on 10-20 staging went green ~23 minutes before CI, and 12 promotion
 in a row refused), so whichever finishes last promotes and the earlier one skips.
 An automatic run is exactly the empty-`sha` manual dispatch — the commit of
 the latest successful staging deploy — with takeover on, so the owned probes
-can certify it. Every guard still applies to it. These skips keep it green
-while deploying nothing:
+can certify it. Every guard still applies to it, including the exact-SHA staging
+user-flow synthetic: the guard refuses unless the `staging user-flow
+synthetic (exact SHA)` job succeeded in the staging run and attempt it
+promotes (see [the synthetic runbook](synthetic-user-flow.md#promotion-prerequisite)).
+These skips keep it green while deploying nothing:
 
 - the triggering staging run did not succeed (`staging-not-green`);
 - the triggering `check` run did not succeed (`ci-not-green`) or was not a

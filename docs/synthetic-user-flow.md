@@ -18,6 +18,19 @@ Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
 or fence refusal. Production is passive: the prod job observes and alerts
 only, and never blocks a deploy.
 
+### Promotion prerequisite
+
+The scheduled run is not the only check. Every `deploy-staging` run also runs
+the staging probe once, as the `user-flow-synthetic` job ("staging user-flow
+synthetic (exact SHA)"), right after its deploy and pinned with
+`--expected-sha` to the commit that run deployed. `certify-promotion` needs
+that job, and the `deploy-production` guard refuses a promotion unless the
+job of that exact name succeeded in the same staging run and attempt it
+promotes. A failed, skipped or missing synthetic leaves the commit staged but
+never promoted. This job has no incident-issue path: the five-minute
+scheduled run keeps alerting. Rollbacks and the live-SHA redeploy waive
+staging history, so they never read it.
+
 The production probe accepts only a stamped identity with a 40-character,
 lowercase hexadecimal `build_revision` and a `build_id` containing exactly two
 non-empty decimal components separated by one hyphen (each at most 20 digits;
