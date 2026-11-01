@@ -96,7 +96,14 @@ STEPS = (
     ("isolated invite saturation acceptance", DB_ENV,
      "cargo test -p two-bot-store --test invite_uses_saturation_acceptance "
      "--features two-bot-core/db --locked -- --test-threads=1"),
+    ("property budget", {},
+     "start=$SECONDS\n"
+     "cargo test --workspace --lib --bins --test '*' --features two-bot-core/db --locked property_\n"
+     "elapsed=$((SECONDS - start))\n"
+     "printf 'Property suite: %s seconds (budget <30)\\n' \"$elapsed\"\n"
+     "test \"$elapsed\" -lt 30"),
     ("docs", {}, "cargo test --workspace --doc --features two-bot-core/db --locked"),
+    ("metrics RSS", {}, "cargo run -p two-bot-core --example metrics_rss --locked"),
 )
 RESULT = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored")
 
@@ -188,17 +195,22 @@ def up(fresh=False):
         docker("run", "-d", "--name", RUNNER, "--network", NETWORK,
                "-v", f"{TARGET_VOLUME}:/target", "-v", f"{CACHE_VOLUME}:/cache",
                *git_mounts(), "--entrypoint", "sleep", rust, "infinity", capture=True)
-        runner_exec(["sh", "-c",
-                     "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
-                     "python3 postgresql-client socat >/dev/null && rm -rf /var/lib/apt/lists/* && "
-                     "mkdir -p /cache/home /cache/cargo /cache/rustup /target/scratch && "
-                     f"chown {os.getuid()}:{os.getgid()} /cache /cache/home /cache/cargo "
-                     "/cache/rustup /target /target/scratch"], root=True)
-        runner_exec(["rustup", "toolchain", "install", toolchain(), "--profile", "minimal",
-                     "--component", "rustfmt", "--component", "clippy", "--no-self-update"])
-        # Tests that pin localhost:5432 reach the service through this forward, as in CI.
-        docker("exec", "-d", RUNNER, "socat",
-               "TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork", "TCP:agent-testdb:5432")
+        try:
+            runner_exec(["sh", "-c",
+                         "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
+                         "python3 postgresql-client socat >/dev/null && rm -rf /var/lib/apt/lists/* && "
+                         "mkdir -p /cache/home /cache/cargo /cache/rustup /target/scratch && "
+                         f"chown {os.getuid()}:{os.getgid()} /cache /cache/home /cache/cargo "
+                         "/cache/rustup /target /target/scratch"], root=True)
+            runner_exec(["rustup", "toolchain", "install", toolchain(), "--profile", "minimal",
+                         "--component", "rustfmt", "--component", "clippy", "--no-self-update"])
+            # Tests that pin localhost:5432 reach the service through this forward, as in CI.
+            docker("exec", "-d", RUNNER, "socat",
+                   "TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork", "TCP:agent-testdb:5432")
+        except BaseException:
+            # A half-provisioned runner would look ready next time; drop it so setup retries.
+            docker("rm", "-f", RUNNER, check=False, capture=True)
+            raise
     # Probe over the network like CI: the image's init server answers on the
     # unix socket before it listens on TCP.
     for _ in range(60):

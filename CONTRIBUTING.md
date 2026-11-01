@@ -215,9 +215,12 @@ in a runner built from the job's `rust:bookworm` image. The guard accepts only
 the literal `agent-testdb` host, so Cargo runs inside that runner rather than on
 the host. Unlike CI it adds `--no-fail-fast`, so one failing test binary does not
 hide the rest, and it prints per-step exit codes and pass/fail/ignored totals.
+It also runs the job's property-test 30-second budget and metrics RSS steps; the
+budget is timed on your host, so a local pass does not prove the CI runner's.
 
 ```sh
 python3 scripts/local_testdb.py test                  # fresh DB + rust-tests steps + summary
+python3 scripts/local_testdb.py exec -- python3 scripts/generate_command_reference.py  # once per fresh checkout
 python3 scripts/local_testdb.py exec [--fresh] -- cargo test -p two-bot-core --features db --locked
 python3 scripts/local_testdb.py env                   # the exported test environment
 python3 scripts/local_testdb.py down [--volumes]      # --volumes also drops the target cache

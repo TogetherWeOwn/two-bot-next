@@ -7,8 +7,11 @@ No Docker, database or network is used.
 """
 
 import importlib.util
+import re
 from pathlib import Path
+import subprocess
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 JOB = "rust-tests"
@@ -61,8 +64,7 @@ class LocalTestDbParity(unittest.TestCase):
         mirrored = {words(command) for _, _, command in self.harness.STEPS}
         for step in self.job["steps"]:
             run = words(step.get("run", ""))
-            if run.startswith(("cargo test", "python3 scripts/generate_command_reference.py")) \
-                    and "property_" not in run:
+            if re.search(r"(^| )(cargo (test|run) |python3 scripts/generate_command_reference\.py)", run):
                 with self.subTest(step=step.get("name")):
                     self.assertIn(run, mirrored)
 
@@ -73,6 +75,25 @@ class LocalTestDbParity(unittest.TestCase):
             self.assertIn(f"createdb -h agent-testdb -U agent_test {name}\n", prepare)
         for key, value in self.harness.WAL:
             self.assertIn(f"ALTER SYSTEM SET {key} = '{value}'", prepare)
+
+
+class RunnerProvisioning(unittest.TestCase):
+    def test_failed_provisioning_removes_the_runner(self):
+        harness = load_harness()
+        calls = []
+
+        def docker(*args, check=True, capture=False):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        failure = subprocess.CalledProcessError(100, ["apt-get"])
+        with mock.patch.object(harness, "docker", docker), \
+                mock.patch.object(harness, "running", return_value=False), \
+                mock.patch.object(harness, "exists", return_value=True), \
+                mock.patch.object(harness, "runner_exec", side_effect=failure):
+            with self.assertRaises(subprocess.CalledProcessError):
+                harness.up()
+        self.assertEqual(calls[-1], ("rm", "-f", harness.RUNNER))
 
 
 if __name__ == "__main__":
