@@ -79,7 +79,7 @@ impl Database {
 
     async fn audit_rows(&self) -> Vec<(String, String, String, String)> {
         sqlx::query(
-            "SELECT request_id, outcome, reason, metadata_json FROM moderation_audit ORDER BY id",
+            "SELECT request_id, outcome, reason, metadata_json FROM moderation_audit ORDER BY created_at, request_id",
         )
         .fetch_all(self.store.pool())
         .await
