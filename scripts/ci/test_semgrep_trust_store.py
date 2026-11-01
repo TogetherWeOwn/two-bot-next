@@ -17,6 +17,42 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "scripts/ci/fixtures"
 CHECK = ROOT / "scripts/ci/check-semgrep-trust-store.py"
 BAD_SHA256 = "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b"
+_LOCKFILE_HEADER = re.compile(r"([A-Za-z0-9_.-]+)==(\S+) \\")
+_LOCKFILE_HASH = re.compile(r" {4}--hash=sha256:([0-9a-f]{64})( \\)?")
+
+
+def parse_semgrep_lockfile(text):
+    """Return ``(name, version, hashes)`` entries, rejecting stray lines.
+
+    Pip accepts indented requirement lines, so counting only column-zero
+    headers would miss a hashless or duplicate requirement.  Every nonblank,
+    noncomment physical line must therefore belong to one strict lockfile
+    entry (or be rejected outright).
+    """
+    entries = []
+    current = None
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.strip().startswith("#"):
+            if current is not None:
+                raise ValueError(f"semgrep lockfile line {line_number}: entry is incomplete")
+            continue
+        if current is None:
+            header = _LOCKFILE_HEADER.fullmatch(line)
+            if header is None:
+                raise ValueError(
+                    f"semgrep lockfile line {line_number}: expected a pinned package header")
+            current = (header.group(1), header.group(2), [])
+            continue
+        hash_line = _LOCKFILE_HASH.fullmatch(line)
+        if hash_line is None:
+            raise ValueError(f"semgrep lockfile line {line_number}: expected a hash line")
+        current[2].append(hash_line.group(1))
+        if hash_line.group(2) is None:
+            entries.append(current)
+            current = None
+    if current is not None:
+        raise ValueError("semgrep lockfile ends with an incomplete entry")
+    return entries
 
 
 class SemgrepTrustStoreTests(unittest.TestCase):
@@ -124,23 +160,44 @@ class SemgrepTrustStoreTests(unittest.TestCase):
         # that drops a hash, duplicates a package or regresses the certifi
         # GHSA-6q48-6c7w-9gw2 floor must fail here, before CI installs it.
         text = (ROOT / "scripts/ci/semgrep-requirements.txt").read_text()
-        entries = re.findall(
-            r"^([A-Za-z0-9_.-]+)==(\S+) \\\n(?: {4}--hash=sha256:[0-9a-f]{64} ?\\\n)*"
-            r" {4}--hash=sha256:([0-9a-f]{64})$",
-            text, re.M)
+        entries = parse_semgrep_lockfile(text)
         self.assertGreaterEqual(len(entries), 60)
-        body = [line for line in text.splitlines()
-                if line.strip() and not line.startswith("#")]
-        # Two lines per entry (pin + final hash line); extra hash lines belong
-        # to their entry, so count entry headers instead of raw lines.
-        headers = [line for line in body if not line.startswith(" ")]
-        self.assertEqual(len(headers), len(entries))
         names = [re.sub(r"[-_.]+", "-", name).lower() for name, _, _ in entries]
         self.assertEqual(len(names), len(set(names)), "duplicate package in lockfile")
         versions = dict(zip(names, (version for _, version, _ in entries)))
         self.assertIn("semgrep", versions)
         certifi = tuple(int(part) for part in versions["certifi"].split("."))
         self.assertGreaterEqual(certifi, (2026, 10, 19))
+
+    def test_requirements_lockfile_parser_accounts_for_every_requirement_line(self):
+        digest = "a" * 64
+        valid = (
+            "# synthetic lockfile\n"
+            "certifi==2026.10.23 \\\n"
+            f"    --hash=sha256:{digest}\n"
+            "semgrep==1.183.0 \\\n"
+            f"    --hash=sha256:{digest}\n"
+        )
+        self.assertEqual(
+            [(name, version) for name, version, _ in parse_semgrep_lockfile(valid)],
+            [("certifi", "2026.10.23"), ("semgrep", "1.183.0")])
+
+        mutations = {
+            "indented hashless header": valid.replace(
+                "certifi==2026.10.23 \\\n"
+                f"    --hash=sha256:{digest}\n",
+                "    certifi==2026.10.23\n", 1),
+            "indented duplicate": valid + "    semgrep==1.180.0\n",
+            "hashless header": valid.replace(
+                "certifi==2026.10.23 \\\n"
+                f"    --hash=sha256:{digest}\n",
+                "certifi==2026.10.23\n", 1),
+            "unaccounted option": valid + "--extra-index-url https://example.invalid/simple\n",
+        }
+        for label, text in mutations.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "semgrep lockfile"):
+                    parse_semgrep_lockfile(text)
 
 
 if __name__ == "__main__":
