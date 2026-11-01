@@ -1850,7 +1850,7 @@ mod tests {
         fn send_live<'a>(&'a self, _channel_id: &'a str, content: &'a str) -> SendFuture<'a> {
             Box::pin(async move {
                 if content.contains("twitch.tv") {
-                    panic!("{CHILD_PANIC_MARKER}");
+                    std::panic::panic_any(CHILD_PANIC_MARKER);
                 }
                 Ok("unreachable-msg".to_owned())
             })
