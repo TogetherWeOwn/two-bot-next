@@ -62,6 +62,11 @@ regression ("this lookup may be slow" with no event-rate path), and
 defensive checks for states the callers already prevent (re-checking a
 permission the router already enforced).
 
+These labels only grade a finding that already qualifies under "What
+merits a finding", "Test rigor" and "Skip"; they never make an item
+reportable. Most of the Not Severe items are skipped outright, and any
+that is still reported is Non-severe.
+
 ## Disproof pass (before posting any finding)
 
 Try to prove your own candidate wrong first:
