@@ -50,7 +50,7 @@ jobs:
             if ! changed=$(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" | tr '\0' '\n'); then
               :
             elif printf '%s\n' "$changed" \
-              | grep -qxE '\.github/.*|(.*/)?Cargo\.(toml|lock)|rust-toolchain(\.toml)?|\.cargo/.*|deny\.toml|scripts/(job-inputs|test_nightly_routing)\.py'; then
+              | grep -qxE '\.github/.*|(.*/)?Cargo\.(toml|lock)|rust-toolchain(\.toml)?|\.cargo/.*|deny\.toml|scripts/(job-inputs|test_nightly_routing|ci/.*nightly.*)\.py'; then
               :
             else
               rust=false supply=false
@@ -95,9 +95,13 @@ jobs:
           arguments: --workspace --all-features
 
   sweep:
-    name: nightly ignored tests and docs
+    name: nightly ignored tests partition ${{ matrix.partition }}
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2, 3]
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
@@ -139,10 +143,14 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
-          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          for _ in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
       - name: Guarded fixture routing and doc references (offline)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+          # The partition acceptance suite parses this workflow contract; it
+          # runs in the `check` job, which already provides PyYAML.
+          test -f scripts/ci/test_nightly_partition_acceptance.py
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
@@ -213,6 +221,7 @@ jobs:
           TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
+          python3 scripts/ci/run-nightly-partition.py --index "${{ matrix.partition }}" --count 4 --
           cargo test --workspace --all-features --locked --no-fail-fast -- --include-ignored --test-threads=1
           --skip regenerate_reference_docs
           --skip channel_moderation_store::
@@ -379,14 +388,14 @@ jobs:
           --skip event_store_s7_duplicate_delivery_inserts_once
           --skip event_store_s7_privacy_tripwire_rejects_descriptions_and_locations
       - name: Channel moderation ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-core --all-features --lib --locked channel_moderation_store::
           -- --include-ignored --test-threads=1
       - name: Channel moderation runtime acceptance with its guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
@@ -394,70 +403,70 @@ jobs:
           --all-features --test channel_moderation_runtime --locked
           -- --include-ignored --test-threads=1
       - name: Discord channel-moderation executor ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-discord --all-features --test internal_channel_moderation --locked
           -- --include-ignored --test-threads=1
       - name: Mutation-429 channel acceptance ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-discord --all-features --test mutation_429_proves_no_effect_channel --locked
           -- --include-ignored --test-threads=1
       - name: Feed store ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-core --all-features --test feeds_store --locked
           -- --include-ignored --test-threads=1
       - name: Legacy verification ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
           -- --include-ignored --test-threads=1
       - name: Legacy TLS fence ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test legacy_tls_fence --locked
           -- --include-ignored --test-threads=1
       - name: Reengagement list ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test reengagement_list_db --locked
           -- --include-ignored --test-threads=1
       - name: Game-activity report tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test game_activity_report_db --locked
           -- --test-threads=1
       - name: Staging migration runner ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test staging_migrate_db --locked
           -- --include-ignored --test-threads=1
       - name: Internal events ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-discord --all-features --test internal_events --locked
           -- --include-ignored --test-threads=1
       - name: Raid list ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: >-
@@ -468,10 +477,10 @@ jobs:
       # Publication also needs the actual CLI binary and a writable scratch root.
       - name: Build backup CLI
         id: backup-cli
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         run: cargo build -p two-bot --bin two-bot --all-features --locked
       - name: Backup roundtrip on a dedicated disposable database
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' }}
         env:
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_nightly
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/backup-roundtrip
@@ -479,7 +488,7 @@ jobs:
           cargo test -p two-bot-core --all-features --test backup_roundtrip --locked
           -- --include-ignored --test-threads=1
       - name: Backup publication on a dedicated disposable database
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' && steps.backup-cli.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && steps.databases.outcome == 'success' && steps.backup-cli.outcome == 'success' }}
         env:
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_publication_nightly
           TWO_BOT_TEST_BACKUP_BIN: ${{ github.workspace }}/target/debug/two-bot
@@ -488,7 +497,7 @@ jobs:
           cargo test -p two-bot-core --all-features --test backup_dump_publication --locked
           -- --include-ignored --test-threads=1
       - name: cargo doc -D warnings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.partition == 0 }}
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
@@ -504,3 +513,27 @@ jobs:
             fi
           done
           df -h "$GITHUB_WORKSPACE"
+
+  sweep-result:
+    name: nightly ignored tests and docs
+    needs: [changes, sweep]
+    # This verdict runs unless the selector explicitly opted out: an explicit
+    # `rust == 'false'` on a successful `changes` leg whose sweep legs never
+    # failed or were cancelled may skip it. Every other case — a failed,
+    # cancelled or skipped `changes` leg, a selected-but-never-run sweep leg,
+    # or a failing sweep — must reach this failing aggregate instead of
+    # skipping green. The step below fails any non-success result.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.sweep.result == 'failure' || needs.sweep.result == 'cancelled') }}
+    permissions:
+      contents: read
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep-result') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Require all four serial partitions and downstream proofs
+        env:
+          SWEEP_RESULT: ${{ needs.sweep.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: |
+          test "$CHANGES_RESULT" = success || { printf 'changes leg failed (result=%s)\n' "$CHANGES_RESULT" >&2; exit 1; }
+          test "$SWEEP_RESULT" = success || { printf 'sweep legs did not succeed (result=%s)\n' "$SWEEP_RESULT" >&2; exit 1; }
