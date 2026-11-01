@@ -136,6 +136,11 @@ class IncompatibleCodeTests(unittest.TestCase):
             'ALTER TABLE "public"."members" ADD COLUMN c bigint NOT NULL;':
                 "add_not_null_column_without_default",
             "ALTER TABLE public.members DROP COLUMN legacy_id;": "drop_object",
+            # Partly quoted qualifiers: neither part may absorb the dot.
+            'ALTER TABLE public."members" DROP COLUMN legacy_id;': "drop_object",
+            'ALTER TABLE public."members" ADD COLUMN c bigint NOT NULL;':
+                "add_not_null_column_without_default",
+            'ALTER TABLE "public".members DROP COLUMN legacy_id;': "drop_object",
             # Backslash escapes in E-strings do not end the literal.
             "INSERT INTO logs VALUES (E'it\\'s'); DROP TABLE members;": "drop_object",
             # An unterminated literal, comment or dollar body refuses

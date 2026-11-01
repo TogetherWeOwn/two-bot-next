@@ -186,9 +186,11 @@ def actions(statement):
     """The comma-separated actions of an ALTER TABLE statement (top level only)."""
     # The relation name may be schema-qualified (public.t, or "public"."t"
     # which lexes to q . q): consume the optional qualifier so the first
-    # action is never mistaken for the table name.
+    # action is never mistaken for the table name. Neither part may absorb
+    # the dot: with \S+, `public. q` (from public."t") matched `public.`
+    # and left `q` in front of the first action, hiding DROP/ADD COLUMN.
     body = re.sub(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
-                  r"\S+(?:\s*\.\s*\S+)?\s*", "", statement, flags=re.I)
+                  r"[^\s.]+(?:\s*\.\s*[^\s.]+)?\s*", "", statement, flags=re.I)
     parts, depth, current = [], 0, []
     for char in body:
         depth += char == "("
