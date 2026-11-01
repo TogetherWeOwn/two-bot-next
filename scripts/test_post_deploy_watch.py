@@ -209,6 +209,50 @@ class WatchTests(unittest.TestCase):
         evidence, _, _ = run(versions=(None,))
         self.assertEqual((evidence["verdict"], evidence["reason"]), ("error", "cloudflare_unreadable"))
 
+    def test_a_single_skip_records_the_gap_without_respawning_windows(self):
+        # The token is fixed for the run: one skip records the gap, and no
+        # further error-rate windows are started.
+        evidence, gate, _ = run(gate=StubGate(["skip"] * 5))
+        self.assertEqual(evidence["verdict"], "clean")
+        self.assertEqual(evidence["gate_windows"], ["skip"])
+        self.assertEqual(gate.started, 1)
+
+    def test_split_traffic_supersedes_instead_of_erroring(self):
+        # An operator traffic split is a valid Cloudflare answer, not an
+        # unreadable one: the watch stops without touching anything.
+        def split():
+            return {"success": True, "result": {"deployments": [
+                {"versions": [{"version_id": VERSION, "percentage": 50},
+                              {"version_id": OTHER, "percentage": 50}]}]}}
+        clock = Clock()
+        gate = StubGate(["pass"])
+        gate.clock = clock
+        routes = {("GET", f"/workers/scripts/{watcher.WORKER}/deployments"): split}
+        evidence = watcher.watch(url=URL, sha=SHA, version=VERSION, client=FakeClient(routes), gate=gate,
+                                 now=clock.now, sleep=clock.sleep, fetch_fn=fetcher(HEALTHY))
+        self.assertEqual((evidence["verdict"], evidence["reason"]), ("superseded", "split_traffic"))
+
+    def test_a_breach_recheck_on_split_traffic_supersedes(self):
+        # The version check passes during the watch but the traffic splits
+        # before the breach re-read: still no rollback of a moved target.
+        calls = {"n": 0}
+
+        def route():
+            calls["n"] += 1
+            if calls["n"] < 6:
+                return {"success": True, "result": {"deployments": [
+                    {"versions": [{"version_id": VERSION, "percentage": 100}]}]}}
+            return {"success": True, "result": {"deployments": [
+                {"versions": [{"version_id": VERSION, "percentage": 50},
+                              {"version_id": OTHER, "percentage": 50}]}]}}
+        clock = Clock()
+        gate = StubGate(["fail"])
+        gate.clock = clock
+        routes = {("GET", f"/workers/scripts/{watcher.WORKER}/deployments"): route}
+        evidence = watcher.watch(url=URL, sha=SHA, version=VERSION, client=FakeClient(routes), gate=gate,
+                                 now=clock.now, sleep=clock.sleep, fetch_fn=fetcher(HEALTHY))
+        self.assertEqual((evidence["verdict"], evidence["reason"]), ("superseded", "split_traffic"))
+
 
 class MainTests(unittest.TestCase):
     def run_main(self, *, versions=(VERSION,), answers=None, gate=None, argv=None):
@@ -274,6 +318,11 @@ class GateProcessTests(unittest.TestCase):
                 popen.return_value.poll.return_value = 1
                 Path(tmp, "watch-error-rate-1.json").write_text(json.dumps({"verdict": "fail"}))
                 self.assertEqual(gate.poll(), "fail")
+                # The child inherits the step environment (no env= override):
+                # PRODUCTION_WORKER_URL rides along, so the gate's origin
+                # allowlist admits the production origin whenever the
+                # workflow step exports it (pinned by test-deploy-production).
+                self.assertNotIn("env", popen.call_args.kwargs)
                 gate.start()
                 gate.child = popen.return_value
                 Path(tmp, "watch-error-rate-2.json").write_text("not json")

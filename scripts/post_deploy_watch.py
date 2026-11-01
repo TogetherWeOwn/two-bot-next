@@ -8,8 +8,11 @@ for the rest of the window and reports one verdict:
 
   clean       30 minutes with no breach.
   superseded  the promoted Worker version no longer serves 100% (a newer
-              deploy or an operator rollback moved traffic): the watch stops
-              without touching anything.
+              deploy, an operator rollback, or an operator traffic split
+              moved traffic): the watch stops without touching anything.
+              Without a metrics token the error-rate gate records one `skip`
+              window and stops starting new ones: the token is fixed for the
+              run, so respawning a window every poll only wastes processes.
   breach      either
                 - readiness: MISS_LIMIT consecutive polls (~3 min) where
                   /health is not 200, or /readyz is not 200 with gateway
@@ -137,6 +140,7 @@ def watch(*, url, sha, version, client, gate, now=time.monotonic, sleep=time.sle
     evidence = {"sha": sha, "version": version, "polls": 0, "misses": 0, "max_miss_streak": 0,
                 "gate_windows": [], "verdict": "clean", "reason": "no_breach"}
     streak, last_version_check, running = 0, None, False
+    error_rate_exhausted = False
 
     def finish(verdict, reason):
         gate.stop()
@@ -144,19 +148,24 @@ def watch(*, url, sha, version, client, gate, now=time.monotonic, sleep=time.sle
         return evidence
 
     def serving():
+        # (version, readable): split traffic is a valid Cloudflare answer
+        # whose version entry is None, distinct from an unreadable one.
         try:
-            return wcr.deployments(client, WORKER)[0]
+            return wcr.deployments(client, WORKER)[0], True
         except GateError:
-            return None
+            return None, False
+
+    def moved_reason(current):
+        return "split_traffic" if current is None else "version_no_longer_serving"
 
     def breach(reason):
         # Re-read immediately before reporting: a breach rolls back, so it
         # must still be the promoted version that is serving.
-        current = serving()
-        if current is None:
+        current, readable = serving()
+        if not readable:
             return finish("error", "cloudflare_unreadable")
         if current != version:
-            return finish("superseded", "version_no_longer_serving")
+            return finish("superseded", moved_reason(current))
         return finish("breach", reason)
 
     # The last error-rate window may start late with a shorter sample, and
@@ -166,11 +175,11 @@ def watch(*, url, sha, version, client, gate, now=time.monotonic, sleep=time.sle
         moment = now()
         if last_version_check is None or moment - last_version_check >= VERSION_EVERY_SECONDS:
             last_version_check = moment
-            current = serving()
-            if current is None:
+            current, readable = serving()
+            if not readable:
                 return finish("error", "cloudflare_unreadable")
             if current != version:
-                return finish("superseded", "version_no_longer_serving")
+                return finish("superseded", moved_reason(current))
         passed, reason = ready(url, sha, fetch_fn)
         evidence["polls"] += 1
         if passed:
@@ -182,7 +191,7 @@ def watch(*, url, sha, version, client, gate, now=time.monotonic, sleep=time.sle
             if streak >= MISS_LIMIT:
                 return breach(f"readiness:{reason}")
         remaining = duration - (moment - started)
-        if not running and remaining > 0:
+        if not running and remaining > 0 and not error_rate_exhausted:
             gate.start(int(max(MIN_FINAL_SAMPLE_SECONDS,
                                min(GATE_SAMPLE_SECONDS, remaining - SCRAPE_SLACK_SECONDS))))
             running = True
@@ -190,7 +199,11 @@ def watch(*, url, sha, version, client, gate, now=time.monotonic, sleep=time.sle
         if verdict is not None:
             running = False
             evidence["gate_windows"].append(verdict)
-            if verdict == "fail":
+            if verdict == "skip":
+                # No token for the whole run: record the gap once instead of
+                # spawning a window every poll.
+                error_rate_exhausted = True
+            elif verdict == "fail":
                 return breach("rest_5xx")
             gate.errors = gate.errors + 1 if verdict == "error" else 0
             if gate.errors >= GATE_ERROR_LIMIT:

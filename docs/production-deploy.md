@@ -365,12 +365,14 @@ for 30 minutes (`scripts/post_deploy_watch.py`):
   `promotion-error-gate.mjs` verdict as the deploy gate. The last window
   starts late with a shorter sample and may finish up to 2 minutes past the
   deadline, so the final minutes are judged too. A failing window is a
-  breach; two unscrapeable windows in a row are a breach; a missing bearer
-  or a quiet window never is;
+  breach; two unscrapeable windows in a row are a breach; a quiet window
+  never is. A missing bearer records one `skip` window and starts no more:
+  the token cannot appear mid-run, so respawning a window every poll only
+  wastes processes;
 - every minute, and again right before reporting a breach: the promoted
-  Worker version still serves 100%. If not (an operator rollback or a
-  manual Cloudflare change moved traffic), the watch stops without touching
-  anything.
+  Worker version still serves 100%. If not (an operator rollback, a manual
+  Cloudflare change, or a traffic split moved traffic), the watch stops
+  without touching anything.
 
 On a breach the job restores the pre-deploy snapshot (Worker version AND
 container image, with takeover) through the same reviewed
