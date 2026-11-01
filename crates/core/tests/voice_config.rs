@@ -629,6 +629,24 @@ fn export_drops_deleted_command_roles_and_keeps_the_restriction() {
 }
 
 #[test]
+fn export_keeps_command_roles_when_the_role_cache_is_not_loaded() {
+    let (config, mut inventory) = fixture();
+    // No @everyone role: the cache has not loaded the guild's roles, so a
+    // missing role may be live. Nothing is pruned and export still refuses.
+    inventory.roles.clear();
+    let mut unloaded = config.clone();
+    assert_eq!(drop_deleted_command_roles(&mut unloaded, &inventory), 0);
+    assert_eq!(unloaded, config);
+    assert!(export_configuration(&unloaded, &inventory).is_err());
+    // A partial set without @everyone is treated the same way.
+    inventory
+        .roles
+        .insert("999".to_owned(), inventory.guild_id.clone());
+    assert_eq!(drop_deleted_command_roles(&mut unloaded, &inventory), 0);
+    assert_eq!(unloaded, config);
+}
+
+#[test]
 fn late_failure_never_returns_partial_config_or_mutates_inputs() {
     let (config, inventory) = fixture();
     let saved_inventory = inventory.clone();

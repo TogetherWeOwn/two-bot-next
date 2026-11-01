@@ -287,10 +287,19 @@ pub fn export_configuration(
 /// would refuse the whole guild. Enforcement is unchanged: nobody holds a
 /// deleted role, and a restriction left with no roles still denies every
 /// non-admin, which is what it did before.
+///
+/// Prunes nothing unless the inventory holds the guild's `@everyone` role
+/// (its ID is the guild ID), which Discord always sends with the full role
+/// list. Without it the role cache is not loaded and an absent role may be
+/// live, so export keeps refusing rather than writing a backup that would
+/// drop a live role on re-import.
 pub fn drop_deleted_command_roles(
     config: &mut VoiceConfiguration,
     inventory: &GuildInventory,
 ) -> usize {
+    if inventory.roles.get(&inventory.guild_id) != Some(&inventory.guild_id) {
+        return 0;
+    }
     let mut dropped = 0;
     for restriction in &mut config.settings.command_roles {
         let before = restriction.role_ids.len();
