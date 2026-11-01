@@ -141,7 +141,12 @@ and its location.
 
 ## Org contributing standard — flag violations as findings
 
-- PR title is not a Conventional Commits header, or the body is missing/empty a template section (Thinking Path, Linked Issues or Issue Description, Verification, Attestation, Model Used).
-- Attestation tier is understated for the touched paths, claims have no changed test mapping, or D-items are checked without evidence in the diff.
-- Title, body, branch name, or review replies contain internal ticket ids, instance links, hostnames, private addresses, emails, or credential material.
-- Verification claims tests or results not evidenced by the diff or CI output.
+Judge each PR against the PR template that applies to this repo
+(`.github/pull_request_template.md` if present, otherwise the org default in
+`TogetherWeOwn/.github`) and the org
+[CONTRIBUTING.md](https://github.com/TogetherWeOwn/.github/blob/main/CONTRIBUTING.md).
+
+- PR title is not a Conventional Commits header, or the body is missing/empty a section that template requires (org default: Thinking Path, Linked Issues or Issue Description, Verification, Attestation, Model Used).
+- Where the template has an Attestation block: the tier is understated for the touched paths, claims lack a test mapping to a file changed in this PR (T2 may use `none`), or D-items are checked without evidence in the diff.
+- Title, body, branch name, or review replies contain internal ticket ids, instance links, internal hostnames, private addresses, private emails, or credential material. Links to public GitHub issues and PRs are allowed.
+- Verification claims tests or results that the diff or CI output contradicts, or reports a local run without its exact command and result.
