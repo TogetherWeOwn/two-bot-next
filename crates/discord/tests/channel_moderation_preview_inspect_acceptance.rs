@@ -870,9 +870,20 @@ async fn inspect_after_real_lockdown_reports_setter_from_audit() {
         "the lockdown actor is durably known via audit: {}",
         reply.text
     );
+    // The live lockdown stamps the real clock, so compare against today
+    // (±1 day for a midnight crossing), never a literal year.
+    let set_at = reply
+        .text
+        .lines()
+        .find_map(|line| line.strip_prefix("set at: "))
+        .and_then(|date| {
+            time::Date::parse(date, &time::format_description::well_known::Iso8601::DATE).ok()
+        })
+        .unwrap_or_else(|| panic!("a live lockdown has a stored date: {}", reply.text));
+    let today = time::OffsetDateTime::now_utc().date();
     assert!(
-        reply.text.contains("set at: 2026"),
-        "a live lockdown has a stored date: {}",
+        (set_at - today).abs() <= time::Duration::DAY,
+        "the live lockdown date is today's, got {set_at}: {}",
         reply.text
     );
     assert!(
