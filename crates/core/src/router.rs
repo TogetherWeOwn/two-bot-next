@@ -103,6 +103,15 @@ pub const MANAGE_EVENTS_REQUIRED: &str =
 pub const GUILD_RESTRICTED_REPLY: &str = "This command is restricted to the configured guild.";
 /// Announcement gate: env-gated, not a Discord role — say who enables it.
 pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
+
+/// The one optional builtin a publication may withhold when an otherwise
+/// valid complete catalog exceeds Discord's 100-command ceiling (see
+/// [`InteractionRouter::publish_set_capacity_deferred`]). `/myroom` is
+/// additive member discovery: withholding it for one publication preserves
+/// a historical catalog's boot, and a later normal sync re-admits it when
+/// capacity allows. Nothing else is deferrable — a baseline that is itself
+/// invalid still fails publication.
+pub const OPTIONAL_CAPACITY_BUILTIN: &str = "myroom";
 /// Moderation gate: env-gated, not a Discord role — say who enables it.
 pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
@@ -923,6 +932,40 @@ impl InteractionRouter {
         &self,
         custom: &[CustomCommand],
     ) -> Result<Vec<CommandDefinition>, RegistryError> {
+        self.build_publish_set(custom, None)
+    }
+
+    /// [`Self::publish_set`] plus the historical-catalog transition: when the
+    /// complete baseline (gate-constrained builtins plus every persisted
+    /// enabled custom row under the existing name/precedence rules) is valid
+    /// but adding the optional [`OPTIONAL_CAPACITY_BUILTIN`] entry alone
+    /// would exceed Discord's 100-command ceiling, publish the baseline
+    /// without only that builtin. A guild whose stored catalog predates the
+    /// new builtin keeps booting instead of failing publication.
+    ///
+    /// Returns the definitions actually fit for publication and the withheld
+    /// builtin name when deferral applied. No custom row is truncated,
+    /// disabled, deleted or evicted, and no registry error is swallowed: a
+    /// baseline that is itself invalid still returns its own error, and the
+    /// next serialized registry sync re-evaluates from scratch (no timer,
+    /// key or retry mechanism is added).
+    pub fn publish_set_capacity_deferred(
+        &self,
+        custom: &[CustomCommand],
+    ) -> Result<(Vec<CommandDefinition>, Option<&'static str>), RegistryError> {
+        match self.build_publish_set(custom, None) {
+            Err(RegistryError::TotalLimit(_)) => self
+                .build_publish_set(custom, Some(OPTIONAL_CAPACITY_BUILTIN))
+                .map(|defs| (defs, Some(OPTIONAL_CAPACITY_BUILTIN))),
+            result => result.map(|defs| (defs, None)),
+        }
+    }
+
+    fn build_publish_set(
+        &self,
+        custom: &[CustomCommand],
+        withhold_builtin: Option<&str>,
+    ) -> Result<Vec<CommandDefinition>, RegistryError> {
         let mut extra: Vec<Vec<CommandDefinition>> = Vec::with_capacity(6);
         if self.gates.scorecard {
             extra.push(vec![scorecard_attendance_command()]);
@@ -937,7 +980,12 @@ impl InteractionRouter {
             extra.push(super::moderation::moderation_commands());
         }
         if self.gates.voice {
-            extra.push(voice_commands());
+            extra.push(
+                voice_commands()
+                    .into_iter()
+                    .filter(|definition| Some(definition.name.as_str()) != withhold_builtin)
+                    .collect(),
+            );
             // No assistant push: the name stays reserved (see
             // `reserved_names`) and dispatch keeps shadowing it, so the
             // slice re-activates by publishing again.
@@ -2005,9 +2053,9 @@ mod tests {
         assert!(gates.voice && gates.voice_assistant);
     }
 
-    /// The 22 voice names in published order (pinned independently in
+    /// The 23 voice names in published order (pinned independently in
     /// `voice_rooms::tests::voice_command_shapes_and_gates`).
-    const VOICE_NAMES: [&str; 22] = [
+    const VOICE_NAMES: [&str; 23] = [
         "create",
         "setup",
         "ping",
@@ -2030,6 +2078,7 @@ mod tests {
         "public",
         "limit",
         "unlimit",
+        "myroom",
     ];
 
     fn voice_on() -> RouterGates {
@@ -2059,9 +2108,9 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 45 builtins keep their order; the 21 voice names that survive
+        // 45 builtins keep their order; the 22 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 66);
+        assert_eq!(on.len(), 67);
         assert_eq!(on_names[..45], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
@@ -2130,12 +2179,12 @@ mod tests {
             );
         }
         // Both gates on is the full voice set without the assistant: 45
-        // builtins plus the 21 surviving voice names.
+        // builtins plus the 22 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 66);
+        assert_eq!(both.len(), 67);
     }
 
     #[test]

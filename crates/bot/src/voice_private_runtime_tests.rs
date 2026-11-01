@@ -845,6 +845,42 @@ async fn public_on_a_room_that_is_open_on_discord_writes_nothing() {
 }
 
 #[tokio::test]
+async fn myroom_lists_owned_live_rooms_as_channel_references() {
+    let (live, store, http, _) = parts();
+    // Channel references only: whatever the ACL shape, the owner-filtered
+    // read returns the same channel ids — no privacy label exists.
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(!worker.privacy.contains_key(&ROOM));
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![ROOM]));
+    assert_eq!(worker.live_owned_rooms(GUEST), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn myroom_lists_the_same_channels_whatever_the_acl() {
+    // The read does not consult permission overwrites: an unrelated-role
+    // deny and a guild-wide deny return the identical channel list, so no
+    // ACL staleness can change what /myroom says.
+    let (live, store, http, _) = parts();
+    set_room_overwrites(
+        &live,
+        vec![role_overwrite(
+            201,
+            Permissions::empty(),
+            Permissions::CONNECT,
+        )],
+    );
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![ROOM]));
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![ROOM]));
+    set_room_overwrites(&live, bot_and_everyone_overwrites(false));
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![ROOM]));
+}
+
+#[tokio::test]
 async fn a_stop_between_the_connect_write_and_the_join_delete_keeps_the_join_id() {
     let (mut worker, trace) = worker().await;
     private_cmd(&mut worker, OWNER);
@@ -1096,4 +1132,281 @@ async fn private_copy_public_again_exact() {
         reply,
         "Making this room public again: anyone can join, and its ⇩ Join channel is going away."
     );
+}
+
+#[test]
+fn parse_myroom() {
+    let interaction = voice_interaction(Some(command_data("myroom", Vec::new())), None, true);
+    // `/myroom` is a published voice command but deliberately outside the
+    // restrictable vocabulary: it carries no per-command role policy, so
+    // `/access` must refuse it rather than save a key nothing enforces.
+    assert_eq!(VoiceCommand::MyRoom.name(), "myroom");
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::MyRoom)
+    );
+    assert!(!two_bot_core::voice_access::VOICE_COMMANDS.contains(&"myroom"));
+    let guildless = voice_interaction(Some(command_data("myroom", Vec::new())), None, false);
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[tokio::test]
+async fn myroom_honours_the_guild_required_role_gate_before_any_actor_read() {
+    // The enforced gate for /myroom is the guild-wide `required_role` row:
+    // a member without the role is denied; a member with it reads normally.
+    let controls = AccessControls {
+        required_role: Some(7),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let request = || voice_interaction(Some(command_data("myroom", Vec::new())), None, true);
+
+    let (_, response) = handle_capture(&runtime, &request()).await;
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::RequiredRole)
+    );
+    let (_, response) = handle_capture(&runtime, &with_roles(request(), &[7])).await;
+    let text = response_text(&response.expect("allowed read"));
+    assert!(
+        text.starts_with(two_bot_core::voice_utilities::MYROOM_EMPTY),
+        "the gate passed and the actor answered: {text}"
+    );
+}
+
+#[tokio::test]
+async fn access_restrict_refuses_myroom_without_writing() {
+    // `myroom` carries no per-command policy vocabulary: the runtime path
+    // refuses truthfully and saves nothing, so a rollback image never meets
+    // a key it cannot decode.
+    let store = Store::new(Trace::default());
+    let saved = std::sync::Arc::new(std::sync::Mutex::new(AccessControls::default()));
+    let saved_writer = saved.clone();
+    let reply = execute_access(
+        &store,
+        GUILD,
+        AccessAction::Restrict {
+            command: "myroom".to_owned(),
+            roles: vec![7],
+        },
+        move |controls| *saved_writer.lock().unwrap() = controls,
+    )
+    .await;
+    assert_eq!(
+        reply,
+        "/myroom cannot be restricted with /access, so nothing was changed."
+    );
+    assert!(
+        saved.lock().unwrap().command_roles.is_empty(),
+        "no myroom policy key may be persisted"
+    );
+    assert!(
+        store
+            .access_controls(GUILD)
+            .await
+            .unwrap()
+            .command_roles
+            .is_empty(),
+        "the store kept zero writes for the refused restriction"
+    );
+}
+
+/// Run `/myroom` through the real handler against a runtime with `actor`
+/// installed (or none), returning every reply text.
+async fn myroom_replies(
+    runtime: &VoiceRuntime<Store, Http>,
+    actor: Option<GuildActor>,
+) -> Vec<String> {
+    if let Some(actor) = actor {
+        runtime.actors.lock().unwrap().insert(GUILD, actor);
+    }
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    let capture = replies.clone();
+    let request = voice_interaction_as(
+        Some(command_data("myroom", Vec::new())),
+        Some(Permissions::empty()),
+        OWNER,
+    );
+    assert!(
+        handle_voice_interaction(runtime, &request, move |response| {
+            capture.lock().unwrap().push(response_text(&response));
+            async {}
+        })
+        .await
+    );
+    let replies = replies.lock().unwrap().clone();
+    replies
+}
+
+#[tokio::test]
+async fn myroom_without_a_worker_says_warming_up_never_that_no_room_is_owned() {
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let replies = myroom_replies(&runtime, None).await;
+    assert_eq!(
+        replies,
+        ["The voice worker isn't warmed up yet — try again in a moment."]
+    );
+    assert_ne!(replies[0], myroom_render(&[], false));
+}
+
+#[tokio::test]
+async fn myroom_with_a_closed_inbox_says_the_worker_stopped_never_that_no_room_is_owned() {
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    let actor = GuildActor {
+        live: LiveGuild::new(GUILD),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    let replies = myroom_replies(&runtime, Some(actor)).await;
+    assert_eq!(replies, [WORKER_LOST_REPLY]);
+}
+
+#[tokio::test]
+async fn myroom_with_a_worker_that_drops_the_reply_says_the_worker_stopped() {
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let actor = GuildActor {
+        live: LiveGuild::new(GUILD),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    let replies = myroom_replies(&runtime, Some(actor)).await;
+    assert_eq!(replies, [WORKER_LOST_REPLY]);
+    assert_ne!(replies[0], myroom_render(&[], false));
+}
+
+#[tokio::test]
+async fn myroom_read_fails_closed_without_authoritative_live_evidence() {
+    let (live, store, http, _) = parts();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![ROOM]));
+    // A halted worker cannot vouch for what is live.
+    worker.halted = true;
+    assert_eq!(worker.live_owned_rooms(OWNER), None);
+    worker.halted = false;
+    // A disconnected gateway leaves the tracked rows behind; they are stale.
+    worker.live.disconnect();
+    assert_eq!(worker.live_owned_rooms(OWNER), None);
+    assert!(worker.rooms.contains_key(&ROOM));
+}
+
+#[tokio::test]
+async fn myroom_through_a_running_actor_never_lists_rooms_while_disconnected() {
+    // Pins the actor dispatch to `live_owned_rooms`: reading the tracked rows
+    // without the live snapshot would list stale rooms as live here.
+    let (live, store, http, _) = parts();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let runtime = gated_runtime(Trace::default(), AccessControls::default(), None);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let actor = GuildActor {
+        live: worker.live.clone(),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    worker.live.disconnect();
+    let handle = tokio::spawn(async move {
+        run_actor(&mut worker, rx, Duration::from_millis(100)).await;
+    });
+    let replies = myroom_replies(&runtime, Some(actor)).await;
+    assert_eq!(replies, [WORKER_LOST_REPLY]);
+    assert_ne!(replies[0], myroom_render(&[ROOM], false));
+    assert_ne!(replies[0], myroom_render(&[], false));
+    runtime.actors.lock().unwrap().clear();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn myroom_read_excludes_deleted_channels_before_reconciliation() {
+    let (live, store, http, _) = parts();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(vec![ROOM]));
+    // The gateway removes channels immediately, but the worker still retains
+    // their persisted rows until reconciliation. Those rows are not live rooms.
+    worker.live.remove_channel(ROOM);
+    assert!(worker.rooms.contains_key(&ROOM));
+    assert_eq!(worker.live_owned_rooms(OWNER), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn myroom_empty_reply_shows_join_guidance_only_when_creation_is_open() {
+    let (live, store, http, _) = parts();
+    // The fixture wires a creator lobby and leaves creation on: guidance shows.
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(worker.creation_available());
+    // The guild-wide creation switch off hides it even with a lobby wired.
+    worker.access.room_creation_enabled = false;
+    assert!(!worker.creation_available());
+    // A deleted lobby keeps its configured id but is no longer joinable.
+    worker.access.room_creation_enabled = true;
+    worker.live.remove_channel(CREATOR);
+    assert!(!worker.creation_available());
+    assert_eq!(
+        myroom_render(&[], true),
+        format!(
+            "{}{}",
+            two_bot_core::voice_utilities::MYROOM_EMPTY,
+            two_bot_core::voice_utilities::MYROOM_CREATION_GUIDANCE
+        )
+    );
+    assert_eq!(
+        myroom_render(&[], false),
+        two_bot_core::voice_utilities::MYROOM_EMPTY
+    );
+}
+
+#[test]
+fn import_preview_and_confirm_refuse_a_new_or_changed_global_command_role() {
+    let refused = |current: &VoiceConfiguration, candidate: &VoiceConfiguration| {
+        let bytes = serde_json::to_vec(candidate).unwrap();
+        for decision in [
+            plan_import_preview(current, &bytes, &config_inventory()),
+            plan_import_confirm(
+                current,
+                candidate,
+                &config_inventory(),
+                &diff_content_hash(current, candidate),
+            ),
+        ] {
+            match decision {
+                ImportDecision::Refuse { message } => assert!(
+                    message.contains("settings.command_role_id")
+                        && message.contains("not enforced"),
+                    "{message}"
+                ),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+    };
+    let accepted = |current: &VoiceConfiguration, candidate: &VoiceConfiguration| {
+        let bytes = serde_json::to_vec(candidate).unwrap();
+        assert!(!matches!(
+            plan_import_preview(current, &bytes, &config_inventory()),
+            ImportDecision::Refuse { .. }
+        ));
+        assert!(matches!(
+            plan_import_confirm(
+                current,
+                candidate,
+                &config_inventory(),
+                &diff_content_hash(current, candidate),
+            ),
+            ImportDecision::Apply { .. }
+        ));
+    };
+    let with_role = |role: Option<u64>| {
+        let mut config = full_config();
+        config.settings.command_role_id = role.map(|id| id.to_string());
+        config
+    };
+    // Both roles exist in the inventory, so only the change guard refuses.
+    refused(&with_role(None), &with_role(Some(MENTION_ROLE)));
+    refused(&with_role(Some(GUILD)), &with_role(Some(MENTION_ROLE)));
+    // The stored role re-imports unchanged, and clearing it is always allowed.
+    let mut kept = with_role(Some(MENTION_ROLE));
+    kept.settings.creation_enabled = !kept.settings.creation_enabled;
+    accepted(&with_role(Some(MENTION_ROLE)), &kept);
+    accepted(&with_role(Some(MENTION_ROLE)), &with_role(None));
 }

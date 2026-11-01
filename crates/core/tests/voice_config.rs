@@ -886,6 +886,16 @@ fn lists_are_bounded_in_count_choices_and_text() {
 
 #[test]
 fn command_roles_accept_only_restrictable_voice_commands() {
+    // Config import and runtime enforcement use different stores: config writes
+    // `voice_command_roles` while the runtime reads `voice_access_controls`.
+    // `/myroom` carries no per-command role policy at all, so it is outside the
+    // restrictable `VOICE_COMMANDS` vocabulary and config import must refuse
+    // it too. Otherwise a guild would believe `myroom` is gated while it stays
+    // unrestricted. This pins both sides: runtime excludes, config excludes.
+    assert!(
+        !VOICE_COMMANDS.contains(&"myroom"),
+        "precondition: myroom is not restrictable"
+    );
     let (config, inventory) = fixture();
     let original = serde_json::to_value(&config).unwrap();
     for bad in [
@@ -896,6 +906,8 @@ fn command_roles_accept_only_restrictable_voice_commands() {
         "kick ",
         "not-a-command",
         "setup\u{0}",
+        // A published voice command with no per-command role policy.
+        "myroom",
     ] {
         let mut value = original.clone();
         *value
@@ -908,10 +920,17 @@ fn command_roles_accept_only_restrictable_voice_commands() {
             &format!("{bad:?}"),
         );
     }
+    // Config-supported commands are the runtime allowlist, which excludes
+    // `myroom`. Established valid commands still import.
     let roles: Vec<Value> = VOICE_COMMANDS
         .iter()
+        .filter(|command| **command != "myroom")
         .map(|command| json!({"command": command, "role_ids": ["201"]}))
         .collect();
+    assert!(
+        !roles.is_empty(),
+        "precondition: config supports established commands"
+    );
     let mut value = original;
     *value.pointer_mut("/settings/command_roles").unwrap() = Value::Array(roles);
     import_value(&value, &inventory).unwrap();
