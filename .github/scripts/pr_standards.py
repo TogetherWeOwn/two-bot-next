@@ -131,12 +131,13 @@ def t0_visible_text(text):
 
 def _looks_like_generic_list(before, content):
     """True for a comma-separated type list glued to a type name, such as the
-    `<T, E>` in `Result<T, E>`: `before` (the char ahead of `<`) ends an
-    identifier or a nested generic, a comma is present, and every blank sits
+    `<T, E>` in `Result<T, E>` or the turbofish in `Ok::<_, E>`: `before`
+    (up to three chars ahead of `<`) ends an identifier or a nested generic,
+    optionally through Rust `::`, a comma is present, and every blank sits
     right after one. Template placeholders either carry a blank inside a
-    phrase (`<secret sinks, ...>`) or stand alone (`proof=<command, result>`),
-    so they never match both halves at once."""
-    if not re.match(r"[A-Za-z0-9_>\]]$", before):
+    phrase (`<secret sinks, ...>`) or stand alone (`proof=<command, result>`,
+    `note:<a, b>`), so they never match both halves at once."""
+    if not re.search(r"[A-Za-z0-9_>\]](?:::)?$", before):
         return False
     blanks = [m.start() for m in re.finditer(r"\s", content)]
     return bool(blanks) and "," in content and all(
@@ -147,7 +148,7 @@ def t0_has_placeholder(text):
     """True when visible attestation text still holds a template placeholder."""
     visible = t0_visible_text(text)
     for match in T0_PLACEHOLDER.finditer(visible):
-        before = visible[match.start() - 1] if match.start() > 0 else ""
+        before = visible[max(0, match.start() - 3):match.start()]
         if not _looks_like_generic_list(before, match.group(0)[1:-1]):
             return True
     return bool(T0_BARE_PLACEHOLDER.search(visible))

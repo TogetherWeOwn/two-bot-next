@@ -369,6 +369,24 @@ class AttestationFloor(unittest.TestCase):
         f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
         self.assertEqual([], f)
 
+    def test_turbofish_generics_are_not_placeholders(self):
+        # `Ok::<_, sqlx::Error>` is Rust turbofish evidence, not a
+        # placeholder: `::<` after a type name reads as a generic list.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: error path covered, `Ok::<_, sqlx::Error>(())` asserted")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_single_colon_lists_still_fail(self):
+        # Only `::` reads as turbofish: `note:<a, b>` keeps the `<` standing
+        # alone, so it is still placeholder-shaped.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "proof=python3 scripts/test_rollback.py 5 OK",
+            "proof=note:<a, b>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
     def test_claims_need_c_numbers_and_tests_need_mappings(self):
         # Prose without a C-number is not a claim; prose without a
         # test=/proof=/failed_before= marker is not a test mapping.
