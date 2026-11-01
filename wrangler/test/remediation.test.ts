@@ -13,6 +13,7 @@ import {
   REMEDIATION_MAX_CONSECUTIVE_FAILURES,
   REMEDIATION_TRIGGERS,
   evaluateRemediation,
+  interruptRemediationHoldDown,
   operatorInstruction,
   remediationRunbookUrl,
   sanitizeRemediationState,
@@ -402,21 +403,33 @@ test("the deaf scope repeats the takeover line once, then stops with the CEO pag
 
 test("both voice scopes firing at once each keep their own guard and the cooldown is global", () => {
   const first = evaluateRemediation([...STALE, ...DEAF], EMPTY_REMEDIATION_STATE, NOW);
-  // Table order decides who spends the global window; the other waits.
+  // Table order decides who spends the global window: the deaf scope's
+  // takeover goes first and the stall scope's no-host-action line waits.
   assert.equal(first.messages.length, 1);
-  assert.equal(first.messages[0]!.scope, "voice-stall");
-  assert.deepEqual(first.state.scopes["voice-live"], EMPTY_REMEDIATION_STATE.scopes["voice-live"]);
-  // Clearing the creator-map alert hands the next window to the deaf scope,
-  // which still has its own idle guard rather than the stall's spend.
-  const next = evaluateRemediation(DEAF, first.state, NOW + REMEDIATION_COOLDOWN_SECONDS);
+  assert.equal(first.messages[0]!.scope, "voice-live");
+  assert.equal(first.messages[0]!.action, "same-sha-takeover");
+  assert.deepEqual(first.state.scopes["voice-stall"], EMPTY_REMEDIATION_STATE.scopes["voice-stall"]);
+  // Clearing the deaf alert hands the next window to the stall scope, which
+  // still has its own idle guard rather than the deaf scope's spend.
+  const next = evaluateRemediation(STALE, first.state, NOW + REMEDIATION_COOLDOWN_SECONDS);
   assert.equal(next.messages.length, 1);
-  assert.equal(next.messages[0]!.scope, "voice-live");
-  assert.equal(next.messages[0]!.action, "same-sha-takeover");
+  assert.equal(next.messages[0]!.scope, "voice-stall");
+  assert.equal(next.messages[0]!.action, "creator-map-reload");
   assert.equal(next.state.scopes["voice-stall"].consecutiveFailures, 0);
   assert.equal(next.state.scopes["voice-live"].consecutiveFailures, 0);
   // Every window still holds exactly one recommendation across the table.
   const again = evaluateRemediation([...STALE, ...DEAF], next.state, NOW + 2 * REMEDIATION_COOLDOWN_SECONDS);
   assert.equal(again.messages.length, 1);
+});
+
+test("a deaf takeover is never queued behind a no-host-action line", () => {
+  // Every trigger whose first step is a takeover sorts ahead of the
+  // in-process-first stall scope, so a concurrent stall never delays one.
+  const order = REMEDIATION_TRIGGERS.map((trigger) => trigger.scope);
+  assert.deepEqual(order, ["voice-live", "voice-stall", "crash-loop"]);
+  const { messages } = evaluateRemediation([...STALE, ...DEAF, ...UNPAIRED], EMPTY_REMEDIATION_STATE, NOW);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]!.action, "same-sha-takeover");
 });
 
 test("a guard persisted before the deaf scope existed still sanitizes, and the new scope starts idle", () => {
@@ -542,4 +555,82 @@ test("a malformed live-scope guard restarts that scope only and preserves valid 
   assert.deepEqual(sanitized.scopes["voice-stall"], stallGuard);
   assert.deepEqual(sanitized.scopes["crash-loop"], stored.scopes["crash-loop"]);
   assert.deepEqual(sanitized.scopes["voice-live"], EMPTY_REMEDIATION_STATE.scopes["voice-live"]);
+});
+
+// Unobserved wall time is never recovery. A quiet tick with no current age
+// sample is not an observed clear, so it must not run down the hold-down: a
+// stopped live scope would otherwise reset to idle across an observation gap
+// and authorize a fresh takeover with zero failures.
+test("an observation gap during the clear hold-down keeps the live stop latched", () => {
+  const stopped: RemediationState = {
+    lastRecommendedAtSeconds: NOW,
+    scopes: {
+      "voice-stall": { ...EMPTY_REMEDIATION_STATE.scopes["voice-stall"] },
+      "voice-live": {
+        phase: "takeover-recommended",
+        consecutiveFailures: REMEDIATION_MAX_CONSECUTIVE_FAILURES,
+        suppressed: true,
+        clearSinceSeconds: 0,
+      },
+      "crash-loop": { ...EMPTY_REMEDIATION_STATE.scopes["crash-loop"] },
+    },
+  };
+  // One current age-0 sample starts the clear clock.
+  const clear = evaluateRemediation([], stopped, NOW + 60);
+  assert.equal(clear.state.scopes["voice-live"].clearSinceSeconds, NOW + 60);
+  // Then a full window of scrapes with no age sample: the stop stays latched
+  // and the hold-down restarts instead of completing.
+  const gap = evaluateRemediation([], clear.state, NOW + 60 + REMEDIATION_COOLDOWN_SECONDS, DEAF);
+  assert.deepEqual(gap.messages, []);
+  assert.deepEqual(gap.state.scopes["voice-live"], { ...stopped.scopes["voice-live"], clearSinceSeconds: 0 });
+  // A fresh firing sample after the gap is still suppressed: no new takeover.
+  const refire = evaluateRemediation(DEAF, gap.state, NOW + 120 + REMEDIATION_COOLDOWN_SECONDS);
+  assert.deepEqual(refire.messages, []);
+  assert.equal(refire.state.scopes["voice-live"].suppressed, true);
+  assert.equal(refire.state.scopes["voice-live"].consecutiveFailures, REMEDIATION_MAX_CONSECUTIVE_FAILURES);
+});
+
+test("after a gap, recovery needs a full window of observed clear from the next sample", () => {
+  const holding: RemediationState = {
+    lastRecommendedAtSeconds: NOW,
+    scopes: {
+      "voice-stall": { ...EMPTY_REMEDIATION_STATE.scopes["voice-stall"] },
+      "voice-live": { phase: "takeover-recommended", consecutiveFailures: 1, suppressed: false, clearSinceSeconds: NOW + 60 },
+      "crash-loop": { ...EMPTY_REMEDIATION_STATE.scopes["crash-loop"] },
+    },
+  };
+  const gap = evaluateRemediation([], holding, NOW + 600, DEAF);
+  assert.equal(gap.state.scopes["voice-live"].clearSinceSeconds, 0);
+  const observed = NOW + 900;
+  const restarted = evaluateRemediation([], gap.state, observed);
+  assert.equal(restarted.state.scopes["voice-live"].clearSinceSeconds, observed);
+  // The original clock would have completed here; the restarted one has not.
+  const early = evaluateRemediation([], restarted.state, NOW + 60 + REMEDIATION_COOLDOWN_SECONDS);
+  assert.equal(early.state.scopes["voice-live"].consecutiveFailures, 1);
+  const done = evaluateRemediation([], early.state, observed + REMEDIATION_COOLDOWN_SECONDS);
+  assert.deepEqual(done.state.scopes["voice-live"], EMPTY_REMEDIATION_STATE.scopes["voice-live"]);
+});
+
+test("an unobserved quiet key leaves an idle scope idle", () => {
+  const { messages, state } = evaluateRemediation([], EMPTY_REMEDIATION_STATE, NOW, DEAF);
+  assert.deepEqual(messages, []);
+  assert.deepEqual(state, EMPTY_REMEDIATION_STATE);
+});
+
+test("a failed scrape restarts every hold-down and latches everything else", () => {
+  const holding: RemediationState = {
+    lastRecommendedAtSeconds: NOW,
+    scopes: {
+      "voice-stall": { phase: "reload-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: NOW + 60 },
+      "voice-live": { phase: "takeover-recommended", consecutiveFailures: 2, suppressed: true, clearSinceSeconds: NOW + 60 },
+      "crash-loop": { ...EMPTY_REMEDIATION_STATE.scopes["crash-loop"] },
+    },
+  };
+  const interrupted = interruptRemediationHoldDown(structuredClone(holding));
+  assert.equal(interrupted.lastRecommendedAtSeconds, NOW);
+  assert.deepEqual(interrupted.scopes["voice-stall"], { ...holding.scopes["voice-stall"], clearSinceSeconds: 0 });
+  assert.deepEqual(interrupted.scopes["voice-live"], { ...holding.scopes["voice-live"], clearSinceSeconds: 0 });
+  assert.deepEqual(interrupted.scopes["crash-loop"], holding.scopes["crash-loop"]);
+  // Nothing holding down: same reference back, so the caller skips the write.
+  assert.equal(interruptRemediationHoldDown(EMPTY_REMEDIATION_STATE), EMPTY_REMEDIATION_STATE);
 });

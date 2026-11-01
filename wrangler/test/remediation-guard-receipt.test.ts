@@ -19,6 +19,7 @@ import {
 
 const NOW = 2_000_000;
 const STALE = ["voice_creator_map_stale"];
+const DEAF = ["voice_live_not_ready"];
 const UNPAIRED = ["gateway_unpaired_disconnect"];
 
 const CORRELATION = {
@@ -94,6 +95,28 @@ test("firing inside the global cooldown without a message is held", () => {
   };
   const { decision } = remediationReceiptDecision([], STALE, afterR1, NOW + 60);
   assert.equal(decision, "held-cooldown");
+});
+
+test("a retained-only deaf alert after the cooldown is an evidence hold, not a cooldown hold", () => {
+  // The evaluator froze the live scope because the scrape carried no age
+  // sample; the window had long expired, so `held-cooldown` would misreport why.
+  const afterTakeover: RemediationState = {
+    lastRecommendedAtSeconds: NOW,
+    scopes: {
+      "voice-stall": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "voice-live": { phase: "takeover-recommended", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+    },
+  };
+  const later = NOW + 2 * REMEDIATION_COOLDOWN_SECONDS;
+  assert.equal(remediationReceiptDecision([], DEAF, afterTakeover, later, DEAF).decision, "held-evidence");
+  // Inside the window the freeze is still the reason nothing moved.
+  assert.equal(remediationReceiptDecision([], DEAF, afterTakeover, NOW + 60, DEAF).decision, "held-evidence");
+  // An observed sibling inside the window is still a cooldown hold.
+  assert.equal(
+    remediationReceiptDecision([], [...STALE, ...DEAF], afterTakeover, NOW + 60, DEAF).decision,
+    "held-cooldown",
+  );
 });
 
 test("quiet tick on a non-idle guard is the sustained-clear hold-down", () => {

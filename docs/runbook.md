@@ -2192,8 +2192,8 @@ Trigger table (a recommendation fires only while its trigger key fires):
 
 | Scope | Trigger firing key | R1 (first) | R2 (escalation) |
 |---|---|---|---|
-| `voice-stall` | `voice_creator_map_stale` | `creator-map-reload`: the bot's maintenance tick retries the merge every 5 minutes; no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
 | `voice-live` | `voice_live_not_ready` | skipped: the alert's 120 s bound is already the bot's self-heal window — the dispatch republishes the not-ready view from the gateway cache every voice frame while it climbs (`voice_live_self_heal_total` counts the repairs), so the expired self-heal counts as attempt one | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
+| `voice-stall` | `voice_creator_map_stale` | `creator-map-reload`: the bot's maintenance tick retries the merge every 5 minutes; no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
 | `crash-loop` | `gateway_unpaired_disconnect` | skipped: no in-process reload can fix a gateway that never came back | `same-sha-takeover`: one Operator card, same path as above |
 
 Guard state (persisted in DO storage next to the alert state):
@@ -2201,18 +2201,27 @@ Guard state (persisted in DO storage next to the alert state):
 - At most one recommendation per 30 minutes across all scopes. Triggers are
   visited in table order and the first eligible one consumes the window, so
   when several scopes fire at once the table order is the priority and the
-  others each wait for their own next window.
+  others each wait for their own next window. `voice-live` comes first: its
+  takeover restarts the whole process, which also re-runs the creator-map
+  merge and re-pairs the gateway, so it never waits behind the stall scope's
+  no-host-action line.
 - A recommendation while a prior one for the same scope did not clear the
   alert counts as one consecutive failure for that scope.
-- A trigger key can also be *retained*: its alert holds the previous firing
-  state when the scrape carries no current evidence (the gauge is missing or
-  malformed — e.g. an older container). The held alert stays firing and
-  untouched, but a retained key never advances its scope — no new
-  recommendation, no failure increment, no hold-down reset, and it never
-  consumes the global window — until a current sample arrives. Today the only
-  retained-capable trigger is `voice_live_not_ready`; the caller passes the
-  scrape's `voiceLiveNotReadyEvidence` flag so progression only ever runs on a
-  current age reading.
+- A trigger key can also be *unobserved*: the scrape carries no current
+  evidence for it (the gauge is missing or malformed — e.g. an older
+  container). A firing unobserved key is *retained*: its alert holds the
+  previous firing state and stays untouched, but the key never advances its
+  scope — no new recommendation, no failure increment, no hold-down reset,
+  and it never consumes the global window — until a current sample arrives.
+  A quiet unobserved key is not a clear either: unobserved time never counts
+  toward recovery, so it restarts that scope's hold-down while the phase,
+  failure count and suppression stay latched, and the next observed clear
+  starts a fresh full window. A failed or rejected scrape observes nothing
+  at all, so it restarts every scope's hold-down the same way. Today the
+  only trigger that can be unobserved in an accepted scrape
+  is `voice_live_not_ready`; the caller passes the scrape's
+  `voiceLiveNotReadyEvidence` flag so progression and recovery only ever run
+  on a current age reading.
 - After 2 consecutive failures the scope goes quiet and the Worker pages the
   CEO card once, on the same best-effort webhook path as the alerts
   themselves: if forwarding is off or delivery fails, the scope still goes
@@ -2323,6 +2332,8 @@ decision or firing key. In Cloudflare dashboard open Workers & Pages →
 Narrow with `decision = "recommend"` (R1/R2), `decision = "ceo-page"`
 (STOP), `decision = "suppressed-quiet"` (quiet after two failures),
 `decision = "held-cooldown"` (inside the 1800 s window),
+`decision = "held-evidence"` (every firing trigger is retained with no
+current sample, so its scope is frozen whatever the window says),
 `decision = "clear-hold"` (sustained-clear hold-down), or `decision = "idle"`
 (pre-drill baseline / reset). Correlate a tick with its alert by matching
 `firing` to the same tick's `metrics_alert` line and `build_revision` /
