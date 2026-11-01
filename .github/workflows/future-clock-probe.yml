@@ -47,13 +47,16 @@ jobs:
           persist-credentials: false
 
       # Debian's 0.9.10 package hangs Postgres 18 at startup; build a pinned
-      # upstream commit instead (runner and Postgres image alike).
+      # upstream commit instead (runner and Postgres image alike). Clock reads
+      # only: with timer/sleep faking, Postgres statement/lock timeouts never
+      # fire under a non-zero offset.
       - name: Build libfaketime and install psql
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
           git clone -q https://github.com/wolfcw/libfaketime "$RUNNER_TEMP/libfaketime"
           git -C "$RUNNER_TEMP/libfaketime" checkout -q 9da91d97cc2b5bc08bcf420a34c9788d5946786c
+          sed -i 's/ -Werror / /; s/ -DFAKE_PTHREAD -DFAKE_STAT -DFAKE_UTIME -DFAKE_SLEEP -DFAKE_TIMERS -DFAKE_INTERNAL_CALLS / /' "$RUNNER_TEMP/libfaketime/src/Makefile"
           make -s -C "$RUNNER_TEMP/libfaketime/src" libfaketimeMT.so.1
           echo "FT_LIB=$RUNNER_TEMP/libfaketime/src/libfaketimeMT.so.1" >> "$GITHUB_ENV"
 
@@ -63,6 +66,7 @@ jobs:
           FROM postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722 AS build
           RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential git ca-certificates >/dev/null \
            && git clone -q https://github.com/wolfcw/libfaketime /src && cd /src && git checkout -q 9da91d97cc2b5bc08bcf420a34c9788d5946786c \
+           && sed -i 's/ -Werror / /; s/ -DFAKE_PTHREAD -DFAKE_STAT -DFAKE_UTIME -DFAKE_SLEEP -DFAKE_TIMERS -DFAKE_INTERNAL_CALLS / /' src/Makefile \
            && make -s -C src libfaketimeMT.so.1
           FROM postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
           COPY --from=build /src/src/libfaketimeMT.so.1 /usr/local/lib/libfaketimeMT.so.1
@@ -91,7 +95,8 @@ jobs:
             --message-format=json-render-diagnostics > "$RUNNER_TEMP/artifacts.json"
 
       # Cargo/rustc hang under libfaketime, so run each built test binary
-      # directly (cwd and CARGO_MANIFEST_DIR as cargo test sets them).
+      # directly (cwd and CARGO_MANIFEST_DIR as cargo test sets them). The
+      # system-wide preload also reaches children spawned with env_clear().
       - name: Run suite at offset ${{ matrix.offset }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -99,7 +104,9 @@ jobs:
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         run: |
-          LD_PRELOAD="$FT_LIB" FAKETIME="$FAKE_AT" date -u
+          echo "$FAKE_AT" | sudo tee /etc/faketimerc
+          echo "$FT_LIB" | sudo tee /etc/ld.so.preload
+          env -i date -u
           python3 - <<'PY'
           import json, os, pathlib, subprocess, sys
           skips = [
@@ -115,11 +122,7 @@ jobs:
               'exact_i32_max_writes_without_saturation_warn',
           ]
           args = [a for s in skips for a in ('--skip', s)]
-          env = os.environ | {
-              'LD_PRELOAD': os.environ['FT_LIB'],
-              'FAKETIME': os.environ['FAKE_AT'],
-              'FAKETIME_DONT_FAKE_MONOTONIC': '1',
-          }
+          env = dict(os.environ)
           bins = []
           for line in pathlib.Path(os.environ['RUNNER_TEMP'], 'artifacts.json').read_text().splitlines():
               msg = json.loads(line)
@@ -140,3 +143,7 @@ jobs:
           print(f'binaries: {len(bins)}, failed: {failed}, timed out: {timed_out}')
           sys.exit(1 if failed or timed_out else 0)
           PY
+
+      - name: Remove the system-wide preload
+        if: always()
+        run: sudo rm -f /etc/ld.so.preload /etc/faketimerc
