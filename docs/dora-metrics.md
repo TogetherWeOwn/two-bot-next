@@ -55,19 +55,23 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
 ## Operating the job
 
 - Dispatch `dora-metrics` with `dry_run` from any branch to run the real
-  computation and upload the files as an artifact without committing.
+  computation and upload the files as an artifact without committing. The
+  compute job's token is read-only, and the publish job stays skipped.
 - A live dispatch (or the Monday schedule) on `main` commits straight to
-  the `automation/dora-metrics` branch with the job token: `main` only
-  accepts pull requests, and the automation branch carries no rulesets. The
-  checkout stays credentialless. Fetch and push use command-scoped Git HTTPS
-  Basic authentication (`x-access-token` with the existing job token), not the
-  API's bearer scheme. The base64 credential is masked before network use and
-  never stored in Git config; base64 is encoding, not encryption. The
-  checked-out code computes the report; a separate temporary worktree publishes
-  only its JSON and Markdown on the automation branch's existing tree (the
+  the `automation/dora-metrics` branch from the separate publish job, the
+  workflow's only write grant: `main` only accepts pull requests, and the
+  automation branch carries no rulesets. Both checkouts stay credentialless.
+  Fetch and push use command-scoped Git HTTPS Basic authentication
+  (`x-access-token` with the publish job token), not the API's bearer scheme.
+  The base64 credential is masked before network use and never stored in Git
+  config; base64 is encoding, not encryption. The read-only compute job runs
+  the checked-out code and uploads the report; the publish job executes no
+  checked-out code and copies only the JSON and Markdown out of that artifact
+  into a temporary worktree on the automation branch's existing tree (the
   current checkout is the first-run fallback). Same-week reruns replace that
   week's report while preserving older weeks. A refused or conflicting push
-  fails the run closed; the original outputs remain available for the artifact.
+  fails the run closed; the compute artifact still preserves that week's
+  numbers.
 - The weekly side-branch push triggers no deploys; `ops/**` is also in
   `deploy-staging`'s push ignore list, so any future main-side delivery
   evidence restarts and promotes nothing.
