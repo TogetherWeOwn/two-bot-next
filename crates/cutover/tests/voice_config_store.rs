@@ -366,8 +366,10 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(rooms.access_controls(46).await?, AccessControls::default());
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT (SELECT count(*) FROM voice_command_roles)
-                  + (SELECT count(*) FROM voice_command_role_members)"
+            "SELECT (SELECT count(*) FROM voice_command_roles
+                      WHERE guild_id IN ('44', '45', '46'))
+                  + (SELECT count(*) FROM voice_command_role_members
+                      WHERE guild_id IN ('44', '45', '46'))"
         )
         .fetch_one(pool)
         .await?,
