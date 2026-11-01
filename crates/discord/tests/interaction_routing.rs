@@ -473,7 +473,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
     ];
     assert_eq!(
         cases.len(),
-        42,
+        43,
         "all handlers except giveaway and lfg-list covered (each has its own test)"
     );
     for (_, id) in cases {
