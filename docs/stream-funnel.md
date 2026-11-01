@@ -232,6 +232,15 @@ four values.
   retryable 503, and the claim fences make that redelivery safe. No header
   value, challenge, body byte or query is ever logged; only scalar
   `event`/`status`/`error_class`.
+- Holds one of the receiver's 32 admission permits for the complete delivery
+  child, not just the HTTP handler. The child is receiver-owned and survives
+  request timeout or disconnect; its terminal post metric is emitted exactly
+  once when claim/send/settle finishes. New delivery children are refused once
+  shutdown latches. The receiver drains HTTP and joins admitted children
+  against one receiver budget inside the supervisor's 5 s HTTP drain
+  (`HTTP_DRAIN_TIMEOUT` minus headroom, mirroring the internal-actions
+  receiver); if it expires, shutdown reports failure and leaves any started
+  claim fenced rather than aborting an uncertain send or starting a retry.
 - Keeps the callback path out of trace spans: `/hooks/twitch` is not in
   `TRACED_PATHS` (`crates/bot/src/server.rs`) and renders as `[REDACTED]`.
 - The DO adds `8092` to `requiredPorts` plus the container bind only while
