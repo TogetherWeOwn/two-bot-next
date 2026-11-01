@@ -47,8 +47,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Same E402-safe convention as the other scripts/ tools.
-import staging_rollout as base  # noqa: E402
-import worker_container_rollback as wcr  # noqa: E402
+import staging_rollout as base
+import worker_container_rollback as wcr
 
 GateError = base.GateError
 require = base.require

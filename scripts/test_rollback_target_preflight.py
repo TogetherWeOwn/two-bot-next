@@ -18,9 +18,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # E402-safe by convention: every scripts/ test adds its own directory first.
-import staging_rollout as base  # noqa: E402
-import rollback_target_preflight as preflight  # noqa: E402
-from test_worker_container_rollback import FakeClient, rollout_row, version_route  # noqa: E402
+import staging_rollout as base
+import rollback_target_preflight as preflight
+from test_worker_container_rollback import FakeClient, rollout_row, version_route
 
 ACCOUNT = "a" * 32
 APPLICATION = preflight.APPLICATION
