@@ -888,14 +888,13 @@ fn lists_are_bounded_in_count_choices_and_text() {
 fn command_roles_accept_only_restrictable_voice_commands() {
     // Config import and runtime enforcement use different stores: config writes
     // `voice_command_roles` while the runtime reads `voice_access_controls`.
-    // `VOICE_COMMANDS` is the runtime allowlist and still includes `myroom`,
-    // but config import must refuse `myroom` until imported restrictions reach
-    // that runtime gate. Otherwise a guild would believe `myroom` is gated while it
-    // stays unrestricted. This pins both sides: runtime includes, config
-    // excludes.
+    // `/myroom` carries no per-command role policy at all, so it is outside the
+    // restrictable `VOICE_COMMANDS` vocabulary and config import must refuse
+    // it too. Otherwise a guild would believe `myroom` is gated while it stays
+    // unrestricted. This pins both sides: runtime excludes, config excludes.
     assert!(
-        VOICE_COMMANDS.contains(&"myroom"),
-        "precondition: runtime allowlist still includes myroom"
+        !VOICE_COMMANDS.contains(&"myroom"),
+        "precondition: myroom is not restrictable"
     );
     let (config, inventory) = fixture();
     let original = serde_json::to_value(&config).unwrap();
@@ -907,7 +906,7 @@ fn command_roles_accept_only_restrictable_voice_commands() {
         "kick ",
         "not-a-command",
         "setup\u{0}",
-        // Runtime-allowlisted but not yet config-importable.
+        // A published voice command with no per-command role policy.
         "myroom",
     ] {
         let mut value = original.clone();
@@ -921,8 +920,8 @@ fn command_roles_accept_only_restrictable_voice_commands() {
             &format!("{bad:?}"),
         );
     }
-    // Config-supported commands are the runtime allowlist minus `myroom`.
-    // Established valid commands still import.
+    // Config-supported commands are the runtime allowlist, which excludes
+    // `myroom`. Established valid commands still import.
     let roles: Vec<Value> = VOICE_COMMANDS
         .iter()
         .filter(|command| **command != "myroom")

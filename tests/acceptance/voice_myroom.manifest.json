@@ -24,9 +24,9 @@
     },
     {
       "path": "crates/core/tests/voice_config.rs",
-      "sha256": "899efb91fe9885f7dfd438fa1187a2e4b11da646e55bef3493a627a033920da7",
+      "sha256": "302bdfb5a03d26884fa474aeba94142bd83e5ceb8faf2ae9f0525050556201be",
       "tests": 25,
-      "change": "Author correction: runtime VOICE_COMMANDS still contains myroom, but the config-import supported subset excludes it. All original invalid-command controls remain; established commands still import."
+      "change": "Author correction: runtime VOICE_COMMANDS still contains myroom, but the config-import supported subset excludes it. All original invalid-command controls remain; established commands still import. Narrowed-contract amendment: the precondition now requires myroom to be outside the restrictable VOICE_COMMANDS vocabulary; the config-import refusal and established-command controls are unchanged."
     },
     {
       "path": "crates/bot/src/voice_config_full_diff_acceptance_tests.rs",
