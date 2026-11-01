@@ -576,7 +576,8 @@ async fn foreign_forged_cancel_and_restart_presses_expire_without_rows() {
     assert_eq!(after_cancel.outcome, PREVIEW_EXPIRED);
 
     // A restart drops the in-memory pending set: the same buttons expire.
-    let runtime2 = runtime(&db, &mock);
+    // `crate::` bypasses the `runtime` local above, which shadows the helper.
+    let runtime2 = crate::runtime(&db, &mock);
     let after_restart = handled(
         runtime2
             .execute(
