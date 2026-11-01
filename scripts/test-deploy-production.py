@@ -2240,7 +2240,9 @@ class RecordStepTests(unittest.TestCase):
         self.assertIn(f"now active: `{VERSION}` (100%)", summary)
         self.assertIn(f"Previously active: `{OLD_VERSION}` (100%)", summary)
         self.assertIn(f"`rollback={OLD_VERSION}`", summary)
-        self.assertEqual(exported, {})
+        # The release notification needs the published version ID on a
+        # cutover hold too, so even a non-takeover deploy exports it.
+        self.assertEqual(exported, {"NEW_VERSION": VERSION})
 
     def test_first_deploy_has_no_previous_version(self):
         code, summary, _ = self.record(before="", after=deployment((VERSION, 100)))
