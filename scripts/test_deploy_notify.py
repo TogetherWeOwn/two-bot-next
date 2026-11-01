@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # E402-safe by convention: every scripts/ test adds its own directory first.
-import deploy_notify as notify  # noqa: E402
+import deploy_notify as notify
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 VERSION = "11111111-1111-4111-8111-111111111111"
