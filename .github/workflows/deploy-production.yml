@@ -1743,12 +1743,16 @@ jobs:
           # The takeover steps below pin to the single version serving 100% of
           # traffic. Anything else (split traffic, unreadable status) refuses
           # the takeover rather than handing ownership to an unknown version.
+          # The release notification also needs the published version ID on a
+          # cutover hold (takeover=false still publishes a new Worker), so
+          # export it for every deploy that leaves one version at 100%.
+          if mode == "deploy" and len(after) == 1 and after[0][1] == 100:
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+                  env_file.write(f"NEW_VERSION={after[0][0]}\n")
           if takeover:
               if len(after) != 1 or after[0][1] != 100:
                   print("::error::takeover requested but no single Worker version serves 100% of traffic")
                   sys.exit(1)
-              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-                  env_file.write(f"NEW_VERSION={after[0][0]}\n")
       # P2/P3 (docs/cutover-production-takeover-design.md): read control state
       # without starting, then take over at exactly the read epoch. Both run
       # only when the dispatch requested the takeover; a routine deploy leaves

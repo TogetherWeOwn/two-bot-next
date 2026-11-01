@@ -399,7 +399,7 @@ record per run (`scripts/deploy_notify.py`):
 | `outcome` | `success`, `rolled_back` (a gate failed, or the post-deploy watch breached, and the snapshot was restored) or `failed` |
 | `sha`, `versionId`, `imageDigest`, `previousVersionId` | the guarded SHA, the new (or restored) Worker version, the promoted image digest, the snapshot's previous version |
 | `runUrl`, `startedAt`, `finishedAt` | this run |
-| `reason` | for a rollback or failure: which gate failed |
+| `reason` | for a rollback, failure, or live-SHA recovery: which gate failed, whether a failed restore was also rolled back, or the recovery mode |
 
 Bindings: repository variable `PAPERCLIP_DEPLOY_WEBHOOK_URL` (https) and
 secret `PAPERCLIP_DEPLOY_WEBHOOK_SECRET`. Headers `X-Paperclip-Timestamp` and

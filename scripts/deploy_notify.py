@@ -96,10 +96,22 @@ def from_workflow(env):
     temp = env.get("RUNNER_TEMP", "")
     failed = next((name for key, name in GATES if env.get(key) == "failure"), None)
     if env.get("MODE") == "rollback":
-        ok = env.get("ROLLBACK_OUTCOME") == "success" and env.get("JOB_STATUS") == "success"
-        return ("rollback", "success" if ok else "failed", env.get("TARGET_VERSION", ""),
+        # Restored means the rollback step AND the revision gate both passed:
+        # the target version is verified serving, so a later bookkeeping
+        # failure (deployment record, re-read) must not relabel the restore.
+        restored = (env.get("ROLLBACK_OUTCOME") == "success"
+                    and env.get("GATE_OUTCOME") == "success")
+        if restored and env.get("JOB_STATUS") == "success":
+            return ("rollback", "success", env.get("TARGET_VERSION", ""),
+                    env.get("TARGET_IMAGE", ""), "",
+                    "operator rollback dispatch")
+        if restored:
+            return ("rollback", "success", env.get("TARGET_VERSION", ""),
+                    env.get("TARGET_IMAGE", ""), "",
+                    "operator rollback dispatch; restored, but a later step failed")
+        return ("rollback", "failed", env.get("TARGET_VERSION", ""),
                 env.get("TARGET_IMAGE", ""), "",
-                "operator rollback dispatch" + ("" if ok else f"; failed at {failed or 'the restore'}"))
+                f"operator rollback dispatch; failed at {failed or 'the restore'}")
     snapshot = read_json(os.path.join(temp, "production-rollback-snapshot.json"))
     previous = snapshot.get("serving_version", "") if snapshot.get("has_previous") is True else ""
     image = read_json(os.path.join(temp, "production-promotion-evidence.json")).get("production_image", "")
@@ -112,7 +124,15 @@ def from_workflow(env):
         return ("deploy", "rolled_back", version, image, previous,
                 f"auto-rollback after the {failed or 'post-deploy checks'} failed")
     if env.get("JOB_STATUS") == "success":
+        if env.get("ALLOW_UNSTAGED") == "true":
+            # A live-SHA recovery builds its image fresh at deploy time, so no
+            # promotion evidence exists and the digest stays null. Name the
+            # mode so the release log can tell that apart from missing data.
+            return "deploy", "success", version, image, previous, "live-SHA recovery"
         return "deploy", "success", version, image, previous, ""
+    if env.get("AUTO_ROLLBACK_OUTCOME") == "failure":
+        return ("deploy", "failed", version, image, previous,
+                f"{failed or 'a step after the deploy'} failed; the automatic rollback also failed")
     return ("deploy", "failed", version, image, previous,
             f"{failed or 'a step after the deploy'} failed; no automatic rollback ran")
 
