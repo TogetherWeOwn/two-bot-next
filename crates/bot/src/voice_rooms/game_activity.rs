@@ -643,6 +643,43 @@ impl GameActivityCollector {
         guilds
     }
 
+    /// Shutdown-only: re-assert every still-playing carried game at `now_ms`.
+    ///
+    /// Presence arrives only on change, so a member who kept playing since
+    /// the last flush holds nothing but a carry, and a flush sessionizes a
+    /// carry only when a fresh delta bridges it. The process is exiting and
+    /// the carry with it, so this records the same-game refresh a live frame
+    /// would have sent: the flush then bridges the carry up to `now_ms` like
+    /// any refreshed run. Stopped carries already have their stop buffered;
+    /// TTL-stale ones (which the flush drops) and ones observed after
+    /// `now_ms` are left alone, so no phantom play is credited.
+    pub fn reassert_carries_at(&self, now_ms: i64) {
+        let refreshes: Vec<(Snowflake, PresenceDelta)> = {
+            let Ok(inner) = self.inner.lock() else {
+                return;
+            };
+            inner
+                .carry
+                .iter()
+                .filter(|(_, stated)| {
+                    stated.stopped_at.is_none()
+                        && stated.last_ms <= now_ms
+                        && stated.from_ms <= now_ms
+                        && now_ms - stated.from_ms <= GAME_ACTIVITY_CARRY_TTL_MS
+                })
+                .map(|((guild, user_key), stated)| {
+                    (
+                        *guild,
+                        synthetic_delta(user_key, &stated.game, stated.is_streaming, now_ms),
+                    )
+                })
+                .collect()
+        };
+        for (guild, delta) in refreshes {
+            self.observe_presence(guild, delta);
+        }
+    }
+
     /// Remove and return one guild's buffered deltas and voice spans at
     /// `now_ms`, clipping each open span there.
     ///
@@ -1301,8 +1338,12 @@ pub async fn flush_loop(
         )
         .await;
     }
+    let now = now_ms();
+    // Silent players hold only a carry; refresh it so the final pass
+    // persists their run since the last flush instead of exiting with it.
+    collector.reassert_carries_at(now);
     // A failure is logged inside; the count matters only to direct callers.
-    let _ = flush_remaining_guilds(&pool, &collector, now_ms(), GAME_ACTIVITY_GAP_TIMEOUT_MS).await;
+    let _ = flush_remaining_guilds(&pool, &collector, now, GAME_ACTIVITY_GAP_TIMEOUT_MS).await;
 }
 
 #[cfg(test)]
@@ -1921,6 +1962,61 @@ mod tests {
             .find(|row| row.game.as_deref() == Some("Zelda"))
             .expect("Zelda row");
         assert_eq!(zelda.total_play_ms, MIN);
+    }
+
+    #[test]
+    fn shutdown_reassert_persists_a_silent_carry_since_the_last_flush() {
+        // Apex from 0 with no further presence: the 10-minute flush persists
+        // the first leg and carries the game. At shutdown (30) the carry is
+        // the only record of the next 20 minutes.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 10 * MIN);
+        assert_eq!(rows[0].total_play_ms, 10 * MIN);
+        assert!(
+            collector.guilds().is_empty(),
+            "a carry-only guild is invisible to the shutdown flush"
+        );
+
+        collector.reassert_carries_at(T0 + 30 * MIN);
+        assert_eq!(collector.guilds(), vec![7]);
+        let rows = collector.flush(7, 15 * MIN, T0 + 30 * MIN);
+        assert_eq!(rows.len(), 1, "the silent run persists, got {rows:?}");
+        assert_eq!(rows[0].game.as_deref(), Some("Apex"));
+        assert_eq!(rows[0].total_play_ms, 20 * MIN);
+    }
+
+    #[test]
+    fn shutdown_reassert_skips_stopped_and_stale_carries() {
+        let collector = GameActivityCollector::new();
+        // Guild 7: played then stopped in the same window; its stop is
+        // buffered, so no refresh may extend the run past it.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 10 * MIN));
+        // Guild 8: a carry older than the TTL, which the flush drops.
+        collector.observe_presence(
+            8,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0),
+        );
+        let _ = collector.flush(8, 15 * MIN, T0 + MIN);
+        let late = T0 + MIN + GAME_ACTIVITY_CARRY_TTL_MS + MIN;
+
+        collector.reassert_carries_at(late);
+        assert_eq!(
+            collector.buffered_counts(7).0,
+            2,
+            "a stopped carry gets no refresh"
+        );
+        assert!(
+            collector.flush(8, 15 * MIN, late).is_empty(),
+            "a stale carry is not revived as phantom play"
+        );
     }
 
     #[test]
