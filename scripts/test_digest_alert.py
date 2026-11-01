@@ -76,10 +76,22 @@ class MainTest(unittest.TestCase):
         opened.assert_not_called()
 
     def test_bad_prev_tag_refuses(self):
-        code, opened = self.run_main(
-            ["--live-sha", SHA, "--prev-tag", "v1.2.3"], {"GITHUB_TOKEN": "fixture"})
-        self.assertEqual(code, 1)
-        opened.assert_not_called()
+        for tag in ("v1.2.3", "v2026.1101.01", "v2026.0101.0", "v2026.1101.0-canary.0", "canary/v2026.1101.0"):
+            with self.subTest(tag=tag):
+                code, opened = self.run_main(
+                    ["--live-sha", SHA, "--prev-tag", tag], {"GITHUB_TOKEN": "fixture"})
+                self.assertEqual(code, 1)
+                opened.assert_not_called()
+
+    def test_calver_prev_tag_alerts(self):
+        # After the CalVer switch the predecessor is vYYYY.MDD.P.
+        for tag in ("v2026.1101.0", "v2027.105.0", "v2026.1231.12"):
+            with self.subTest(tag=tag):
+                code, opened = self.run_main(
+                    ["--live-sha", SHA, "--prev-tag", tag], {"GITHUB_TOKEN": "fixture"})
+                self.assertEqual(code, 0)
+                opened.assert_called_once()
+                self.assertIn(tag, opened.call_args.args[3])
 
 
 if __name__ == "__main__":

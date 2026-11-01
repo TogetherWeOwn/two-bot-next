@@ -53,7 +53,7 @@ JOB_INVENTORY = {
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
-    # Daily digest release (docs/releases.md): one vYYYY.MM.DD tag per day,
+    # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
     "daily-digest.yml": {"digest", "alert", "rollback-proof-watch"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
@@ -2565,16 +2565,18 @@ def release_errors(workflow):
 
 
 def daily_digest_errors(workflow):
-    """daily-digest cuts one vYYYY.MM.DD tag per day and alerts when production moved but no tag was made.
+    """daily-digest cuts at most one vYYYY.MDD.P tag a day and alerts when production moved but no tag was made.
 
     Schedule-only plus manual dispatch: one daily cron at an off-minute (never
     :00 or :30, never bunched with the deploy-production backstop) and a
     dry_run-only dispatch. The digest job resolves the live production SHA
     (/readyz, falling back to the newest recorded successful production
     Deployment: rows whose description is a deploy ID),
-    cuts the tag via daily-digest.cjs, and dispatches the SBOM chain for the
-    fresh or existing release. The alert job consumes owed-digest outputs even
-    on a failed publication and opens the `daily-digest` incident issue with
+    plans and publishes through the shared CalVer action (both steps pinned to
+    one full TogetherWeOwn/.github commit) around the daily-digest.cjs
+    adapter, and dispatches the SBOM chain for the fresh or existing release. The alert job consumes owed-digest outputs even
+    on a failed publication, or a digest job that failed before classification
+    with a proven live SHA, and opens the `daily-digest` incident issue with
     the job token (issues: write), no environment or secret.
     """
     name = "daily-digest.yml"
@@ -2627,6 +2629,12 @@ def daily_digest_errors(workflow):
             errors.append(f"{name}:digest: missing pin {required}")
     if "release-on-promote" in digest_text or "vX.Y.Z" in digest_text:
         errors.append(f"{name}:digest: must not reference the retired per-promote tagging")
+    calver = [step.get("uses", "") for step in digest.get("steps") or []
+              if "actions/calver" in str(step.get("uses", ""))]
+    calver_pin = re.compile(r"TogetherWeOwn/\.github/actions/calver@[0-9a-f]{40}")
+    if len(calver) != 2 or len(set(calver)) != 1 or not all(calver_pin.fullmatch(u) for u in calver):
+        errors.append(f"{name}:digest: plan and publish must use the shared CalVer action "
+                      "pinned to one full commit SHA")
     outputs = digest.get("outputs") or {}
     for output in ("released", "tag_name", "prod_changed", "live_sha", "prev_tag"):
         if output not in outputs:
@@ -2634,10 +2642,12 @@ def daily_digest_errors(workflow):
     alert = jobs["alert"]
     if alert.get("needs") != "digest":
         errors.append(f"{name}:alert: must wait for the digest job")
-    expected_alert_if = ("${{ !cancelled() && "
-                         "needs.digest.outputs.prod_changed == 'true' && "
-                         "needs.digest.outputs.released != 'true' && "
-                         "inputs.dry_run != true }}")
+    expected_alert_if = ("${{ !cancelled() && inputs.dry_run != true && "
+                         "((needs.digest.outputs.prod_changed == 'true' && "
+                         "needs.digest.outputs.released != 'true') || "
+                         "(needs.digest.result == 'failure' && "
+                         "needs.digest.outputs.prod_changed == '' && "
+                         "needs.digest.outputs.live_sha != '')) }}")
     if alert.get("if") != expected_alert_if:
         errors.append(f"{name}:alert: must consume owed-digest outputs even on failure, "
                       "never on a dry run")

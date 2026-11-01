@@ -1,7 +1,9 @@
 # Changelog
 
-Releases after v0.4.0 are published on the GitHub Releases page by each
-production promote (see docs/releases.md); this file keeps the earlier history.
+This file is frozen history up to v0.4.0. Later releases are published on the
+[GitHub Releases page](https://github.com/TogetherWeOwn/two-bot-next/releases)
+by the daily digest: `vYYYY.MM.DD` tags through v2026.10.23, then CalVer
+`vYYYY.MDD.P` (see docs/releases.md).
 
 ## [0.4.0](https://github.com/TogetherWeOwn/two-bot-next/compare/v0.3.0...v0.4.0) (2026-10-10)
 

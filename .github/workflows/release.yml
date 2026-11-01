@@ -15,7 +15,7 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: Digest release to attach SBOM assets (vYYYY.MM.DD, or vX.Y.Z for pre-digest repair)
+        description: Digest release to attach SBOM assets (vYYYY.MDD.P, or a legacy vYYYY.MM.DD / vX.Y.Z tag for repair)
         type: string
         default: ''
 
