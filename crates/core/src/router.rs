@@ -85,6 +85,12 @@ pub const TICKET_CLOSE_ID: &str = "two:tickets:close";
 pub const LFG_PREFIX: &str = "two:lfg:";
 /// Self-role button/select prefix (`src/selfRoles/plan.ts`).
 pub const SELF_ROLE_PREFIX: &str = "two:self-role:";
+/// `/lockdown-preview` Confirm button prefix (spec section 3 step 3). The
+/// suffix is `<actor>:<digest32>`; ownership is checked in the channel slice,
+/// never from the id alone.
+pub const LOCKDOWN_PREVIEW_CONFIRM_PREFIX: &str = "lockdown-preview:confirm:";
+/// `/lockdown-preview` Cancel button prefix, same suffix shape as confirm.
+pub const LOCKDOWN_PREVIEW_CANCEL_PREFIX: &str = "lockdown-preview:cancel:";
 
 // --- refusal texts ------------------------------------------------------------
 // Actionable denials: every refusal names the Discord permission, who to ask,
@@ -164,6 +170,11 @@ pub enum ComponentHandler {
     Tickets,
     LfgSignup,
     GiveawayEntry,
+    /// `/lockdown-preview` Confirm / Cancel buttons. Routed on the same
+    /// `ManageChannels` disclosure basis as the preview slash (spec section 5):
+    /// the moderator gate runs in the channel slice, which re-runs the slash
+    /// adjudication on the pressing member before any read.
+    LockdownPreview,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -871,6 +882,21 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::GiveawayEntry
+        } else if custom_id
+            .strip_prefix(LOCKDOWN_PREVIEW_CONFIRM_PREFIX)
+            .is_some()
+            || custom_id
+                .strip_prefix(LOCKDOWN_PREVIEW_CANCEL_PREFIX)
+                .is_some()
+        {
+            // Same disclosure basis as the `/lockdown-preview` slash: the
+            // moderation gate and guild fence run here; the `ManageChannels`
+            // check on the pressing member re-runs in the channel slice
+            // before any read (spec sections 3 step 5 and 5).
+            if !self.gates.moderation || !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::LockdownPreview
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown
@@ -1654,6 +1680,34 @@ mod tests {
             assert_eq!(r.route_component(id, Some(9999)), ComponentOutcome::Ignore);
             assert_eq!(r.route_component(id, None), ComponentOutcome::Ignore);
         }
+        for id in [
+            "lockdown-preview:confirm:3333:0123456789abcdef0123456789abcdef",
+            "lockdown-preview:cancel:3333:0123456789abcdef0123456789abcdef",
+        ] {
+            assert_eq!(
+                r.route_component(id, Some(GUILD)),
+                ComponentOutcome::Handled {
+                    handler: ComponentHandler::LockdownPreview
+                },
+                "{id} routes to the lockdown-preview slice"
+            );
+        }
+        // The guild fence holds for the preview buttons: a foreign guild or
+        // no guild is silent, never an unknown-command reply.
+        assert_eq!(
+            r.route_component(
+                "lockdown-preview:confirm:3333:0123456789abcdef0123456789abcdef",
+                Some(9999)
+            ),
+            ComponentOutcome::Ignore
+        );
+        assert_eq!(
+            r.route_component(
+                "lockdown-preview:cancel:3333:0123456789abcdef0123456789abcdef",
+                None
+            ),
+            ComponentOutcome::Ignore
+        );
         // Modal submits share the table.
         assert_eq!(
             r.route_modal("two:lfg:abc123", Some(GUILD)),
@@ -1690,6 +1744,19 @@ mod tests {
                 "{id} ignored while disabled"
             );
         }
+        // The preview buttons need the moderation gate, not the ticket /
+        // self-role surfaces above: with `TWO_MODERATION=0` they stay silent.
+        let moderation_off = InteractionRouter::new(RouterGates {
+            moderation: false,
+            ..all_on()
+        });
+        assert_eq!(
+            moderation_off.route_component(
+                "lockdown-preview:confirm:3333:0123456789abcdef0123456789abcdef",
+                Some(GUILD)
+            ),
+            ComponentOutcome::Ignore
+        );
         // Guild fence on the fenced components.
         let r = router();
         assert_eq!(
