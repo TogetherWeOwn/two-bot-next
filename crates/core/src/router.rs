@@ -910,6 +910,10 @@ impl InteractionRouter {
             reserved.extend(voice_command_names().iter().cloned());
         }
         reserved.insert("templateassistant".to_owned());
+        // `/lockdown-preview` is routed but dark until its publish slice
+        // lands: dispatch shadows the name (see `route_slash`), so a custom
+        // row under it could publish yet never execute.
+        reserved.insert("lockdown-preview".to_owned());
         reserved
     }
 
@@ -1074,7 +1078,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 45, "all 45 handler-owned builtins covered");
+        assert_eq!(cases.len(), 46, "all 46 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),

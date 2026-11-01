@@ -22,13 +22,26 @@ extern crate self as two_bot_core;
 extern crate two_bot_core as real_core;
 
 pub use real_core::{
-    channel_moderation, lockdown_preview, metrics, ChannelAuditRow, HandlerId, InteractionHandler,
-    InteractionRouter, LockdownRecord, ModerationAction, RouterGates, SlashOutcome,
+    channel_moderation, metrics, ChannelAuditRow, HandlerId, InteractionHandler, InteractionRouter,
+    LockdownRecord, ModerationAction, RouterGates, SlashOutcome,
 };
 pub use two_bot_discord::{
-    lockdown_preview, route_interaction, ChannelCall, ChannelCallOutcome, DiscordError,
-    EveryoneOverwrite, RoutedInteraction,
+    route_interaction, ChannelCall, ChannelCallOutcome, DiscordError, EveryoneOverwrite,
+    RoutedInteraction,
 };
+
+/// Merged preview surface for the included `subject`: the core planner
+/// names (`two_bot_core::lockdown_preview`, via `extern crate self`) and the
+/// discord render/pending names (`crate::lockdown_preview`) share one root
+/// name, so both import lists in `channel_moderation.rs` resolve here. The
+/// two modules have no overlapping item names.
+pub mod lockdown_preview {
+    pub use real_core::lockdown_preview::{plan_preview, PreviewError, PreviewSnapshot};
+    pub use two_bot_discord::lockdown_preview::{
+        cancel_custom_id, confirm_custom_id, preview_audit_metadata, render_preview, PendingEntry,
+        PendingFull, PendingStore, RateLimiter, PREVIEW_TTL_SECS,
+    };
+}
 
 // --- offline sqlx boundary -------------------------------------------------
 

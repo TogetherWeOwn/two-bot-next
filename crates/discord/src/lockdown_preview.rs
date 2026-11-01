@@ -351,6 +351,7 @@ mod tests {
 
     const VIEW: u64 = 1 << 10;
     const SEND: u64 = 1 << 11;
+    const ADMINISTRATOR: u64 = 1 << 3;
 
     fn snapshot() -> PreviewSnapshot {
         PreviewSnapshot {
@@ -618,9 +619,13 @@ mod tests {
     }
 
     /// Adversarial snapshot: 250 evaluated roles, maximum-width ids and
-    /// masks, saved state present. The interaction edit neutralizes the
-    /// four `@everyone` tokens (+1 unit each), so the bound applies to the
-    /// wire form, not the raw render.
+    /// masks, saved state present. Keeper roles carry Administrator so they
+    /// keep usable SendMessages without one overwrite each (the snapshot
+    /// overwrite cap is 100), and the `@everyone` overwrite carries full
+    /// masks for maximum-width allow/deny text. Without keepers the render
+    /// would stay small and never exercise the count-only fallback. The
+    /// interaction edit neutralizes the four `@everyone` tokens (+1 unit
+    /// each), so the bound applies to the wire form, not the raw render.
     fn adversarial_snapshot(keepers: usize, id_base: u64) -> PreviewSnapshot {
         let mut roles = vec![RoleSnapshot {
             id: 7,
@@ -630,7 +635,7 @@ mod tests {
         roles.extend((0..keepers).map(|index| RoleSnapshot {
             id: id_base + index as u64,
             position: index as i64 + 1,
-            permissions: VIEW | SEND,
+            permissions: VIEW | SEND | ADMINISTRATOR,
         }));
         roles.extend((keepers..249).map(|index| RoleSnapshot {
             id: 1_000_000 + index as u64,
@@ -650,8 +655,8 @@ mod tests {
             overwrites: vec![OverwriteSnapshot {
                 kind: 0,
                 id: 7,
-                allow: 0,
-                deny: 0,
+                allow: u64::MAX,
+                deny: u64::MAX,
             }],
         }
     }
