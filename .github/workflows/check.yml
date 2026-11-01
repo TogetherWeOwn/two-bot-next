@@ -900,6 +900,11 @@ jobs:
       - name: cargo test (isolated ticket skip/budget acceptance)
         run: cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked ticket_runtime::cursor_budget -- --test-threads=1
 
+      # The gateway lifecycle acceptance target is generated from live source
+      # (never committed), so the integration sweep below compiles and runs it.
+      - name: prepare gateway lifecycle acceptance
+        run: python3 tests/gateway_lifecycle/prepare.py --prepare
+
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
