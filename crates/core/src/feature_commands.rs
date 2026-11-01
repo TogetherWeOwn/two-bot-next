@@ -129,7 +129,7 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
         // one name/draft. Automation- and ManageGuild-gated like other admin commands.
         CommandDefinition::new(
             "command-inspect",
-            "Inspect a saved command or privately preview an unsaved draft",
+            "Inspect saved state and text-trigger eligibility, or preview an unsaved draft",
         )
         .permissions(PERM_MANAGE_GUILD)
         .options(vec![

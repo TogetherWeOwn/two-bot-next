@@ -948,28 +948,153 @@ pub fn format_inspect_miss(name: &str) -> String {
     )
 }
 
-/// Private definition summary: saved description, existing enabled state,
-/// text trigger and usable template/preview/correction examples. Never the
-/// template body or a preview — those are their own views. Disabled rows
-/// stay inspectable; nothing here enables them.
+/// Why a saved row is not currently a prefix-dispatch candidate. Each reason is
+/// derived from the same inputs as the live text path: the row, the effective
+/// text-command gate and [`builtin_command_names`] (never the wider write
+/// reservation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextBlocker {
+    NoTrigger,
+    Paused,
+    GateOff,
+    Builtin,
+}
+
+/// Current text-trigger eligibility for one saved row. `gate` is the effective
+/// automations-and-text-commands flag; `None` means the caller could not read
+/// it, which is reported as unknown, never as enabled.
+fn text_blockers(row: &StoredCommand, gate: Option<bool>) -> Vec<TextBlocker> {
+    let mut blockers = Vec::new();
+    match row.text_trigger.as_deref() {
+        None => blockers.push(TextBlocker::NoTrigger),
+        Some(trigger) => {
+            if trigger_word(trigger)
+                .is_some_and(|word| is_builtin_trigger(&word, &builtin_command_names()))
+            {
+                blockers.push(TextBlocker::Builtin);
+            }
+        }
+    }
+    if !row.enabled {
+        blockers.push(TextBlocker::Paused);
+    }
+    if gate == Some(false) {
+        blockers.push(TextBlocker::GateOff);
+    }
+    blockers
+}
+
+fn text_eligibility_lines(row: &StoredCommand, gate: Option<bool>) -> String {
+    let blockers = text_blockers(row, gate);
+    let name = &row.name;
+    // Stored names predate validation on raw rows, so display echoes go
+    // through the same escape as the summary examples; the reservation
+    // check below keeps the raw stored value.
+    let shown = escape_inspect_text(name);
+    // Both replacement and resume enforce the wider write reservation.
+    let reserved = reserved_command_names();
+    let name_reserved = reserved.contains(name);
+    if blockers.is_empty() {
+        return if gate.is_some() {
+            "\nText-trigger eligibility: Eligible, subject to normal per-message permission checks and automod. This is not a delivery guarantee and says nothing about slash-command registration.".to_owned()
+        } else {
+            "\nText-trigger eligibility: Unknown (the current text commands gate is unavailable to this view; the saved definition itself has no blocker). Nothing here is a delivery guarantee.".to_owned()
+        };
+    }
+    let reasons = blockers
+        .iter()
+        .map(|blocker| match blocker {
+            TextBlocker::NoTrigger => "no text trigger",
+            TextBlocker::Paused => "paused definition",
+            TextBlocker::GateOff => "text commands gate off",
+            TextBlocker::Builtin => "builtin-reserved trigger",
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut out = format!("\nText-trigger eligibility: Not eligible ({reasons})");
+    if gate.is_none() {
+        out.push_str("; text commands gate unknown");
+    }
+    for blocker in &blockers {
+        match blocker {
+            TextBlocker::NoTrigger | TextBlocker::Builtin | TextBlocker::Paused if name_reserved => {
+                out.push_str(&format!(
+                    "\nNext: the name \"{shown}\" is reserved, so this definition cannot be resumed or replaced under this name. Recreate it under a different name with /command, or delete it with /command-remove name:{shown}."
+                ));
+            }
+            TextBlocker::NoTrigger => out.push_str(&format!(
+                "\nNext: add a trigger with /command name:{shown} template:... text-trigger:!word (replaces the definition)."
+            )),
+            TextBlocker::Builtin => out.push_str(&format!(
+                "\nNext: choose a non-builtin trigger with /command name:{shown} template:... text-trigger:!word (replaces the definition)."
+            )),
+            TextBlocker::Paused => {
+                if validate_toggle_enable(row, &reserved, &builtin_command_names()).is_ok() {
+                    out.push_str(&format!("\nNext: resume it with /command-enable name:{shown}."));
+                } else {
+                    out.push_str(&format!(
+                        "\nNext: repair the saved definition with /command name:{shown} template:... description:... text-trigger:!word (replaces the definition). It cannot be resumed as stored."
+                    ));
+                }
+            }
+            TextBlocker::GateOff => out.push_str(
+                "\nNext: text commands follow the TWO_TEXT_COMMANDS configuration; ask the bot operator to review it. Inspecting changes nothing.",
+            ),
+        }
+    }
+    out
+}
+
+/// Private definition summary with the current text-trigger eligibility
+/// unknown: the caller has no effective text-command gate to report.
 #[must_use]
 pub fn format_inspect_summary(row: &StoredCommand) -> String {
+    format_inspect_summary_with_gate(row, None)
+}
+
+/// Private definition summary: saved description, saved enabled state (kept
+/// separate from live dispatch), text trigger, current text-trigger
+/// eligibility with a safe next action per blocker, and usable
+/// template/preview/correction examples. Never the template body or a
+/// preview — those are their own views. Disabled rows stay inspectable;
+/// nothing here enables them. `text_commands_gate` is the effective
+/// automations-and-text-commands flag the text path uses, or `None` when
+/// unavailable. A passing result stays subject to per-message permission
+/// checks and automod.
+#[must_use]
+pub fn format_inspect_summary_with_gate(
+    row: &StoredCommand,
+    text_commands_gate: Option<bool>,
+) -> String {
     let heading = InspectView::Summary.heading(&row.name);
-    let status = if row.enabled { "Enabled" } else { "Disabled" };
+    let status = if row.enabled {
+        "Enabled"
+    } else {
+        "Disabled (paused)"
+    };
     let trigger = escape_inspect_text(row.text_trigger.as_deref().unwrap_or("none (slash-only)"));
     let shown = escape_inspect_text(&row.name);
+    let eligibility = text_eligibility_lines(row, text_commands_gate);
+    let correction = if reserved_command_names().contains(&row.name) {
+        "Recreate under a different name: /command name:another-name template:...".to_owned()
+    } else {
+        format!("Replace the definition: /command name:{shown} template:...")
+    };
     let examples = format!(
-        "\nSaved template: /command-inspect name:{shown} view:template\nPrivate preview: /command-inspect name:{shown} view:preview\nReplace the definition: /command name:{shown} template:..."
+        "\nSaved template: /command-inspect name:{shown} view:template\nPrivate preview: /command-inspect name:{shown} view:preview\n{correction}"
     );
     // Fixed overhead first: only the escaped description is unbounded (raw
     // rows predate validation), so only it can be cut — with an explicit
     // marker, never a silent partial.
     let fixed_units = heading.encode_utf16().count()
         + "\nDescription: ".encode_utf16().count()
-        + "\nStatus: ".encode_utf16().count()
+        + "\nSaved definition \u{2014} Status: "
+            .encode_utf16()
+            .count()
         + status.encode_utf16().count()
         + "\nText trigger: ".encode_utf16().count()
         + trigger.encode_utf16().count()
+        + eligibility.encode_utf16().count()
         + examples.encode_utf16().count();
     let mut description = escape_inspect_text(&row.description);
     let budget = MAX_RENDERED_CHARS.saturating_sub(fixed_units);
@@ -981,7 +1106,7 @@ pub fn format_inspect_summary(row: &StoredCommand) -> String {
         );
         description = format!("{cut}{MARKER}");
     }
-    let reply = format!("{heading}\nDescription: {description}\nStatus: {status}\nText trigger: {trigger}{examples}");
+    let reply = format!("{heading}\nDescription: {description}\nSaved definition \u{2014} Status: {status}\nText trigger: {trigger}{eligibility}{examples}");
     debug_assert!(reply.encode_utf16().count() <= MAX_RENDERED_CHARS);
     reply
 }
@@ -1968,6 +2093,168 @@ mod tests {
         assert!(summary.contains("Disabled"));
         assert!(!summary.to_lowercase().contains("enabled"));
         assert!(summary.contains("none (slash-only)"));
+    }
+
+    #[test]
+    fn inspect_summary_eligibility_follows_gate_trigger_state_and_reservation() {
+        let eligibility = |row: &StoredCommand, gate| {
+            format_inspect_summary_with_gate(row, gate)
+                .lines()
+                .find(|line| line.starts_with("Text-trigger eligibility:"))
+                .expect("eligibility line")
+                .to_owned()
+        };
+        let row = inspect_row();
+        assert!(eligibility(&row, Some(true)).contains("Eligible, subject to"));
+        assert!(eligibility(&row, Some(true)).contains("automod"));
+        assert!(eligibility(&row, Some(false)).contains("text commands gate off"));
+        assert!(eligibility(&row, None).contains("Unknown"));
+        let mut paused = inspect_row();
+        paused.enabled = false;
+        assert!(eligibility(&paused, Some(true)).contains("paused definition"));
+        let mut reserved = inspect_row();
+        reserved.text_trigger = Some("!HELP".to_owned());
+        assert!(eligibility(&reserved, Some(true)).contains("builtin-reserved trigger"));
+        // Dispatch reserves builtin names only, not the wider write set.
+        let mut write_only = inspect_row();
+        write_only.text_trigger = Some("!setup".to_owned());
+        assert!(eligibility(&write_only, Some(true)).contains("Eligible"));
+        let mut slash_only = inspect_row();
+        slash_only.text_trigger = None;
+        let summary = format_inspect_summary_with_gate(&slash_only, Some(true));
+        assert!(summary.contains("no text trigger"));
+        assert!(summary.contains("text-trigger:"));
+        assert!(!summary.contains("registration"));
+    }
+
+    #[test]
+    fn inspect_summary_paused_reserved_name_points_at_replace_or_delete_not_resume() {
+        assert!(
+            reserved_command_names().contains("setup"),
+            "test premise: setup is a voice-room name in the write reservation"
+        );
+        let mut row = inspect_row();
+        row.name = "setup".to_owned();
+        row.text_trigger = Some("!setup".to_owned());
+        row.enabled = false;
+        let summary = format_inspect_summary_with_gate(&row, Some(true));
+        assert!(summary.contains("paused definition"));
+        assert!(!summary.contains("builtin-reserved trigger"));
+        assert!(!summary.contains("/command-enable"));
+        assert!(summary.contains("is reserved"));
+        assert!(summary.contains("cannot be resumed"));
+        assert!(summary.contains("/command-remove name:setup"));
+        assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        // Control: an ordinary paused row still offers resume.
+        let mut plain = inspect_row();
+        plain.enabled = false;
+        let control = format_inspect_summary_with_gate(&plain, Some(true));
+        assert!(control.contains("/command-enable name:faq"));
+    }
+
+    #[test]
+    fn inspect_summary_reserved_name_trigger_repairs_require_a_different_name() {
+        let reserved = reserved_command_names();
+        for enabled in [true, false] {
+            for trigger in [None, Some("!help")] {
+                let mut row = inspect_row();
+                row.name = "setup".to_owned();
+                row.enabled = enabled;
+                row.text_trigger = trigger.map(str::to_owned);
+                assert_eq!(
+                    validate_put_input(
+                        &PutCommandInput {
+                            name: row.name.clone(),
+                            description: row.description.clone(),
+                            template: row.template.clone(),
+                            text_trigger: Some("!word".to_owned()),
+                        },
+                        &reserved,
+                    ),
+                    Err(CommandError::ReservedName("setup".to_owned()))
+                );
+                let summary = format_inspect_summary_with_gate(&row, Some(true));
+                assert!(summary.contains("Not eligible"));
+                assert!(summary.contains("Recreate it under a different name with /command"));
+                assert!(summary.contains("/command-remove name:setup"));
+                assert!(!summary.contains("/command name:setup"));
+                assert!(!summary.contains("/command-enable name:setup"));
+                assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+            }
+        }
+    }
+
+    #[test]
+    fn inspect_summary_offers_resume_only_when_the_full_enable_validator_accepts() {
+        let reserved = reserved_command_names();
+        let dispatch = builtin_command_names();
+        let mut row = inspect_row();
+        row.enabled = false;
+        for (template, description, trigger, expected) in [
+            (
+                "Hello {unknown}",
+                "FAQ",
+                "!faq",
+                CommandError::InvalidTemplate(TemplateError::UnknownPlaceholder(
+                    "unknown".to_owned(),
+                )),
+            ),
+            ("Hello", "", "!faq", CommandError::InvalidDescription),
+            (
+                "Hello",
+                "FAQ",
+                "!help",
+                CommandError::ReservedTextTrigger("!help".to_owned()),
+            ),
+        ] {
+            row.template = template.to_owned();
+            row.description = description.to_owned();
+            row.text_trigger = Some(trigger.to_owned());
+            assert_eq!(
+                validate_toggle_enable(&row, &reserved, &dispatch),
+                Err(expected)
+            );
+            let summary = format_inspect_summary_with_gate(&row, Some(true));
+            assert!(summary.contains("paused definition"));
+            assert!(!summary.contains("/command-enable"));
+            assert!(summary.contains("Next: repair the saved definition with /command name:faq"));
+            assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        }
+        row = inspect_row();
+        row.enabled = false;
+        assert_eq!(validate_toggle_enable(&row, &reserved, &dispatch), Ok(()));
+        assert!(format_inspect_summary_with_gate(&row, Some(true))
+            .contains("Next: resume it with /command-enable name:faq."));
+    }
+
+    #[test]
+    fn inspect_summary_next_actions_escape_markdown_active_names() {
+        for (enabled, trigger, expected) in [
+            (
+                false,
+                Some("!faq"),
+                "Next: resume it with /command-enable name:\\_\\_forged\\_\\_.",
+            ),
+            (
+                true,
+                None,
+                "Next: add a trigger with /command name:\\_\\_forged\\_\\_ template:",
+            ),
+            (
+                true,
+                Some("!help"),
+                "Next: choose a non-builtin trigger with /command name:\\_\\_forged\\_\\_ template:",
+            ),
+        ] {
+            let mut row = inspect_row();
+            row.name = "__forged__".to_owned();
+            row.enabled = enabled;
+            row.text_trigger = trigger.map(str::to_owned);
+            let summary = format_inspect_summary_with_gate(&row, Some(true));
+            assert!(summary.lines().any(|line| line.starts_with(expected)));
+            assert!(!summary.contains("name:__forged__"));
+            assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        }
     }
 
     #[test]

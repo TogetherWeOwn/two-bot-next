@@ -13,14 +13,14 @@ red. Each pin below is proven by an exit-1 mutant going red.
 
 Contract pinned here:
 
-* ``synthetic_alert --dry-run`` raw return ``is 0`` with a valid webhook,
-  a missing webhook, and a missing probe sample.
+* ``synthetic_alert --dry-run`` raw return ``is 0`` with a ready issue sink,
+  a missing token, and a missing probe sample.
 * ``synthetic_alert --dry-run`` on refused evidence returns ``is 1`` with
   the live-path fixed-vocabulary refusal and no traceback.
 * ``staging_voice_synthetic --dry-run`` raw return ``is 0`` with no token.
-* Every network/Discord entry point refuses during the run.
+* Every network/Discord/GitHub entry point refuses during the run.
 
-Offline only: the webhook history read is mocked, every network entry
+Offline only: the workflow history read is mocked, every network entry
 point refuses, no sockets, no subprocess, no Discord.
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_dry_run_exit_code_pins.py -v
@@ -34,6 +34,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,8 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 alert = importlib.import_module("synthetic_alert")
 synth = importlib.import_module("staging_voice_synthetic")
 
-# Obviously fake webhook shape; never a real credential.
-HOOK = "https://discord.com/api/webhooks/234567890123456789/dry-run-plan-token-not-a-secret"
+# Obviously fake token; never a real credential.
+TOKEN = "dry-run-plan-token-not-a-secret"
 
 EVIDENCE = {
     "origin": "https://two-bot-next-staging.example.workers.dev",
@@ -97,9 +98,10 @@ def no_network(history=()):
     with (
         patch.object(alert, "previous_probe_outcomes", return_value=list(history)),
         patch.object(alert, "post", side_effect=AssertionError("post() during --dry-run")),
-        patch.object(alert.urllib.request, "build_opener",
+        patch.object(alert, "open_issue_without_incident", return_value=False),
+        patch.object(urllib.request, "build_opener",
                      side_effect=AssertionError("network opener during --dry-run")),
-        patch.object(alert.urllib.request, "urlopen",
+        patch.object(urllib.request, "urlopen",
                      side_effect=AssertionError("urlopen during --dry-run")),
     ):
         yield
@@ -124,7 +126,7 @@ def no_discord():
 
 def base_env(**over):
     env = {
-        "SYNTHETIC_ALERT_WEBHOOK_URL": HOOK,
+        "GITHUB_TOKEN": TOKEN,
         "RUN_ID": "999",
         "GITHUB_RUN_ID": "999",
         "PROBE_OUTCOME": "failure",
@@ -159,12 +161,12 @@ class AlertExitCodePins(unittest.TestCase):
         self.assertExactZero(code, err, "alert-transition --dry-run")
         self.assertIn("dry-run plan", out, "must print the plan to stdout")
 
-    def test_dry_run_without_webhook_returns_exact_zero(self):
+    def test_dry_run_without_token_returns_exact_zero(self):
         env = base_env()
-        del env["SYNTHETIC_ALERT_WEBHOOK_URL"]
+        del env["GITHUB_TOKEN"]
         with no_network(history=[("failure", "success")]):
             code, out, err = raw_alert(self.argv(), env)
-        self.assertExactZero(code, err, "missing-webhook --dry-run")
+        self.assertExactZero(code, err, "missing-token --dry-run")
         self.assertIn("staging", out.lower(), "plan must still name the environment")
 
     def test_dry_run_without_probe_sample_returns_exact_zero(self):

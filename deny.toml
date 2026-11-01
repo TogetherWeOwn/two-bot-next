@@ -1,5 +1,6 @@
 # cargo-deny: every dependency must be permissively licensed and unflagged.
-# Run locally with `cargo deny check all`; CI runs the same command.
+# Run locally with `cargo deny --workspace --all-features check all`; CI runs
+# the same command. Without `--workspace` the graph is only the root package.
 # Allow-list verified against the real Cargo.lock (cargo-deny 0.20):
 # `check all` passes with no unmatched-allowance warnings, so the list is
 # tight. `BUSL-1.1` is our own crate license (repo LICENSE + workspace);
