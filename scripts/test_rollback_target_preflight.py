@@ -119,6 +119,15 @@ class IncompatibleCodeTests(unittest.TestCase):
             "DELETE FROM ONLY t;": "delete_all_rows",
             "DELETE FROM t RETURNING *;": "delete_all_rows",
             "/* cleanup */ DELETE FROM t;": "delete_all_rows",
+            # A WHERE outside the DELETE's own scope does not waive it: an
+            # outer query's WHERE or a RETURNING subquery's WHERE still
+            # empties the table.
+            "WITH removed AS (DELETE FROM members RETURNING id) "
+            "SELECT id FROM removed WHERE id > 0;": "delete_all_rows",
+            "DELETE FROM t RETURNING (SELECT max(x) FROM u WHERE y = 1);":
+                "delete_all_rows",
+            "WITH x AS (SELECT * FROM b WHERE y = 1) DELETE FROM t;":
+                "delete_all_rows",
             "REVOKE SELECT ON t FROM app;": "revoke",
             "ALTER TABLE t ADD COLUMN c bigint NOT NULL;": "add_not_null_column_without_default",
             # PostgreSQL lets COLUMN be omitted.
@@ -179,6 +188,7 @@ class IncompatibleCodeTests(unittest.TestCase):
             "delete from t using u where t.id = u.id;",
             "DELETE FROM ONLY t WHERE id = 1 RETURNING *;",
             "DELETE FROM t WHERE id IN (SELECT id FROM u);",
+            "WITH x AS (SELECT * FROM b WHERE y = 1) DELETE FROM t WHERE id = 1;",
             # A DELETE trigger event deletes nothing: defining the trigger
             # must not block a promotion.
             "CREATE TRIGGER watch BEFORE DELETE ON members FOR EACH ROW "
