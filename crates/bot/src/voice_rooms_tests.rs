@@ -14317,6 +14317,70 @@ async fn a_confirmed_import_hands_its_settings_to_the_worker() {
     assert_eq!(settings, NameSettings::from_config(&full_config()));
 }
 
+#[tokio::test]
+async fn a_confirmed_import_turns_creation_off_at_the_worker_without_a_reload() {
+    // End to end: the Confirm handoff, not the five-minute reload, is what
+    // stops creation. The worker is warmed on the old settings (its first
+    // reload already read them), so deleting `access_imported` leaves the
+    // post-confirm join creating a room and fails this test.
+    let trace = Trace::default();
+    let mut candidate = full_config();
+    candidate.settings.creation_enabled = false;
+    let bytes = serde_json::to_vec(&candidate).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let (probe_store, _) = runtime.make_pair();
+    let reads = probe_store.config_reads.clone();
+    let initial_reads = reads.load(Ordering::Relaxed);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("loaded worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    // Let the worker's first reload finish on the OLD settings, like the
+    // full-inbox sibling: preview read, load read, first paced reload.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reads.load(Ordering::Relaxed) < initial_reads + 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("old-settings worker reload before the confirm");
+    // Baseline: creation is on at the warmed worker.
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "on".to_owned()));
+    assert!(
+        wait_for_trace(&trace, "create").await,
+        "creation on before the confirm: {:?}",
+        trace.lock().unwrap()
+    );
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER + 1,
+        Some(CREATOR),
+        Some(false),
+        "off".to_owned()
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.as_str() == "create")
+            .count(),
+        1,
+        "the confirmed import stopped creation at the worker: {:?}",
+        trace.lock().unwrap()
+    );
+    runtime.remove_guild(GUILD);
+}
+
 #[test]
 fn imported_settings_map_to_the_runtime_gates() {
     // The values a confirmed import hands the worker: creation switch,
