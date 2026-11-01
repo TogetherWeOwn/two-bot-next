@@ -842,9 +842,12 @@ def staging_pinned_sha_errors(workflows):
     dispatch-or-head ref at full depth, and each carries one SHA step that
     resolves the same expression through the environment, proves HEAD equals
     it, enforces a full 40-hex shape and refuses anything that is not an
-    ancestor of origin/main. Each SHA step refuses exactly four ways (shape,
-    length, checkout equality, ancestry), pinned by exit count so no refusal
-    can go green. Exactly nine reads exist (three checkout refs, three
+    ancestor of origin/main. Each SHA step refuses exactly five ways
+    (workflow ref, shape, length, checkout equality, ancestry), pinned by
+    exit count so no refusal can go green. The workflow-ref refusal comes
+    first: the job must itself run from `refs/heads/main`, an in-file
+    fail-closed backstop behind the Environment branch policy (a job-level
+    `if:` would skip silently instead, so the job still carries none). Exactly nine reads exist (three checkout refs, three
     SHA-step envs, the schema gate's --source-sha env, the user-flow
     synthetic's expected SHA, the history guard's comparison env): eight use
     the pinned expression and the ninth is the guard's raw pin-vs-head
@@ -912,17 +915,27 @@ def staging_pinned_sha_errors(workflows):
         if (step.get("env") or {}).get("SOURCE_SHA") != DEPLOY_SHA_EXPRESSION:
             errors.append(f"deploy-staging.yml:{job_id}: SHA step must resolve the dispatch-or-head "
                           "SHA through the environment")
+        if (step.get("env") or {}).get("WORKFLOW_REF") != "${{ github.ref }}":
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must resolve the workflow ref "
+                          "through the environment")
         run = str(step.get("run") or "")
-        for needle in ("git rev-parse HEAD", "git fetch origin main",
+        for needle in ('[ "$WORKFLOW_REF" = "refs/heads/main" ]',
+                       "git rev-parse HEAD", "git fetch origin main",
                        'git merge-base --is-ancestor "$SOURCE_SHA" origin/main',
                        "[!0-9a-f]", '"${#SOURCE_SHA}"', "-eq 40"):
             if needle not in run:
                 errors.append(f"deploy-staging.yml:{job_id}: SHA step must contain {needle}")
-        # Four refusals, four exits: flipping any refusal green (in
+        # Five refusals, five exits: flipping any refusal green (in
         # particular the ancestry rejection) trips this count.
-        if run.count("exit 1") != 4:
-            errors.append(f"deploy-staging.yml:{job_id}: SHA step must refuse exactly four ways "
-                          "(shape, length, checkout equality, ancestry)")
+        if run.count("exit 1") != 5:
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must refuse exactly five ways "
+                          "(workflow ref, shape, length, checkout equality, ancestry)")
+        # The workflow-ref refusal runs before the shape check: a job not
+        # running from main stops before it can judge or touch anything else.
+        if ('"$WORKFLOW_REF"' in run and "[!0-9a-f]" in run
+                and run.index('"$WORKFLOW_REF"') > run.index("[!0-9a-f]")):
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must check the workflow ref "
+                          "before the 40-hex shape")
         # The shape check runs before the checkout equality: HEAD is always a
         # full SHA, so an equality-first order would refuse a short or branch
         # pin with no message before the shape refusal could explain it.
@@ -3876,8 +3889,44 @@ def scheduled_binding_audit_errors(workflows):
     return errors
 
 
+# The only Environments that hold the Cloudflare deploy pair. The pair is
+# Environment-scoped (no repository-scope copy), so a job may read it only
+# from inside one of these Environments.
+CLOUDFLARE_ENVIRONMENTS = ("staging", "production")
+
+
+def cloudflare_environment_errors(workflows):
+    """The Cloudflare pair is readable only inside its Environments.
+
+    `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` live in the `staging`
+    and `production` Environment secret stores and nowhere else: a job that
+    references either secret without declaring one of those Environments
+    could only have read it at repository scope, the placement this pin
+    keeps retired. The check is on the job's own `environment:`, so a future
+    reusable-workflow caller that forwards the pair needs an explicit
+    policy change rather than a silent new reader.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        for job_id, job in (workflow.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            text = str(job)
+            if "secrets.CLOUDFLARE_API_TOKEN" not in text \
+                    and "secrets.CLOUDFLARE_ACCOUNT_ID" not in text:
+                continue
+            environment = job.get("environment")
+            if isinstance(environment, dict):
+                environment = environment.get("name")
+            if environment not in CLOUDFLARE_ENVIRONMENTS:
+                errors.append(f"{name}:{job_id}: Cloudflare secrets are Environment-scoped; "
+                              "the job must declare the staging or production environment")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
+    errors.extend(cloudflare_environment_errors(workflows))
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
     errors.extend(staging_fault_injection_errors(workflows))
@@ -6245,6 +6294,26 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(staging_fault_injection_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
 
+    def test_cloudflare_secrets_stay_environment_scoped(self):
+        workflows = self.workflows
+        self.assertEqual(cloudflare_environment_errors(workflows), [])
+        mutations = {
+            "staging deploy loses its environment": lambda w:
+                w["deploy-staging.yml"]["jobs"]["deploy"].pop("environment"),
+            "production loses its environment": lambda w:
+                w["deploy-production.yml"]["jobs"]["production"].pop("environment"),
+            "a non-environment job reads the pair": lambda w:
+                next(iter(w["check.yml"]["jobs"].values()))
+                .setdefault("env", {}).__setitem__(
+                    "T", "${{ secrets.CLOUDFLARE_API_TOKEN }}"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed)
+                self.assertTrue(cloudflare_environment_errors(changed), label)
+                self.assertTrue(workflow_policy_errors(changed), label)
+
     def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
         workflows = self.workflows
         staging = workflows["deploy-staging.yml"]
@@ -6285,6 +6354,12 @@ class WorkflowTests(unittest.TestCase):
                 .__setitem__("fetch-depth", "1"),
             "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][2]["env"]
                 .__setitem__("SOURCE_SHA", "abc"),
+            "workflow ref env constant": lambda w: w["jobs"]["deploy"]["steps"][2]["env"]
+                .__setitem__("WORKFLOW_REF", "refs/heads/main"),
+            "workflow ref check dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
+                .__setitem__("run", "\n".join(line for line in
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
+                                             if "WORKFLOW_REF" not in line)),
             "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
                                              w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
@@ -6522,8 +6597,8 @@ class WorkflowTests(unittest.TestCase):
     def test_pinned_sha_shell_behaves(self):
         # Execute the actual SHA-check shells in a scratch git repo: a valid
         # ancestor passes and (in the deploy job) exports DEPLOY_SHA, while a
-        # short, uppercase, empty or branch pin, a non-ancestor and a
-        # HEAD-mismatch all refuse with their reason. The temp remote's
+        # non-main or empty workflow ref, a short, uppercase, empty or branch
+        # pin, a non-ancestor and a HEAD-mismatch all refuse with their reason. The temp remote's
         # origin/main is the ancestry root; each case checks out its commit
         # first, exactly as the workflow checkout lands on the pin before the
         # SHA step runs. The deploy shell runs from a subdirectory, mirroring
@@ -6589,15 +6664,17 @@ class WorkflowTests(unittest.TestCase):
             unmerged = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
             (repo / "wrangler").mkdir()
             cases = (
-                ("valid ancestor passes", head, head, 0, ""),
-                ("short pin refuses", head, "abc123", 1, "full 40-hex"),
-                ("uppercase pin refuses", head, head.upper(), 1, "full 40-hex"),
-                ("empty pin refuses", head, "", 1, "full 40-hex"),
-                ("branch pin refuses", head, "main", 1, "full 40-hex"),
-                ("non-ancestor refuses", unmerged, unmerged, 1, "not an ancestor"),
-                ("head mismatch refuses", head, ancestor, 1, "did not land"),
+                ("valid ancestor passes", head, head, "refs/heads/main", 0, ""),
+                ("non-main workflow ref refuses", head, head, "refs/heads/feat/x", 1, "must run from main"),
+                ("empty workflow ref refuses", head, head, "", 1, "must run from main"),
+                ("short pin refuses", head, "abc123", "refs/heads/main", 1, "full 40-hex"),
+                ("uppercase pin refuses", head, head.upper(), "refs/heads/main", 1, "full 40-hex"),
+                ("empty pin refuses", head, "", "refs/heads/main", 1, "full 40-hex"),
+                ("branch pin refuses", head, "main", "refs/heads/main", 1, "full 40-hex"),
+                ("non-ancestor refuses", unmerged, unmerged, "refs/heads/main", 1, "not an ancestor"),
+                ("head mismatch refuses", head, ancestor, "refs/heads/main", 1, "did not land"),
             )
-            for label, checkout_ref, source_sha, expected_code, needle in cases:
+            for label, checkout_ref, source_sha, workflow_ref, expected_code, needle in cases:
                 with self.subTest(label):
                     git("checkout", checkout_ref, cwd=repo)
                     for job_id, shell in shells.items():
@@ -6605,7 +6682,8 @@ class WorkflowTests(unittest.TestCase):
                             exported = temp / f"github-env-{job_id}"
                             exported.write_text("", encoding="utf-8")
                             env = dict(base_env, GITHUB_WORKSPACE=str(repo),
-                                       SOURCE_SHA=source_sha, GITHUB_ENV=str(exported))
+                                       SOURCE_SHA=source_sha, WORKFLOW_REF=workflow_ref,
+                                       GITHUB_ENV=str(exported))
                             workdir = repo / "wrangler" if job_id == "deploy" else repo
                             proc = subprocess.run(
                                 ["bash", "-e", "-c", shell], cwd=str(workdir), env=env,
