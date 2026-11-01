@@ -935,7 +935,7 @@ impl InteractionRouter {
         self.build_publish_set(custom, None)
     }
 
-    /// [`publish_set`] plus the historical-catalog transition: when the
+    /// [`Self::publish_set`] plus the historical-catalog transition: when the
     /// complete baseline (gate-constrained builtins plus every persisted
     /// enabled custom row under the existing name/precedence rules) is valid
     /// but adding the optional [`OPTIONAL_CAPACITY_BUILTIN`] entry alone

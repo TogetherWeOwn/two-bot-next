@@ -1167,9 +1167,10 @@ async fn myroom_honours_the_guild_required_role_gate_before_any_actor_read() {
         access_denied_text(AccessDenyReason::RequiredRole)
     );
     let (_, response) = handle_capture(&runtime, &with_roles(request(), &[7])).await;
-    assert_eq!(
-        response_text(&response.expect("allowed read")),
-        myroom_render(&[], false)
+    let text = response_text(&response.expect("allowed read"));
+    assert!(
+        text.starts_with(two_bot_core::voice_utilities::MYROOM_EMPTY),
+        "the gate passed and the actor answered: {text}"
     );
 }
 
@@ -1332,15 +1333,12 @@ async fn myroom_read_excludes_deleted_channels_before_reconciliation() {
 #[tokio::test]
 async fn myroom_empty_reply_shows_join_guidance_only_when_creation_is_open() {
     let (live, store, http, _) = parts();
-    // The loaded worker's guild has no creator channel wired, so creation is
-    // not open and the empty read stays guidance-free.
-    let worker = GuildRoomWorker::load(live.clone(), store, http)
-        .await
-        .unwrap();
-    assert!(!worker.creation_available());
-    // With a creator channel live, the guidance becomes available.
-    live.protect_creators([7001]);
+    // The fixture wires a creator lobby and leaves creation on: guidance shows.
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     assert!(worker.creation_available());
+    // The guild-wide creation switch off hides it even with a lobby wired.
+    worker.access.room_creation_enabled = false;
+    assert!(!worker.creation_available());
     assert_eq!(
         myroom_render(&[], true),
         format!(

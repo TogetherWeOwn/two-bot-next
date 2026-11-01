@@ -705,7 +705,9 @@ async fn myroom_many_long_ids_complete_at_whole_row_boundary_with_omitted_accoun
     // mention will be cut mid-row. RoomHttp's private loopback
     // constructor is not accessible here: this pins its real responder input,
     // not an observed RoomHttp transport request.
-    let ids: BTreeSet<u64> = (0..61)
+    // Unlabelled 19-digit rows are 23 scalars each, so 100 of them exceed the
+    // 2000-scalar budget and force a bounded omission.
+    let ids: BTreeSet<u64> = (0..100)
         .map(|index| 1_000_000_000_000_000_000 + index)
         .collect();
     assert!(ids.iter().all(|id| id.to_string().len() == 19));
@@ -808,7 +810,7 @@ async fn myroom_many_long_ids_complete_at_whole_row_boundary_with_omitted_accoun
         let omitted = ids.len() - shown.len();
         assert!(
             omitted > 0,
-            "61 long rows require bounded omission or attachment"
+            "100 long rows require bounded omission or attachment"
         );
         let footer = text
             .lines()
@@ -824,7 +826,7 @@ async fn myroom_many_long_ids_complete_at_whole_row_boundary_with_omitted_accoun
             .collect();
         assert!(
             counts.contains(&omitted),
-            "{} shown + {omitted} omitted = 61, footer was {footer}",
+            "{} shown + {omitted} omitted = 100, footer was {footer}",
             shown.len()
         );
     }

@@ -7,9 +7,9 @@
   "protectedFiles": [
     {
       "path": "crates/bot/src/voice_myroom_acceptance_tests.rs",
-      "sha256": "85f9e0aec858d8f8d3a637d0f3a180faa355d13535c41e66da00ba564d60c7a4",
+      "sha256": "481c1332ecd5e55ee748d37eb77baa76171468f17370a779cb690a015b95a3f5",
       "tests": 16,
-      "change": "Room 501 has an observed guild @everyone Connect deny that must not leak into the listing. All original refusal, owner identity, ephemeral reply, poisoned-store and pre/post no-write assertions remain. Adds genuine partial-public failure, unknown ACL, controlled reconnect, deleted/disconnected controls and bounded long-response cases. Narrowed-contract amendment (channel references only): the read result is MyRoomsReply rooms, so oracles compare channel ids instead of (channel, private) pairs; rows must carry no privacy word; a ready channel with no overwrite snapshot is still listed; partial-public, reconnect, deleted, disconnected, long-list and read-only assertions are otherwise unchanged."
+      "change": "Room 501 has an observed guild @everyone Connect deny that must not leak into the listing. All original refusal, owner identity, ephemeral reply, poisoned-store and pre/post no-write assertions remain. Adds genuine partial-public failure, unknown ACL, controlled reconnect, deleted/disconnected controls and bounded long-response cases. Narrowed-contract amendment (channel references only): the read result is MyRoomsReply rooms, so oracles compare channel ids instead of (channel, private) pairs; rows must carry no privacy word; a ready channel with no overwrite snapshot is still listed; partial-public, reconnect, deleted, disconnected, long-list and read-only assertions are otherwise unchanged. The long-list case uses 100 rooms, because unlabelled 61-row output fits the budget."
     },
     {
       "path": "crates/core/tests/voice_myroom_acceptance.rs",
@@ -30,9 +30,9 @@
     },
     {
       "path": "crates/bot/src/voice_config_full_diff_acceptance_tests.rs",
-      "sha256": "751e6d733c4449bf6a1cf25967fd88098871681f87ceb07b75bbcab83b634200",
+      "sha256": "731eb65b86cabb7cc995fae45a9853e9a01338f930f11f5b6e47674149dbbad7",
       "tests": 31,
-      "change": "Adds codec/preview/real forged-Confirm refusal without saved success or writes, established-command controls, and real access restrict/unrestrict cleanup with a frozen previous-reader fixture. Existing full-diff oracles are unchanged."
+      "change": "Adds codec/preview/real forged-Confirm refusal without saved success or writes, established-command controls, and real access restrict/unrestrict cleanup with a frozen previous-reader fixture. Existing full-diff oracles are unchanged. Narrowed-contract amendment: the previous-reader sequence now pins that /access restrict myroom is refused without a write, unrestrict myroom is a no-op, and the stored policy stays acceptable to both readers."
     },
     {
       "path": "crates/discord/tests/custom_command_toggle_acceptance.rs",
@@ -166,13 +166,13 @@
   },
   "contract": {
     "cap": "Recorded UserCap and the four non-cap operator diagnostics remain byte-identical and context-free, with or without known owned rooms. No member-specific room IDs enter diagnostic dedup keys or notices.",
-    "privacy": "Observed known @everyone Connect ACL determines the listed state. An accepted Connect-open overwrite followed by refused Join deletion must list public while persisted private=true and retry bookkeeping remain unchanged. Unknown overwrites yield unavailable, not public; explicitly empty overwrites remain known public evidence.",
-    "singleSnapshot": "Ready, presence and ACL facts must come from one live read guard. The deterministic test covers queued-read disconnect/reconnect ordering and new-generation ACL results; it does not reproduce an intrafunction interleaving between synchronous guard acquisitions.",
-    "configImport": "Reject myroom command_roles entries in codec/import, preview and Confirm, including empty role lists, until that distinct policy store can enforce them. Runtime /access restrict and the runtime allowlist continue to support myroom.",
-    "rollback": "Before reverting to the prior strict reader, use /access show and /access unrestrict command:myroom in every affected guild and read back the runtime store. Cleanup removes only myroom; unrelated established restrictions remain old-reader compatible. Config export/import is not runtime-store clearance evidence.",
+    "privacy": "Narrowed: discovery returns channel references only. No row carries a privacy word or ACL classification, so retry bookkeeping, unknown overwrites and explicitly empty overwrites can neither hide a present owned channel nor mislabel it.",
+    "singleSnapshot": "Ready, halted and channel presence come from one live read guard. The deterministic test covers queued-read disconnect/reconnect ordering and new-generation results; it does not reproduce an intrafunction interleaving between synchronous guard acquisitions.",
+    "configImport": "Reject myroom command_roles entries in codec/import, preview and Confirm, including empty role lists. Runtime /access restrict also refuses myroom without a write and /access unrestrict myroom is a truthful no-op, so no writer can persist a myroom policy key.",
+    "rollback": "No myroom policy key can be persisted, so every runtime policy row stays previous-reader compatible and rollback needs no cleanup step.",
     "capacity": "33 noncolliding custom rows remain exportable/importable and manageable without growth. Voice off/on publication remains 45+33=78 and 67+33=100. Held assistant metadata reserves its name, not another publication slot. 34-row genuine overflow is refused with no partial transaction writes; internal import and replay use the same bound.",
     "legacyCustom": "With automations on and voice off, saved pre-upgrade custom myroom continues to publish, dispatch, edit and pause/resume. With voice on, the voice slash handler wins. Fresh names remain safe and other saved customs remain usable.",
-    "responseBound": "61 private rooms with 19-digit IDs produce a completion input of at most 2000 scalars with complete rows and explicit omitted-room accounting, or an inspectable bounded complete UTF-8 room-list attachment. Exactly one private response and no room mutations remain required."
+    "responseBound": "100 owned rooms with 19-digit IDs (unlabelled rows of 23 scalars) produce a completion input of at most 2000 scalars with complete rows and explicit omitted-room accounting, or an inspectable bounded complete UTF-8 room-list attachment. Exactly one private response and no room mutations remain required."
   },
   "authorVerification": {
     "teardownHygieneCorrection": {
@@ -278,5 +278,15 @@
     "supersedes": "99ce504420707ed2ddbea4c0dd70a2dcf52a637f",
     "baseCommit": "3301618ab2be73b737fa2a2909ceb26152682b56",
     "reason": "Teardown hygiene only: move the existing gateway voice-off completion/publication checks and Discord voice-off catalog/dispatch/collision checks after awaited explicit disposable-database teardown. Capture observations before teardown and preserve every predicate and expected value, including empty fresh-collision rows, with a contextual expect. Refresh only the two changed protected-file hashes; seven other files and both inline regions remain unchanged. The intervening feature-branch test-fixture correction is preserved without editing it; no production or gate/rule change."
+  },
+  "renamedTests": {
+    "note": "Narrowed-contract renames; historical baseline lists above keep the names that were observed at the time.",
+    "myroom_lists_all_owned_live_channels_with_their_runtime_privacy_outside_voice": "myroom_lists_all_owned_live_channels_outside_voice",
+    "myroom_partial_public_delete_refusal_reports_observed_open_acl_without_retiring_retry": "myroom_partial_public_delete_refusal_still_lists_the_room_without_retiring_retry",
+    "myroom_queued_read_disconnects_before_dispatch_then_reconnect_uses_new_acl": "myroom_queued_read_disconnects_before_dispatch_then_reconnect_reads_new_generation",
+    "myroom_many_long_private_ids_complete_at_whole_row_boundary_with_omitted_accounting": "myroom_many_long_ids_complete_at_whole_row_boundary_with_omitted_accounting",
+    "myroom_unknown_overwrites_are_unavailable_through_facade_and_handler": "myroom_unknown_overwrites_still_list_the_present_channel",
+    "control_myroom_explicit_empty_overwrites_are_known_public_evidence": "control_myroom_explicit_empty_overwrites_list_the_room_unlabelled",
+    "myroom_access_restriction_previous_reader_compat_sequence": "myroom_access_restriction_is_refused_and_stays_previous_reader_compatible"
   }
 }

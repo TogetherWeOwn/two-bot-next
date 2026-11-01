@@ -1217,17 +1217,15 @@ async fn myroom_command_roles_forged_confirm_revalidates_before_any_write() {
 /// Previous-reader compatibility for `/access restrict myroom`.
 ///
 /// Baseline `89c4fba7e` did not list `myroom` in `VOICE_COMMANDS`, so its
-/// strict validator refused a `myroom` key as unknown. The current image
-/// persists `myroom` via `/access` into the runtime policy store
-/// (`voice_access_controls`, JSON `command_roles`), which a previous reader
-/// would reject on readback. This pins the cleanup sequence through the real
-/// `/access` dispatch and actual JSON round-trips of the runtime policy store
-/// (not config export): new saves `myroom` plus an unrelated restriction, the
-/// previous validator is incompatible before cleanup, `/access unrestrict
-/// myroom` removes only that key, and the previous validator passes after
-/// cleanup. No database or Discord.
+/// strict validator refuses a `myroom` key as unknown. The current image
+/// therefore never persists one: through the real `/access` dispatch,
+/// `restrict myroom` is refused without a write, `unrestrict myroom` is a
+/// truthful no-op, the unrelated restriction is untouched, and the actual
+/// JSON round-trip of the runtime policy store (`voice_access_controls`)
+/// stays acceptable to both the previous and the current validator. No
+/// database or Discord.
 #[tokio::test]
-async fn myroom_access_restriction_previous_reader_compat_sequence() {
+async fn myroom_access_restriction_is_refused_and_stays_previous_reader_compatible() {
     use std::collections::BTreeMap;
     use two_bot_core::voice_access::{validate_access_controls, AccessControls};
 
@@ -1324,7 +1322,7 @@ async fn myroom_access_restriction_previous_reader_compat_sequence() {
     }));
     let runtime = shared_runtime(Trace::default(), shared.clone(), None);
 
-    // New saves `myroom` via the real `/access restrict` dispatch.
+    // `/access restrict myroom` via the real dispatch is refused without a write.
     let restrict = access_interaction(
         sub_option(
             "restrict",
@@ -1335,29 +1333,19 @@ async fn myroom_access_restriction_previous_reader_compat_sequence() {
     let (owned, response) = handle_capture(&runtime, &restrict).await;
     assert!(owned, "access stays owned");
     let text = response_text(&response.expect("restrict reply"));
-    assert!(text.starts_with("Saved."), "new saves myroom: {text:?}");
+    assert_eq!(
+        text, "/myroom cannot be restricted with /access, so nothing was changed.",
+        "new refuses myroom"
+    );
     let saved = shared.lock().unwrap().clone();
-    assert_eq!(saved.command_roles.len(), 2, "myroom plus kick: {saved:?}");
+    assert_eq!(saved.command_roles.len(), 1, "only kick: {saved:?}");
     assert_eq!(saved.command_roles.get("kick"), Some(&vec![7]));
-    assert_eq!(saved.command_roles.get("myroom"), Some(&vec![8]));
-
-    // Before cleanup, actual JSON readback is previous-reader-incompatible.
-    let json = encode_runtime_policy(&saved);
-    assert!(json.contains("myroom"), "JSON carries myroom: {json:?}");
-    assert!(json.contains("kick"), "JSON carries kick: {json:?}");
-    let decoded = decode_runtime_policy(&json, saved.room_creation_enabled, saved.required_role);
-    assert_eq!(decoded, saved, "JSON round-trip preserves runtime policy");
     assert!(
-        validate_access_controls(&decoded).is_ok(),
-        "new reader accepts myroom"
-    );
-    let err = previous_validate(&decoded).unwrap_err();
-    assert!(
-        err.contains("myroom"),
-        "previous reader rejects myroom: {err:?}"
+        !saved.command_roles.contains_key("myroom"),
+        "no myroom key: {saved:?}"
     );
 
-    // `/access unrestrict myroom` via real dispatch removes only that key.
+    // `/access unrestrict myroom` finds nothing to remove and writes nothing.
     let unrestrict = access_interaction(
         sub_option("unrestrict", vec![command_option("command", "myroom")]),
         true,
@@ -1365,34 +1353,24 @@ async fn myroom_access_restriction_previous_reader_compat_sequence() {
     let (owned, response) = handle_capture(&runtime, &unrestrict).await;
     assert!(owned, "access stays owned");
     let text = response_text(&response.expect("unrestrict reply"));
-    assert!(text.starts_with("Saved."), "unrestrict saves: {text:?}");
-    let cleaned = shared.lock().unwrap().clone();
     assert_eq!(
-        cleaned.command_roles.len(),
-        1,
-        "unrestrict removes ONLY myroom: {cleaned:?}"
+        text, "/myroom has no role restriction, so nothing was changed.",
+        "unrestrict is a truthful no-op"
     );
-    assert_eq!(cleaned.command_roles.get("kick"), Some(&vec![7]));
-    assert!(
-        !cleaned.command_roles.contains_key("myroom"),
-        "myroom gone: {cleaned:?}"
-    );
+    assert_eq!(*shared.lock().unwrap(), saved, "unrestrict wrote nothing");
 
-    // After cleanup, actual JSON readback is previous-reader-compatible.
-    let json = encode_runtime_policy(&cleaned);
-    assert!(
-        !json.contains("myroom"),
-        "JSON no longer carries myroom: {json:?}"
-    );
-    let decoded =
-        decode_runtime_policy(&json, cleaned.room_creation_enabled, cleaned.required_role);
-    assert_eq!(decoded, cleaned, "JSON round-trip preserves cleaned policy");
+    // Actual JSON readback never carries myroom, so every reader accepts it.
+    let json = encode_runtime_policy(&saved);
+    assert!(!json.contains("myroom"), "JSON carries no myroom: {json:?}");
+    assert!(json.contains("kick"), "JSON carries kick: {json:?}");
+    let decoded = decode_runtime_policy(&json, saved.room_creation_enabled, saved.required_role);
+    assert_eq!(decoded, saved, "JSON round-trip preserves runtime policy");
     assert!(
         previous_validate(&decoded).is_ok(),
-        "previous reader compatible after cleanup"
+        "previous reader compatible"
     );
     assert!(
         validate_access_controls(&decoded).is_ok(),
-        "new reader still accepts cleaned policy"
+        "new reader accepts the policy"
     );
 }
