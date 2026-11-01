@@ -106,18 +106,31 @@ T0_PATH_PATTERNS = (
 T0_DOC_SUFFIXES = (".md", ".rst", ".txt")
 T0_RISK_TIER = re.compile(r"^risk_tier:\s*(T0|T1|T2)\s*$", re.I | re.M)
 T0_CHECK_ITEM = re.compile(r"^-\s*\[( |x|X)\]\s*(D[1-8]):\s*(.+?)\s*$")
-# Template placeholders always carry a space, a pipe or a slash
-# (<secret sinks, ...>, <T0|T1|T2>, <path/to/test_file>); bare generics such
-# as Vec<u8> or Option<T> do not. Inline code and autolinks are stripped
-# before matching so evidence like `Vec<u8>` never counts as a placeholder.
+# Template placeholders either carry a space, a pipe or a slash
+# (<secret sinks, ...>, <T0|T1|T2>, <path/to/test_file>) or are bare template
+# tokens (<test_name>). Real generics such as Vec<u8> or Option<T> always have
+# the `<` glued to an identifier, so the bare-token expression requires a
+# non-identifier boundary before the `<`. Autolinks are stripped before
+# matching so evidence links never count as placeholders; inline code is kept
+# visible so backticked placeholders still fail while `Vec<u8>` passes via
+# the boundary rule.
 T0_PLACEHOLDER = re.compile(r"<[^<>\n]*[ |/][^<>\n]*>")
-T0_CODE_SPAN = re.compile(r"`[^`\n]+`")
+T0_BARE_PLACEHOLDER = re.compile(r"(?<![A-Za-z0-9_])<[A-Za-z][A-Za-z0-9_]*>")
 T0_AUTOLINK = re.compile(r"<https?://[^<>\s]+>")
+T0_CLAIM_REF = re.compile(r"\bC\d+\b", re.I)
+T0_TEST_MAPPING = re.compile(r"\b(?:test|proof|failed_before)\s*=", re.I)
 
 
 def t0_visible_text(text):
-    """Attestation prose minus inline code spans and autolinks, for placeholder scans."""
-    return T0_AUTOLINK.sub("", T0_CODE_SPAN.sub("", text or ""))
+    """Attestation prose minus autolinks, for placeholder scans."""
+    return T0_AUTOLINK.sub("", text or "")
+
+
+def t0_has_placeholder(text):
+    """True when visible attestation text still holds a template placeholder."""
+    visible = t0_visible_text(text)
+    return bool(T0_PLACEHOLDER.search(visible)
+                or T0_BARE_PLACEHOLDER.search(visible))
 
 
 def t0_path_words(component):
@@ -144,13 +157,14 @@ def is_t0_path(path):
 
 def attestation_findings(body, paths):
     """T0 attestation gate. Empty unless a changed path hits the T0 floor, in
-    which case the body must declare `risk_tier: T0`, carry non-empty
-    `### Claims` and `### Tests` subsections, and carry all of D1–D8
-    checked with real evidence (no leftover `<placeholder>` text anywhere in
-    the Attestation section). Every finding is an error: declaring a higher
-    tier than the floor is fine, understating it is not. The gate checks the
-    shape and presence of the claim-to-test mapping, not test execution or
-    the truth of claims."""
+    which case the body must declare `risk_tier: T0`, carry a `### Claims`
+    subsection with C-numbered claims and a `### Tests` subsection with one
+    test-mapping line per claim, and carry all of D1–D8 checked with real
+    evidence (no leftover `<placeholder>` text anywhere in the Attestation
+    section, backticked or bare). Every finding is an error: declaring a
+    higher tier than the floor is fine, understating it is not. The gate
+    checks the shape and presence of the claim-to-test mapping, not test
+    execution, changed-file references or the truth of claims."""
     t0_paths = sorted({p for p in paths if is_t0_path(p)})
     if not t0_paths:
         return []
@@ -170,14 +184,20 @@ def attestation_findings(body, paths):
                            f"{', …' if len(t0_paths) > 3 else ''}) but does not declare "
                            "`risk_tier: T0`. The floor is a minimum: declaring T0 for "
                            "a critical change on any path is always fine."))
-    for heading in ("Claims", "Tests"):
+    for heading, marker, hint in (
+        ("Claims", T0_CLAIM_REF,
+         "one behavior claim per C-number (C1, C2, ...)"),
+        ("Tests", T0_TEST_MAPPING,
+         "one test-mapping line per claim "
+         "(test=... | failed_before=... | proof=...)"),
+    ):
         m = re.search(rf"^###\s*{heading}\s*$", att, flags=re.M | re.I)
         chunk = re.split(r"^###\s+", att[m.end():], flags=re.M)[0] if m else ""
-        if m is None or real_items(t0_visible_text(chunk)) < 1:
+        if (m is None or real_items(t0_visible_text(chunk)) < 1
+                or not marker.search(t0_visible_text(chunk))):
             out.append(Finding("error", "Attestation",
                                f"T0 PRs need a non-empty '### {heading}' subsection: "
-                               f"one behavior claim per C-number and one test-mapping "
-                               f"line per claim."))
+                               f"{hint}."))
     items = {}
     for line in att.splitlines():
         m = T0_CHECK_ITEM.match(line.strip())
@@ -186,7 +206,7 @@ def attestation_findings(body, paths):
     bad = [f"D{i}" for i in range(1, 9)
            if f"D{i}" not in items or not items[f"D{i}"][0]
            or not items[f"D{i}"][1].strip()
-           or T0_PLACEHOLDER.search(t0_visible_text(items[f"D{i}"][1]))]
+           or t0_has_placeholder(items[f"D{i}"][1])]
     if bad:
         out.append(Finding("error", "Attestation",
                            f"T0 PRs need all of D1–D8 checked with evidence, not "
@@ -195,7 +215,7 @@ def attestation_findings(body, paths):
     # the risk_tier and D-lines report their own findings above.
     rest = T0_RISK_TIER.sub("", re.sub(r"^-\s*\[[ xX]\]\s*D[1-8]:.*$", "", att,
                                             flags=re.M | re.I))
-    if T0_PLACEHOLDER.search(t0_visible_text(rest)):
+    if t0_has_placeholder(rest):
         out.append(Finding("error", "Attestation",
                            "The Attestation section still holds placeholder text "
                            "(<...>). Replace every placeholder with evidence or "

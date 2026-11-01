@@ -316,6 +316,47 @@ class AttestationFloor(unittest.TestCase):
         f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
         self.assertEqual([], f)
 
+    def test_bare_template_tokens_fail(self):
+        # A contributor can replace the path while leaving <test_name> intact;
+        # bare template tokens are placeholders even without a separator.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "test=scripts/test_rollback.py::test_refuses_bare_delete",
+            "test=scripts/test_rollback.py::<test_name>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_backticked_placeholders_fail(self):
+        # Wrapping a template placeholder in inline code does not hide it.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: `<malformed shapes, Unicode, parsing and host validation>`")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_unfenced_generics_are_not_placeholders(self):
+        # Option<T> outside code spans is evidence: the `<` is glued to an
+        # identifier, which bare template tokens never are.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed payloads rejected, Option<T> handled")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_claims_need_c_numbers_and_tests_need_mappings(self):
+        # Prose without a C-number is not a claim; prose without a
+        # test=/proof=/failed_before= marker is not a test mapping.
+        prose_claims = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- C1: rollback refuses an unqualified DELETE",
+            "- rollback refuses bad deletes, trust me")
+        f = ps.evaluate(env(BODY=prose_claims, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        prose_tests = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- C1 | test=scripts/test_rollback.py::test_refuses_bare_delete | "
+            "failed_before=not-run | proof=python3 scripts/test_rollback.py 5 OK",
+            "- ran the rollback suite and it looked good")
+        f = ps.evaluate(env(BODY=prose_tests, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
     def test_generated_exemption_needs_a_bot_author(self):
         # A human branch wearing the release-please-- prefix still hits the gate.
         f = ps.evaluate(env(BODY=GOOD_BODY, HEAD_REF="release-please--branches--main",
