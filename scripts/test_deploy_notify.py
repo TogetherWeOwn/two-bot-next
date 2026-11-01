@@ -151,6 +151,32 @@ class FromWorkflowTests(unittest.TestCase):
         self.assertEqual((event, outcome), ("deploy", "failed"))
         self.assertIn("readyz gate failed; no automatic rollback ran", reason)
 
+    def test_a_watch_rollback_reports_its_breach(self):
+        derived = self.derive(JOB_STATUS="failure", GATE_OUTCOME="success", AUTO_ROLLBACK_OUTCOME="skipped",
+                              WATCH_ROLLBACK_OUTCOME="success", WATCH_REASON="readiness:health_not_200")
+        self.assertEqual(derived[:2], ("deploy", "rolled_back"))
+        self.assertEqual(derived[5], "auto-rollback after the post-deploy watch breached (readiness:health_not_200)")
+
+    def test_every_generated_reason_survives_the_allowlist(self):
+        # A reason the allowlist drops would reach the release log as null.
+        cases = [
+            {"MODE": "rollback", "ROLLBACK_OUTCOME": "failure", "JOB_STATUS": "failure"},
+            {"MODE": "rollback", "ROLLBACK_OUTCOME": "success", "JOB_STATUS": "failure", "GATE_OUTCOME": "failure"},
+            {"JOB_STATUS": "failure", "GATE_OUTCOME": "failure"},
+            {"JOB_STATUS": "failure"},
+            {"JOB_STATUS": "failure", "ERROR_GATE_OUTCOME": "failure", "AUTO_ROLLBACK_OUTCOME": "success"},
+            {"JOB_STATUS": "failure", "WATCH_ROLLBACK_OUTCOME": "success", "WATCH_REASON": "rest_5xx"},
+        ]
+        for env in cases:
+            with self.subTest(env=env):
+                derived = self.derive(**env)
+                code, opener, _ = run(["--from-workflow", "--sha", SHA],
+                                      env={"RUNNER_TEMP": str(self.temp), "NEW_VERSION": VERSION,
+                                           "MODE": "deploy", **env})
+                self.assertEqual(code, 0)
+                self.assertEqual(sent(opener)[1]["reason"], derived[5])
+                self.assertIsNotNone(sent(opener)[1]["reason"])
+
     def test_an_operator_rollback_reports_its_target(self):
         derived = self.derive(MODE="rollback", ROLLBACK_OUTCOME="success", JOB_STATUS="success",
                               TARGET_VERSION=PREVIOUS, TARGET_IMAGE=IMAGE)

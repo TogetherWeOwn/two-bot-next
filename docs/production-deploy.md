@@ -396,7 +396,7 @@ record per run (`scripts/deploy_notify.py`):
 | Field | Value |
 | --- | --- |
 | `event` | `deploy`, or `rollback` for an operator rollback dispatch |
-| `outcome` | `success`, `rolled_back` (a gate failed and the in-run auto-rollback restored the snapshot) or `failed` |
+| `outcome` | `success`, `rolled_back` (a gate failed, or the post-deploy watch breached, and the snapshot was restored) or `failed` |
 | `sha`, `versionId`, `imageDigest`, `previousVersionId` | the guarded SHA, the new (or restored) Worker version, the promoted image digest, the snapshot's previous version |
 | `runUrl`, `startedAt`, `finishedAt` | this run |
 | `reason` | for a rollback or failure: which gate failed |

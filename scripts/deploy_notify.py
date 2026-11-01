@@ -44,7 +44,7 @@ VERSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 IMAGE = re.compile(r"registry\.cloudflare\.com/[^/:@\s]+/[^/:@\s]+@sha256:[0-9a-f]{64}")
 RUN_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+")
 TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
-REASON = re.compile(r"[A-Za-z0-9 _:./()-]{1,200}")
+REASON = re.compile(r"[A-Za-z0-9 _:;,./()-]{1,200}")
 TIMEOUT_SECONDS = 15
 
 
@@ -104,6 +104,10 @@ def from_workflow(env):
     previous = snapshot.get("serving_version", "") if snapshot.get("has_previous") is True else ""
     image = read_json(os.path.join(temp, "production-promotion-evidence.json")).get("production_image", "")
     version = env.get("NEW_VERSION", "")
+    if env.get("WATCH_ROLLBACK_OUTCOME") == "success":
+        # The post-deploy watch restored the snapshot after the gates passed.
+        return ("deploy", "rolled_back", version, image, previous,
+                f"auto-rollback after the post-deploy watch breached ({env.get('WATCH_REASON') or 'unknown'})")
     if env.get("AUTO_ROLLBACK_OUTCOME") == "success":
         return ("deploy", "rolled_back", version, image, previous,
                 f"auto-rollback after the {failed or 'post-deploy checks'} failed")
