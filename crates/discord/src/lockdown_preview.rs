@@ -579,7 +579,7 @@ mod tests {
         let mut snap = snapshot();
         snap.roles.extend((100..112).map(|id| RoleSnapshot {
             id,
-            position: i64::from(id),
+            position: id as i64,
             permissions: 0,
         }));
         // Each role's own overwrite allows SEND, so all 12 keep usable send
