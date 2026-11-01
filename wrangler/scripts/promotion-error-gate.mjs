@@ -120,7 +120,7 @@ function isBareHttpsOrigin(value) {
 }
 
 /** Canonical origin (`https://host`) for a bare origin, else null. */
-function originOf(value) {
+export function originOf(value) {
   if (!isBareHttpsOrigin(value)) return null;
   try {
     return new URL(value).origin;
@@ -167,7 +167,7 @@ function normalizeAllowedOrigins(entries) {
  * values as STAGING_URL / PRODUCTION_URL for the gate step, so both
  * spellings authorize the identical origin; nothing else does.
  */
-function allowedOriginsFromEnv(env) {
+export function allowedOriginsFromEnv(env) {
   return normalizeAllowedOrigins([
     env.STAGING_WORKER_URL,
     env.PRODUCTION_WORKER_URL,
@@ -312,7 +312,7 @@ export function decideMode({ rehearsalFiring, token }) {
   return { mode: "skip", reason: "metrics scrape token absent: gate not yet enforcing (see docs/runbook-observability.md)" };
 }
 
-async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds = SCRAPE_RETRY_SECONDS, userAgent = USER_AGENT }) {
+export async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds = SCRAPE_RETRY_SECONDS, userAgent = USER_AGENT }) {
   const url = `${metricsUrl.replace(/\/$/, "")}/ops/metrics`;
   const delayMs = timeoutMs(timeoutSeconds);
   for (let attempt = 1; attempt <= SCRAPE_ATTEMPTS; attempt += 1) {

@@ -342,7 +342,8 @@ class StaticGuardTests(unittest.TestCase):
         # the prod schema gate and the prod roles gate. A rollback serves no
         # new schema and waives the ledger check inside the reviewed gate
         # script, never here.
-        self.assertEqual(value(production["needs"]), "[guard, soak, recheck, schema-gate, roles-gate]")
+        self.assertEqual(value(production["needs"]),
+                         "[guard, soak, recheck, schema-gate, roles-gate, staging-soak-evidence]")
         for gate in ("schema-gate", "roles-gate"):
             condition = value(children(JOBS[gate][1:], 4)["if"])
             self.assertEqual(condition, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
@@ -373,13 +374,13 @@ class StaticGuardTests(unittest.TestCase):
         conc = children(JOBS["production"][1:], 4).get("concurrency", [])
         self.assertIn("group: deploy-production", "\n".join(conc))
         self.assertIn("cancel-in-progress: false", "\n".join(conc))
-        for job in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
+        for job in ("guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck"):
             self.assertNotIn("concurrency", children(JOBS[job][1:], 4))
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak", "recheck",
-                                      "production"])
+        self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
+                                      "staging-soak-evidence", "recheck", "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -650,7 +651,7 @@ class StaticGuardTests(unittest.TestCase):
         # waits for the soak AND both gates, so the read happens after the
         # last long build; a hold flipped during the gate builds still skips.
         recheck_job = "\n".join(JOBS["recheck"])
-        self.assertIn("needs: [guard, soak, schema-gate, roles-gate]", recheck_job)
+        self.assertIn("needs: [guard, soak, schema-gate, roles-gate, staging-soak-evidence]", recheck_job)
         condition = value(children(JOBS["recheck"][1:], 4)["if"])
         for needle in ("!cancelled()",
                        "needs.guard.result == 'success'",
@@ -659,7 +660,9 @@ class StaticGuardTests(unittest.TestCase):
                        "needs.guard.outputs.auto == 'true'",
                        "(needs.soak.result == 'success' || needs.soak.result == 'skipped')",
                        "needs.schema-gate.result == 'success'",
-                       "needs.roles-gate.result == 'success'"):
+                       "needs.roles-gate.result == 'success'",
+                       "needs.staging-soak-evidence.result == 'success'",
+                       "needs.staging-soak-evidence.outputs.skip == ''"):
             self.assertIn(needle, condition)
         self.assertIn("HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}", recheck_job)
         self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", recheck_job)
@@ -690,6 +693,47 @@ class StaticGuardTests(unittest.TestCase):
                       production_if)
         self.assertIn("needs.recheck.result == 'success' && needs.recheck.outputs.skip == ''",
                       production_if)
+
+    def test_regression_gate_judges_the_soaked_candidate_against_production(self):
+        job = children(JOBS["staging-soak-evidence"][1:], 4)
+        self.assertEqual(value(job["needs"]), "[guard, soak]")
+        condition = value(job["if"])
+        for needle in ("!cancelled()", "needs.guard.result == 'success'", "needs.guard.outputs.skip == ''",
+                       "needs.guard.outputs.mode == 'deploy'", "needs.guard.outputs.allow_unstaged != 'true'",
+                       "(needs.soak.result == 'success' || needs.soak.result == 'skipped')"):
+            self.assertIn(needle, condition)
+        # The staging bearer through the existing Environment, no deployment record.
+        self.assertEqual("\n".join(job["environment"]),
+                         "    environment:\n      name: staging\n      deployment: false")
+        text = "\n".join(JOBS["staging-soak-evidence"])
+        self.assertIn("METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}", text)
+        self.assertNotIn("PRODUCTION_", text)
+        staging = inline_script("Read the candidate's staging journeys and soak REST counters")
+        for needle in ("set -euo pipefail", '--expected-sha "$SHA"', 'if [ "$probe" -gt 1 ]',
+                       "wrangler/scripts/rest-5xx-counters.mjs",
+                       'promotion_regression_gate.py staging', '--auto "$AUTO"'):
+            self.assertIn(needle, staging)
+        # Production leg: before the artifact admission and the deploy, ordinary promotions only.
+        names = [step[0].split("name: ", 1)[-1] for step in steps(JOBS["production"])]
+        gate = names.index("Gate on regression against the production baseline")
+        self.assertLess(gate, names.index("Admit the immutable staging artifact before production mutation"))
+        self.assertLess(gate, names.index("Deploy to production"))
+        conditions = {step[0]: [line.strip() for line in step
+                                if line.strip().startswith(("if:", "continue-on-error"))]
+                      for step in steps(JOBS["production"])}
+        self.assertEqual(conditions["      - name: Gate on regression against the production baseline"],
+                         ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'"])
+        compare = inline_script("Gate on regression against the production baseline")
+        for needle in ("set -euo pipefail", "../tooling/scripts/prod_passive_probe.py",
+                       'if [ "$probe" -gt 1 ]', "../tooling/wrangler/scripts/rest-5xx-counters.mjs",
+                       "../tooling/scripts/promotion_regression_gate.py compare",
+                       '--staging-evidence "$STAGING_EVIDENCE"', '--sha "$SHA"'):
+            self.assertIn(needle, compare)
+        self.assertNotIn("${{", compare + staging)
+        # A superseded staging skip (or a failed staging leg) never deploys.
+        production_if = value(children(JOBS["production"][1:], 4)["if"])
+        self.assertIn("needs.staging-soak-evidence.result == 'success' && "
+                      "needs.staging-soak-evidence.outputs.skip == ''", production_if)
 
     def test_production_error_rate_gate_uses_reviewed_tooling_and_production_bindings(self):
         production = "\n".join(JOBS["production"])
