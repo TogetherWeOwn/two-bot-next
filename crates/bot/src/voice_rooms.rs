@@ -8273,8 +8273,9 @@ pub struct VoiceRuntime<S, H> {
     /// set, a live view that is not ready is a fault, not an outage, and
     /// every dispatch retries the cached snapshot (see `heal_not_ready`).
     gateway_connected: AtomicBool,
-    /// Serializes `/access` read-modify-write cycles so two admins cannot
-    /// overwrite each other's change (rare, admin-only, so one lock is enough).
+    /// Serializes `/access` read-modify-write cycles and import Confirm so
+    /// two admins cannot overwrite each other's change (rare, admin-only, so
+    /// one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
     /// Previewed import candidates by (guild, uploading member, content
     /// hash). Confirm consumes the entry, so a double click cannot apply
@@ -14842,6 +14843,10 @@ where
         .await;
         return true;
     };
+    // Same lock as `/access`: import writes the per-command restrictions
+    // `/access` read-modify-writes, and the store's advisory lock only
+    // serializes imports. Held from the re-read through the apply.
+    let _serialized = runtime.access_lock.lock().await;
     let current = match store.config_snapshot(guild_id).await {
         Ok(config) => config,
         Err(_) => {
