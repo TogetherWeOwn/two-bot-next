@@ -429,6 +429,38 @@ mod tests {
             .await
             .expect_err("missing overwrites must refuse");
         assert!(matches!(error, DiscordError::Rejected(_)), "{error:?}");
+        assert_eq!(mock.requests().len(), 1);
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wire_failures_cost_one_get_each() {
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::status(500),
+                ScriptedResponse::json(200, json!([{"id": "5555"}])),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let executor = executor_for(&mock);
+        let channel_error = executor
+            .read_preview_channel(CHANNEL, GUILD)
+            .await
+            .expect_err("a 500 must fail the channel read");
+        assert!(
+            matches!(channel_error, DiscordError::Unavailable(_)),
+            "{channel_error:?}"
+        );
+        let roles_error = executor
+            .read_preview_roles(GUILD)
+            .await
+            .expect_err("a malformed role row must refuse");
+        assert!(
+            matches!(roles_error, DiscordError::Rejected(_)),
+            "{roles_error:?}"
+        );
+        assert_eq!(mock.requests().len(), 2);
         mock.shutdown().await;
     }
 }
