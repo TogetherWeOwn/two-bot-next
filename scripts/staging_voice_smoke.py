@@ -111,6 +111,35 @@ WORKER_ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_
 AWAITING_REGISTRATION = "awaiting voice command registration"
 
 
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    # Decode bytes exactly as json.loads would, then scan and parse that text.
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    depth = 0
+    for match in JSON_TOKEN.finditer(raw):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 class SmokeError(Exception):
     """A check's one-line failure reason (fixed vocabulary only)."""
 
@@ -252,7 +281,7 @@ def get_json(fetch_fn, url):
     if len(body) > BODY_CAP:
         raise SmokeError("interactions endpoint answered over the body cap")
     try:
-        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise SmokeError("interactions endpoint answered 200 with duplicate JSON object keys")
     except (ValueError, UnicodeDecodeError, RecursionError):
@@ -400,7 +429,7 @@ def check_worker(origin):
     if len(body) > BODY_CAP:
         return [Result("worker-health", "fail", "GET /health answered over the body cap")], None
     try:
-        health = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        health = _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         return [Result("worker-health", "fail",
                        "GET /health carries duplicate JSON object keys")], None
@@ -423,7 +452,7 @@ def check_worker(origin):
         results.append(Result("worker-readyz", "fail", "GET /readyz answered over the body cap"))
         return results, None
     try:
-        report = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        report = _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         results.append(Result("worker-readyz", "fail",
                               "GET /readyz carries duplicate JSON object keys"))
