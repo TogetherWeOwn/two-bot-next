@@ -834,6 +834,28 @@ async fn public_opens_a_room_a_creator_made_private_without_a_join_channel() {
 }
 
 #[tokio::test]
+async fn inspect_reads_a_creator_default_private_room_as_private_without_writing() {
+    let (live, store, http, trace) = parts();
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(!worker.privacy.contains_key(&ROOM));
+    let reply = worker.apply_room_access(OWNER, false, PageArg::Missing);
+    assert!(reply.contains("this room is private."), "{reply}");
+    assert!(!worker.privacy.contains_key(&ROOM));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(calls(&trace).is_empty());
+}
+
+#[tokio::test]
+async fn inspect_reads_an_open_room_without_a_record_as_public() {
+    let (live, store, http, _) = parts();
+    set_room_overwrites(&live, bot_and_everyone_overwrites(false));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let reply = worker.apply_room_access(OWNER, false, PageArg::Missing);
+    assert!(reply.contains("this room is public."), "{reply}");
+}
+
+#[tokio::test]
 async fn public_on_a_room_that_is_open_on_discord_writes_nothing() {
     let (live, store, http, trace) = parts();
     set_room_overwrites(&live, bot_and_everyone_overwrites(false));

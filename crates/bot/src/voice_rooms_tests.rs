@@ -7996,7 +7996,6 @@ fn command_names_key_the_role_restrictions() {
             channel_id: CREATOR,
             request: request(None, None, None),
         },
-        VoiceCommand::RoomAccessInspect(PageArg::Missing),
     ];
     for command in &commands {
         assert!(
@@ -8006,7 +8005,13 @@ fn command_names_key_the_role_restrictions() {
         );
     }
     assert_eq!(commands[4].name(), "textchannels");
-    assert_eq!(commands[5].name(), "room-access-inspect");
+    // The owner read keeps its own name, so it never inherits another
+    // command's restriction. It is not per-command restrictable: a stored
+    // key would make an older binary reject the guild's whole controls row
+    // on rollback. The guild-wide required role still gates it.
+    let inspect = VoiceCommand::RoomAccessInspect(PageArg::Missing);
+    assert_eq!(inspect.name(), "room-access-inspect");
+    assert!(!two_bot_core::voice_access::VOICE_COMMANDS.contains(&inspect.name()));
 }
 
 #[test]

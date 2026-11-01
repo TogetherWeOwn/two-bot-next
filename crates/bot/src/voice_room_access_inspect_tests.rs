@@ -72,7 +72,46 @@ async fn invoke(runtime: &VoiceRuntime<Store, Http>, options: Vec<CommandDataOpt
     assert!(owned, "inspect must be handled, not silently dropped");
     let responses = responses.lock().unwrap();
     assert_eq!(responses.len(), 1, "exactly one reply");
-    response_text(&responses[0])
+    assert_private_plain_reply(&responses[0])
+}
+
+/// Every reply, fallbacks included, is ephemeral plain text within Discord's
+/// content bound and offers no component that could mutate access.
+fn assert_private_plain_reply(response: &InteractionResponse) -> String {
+    let data = response.data.as_ref().expect("reply data");
+    assert!(
+        data.flags
+            .unwrap_or(MessageFlags::empty())
+            .contains(MessageFlags::EPHEMERAL),
+        "room access replies must not be public"
+    );
+    assert!(
+        data.components.as_ref().is_none_or(Vec::is_empty),
+        "a room access reply must not carry components"
+    );
+    let text = response_text(response);
+    assert!(!text.trim().is_empty(), "reply cannot be empty");
+    assert!(text.encode_utf16().count() <= 2000, "reply over bound");
+    text
+}
+
+/// A runtime whose guild actor is a real worker on the owner fixture, so a
+/// dispatched read reaches `apply_room_access`.
+fn live_runtime(mut worker: Worker) -> VoiceRuntime<Store, Http> {
+    let runtime = test_runtime(worker.store.trace.clone());
+    let (tx, rx) = mpsc::unbounded_channel();
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live: worker.live.clone(),
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
+    tokio::spawn(async move {
+        run_actor(&mut worker, rx, Duration::from_secs(3600)).await;
+    });
+    runtime
 }
 
 fn assert_no_access_sections(text: &str) {
@@ -224,11 +263,54 @@ async fn inspect_with_stalled_actor_reports_worker_lost_within_ack_wait() {
     assert!(owned, "inspect must be handled, not silently dropped");
     let responses = responses.lock().unwrap();
     assert_eq!(responses.len(), 1, "exactly one reply");
-    let text = response_text(&responses[0]);
+    let text = assert_private_plain_reply(&responses[0]);
     assert_eq!(
         text,
         "The voice worker stopped answering — try again in a moment."
     );
     assert_no_access_sections(&text);
     drop(held);
+}
+
+#[tokio::test]
+async fn unusable_page_refuses_through_dispatch() {
+    let runtime = live_runtime(owned_worker().await);
+    for options in [
+        vec![page_option(CommandOptionValue::Integer(0))],
+        vec![page_option(CommandOptionValue::String("2".to_owned()))],
+        vec![
+            page_option(CommandOptionValue::Integer(1)),
+            page_option(CommandOptionValue::Integer(2)),
+        ],
+    ] {
+        assert_eq!(
+            invoke(&runtime, options).await,
+            "Unknown page. Use /room-access-inspect page:1 to see the first page."
+        );
+    }
+    let text = invoke(&runtime, vec![page_option(CommandOptionValue::Integer(2))]).await;
+    assert_eq!(
+        text,
+        "Unknown page. /room-access-inspect has 1 page; \
+         use /room-access-inspect page:1 to start over."
+    );
+}
+
+#[tokio::test]
+async fn non_owner_page_errors_stay_behind_the_owner_gate() {
+    let mut worker = owned_worker().await;
+    let blocked: Vec<u64> = (0..300).map(|n| 81_000_000_000_000_000 + n).collect();
+    seed_access(&mut worker, &blocked, &[], &[]);
+    let refusal = worker.apply_room_access(301, false, PageArg::Missing);
+    assert_eq!(
+        refusal,
+        "Only the room owner or an admin can use /room-access-inspect."
+    );
+    for page in [PageArg::Page(99_999), PageArg::Invalid] {
+        assert_eq!(
+            worker.apply_room_access(301, false, page),
+            refusal,
+            "a non-owner must not learn the page count"
+        );
+    }
 }

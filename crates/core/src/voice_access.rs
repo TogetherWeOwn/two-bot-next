@@ -38,7 +38,6 @@ pub const VOICE_COMMANDS: &[&str] = &[
     "private",
     "public",
     "reclaim",
-    "room-access-inspect",
     "setup",
     "template",
     "templateassistant",

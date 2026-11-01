@@ -97,8 +97,8 @@ fn compose(
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Answer `/room-access-inspect` from the live privacy state. Pure read:
     /// no state is created, refreshed or persisted, and no Discord write is
-    /// queued. A room with no privacy record reads as public with three empty
-    /// lists.
+    /// queued. A room with no privacy record has three empty lists and reads
+    /// as public unless Discord already denies @everyone Connect.
     pub(super) fn apply_room_access(
         &self,
         actor_id: Snowflake,
@@ -124,7 +124,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             ("Granted", &granted),
             ("Pending join requests", &pending),
         ];
-        render_room_access(state.is_some_and(|s| s.private), &lists, page).unwrap_or_else(|pages| {
+        // A room an `/alwaysprivate` creator made denies Connect to @everyone
+        // before any privacy record exists, so the flag alone cannot say the
+        // room is open: an observed deny also reads as private (as `/public`).
+        let private =
+            state.is_some_and(|s| s.private) || self.live_everyone_denies_connect(channel);
+        render_room_access(private, &lists, page).unwrap_or_else(|pages| {
             let noun = if pages == 1 { "page" } else { "pages" };
             format!(
                 "Unknown page. /{COMMAND} has {pages} {noun}; use /{COMMAND} page:1 to start over."
