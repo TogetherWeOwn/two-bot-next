@@ -1,10 +1,16 @@
 # Custom commands: one bounded `{args}` substitution
 
-Status: **proposed, design only**. Written 2026-10-24; review by 2026-10-31.
-No runtime, command, test, migration, permission or configuration change is
-included. Merging this document does not enable `{args}` or authorize build
-work. This file is the repository source of truth; card documents bind its
-commit and SHA-256 rather than maintaining a second editable contract.
+Status: **Accepted for M2, conditional on its kill rule** (owner decision
+2026-11-01). If containment cannot be proved with a bounded test plan, it
+becomes Declined and M2 does not slip. Building it reverses the `{args}` refusal
+in `custom_commands.rs` and in [custom
+responses](dashboard-custom-responses-spec.md); change both in the same slice.
+Each build re-checks this spec's `file:line` seams on current `main` first.
+Original proposal: written 2026-10-24. No runtime, command, test, migration,
+permission or configuration change is included. Merging this document does not
+enable `{args}` or authorize build work. This file is the repository source of
+truth; card documents bind its commit and SHA-256 rather than maintaining a
+second editable contract.
 
 ## 1. Outcome and decision boundary
 

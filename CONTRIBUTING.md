@@ -121,6 +121,14 @@ Use an issue form: bug report, feature request, enhancement or documentation
 issue. Blank issues are off. Report a vulnerability privately; see
 [`SECURITY.md`](SECURITY.md).
 
+### Design-only specs
+
+A new design-only spec under `docs/` needs a linked tracking card or issue that
+names the date the owner will decide it. Say so in the PR body. The spec's
+`Status:` line then records the decision: accepted for a milestone, deferred to
+a month or a roadmap, declined (no build), or merged into another spec. A spec
+with no decision stays no-build. Keep a declined spec as the record.
+
 ## Releases
 
 The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`

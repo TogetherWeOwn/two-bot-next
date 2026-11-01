@@ -1,10 +1,12 @@
 # Private, bounded warning history for staff
 
-Status: **proposed; design only**, 2026-10-26. Review by 2026-11-02.
-This is the sole editable repository spec; the task document mirrors it.
-Merge publishes a proposal, **not** intent acceptance, a historical-data grant,
-command publication or production activation. No runtime code, schema, retention
-policy, credential, permission, data collection or live operation changes.
+Status: **Accepted for M2** (owner decision 2026-11-01). Build is tracked on
+linked cards; each build re-checks this spec's `file:line` seams on current
+`main` first. Original proposal: written 2026-10-26. This is the sole editable
+repository spec; the task document mirrors it. Merge publishes a proposal,
+**not** intent acceptance, a historical-data grant, command publication or
+production activation. No runtime code, schema, retention policy, credential,
+permission, data collection or live operation changes.
 
 ## Decision and alternatives
 

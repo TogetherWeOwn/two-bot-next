@@ -1,10 +1,12 @@
 # Dashboard custom-response configuration contract
 
-Status: **proposed; design only**, 2026-10-25. Intent review target: 2026-11-01.
-No page, endpoint, migration, grant, runtime activation or live write is added.
-This file is the single repository source for the proposal and offline fixtures.
-Source inventory: `c3af7333df80a766f5d4c229506a3bce53680828` (main baseline).
-Source-shipped does not mean deployed, enabled or verified against Discord.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: written 2026-10-25. No page, endpoint, migration, grant, runtime
+activation or live write is added. This file is the single repository source for
+the proposal and offline fixtures. Source inventory:
+`c3af7333df80a766f5d4c229506a3bce53680828` (main baseline). Source-shipped does
+not mean deployed, enabled or verified against Discord.
 
 ## Decision and alternatives
 
@@ -71,8 +73,8 @@ before creating a browser build in that project's own card. The separate
   (`custom_commands.rs:19,144-170`). Validation rejects unknown lowercase-alpha
   tokens such as `{guild}` or `{args}` (`:118-132`); other brace text such as
   `{User}` stays literal (`:74-88`). The raw renderer's unknown-token literal
-  fallback is not permission to bypass validation. `{args}` remains
-  [design only](custom-command-args-spec.md). Arguments do not authorize new
+  fallback is not permission to bypass validation. `{args}` is
+  [accepted for M2, conditionally](custom-command-args-spec.md) but not built. Arguments do not authorize new
   evaluation. No HTML, script, SQL, include, network, or nested substitution.
 
 Pending work is not a prerequisite claimed delivered: clone is open PR

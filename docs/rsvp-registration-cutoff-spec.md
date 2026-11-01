@@ -1,10 +1,13 @@
 # RSVP: an optional registration cutoff
 
-Status: **Proposed, design only**. Written 2026-10-26; review by **2026-11-02**.
-No runtime, command, endpoint, schema, permission, migration or deployment change.
-Merge records this proposal, not accepted intent, security disposition or build
-approval. This indexed file is the sole editable contract; the task document
-captures its exact commit and SHA-256, not an independent moving specification.
+Status: **Merged into [RSVP capacity](rsvp-capacity-spec.md)**, deferred to
+2026-12 (owner decision 2026-11-01). That doc is now the single RSVP-policy
+spec; this one stays as the detailed record of its slice. Original proposal:
+written 2026-10-26. No runtime, command, endpoint, schema, permission, migration
+or deployment change. Merge records this proposal, not accepted intent, security
+disposition or build approval. This indexed file is the sole editable contract;
+the task document captures its exact commit and SHA-256, not an independent
+moving specification.
 
 ## 1. User value and no-build comparison
 

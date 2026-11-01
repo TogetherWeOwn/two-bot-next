@@ -1,10 +1,11 @@
 # Giveaways: voluntary withdrawal without refunding entry budgets
 
-Status: **proposed, design only**. Written 2026-10-25; review target 2026-11-01,
-not a deployment promise. No runtime/store/schema implementation, migration run,
-live member test, credential, spend or activation. Merge publishes a proposal,
-not accepted intent. This file is the single repo contract; the task spec mirrors
-it. Intent review binds its exact commit and SHA-256, not a moving branch.
+Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit then, or
+earlier if a host names a need and an M2 slot opens. Original proposal: written
+2026-10-25. No runtime/store/schema implementation, migration run, live member
+test, credential, spend or activation. Merge publishes a proposal, not accepted
+intent. This file is the single repo contract; the task spec mirrors it. Intent
+review binds its exact commit and SHA-256, not a moving branch.
 
 ## 1. Choice and evidence
 

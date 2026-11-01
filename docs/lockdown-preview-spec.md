@@ -1,10 +1,12 @@
 # Private lockdown preview before execution
 
-Status: **Proposed; design only**. Written 2026-10-26; review by 2026-11-02.
-No commands, components, storage, migrations, permissions, sends or runtime
-tests are added, and no lockdown is performed. Merge publishes a proposal, not
-permission to implement or activate it. This file is the single repository
-contract; a review request binds its exact commit and SHA-256.
+Status: **Accepted for M2** (owner decision 2026-11-01). Build is tracked on
+linked cards; each build re-checks this spec's `file:line` seams on current
+`main` first. Original proposal: written 2026-10-26. No commands, components,
+storage, migrations, permissions, sends or runtime tests are added, and no
+lockdown is performed. Merge publishes a proposal, not permission to implement
+or activate it. This file is the single repository contract; a review request
+binds its exact commit and SHA-256.
 
 ## 1. Decision, alternatives and scope
 

@@ -1,12 +1,13 @@
 # Dashboard LFG configuration contract
 
-Status: **proposed; design only**. Written 2026-10-26; intent review by
-2026-11-02. This proposal adds no runtime, page, migration, permission, live
-write or activation. Publication is not implementation or production approval.
-This file is the single repository source, including the manifest and fixture
-oracle. It extends neither the ticket/onboarding pages nor the LFG lifecycle
-specs. Seats, signup-member and reminder scopes stay with their siblings
-(`rsvp-capacity-spec.md`, `rsvp-withdrawal-spec.md`,
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: written 2026-10-26. This proposal adds no runtime, page, migration,
+permission, live write or activation. Publication is not implementation or
+production approval. This file is the single repository source, including the
+manifest and fixture oracle. It extends neither the ticket/onboarding pages nor
+the LFG lifecycle specs. Seats, signup-member and reminder scopes stay with
+their siblings (`rsvp-capacity-spec.md`, `rsvp-withdrawal-spec.md`,
 `event-reminder-preferences-spec.md`).
 
 ## Decision

@@ -1,9 +1,13 @@
 # Dashboard: onboarding and self-roles admin page
 
-Status: **proposed, design only**. Written 2026-10-24; review by 2026-10-31.
-No runtime, migration, dashboard edit, live write or experiment is added.
-Merge publishes a proposal, not permission to build or activate it. This file is
-the single repository contract; review requests bind its commit and SHA-256.
+Status: **Self-role half merged into [self-role
+panels](dashboard-self-roles-spec.md); onboarding-keys half deferred to the
+two-web-next roadmap** (owner decision 2026-11-01). W2 here
+(`TWO_SELF_ROLE_DRY_RUN` wiring) is SR-W3 there. Build the onboarding keys only
+when a two-web-next goal claims the page. Original proposal: written 2026-10-24.
+No runtime, migration, dashboard edit, live write or experiment is added. Merge
+publishes a proposal, not permission to build or activate it. This file is the
+single repository contract; review requests bind its commit and SHA-256.
 
 ## 1. Decision and evidence
 
