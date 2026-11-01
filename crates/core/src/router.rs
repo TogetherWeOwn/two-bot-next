@@ -108,6 +108,13 @@ pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this s
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
 pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 
+/// Slash names routed while dark (unpublished until their slice lands).
+/// Dispatch shadows each name (see `route_slash`), so a custom row under
+/// one could publish yet never execute. [`crate::custom_commands::reserved_command_names`]
+/// mirrors this set on the write path (`/command`, imports), so writes
+/// refuse the names instead of accepting rows that can never publish.
+pub const DARK_RESERVED_NAMES: &[&str] = &["lockdown-preview"];
+
 // --- handler identity ----------------------------------------------------------
 
 /// Which feature slice owns a routed slash command (parity §1 row).
@@ -143,6 +150,7 @@ pub enum HandlerId {
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
+    LockdownPreview,
     TempbanList,
     ModerationRecent,
 }
@@ -284,6 +292,7 @@ pub enum RouterRefusal {
     ModerationPermission(ModerationAction),
     PurgePreviewPermission,
     ChannelInspectPermission,
+    LockdownPreviewPermission,
     TempbanListPermission,
     ModerationRecentPermission,
 }
@@ -303,6 +312,7 @@ impl RouterRefusal {
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::LockdownPreviewPermission => "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ModerationRecentPermission => "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
@@ -414,6 +424,7 @@ impl InteractionRouter {
             }
             register(HandlerId::PurgePreview);
             register(HandlerId::ChannelInspect);
+            register(HandlerId::LockdownPreview);
             register(HandlerId::ModerationRecent);
         }
         if gates.automations {
@@ -594,6 +605,12 @@ impl InteractionRouter {
             "channel-inspect" => Some((
                 HandlerId::ChannelInspect,
                 RouterRefusal::ChannelInspectPermission,
+            )),
+            // Dark until the publication slice: routed and adjudicated like
+            // the other channel reads, but with no published definition.
+            "lockdown-preview" => Some((
+                HandlerId::LockdownPreview,
+                RouterRefusal::LockdownPreviewPermission,
             )),
             "moderation-recent" => Some((
                 HandlerId::ModerationRecent,
@@ -900,6 +917,10 @@ impl InteractionRouter {
             reserved.extend(voice_command_names().iter().cloned());
         }
         reserved.insert("templateassistant".to_owned());
+        // Dark routed names (see [`DARK_RESERVED_NAMES`]): dispatch shadows
+        // each one until its publish slice lands, so a custom row under it
+        // could publish yet never execute.
+        reserved.extend(DARK_RESERVED_NAMES.iter().map(|name| (*name).to_owned()));
         reserved
     }
 
@@ -1049,6 +1070,7 @@ mod tests {
             ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
             ("purge-preview", HandlerId::PurgePreview),
             ("channel-inspect", HandlerId::ChannelInspect),
+            ("lockdown-preview", HandlerId::LockdownPreview),
             ("moderation-recent", HandlerId::ModerationRecent),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
@@ -1076,7 +1098,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 45, "all 45 handler-owned builtins covered");
+        assert_eq!(cases.len(), 46, "all 46 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1259,6 +1281,8 @@ mod tests {
              "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
             ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
              "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
+            ("lockdown-preview", 16, HandlerId::LockdownPreview, RouterRefusal::LockdownPreviewPermission,
+             "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it."),
             ("moderation-recent", 1_099_511_627_776, HandlerId::ModerationRecent, RouterRefusal::ModerationRecentPermission,
              "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it."),
         ] {

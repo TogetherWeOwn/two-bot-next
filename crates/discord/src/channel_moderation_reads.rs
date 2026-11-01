@@ -88,6 +88,7 @@ async fn preview(runtime: &ChannelModerationRuntime, channel: &str, count: u64) 
         _ => ("none".to_owned(), "none".to_owned()),
     };
     ChannelReply {
+        digest32: None,
         text: format!(
             "Purge preview — newest-page sample, listed: {} (up to {count})\n\
              targetable: {}\nspan: {span}\ntime span (newest to oldest): {times}\n\
@@ -160,6 +161,7 @@ async fn inspect(runtime: &ChannelModerationRuntime, channel: &str, guild: &str)
         Err(_) => "unknown — try again shortly".to_owned(),
     };
     ChannelReply {
+        digest32: None,
         text: format!("Channel restrictions snapshot\n{saved}\nslowmode: {slowmode}\nslowmode set at: unknown\nslowmode set by: unknown\nRead-only snapshot; restrictions may change. Nothing was changed."),
         outcome: "channel_inspect".to_owned(),
         replayed: false,

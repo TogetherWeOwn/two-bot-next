@@ -685,6 +685,34 @@ impl ChannelModerationStore {
         Self::record_audit_on(&mut *self.pool.acquire().await?, row).await
     }
 
+    /// Insert-or-nothing variant for the lockdown preview
+    /// (`docs/lockdown-preview-spec.md` section 6): the preview renders and
+    /// arms only when exactly one row is created. An error **or** zero rows
+    /// (a redelivered interaction retry under the same `request_id`) refuses
+    /// the whole preview with no render and no pending entry.
+    pub async fn try_record_audit(&self, row: &ChannelAuditRow) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO moderation_audit
+               (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+                outcome, idempotency_key, metadata_json, created_at)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10::text::timestamptz)
+             ON CONFLICT (request_id) DO NOTHING",
+        )
+        .bind(&row.request_id)
+        .bind(&row.guild_id)
+        .bind(&row.actor_id)
+        .bind(&row.action)
+        .bind(&row.channel_id)
+        .bind(&row.reason)
+        .bind(&row.outcome)
+        .bind(&row.idempotency_key)
+        .bind(&row.metadata_json)
+        .bind(&row.created_at)
+        .execute(&mut *self.pool.acquire().await?)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn record_audit_on(
         connection: &mut PgConnection,
         row: &ChannelAuditRow,

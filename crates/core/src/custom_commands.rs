@@ -322,11 +322,15 @@ pub fn builtin_command_names() -> HashSet<String> {
 }
 
 /// Names a custom command may not be *written* under: every builtin plus the
-/// voice-room and assistant sets. The voice sink dispatches by name, so a custom
-/// command named `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
-/// turns on, even if it was created while voice was off. This guards writes
-/// only (`/command`, imports). Dispatch keeps [`builtin_command_names`], so a
-/// stored row that predates the reservation keeps running while voice is off.
+/// voice-room and assistant sets, plus the dark routed names (see
+/// [`super::router::DARK_RESERVED_NAMES`]). The voice sink dispatches by name,
+/// so a custom command named `setup` or `export` would reach the voice handlers
+/// the moment `TWO_VOICE` turns on, even if it was created while voice was off.
+/// A custom row under a dark name would validate yet never publish (the router
+/// withholds it while dispatch shadows the name), so writes refuse those too.
+/// This guards writes only (`/command`, imports). Dispatch keeps
+/// [`builtin_command_names`], so a stored row that predates the reservation
+/// keeps running while voice is off.
 #[must_use]
 pub fn reserved_command_names() -> HashSet<String> {
     let mut names = builtin_command_names();
@@ -335,6 +339,11 @@ pub fn reserved_command_names() -> HashSet<String> {
             .into_iter()
             .chain(super::voice_assistant::assistant_commands())
             .map(|def| def.name),
+    );
+    names.extend(
+        super::router::DARK_RESERVED_NAMES
+            .iter()
+            .map(|name| (*name).to_owned()),
     );
     names
 }
@@ -1547,17 +1556,24 @@ mod tests {
         let reserved = reserved_command_names();
         let definitions = router.publish_set(&[]).unwrap();
         let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
-        // `templateassistant` is unpublished until its slice lands, but the name
-        // stays squatted: reservations cover the publish set plus exactly that
-        // one held name (which keeps holding its guild slot in the capacity
-        // math below, so the slot count does not churn when it republishes).
+        // `templateassistant` and `lockdown-preview` are unpublished until
+        // their slices land, but the names stay squatted: reservations cover
+        // the publish set plus exactly those two held names (which keep
+        // holding their guild slots in the capacity math below, so the slot
+        // count does not churn when they republish).
         assert!(published.is_subset(&reserved));
-        assert_eq!(reserved.len(), published.len() + 1);
+        assert_eq!(reserved.len(), published.len() + 2);
         assert!(reserved.contains("templateassistant"));
+        assert!(reserved.contains("lockdown-preview"));
         assert!(!published.contains("templateassistant"));
+        assert!(!published.contains("lockdown-preview"));
         assert_eq!(
             validate_put_input(&put_input("templateassistant"), &reserved),
             Err(CommandError::ReservedName("templateassistant".to_owned()))
+        );
+        assert_eq!(
+            validate_put_input(&put_input("lockdown-preview"), &reserved),
+            Err(CommandError::ReservedName("lockdown-preview".to_owned()))
         );
         let capacity = max_custom_commands(reserved.len());
         let custom: Vec<_> = (0..capacity)
