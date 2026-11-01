@@ -326,8 +326,8 @@ prove quotas, cancellation, peak heap, safe rendering or zero effects.
 circulation of the bounded candidate, **not approval of our own capability
 request**. An independent authorized boundary decision must cover outbound
 abuse/rate, sole-owner enforcement, cancellation/CPU/heap and title-only value
-before any build card; independent exact-head Paperclip Review 5/5 and CI are
-separate gates, never replaced by this document.
+before any build card; exact-head `ci-ok`, `gitleaks`, `pr-lint`, CodeRabbit and
+Devin Review are separate gates, never replaced by this document.
 
 Request CEO acceptance and actual guild-host intent alignment through the
 President/COO, bound to the issue spec revision plus this file's commit and

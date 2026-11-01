@@ -43,6 +43,8 @@ mod sticky_unsaved_preview_acceptance_tests;
 #[path = "tempban_inventory_acceptance_tests.rs"]
 mod tempban_inventory_acceptance_tests;
 
+#[path = "custom_command_inspect_eligibility_acceptance.rs"]
+mod custom_command_inspect_eligibility_acceptance;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 #[path = "custom_command_toggle_acceptance.rs"]

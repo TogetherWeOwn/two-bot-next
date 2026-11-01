@@ -1563,9 +1563,10 @@ def rollback_proof_job_errors(job, mode):
         permissions["actions"] = "write" if mode == "run" else "read"
         env["GH_TOKEN"] = "${{ github.token }}"
     if mode in ("alert", "watch"):
-        env["SYNTHETIC_ALERT_WEBHOOK_URL"] = "${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}"
-    expected_environment = "synthetic-alerts" if mode in ("alert", "watch") else None
-    if job.get("permissions") != permissions or job.get("environment") != expected_environment:
+        # The incident issue sink: the job token with issues: write, no secret.
+        permissions["issues"] = "write"
+        env["GITHUB_TOKEN"] = "${{ github.token }}"
+    if job.get("permissions") != permissions or "environment" in job:
         errors.append(f"rollback proof {mode}: least-privilege token/environment changed")
     for key in ("env", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
         if key in job:
@@ -2573,8 +2574,8 @@ def daily_digest_errors(workflow):
     Deployment: rows whose description is a deploy ID),
     cuts the tag via daily-digest.cjs, and dispatches the SBOM chain for the
     fresh or existing release. The alert job consumes owed-digest outputs even
-    on a failed publication through the synthetic-alerts environment, reusing
-    the existing Discord line.
+    on a failed publication and opens the `daily-digest` incident issue with
+    the job token (issues: write), no environment or secret.
     """
     name = "daily-digest.yml"
     errors = []
@@ -2640,14 +2641,14 @@ def daily_digest_errors(workflow):
     if alert.get("if") != expected_alert_if:
         errors.append(f"{name}:alert: must consume owed-digest outputs even on failure, "
                       "never on a dry run")
-    if alert.get("permissions") != {"contents": "read"}:
-        errors.append(f"{name}:alert: must keep contents:read only")
-    if alert.get("environment") != "synthetic-alerts":
-        errors.append(f"{name}:alert: must reuse the synthetic-alerts environment webhook")
+    if alert.get("permissions") != {"contents": "read", "issues": "write"}:
+        errors.append(f"{name}:alert: must keep contents:read plus issues:write only")
+    if "environment" in alert:
+        errors.append(f"{name}:alert: the incident issue sink needs no environment")
     if not runner_allowed("alert", alert.get("runs-on")):
         errors.append(f"{name}:alert: must use the routed runner expression for job 'alert'")
     alert_text = str(alert)
-    for required in ("SYNTHETIC_ALERT_WEBHOOK_URL", "scripts/digest_alert.py",
+    for required in ("${{ secrets.GITHUB_TOKEN }}", "scripts/digest_alert.py",
                      "needs.digest.outputs.live_sha", "needs.digest.outputs.prev_tag"):
         if required not in alert_text:
             errors.append(f"{name}:alert: missing pin {required}")
@@ -3342,8 +3343,8 @@ SYNTHETIC_MISSING_BINDING_RUN = {
 def synthetic_user_flow_errors(workflow):
     """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
 
-    Runs on a 5-minute schedule and manual dispatch, only from main, through
-    the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
+    Runs on a 5-minute schedule and manual dispatch, only from main, with no
+    environment or secret beyond the job token. Two jobs: `staging` runs the reviewed
     staging health-contract probe, `prod-passive` runs the reviewed passive
     production probe (observe and alert only, never a deploy gate). Each job
     has an optional target probe, a fail-closed error when its binding is
@@ -3352,7 +3353,8 @@ def synthetic_user_flow_errors(workflow):
     The decide step reads recent run history with actions:read, alerts after
     two failures, and writes the event to GITHUB_OUTPUT; the post step runs
     only when an event is due so a no-op is skipped (never success), and only
-    a successful post counts as delivered. No wrangler, no deploy route, no
+    a successful post counts as delivered. The post step writes the env's
+    `incident` issue with issues:write. No wrangler, no deploy route, no
     `set -x`.
     """
     name = "synthetic-user-flow.yml"
@@ -3388,12 +3390,12 @@ def synthetic_user_flow_errors(workflow):
                        "prod-passive": "scripts/prod_passive_probe.py"}
     for job_id in ("staging", "prod-passive"):
         job = jobs[job_id]
-        if job.get("environment") != "synthetic-alerts":
-            errors.append(f"{name}:{job_id}: must read only the synthetic-alerts Environment")
+        if "environment" in job:
+            errors.append(f"{name}:{job_id}: the incident issue sink needs no Environment")
         if job.get("if") != "github.ref == 'refs/heads/main'":
             errors.append(f"{name}:{job_id}: must run only from main")
-        if job.get("permissions") != {"actions": "read", "contents": "read"}:
-            errors.append(f"{name}:{job_id}: must keep actions:read plus contents:read only")
+        if job.get("permissions") != {"actions": "read", "contents": "read", "issues": "write"}:
+            errors.append(f"{name}:{job_id}: must keep actions:read, contents:read and issues:write only")
         if job.get("timeout-minutes") != "10":
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
@@ -3465,16 +3467,15 @@ def synthetic_user_flow_errors(workflow):
         decide_env = decide_step.get("env") or {}
         if (decide_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
                 or decide_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"
-                or "SYNTHETIC_ALERT_WEBHOOK_URL" in decide_env
+                or set(decide_env) - {"GITHUB_TOKEN", "PROBE_OUTCOME", "FORCE_FAIL", "RUN_ID"}
                 or "secrets." in str(decide_step.get("run", ""))):
             errors.append(f"{name}:{job_id}: decide step must pass token and outcome via env only")
         alert_env = alert_step.get("env") or {}
-        if (alert_env.get("SYNTHETIC_ALERT_WEBHOOK_URL") != "${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}"
+        if (alert_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
                 or alert_env.get("ALERT_EVENT") != "${{ steps.decide.outputs.event }}"
-                or "GITHUB_TOKEN" in alert_env
                 or "PROBE_OUTCOME" in alert_env
                 or "secrets." in str(alert_step.get("run", ""))):
-            errors.append(f"{name}:{job_id}: post step must pass webhook and decided event via env only")
+            errors.append(f"{name}:{job_id}: post step must pass token and decided event via env only")
         for step in steps:
             if step not in (decide_step, alert_step) and "secrets." in str(step):
                 errors.append(f"{name}:{job_id}: only the decide and alert steps may hold a secret")
@@ -3484,8 +3485,8 @@ def synthetic_user_flow_errors(workflow):
         if marker in text:
             errors.append(f"{name}: must not contain {marker!r}")
     secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
-    if secrets != {"synthetic_alert_webhook_url", "github_token"}:
-        errors.append(f"{name}: must read only the webhook secret and read-only GitHub token")
+    if secrets != {"github_token"}:
+        errors.append(f"{name}: must read only the job-scoped GitHub token")
     return errors
 
 
@@ -3825,8 +3826,7 @@ def workflow_policy_errors(workflows):
             errors.extend(release_errors(workflow))
         if name == "daily-digest.yml":
             # Pinned shape above; the generic environment/marker scan below
-            # would flag its synthetic-alerts binding, production probe URL
-            # and Deployment fallback reads.
+            # would flag its production probe URL and Deployment fallback reads.
             errors.extend(daily_digest_errors(workflow))
             continue
         if name == "voice-synthetic.yml":
@@ -3836,7 +3836,7 @@ def workflow_policy_errors(workflows):
             continue
         if name == "synthetic-user-flow.yml":
             # Pinned shape above; the generic environment/marker scan below
-            # would flag its synthetic-alerts binding and probe paths.
+            # would flag its probe paths.
             errors.extend(synthetic_user_flow_errors(workflow))
             continue
         if name == "slow-burn-tracker.yml":
@@ -7310,7 +7310,8 @@ class WorkflowTests(unittest.TestCase):
             "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"URL": "production"}),
             "missing evidence": lambda w: w["jobs"]["proof"]["steps"].pop(),
             "alert on success": lambda w: w["jobs"]["alert"].update({"if": "always()"}),
-            "alert no webhook scope": lambda w: w["jobs"]["alert"].pop("environment"),
+            "alert cannot write the incident issue": lambda w: w["jobs"]["alert"]["permissions"].pop("issues"),
+            "alert reads an environment": lambda w: w["jobs"]["alert"].update({"environment": "synthetic-alerts"}),
             "manual drill loses lane": lambda w: w["jobs"]["drill"].pop("concurrency"),
         }.items():
             changed = deepcopy(workflow)
@@ -8865,8 +8866,9 @@ class WorkflowTests(unittest.TestCase):
                     expected = {"contents": "read"}
                     if (name, job_id) in (("synthetic-user-flow.yml", "staging"),
                                           ("synthetic-user-flow.yml", "prod-passive")):
-                        # Read workflow/job history to debounce alerts and detect recovery.
-                        expected = {"contents": "read", "actions": "read"}
+                        # Read workflow/job history to debounce alerts and detect
+                        # recovery; open, comment on and close the incident issue.
+                        expected = {"contents": "read", "actions": "read", "issues": "write"}
                     elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
@@ -8906,7 +8908,12 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("staging-rollback-drill.yml", "proof"):
                         expected = {"contents": "read", "actions": "write"}
                     elif (name, job_id) == ("daily-digest.yml", "rollback-proof-watch"):
-                        expected = {"contents": "read", "actions": "read"}
+                        # Reads the daily proof run; opens or closes its incident issue.
+                        expected = {"contents": "read", "actions": "read", "issues": "write"}
+                    elif (name, job_id) in (("daily-digest.yml", "alert"),
+                                            ("staging-rollback-drill.yml", "alert")):
+                        # Opens or comments on the check's incident issue.
+                        expected = {"contents": "read", "issues": "write"}
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}

@@ -87,10 +87,12 @@ jobs:
           persist-credentials: false
       # Fetch current RustSec data even when Cargo.lock has not changed.
       # cargo-deny reads the lockfile; no token-writing/reporting steps.
+      # `--workspace`: see the cargo-deny step in check.yml.
       - name: cargo deny check advisories
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories
+          arguments: --workspace --all-features
 
   sweep:
     name: nightly ignored tests and docs

@@ -72,9 +72,9 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.\n\
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.\n\
   The Container registers a `guild_settings` poll job\n\
-  (`crates/bot/src/website_jobs.rs:207`) that polls every 15 s and publishes a\n\
+  (`crates/bot/src/website_jobs.rs`, `settings_jobs::job`) that polls every 15 s and publishes a\n\
   `SettingsCache` snapshot only when the revision or row count changes\n\
-  (`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`\n\
+  (`crates/bot/src/settings_jobs.rs` `poll_once`), exposed through `settings_jobs::live`\n\
   (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:\n\
   a stored row wins and an absent row falls back to the boot value, except\n\
   the invite responder, which falls back to the live vanity code; a live /ops override wins over the stored row while the container polls an ops record, falling back to the row on clear or expiry; a malformed\n\
@@ -93,13 +93,13 @@ Live snapshot consumers (canonical table; gateway facts and attendance share\n\
 | --- | --- | --- | --- |\n\
 | automod | `automod_gateway.rs:211-223`, `:328` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
 | feed | `feed_jobs.rs:235-237`, `:266` | `TWO_FEED_POLL_SECONDS` (`:207`), `TWO_ANNOUNCEMENTS` (`:244`) | supervisor cadence + per-tick gates (`:276-327`, `:385-419`) |\n\
-| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
+| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`CHANNEL_KEYS`) | every record (`:483`) and sweep (`:497`), once installed |\n\
 | ticket | `ticket_runtime.rs:749-752`, `:1491` | 3 destinations + cooldown (`:311-339`, `:719-744`) | every execute/recovery and purge; effective ops changes included |\n\
 | self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |\n\
 | gateway classifier | `gateway.rs::refresh_channel_classifier_from_poller`, `gateway.rs::apply_dispatch` | seven channel + exclusion sets through `community_classifier.rs::classifier_config_from_live` | guild `MessageCreate`, `VoiceStateUpdate`, `MemberAdd`, `MemberUpdate`, `MemberRemove`, before fact collection/drain; classifier + facts sink swap together |\n\
 | attendance | `community_classifier.rs::LiveClassifier`, `rsvp.rs::execute`; installed by `main.rs::build_interaction_runtime` and `command_runtime.rs::CommandRuntime::build` | same seven channel + exclusion sets | execution-time read in both `handle` and `prepare`/`complete`, after successful acknowledgement and live membership reads, immediately before target classification |\n\
 | community | `community_jobs.rs:185-187` | 5 scorecard/presence/inactivity keys (`:174-180`) | every tick: probe (`:400`), scorecard (`:552`), sweep (`:638`) |\n\
-| voice | `gateway.rs:2339-2341` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8222-8230`), maintenance (`:3571-3573`), `/invite` (`:14195-14204`) |\n\n\
+| voice | `gateway.rs` `build_voice_runtime` closure | empty grace (`voice_rooms.rs` `stored_empty_grace_with`), invite code (`stored_invite_code_with`) | spawn (`ensure_actor`), maintenance (`refresh_empty_grace_with`), `/invite` (`handle_received`) |\n\n\
 The forty-nine keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
@@ -128,7 +128,7 @@ reschedules the next run to last-run + new interval without a restart\n\
 (`crates/bot/src/feed_jobs.rs:235-237`, `:276-327`); the audit mirror applies\n\
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and\n\
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and\n\
-sweep (`crates/bot/src/audit_runtime.rs:60-63`, `:308`, `:438`), where blanking\n\
+sweep (`crates/bot/src/audit_runtime.rs` `CHANNEL_KEYS`, `:308`, `:438`), where blanking\n\
 all three parks the mirror live and a malformed row keeps the last good\n\
 destinations; with no destination at boot, registration installs neither the\n\
 mirror handle nor the retry job, so a later stored destination cannot activate\n\
@@ -174,17 +174,17 @@ guild-scoped snapshot: stored sets replace boot sets, explicit empty clears a\n\
 set, and deleting a row restores boot fallback. Malformed entries are filtered\n\
 silently, so a wholly-malformed row applies as the empty set\n\
 (`crates/core/src/community.rs:252-260`). `TWO_COMMUNITY_CLASSIFIER_VERSION`\n\
-remains boot-only. The voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8222-8230`, `:3571-3573`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10239-10255`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges\n\
+remains boot-only. The voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs` `ensure_actor`, `refresh_empty_grace_with`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs` `handle_received`), falling back to the live vanity code when the row is absent or invalid (`stored_invite_code_with`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
-(`crates/bot/src/gateway.rs:2339`); gateway intents plus ticket command\n\
+(`crates/bot/src/gateway.rs` `build_voice_runtime`); gateway intents plus ticket command\n\
 publication read the ticket destination keys once at boot\n\
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:448`), so a stored ticket\n\
+(`crates/bot/src/gateway.rs` `intents_from_env`, `crates/bot/src/command_runtime.rs` `CommandRuntime::from_env`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
 refresh above; the community-facts sink arms once at boot\n\
-(`crates/bot/src/main.rs:697-698`), so a live scorecard `0` stops scoring but\n\
+(`crates/bot/src/main.rs` `run`), so a live scorecard `0` stops scoring but\n\
 not capture; the scorecard command surface publishes at boot\n\
-(`crates/bot/src/main.rs:1004`, `crates/bot/src/command_runtime.rs:440`); and\n\
+(`crates/bot/src/main.rs` `build_interaction_runtime`, `crates/bot/src/command_runtime.rs` `CommandRuntime::from_env`); and\n\
 a boot-parked community job needs a restart to start ticking, like the parked\n\
 audit runtime. Every other\n\
 storable row's stored value is unwired.\n\n\
@@ -220,7 +220,7 @@ for delete protection, not creator provisioning. Its empty grace is fixed at\n\
 Automod and scorecard typed loaders exist but are not\n\
 called during boot; their defaults below come from empty-map calls.\n\
 Onboarding gates are validated at boot (`OnboardingGates::from_env`,\n\
-`crates/bot/src/main.rs:563`): an invalid `TWO_ONBOARDING_MODE` fails startup. The\n\
+`crates/core/src/onboarding.rs`): an invalid `TWO_ONBOARDING_MODE` fails startup. The\n\
 classifier loader runs when the ordered pipeline is built and again when\n\
 community-facts capture is armed, then refreshes live for the guild\n\
 fact-producing dispatches above. Attendance resolves its live classifier at\n\
@@ -293,7 +293,7 @@ const BOOT_ENV: &[&str] = &[
 /// (`ticket_runtime.rs:457`, `:981`), the gateway classifier's per-fact-dispatch
 /// refresh and attendance's execution-time refresh in both interaction paths
 /// (`community_classifier.rs::classifier_config_from_live`), voice grace/invite through the
-/// gateway closure (`gateway.rs:2339-2341`), containment
+/// gateway closure (`gateway.rs` `build_voice_runtime`), containment
 /// (`containment_runtime.rs:61-67`, `:278-286`), join-risk
 /// (`join_risk_runtime.rs:66-70`, `:239-249`), raid
 /// (`raid_runtime.rs:45-48`, `:194-202`) and onboarding's per-event

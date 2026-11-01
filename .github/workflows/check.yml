@@ -310,6 +310,14 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests_no_assert_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_deps_no_assert.py' -v
+      - name: Docker replay confinement acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_replay_intake_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -O -m unittest discover -s scripts -p 'test_docker_replay_intake_acceptance.py' -v
+      - name: Tracker scratch failure acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_scratch_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -O -m unittest discover -s scripts -p 'test_slow_burn_tracker_scratch_acceptance.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -374,10 +382,14 @@ jobs:
       # includes the advisory scan, and the deny image carries its own
       # toolchain, so this also reports advisories on docs-only PRs for the
       # cost of one advisory-DB fetch. Advisory findings fail the PR (HARD).
+      # `--workspace` is required: the root manifest is also a package, so
+      # without it the graph holds only `two-bot-next` and every check
+      # passes on one crate with no dependencies.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+          arguments: --workspace --all-features
 
       - name: Install Rust toolchain
         id: toolchain
@@ -3587,6 +3599,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_build_identity_acceptance.py -v
       - name: Verify passive production probe duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
+      - name: Verify incident issue sink (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_incident_issue.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
       - name: Verify synthetic history admission boundaries (offline fixtures)

@@ -342,7 +342,7 @@ pub fn expected_registry() -> Value {
     // manufacture it from production shapes.
     let inspect = json!({
         "name": "command-inspect",
-        "description": "Inspect a saved command or privately preview an unsaved draft",
+        "description": "Inspect saved state and text-trigger eligibility, or preview an unsaved draft",
         "dm_permission": false,
         "default_member_permissions": "32",
         "options": [
