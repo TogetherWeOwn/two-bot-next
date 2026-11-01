@@ -485,6 +485,29 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("production-rollback-snapshot.json", production)
         self.assertIn("production-auto-rollback-evidence.json", production)
 
+    def test_rollback_target_preflight_runs_before_any_production_mutation(self):
+        names = [step[0].split("name: ", 1)[-1] for step in steps(JOBS["production"])]
+        preflight = names.index("Preflight the rollback target before production mutation")
+        # After the snapshot it judges, before the artifact admission (which
+        # copies the image into the production registry) and the deploy.
+        self.assertLess(names.index(SNAPSHOT_STEP), preflight)
+        self.assertLess(preflight, names.index("Admit the immutable staging artifact before production mutation"))
+        self.assertLess(preflight, names.index("Deploy to production"))
+        script = inline_script("Preflight the rollback target before production mutation")
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn("../tooling/scripts/rollback_target_preflight.py", script)
+        self.assertIn('--snapshot "$RUNNER_TEMP/production-rollback-snapshot.json"', script)
+        self.assertIn('--sha "$SHA" --repo ..', script)
+        conditions = {
+            step[0]: [line.strip() for line in step if line.strip().startswith(("if:", "continue-on-error"))]
+            for step in steps(JOBS["production"])
+        }
+        # Ordinary promotions only, never tolerated: recovery never waits on it.
+        self.assertEqual(
+            conditions["      - name: Preflight the rollback target before production mutation"],
+            ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'"],
+        )
+
     def test_pre_freeze_candidate_requires_the_full_latest_ci_verdict(self):
         row = next(line for line in (ROOT / "docs/cutover-sequence.md").read_text().splitlines()
                    if line.startswith("| 0.1 |"))

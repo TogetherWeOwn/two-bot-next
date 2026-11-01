@@ -1373,6 +1373,24 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+      # Rollback-target preflight, before any production mutation: the
+      # snapshot must name a complete receipt (previous Worker version, its
+      # SHA, its image digest), live Cloudflare state must still bind it, the
+      # registry must still hold the image, and no migration added since the
+      # serving SHA may be backward-incompatible (the serving build must run
+      # on the candidate's schema after a rollback). No valid target refuses
+      # the promotion. Recovery paths (rollback, live-SHA redeploy) skip it.
+      - name: Preflight the rollback target before production mutation
+        id: rollback_preflight
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/rollback_target_preflight.py \
+            --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" \
+            --sha "$SHA" --repo .. --out "$RUNNER_TEMP/production-rollback-preflight.json"
       # Ordinary promotion consumes only the bytes certified by the exact
       # guarded staging attempt. Recovery remains independent of artifacts.
       - name: Admit the immutable staging artifact before production mutation
