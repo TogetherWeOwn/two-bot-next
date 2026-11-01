@@ -140,16 +140,21 @@ struct ChildFailureReport {
 impl Drop for ChildFailureReport {
     fn drop(&mut self) {
         if self.armed {
-            let panicked = std::thread::panicking();
-            tracing::warn!(
-                event = "eventsub_receiver",
-                msg = "eventsub_delivery_child_failed",
-                panicked = panicked,
-                cancelled = !panicked,
-                "delivery child failed; durable claim fences retain uncertainty"
-            );
+            report_child_failure(std::thread::panicking());
         }
     }
+}
+
+/// Bounded child-failure warning: only whether the child panicked or was
+/// cancelled, never the join error or panic payload.
+fn report_child_failure(panicked: bool) {
+    tracing::warn!(
+        event = "eventsub_receiver",
+        msg = "eventsub_delivery_child_failed",
+        panicked = panicked,
+        cancelled = !panicked,
+        "delivery child failed; durable claim fences retain uncertainty"
+    );
 }
 
 /// Binding completes before any gateway/job task starts. Invalid enabled
