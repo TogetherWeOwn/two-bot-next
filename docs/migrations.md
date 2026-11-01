@@ -109,16 +109,19 @@ scans each migration added between the serving build's SHA and the
 candidate. A statement the serving build may not survive refuses the
 promotion: `DROP TABLE`/`COLUMN`/`TYPE`/`VIEW`/`SCHEMA`/`FUNCTION`/`SEQUENCE`,
 `RENAME`, `ALTER COLUMN ... TYPE`, `SET NOT NULL`, `DROP DEFAULT`,
-`TRUNCATE`, `REVOKE`, and `ADD COLUMN ... NOT NULL` without a `DEFAULT`.
+`TRUNCATE`, an unqualified `DELETE FROM` with no `WHERE`, `REVOKE`, and
+`ADD COLUMN ... NOT NULL` without a `DEFAULT`.
 `COLUMN` may be omitted, as PostgreSQL allows; any top-level `DROP` other than
 `DROP INDEX` refuses; statements inside `DO` and function bodies are checked
-too. Comments and string literals are lexed out first, so a `--` or `;` in a
+too. Only a `WHERE` in the `DELETE`'s own scope counts: a `WHERE` in a
+preceding CTE, an outer query, or a `RETURNING` subquery does not waive it. Comments and string literals are lexed out first, so a `--` or `;` in a
 literal hides nothing; quoted identifiers (including schema-qualified ones
 like `"public"."members"`) and `E'...'` backslash escapes are handled the
 same way. A literal, comment or dollar-quoted body the lexer cannot close
 refuses as `unparseable_migration`: an unreadable migration never passes.
 `TRUNCATE` in a `CREATE TRIGGER ... BEFORE|AFTER|INSTEAD OF` event clause is
-not an executed truncate and does not refuse. Dynamic SQL inside an
+not an executed truncate and does not refuse; the same holds for `DELETE`
+in a trigger event clause (it names the event, not a `DELETE FROM`). Dynamic SQL inside an
 `EXECUTE '...'` string is not visible to the scan: keep it out of migrations,
 or annotate the file. A rewritten or deleted migration always refuses.
 

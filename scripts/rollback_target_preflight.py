@@ -23,7 +23,8 @@ still fits the candidate's schema before the deploy:
    schema after a rollback (a Worker rollback never undoes schema). A
    statement that drops or renames an object, changes a column type, adds a
    NOT NULL constraint (or a NOT NULL column without a default), drops a
-   default, truncates or revokes refuses, unless the file carries a reviewed
+   default, truncates, deletes all rows or revokes refuses, unless the file
+   carries a reviewed
    `-- rollback-compatible: <reason>` line. A rewritten or deleted migration
    always refuses. The serving SHA must be an ancestor of the candidate.
 
@@ -79,8 +80,50 @@ INCOMPATIBLE = (
     ("set_not_null", re.compile(r"\bSET\s+NOT\s+NULL\b", re.I)),
     ("drop_default", re.compile(r"\bDROP\s+DEFAULT\b", re.I)),
     ("truncate", re.compile(r"\bTRUNCATE\b", re.I)),
+    # An unqualified DELETE empties the table like TRUNCATE. It is judged by
+    # _unqualified_delete (not a single regex): only a WHERE in the DELETE's
+    # own scope waives it, so a WHERE in a preceding CTE, an outer query or
+    # a RETURNING subquery does not excuse it. None marks the function entry.
+    ("delete_all_rows", None),
     ("revoke", re.compile(r"\bREVOKE\b", re.I)),
 )
+DELETE_FROM = re.compile(r"\bDELETE\s+FROM\b", re.I)
+# Tokens that bound a DELETE's own scope: leaving its parenthesis, another
+# DELETE at the same depth, or a set operation means no own WHERE follows.
+_DELETE_SCOPE_TOKEN = re.compile(
+    r"(?P<open>\()|(?P<close>\))|(?P<where>\bWHERE\b)|(?P<delete>\bDELETE\s+FROM\b)"
+    r"|(?P<setop>\bUNION\b|\bEXCEPT\b|\bINTERSECT\b)", re.I)
+
+
+def _unqualified_delete(statement):
+    """Whether some DELETE FROM in the statement has no WHERE of its own.
+
+    Runs on lexed SQL, so comments, literals and quoted identifiers are
+    already blanked. Parenthesis depth keeps a WHERE in a preceding CTE, an
+    outer query or a RETURNING subquery from waiving the DELETE.
+    """
+    for match in DELETE_FROM.finditer(statement):
+        base = statement.count("(", 0, match.start()) - statement.count(")", 0, match.start())
+        depth = base
+        for token in _DELETE_SCOPE_TOKEN.finditer(statement, match.end()):
+            kind = token.lastgroup
+            if kind == "open":
+                depth += 1
+            elif kind == "close":
+                depth -= 1
+                if depth < base:
+                    return True
+            elif depth != base:
+                continue
+            elif kind == "where":
+                break
+            else:
+                # Another DELETE or a set operation at the DELETE's own
+                # depth: its own scope ended with no WHERE (fail closed).
+                return True
+        else:
+            return True
+    return False
 # A top-level DROP is safe only for an index; anything else (table, type,
 # view, function, trigger, policy, ...) refuses conservatively.
 TOP_LEVEL_DROP = re.compile(r"(?:^|\b(?:BEGIN|THEN|ELSE|LOOP|DO)\s+)DROP\s+(?!INDEX\b)", re.I)
@@ -224,7 +267,10 @@ def incompatible_code(sql):
         if TOP_LEVEL_DROP.search(statement):
             return "drop_object"
         for code, pattern in INCOMPATIBLE:
-            if pattern.search(statement):
+            if pattern is None:
+                if code == "delete_all_rows" and _unqualified_delete(statement):
+                    return code
+            elif pattern.search(statement):
                 return code
         for alter in ALTER_TABLE.finditer(statement):
             for action in actions(statement[alter.start():]):
