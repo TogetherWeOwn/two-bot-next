@@ -59,8 +59,11 @@ publish steps pin the action to one full commit SHA. The bot adapter
   live SHA or plan are established remain red without claiming a production
   change.
 
-`sbom-target`, `release-sbom` and `attach-sbom` build, scan and attach the
-SBOM assets to the digest release (`docs/supply-chain.md`).
+`sbom-target`, `release-sbom`, `verify-sbom` and `attach-sbom` build, scan,
+verify and attach the SBOM assets to the digest release
+(`docs/supply-chain.md`). Only `attach-sbom` holds a write token: target
+selection and source verification run read-only, and the write job runs no
+checkout and no repository script.
 
 There is no release PR, so there is nothing to regenerate, re-check, review or
 freeze `main` for. The version and notes come from commits that already passed
@@ -110,7 +113,9 @@ gh workflow run release.yml --ref main -f dry_run=true
 
 A dispatch with every input at its default selects no release path, so the
 `verdict` job fails the run and names the skipped jobs and why instead of
-reading green with nothing published.
+reading green with nothing published. A `release_tag` dispatch from any ref
+but `main` fails the same way and names the ref: publication runs from
+`main` only, while a `dry_run` dispatch may run from any ref.
 
 To move to a newer shared releaser, repin both `actions/calver` steps in
 `daily-digest.yml` to the same merged `TogetherWeOwn/.github` commit;

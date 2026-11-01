@@ -52,7 +52,7 @@ JOB_INVENTORY = {
                            "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
+    "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
     "daily-digest.yml": {"digest", "alert", "rollback-proof-watch"},
@@ -2539,15 +2539,21 @@ def release_errors(workflow):
 
     release.yml is dispatch-only with the dry_run and release_tag inputs
     (per-promote sha tagging is retired), and every job but the verdict is
-    input-guarded: an all-default dispatch skips sbom-target, release-sbom
-    and attach-sbom and would read green with nothing published. One verdict
-    job runs after all three (no input guard, always() so failures still
-    judge): it fails the run with an error naming the skipped jobs and why
-    when every input sits at its default, fails on any failed or cancelled
+    input-guarded: an all-default dispatch skips sbom-target, release-sbom,
+    verify-sbom and attach-sbom and would read green with nothing published.
+    One verdict job runs after all four (no input guard, always() so failures
+    still judge): it fails the run with an error naming the skipped jobs and
+    why when every input sits at its default, fails a release_tag publication
+    dispatched from any ref but main, fails on any failed or cancelled
     dependency, and passes otherwise, so the dry_run and release_tag
     dispatches behave exactly as before (their designed skips stay green).
     Every real job carries an explicit timeout: the SBOM plumbing
-    (sbom-target, attach-sbom) and the verdict 5 minutes.
+    (sbom-target, verify-sbom, attach-sbom) and the verdict 5 minutes.
+    Publication is main-only and the write token stays in attach-sbom alone:
+    sbom-target refuses a release_tag dispatch from another ref before any
+    write token exists, verify-sbom runs the source-verification script with
+    contents:read, and attach-sbom (contents:write, main-guarded) runs no
+    checkout and no repository script, only the asset upload.
     """
     name = "release.yml"
     errors = []
@@ -2571,17 +2577,49 @@ def release_errors(workflow):
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"sbom-target", "release-sbom", "attach-sbom", "verdict"}:
-        errors.append(f"{name}: jobs must be exactly sbom-target, release-sbom, attach-sbom and verdict")
+    if set(jobs) != {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"}:
+        errors.append(f"{name}: jobs must be exactly sbom-target, release-sbom, verify-sbom, attach-sbom and verdict")
         return errors
-    for job_id, expected_timeout in (("sbom-target", "5"), ("attach-sbom", "5")):
+    for job_id, expected_timeout in (("sbom-target", "5"), ("verify-sbom", "5"), ("attach-sbom", "5")):
         if jobs[job_id].get("timeout-minutes") != expected_timeout:
             errors.append(f"{name}:{job_id}: timeout must stay {expected_timeout} minutes")
+    main_ref = "github.ref == 'refs/heads/main'"
+    if main_ref not in str(jobs["sbom-target"].get("if") or ""):
+        errors.append(f"{name}:sbom-target: release_tag publication must stay main-guarded")
+    verify_sbom = jobs["verify-sbom"]
+    if verify_sbom.get("needs") != ["sbom-target", "release-sbom"]:
+        errors.append(f"{name}:verify-sbom: must run after sbom-target and release-sbom")
+    if "needs.release-sbom.result == 'success'" not in str(verify_sbom.get("if") or ""):
+        errors.append(f"{name}:verify-sbom: must only verify after a successful release-sbom")
+    if verify_sbom.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:verify-sbom: script execution must keep contents:read only")
+    if "release-sbom-target.py --verify-source" not in str(verify_sbom.get("steps") or ""):
+        errors.append(f"{name}:verify-sbom: must run the source-verification script")
+    attach = jobs["attach-sbom"]
+    if attach.get("needs") != ["sbom-target", "verify-sbom"]:
+        errors.append(f"{name}:attach-sbom: must run after sbom-target and verify-sbom")
+    # The !cancelled() wrapper drops GitHub's implicit success() guard, so
+    # the explicit success check is what keeps a failed/cancelled/skipped
+    # verification from ever scheduling the upload.
+    if "needs.verify-sbom.result == 'success'" not in str(attach.get("if") or ""):
+        errors.append(f"{name}:attach-sbom: must only upload after a successful verify-sbom")
+    if main_ref not in str(attach.get("if") or ""):
+        errors.append(f"{name}:attach-sbom: the write job must stay main-guarded")
+    attach_runs = "\n".join(str(step.get("run") or "") for step in attach.get("steps") or [])
+    if "git/ref/tags/" not in attach_runs or 'test "$obj_sha" = "$EXPECTED_SHA"' not in attach_runs:
+        errors.append(f"{name}:attach-sbom: must re-resolve the tag to the expected SHA before upload")
+    if attach.get("permissions") != {"contents": "write"}:
+        errors.append(f"{name}:attach-sbom: must keep contents:write only")
+    for step in attach.get("steps") or []:
+        if "actions/checkout" in str(step.get("uses") or ""):
+            errors.append(f"{name}:attach-sbom: the write job must not check out a ref")
+        if "scripts/" in str(step.get("run") or ""):
+            errors.append(f"{name}:attach-sbom: the write job must not run a repository script")
     verdict = jobs["verdict"]
     if verdict.get("name") != "release verdict (fail closed on empty dispatch)":
         errors.append(f"{name}:verdict: consumer job identity changed")
-    if verdict.get("needs") != ["sbom-target", "release-sbom", "attach-sbom"]:
-        errors.append(f"{name}:verdict: must run after sbom-target, release-sbom and attach-sbom")
+    if verdict.get("needs") != ["sbom-target", "release-sbom", "verify-sbom", "attach-sbom"]:
+        errors.append(f"{name}:verdict: must run after sbom-target, release-sbom, verify-sbom and attach-sbom")
     if verdict.get("if") != "${{ always() }}":
         errors.append(f"{name}:verdict: must run with if: always() so failures still judge")
     if verdict.get("permissions") != {"contents": "read"}:
@@ -2603,13 +2641,15 @@ def release_errors(workflow):
     step = steps[0]
     if step.get("env") != {"DRY_RUN": "${{ inputs.dry_run }}",
                            "RELEASE_TAG": "${{ inputs.release_tag }}",
+                           "DISPATCH_REF": "${{ github.ref }}",
                            "SBOM_TARGET_RESULT": "${{ needs.sbom-target.result }}",
                            "RELEASE_SBOM_RESULT": "${{ needs.release-sbom.result }}",
+                           "VERIFY_SBOM_RESULT": "${{ needs.verify-sbom.result }}",
                            "ATTACH_SBOM_RESULT": "${{ needs.attach-sbom.result }}"}:
         errors.append(f"{name}:verdict: step must bind exactly the dispatch inputs and job results "
                       "via the environment")
     run = str(step.get("run") or "")
-    for needle in ("DRY_RUN", "RELEASE_TAG", "skipped",
+    for needle in ("DRY_RUN", "RELEASE_TAG", "DISPATCH_REF", "refs/heads/main", "skipped",
                    "failure", "cancelled", "::error::"):
         if needle not in run:
             errors.append(f"{name}:verdict: missing pin {needle}")
