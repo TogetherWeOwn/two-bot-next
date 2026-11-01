@@ -1,7 +1,7 @@
 //! Channel handlers after shared-router adjudication. All HTTP uses ActionExecutor;
 //! the durable store owns replay, channel exclusion and exact overwrite recovery.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -109,16 +109,18 @@ pub enum ChannelResponseError {
     Edit,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChannelModerationRuntime {
     store: ChannelModerationStore,
     executor: ActionExecutor,
     /// Armed `/lockdown-preview` entries: in-memory only, gone on
-    /// consume/cancel/expiry/restart. Short critical sections, never held
-    /// across an await.
-    preview_pending: Mutex<PendingStore>,
+    /// consume/cancel/expiry/restart. Shared across clones so a spawned
+    /// responder observes the same pending set. Short critical sections,
+    /// never held across an await.
+    preview_pending: Arc<Mutex<PendingStore>>,
     /// Preview budget: in-memory sliding windows, reset on restart.
-    preview_limiter: Mutex<RateLimiter>,
+    /// Shared across clones like the pending set.
+    preview_limiter: Arc<Mutex<RateLimiter>>,
 }
 
 struct Request {
@@ -164,8 +166,8 @@ impl ChannelModerationRuntime {
         Self {
             store,
             executor,
-            preview_pending: Mutex::new(PendingStore::new()),
-            preview_limiter: Mutex::new(RateLimiter::new()),
+            preview_pending: Arc::new(Mutex::new(PendingStore::new())),
+            preview_limiter: Arc::new(Mutex::new(RateLimiter::new())),
         }
     }
 
