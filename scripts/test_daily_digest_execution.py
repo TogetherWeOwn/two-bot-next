@@ -122,6 +122,7 @@ class DigestExecutionTest(unittest.TestCase):
                 for name, value in JOB["outputs"].items()}
 
     def alerts(self, needs, dry_run=False, cancelled=False):
+        needs = {"needs.digest.result": "success", **needs}
         return gate(WORKFLOW["jobs"]["alert"]["if"], {**needs, "inputs.dry_run": dry_run}, cancelled)
 
     def planned(self, dry_run=False):
@@ -177,6 +178,27 @@ class DigestExecutionTest(unittest.TestCase):
         self.assertFalse(self.alerts(needs, dry_run=True))
         self.assertFalse(gate(DISPATCH["if"], context))
         self.assertIn(SHA[:7], self.file_incident(needs))
+
+    def test_failed_plan_step_alerts_without_classification(self):
+        # The shared plan step (or adapt) crashed before classification, so
+        # prod_changed was never written, but resolve proved the live SHA.
+        context = {"steps.resolve.outputs.live_sha": SHA, "inputs.dry_run": False,
+                   "secrets.GITHUB_TOKEN": "fixture", "github.repository": "o/r"}
+        needs = self.job_outputs(context)
+        self.assertEqual(needs["needs.digest.outputs.prod_changed"], "")
+        self.assertEqual(needs["needs.digest.outputs.live_sha"], SHA)
+        failed = {**needs, "needs.digest.result": "failure"}
+        self.assertTrue(self.alerts(failed))
+        self.assertFalse(self.alerts(failed, cancelled=True))
+        self.assertFalse(self.alerts(failed, dry_run=True))
+        # A green digest with nothing classified never alerts, nor does a
+        # failure that never resolved the live SHA (nothing to prove).
+        self.assertFalse(self.alerts(needs))
+        self.assertFalse(self.alerts({**failed, "needs.digest.outputs.live_sha": ""}))
+        # Adapt never ran (skipped after the plan failure), so no dispatch.
+        context["steps.digest.outcome"] = "skipped"
+        self.assertFalse(gate(DISPATCH["if"], context))
+        self.assertIn(SHA[:7], self.file_incident(failed))
 
     def test_failed_publication_keeps_latest_sbom_dispatch(self):
         # Latest lacks assets and today's publish fails: the alert fires and

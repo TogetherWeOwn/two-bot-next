@@ -2575,7 +2575,8 @@ def daily_digest_errors(workflow):
     plans and publishes through the shared CalVer action (both steps pinned to
     one full TogetherWeOwn/.github commit) around the daily-digest.cjs
     adapter, and dispatches the SBOM chain for the fresh or existing release. The alert job consumes owed-digest outputs even
-    on a failed publication and opens the `daily-digest` incident issue with
+    on a failed publication, or a digest job that failed before classification
+    with a proven live SHA, and opens the `daily-digest` incident issue with
     the job token (issues: write), no environment or secret.
     """
     name = "daily-digest.yml"
@@ -2641,10 +2642,12 @@ def daily_digest_errors(workflow):
     alert = jobs["alert"]
     if alert.get("needs") != "digest":
         errors.append(f"{name}:alert: must wait for the digest job")
-    expected_alert_if = ("${{ !cancelled() && "
-                         "needs.digest.outputs.prod_changed == 'true' && "
-                         "needs.digest.outputs.released != 'true' && "
-                         "inputs.dry_run != true }}")
+    expected_alert_if = ("${{ !cancelled() && inputs.dry_run != true && "
+                         "((needs.digest.outputs.prod_changed == 'true' && "
+                         "needs.digest.outputs.released != 'true') || "
+                         "(needs.digest.result == 'failure' && "
+                         "needs.digest.outputs.prod_changed == '' && "
+                         "needs.digest.outputs.live_sha != '')) }}")
     if alert.get("if") != expected_alert_if:
         errors.append(f"{name}:alert: must consume owed-digest outputs even on failure, "
                       "never on a dry run")

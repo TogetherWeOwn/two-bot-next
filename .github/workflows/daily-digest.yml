@@ -8,8 +8,10 @@ name: daily-digest
 # as green skips with no tag. The bot adapter (.github/scripts/daily-digest.cjs)
 # keeps the live-SHA proof, the missing-digest alert outputs, Release repair
 # and the SBOM dispatch/redispatch. A failed publish retains its owed-digest
-# outputs so `alert` can open the `daily-digest` incident issue for an agent.
-# Dry runs plan and publish with zero writes and never alert.
+# outputs so `alert` can open the `daily-digest` incident issue for an agent;
+# a plan or adapt crash before classification alerts on the failed digest job
+# with its proven live SHA instead. Dry runs plan and publish with zero writes
+# and never alert.
 #
 # Resolve the live /readyz build revision through PRODUCTION_WORKER_URL,
 # falling back to the newest successful recorded production Deployment.
@@ -141,9 +143,11 @@ jobs:
     needs: digest
     # The adapter emits prod_changed=true/released=false before the publish
     # step; record overwrites released on success. Consume outputs even when
-    # publication failed; SBOM-only failures have released=true.
+    # publication failed; SBOM-only failures have released=true. A plan or
+    # adapt crash before classification never writes prod_changed, so also
+    # alert when the digest job failed after resolve proved the live SHA.
     # Quiet days, rollbacks, already-cut releases and dry runs never alert.
-    if: ${{ !cancelled() && needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true' && inputs.dry_run != true }}
+    if: ${{ !cancelled() && inputs.dry_run != true && ((needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true') || (needs.digest.result == 'failure' && needs.digest.outputs.prod_changed == '' && needs.digest.outputs.live_sha != '')) }}
     permissions:
       contents: read
       issues: write # open or comment on the daily-digest incident issue
