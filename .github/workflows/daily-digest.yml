@@ -3,8 +3,8 @@ name: daily-digest
 # Daily digest release (docs/releases.md): one tag vYYYY.MM.DD per day,
 # covering the live production commit with notes from Conventional Commit
 # subjects since the previous digest. Quiet days and rollbacks get no tag.
-# A failed cut or repair retains its owed-digest outputs so `alert` can post
-# through the existing Discord synthetic-alert line. Dry runs never alert.
+# A failed cut or repair retains its owed-digest outputs so `alert` can open
+# the `daily-digest` incident issue for an agent. Dry runs never alert.
 #
 # Resolve the live /readyz build revision through PRODUCTION_WORKER_URL,
 # falling back to the newest successful recorded production Deployment.
@@ -34,7 +34,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    environment: synthetic-alerts
+      issues: write # open or close the staging-rollback-proof incident issue
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rollback-proof-watch') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
@@ -45,7 +45,7 @@ jobs:
       - name: Check daily rollback proof freshness independently of the digest
         env:
           GH_TOKEN: ${{ github.token }}
-          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/rollback_proof.py watch
 
   digest:
@@ -104,7 +104,7 @@ jobs:
     if: ${{ !cancelled() && needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true' && inputs.dry_run != true }}
     permissions:
       contents: read
-    environment: synthetic-alerts
+      issues: write # open or comment on the daily-digest incident issue
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'alert') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
@@ -113,9 +113,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: Alert the ops channel about the missing digest
+      - name: File the incident issue for the missing digest
         env:
-          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.run_id }}
           LIVE_SHA: ${{ needs.digest.outputs.live_sha }}
           PREV_TAG: ${{ needs.digest.outputs.prev_tag }}

@@ -401,7 +401,7 @@ if one cannot fit, split it again without dropping its controls. None created he
 
 All new behavior stays dark until schema/provenance/erasure, private UX, dispatch
 and fallback are jointly verified; partially merged foundations grant no reads.
-Ordinary CI, independent Paperclip Review and per-builder CISO gates still apply.
+Ordinary CI, CodeRabbit, Devin Review and per-builder CISO gates still apply.
 Staging fixtures only, never real production tickets. Future auto-close work owns
 its lifecycle; no timer or warning becomes a transcript-delivery grant here.
 
