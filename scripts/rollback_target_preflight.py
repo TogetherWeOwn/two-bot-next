@@ -23,7 +23,8 @@ still fits the candidate's schema before the deploy:
    schema after a rollback (a Worker rollback never undoes schema). A
    statement that drops or renames an object, changes a column type, adds a
    NOT NULL constraint (or a NOT NULL column without a default), drops a
-   default, truncates or revokes refuses, unless the file carries a reviewed
+   default, truncates, deletes all rows or revokes refuses, unless the file
+   carries a reviewed
    `-- rollback-compatible: <reason>` line. A rewritten or deleted migration
    always refuses. The serving SHA must be an ancestor of the candidate.
 
@@ -79,6 +80,12 @@ INCOMPATIBLE = (
     ("set_not_null", re.compile(r"\bSET\s+NOT\s+NULL\b", re.I)),
     ("drop_default", re.compile(r"\bDROP\s+DEFAULT\b", re.I)),
     ("truncate", re.compile(r"\bTRUNCATE\b", re.I)),
+    # An unqualified DELETE empties the table like TRUNCATE. The negative
+    # lookahead waives only a DELETE whose own remainder names WHERE, so a
+    # WHERE in a preceding CTE does not excuse it; comments, literals and
+    # quoted identifiers are already blanked by lex, and case/whitespace are
+    # normalized the same way as the other patterns.
+    ("delete_all_rows", re.compile(r"\bDELETE\s+FROM\b(?![\s\S]*\bWHERE\b)", re.I)),
     ("revoke", re.compile(r"\bREVOKE\b", re.I)),
 )
 # A top-level DROP is safe only for an index; anything else (table, type,

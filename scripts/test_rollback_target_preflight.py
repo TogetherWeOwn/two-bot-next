@@ -113,6 +113,12 @@ class IncompatibleCodeTests(unittest.TestCase):
             "ALTER TABLE t ALTER COLUMN c SET NOT NULL;": "set_not_null",
             "ALTER TABLE t ALTER COLUMN c DROP DEFAULT;": "drop_default",
             "TRUNCATE t;": "truncate",
+            "DELETE FROM t;": "delete_all_rows",
+            "delete from t;": "delete_all_rows",
+            "DELETE\nFROM t;": "delete_all_rows",
+            "DELETE FROM ONLY t;": "delete_all_rows",
+            "DELETE FROM t RETURNING *;": "delete_all_rows",
+            "/* cleanup */ DELETE FROM t;": "delete_all_rows",
             "REVOKE SELECT ON t FROM app;": "revoke",
             "ALTER TABLE t ADD COLUMN c bigint NOT NULL;": "add_not_null_column_without_default",
             # PostgreSQL lets COLUMN be omitted.
@@ -169,6 +175,14 @@ class IncompatibleCodeTests(unittest.TestCase):
             "ALTER TABLE t ALTER COLUMN c SET DEFAULT 0, ADD COLUMN d int NOT NULL DEFAULT 1;",
             'CREATE TABLE "drop" (id bigint);',
             "DROP INDEX CONCURRENTLY IF EXISTS t_old;",
+            "DELETE FROM t WHERE id = 1;",
+            "delete from t using u where t.id = u.id;",
+            "DELETE FROM ONLY t WHERE id = 1 RETURNING *;",
+            "DELETE FROM t WHERE id IN (SELECT id FROM u);",
+            # A DELETE trigger event deletes nothing: defining the trigger
+            # must not block a promotion.
+            "CREATE TRIGGER watch BEFORE DELETE ON members FOR EACH ROW "
+            "EXECUTE FUNCTION log_change();",
             # A TRUNCATE trigger event truncates nothing: defining the
             # trigger must not block a promotion.
             "CREATE TRIGGER watch BEFORE TRUNCATE ON members FOR EACH STATEMENT "
@@ -232,6 +246,24 @@ class MigrationFindingTests(unittest.TestCase):
                         "-- rollback-compatible: x         \nDROP TABLE x;\n")
         self.assertEqual(self.findings(self.repo.commit("padded"))[1],
                          [{"migration": "0002_drop.sql", "code": "drop_object"}])
+
+    def test_unqualified_delete_refuses_unless_reviewed(self):
+        self.repo.write("crates/store/migrations/0002_wipe.sql", "DELETE FROM t;\n")
+        self.assertEqual(self.findings(self.repo.commit("wipe"))[1],
+                         [{"migration": "0002_wipe.sql", "code": "delete_all_rows"}])
+        self.repo.write("crates/store/migrations/0002_wipe.sql",
+                        "DELETE FROM t WHERE id = 1;\n")
+        checked, refusals = self.findings(self.repo.commit("scoped"))
+        self.assertEqual(checked, ["0002_wipe.sql"])
+        self.assertEqual(refusals, [])
+        self.repo.write("crates/store/migrations/0002_wipe.sql",
+                        "-- rollback-compatible: table holds only rebuildable cache rows\n"
+                        "DELETE FROM t;\n")
+        self.assertEqual(self.findings(self.repo.commit("reviewed"))[1], [])
+        self.repo.write("crates/store/migrations/0002_wipe.sql",
+                        "-- rollback-compatible: x         \nDELETE FROM t;\n")
+        self.assertEqual(self.findings(self.repo.commit("padded"))[1],
+                         [{"migration": "0002_wipe.sql", "code": "delete_all_rows"}])
 
     def test_rewritten_or_deleted_migration_refuses(self):
         self.repo.write("crates/store/migrations/0001_base.sql", "CREATE TABLE t (id int);\n")
