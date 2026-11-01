@@ -213,3 +213,78 @@ pub fn render_page(
     }
     Ok(content)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUILD: &str = "100000000000000001";
+    const CHANNEL: &str = "100000000000000002";
+
+    fn cursor(id: &str) -> ListCursor {
+        ListCursor {
+            created_at: OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap(),
+            id: id.to_owned(),
+        }
+    }
+
+    /// Correctly signed, so only the structural checks can refuse it.
+    fn signed(mut payload: Vec<u8>) -> String {
+        let tag = cursor_mac(GUILD, CHANNEL, &payload).finalize().into_bytes();
+        payload.extend(tag);
+        URL_SAFE_NO_PAD.encode(payload)
+    }
+
+    fn payload(version: u8, id_bytes: &[u8]) -> Vec<u8> {
+        let mut payload = vec![version];
+        payload.extend(1_767_225_600_000_000_000i128.to_be_bytes());
+        payload.extend(id_bytes);
+        payload
+    }
+
+    #[test]
+    fn shortest_and_longest_ids_round_trip_in_scope_only() {
+        let longest = "é".repeat(crate::commands::MAX_RESOURCE_ID_CHARS);
+        for id in ["a", longest.as_str()] {
+            let token = cursor(id).encode(GUILD, CHANNEL);
+            assert!(token.len() <= MAX_CURSOR_LEN);
+            let decoded = ListCursor::decode(&token, GUILD, CHANNEL).unwrap();
+            assert_eq!(decoded.id, id);
+            assert_eq!(decoded.created_at, cursor(id).created_at);
+            assert!(ListCursor::decode(&token, CHANNEL, CHANNEL).is_none());
+            assert!(ListCursor::decode(&token, GUILD, GUILD).is_none());
+        }
+    }
+
+    #[test]
+    fn signed_but_malformed_payloads_are_refused() {
+        assert!(ListCursor::decode(&signed(payload(1, &[0, b'a'])), GUILD, CHANNEL).is_some());
+        // Unknown version.
+        assert!(ListCursor::decode(&signed(payload(2, &[0, b'a'])), GUILD, CHANNEL).is_none());
+        // A dangling half UTF-16 unit.
+        assert!(
+            ListCursor::decode(&signed(payload(1, &[0, b'a', 0, b'b', 0])), GUILD, CHANNEL)
+                .is_none()
+        );
+        // A lone surrogate.
+        assert!(ListCursor::decode(&signed(payload(1, &[0xd8, 0])), GUILD, CHANNEL).is_none());
+        // Empty ID.
+        assert!(ListCursor::decode(&signed(payload(1, &[])), GUILD, CHANNEL).is_none());
+        // Timestamp outside the supported range.
+        let mut far = payload(1, &[0, b'a']);
+        far[1..17].copy_from_slice(&i128::MAX.to_be_bytes());
+        assert!(ListCursor::decode(&signed(far), GUILD, CHANNEL).is_none());
+    }
+
+    #[test]
+    fn tampered_and_oversized_tokens_are_refused() {
+        let token = cursor("post").encode(GUILD, CHANNEL);
+        let mut bytes = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        let tampered = URL_SAFE_NO_PAD.encode(bytes);
+        assert!(ListCursor::decode(&tampered, GUILD, CHANNEL).is_none());
+        assert!(ListCursor::decode("", GUILD, CHANNEL).is_none());
+        assert!(ListCursor::decode(&"A".repeat(MAX_CURSOR_LEN + 1), GUILD, CHANNEL).is_none());
+    }
+}
