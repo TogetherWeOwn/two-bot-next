@@ -1176,9 +1176,8 @@ impl ChannelModerationRuntime {
         };
         let mut request =
             confirm_request_row(interaction, &guild, &channel, presser, &pending, &at);
-        Ok(self
-            .enter_mutation_path(ModerationAction::Lockdown, &mut request, Some(expected))
-            .await?)
+        self.enter_mutation_path(ModerationAction::Lockdown, &mut request, Some(expected))
+            .await
     }
 
     /// Run one prepared call. Purge is split into its two phases: a failed

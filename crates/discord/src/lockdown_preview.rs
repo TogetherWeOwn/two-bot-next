@@ -323,10 +323,9 @@ pub fn parse_preview_custom_id(custom_id: &str) -> Option<PreviewPress> {
     let (is_confirm, rest) =
         if let Some(rest) = custom_id.strip_prefix(LOCKDOWN_PREVIEW_CONFIRM_PREFIX) {
             (true, rest)
-        } else if let Some(rest) = custom_id.strip_prefix(LOCKDOWN_PREVIEW_CANCEL_PREFIX) {
-            (false, rest)
         } else {
-            return None;
+            let rest = custom_id.strip_prefix(LOCKDOWN_PREVIEW_CANCEL_PREFIX)?;
+            (false, rest)
         };
     let (actor, digest32) = rest.split_once(':')?;
     let actor: u64 = actor.parse().ok()?;
