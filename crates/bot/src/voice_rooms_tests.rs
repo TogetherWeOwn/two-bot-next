@@ -13922,6 +13922,29 @@ async fn a_pool_too_small_to_vary_keeps_the_drawn_seed() {
 }
 
 #[tokio::test]
+async fn voice_name_reload_refreshes_the_cached_creation_switch() {
+    // An out-of-process writer (the operator CLI applying a file with
+    // `creation_enabled: false`) cannot push `AccessChanged`, so the
+    // periodic snapshot reload must converge the worker's cached gates.
+    let (live, mut store, http, _) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    *store.config.lock().unwrap() = empty_config();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(may_create_room(&worker.access));
+    worker
+        .store
+        .config
+        .lock()
+        .unwrap()
+        .settings
+        .creation_enabled = false;
+    worker.store.config.lock().unwrap().settings.command_role_id = Some(MENTION_ROLE.to_string());
+    worker.reload_name_settings(0).await;
+    assert!(!may_create_room(&worker.access));
+    assert_eq!(worker.access.required_role, Some(MENTION_ROLE));
+}
+
+#[tokio::test]
 async fn voice_name_reload_rerenders_unchanged_facts_after_list_edit() {
     let (live, mut store, http, trace) = fixture();
     store.snapshot_uses_creator_rows = false;
@@ -14292,6 +14315,32 @@ async fn a_confirmed_import_hands_its_settings_to_the_worker() {
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     let (settings, _) = runtime.naming_probe(GUILD).await.expect("probe");
     assert_eq!(settings, NameSettings::from_config(&full_config()));
+}
+
+#[test]
+fn imported_settings_map_to_the_runtime_gates() {
+    // The values a confirmed import hands the worker: creation switch,
+    // guild-wide command role and per-command restrictions, in the shape
+    // `may_create_room` / `may_use_command` read.
+    let mut config = empty_config();
+    config.settings.creation_enabled = false;
+    config.settings.command_role_id = Some(MENTION_ROLE.to_string());
+    config.settings.command_roles = vec![config_codec::CommandRoles {
+        command: "kick".to_owned(),
+        role_ids: vec![MENTION_ROLE.to_string()],
+    }];
+    assert_eq!(
+        import_access_controls(&config),
+        Some(AccessControls {
+            room_creation_enabled: false,
+            required_role: Some(MENTION_ROLE),
+            command_roles: BTreeMap::from([("kick".to_owned(), vec![MENTION_ROLE])]),
+        })
+    );
+    // A value the planner would never let through maps to nothing, so the
+    // worker keeps its previous controls instead of a half-built set.
+    config.settings.command_role_id = Some("not-a-role".to_owned());
+    assert_eq!(import_access_controls(&config), None);
 }
 
 #[tokio::test]
