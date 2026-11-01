@@ -159,10 +159,14 @@ or remove hashes to force an incompatible graph.
 Regenerating the lockfile (CPython 3.11 / Linux x86_64, Bookworm glibc):
 
 ```sh
+SCRATCH="${SCRATCH:-$(mktemp -d)}"
+mkdir -p "$SCRATCH/wheels" "$SCRATCH/installed"
+
 # 1. Resolve the newest Semgrep-compatible graph. The certifi floor keeps the
 #    GHSA-6q48-6c7w-9gw2 fix even if an older Semgrep is ever resolved.
 printf 'semgrep\ncertifi>=2026.10.19\n' > "$SCRATCH/in.txt"
-uv pip compile --python-version 3.11 --only-binary :all: --no-emit-index-url \
+uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_36 \
+  --only-binary :all: --no-emit-index-url \
   "$SCRATCH/in.txt" -o "$SCRATCH/versions.txt"
 # Keep only the bare name==version lines as the download input.
 
@@ -191,9 +195,11 @@ PYTHONPATH="$SCRATCH/installed" python3.11 scripts/ci/check-semgrep-trust-store.
 ```
 
 Bounded mitigation: use this environment only for the existing one-shot
-`semgrep scan` with vendored rules. Do not start an MCP/Streamable HTTP server
-or an inbound instrumented HTTP service with it. Those are the inbound paths
-these advisories require; this is a reachability assessment, not a claim that
+`semgrep scan` with vendored rules. Do not use it as an MCP client or server
+(including Streamable HTTP/SSE transports) or as an inbound instrumented HTTP
+service. The advisories cover MCP server, MCP client-transport and
+schema-validation, and inbound trace-header paths; the existing scan exercises
+none of them. This is a reachability assessment, not a claim that
 the packages are patched. CI maintainers must re-check upstream constraints by
 **2026-11-16** and upgrade the compatible graph when available. Reassess sooner
 if scanner invocation or advisory scope changes. No scan gate or permission
