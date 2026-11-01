@@ -4,12 +4,14 @@ Status: **Deferred to 2026-12** (owner decision 2026-11-01). This is now the
 single RSVP-policy spec: it absorbs [registration
 cutoff](rsvp-registration-cutoff-spec.md) and
 [withdrawal](rsvp-withdrawal-spec.md), which fence the same `event_rsvps` row.
-Design all three as one build when the events-and-RSVP theme is picked up.
-Original proposal: written 2026-10-23. No runtime, command, test, migration,
-permission or configuration changes are included. Merging this document does not
-enable seats or authorize build work. This file is the repository source of
-truth; review documents bind its commit and SHA-256 rather than maintaining a
-second independently editable contract.
+Design all three as one build when the events-and-RSVP theme is picked up. Where
+the absorbed specs disagree (for example, whether a registration cutoff needs
+seat mode or can stand alone), the merged design settles one scope and rollout
+contract before any build. Original proposal: written 2026-10-23. No runtime,
+command, test, migration, permission or configuration changes are included.
+Merging this document does not enable seats or authorize build work. This file
+is the repository source of truth; review documents bind its commit and SHA-256
+rather than maintaining a second independently editable contract.
 
 ## 1. Outcome, evidence and decision boundary
 
