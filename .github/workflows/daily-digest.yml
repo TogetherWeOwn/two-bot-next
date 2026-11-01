@@ -122,13 +122,17 @@ jobs:
           GH_REPO: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: node .github/scripts/daily-digest.cjs record
-      - name: Dispatch the SBOM chain for the digest tag
-        if: steps.record.outputs.sbom_tag != '' || steps.digest.outputs.sbom_tag != ''
+      - name: Dispatch the SBOM chain for each owed digest tag
+        if: steps.record.outputs.sbom_tags != '' || steps.digest.outputs.sbom_tags != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.record.outputs.sbom_tag || steps.digest.outputs.sbom_tag }}
-        run: gh workflow run release.yml --ref main -f release_tag="$TAG"
+          # Adapter-validated vX.Y.Z names, space-separated; dispatch each once.
+          TAGS: ${{ format('{0} {1}', steps.digest.outputs.sbom_tags, steps.record.outputs.sbom_tags) }}
+        run: |
+          for tag in $(printf '%s\n' $TAGS | sort -u); do
+            gh workflow run release.yml --ref main -f release_tag="$tag"
+          done
 
   alert:
     name: alert on a missing digest

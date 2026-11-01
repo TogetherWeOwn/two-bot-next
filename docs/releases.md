@@ -19,10 +19,15 @@ publish steps pin the action to one full commit SHA. The bot adapter
 - **Quiet day** (production matches the newest stable tag), **rollback**
   (production is older than, or diverged from, the newest stable tag) and
   **already published today**: the planner returns a classified green skip
-  and nothing is tagged. When the Latest release lacks its SBOM assets (a lost
-  dispatch), the adapter redispatches the idempotent SBOM chain for it, so a
-  green rerun the next morning restores the inventories no later run would
-  backfill. A lookup failure stays green without dispatching.
+  and nothing is tagged. The planner recovers a SHA's earlier plan before
+  those checks, so production still on (or rolled back to) a CalVer digest
+  comes back as that digest's plan. When its Release exists the adapter
+  treats the day as a skip too and never re-publishes it.
+- **SBOM reconciliation:** every non-dry run checks the Latest release (and a
+  replayed or repaired digest) for its SBOM assets and redispatches the
+  idempotent SBOM chain once per tag that lacks them, so a green rerun the
+  next morning restores the inventories no later run would backfill. A
+  lookup failure stays green without dispatching.
 - **Stalled production:** on a quiet day where the Latest release is more
   than three days old and `main` is ahead of the live SHA, the run writes a
   warning annotation and a step summary naming the live SHA, the tag and the
@@ -38,9 +43,12 @@ publish steps pin the action to one full commit SHA. The bot adapter
 - **Retry of the same build:** the plan operation is `daily-digest/<sha>`, so a
   retry for the same live SHA recovers its frozen plan (same version, even
   across midnight) instead of allocating a new one. A tag whose Release
-  creation failed is finished by the retry (`repair: true`). An exact replay
-  of a complete digest is idempotent and redispatches SBOM only when the
-  release lacks assets.
+  creation failed is finished by the retry (`repair: true`).
+- **Unfinished tag, production moved on:** when today's CalVer tag exists
+  without its Release and production has since moved, the planner skips the
+  new SHA as already published. The adapter then reads today's tag
+  annotation and finishes that tag from its own frozen plan with
+  `repair: true`. It never retargets the tag or cuts a second one.
 - **Publication fails:** the adapter records `prod_changed=true` and
   `released=false` before the publish step. The `alert` job consumes those
   outputs even on failure and opens (or comments on) the one `daily-digest`
@@ -109,15 +117,17 @@ To move to a newer shared releaser, repin both `actions/calver` steps in
 ## Offline verification
 
 `scripts/test-daily-digest.cjs` (worker CI) runs each adapter mode against a
-mocked `gh`: the SHA-bound plan request, the publish request (exact plan,
-`repair`, dry-run flag), every classified skip, SBOM redispatch for missing
-assets (complete assets and lookup failures stay green), the stalled-production
-warning and its silent cases, the record step for fresh, replayed and dry-run
-publications, and invalid inputs. `scripts/test_daily_digest_execution.py`
+fixture `gh`: the SHA-bound plan request, the publish request (exact plan,
+`repair`, dry-run flag), every classified skip, completed replays (no
+re-publish, both Latest and the replayed tag reconciled), the
+unfinished-today repair from the tag annotation and its fall-through cases,
+SBOM redispatch for missing assets (complete assets and lookup failures stay
+green), the stalled-production warning and its silent cases, the record step
+for fresh, replayed and dry-run publications, and invalid inputs. `scripts/test_daily_digest_execution.py`
 runs the adapter through the workflow's own step bindings and expressions: a
 failed publication reaches the alert gate and the incident issue, a fresh
-release dispatches `release.yml`, skips never alert, and dry runs publish
-nothing. `scripts/test_digest_resolve.py` executes
+release dispatches `release.yml`, owed tags dispatch once each, skips never
+alert, and dry runs publish nothing. `scripts/test_digest_resolve.py` executes
 `scripts/digest_resolve.py` with offline readyz/Deployment fixtures, including
 automatic rows before recorded rows, failure statuses, malformed bodies, HTTPS
 refusal, 503 revisions and fail-closed behavior. `scripts/test_digest_alert.py`

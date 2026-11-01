@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -24,6 +25,9 @@ ALERT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ALERT)
 CALVER = "TogetherWeOwn/.github/actions/calver@"
 SHA = "b" * 40
+VIEW = "release view {} --json tagName,assets,publishedAt"
+ASSETS = [{"name": name} for name in (
+    "rust-workspace.cdx.json", "container-image.cdx.json", "SHA256SUMS", "source-sha.txt", "image-id.txt")]
 
 
 def gate(expression, values, cancelled=False):
@@ -49,11 +53,16 @@ class DigestExecutionTest(unittest.TestCase):
             "#!" + shutil.which("python3") + "\n"
             "import json, os, sys\n"
             "with open(os.environ['GH_CALLS'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "fixtures = json.loads(os.environ.get('GH_FIXTURES', '{}'))\n"
+            "key = ' '.join(sys.argv[1:])\n"
+            "if key in fixtures:\n"
+            "    print(json.dumps(fixtures[key]))\n"
+            "    sys.exit(0)\n"
             "if sys.argv[1:3] == ['release', 'view']:\n"
             "    view = os.environ.get('RELEASE_VIEW_JSON')\n"
             "    print(view or '')\n"
             "    sys.exit(0 if view else 1)\n"
-            "sys.exit(0)\n"
+            "sys.exit(0 if sys.argv[1:3] == ['workflow', 'run'] else 1)\n"
         )
         gh.chmod(0o755)
         # Never inherit a host credential, GITHUB_OUTPUT or DRY_RUN.
@@ -81,6 +90,18 @@ class DigestExecutionTest(unittest.TestCase):
             outputs[f"steps.{step_id}.outputs.{key}"] = value
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         return result, outputs, calls
+
+    def dispatch(self, context):
+        """Run the dispatch step's loop with TAGS built as its format() binding does."""
+        self.assertEqual(DISPATCH["env"]["TAGS"], "${{ format('{0} {1}', steps.digest.outputs.sbom_tags, "
+                                                 "steps.record.outputs.sbom_tags) }}")
+        tags = "{0} {1}".format(context.get("steps.digest.outputs.sbom_tags", ""),
+                                context.get("steps.record.outputs.sbom_tags", ""))
+        self.calls.write_text("")
+        done = subprocess.run(["bash", "-euc", DISPATCH["run"]], cwd=self.dir,
+                              env={**self.env, "TAGS": tags}, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
 
     def job_outputs(self, context):
         return {f"needs.digest.outputs.{name}": gate(value, context)
@@ -160,12 +181,8 @@ class DigestExecutionTest(unittest.TestCase):
         self.assertEqual(needs["needs.digest.outputs.tag_name"], "v2026.1101.0")
         self.assertFalse(self.alerts(needs))
         self.assertTrue(gate(DISPATCH["if"], context))
-        tag = gate(DISPATCH["env"]["TAG"], context)
-        dispatched = subprocess.run(["bash", "-euc", DISPATCH["run"]], cwd=self.dir,
-                                    env={**self.env, "TAG": tag}, capture_output=True, text=True)
-        self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
-        last = json.loads(self.calls.read_text().splitlines()[-1])
-        self.assertEqual(last, ["workflow", "run", "release.yml", "--ref", "main", "-f", "release_tag=v2026.1101.0"])
+        self.assertEqual(self.dispatch(context), [
+            ["workflow", "run", "release.yml", "--ref", "main", "-f", "release_tag=v2026.1101.0"]])
 
     def test_skips_never_alert_and_redispatch_missing_assets(self):
         partial = json.dumps({"tagName": "v2026.10.23", "assets": [{"name": "SHA256SUMS"}],
@@ -181,8 +198,69 @@ class DigestExecutionTest(unittest.TestCase):
                 self.assertFalse(gate(STEPS["publish"]["if"], context))
                 self.assertFalse(self.alerts(self.job_outputs(context)))
                 self.assertTrue(gate(DISPATCH["if"], context))
-                self.assertEqual(gate(DISPATCH["env"]["TAG"], context), "v2026.10.23")
                 self.assertFalse(any(call[:2] == ["release", "create"] for call in calls))
+                self.assertEqual(self.dispatch(context), [
+                    ["workflow", "run", "release.yml", "--ref", "main", "-f", "release_tag=v2026.10.23"]])
+
+    def test_latest_and_published_tags_dispatch_once_each(self):
+        # Latest lacks assets and the fresh publication is a second tag: both
+        # dispatch; a tag owed twice dispatches once.
+        context = {"steps.digest.outputs.sbom_tags": "v2026.1101.0",
+                   "steps.record.outputs.sbom_tags": "v2026.1102.0"}
+        self.assertEqual([call[-1] for call in self.dispatch(context)],
+                         ["release_tag=v2026.1101.0", "release_tag=v2026.1102.0"])
+        context["steps.record.outputs.sbom_tags"] = "v2026.1101.0"
+        self.assertEqual([call[-1] for call in self.dispatch(context)], ["release_tag=v2026.1101.0"])
+
+    def test_completed_replay_neither_publishes_nor_alerts(self):
+        # Production stays on (or rolls back to) an already-published CalVer
+        # digest: the planner recovers its plan, the Release exists.
+        self.env["GH_FIXTURES"] = json.dumps({VIEW.format("v2026.1101.0"): {
+            "tagName": "v2026.1101.0", "assets": ASSETS, "publishedAt": "2026-11-01T12:00:00Z"}})
+        context = self.planned()
+        self.assertEqual(context["steps.digest.outputs.publish"], "false")
+        self.assertEqual(context["steps.digest.outputs.prod_changed"], "false")
+        self.assertFalse(gate(STEPS["publish"]["if"], context))
+        needs = self.job_outputs(context)
+        self.assertEqual(needs["needs.digest.outputs.released"], "false")
+        self.assertFalse(self.alerts(needs))
+        self.assertFalse(gate(DISPATCH["if"], context))
+
+    def test_unfinished_tag_is_finished_from_its_frozen_plan(self):
+        # Today's tag lost its Release, then production moved: the planner
+        # skips the new SHA, and the adapter repairs the old tag's own plan.
+        today = time.gmtime()
+        tag = f"v{today.tm_year}.{today.tm_mon}{today.tm_mday:02d}.0"
+        frozen = {"schema": "calver-plan-v1", "sha": "a" * 40, "policy": "live-digest",
+                  "tag": tag, "previousStableTag": "v2026.10.23", "id": "y"}
+        self.env["GH_FIXTURES"] = json.dumps({
+            f"api repos/o/r/git/matching-refs/tags/{tag[:-1]}": [
+                {"ref": f"refs/tags/{tag}", "object": {"type": "tag", "sha": "f" * 40}}],
+            "api repos/o/r/git/tags/" + "f" * 40: {
+                "message": "calver-plan-v1\n" + json.dumps({**frozen, "publicationEvidence": None})},
+        })
+        context = {"steps.resolve.outputs.live_sha": SHA, "steps.plan.outputs.skipped": "true",
+                   "steps.plan.outputs.reason": "digest-already-published", "inputs.dry_run": False,
+                   "github.repository": "o/r", "secrets.GITHUB_TOKEN": "fixture"}
+        result, outputs, calls = self.step("digest", context)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        context.update(outputs)
+        self.assertTrue(gate(STEPS["publish"]["if"], context))
+        publish = json.loads(context["steps.digest.outputs.publish_request"])
+        self.assertEqual(publish, {"phase": "publish", "plan": frozen, "dryRun": False, "repair": True})
+        self.assertIn(["release", "view", tag, "--json", "tagName,assets,publishedAt"], calls)
+        # A failed repair is owed work: it reaches the alert gate.
+        needs = self.job_outputs(context)
+        self.assertEqual(needs["needs.digest.outputs.prod_changed"], "true")
+        self.assertEqual(needs["needs.digest.outputs.prev_tag"], "v2026.10.23")
+        self.assertTrue(self.alerts(needs))
+        # A successful repair of an existing tag records and dispatches SBOM.
+        context.update({"steps.publish.outputs.created": "true", "steps.publish.outputs.tag": tag})
+        result, outputs, _ = self.step("record", context)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        context.update(outputs)
+        self.assertFalse(self.alerts(self.job_outputs(context)))
+        self.assertEqual([call[-1] for call in self.dispatch(context)], [f"release_tag={tag}"])
 
     def test_dry_run_publishes_nothing_and_never_alerts(self):
         context = self.planned(dry_run=True)

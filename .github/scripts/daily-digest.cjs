@@ -10,16 +10,21 @@
 //            The operation is bound to the SHA, so a retry for the same
 //            build recovers its frozen plan instead of allocating again.
 //   adapt    Read the plan step. A classified skip (quiet-day, rollback,
-//            digest-already-published) owes no tag but may owe SBOM assets
-//            on the Latest release. Otherwise persist the owed-digest
-//            outputs for the alert job and emit the publish request.
+//            digest-already-published) and a replay of a SHA whose Release
+//            already exists owe no tag. Today's CalVer tag left without its
+//            Release (a failed publish before production moved again) is
+//            finished from its own frozen plan. Otherwise persist the
+//            owed-digest outputs for the alert job and emit the publish
+//            request. Every non-dry path reconciles the Latest release's
+//            SBOM assets.
 //   record   Read the publish step. A new Release dispatches the SBOM
 //            chain; an existing one redispatches only when assets are
 //            missing.
 //
 // Env: PROD_SHA (40-hex), GH_REPO, GITHUB_OUTPUT, DRY_RUN=true for a
-// zero-write run; adapt reads SKIPPED, REASON, PLAN and PREV_TAG; record
-// reads CREATED and TAG.
+// zero-write run (no gh calls besides the shared action's own reads); adapt
+// reads SKIPPED, REASON, PLAN and PREV_TAG; record reads CREATED and TAG.
+// sbom_tags is a space-separated list of release tags owed an SBOM dispatch.
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -37,6 +42,8 @@ const SBOM_ASSETS = [
 // production, not a quiet day (2026-10-23..31: guard skips reported green).
 const STALE_DAYS = 3;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const STABLE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
+const ANNOTATION = "calver-plan-v1\n";
 
 function output(values) {
 	const text = Object.entries(values)
@@ -68,11 +75,15 @@ function dryRun() {
 function releaseView(tag) {
 	const args = ["release", "view", ...(tag ? [tag] : []), "--json", "tagName,assets,publishedAt"];
 	try {
-		const view = JSON.parse(execFileSync("gh", args, { encoding: "utf8" }));
-		return view && typeof view.tagName === "string" ? view : null;
+		const view = ghJson(args);
+		return view && typeof view.tagName === "string" && STABLE_TAG.test(view.tagName) ? view : null;
 	} catch {
 		return null;
 	}
+}
+
+function ghJson(args) {
+	return JSON.parse(execFileSync("gh", args, { encoding: "utf8" }));
 }
 
 function assetsMissing(view) {
@@ -118,25 +129,70 @@ function staleWarning(sha, latest, now) {
 	summary(`### Stalled production\n\n${text}.`);
 }
 
+// Today's CalVer tag whose Release is missing, as its own frozen plan read
+// from the tag annotation the shared releaser wrote; null when there is
+// none or a lookup fails.
+function unfinishedToday(now) {
+	const d = new Date(now);
+	const prefix = `v${d.getUTCFullYear()}.${d.getUTCMonth() + 1}${String(d.getUTCDate()).padStart(2, "0")}.`;
+	try {
+		const refs = ghJson(["api", `repos/${process.env.GH_REPO}/git/matching-refs/tags/${prefix}`]);
+		for (const ref of Array.isArray(refs) ? refs : []) {
+			const tag = String(ref && ref.ref).replace(/^refs\/tags\//, "");
+			if (!STABLE_TAG.test(tag) || ref.object?.type !== "tag" || releaseView(tag)) continue;
+			const message = ghJson(["api", `repos/${process.env.GH_REPO}/git/tags/${ref.object.sha}`]).message;
+			if (typeof message !== "string" || !message.startsWith(ANNOTATION)) continue;
+			const { publicationEvidence, ...plan } = JSON.parse(message.slice(ANNOTATION.length));
+			if (plan.tag === tag && plan.policy === "live-digest") return plan;
+		}
+	} catch {
+		return null;
+	}
+	return null;
+}
+
+function noDigest(reason, latest, owed) {
+	summary(`## Daily digest skipped: ${reason}\n\nLive production: \`${prodSha()}\``);
+	output({
+		publish: "false", tag_name: "", released: "false", prod_changed: "false",
+		prev_tag: latest ? latest.tagName : "", sbom_tags: [...new Set(owed)].join(" "),
+	});
+}
+
+// Persist the owed state before publication. On a failed publish these
+// outputs survive for the alert job; record overwrites released.
+// `repair` lets a retry finish a tag whose Release creation failed.
+function owe(plan, prevTag, owed) {
+	const publish = { phase: "publish", plan, dryRun: dryRun(), repair: true };
+	output({
+		publish: "true", tag_name: "", released: "false", prod_changed: "true",
+		prev_tag: prevTag, sbom_tags: owed.join(" "),
+		publish_request: JSON.stringify(publish),
+	});
+}
+
 function adapt() {
 	const sha = prodSha();
 	const dry = dryRun();
+	const now = Date.now();
+	// A red run after an earlier cut leaves its release without inventories,
+	// and no later run backfills it. Every path redispatches the idempotent
+	// chain for the Latest release when its assets are missing.
+	const latest = dry ? null : releaseView("");
+	const owed = latest && assetsMissing(latest) ? [latest.tagName] : [];
+	if (owed.length) console.log(`${owed[0]} lacks SBOM assets; redispatching the SBOM chain`);
 	if (process.env.SKIPPED === "true") {
 		const reason = process.env.REASON || "";
 		if (!SKIP_REASONS.has(reason)) throw new Error(`unclassified skip reason ${JSON.stringify(reason)}`);
-		const latest = dry ? null : releaseView("");
+		const unfinished = !dry && reason === "digest-already-published" ? unfinishedToday(now) : null;
+		if (unfinished) {
+			console.log(`${unfinished.tag} has no Release; finishing it from its frozen plan`);
+			owe(unfinished, unfinished.previousStableTag || "", owed);
+			return;
+		}
 		console.log(`${sha} owes no digest today: ${reason}`);
-		summary(`## Daily digest skipped: ${reason}\n\nLive production: \`${sha}\``);
-		if (reason === "quiet-day") staleWarning(sha, latest, Date.now());
-		// A red run after an earlier cut leaves its release without
-		// inventories, and no later run backfills it. Redispatch the
-		// idempotent chain for the Latest release when assets are missing.
-		const owed = latest && assetsMissing(latest) ? latest.tagName : "";
-		if (owed) console.log(`${owed} lacks SBOM assets; redispatching the SBOM chain`);
-		output({
-			publish: "false", tag_name: "", released: "false", prod_changed: "false",
-			prev_tag: latest ? latest.tagName : "", sbom_tag: owed,
-		});
+		if (reason === "quiet-day") staleWarning(sha, latest, now);
+		noDigest(reason, latest, owed);
 		return;
 	}
 	let plan;
@@ -145,35 +201,39 @@ function adapt() {
 	} catch {
 		throw new Error("plan step returned neither a skip nor a JSON plan");
 	}
-	if (!plan || plan.sha !== sha || plan.policy !== "live-digest")
+	if (!plan || plan.sha !== sha || plan.policy !== "live-digest" || !STABLE_TAG.test(plan.tag))
 		throw new Error("plan does not bind the live production SHA under live-digest");
-	// Persist the owed state before publication. On a failed publish these
-	// outputs survive for the alert job; record overwrites released.
-	// `repair` lets a retry finish a tag whose Release creation failed.
-	const publish = { phase: "publish", plan, dryRun: dry, repair: true };
-	output({
-		publish: "true", tag_name: "", released: "false", prod_changed: "true",
-		prev_tag: process.env.PREV_TAG || "", sbom_tag: "",
-		publish_request: JSON.stringify(publish),
-	});
+	// The shared planner recovers a SHA's prior plan before its quiet-day and
+	// rollback checks. When that Release already exists, production has not
+	// moved to anything new: owe nothing, and never re-publish (a transient
+	// publish error would page for a digest that exists).
+	const own = dry ? null : releaseView(plan.tag);
+	if (own) {
+		console.log(`${sha} is already published as ${plan.tag}; no new digest`);
+		if (latest && latest.tagName === plan.tag) staleWarning(sha, latest, now);
+		if (assetsMissing(own)) owed.push(plan.tag);
+		noDigest("already-published", latest, owed);
+		return;
+	}
+	owe(plan, process.env.PREV_TAG || "", owed);
 }
 
 function record() {
 	const tag = (process.env.TAG || "").trim();
-	if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) throw new Error("publish step returned no stable tag");
+	if (!STABLE_TAG.test(tag)) throw new Error("publish step returned no stable tag");
 	if (dryRun()) {
 		console.log(`dry run: would publish ${tag}`);
-		output({ tag_name: "", released: "false", sbom_tag: "" });
+		output({ tag_name: "", released: "false", sbom_tags: "" });
 		return;
 	}
 	let owed = tag;
 	if (process.env.CREATED !== "true") {
-		// An exact replay of an already-published digest: dispatch only when
-		// its inventories are incomplete. A lookup failure stays green.
+		// A repaired or replayed digest: dispatch only when its inventories
+		// are incomplete. A lookup failure stays green.
 		const view = releaseView(tag);
 		owed = view && assetsMissing(view) ? tag : "";
 	}
-	output({ tag_name: tag, released: "true", sbom_tag: owed });
+	output({ tag_name: tag, released: "true", sbom_tags: owed });
 }
 
 const MODES = { request, adapt, record };
