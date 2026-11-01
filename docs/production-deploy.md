@@ -260,8 +260,8 @@ These skips keep it green while deploying nothing:
 Otherwise the `soak` job sleeps the remainder of 30 minutes past the
 staging-green time, recomputed there from the staging-green timestamp the
 guard reports (an unreadable timestamp soaks the full window). The soak runs
-outside the `deploy-production` lane — only the `production` and `release`
-jobs hold it — so a sleeping promotion never queues an operator rollback
+outside the `deploy-production` lane — only the `production` and
+`post-deploy-watch` jobs hold it — so a sleeping promotion never queues an operator rollback
 behind it. The lane keeps the default single pending slot, so a `recheck`
 job waits for the soak and both gates, then re-reads the hold, the live
 revision and the active dispatches immediately before the deploy: a hold set,
@@ -351,6 +351,34 @@ A failing production journey lowers the baseline, never the bar: the gate
 only asks that the candidate is no worse than what serves now. The
 `transport` result stays out of the 5xx count, as in `rest_5xx_rate`. Rollback
 and the live-SHA redeploy skip both legs.
+
+## Post-deploy watch
+
+The in-run gates judge a few minutes. After an ordinary takeover promotion
+succeeds, the `post-deploy-watch` job keeps watching production for 30
+minutes (`scripts/post_deploy_watch.py`):
+
+- every 10 s: `/health` 200 and `/readyz` 200 with gateway ready and the
+  promoted build revision. 18 consecutive misses (~3 min, the deploy gate's
+  stability window) is a breach; a single blip is not;
+- back-to-back REST 5xx windows through the same
+  `promotion-error-gate.mjs` verdict as the deploy gate. A failing window is
+  a breach; two unscrapeable windows in a row are a breach; a missing bearer
+  or a quiet window never is;
+- every minute: the promoted Worker version still serves 100%. If not (a
+  newer deploy or an operator rollback moved traffic), the watch stops
+  without touching anything.
+
+On a breach the job restores this run's pre-deploy snapshot (Worker version
+AND container image, with takeover) through the same reviewed
+`worker_container_rollback.py` as the in-run auto-rollback, and the run fails
+red. If the watch cannot read Cloudflare it fails red without rolling back.
+The job holds the `deploy-production` lane, so no newer deploy lands
+mid-watch; an operator who needs the lane sooner cancels the watch run. It
+reads the production bindings through the `production` Environment with
+`deployment: false` (no second deployment record). As after a manual
+rollback, set `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` after a watch rollback,
+or the next automatic run re-promotes the same build.
 
 ## Production error-rate gate
 

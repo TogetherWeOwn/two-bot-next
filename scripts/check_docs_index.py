@@ -31,6 +31,7 @@ LARGE_DOCS = {
     "docs/metrics.md": "Existing metric catalog; split by area in a separate content change.",
     "docs/observability-event-catalog.md": "Existing observability event catalog; split by area in a separate content change.",
     "docs/parity.md": "Historical parity ledger; use the start-here section map.",
+    "docs/production-deploy.md": "Promotion-gate reference for every pre- and post-deploy gate; use section navigation.",
     "docs/runbook.md": "Existing operations guide; use section and alert navigation.",
     "docs/soak-checklist.md": "Generated coverage ledger; use the start-here section map.",
 }

@@ -380,7 +380,8 @@ class StaticGuardTests(unittest.TestCase):
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
-                                      "staging-soak-evidence", "recheck", "production"])
+                                      "staging-soak-evidence", "recheck", "production",
+                                      "post-deploy-watch"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -519,6 +520,37 @@ class StaticGuardTests(unittest.TestCase):
             conditions["      - name: Preflight the rollback target before production mutation"],
             ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'"],
         )
+    def test_post_deploy_watch_judges_30_minutes_and_rolls_back_on_a_breach(self):
+        job = children(JOBS["post-deploy-watch"][1:], 4)
+        self.assertEqual(value(job["needs"]), "[guard, production]")
+        condition = value(job["if"])
+        for needle in ("!cancelled()", "needs.production.result == 'success'",
+                       "needs.guard.outputs.mode == 'deploy'", "needs.guard.outputs.allow_unstaged != 'true'",
+                       "needs.guard.outputs.takeover == 'true'", "needs.production.outputs.new_version != ''"):
+            self.assertIn(needle, condition)
+        # Holds the deploy lane: no newer deploy lands mid-watch, so a breach
+        # never rolls back someone else's version.
+        self.assertIn("group: deploy-production", "\n".join(job["concurrency"]))
+        self.assertIn("cancel-in-progress: false", "\n".join(job["concurrency"]))
+        self.assertEqual("\n".join(job["environment"]),
+                         "    environment:\n      name: production\n      deployment: false")
+        self.assertEqual(value(children(JOBS["production"][1:], 4)["outputs"][1:2]),
+                         "${{ steps.confirm.outputs.new_version }}")
+        watch = inline_script("Watch production for 30 minutes after the promotion")
+        for needle in ("set -euo pipefail", "python3 scripts/post_deploy_watch.py",
+                       '--sha "$SHA" --version "$NEW_VERSION"'):
+            self.assertIn(needle, watch)
+        rollback = inline_script("Auto-roll back Worker version and container image after a watch breach")
+        for needle in ("python3 scripts/worker_container_rollback.py rollback", "--variant production",
+                       '--snapshot "$RUNNER_TEMP/watch-snapshot/production-rollback-snapshot.json"'):
+            self.assertIn(needle, rollback)
+        self.assertNotIn("--expected-sha", rollback)
+        self.assertNotIn("${{", watch + rollback)
+        conditions = {step[0]: [line.strip() for line in step if line.strip().startswith("if:")]
+                      for step in steps(JOBS["post-deploy-watch"])}
+        self.assertEqual(
+            conditions["      - name: Auto-roll back Worker version and container image after a watch breach"],
+            ["if: failure() && steps.watch.outputs.verdict == 'breach'"])
 
     def test_pre_freeze_candidate_requires_the_full_latest_ci_verdict(self):
         row = next(line for line in (ROOT / "docs/cutover-sequence.md").read_text().splitlines()
@@ -2268,6 +2300,22 @@ class ConfirmStepTests(unittest.TestCase):
             with self.subTest(reread=reread[:30], new_version=new_version):
                 code, _ = self.confirm(reread=reread, new_version=new_version)
                 self.assertEqual(code, 1)
+
+
+    def test_confirmed_version_is_published_for_the_post_deploy_watch(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            output = Path(tmp) / "output"
+            env = {"REREAD": deployment((VERSION, 100)), "NEW_VERSION": VERSION,
+                   "GITHUB_STEP_SUMMARY": str(Path(tmp) / "summary"), "GITHUB_OUTPUT": str(output)}
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+                exec(CONFIRM, {})
+            self.assertEqual(output.read_text(), f"new_version={VERSION}\n")
+            env["REREAD"] = deployment((OLD_VERSION, 100))
+            output.unlink()
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    exec(CONFIRM, {})
+            self.assertFalse(output.exists())
 
 
 class ScriptedWorker:

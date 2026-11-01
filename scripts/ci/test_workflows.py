@@ -47,7 +47,7 @@ JOB_INVENTORY = {
                   # like the Rust lanes.
                   "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "production"},
+                              "production", "post-deploy-watch"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "user-flow-synthetic",
                            "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
@@ -8905,6 +8905,9 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "staging-soak-evidence"):
                         # Reads deploy-staging runs to tell a promoted newer
                         # build (skip green) from a stalled promotion (refuse).
+                        expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "post-deploy-watch"):
+                        # Downloads this run's pre-deploy rollback snapshot.
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the
