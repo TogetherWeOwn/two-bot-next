@@ -1,0 +1,47 @@
+-- 0469_voice_command_roles_authority: one store for per-command role gates.
+--
+-- `/import` (0229) wrote per-command restrictions to `voice_command_roles` /
+-- `voice_command_role_members`, but the command gate reads only
+-- `voice_access_controls.command_roles` (0227), so an imported and confirmed
+-- restriction was never enforced. `voice_access_controls.command_roles` is now
+-- the single authority: `PgVoiceConfigStore` reads and writes it, `/access`
+-- already did. This copies every legacy row there. Expand/contract: the
+-- legacy tables stay as they are, because the previous binary's `/export`
+-- and `/import` read them; a later contract migration drops them once this
+-- release is stable in production.
+--
+-- Merge rule: a command already restricted in `voice_access_controls` keeps
+-- its enforced role list; a command only the legacy tables restrict is added.
+-- So the backfill never loosens a gate that is enforced today, and a legacy
+-- command with no member rows lands as an empty list (deny every non-admin),
+-- the same meaning both stores give it. Only names in
+-- `voice_access::VOICE_COMMANDS` move: the gate refuses a row holding any
+-- other name, which would block every voice command for the guild. The
+-- legacy tables accepted any non-blank name and the gate never read them, so
+-- dropping an unknown one loosens nothing. Role lists are canonical (numeric
+-- order). A re-run only re-adds a copied command that was lifted since,
+-- which tightens and never loosens; migrations run once. Backout: deploy the
+-- previous binary; the copied restrictions stay enforced and its `/export`
+-- and `/import` still see the legacy rows, which `/import` on this binary
+-- keeps mirrored. No member PII.
+-- Bot schema range: 0001-0999. Database tests use test containers only.
+
+INSERT INTO voice_access_controls (guild_id, command_roles)
+SELECT c.guild_id,
+       jsonb_object_agg(
+         c.command,
+         COALESCE(
+           (SELECT jsonb_agg(m.role_id ORDER BY length(m.role_id), m.role_id)
+              FROM voice_command_role_members m
+             WHERE m.guild_id = c.guild_id AND m.command = c.command),
+           '[]'::jsonb))
+  FROM voice_command_roles c
+ WHERE c.command IN (
+      'alias', 'alwaysprivate', 'channelinfo', 'create', 'defaultlimit',
+      'export', 'group', 'import', 'inheritpermissions', 'invite', 'kick',
+      'limit', 'logging', 'name', 'nick', 'ping', 'position', 'private',
+      'public', 'reclaim', 'setup', 'template', 'templateassistant',
+      'textchannels', 'transfer', 'unlimit')
+ GROUP BY c.guild_id
+ON CONFLICT (guild_id) DO UPDATE
+  SET command_roles = EXCLUDED.command_roles || voice_access_controls.command_roles;

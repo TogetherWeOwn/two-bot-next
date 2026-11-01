@@ -211,6 +211,9 @@ struct Store {
     access: Arc<Mutex<AccessControls>>,
     access_error: Option<StoreError>,
     save_access_error: Option<StoreError>,
+    /// Stored right after the next `access_controls` read, as a confirmed
+    /// `/import` landing between an `/access` read and its save.
+    import_after_access_read: Mutex<Option<AccessControls>>,
     logging: Arc<Mutex<LoggingSettings>>,
     logging_error: Option<StoreError>,
     save_logging_error: Option<StoreError>,
@@ -294,6 +297,7 @@ impl Store {
             access: Arc::new(Mutex::new(AccessControls::default())),
             access_error: None,
             save_access_error: None,
+            import_after_access_read: Mutex::new(None),
             logging: Arc::new(Mutex::new(LoggingSettings::default())),
             logging_error: None,
             save_logging_error: None,
@@ -344,18 +348,29 @@ impl RoomPersistence for Store {
     async fn access_controls(&self, _: u64) -> Result<AccessControls, StoreError> {
         match self.access_error {
             Some(error) => Err(error),
-            None => Ok(self.access.lock().unwrap().clone()),
+            None => {
+                let read = self.access.lock().unwrap().clone();
+                if let Some(imported) = self.import_after_access_read.lock().unwrap().take() {
+                    *self.access.lock().unwrap() = imported;
+                }
+                Ok(read)
+            }
         }
     }
     async fn save_access_controls(
         &self,
         _: u64,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
         if let Some(error) = self.save_access_error {
             return Err(error);
         }
-        *self.access.lock().unwrap() = controls.clone();
+        let mut stored = self.access.lock().unwrap();
+        if *stored != *expected {
+            return Err(StoreError::Conflict);
+        }
+        *stored = controls.clone();
         Ok(())
     }
     async fn logging_settings(&self, _: u64) -> Result<LoggingSettings, StoreError> {
@@ -6792,6 +6807,26 @@ async fn access_command_refuses_bad_input_without_changing_anything() {
         assert!(!text.starts_with("Saved."), "{text}");
         assert_eq!(*shared.lock().unwrap(), AccessControls::default());
     }
+}
+
+#[tokio::test]
+async fn access_save_never_reverts_an_import_confirmed_after_its_read() {
+    // `/access creation off` reads `{}`, an import then confirms a `/kick`
+    // restriction, and only then does `/access` save: the save must refuse,
+    // not write back the stale `{}` and silently unrestrict `/kick`.
+    let store = Store::new(Trace::default());
+    let mut imported = AccessControls::default();
+    imported.command_roles.insert("kick".to_owned(), vec![201]);
+    *store.import_after_access_read.lock().unwrap() = Some(imported.clone());
+    let mut saved = None;
+    let text = execute_access(&store, GUILD, AccessAction::Creation(false), |controls| {
+        saved = Some(controls);
+    })
+    .await;
+    assert!(!text.starts_with("Saved."), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert_eq!(saved, None);
+    assert_eq!(*store.access.lock().unwrap(), imported);
 }
 
 // These tests share the process-global log capture. Serialize every admin

@@ -39,9 +39,13 @@ event replays are not detected by this core.
 
 ## Persistence
 
-`PgRoomStore::access_controls(guild)` / `save_access_controls(guild, controls)`
+`PgRoomStore::access_controls(guild)` / `save_access_controls(guild, expected, controls)`
 (migration `0227_voice_access_controls.sql`, table `voice_access_controls`)
-read and replace the whole per-guild row in one upsert. No row reads as
+read and replace the whole per-guild row in one upsert. `/import` writes the
+row's `command_roles` too (0469), so the save is a compare-and-swap under the
+same per-guild advisory lock as `PgVoiceConfigStore::apply`: when the row no
+longer equals `expected` it refuses (`RowNotFound`, the bot's `Conflict`)
+instead of reverting a confirmed import. No row reads as
 `AccessControls::default()` (creation on, nothing restricted). Saves run
 `validate_access_controls` first, and loads re-validate, so a hand-edited row
 with an unknown command or zero role fails closed instead of becoming a
@@ -55,7 +59,9 @@ silent no-op. The runtime still owns per-guild serialization and enforcement.
 `unrestrict command:<name>`. Each change is a read-modify-write under one
 runtime lock, validated by `validate_access_controls`, saved with
 `save_access_controls`, then pushed to the guild's live actor so a creation
-switch applies immediately. A failed read or write changes nothing and says so.
+switch applies immediately. A failed read or write changes nothing and says so,
+as does a save that finds an import confirmed since its read. Import Confirm
+takes the same runtime lock.
 
 ## Residual parent work
 

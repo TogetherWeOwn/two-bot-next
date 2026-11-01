@@ -87,6 +87,13 @@ Further checks, each naming only the field (never the uploaded text):
   nonblank, at most 100 characters and free of control characters.
 - **Command roles.** `settings.command_roles[].command` must be an exact entry of
   `voice_access::VOICE_COMMANDS`.
+  Apply stores them in `voice_access_controls.command_roles`, the same column
+  `/access` writes and the command gate reads, so an imported restriction is
+  enforced and an `/access` restriction is exported. Nothing prunes a role
+  Discord deletes from that column, so `/export` first drops role IDs missing
+  from the inventory (`drop_deleted_command_roles`) and says how many it left
+  out; the restriction itself stays, and an emptied one still denies every
+  non-admin.
 Import accepts JSON only (YAML payloads fail as malformed) and refuses documents
 over `MAX_IMPORT_BYTES` (256 KiB) on the document before parsing, so an
 oversized upload can never partially apply. Export holds the same cap, because
