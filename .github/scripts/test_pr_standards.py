@@ -342,6 +342,24 @@ class AttestationFloor(unittest.TestCase):
         f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
         self.assertEqual([], f)
 
+    def test_comma_separated_proof_values_fail(self):
+        # `proof=<command, result>` is an unfilled proof value, not a generic:
+        # the `<` stands alone instead of glued to a type name.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "proof=python3 scripts/test_rollback.py 5 OK",
+            "proof=<command, result>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_standalone_generic_lists_fail(self):
+        # A comma-blank list only reads as a generic when glued to a type
+        # name; a bare `<T, E>` in prose is still placeholder-shaped.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed payloads rejected, over <T, E> handled")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
     def test_unfenced_generics_are_not_placeholders(self):
         # Option<T> outside code spans is evidence: the `<` is glued to an
         # identifier, which bare template tokens never are.

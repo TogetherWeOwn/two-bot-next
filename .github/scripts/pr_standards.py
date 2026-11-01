@@ -113,9 +113,10 @@ T0_CHECK_ITEM = re.compile(r"^-\s*\[( |x|X)\]\s*(D[1-8]):\s*(.+?)\s*$")
 # non-identifier boundary before the `<`. Autolinks are stripped before
 # matching so evidence links never count as placeholders; inline code is kept
 # visible so backticked placeholders still fail while `Vec<u8>` passes via
-# the boundary rule. Spaced generics such as `Result<T, E>` are excluded by
-# the comma-blank shape; template placeholders always carry a blank inside
-# a phrase.
+# the boundary rule. Spaced generics such as `Result<T, E>` are excluded only
+# when the `<` is glued to a type name and every blank sits right after a
+# comma; a standalone `<command, result>` (after `=`, a space or line start)
+# is an unfilled proof value, not a generic, so it still fails.
 T0_PLACEHOLDER = re.compile(r"<[^<>\n]*[ |/][^<>\n]*>")
 T0_BARE_PLACEHOLDER = re.compile(r"(?<![A-Za-z0-9_])<[A-Za-z][A-Za-z0-9_]*>")
 T0_AUTOLINK = re.compile(r"<https?://[^<>\s]+>")
@@ -128,10 +129,15 @@ def t0_visible_text(text):
     return T0_AUTOLINK.sub("", text or "")
 
 
-def _looks_like_generic_list(content):
-    """True for comma-separated type lists such as `T, E`: a comma is present
-    and every blank sits right after one. Template placeholders always carry
-    a blank inside a phrase (`<secret sinks, ...>`), so they never match."""
+def _looks_like_generic_list(before, content):
+    """True for a comma-separated type list glued to a type name, such as the
+    `<T, E>` in `Result<T, E>`: `before` (the char ahead of `<`) ends an
+    identifier or a nested generic, a comma is present, and every blank sits
+    right after one. Template placeholders either carry a blank inside a
+    phrase (`<secret sinks, ...>`) or stand alone (`proof=<command, result>`),
+    so they never match both halves at once."""
+    if not re.match(r"[A-Za-z0-9_>\]]$", before):
+        return False
     blanks = [m.start() for m in re.finditer(r"\s", content)]
     return bool(blanks) and "," in content and all(
         content[pos - 1] == "," for pos in blanks)
@@ -141,7 +147,8 @@ def t0_has_placeholder(text):
     """True when visible attestation text still holds a template placeholder."""
     visible = t0_visible_text(text)
     for match in T0_PLACEHOLDER.finditer(visible):
-        if not _looks_like_generic_list(match.group(0)[1:-1]):
+        before = visible[match.start() - 1] if match.start() > 0 else ""
+        if not _looks_like_generic_list(before, match.group(0)[1:-1]):
             return True
     return bool(T0_BARE_PLACEHOLDER.search(visible))
 
