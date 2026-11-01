@@ -36,6 +36,7 @@ its remaining findings, then push the resolution before expecting GitHub to merg
 - Use the PR template, in short, active sentences. Required: Linked Issues or
   Issue Description, and Verification (commands run and their results). What
   Changed and Notes for reviewers are optional.
+- PRs follow the org contract in `TogetherWeOwn/.github` CONTRIBUTING + this repo's overrides; the PR template's Attestation is mandatory.
 - Keep references public-safe. Put no secret, token, private URL or internal
   tracker ID (`TOG-`, `PAP-`) in any title, body, commit, comment or branch name.
   Link public GitHub issues as `Closes #123`.
