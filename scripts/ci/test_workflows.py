@@ -4047,6 +4047,22 @@ class WorkflowTests(unittest.TestCase):
         for name in ("deploy-staging.yml", "deploy-production.yml"):
             self.assertNotIn("merge_group", self.workflows[name]["on"])
 
+    def test_pr_lint_feeds_changed_files_to_the_t0_gate(self):
+        # The T0 attestation floor in pr_standards.py needs the PR file list.
+        # Pin the step and its wiring so the gate cannot be silently starved.
+        # The step runs on PR events only: on push there is no PR number and
+        # the numeric guard would fail every main commit.
+        steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
+        listed = next(s for s in steps if s.get("name") == "List changed files")
+        self.assertEqual(listed["if"],
+                         "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
+        self.assertIn("pulls/", listed["run"])
+        self.assertIn("previous_filename", listed["run"])
+        check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
+        self.assertEqual(check["env"]["CHANGED_FILES_FILE"],
+                         "${{ steps.changed.outputs.changed_files_file }}")
+        self.assertIn("CHANGED_FILES", check["run"])
+
     def test_quality_gates_diff_merge_checkout_against_its_first_parent(self):
         steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
         expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"

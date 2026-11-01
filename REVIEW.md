@@ -148,5 +148,6 @@ Judge each PR against the PR template that applies to this repo
 
 - PR title is not a Conventional Commits header, or the body is missing/empty a section that template requires (org default: Thinking Path, Linked Issues or Issue Description, Verification, Attestation, Model Used).
 - Where the template has an Attestation block: the tier is understated for the touched paths, claims lack a test mapping to a file changed in this PR (T2 may use `none`), or D-items are checked without evidence in the diff.
+- T0 path → attestation present: a diff touching a T0 path (migrations/sql/db, auth words, `.github/workflows/deploy*`, `crates/cutover/**`, wrangler config) must declare `risk_tier: T0` with claims↔tests and checked D1–D8; `pr-lint` enforces this floor, so a missing attestation is a blocking finding even when CI is otherwise green.
 - Title, body, branch name, or review replies contain internal ticket ids, instance links, internal hostnames, private addresses, private emails, or credential material. Links to public GitHub issues and PRs are allowed.
 - Verification claims tests or results that the diff or CI output contradicts, or reports a local run without its exact command and result.
