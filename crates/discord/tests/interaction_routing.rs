@@ -276,14 +276,14 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
         .collect();
     // 23 legacy restricted rows plus management-only command-inspect,
-    // command-disable, command-enable, giveaway and welcome-preview, plus
+    // command-disable, command-enable, command-edit, giveaway and welcome-preview, plus
     // purge-preview, channel-inspect, lfg-edit, lfg-list, feed-inspect, game-mix,
     // tempban-list and moderation-recent. Discord defaults never
     // replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        38,
-        "23 legacy restricted rows plus fifteen Next-only management commands"
+        39,
+        "23 legacy restricted rows plus sixteen Next-only management commands"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
@@ -379,11 +379,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 48);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 49);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 45);
+    assert_eq!(commands.len(), 46);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -453,6 +453,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("command-inspect", HandlerId::AutomationAdmin),
         ("command-disable", HandlerId::AutomationAdmin),
         ("command-enable", HandlerId::AutomationAdmin),
+        ("command-edit", HandlerId::AutomationAdmin),
         ("schedule", HandlerId::AutomationAdmin),
         ("schedule-remove", HandlerId::AutomationAdmin),
         ("schedule-list", HandlerId::AutomationAdmin),
@@ -472,7 +473,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
     ];
     assert_eq!(
         cases.len(),
-        42,
+        43,
         "all handlers except giveaway and lfg-list covered (each has its own test)"
     );
     for (_, id) in cases {
@@ -1132,7 +1133,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 46 names, no partial view.
+    // endpoint: one request, all 47 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1143,8 +1144,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        46,
-        "7 core + 25 feature + 9 moderation mutations + 4 reads + 1 custom"
+        47,
+        "7 core + 26 feature + 9 moderation mutations + 4 reads + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1176,7 +1177,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 46, "no partial view");
+    assert_eq!(names.len(), 47, "no partial view");
     assert_eq!(
         names.iter().filter(|name| **name == "tempban-list").count(),
         1
@@ -1201,6 +1202,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         "command-inspect",
         "command-disable",
         "command-enable",
+        "command-edit",
         "schedule-list",
         "sticky-remove",
         "giveaway",
