@@ -194,7 +194,7 @@ impl BoundEventsubReceiver {
             (Ok(Ok(())), true) => Ok(()),
             (Ok(Err(error)), _) => Err(error),
             _ => {
-                tracing::error!(
+                tracing::warn!(
                     event = "eventsub_receiver",
                     msg = "eventsub_receiver_drain_deadline",
                     "receiver shutdown deadline exhausted; unfinished delivery claims remain fenced"
@@ -234,7 +234,7 @@ impl BoundEventsubReceiver {
                 // Started sends have unknown external effects. Detach rather
                 // than abort them; their durable started claims remain fenced.
                 children.detach_all();
-                tracing::error!(
+                tracing::warn!(
                     event = "eventsub_receiver",
                     msg = "eventsub_receiver_drain_deadline",
                     pending = pending,
