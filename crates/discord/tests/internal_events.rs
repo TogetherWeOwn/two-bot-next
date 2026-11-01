@@ -771,6 +771,38 @@ async fn malformed_or_mismatched_success_never_becomes_retry_safe() {
     }
 }
 
+/// A 200 cancel whose body is not CANCELLED did not prove the cancel landed.
+/// It must neither publish, overwrite the mirror, nor release the lane.
+#[tokio::test]
+async fn cancel_success_without_cancelled_status_fails_closed() {
+    for status in [1, 2, 3] {
+        let rest = MockRest::start(
+            vec![ScriptedResponse::json(200, response(status, false))],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let (executor, lane) = governed(&rest);
+        let (mirror, seeded) = seeded_mirror().await;
+        let error = executor
+            .execute_event(
+                GUILD,
+                &EventCall::Cancel {
+                    event_id: EVENT.to_owned(),
+                },
+                &mirror,
+                stamp,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, EventActionError::InvalidResponse, "status {status}");
+        assert!(!error.is_safe_pre_mutation());
+        assert_eq!(mirror.snapshot(), seeded, "status {status}");
+        assert_eq!(lane.released(), 0, "status {status}");
+        assert_eq!(rest.requests().len(), 1);
+        rest.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn missing_create_identity_failed_write_and_bad_local_id_fail_closed() {
     for body in [json!({}), {

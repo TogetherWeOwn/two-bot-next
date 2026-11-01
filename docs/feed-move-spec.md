@@ -339,7 +339,7 @@ preview expiry. No staging/production DB or live channel/source requests.
 
 **Independent CISO boundary disposition: not obtained.** The proposal's author
 cannot approve their own request; an adversarial drafting review or ordinary
-Paperclip Review is not that disposition. Request independent accept/change/reject
+CodeRabbit or Devin Review is not that disposition. Request independent accept/change/reject
 on audience equivalence/residual ACL race, current two-channel authority,
 linkable receipt retention/erasure and delivery/recovery invariants. No new
 credential, permission or runtime authority is granted by this proposal.

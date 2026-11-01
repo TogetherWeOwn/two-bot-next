@@ -80,7 +80,7 @@ const COOLDOWN_REPLY: &str = "Wait 5 seconds before using another member moderat
 /// Fixed diagnostic vocabulary only: never carry Discord bodies, parser errors,
 /// transport details or member-supplied strings into refusal logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AuthorityCause {
+pub(crate) enum AuthorityCause {
     Discord403,
     Transport,
     MalformedRoles,
@@ -89,7 +89,7 @@ enum AuthorityCause {
 }
 
 impl AuthorityCause {
-    fn token(self) -> &'static str {
+    pub(crate) fn token(self) -> &'static str {
         match self {
             Self::Discord403 => "discord_403",
             Self::Transport => "transport",
@@ -257,6 +257,52 @@ impl MemberRuntime {
         self.store.clone()
     }
 
+    /// Private saved-state read. Unlike an effect it needs no target hierarchy,
+    /// bot identity, member lane, cooldown claim or applied-mutation audit.
+    /// Reuse the same strict current guild/member authority resolver first.
+    pub(crate) async fn inventory_reply(
+        &self,
+        executor: &ActionExecutor,
+        interaction: &Interaction,
+    ) -> String {
+        use two_bot_core::tempban_inventory;
+
+        let page = match inventory_page(interaction) {
+            Some(page) => page,
+            None => return tempban_inventory::SELECTOR_CORRECTION.to_owned(),
+        };
+        let actor_id = actor_id(interaction);
+        if actor_id.is_empty()
+            || interaction.guild_id.map(|id| id.to_string()).as_deref() != Some(&self.guild_id)
+        {
+            return tempban_inventory::UNAVAILABLE.to_owned();
+        }
+        let authority = async {
+            let facts = guild_facts(executor, &self.guild_id).await?;
+            let (roles, _) = fetched_member(executor, &self.guild_id, &actor_id)
+                .await?
+                .ok_or(AuthorityCause::MalformedRoles)?;
+            actor_authority(&actor_id, roles, &facts).ok_or(AuthorityCause::MalformedRoles)
+        }
+        .await;
+        match authority {
+            Ok(actor) if actor.permissions & two_bot_core::commands::PERM_BAN_MEMBERS != 0 => {}
+            Ok(_) => return "You need the current Ban Members permission to inspect saved expiries. Ask a server moderator or admin.".to_owned(),
+            Err(cause) => {
+                tracing::warn!(cause = cause.token(), "tempban inventory authority unavailable");
+                return tempban_inventory::UNAVAILABLE.to_owned();
+            }
+        }
+        match self.store.saved_expiries(&self.guild_id, page).await {
+            Ok(rows) => tempban_inventory::render(page, &rows),
+            Err(_) => {
+                // Fixed vocabulary only: store errors can carry database detail.
+                tracing::warn!("tempban inventory read unavailable");
+                tempban_inventory::UNAVAILABLE.to_owned()
+            }
+        }
+    }
+
     /// Policy stamped with the resolved bot identity; callers resolve it first.
     fn policy(&self, bot_id: &str) -> ModerationPolicy {
         ModerationPolicy {
@@ -340,6 +386,31 @@ impl MemberRuntime {
     }
 }
 
+/// Decode the complete inventory shape before authority or storage reads. No
+/// permissive lookup that could ignore a duplicate, nested or unknown selector.
+fn inventory_page(
+    interaction: &Interaction,
+) -> Option<two_bot_core::tempban_inventory::ExpiryPage> {
+    use two_bot_core::tempban_inventory::ExpiryPage;
+
+    let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
+        return None;
+    };
+    if data.name != "tempban-list"
+        || data.kind != twilight_model::application::command::CommandType::ChatInput
+    {
+        return None;
+    }
+    match data.options.as_slice() {
+        [] => ExpiryPage::new(1),
+        [option] if option.name == "page" => match option.value {
+            CommandOptionValue::Integer(number) => ExpiryPage::new(number),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Current epoch millis as the service clock expects.
 fn now_millis_i64() -> i64 {
     std::time::SystemTime::now()
@@ -350,7 +421,7 @@ fn now_millis_i64() -> i64 {
 }
 
 /// Role positions plus the guild owner, read live per command.
-struct GuildFacts {
+pub(crate) struct GuildFacts {
     guild_id: String,
     owner_id: String,
     positions: HashMap<String, i64>,
@@ -364,7 +435,7 @@ fn text(value: &serde_json::Value, key: &str) -> Option<String> {
 /// One `GET /guilds/{id}`: owner id plus every role position. Any malformed
 /// or missing piece fails the command — hierarchy never runs on a partial
 /// snapshot.
-async fn guild_facts(
+pub(crate) async fn guild_facts(
     executor: &ActionExecutor,
     guild_id: &str,
 ) -> Result<GuildFacts, AuthorityCause> {
@@ -423,7 +494,7 @@ fn valid_id(id: &str) -> bool {
 /// an unknown role is incomplete evidence, not an implicit privilege grant.
 /// Owners and administrators hold every permission, but only the guild owner
 /// is exempt from role hierarchy: an administrator keeps the real top position.
-fn actor_authority(
+pub(crate) fn actor_authority(
     user_id: &str,
     held: Vec<String>,
     facts: &GuildFacts,
@@ -694,7 +765,7 @@ fn strict_refuse_unexpected(verb: &str, wants_duration: bool, name: &str) -> Str
 /// Membership plus bot flag from `GET /guilds/{g}/members/{u}`. `None` is a
 /// departed or never-joined user (ban tolerates; kick/timeout/warn refuse).
 /// An id mismatch or malformed body fails closed.
-async fn fetched_member(
+pub(crate) async fn fetched_member(
     executor: &ActionExecutor,
     guild_id: &str,
     target: &str,
@@ -795,7 +866,7 @@ fn sanitize_target_display(display: &str) -> String {
 
 /// Same reply-slot sanitizer for an echoed option name, capped tighter so
 /// the strict refusal always stays a short private reply.
-fn sanitize_option_name(name: &str) -> String {
+pub(crate) fn sanitize_option_name(name: &str) -> String {
     sanitize_reply_slot(name, 64)
 }
 

@@ -241,5 +241,9 @@ class PinnedLayerTests(unittest.TestCase):
         self.check_valid("-O")
 
 
+# Keep the protected COPY intake battery on the existing CI entrypoint.
+from test_docker_replay_intake_acceptance import DockerCopyIntakeAcceptanceTests
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ SPEC.loader.exec_module(inputs)
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_YML = ROOT / ".github/workflows/check.yml"
+DOCS_PREFIX = inputs.DOCS_PREFIX
 RUST, WORKER, PARITY = inputs.RUST, inputs.WORKER, inputs.PARITY
 SUPPLY, DOCS = inputs.SUPPLY, inputs.DOCS
 
@@ -434,21 +435,90 @@ class ReaderCoverageTests(unittest.TestCase):
         "docs/runbook.md",
     })
 
+    # Quoted path literals in Rust: bare repo-relative ("docs/x.md",
+    # root.join("wrangler/src/x.ts")), manifest-relative
+    # (.join("../../docs/x.md"), read_manifest_file("../../docs/x.md")) and
+    # format-prefixed ("{}/../../docs/x.md" after CARGO_MANIFEST_DIR).
+    PATH_LITERAL = re.compile(
+        r'"(?:\{\}/)?((?:\.\./)*[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]+)"')
+    INCLUDE_STR = re.compile(r'include_str!\(\s*"([A-Za-z0-9_./-]+)"\s*\)')
+    # Rust-owned roots already select the rust job by prefix.
+    RUST_ROOTS = ("crates/", "src/", "tests/")
+
+    @staticmethod
+    def manifest_dir(source):
+        for parent in source.parents:
+            if (parent / "Cargo.toml").is_file():
+                return parent
+        return ROOT
+
+    @classmethod
+    def rust_content_readers(cls, source, text):
+        """Repo files outside Rust roots that one Rust source names by path.
+
+        include_str! resolves from the source file; every other literal
+        resolves from the crate's CARGO_MANIFEST_DIR and, when it does not
+        climb with ``../``, from the repo root. Outside docs/ only literals
+        that land on an existing repo file count, so prose and identifiers
+        drop out; docs/*.md|json count even when absent, because ignored
+        generated docs (docs/generated/commands.md) do not exist when the
+        selector regressions run.
+        """
+        text = "\n".join(line for line in text.splitlines()
+                         if not line.strip().startswith("//"))
+        candidates = [(source.parent / path).resolve()
+                      for path in cls.INCLUDE_STR.findall(text)]
+        manifest = cls.manifest_dir(source)
+        for literal in cls.PATH_LITERAL.findall(text):
+            candidates.append((manifest / literal).resolve())
+            if not literal.startswith("../"):
+                candidates.append((ROOT / literal).resolve())
+        readers = set()
+        for resolved in candidates:
+            if not resolved.is_relative_to(ROOT):
+                continue
+            relative = resolved.relative_to(ROOT).as_posix()
+            is_doc = relative.startswith(DOCS_PREFIX) and \
+                resolved.suffix in (".md", ".json")
+            if (is_doc or resolved.is_file()) and \
+                    not relative.startswith(cls.RUST_ROOTS):
+                readers.add(relative)
+        return readers
+
+    def test_reader_scan_resolves_relative_literal_shapes(self):
+        source = ROOT / "crates/core/tests/fixture.rs"
+        shapes = {
+            'Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/custom-commands.md")':
+                "docs/custom-commands.md",
+            'read_manifest_file("../../docs/cutover-migration-ledger.md")':
+                "docs/cutover-migration-ledger.md",
+            'root.join("wrangler/src/container-env.ts")':
+                "wrangler/src/container-env.ts",
+            'format!("{}/../../docs/observability-event-catalog.md", dir)':
+                "docs/observability-event-catalog.md",
+            'include_str!("../../../docs/tickets.md")': "docs/tickets.md",
+        }
+        for text, want in shapes.items():
+            with self.subTest(shape=text):
+                self.assertEqual(self.rust_content_readers(source, text), {want})
+                self.assertIn(RUST, inputs.classify(want), want)
+        # Ignored generated docs are absent on CI but stay in the scan.
+        self.assertEqual(
+            self.rust_content_readers(
+                source, '.join("../../docs/generated/not-generated.md")'),
+            {"docs/generated/not-generated.md"})
+        for text in ('"../../wrangler/no-such-file.ts"', '// "docs/README.md"',
+                     '"src/lib.rs"', '"not a path"'):
+            with self.subTest(ignored=text):
+                self.assertEqual(self.rust_content_readers(source, text), set())
+
     def test_rust_content_readers_are_classified_rust(self):
         content_readers = set()
         rust_sources = list((ROOT / "crates").rglob("*.rs")) + (
             [ROOT / "src/lib.rs"] if (ROOT / "src/lib.rs").exists() else [])
         for source in rust_sources:
-            source_text = "\n".join(
-                line for line in source.read_text().splitlines()
-                if not line.strip().startswith("//"))
-            content_readers.update(re.findall(
-                r'"(docs/[A-Za-z0-9_./-]+\.(?:md|json))"', source_text))
-            for include_path in re.findall(
-                    r'include_str!\(\s*"([A-Za-z0-9_./-]+)"\s*\)', source_text):
-                resolved = (source.parent / include_path).resolve()
-                if resolved.is_file() and resolved.is_relative_to(ROOT):
-                    content_readers.add(resolved.relative_to(ROOT).as_posix())
+            content_readers |= self.rust_content_readers(
+                source, source.read_text())
         self.assertTrue(content_readers, "expected Rust content readers")
         for doc in self.EXISTENCE_ONLY_DOCS:
             self.assertIn(doc, content_readers, f"{doc} left Rust sources")
@@ -550,7 +620,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("test_job_inputs.py", self.selector)
 
     def test_consumer_jobs_wait_on_selector(self):
-        for job in ("check", "rust-tests", "patch-coverage", "ignored-db-stores",
+        for job in ("check", "rust-tests", "coverage-plan", "coverage-shard",
+                    "patch-coverage", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
                     "tickets-postgres", "worker", "supply-chain", "ci-ok",
                     "fuzz-compile"):
@@ -582,7 +653,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
         head = self.text.split("\n  ci-ok:")[1].split("steps:", 1)[0]
         self.assertIn("always()", head)
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
-                    "patch-coverage", "ignored-db-stores", "ignored-db-runtime", "worker",
+                    "coverage-plan", "coverage-shard", "patch-coverage",
+                    "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
                     "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
             self.assertIn(job, head)
@@ -659,7 +731,10 @@ class WorkflowSurfaceTests(unittest.TestCase):
 
     # The `check` lane always runs, so its Rust/DB steps carry the selector
     # guard per step; the four Rust test lanes skip at the job level instead.
-    RUST_LANES = ("rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime")
+    # The coverage planner skips at the job level too but is too small for
+    # the lane-shape pin below, and the merge uses a fail-closed `always()`
+    # form; both are pinned by test_coverage_plan_and_merge_skip_without_rust.
+    RUST_LANES = ("rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime")
     LANE_GUARD = "if: needs.job-inputs.outputs.rust != 'false'"
 
     # What a step must not do on a rust=false PR: that run never installs the
@@ -717,6 +792,22 @@ class WorkflowSurfaceTests(unittest.TestCase):
                         body, r"(?m)^\s+if:.*outputs\.rust",
                         f"{name!r}: the lane is already gated at the job level")
 
+    def test_coverage_plan_and_merge_skip_without_rust(self):
+        # No Rust inputs (docs-only, worker-UI-only): the planner skips at
+        # the job level like the test lanes, and the merge skips too — its
+        # fail-closed `always()` form still requires the rust selector plus a
+        # successful plan, so a partial shard set can never read as measured.
+        # ci-ok accepts the skips only because the selector deselected them.
+        plan = self.job_text(self.text, "coverage-plan").split("\n    steps:\n", 1)[0]
+        self.assertIn(f"\n    {self.LANE_GUARD}\n", plan)
+        self.assertIn("job-inputs", plan)
+        merge = self.job_text(self.text, "patch-coverage").split("\n    steps:\n", 1)[0]
+        self.assertIn("always()", merge)
+        self.assertIn("!cancelled()", merge)
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", merge)
+        self.assertIn("needs.coverage-plan.result == 'success'", merge)
+        self.assertIn("coverage-shard", merge)
+
     def test_fuzz_compile_lane_skips_at_the_job_level(self):
         # Compile-only libFuzzer lane follows the same rust selector as the
         # test lanes; ci-ok only accepts its skip when rust was deselected.
@@ -743,14 +834,19 @@ class WorkflowSurfaceTests(unittest.TestCase):
                          ["channel moderation store clippy"])
 
     def test_check_lanes_start_with_the_selector_not_behind_slow_jobs(self):
-        # The lint lane and the three test lanes run in parallel: each waits
+        # The lint lane and the test lanes run in parallel: each waits
         # on the selector only, never on the SBOM scan or the DB jobs (the old
         # `check` started a median ~7.8 min after the run began because it
         # waited on them). The aggregators carry those gates instead.
+        # Exception: coverage-shard also waits on coverage-plan, the fast
+        # (~2 min) matrix it cannot start without.
         for job in ("check", *self.RUST_LANES):
             with self.subTest(job=job):
                 head = self.job_text(self.text, job)
-                self.assertRegex(head, r"(?m)^    needs: \[job-inputs\]$")
+                if job == "coverage-shard":
+                    self.assertRegex(head, r"(?m)^    needs: \[job-inputs, coverage-plan\]$")
+                else:
+                    self.assertRegex(head, r"(?m)^    needs: \[job-inputs\]$")
 
     def test_push_to_main_selects_everything(self):
         self.assertIn("pull_request", self.selector)

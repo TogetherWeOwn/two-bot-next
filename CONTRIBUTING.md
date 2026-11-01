@@ -44,6 +44,8 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 The rulesets on `main` require one PR and squash-only merges, and block deletion
 and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main`.
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
+The review apps CodeRabbit and Devin Review are required checks too. No approving
+review is required.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
 body as errors, and the two required template sections (Linked Issues and
@@ -53,10 +55,23 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
+Who merges (owner decision 2026-10-31): the agent that did the work merges a PR
+once every required check is green and each review finding is fixed or answered
+with evidence. A merge to `main` that touches a path outside the
+`paths-ignore` list in `deploy-staging.yml` starts `deploy-staging`, and
+`deploy-production` then promotes that commit on its own once staging and
+`ci-ok` are green. That merge therefore needs the owner's approval through
+`request_confirmation` on the card first, and the approval covers the automatic
+promotion that follows. A merge that only touches ignored paths (root `*.md`,
+`docs/**` and the rest of that list) starts no deploy and needs no owner
+approval. A manual production dispatch or rollback needs its own approval.
+
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests), `patch coverage` (the HARD patch-coverage
-measurement, split out of `rust tests` so the two signals fail independently),
+(unit, integration and doc tests), the sharded `patch coverage` measurement
+(`coverage-plan` selects the legs, the `coverage-shard` matrix runs them,
+`patch-coverage` merges and gates, so the unit-test signal and the coverage
+verdict fail independently),
 `rust nextest` (workspace lib/bins under
 cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
 `ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
@@ -72,10 +87,11 @@ the SBOM job. The legacy `required-checks` aggregate is removed.
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
 the `check` lane on the existing routed runner; see
-[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
-`patch-coverage` with the disposable Postgres service and ignored database-backed
-tests. New checks start in WARN (report, never fail) and flip to HARD only with
-their backlog burned down.
+[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs
+sharded across `coverage-plan`, the `coverage-shard` matrix (with per-shard
+disposable Postgres services and ignored database-backed tests) and the
+`patch-coverage` merge. New checks start in WARN (report, never fail) and flip
+to HARD only with their backlog burned down.
 
 Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use
