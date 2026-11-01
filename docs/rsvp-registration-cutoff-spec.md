@@ -2,7 +2,9 @@
 
 Status: **Merged into [RSVP capacity](rsvp-capacity-spec.md)**, deferred to
 2026-12 (owner decision 2026-11-01). That doc is now the single RSVP-policy
-spec; this one stays as the detailed record of its slice. Original proposal:
+spec; this one stays as the detailed record of its slice. Edit policy there,
+not here: the "sole editable contract" wording in the original proposal text
+below is superseded by this merge. Original proposal:
 written 2026-10-26. No runtime, command, endpoint, schema, permission, migration
 or deployment change. Merge records this proposal, not accepted intent, security
 disposition or build approval. This indexed file is the sole editable contract;
