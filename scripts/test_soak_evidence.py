@@ -347,10 +347,9 @@ class SoakEvidenceTests(unittest.TestCase):
                 self.assertEqual(main([clean.name]), 0)
 
     def test_decoder_recursion_overflow_becomes_unknown_then_continues(self):
-        # Deep enough to overflow the C JSON decoder itself (default
-        # recursion limit 1000), so json.loads raises RecursionError before
-        # _too_deeply_nested is reached. This pins the except RecursionError
-        # branch in summarize(): without it the whole run aborts.
+        # Deep enough to overflow the C JSON decoder on older CPython. The
+        # lexical pre-scan refuses it before json.loads on every version;
+        # this pins that the run marks it UNKNOWN and continues, not aborts.
         bad = "[" * 100000 + "\n"
         good = (
             '{"ts": "2026-09-20T00:00:02Z", "event": "connect", '
