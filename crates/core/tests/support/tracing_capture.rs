@@ -14,6 +14,7 @@ struct SpanState {
 #[derive(Default)]
 struct Inner {
     text: Mutex<String>,
+    cases: Mutex<HashMap<String, String>>,
     spans: Mutex<HashMap<u64, SpanState>>,
     next_span: AtomicU64,
 }
@@ -23,16 +24,32 @@ pub struct Capture(Arc<Inner>);
 
 impl Capture {
     pub fn text(&self) -> String {
-        self.0.text.lock().unwrap().clone()
+        self.text_for_case(None)
+    }
+
+    /// Return complete events attributed by entered spans, or all events for
+    /// `None`. Rendered message text cannot forge attribution, and embedded
+    /// newlines cannot separate sensitive text from its event's case.
+    pub fn text_for_case(&self, case: Option<&str>) -> String {
+        match case {
+            Some(case) => self
+                .0
+                .cases
+                .lock()
+                .unwrap()
+                .get(case)
+                .cloned()
+                .unwrap_or_default(),
+            None => self.0.text.lock().unwrap().clone(),
+        }
     }
 }
 
 // Test-only attribution: a span carrying a `capture_case` field tags every
-// event emitted while it is entered with ` capture_case=<value>` on the same
-// line. Parallel tests sharing the one global capture can then keep only the
-// lines their own exercised unit produced, instead of scanning (or being
-// satisfied by) whatever sibling tests logged in the same byte window. Spans
-// without that field annotate nothing, so existing captures are unchanged.
+// event emitted while it is entered. Keep the rendered suffix for existing
+// readers, but `text_for_case` selects complete records from entered spans:
+// multiline messages and message text resembling a marker cannot defeat it.
+// Spans without that field annotate nothing, so existing text is unchanged.
 thread_local! {
     static ENTERED_CASES: std::cell::RefCell<Vec<(u64, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -156,6 +173,7 @@ impl Subscriber for Capture {
 
     fn event(&self, event: &Event<'_>) {
         let mut text = self.0.text.lock().unwrap();
+        let start = text.len();
         write!(
             text,
             "{} {}",
@@ -170,5 +188,14 @@ impl Subscriber for Capture {
             }
         });
         text.push('\n');
+        ENTERED_CASES.with(|entered| {
+            let mut cases = self.0.cases.lock().unwrap();
+            for (_, case) in entered.borrow().iter() {
+                cases
+                    .entry(case.clone())
+                    .or_default()
+                    .push_str(&text[start..]);
+            }
+        });
     }
 }
