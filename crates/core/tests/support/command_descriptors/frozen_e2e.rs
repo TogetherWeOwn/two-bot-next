@@ -196,7 +196,7 @@ pub const FROZEN_E2E: &[FrozenE2e] = &[
     },
     FrozenE2e {
         name: "rsvp",
-        success_shape: "Ephemeral `RSVP saved: <status>.` confirmation (pasted links append the event id).",
+        success_shape: "Ephemeral `RSVP saved: <status>.` confirmation; a changed or repeated choice adds `(changed from <previous>)` or `(saved again; time updated)` (pasted links append the event id).",
         permission_name: "Everyone",
         denials: &[
             "Gate:AnnouncementsDisabled",
