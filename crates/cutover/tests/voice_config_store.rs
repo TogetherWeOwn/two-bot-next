@@ -327,7 +327,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     // 0469 backfill: a legacy-only restriction moves into the gate's store,
     // an enforced one keeps its roles, a name the gate refuses is dropped
     // (else the whole guild's row would fail to decode), and the legacy
-    // tables empty.
+    // tables keep every row for the previous binary (expand/contract).
     sqlx::query(
         "INSERT INTO voice_command_roles (guild_id, command) VALUES
            ('44','kick'), ('44','limit'), ('44','retired'), ('45','transfer'),
@@ -371,7 +371,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         )
         .fetch_one(pool)
         .await?,
-        0
+        10
     );
 
     // Another guild is independent of this one.
@@ -386,6 +386,11 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     let smaller_expected = store.snapshot(GUILD).await?;
     store.apply(GUILD, &smaller, &smaller_expected).await?;
     assert_eq!(store.snapshot(GUILD).await?, smaller);
+    assert_eq!(
+        legacy_rows(pool, GUILD_ID).await?,
+        Vec::new(),
+        "lifted restrictions leave the legacy mirror"
+    );
     assert_eq!(
         store.snapshot(42).await?,
         neighbour,
@@ -417,6 +422,25 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     store.apply(GUILD, &config, &restore_expected).await?;
     let before = store.snapshot(GUILD).await?;
     assert_eq!(before, config);
+    // Apply mirrors the restrictions into the legacy tables, so the previous
+    // binary's `/export` shows the same after a backout.
+    let mirrored: Vec<(String, Option<String>)> = config
+        .settings
+        .command_roles
+        .iter()
+        .flat_map(|restriction| {
+            let roles: Vec<Option<String>> = if restriction.role_ids.is_empty() {
+                vec![None]
+            } else {
+                restriction.role_ids.iter().cloned().map(Some).collect()
+            };
+            roles
+                .into_iter()
+                .map(move |role| (restriction.command.clone(), role))
+        })
+        .collect();
+    assert!(!mirrored.is_empty(), "fixture restricts a command");
+    assert_eq!(legacy_rows(pool, GUILD_ID).await?, mirrored);
     let rows_before = config_rows(pool, GUILD_ID).await?;
     let mut bad_creator = alternate(&config);
     bad_creator.creators[0].first_number = 0; // CHECK first_room_number >= 1
@@ -753,4 +777,23 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     store.apply(79, &imported, &imported_expected).await?;
     assert_eq!(store.snapshot(79).await?, fresh);
     Ok(())
+}
+
+/// The legacy 0229 command-role rows, in the order `config.settings` lists
+/// them: one `(command, None)` for a command with no roles.
+async fn legacy_rows(
+    pool: &PgPool,
+    guild: &str,
+) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT c.command, m.role_id
+             FROM voice_command_roles c
+             LEFT JOIN voice_command_role_members m
+               ON m.guild_id = c.guild_id AND m.command = c.command
+            WHERE c.guild_id = $1
+            ORDER BY c.command COLLATE "C", length(m.role_id), m.role_id"#,
+    )
+    .bind(guild)
+    .fetch_all(pool)
+    .await
 }

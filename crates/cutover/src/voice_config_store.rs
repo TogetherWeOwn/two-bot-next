@@ -11,7 +11,10 @@
 //! `settings.command_roles` lives in `voice_access_controls.command_roles`,
 //! the column the command gate and `/access` use (0469), so an imported
 //! restriction is enforced and an `/access` restriction is exported. The 0229
-//! `voice_command_roles` tables are legacy: apply only clears them.
+//! `voice_command_roles` tables are legacy and nothing here reads them; apply
+//! still mirrors the imported restrictions into them so the previous binary's
+//! `/export` and `/import` match after a backout, until a contract migration
+//! drops them.
 //!
 //! The caller validates against a trusted guild inventory with
 //! `two_bot_core::voice_config::validate_configuration` before applying; the
@@ -543,6 +546,26 @@ async fn write_settings(
     .bind(serde_json::to_string(&command_roles).map_err(invalid_argument)?)
     .execute(&mut **tx)
     .await?;
+    // Expand/contract mirror (0469): the previous binary reads the legacy
+    // tables, so a backout keeps showing what was imported here.
+    for (command, roles) in &command_roles {
+        sqlx::query("INSERT INTO voice_command_roles (guild_id, command) VALUES ($1,$2)")
+            .bind(guild)
+            .bind(command)
+            .execute(&mut **tx)
+            .await?;
+        for role in roles {
+            sqlx::query(
+                "INSERT INTO voice_command_role_members (guild_id, command, role_id)
+                 VALUES ($1,$2,$3)",
+            )
+            .bind(guild)
+            .bind(command)
+            .bind(role)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
     Ok(())
 }
 

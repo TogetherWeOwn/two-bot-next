@@ -5,8 +5,10 @@
 -- `voice_access_controls.command_roles` (0227), so an imported and confirmed
 -- restriction was never enforced. `voice_access_controls.command_roles` is now
 -- the single authority: `PgVoiceConfigStore` reads and writes it, `/access`
--- already did. This moves every legacy row there and empties the legacy
--- tables, which nothing reads any more.
+-- already did. This copies every legacy row there. Expand/contract: the
+-- legacy tables stay as they are, because the previous binary's `/export`
+-- and `/import` read them; a later contract migration drops them once this
+-- release is stable in production.
 --
 -- Merge rule: a command already restricted in `voice_access_controls` keeps
 -- its enforced role list; a command only the legacy tables restrict is added.
@@ -17,9 +19,11 @@
 -- other name, which would block every voice command for the guild. The
 -- legacy tables accepted any non-blank name and the gate never read them, so
 -- dropping an unknown one loosens nothing. Role lists are canonical (numeric
--- order). The deletes make a re-run a no-op. Backout: deploy the previous
--- binary; the moved restrictions stay enforced, but its `/export` and
--- `/import` no longer see them until they are re-imported. No member PII.
+-- order). A re-run only re-adds a copied command that was lifted since,
+-- which tightens and never loosens; migrations run once. Backout: deploy the
+-- previous binary; the copied restrictions stay enforced and its `/export`
+-- and `/import` still see the legacy rows, which `/import` on this binary
+-- keeps mirrored. No member PII.
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 
 INSERT INTO voice_access_controls (guild_id, command_roles)
@@ -41,6 +45,3 @@ SELECT c.guild_id,
  GROUP BY c.guild_id
 ON CONFLICT (guild_id) DO UPDATE
   SET command_roles = EXCLUDED.command_roles || voice_access_controls.command_roles;
-
-DELETE FROM voice_command_role_members;
-DELETE FROM voice_command_roles;
