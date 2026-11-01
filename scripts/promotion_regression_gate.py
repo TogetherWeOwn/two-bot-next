@@ -103,7 +103,9 @@ def staging_step(probe, rest, sha, auto):
         raise GateError("no staging probe receipt")
     revision = probe.get("build_revision")
     if not isinstance(revision, str) or not SHA.fullmatch(revision):
-        revision = None
+        # Only a verified different build proves staging moved on: an
+        # unreadable or unstamped revision is a candidate failure, never a skip.
+        raise GateError("staging reports no verifiable build revision")
     code = (rest or {}).get("code")
     evidence = {"sha": sha, "staging_build_revision": revision, "checks": checks(probe), "rest": None,
                 "rest_code": code if isinstance(code, str) and CHECK_NAME.fullmatch(code) else None}

@@ -48,6 +48,14 @@ class StagingStepTests(unittest.TestCase):
         with self.assertRaises(gate.GateError):
             gate.staging_step(None, rest(0, 50), SHA, auto=True)
 
+    def test_an_unreadable_staging_revision_refuses_instead_of_skipping(self):
+        # A down or unstamped staging build is not proof of a newer build.
+        for revision in (None, "unknown", "", SHA.upper()):
+            with self.subTest(revision=revision):
+                receipt = probe(revision=revision, health="fail", readyz="fail", build="fail")
+                with self.assertRaises(gate.GateError):
+                    gate.staging_step(receipt, rest(0, 50), SHA, auto=True)
+
     def test_unavailable_or_inconsistent_counters_record_no_data(self):
         for counters in (None, {"available": False, "code": "token_absent"},
                          rest(5, 4), {**rest(1, 10), "rest5xx": True}):
