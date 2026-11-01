@@ -6,9 +6,9 @@ no secret access. Static rows come from the `Dockerfile` at sample source SHA
 that main head, described under Measured sample image.
 
 - Baseline inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
-- Builder-row refresh (2026-10-04): [`Dockerfile:10` at `723663df9c74fd24734170a981cf59908aadd33a`](https://github.com/TogetherWeOwn/two-bot-next/blob/723663df9c74fd24734170a981cf59908aadd33a/Dockerfile#L10).
+- Builder-row refresh (2026-11-01): [`Dockerfile:10` at `e403836cec544d6a1c4f74c6fa0c8daebcf91734`](https://github.com/TogetherWeOwn/two-bot-next/blob/e403836cec544d6a1c4f74c6fa0c8daebcf91734/Dockerfile#L10).
   The baseline used `rust:1.94-trixie`; only the builder row now records the
-  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
+  Rust 1.99 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
   main-head sample, not the cutover candidate and not the baseline estimate.
 - Source files: `Dockerfile`, `.github/workflows/sbom.yml`,
   `docs/supply-chain.md`, `scripts/container-smoke.py`, `.trivyignore.yaml`
@@ -20,7 +20,7 @@ that main head, described under Measured sample image.
 
 | Stage | Reference (pinned) | OS | Purpose |
 |---|---|---|---|
-| builder | `rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
+| builder | `rust:1.99-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
 | runtime | `gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` | Debian 13, distroless `cc` | Ships glibc, libgcc, CA trust data and the `nonroot` account (uid/gid 65532); carries only the release binary |
 
 Both stages are Debian 13, so the binary links against the glibc it runs on.

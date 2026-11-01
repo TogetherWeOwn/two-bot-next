@@ -728,7 +728,7 @@ pub fn build_seed_halves(now_ms: i64) -> VoiceHalves {
         occurred_at: at(offset),
         channel: channel.to_owned(),
         start_known,
-        started_at: started_at.map(&at),
+        started_at: started_at.map(at),
         duration_seconds,
     };
     let mut halves = VoiceHalves {

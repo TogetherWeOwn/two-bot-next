@@ -5,7 +5,7 @@
 #
 # Build from the repo root (the probe is a workspace member):
 #   docker build -f crates/voice-probe/Dockerfile -t voice-probe .
-FROM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder
+FROM rust:1.99-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
 
 WORKDIR /app
 

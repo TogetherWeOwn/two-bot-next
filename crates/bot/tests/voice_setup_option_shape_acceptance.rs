@@ -206,9 +206,23 @@ impl RoomPersistence for Store {
     store_refuses!(save_custom_name(_guild: u64, _channel: u64, _name: Option<&str>) -> bool);
     store_refuses!(save_access_controls(_guild: u64, _controls: &AccessControls) -> ());
     store_refuses!(save_logging_settings(_guild: u64, _settings: &LoggingSettings) -> ());
-    store_refuses!(config_apply(_guild: u64, _config: &VoiceConfiguration, _expected: &VoiceConfiguration) -> ());
+    store_refuses!(
+        config_apply(
+            _guild: u64,
+            _config: &VoiceConfiguration,
+            _expected: &VoiceConfiguration,
+        ) -> ()
+    );
     store_refuses!(forget(_guild: u64, _channel: u64) -> ());
-    store_refuses!(claim_create(_guild: u64, _user: u64, _leaving: &[u64], _config: &CreateAdmissionConfig, _now: i64) -> CreateClaim);
+    store_refuses!(
+        claim_create(
+            _guild: u64,
+            _user: u64,
+            _leaving: &[u64],
+            _config: &CreateAdmissionConfig,
+            _now: i64,
+        ) -> CreateClaim
+    );
     store_refuses!(bind_create_channel(_guild: u64, _reservation: &str, _channel: u64) -> ());
     store_refuses!(persist_create(_reservation: &str, _room: &VoiceRoom) -> ());
     store_refuses!(settle_create(_reservation: &str) -> bool);
@@ -220,8 +234,20 @@ impl RoomPersistence for Store {
     store_refuses!(remove_join_grant(_guild: u64, _room: u64, _member: u64) -> ());
     store_refuses!(record_event_voice_join(_channel: u64, _member: u64) -> ());
     store_refuses!(record_event_voice_leave(_channel: u64, _member: u64) -> ());
-    store_refuses!(flush_event_voice_presence(_event: &str, _instance: time::OffsetDateTime, _members: &[u64]) -> u64);
-    store_refuses!(close_event_voice_spans_absent(_event: &str, _instance: time::OffsetDateTime, _present: &[u64]) -> u64);
+    store_refuses!(
+        flush_event_voice_presence(
+            _event: &str,
+            _instance: time::OffsetDateTime,
+            _members: &[u64],
+        ) -> u64
+    );
+    store_refuses!(
+        close_event_voice_spans_absent(
+            _event: &str,
+            _instance: time::OffsetDateTime,
+            _present: &[u64],
+        ) -> u64
+    );
 }
 
 #[derive(Clone)]
@@ -270,23 +296,50 @@ impl RoomWrites for Discord {
             .push("discord:is_unauthorized".into());
         false
     }
-    discord_refuses!(move_member(_guild: u64, _member: u64, _channel: u64, _guard: WriteGuard) -> ());
+    discord_refuses!(
+        move_member(_guild: u64, _member: u64, _channel: u64, _guard: WriteGuard) -> ()
+    );
     discord_refuses!(disconnect(_guild: u64, _member: u64, _guard: WriteGuard) -> ());
     discord_refuses!(deny_connect(_channel: u64, _member: u64, _guard: WriteGuard) -> ());
     discord_refuses!(delete(_channel: u64, _guard: WriteGuard) -> ());
     discord_refuses!(rename(_channel: u64, _name: &str) -> ());
     discord_refuses!(set_user_limit(_channel: u64, _limit: u32, _guard: WriteGuard) -> ());
     discord_refuses!(download_attachment(_url: &str, _max: usize) -> Vec<u8>);
-    discord_refuses!(create_companion(_plan: &TextChannelPlan, _bot: u64, _guard: WriteGuard) -> Channel);
+    discord_refuses!(
+        create_companion(_plan: &TextChannelPlan, _bot: u64, _guard: WriteGuard) -> Channel
+    );
     discord_refuses!(grant_companion_view(_channel: u64, _member: u64, _guard: WriteGuard) -> ());
     discord_refuses!(revoke_companion_view(_channel: u64, _member: u64, _guard: WriteGuard) -> ());
     discord_refuses!(reorder_channels(_guild: u64, _positions: &[(u64, u64)]) -> ());
     discord_refuses!(set_voice_status(_channel: u64, _status: &str) -> ());
-    discord_refuses!(put_overwrite(_channel: u64, _overwrite: PermissionOverwrite, _guard: WriteGuard) -> ());
-    discord_refuses!(create_join_channel(_guild: u64, _name: &str, _parent: Option<u64>, _position: Option<u64>, _guard: WriteGuard) -> Channel);
+    discord_refuses!(
+        put_overwrite(_channel: u64, _overwrite: PermissionOverwrite, _guard: WriteGuard) -> ()
+    );
+    discord_refuses!(
+        create_join_channel(
+            _guild: u64,
+            _name: &str,
+            _parent: Option<u64>,
+            _position: Option<u64>,
+            _guard: WriteGuard,
+        ) -> Channel
+    );
     discord_refuses!(delete_overwrite(_channel: u64, _member: u64, _guard: WriteGuard) -> ());
-    discord_refuses!(send_component_message(_channel: u64, _content: &str, _mention: Option<u64>, _components: &[Component]) -> MessageRef);
-    discord_refuses!(edit_component_message(_message: MessageRef, _content: &str, _components: &[Component]) -> ());
+    discord_refuses!(
+        send_component_message(
+            _channel: u64,
+            _content: &str,
+            _mention: Option<u64>,
+            _components: &[Component],
+        ) -> MessageRef
+    );
+    discord_refuses!(
+        edit_component_message(
+            _message: MessageRef,
+            _content: &str,
+            _components: &[Component],
+        ) -> ()
+    );
     discord_refuses!(send_notice(_target: NoticeTarget, _content: &str, _role: Option<u64>) -> ());
 }
 
