@@ -17,6 +17,10 @@ name: supply-chain
 #   * PR body follows .github/pull_request_template.md: Linked Issues or Issue Description
 #     (non-light types) and Verification are required; the rest is optional. The rules live in
 #     .github/scripts/pr_standards.py with tests beside it; this job runs both.
+#     A PR touching a T0 path (migrations/sql/db, auth words, .github/workflows/deploy*,
+#     crates/cutover/**, wrangler config) must carry `risk_tier: T0` with checked D1–D8
+#     and no leftover placeholders. That floor is always an error, even in warn mode;
+#     the changed paths arrive from the PR files API via the List changed files step.
 #   * This repo is public. No card reference is required (`REQUIRE_CARD_REF: "false"`), and an
 #     internal tracker ID (a `TOG-` or `PAP-` prefix followed by digits) must not appear in a
 #     title, body, commit subject or branch name. The strict title/body subset (tracker id,
@@ -204,6 +208,34 @@ jobs:
       - name: Unit-test the lint
         run: python3 -m unittest discover -s .github/scripts -p 'test_pr_standards.py'
 
+      # Changed paths feed the T0 attestation floor in pr_standards.py. Read-only:
+      # the PR files API under the job's pull-requests: read grant. Renames emit
+      # both the new and the previous name (deleting or moving a T0 file stays
+      # T0); deletes arrive with status removed and are included like any other
+      # change. An empty or missing list fails the job, so a PR cannot reach
+      # the gate without one.
+      - name: List changed files
+        if: github.event_name != 'merge_group'
+        id: changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          case "${PR_NUMBER}" in
+            ''|*[!0-9]*)
+              echo "Expected a numeric PR number" >&2
+              exit 1
+              ;;
+          esac
+          files_path="${RUNNER_TEMP}/changed-files.txt"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --paginate \
+            -q '.[] | [.filename, .previous_filename] | map(select(. != null and . != "")) | .[]' \
+            > "${files_path}"
+          test -s "${files_path}" || { echo "Changed-file list is empty" >&2; exit 1; }
+          echo "changed_files_file=${files_path}" >> "${GITHUB_OUTPUT}"
+
       - name: Check title, body, branch and commits
         if: github.event_name != 'merge_group'
         env:
@@ -214,6 +246,7 @@ jobs:
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           COMMITS: ${{ toJSON(github.event.commits) }}
+          CHANGED_FILES_FILE: ${{ steps.changed.outputs.changed_files_file }}
         shell: python3 {0}
         run: |
           import os, sys
@@ -222,7 +255,7 @@ jobs:
           # release notes can exceed the per-string execve limit (E2BIG) that
           # would otherwise keep this process from starting at all. The gate
           # reads env, so bridge the two in-process, where no such limit
-          # applies.
+          # applies. The changed-file list travels the same way.
           root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
           sys.path.insert(0, os.path.join(root, ".github/scripts"))
           import pr_standards
@@ -230,6 +263,10 @@ jobs:
           if os.environ.get("EVENT") == "pull_request":
               with open(os.environ["BODY_FILE"], encoding="utf-8") as handle:
                   os.environ["BODY"] = handle.read()
+              files_path = os.environ.get("CHANGED_FILES_FILE") or ""
+              if files_path:
+                  with open(files_path, encoding="utf-8") as handle:
+                      os.environ["CHANGED_FILES"] = handle.read()
           sys.exit(pr_standards.main())
 
       # release-please silently drops a commit its strict parser rejects, so the

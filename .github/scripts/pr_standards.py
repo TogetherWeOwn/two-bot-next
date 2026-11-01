@@ -11,6 +11,12 @@ Environment contract (every value is a plain string):
   EVENT                  pull_request | push | workflow_dispatch   (anything but pull_request lints commits)
   TITLE, BODY, AUTHOR    pull request title, body, author login
   HEAD_REF               pull request head branch name
+  CHANGED_FILES          newline-separated repository-relative paths changed by the PR.
+                         Renames carry both the old and the new path (one per line);
+                         deletes are listed like any other change. Absent or empty
+                         skips the attestation gate (push events carry no PR diff;
+                         the workflow fails the job when the PR file list cannot
+                         be produced, so a PR cannot reach the gate without one).
   COMMITS                JSON array of {id, message} for push events
   REPO_PRIVATE           "true" | "false"; decides whether internal ticket references are allowed
   REQUIRE_CARD_REF       "true" | "false"; private repos only: demand `Refs: TOG-1234` in the body
@@ -20,6 +26,9 @@ Environment contract (every value is a plain string):
 Title format, an empty body and a missing required card reference are always errors: they are the
 standard the org already enforces. On a public repo the strict title/body subset (tracker ids,
 instance UI links, the internal host) is also always an error, regardless of PR_STANDARDS_MODE.
+A PR whose changed paths hit the T0 risk floor must carry a complete T0 attestation
+(`risk_tier: T0`, checked D1–D8, no leftover placeholders): that too is always an error,
+regardless of PR_STANDARDS_MODE, the same way internal references already are.
 Only the required template sections (beyond an empty body), the advisory title/body remainder
 (agent links, localhost, private-network addresses, tailnet names), branch names and commit
 history follow PR_STANDARDS_MODE, so a repo can land the gate in warn mode, clear its open
@@ -73,6 +82,100 @@ OTHER_FIXED = [
 # Single source for the fixed patterns: the full scan is the strict subset plus
 # the advisory remainder, interleaved to keep the long-standing finding order.
 FIXED_INTERNAL = OTHER_FIXED[:1] + [INSTANCE_UI] + OTHER_FIXED[1:] + [HOST_INTERNAL]
+
+# T0 risk floor: the path list from the Attestation section of
+# .github/pull_request_template.md. Word/directory sets mirror the central
+# TogetherWeOwn/.github attestation validator so the required gate and the
+# shadow observation agree on what counts as T0.
+T0_DIRECTORIES = frozenset({"migrations", "sql", "db", "database", "drizzle"})
+T0_WORDS = frozenset({
+    "auth", "authn", "authz", "authentication", "authorization", "oauth",
+    "session", "sessions", "billing", "payment", "payments", "permission", "permissions",
+    "gateway", "voice", "crypto", "vault",
+    "secret", "secrets", "backup", "backups", "dump", "dumps",
+    "grant", "grants", "role", "roles", "erasure", "ingest",
+})
+T0_PATH_PATTERNS = (
+    re.compile(r"^\.github/workflows/deploy[^/]*(?:/.*)?$"),
+    re.compile(r"(?:^|/)wrangler(?:[.-][^/]*)?\.(?:toml|jsonc?)$"),
+    re.compile(r"^crates/cutover/"),
+)
+T0_DOC_SUFFIXES = (".md", ".rst", ".txt")
+T0_RISK_TIER = re.compile(r"^risk_tier:\s*(T0|T1|T2)\s*$", re.I | re.M)
+T0_CHECK_ITEM = re.compile(r"^-\s*\[( |x|X)\]\s*(D[1-8]):\s*(.+?)\s*$")
+T0_PLACEHOLDER = re.compile(r"<[^<>\n]+>")
+
+
+def t0_path_words(component):
+    """Split one path component the way the template defines words: punctuation,
+    snake_case, kebab-case and CamelCase boundaries (auth.rs, gateway_backoff.rs,
+    member-erasure.ts, SessionController.php)."""
+    component = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", component)
+    component = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", component)
+    return set(re.split(r"[^a-z0-9]+", component.lower()))
+
+
+def is_t0_path(path):
+    """True when one changed path hits the T0 floor. Prose files (.md/.rst/.txt)
+    are not modules, but still inherit a critical directory floor; substrings
+    such as authors.py, voices/ and roleplay.ts do not match the word list."""
+    if any(pat.search(path) for pat in T0_PATH_PATTERNS):
+        return True
+    parts = path.split("/")
+    if any(part.lower() in T0_DIRECTORIES for part in parts[:-1]):
+        return True
+    components = parts[:-1] if path.lower().endswith(T0_DOC_SUFFIXES) else parts
+    return any(t0_path_words(part) & T0_WORDS for part in components)
+
+
+def attestation_findings(body, paths):
+    """T0 attestation gate. Empty unless a changed path hits the T0 floor, in
+    which case the body must declare `risk_tier: T0` and carry all of D1–D8
+    checked with real evidence (no leftover `<placeholder>` text anywhere in
+    the Attestation section). Every finding is an error: declaring a higher
+    tier than the floor is fine, understating it is not."""
+    t0_paths = sorted({p for p in paths if is_t0_path(p)})
+    if not t0_paths:
+        return []
+    sections = parse_sections(body)
+    att = sections.get("attestation")
+    if att is None:
+        return [Finding("error", "Attestation",
+                        f"This PR touches T0 paths ({', '.join(t0_paths[:3])}"
+                        f"{', …' if len(t0_paths) > 3 else ''}) but the body has no "
+                        "'## Attestation' section. Declare `risk_tier: T0` with the "
+                        "claim-to-test mapping and checked D1–D8.")]
+    out = []
+    tier = T0_RISK_TIER.search(att)
+    if tier is None or tier.group(1).upper() != "T0":
+        out.append(Finding("error", "Attestation",
+                           f"This PR touches T0 paths ({', '.join(t0_paths[:3])}"
+                           f"{', …' if len(t0_paths) > 3 else ''}) but does not declare "
+                           "`risk_tier: T0`. The floor is a minimum: declaring T0 for "
+                           "a critical change on any path is always fine."))
+    items = {}
+    for line in att.splitlines():
+        m = T0_CHECK_ITEM.match(line.strip())
+        if m:
+            items[m.group(2).upper()] = (m.group(1).lower() == "x", m.group(3))
+    bad = [f"D{i}" for i in range(1, 9)
+           if f"D{i}" not in items or not items[f"D{i}"][0]
+           or not items[f"D{i}"][1].strip()
+           or T0_PLACEHOLDER.search(items[f"D{i}"][1])]
+    if bad:
+        out.append(Finding("error", "Attestation",
+                           f"T0 PRs need all of D1–D8 checked with evidence, not "
+                           f"placeholders. Fix: {', '.join(bad)}."))
+    # Leftover placeholders in the rest of the section (claims, test mapping):
+    # the risk_tier and D-lines report their own findings above.
+    rest = T0_RISK_TIER.sub("", re.sub(r"^-\s*\[[ xX]\]\s*D[1-8]:.*$", "", att,
+                                            flags=re.M | re.I))
+    if T0_PLACEHOLDER.search(rest):
+        out.append(Finding("error", "Attestation",
+                           "The Attestation section still holds placeholder text "
+                           "(<...>). Replace every placeholder with evidence or "
+                           "not-applicable plus a concrete reason."))
+    return out
 
 
 @dataclass
@@ -210,6 +313,13 @@ def check_pull_request(env):
             if real_items(content) < minimum:
                 need = f"at least {minimum} items" if minimum > 1 else "real content"
                 out.append(Finding(mode, "PR template", f"'## {heading}' needs {need}."))
+
+    if not generated:
+        # T0 attestation floor: always an error, regardless of PR_STANDARDS_MODE.
+        # Release automation cannot write attestations, so generated PRs are exempt.
+        changed = [line.strip() for line in (env.get("CHANGED_FILES") or "").splitlines()
+                   if line.strip()]
+        out.extend(attestation_findings(body, changed))
 
     if private:
         if not generated and not re.search(r"\bTOG-\d+\b", body):

@@ -241,6 +241,97 @@ class CardAndInternalRefs(unittest.TestCase):
         self.assertIn(("error", "Internal reference"), levels(f))
 
 
+FULL_ATTESTATION = """
+## Attestation
+
+risk_tier: T0
+
+### Claims
+
+- C1: rollback refuses an unqualified DELETE
+
+### Tests
+
+- C1 | test=scripts/test_rollback.py::test_refuses_bare_delete | failed_before=not-run | proof=python3 scripts/test_rollback.py 5 OK
+
+### High-risk checklist
+
+- [x] D1: no secret sinks; redacted evidence only
+- [x] D2: no auth paths changed
+- [x] D3: no migrations shipped
+- [x] D4: bounded inputs and caps
+- [x] D5: no concurrency hazard
+- [x] D6: pinned actions only
+- [x] D7: failures propagate honestly
+- [x] D8: malformed shapes covered
+"""
+
+
+class AttestationFloor(unittest.TestCase):
+    T0_FILES = ".github/workflows/deploy-production.yml"
+
+    def test_t0_path_without_attestation_fails(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_t0_path_with_full_attestation_passes(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY + FULL_ATTESTATION, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_t1_path_without_attestation_passes(self):
+        body = GOOD_BODY
+        for changed in ("src/main.rs\ndocs/guide.md", ""):
+            self.assertEqual([], ps.evaluate(env(BODY=body, CHANGED_FILES=changed)))
+
+    def test_leftover_placeholders_fail(self):
+        base = GOOD_BODY + FULL_ATTESTATION
+        bodies = [
+            base.replace("- [x] D1: no secret sinks; redacted evidence only",
+                         "- [x] D1: <secret sinks, redaction and log/artifact exposure>"),
+            base.replace("risk_tier: T0", "risk_tier: <T0|T1|T2>"),
+            base.replace("- C1: rollback refuses an unqualified DELETE",
+                         "- C1: <behavior guaranteed by this change>"),
+        ]
+        for body in bodies:
+            f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+            self.assertIn(("error", "Attestation"), levels(f), body[-200:])
+
+    def test_rename_from_a_t0_path_counts(self):
+        # Renames carry both paths; the old T0 path keeps the floor at T0.
+        # Deleting a T0 file is still T0.
+        for changed in ("scripts/renamed.py\ncrates/cutover/src/parse.rs",
+                        "migrations/0001_init.sql"):
+            f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=changed))
+            self.assertIn(("error", "Attestation"), levels(f), changed)
+
+    def test_t0_gate_is_an_error_in_warn_mode(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=self.T0_FILES,
+                            PR_STANDARDS_MODE="warn"))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_understated_tier_fails_and_higher_tier_is_fine(self):
+        base = GOOD_BODY + FULL_ATTESTATION
+        f = ps.evaluate(env(BODY=base.replace("risk_tier: T0", "risk_tier: T1"),
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        # Declaring T0 on a T1 path is allowed.
+        self.assertEqual([], ps.evaluate(env(BODY=base, CHANGED_FILES="src/main.rs")))
+
+    def test_t0_path_matching_follows_the_template(self):
+        t0 = ("migrations/0001.sql", "sql/web_v1.sql", "db/schema.sql",
+              "src/auth.rs", "crates/core/src/session_controller.rs",
+              "crates/cutover/src/parse.rs", ".github/workflows/deploy-production.yml",
+              "wrangler.toml", "config/wrangler.production.json",
+              "migrations/notes.md")
+        for path in t0:
+            self.assertTrue(ps.is_t0_path(path), path)
+        not_t0 = ("src/main.rs", "src/authors.py", "crates/discord/src/voices.rs",
+                  "src/roleplay.ts", "docs/auth-guide.md", "docs/wrangler.md",
+                  ".github/workflows/check.yml", "README.md")
+        for path in not_t0:
+            self.assertFalse(ps.is_t0_path(path), path)
+
+
 class Push(unittest.TestCase):
     def commits(self, *msgs):
         return json.dumps([{"id": f"{i:040x}", "message": m} for i, m in enumerate(msgs)])
