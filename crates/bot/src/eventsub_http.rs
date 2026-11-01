@@ -24,7 +24,7 @@ use std::{
     future::IntoFuture,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -40,7 +40,7 @@ use axum::{
 use serde_json::json;
 use tokio::{
     net::TcpListener,
-    sync::{oneshot, Mutex, Semaphore},
+    sync::{oneshot, watch, Mutex, Semaphore},
     task::JoinSet,
 };
 use tracing::Instrument;
@@ -81,6 +81,10 @@ struct ReceiverState {
     children: Mutex<JoinSet<()>>,
     /// Set under the child lock at shutdown so no child can race admission.
     draining: AtomicBool,
+    /// The service shutdown watch, installed when `serve` starts. Admission
+    /// reads the latch itself, so a request that finishes verifying after
+    /// shutdown latches is refused even before `serve` closes admission.
+    shutdown: OnceLock<watch::Receiver<bool>>,
     /// Go-live delivery dependencies, injected at bind time. `None` keeps
     /// verified notifications side-effect free (acknowledge only).
     delivery: Option<Arc<DeliveryDeps>>,
@@ -109,7 +113,41 @@ impl ReceiverState {
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             children: Mutex::new(JoinSet::new()),
             draining: AtomicBool::new(false),
+            shutdown: OnceLock::new(),
             delivery: delivery.map(Arc::new),
+        }
+    }
+
+    /// Admission is closed once `serve` drains or the shared shutdown watch
+    /// has latched, whichever this request observes first.
+    fn admission_closed(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+            || self
+                .shutdown
+                .get()
+                .is_some_and(|shutdown| *shutdown.borrow())
+    }
+}
+
+/// Reports a delivery child that ends without completing (panic or
+/// cancellation). It drops inside the child's own instrumented span, so the
+/// warning carries that delivery's `request_id` and is emitted when the
+/// child fails, not when a later admission or shutdown reaps its join.
+struct ChildFailureReport {
+    armed: bool,
+}
+
+impl Drop for ChildFailureReport {
+    fn drop(&mut self) {
+        if self.armed {
+            let panicked = std::thread::panicking();
+            tracing::warn!(
+                event = "eventsub_receiver",
+                msg = "eventsub_delivery_child_failed",
+                panicked = panicked,
+                cancelled = !panicked,
+                "delivery child failed; durable claim fences retain uncertainty"
+            );
         }
     }
 }
@@ -165,6 +203,8 @@ impl BoundEventsubReceiver {
     /// receiver; first termination stops admission everywhere. Shutdown
     /// joins admitted children against [`Self::shutdown_budget`].
     pub async fn serve(self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
+        // `serve` consumes the bound receiver, so this is the only install.
+        let _ = self.state.shutdown.set(shutdown.clone());
         let server = axum::serve(self.listener, router(Arc::clone(&self.state)))
             .with_graceful_shutdown(crate::server::shutdown_requested(shutdown.clone()))
             .into_future();
@@ -214,17 +254,8 @@ impl BoundEventsubReceiver {
     async fn join_children(state: &ReceiverState, deadline: tokio::time::Instant) -> bool {
         let mut children = state.children.lock().await;
         match tokio::time::timeout_at(deadline, async {
-            while let Some(result) = children.join_next().await {
-                if let Err(error) = result {
-                    tracing::warn!(
-                        event = "eventsub_receiver",
-                        msg = "eventsub_delivery_child_failed",
-                        panicked = error.is_panic(),
-                        cancelled = error.is_cancelled(),
-                        "delivery child failed; durable claim fences retain uncertainty"
-                    );
-                }
-            }
+            // Each child reports its own failure (`ChildFailureReport`).
+            while children.join_next().await.is_some() {}
         })
         .await
         {
@@ -441,7 +472,7 @@ async fn handle_notification(
     let (complete_tx, complete_rx) = oneshot::channel();
     {
         let mut children = state.children.lock().await;
-        if state.draining.load(Ordering::SeqCst) {
+        if state.admission_closed() {
             return refuse(
                 state,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -451,20 +482,12 @@ async fn handle_notification(
                 bounded_message_type("notification"),
             );
         }
-        while let Some(result) = children.try_join_next() {
-            if let Err(error) = result {
-                tracing::warn!(
-                    event = "eventsub_receiver",
-                    msg = "eventsub_delivery_child_failed",
-                    panicked = error.is_panic(),
-                    cancelled = error.is_cancelled(),
-                    "delivery child failed; durable claim fences retain uncertainty"
-                );
-            }
-        }
+        // Reap finished joins; each child reports its own failure.
+        while children.try_join_next().is_some() {}
         let child_span = tracing::Span::current();
         children.spawn(
             async move {
+                let mut failure = ChildFailureReport { armed: true };
                 let _permit = permit;
                 let delivery = deliver_go_live(
                     task_deps.ledger.as_ref(),
@@ -485,6 +508,7 @@ async fn handle_notification(
                     metrics.eventsub_post("failed");
                 }
                 let _ = complete_tx.send(delivery);
+                failure.armed = false;
             }
             .instrument(child_span),
         );
@@ -1600,6 +1624,307 @@ mod tests {
             "deadline exhaustion must leave the started claim fenced"
         );
         in_flight.abort();
+    }
+
+    #[tokio::test]
+    async fn latched_shutdown_refuses_notification_before_admission_closes() {
+        // The shared watch latch, not only `close_admission`, closes
+        // admission: a request that finishes verifying after shutdown latches
+        // but before `serve` drains must not start a delivery child.
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let ledger = Arc::new(FakeLedger::default());
+        let sender = FakeSender::scripted(vec![Ok("msg-latch-1".to_owned())]);
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(delivery_deps_for(Arc::clone(&ledger), sender.clone())),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        assert!(state.shutdown.set(shutdown_rx).is_ok(), "first install");
+        shutdown_tx.send_replace(true);
+        assert!(
+            !state.draining.load(Ordering::SeqCst),
+            "serve has not closed admission; only the latch is set"
+        );
+        let response =
+            post_notification(router(Arc::clone(&state)), "synthetic-latch-guard-1").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "busy");
+        assert_eq!(value["error"]["retryable"], true);
+        assert!(
+            ledger.rows.lock().unwrap().is_empty(),
+            "a latched refusal must not claim"
+        );
+        assert!(sender.calls().is_empty(), "a latched refusal must not send");
+        assert_eq!(state.children.lock().await.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_exhaustion_detaches_child_so_it_still_settles_once() {
+        // The `join_children` deadline branch must detach, not abort: after
+        // `serve` reports exhaustion, releasing the send still settles the
+        // same child once and answers its request with one terminal metric.
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let attempted_before = post_count("attempted");
+        let succeeded_before = post_count("succeeded");
+        let failed_before = post_count("failed");
+        let ledger = Arc::new(FakeLedger::default());
+        let sender = BlockingSender::new();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind must succeed");
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(delivery_deps_for(Arc::clone(&ledger), sender.clone())),
+        ));
+        let bound = BoundEventsubReceiver {
+            listener,
+            state: Arc::clone(&state),
+        };
+        let in_flight = tokio::spawn(post_notification(
+            router(Arc::clone(&state)),
+            "synthetic-detach-1",
+        ));
+        for _ in 0..10_000 {
+            if sender.entered.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sender.entered.load(Ordering::SeqCst),
+            1,
+            "the delivery must block in its send before shutdown latches"
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send_replace(true);
+        let error = bound
+            .serve(shutdown_rx)
+            .await
+            .expect_err("deadline exhaustion must be reported, not success");
+        assert_eq!(
+            error.to_string(),
+            "EventSub receiver shutdown deadline exceeded"
+        );
+        assert_eq!(
+            state.children.lock().await.len(),
+            0,
+            "the unfinished child leaves the receiver's join set detached"
+        );
+
+        sender.release.add_permits(1);
+        let response = in_flight.await.expect("request task");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the detached child must settle and answer, not be cancelled"
+        );
+        assert!(ledger
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .all(|row| *row == FakeRow::Delivered));
+        assert_eq!(sender.calls().len(), 1, "exactly one send attempt");
+        assert_eq!(post_count("attempted"), attempted_before + 1);
+        assert_eq!(post_count("succeeded"), succeeded_before + 1);
+        assert_eq!(post_count("failed"), failed_before);
+    }
+
+    fn raw_notification(message_id: &str) -> String {
+        let body = notification_body();
+        let timestamp = fresh_timestamp();
+        let signature = sign(message_id, &timestamp, body.as_bytes());
+        format!(
+            "POST {EVENTSUB_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\ntwitch-eventsub-message-id: {message_id}\r\ntwitch-eventsub-message-timestamp: {timestamp}\r\ntwitch-eventsub-message-signature: {signature}\r\ntwitch-eventsub-message-type: notification\r\n\r\n{body}",
+            body.len(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aged_http_delivery_reports_receiver_deadline_before_drain_backstop() {
+        // Composition oracle through the real listener: the request is 19 s
+        // old when shutdown latches, so its handler times out 1 s into the
+        // drain while its child stays blocked. The child join must reuse the
+        // deadline armed at the latch; a deadline renewed after the HTTP
+        // drain would outlast `drain_http` and surface its generic timeout.
+        use tokio::io::AsyncWriteExt as _;
+
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let ledger = Arc::new(FakeLedger::default());
+        let sender = BlockingSender::new();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind must succeed");
+        let addr = listener.local_addr().expect("bound port");
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(delivery_deps_for(Arc::clone(&ledger), sender.clone())),
+        ));
+        let bound = BoundEventsubReceiver {
+            listener,
+            state: Arc::clone(&state),
+        };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let status = crate::jobs::statuses(&[], true);
+        let serve = tokio::spawn(crate::website_jobs::serve_jobs(
+            Vec::new(),
+            status,
+            shutdown_tx.clone(),
+            bound.serve(shutdown_tx.subscribe()),
+        ));
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("loopback connect");
+        client
+            .write_all(raw_notification("synthetic-aged-1").as_bytes())
+            .await
+            .expect("loopback write");
+        for _ in 0..10_000 {
+            if sender.entered.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sender.entered.load(Ordering::SeqCst),
+            1,
+            "the HTTP delivery must block in its send before shutdown latches"
+        );
+
+        tokio::time::advance(REQUEST_TIMEOUT - Duration::from_secs(1)).await;
+        shutdown_tx.send_replace(true);
+        // Past the receiver budget (4.5 s) but not the drain backstop (5 s).
+        for _ in 0..48 {
+            if serve.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            serve.is_finished(),
+            "serve_jobs must report within the receiver budget, before the HTTP drain backstop"
+        );
+        let error = serve
+            .await
+            .expect("serve task")
+            .expect_err("deadline exhaustion must be reported, not success");
+        assert_eq!(
+            error.to_string(),
+            "EventSub receiver shutdown deadline exceeded"
+        );
+        assert_eq!(sender.calls().len(), 1, "exactly one send attempt");
+        assert!(
+            ledger
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .all(|row| *row == FakeRow::Started),
+            "deadline exhaustion must leave the started claim fenced"
+        );
+        drop(client);
+    }
+
+    /// Panics inside the send with a marker payload, so a test can prove
+    /// the child-failure warning never carries the panic message.
+    struct PanickingSender;
+
+    const CHILD_PANIC_MARKER: &str = "synthetic-child-panic-marker";
+
+    impl LiveSender for PanickingSender {
+        fn send_live<'a>(&'a self, _channel_id: &'a str, content: &'a str) -> SendFuture<'a> {
+            Box::pin(async move {
+                if content.contains("twitch.tv") {
+                    panic!("{CHILD_PANIC_MARKER}");
+                }
+                Ok("unreachable-msg".to_owned())
+            })
+        }
+    }
+
+    /// Child: a delivery child that panics reports one bounded warning in
+    /// its own request span, before any later request or shutdown reaps it.
+    #[tokio::test]
+    async fn child_failure_report_carries_its_own_request_id_child() {
+        if std::env::var_os("EVENTSUB_CHILD_PANIC_PROBE").is_none() {
+            return;
+        }
+        let capture = crate::logging::Capture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(crate::logging::capture_subscriber(capture.clone()));
+        let sent = two_bot_core::internal_actions::new_request_id(1_720_000_000_000, &[7u8; 16]);
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(delivery_deps_for(
+                Arc::new(FakeLedger::default()),
+                Arc::new(PanickingSender),
+            )),
+        ));
+        let message_id = "synthetic-child-panic-1";
+        let body = notification_body();
+        let timestamp = fresh_timestamp();
+        let signature = sign(message_id, &timestamp, body.as_bytes());
+        let mut panicking = request(
+            "POST",
+            EVENTSUB_PATH,
+            Some(message_id),
+            Some(&timestamp),
+            Some(&signature),
+            Some("notification"),
+            body,
+        );
+        panicking
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_str(&sent).unwrap());
+        let response = router(Arc::clone(&state)).oneshot(panicking).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // No second request and no shutdown: the warning is already emitted.
+        let failures: Vec<serde_json::Value> = capture
+            .lines()
+            .into_iter()
+            .filter(|line| line.to_string().contains("eventsub_delivery_child_failed"))
+            .collect();
+        assert_eq!(failures.len(), 1, "exactly one child-failure warning");
+        let failure = &failures[0];
+        assert_eq!(failure["request_id"], sent.as_str());
+        assert_eq!(failure["panicked"], true);
+        assert_eq!(failure["cancelled"], false);
+        assert!(
+            !capture.text().contains(CHILD_PANIC_MARKER),
+            "the panic payload must never reach structured logs"
+        );
+    }
+
+    /// Parent: re-run only the probe above in an env-cleared child process,
+    /// so process-global tracing callsites cannot race the parallel suite.
+    #[test]
+    fn child_failure_report_carries_its_own_request_id() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .args([
+                "eventsub_http::tests::child_failure_report_carries_its_own_request_id_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("EVENTSUB_CHILD_PANIC_PROBE", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated child-panic probe failed: {stdout}{stderr}"
+        );
+        assert!(stdout.contains("running 1 test"));
+        assert!(stdout.contains("child_failure_report_carries_its_own_request_id_child ... ok"));
     }
 
     #[tokio::test]
