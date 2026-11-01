@@ -448,6 +448,7 @@ impl ChannelModerationRuntime {
                     ComponentOutcome::Handled {
                         handler: ComponentHandler::LockdownPreview,
                     },
+                ..
             } => {
                 return Ok(Some(
                     self.execute_preview_component(router, interaction, &custom_id)
@@ -1150,9 +1151,9 @@ impl ChannelModerationRuntime {
             // log the fixed token like the missing-context path does.
             let mut row =
                 confirm_request_row(interaction, &guild, &channel, presser, &pending, &at);
-            row.outcome = "refused".to_owned();
-            row.metadata_json = serde_json::json!({"stale_preview": 1}).to_string();
-            if self.store.record_audit(&row).await.is_err() {
+            row.row.outcome = "refused".to_owned();
+            row.row.metadata_json = serde_json::json!({"stale_preview": 1}).to_string();
+            if self.store.record_audit(&row.row).await.is_err() {
                 tracing::error!(
                     action = ModerationAction::Lockdown.action_name(),
                     "channel_refusal_audit_failed"
