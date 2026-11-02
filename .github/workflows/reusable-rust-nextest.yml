@@ -199,10 +199,11 @@ jobs:
       # could poison objects a later main build links). The GitHub-cache
       # backend stays off PRs and the merge queue too: its entries share the
       # repo Actions cache quota with the warm `check` entry the required
-      # lanes restore, so a non-main lane must not grow it. Push-to-main and
-      # workflow_dispatch runs use R2 when the caller passed all the pins,
-      # else the GitHub-cache backend. Values travel via the environment
-      # file, never the log: secrets stay masked.
+      # lanes restore, so a non-main lane must not grow it. Push and
+      # workflow_dispatch runs on `main` use R2 when the caller passed all
+      # the pins, else the GitHub-cache backend; the ref check matters
+      # because workflow_dispatch accepts any branch or tag. Values travel
+      # via the environment file, never the log: secrets stay masked.
       - name: Select sccache backend (R2 when pinned, GitHub cache otherwise)
         env:
           R2_BUCKET: ${{ secrets.SCCACHE_BUCKET }}
@@ -211,10 +212,11 @@ jobs:
           R2_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
           R2_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           NEXTEST_EVENT: ${{ github.event_name }}
+          NEXTEST_REF: ${{ github.ref }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then
+          if { [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; } && [ "$NEXTEST_REF" = "refs/heads/main" ]; then
             if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
               {
                 echo "SCCACHE_BUCKET=$R2_BUCKET"
@@ -229,7 +231,7 @@ jobs:
               echo "sccache backend: GitHub cache"
             fi
           else
-            echo "sccache backend: local disk only (no shared writes on PRs, the merge queue, or other events)"
+            echo "sccache backend: local disk only (no shared writes on PRs, the merge queue, or refs/events off main)"
           fi
 
       - name: Start sccache
@@ -256,8 +258,9 @@ jobs:
 
       # Restore-only: the warm `check` entry in check.yml owns the registry
       # write, so this step never saves. sccache is the only shared-cache
-      # writer left, and only on push to main or workflow_dispatch (R2 or
-      # GitHub cache; local disk everywhere else per the backend step above).
+      # writer left, and only on push or workflow_dispatch runs on main (R2
+      # or GitHub cache; local disk everywhere else per the backend step
+      # above).
       - name: Restore cargo registry cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:

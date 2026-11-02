@@ -8538,17 +8538,20 @@ class WorkflowTests(unittest.TestCase):
         # (build scripts and tests execute at a head that is not on `main`
         # yet, and a shared R2 bucket has no per-PR scope: a PR could poison
         # objects main later links). check.yml runs on merge_group, so a
-        # pull_request-only denylist is not enough. Only push-to-main and
-        # workflow_dispatch runs may use shared backends; every other event
-        # uses sccache on local disk only. The GitHub-cache backend has the
-        # same quota shape: the lane's entries share the repo Actions cache
-        # with the warm `check` entry, so non-main runs must not grow it.
+        # pull_request-only denylist is not enough, and workflow_dispatch
+        # accepts any branch or tag, so the event name alone is not enough
+        # either. Only push and workflow_dispatch runs on `main` may use
+        # shared backends; every other event or ref uses sccache on local
+        # disk only. The GitHub-cache backend has the same quota shape: the
+        # lane's entries share the repo Actions cache with the warm `check`
+        # entry, so non-main runs must not grow it.
         lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         select = next(step for step in lane.get("steps", [])
                       if str(step.get("name", "")).startswith("Select sccache backend"))
         run_text = str(select.get("run", ""))
         self.assertIn("workflow_dispatch", run_text)
         self.assertIn("github.event_name", str(select.get("env", "")))
+        self.assertIn("github.ref", str(select.get("env", "")))
         self.assertIn("local disk", run_text)
         # The allowlist branch must come FIRST: a denylist (`!=`) or a
         # reordered R2 branch ahead of it would let shared-backend
@@ -8558,12 +8561,12 @@ class WorkflowTests(unittest.TestCase):
         lines = run_text.splitlines()
         gate = next(i for i, line in enumerate(lines)
                     if "NEXTEST_EVENT" in line)
-        # Exact pin: a denylist, dead (&& false), or reordered guard all keep
-        # the `if ` prefix, so pin the full first line.
+        # Exact pin: a denylist, dead (&& false), reordered, or ref-less
+        # guard all keep the `if ` prefix, so pin the full first line.
         self.assertEqual(
             lines[gate].strip(),
-            'if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then',
-            f"push/workflow_dispatch allowlist must be the exact first branch, got: {lines[gate]!r}",
+            'if { [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; } && [ "$NEXTEST_REF" = "refs/heads/main" ]; then',
+            f"push/workflow_dispatch-on-main allowlist must be the exact first branch, got: {lines[gate]!r}",
         )
         before = "\n".join(lines[:gate])
         self.assertNotIn("GITHUB_ENV", before)
@@ -8595,9 +8598,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("GITHUB_ENV", "\n".join(lines[gate + 1 : outer_else]))
         # Behavioral pin: run the extracted step under bash. On
         # pull_request, merge_group, and other events the env file stays
-        # empty even with all R2 vars set; on push and workflow_dispatch
-        # the R2 lines appear. Catches inverted/dead guards and disk-branch
-        # writes that structural pins miss.
+        # empty even with all R2 vars set, and so it does on push and
+        # workflow_dispatch runs at a ref other than `main` (a manual
+        # dispatch can target any branch or tag); only push and
+        # workflow_dispatch on `main` write the R2 lines. Catches
+        # inverted/dead guards and disk-branch writes that structural pins
+        # miss.
         import os
         import subprocess
         import tempfile
@@ -8613,12 +8619,21 @@ class WorkflowTests(unittest.TestCase):
             backend_env_path = tmp.name
         try:
             base = dict(os.environ)
-            for event in ("pull_request", "merge_group", "schedule"):
-                with self.subTest(event=event):
+            withheld = (
+                ("pull_request", "refs/pull/1/merge"),
+                ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1-abc"),
+                ("schedule", "refs/heads/main"),
+                ("push", "refs/heads/some-feature"),
+                ("workflow_dispatch", "refs/heads/some-feature"),
+                ("workflow_dispatch", "refs/tags/v1.0.0"),
+            )
+            for event, ref in withheld:
+                with self.subTest(event=event, ref=ref):
                     run_env = dict(base)
                     run_env.update(
                         {
                             "NEXTEST_EVENT": event,
+                            "NEXTEST_REF": ref,
                             **r2_env,
                             "GITHUB_ENV": backend_env_path,
                         }
@@ -8635,14 +8650,15 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(
                         Path(backend_env_path).read_text(encoding="utf-8"),
                         "",
-                        f"{event} run must not write shared-backend credentials",
+                        f"{event} run at {ref} must not write shared-backend credentials",
                     )
             for event in ("push", "workflow_dispatch"):
-                with self.subTest(event=event):
+                with self.subTest(event=event, ref="refs/heads/main"):
                     run_env = dict(base)
                     run_env.update(
                         {
                             "NEXTEST_EVENT": event,
+                            "NEXTEST_REF": "refs/heads/main",
                             **r2_env,
                             "GITHUB_ENV": backend_env_path,
                         }
@@ -8669,26 +8685,29 @@ class WorkflowTests(unittest.TestCase):
 
     def test_required_nextest_withholds_r2_secrets_on_pull_request(self):
         # Even with the callee-side guard, the caller must forward R2 write
-        # secrets only on push to main and workflow_dispatch. check.yml runs
-        # on merge_group too, so a `!= 'pull_request'` gate would forward the
-        # secrets to queued code that is not on `main` yet. The gate must
-        # read `(== 'push' || == 'workflow_dispatch') && secrets.X || ''`:
-        # the seemingly equivalent `== 'pull_request' && '' || secrets.X`
-        # forwards the secret anyway, because '' is falsy in GitHub
-        # expressions.
+        # secrets only on push and workflow_dispatch runs on `main`.
+        # check.yml runs on merge_group too, so a `!= 'pull_request'` gate
+        # would forward the secrets to queued code that is not on `main`
+        # yet, and workflow_dispatch accepts any branch or tag, so the event
+        # name without the ref would forward them to a manual run off
+        # `main`. The gate must read `ref == 'refs/heads/main' && (== 'push'
+        # || == 'workflow_dispatch') && secrets.X || ''`: the seemingly
+        # equivalent `== 'pull_request' && '' || secrets.X` forwards the
+        # secret anyway, because '' is falsy in GitHub expressions.
         job = self.workflows["check.yml"]["jobs"]["nextest"]
         r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         for key in r2_keys:
             with self.subTest(secret=key):
                 # Exact pin: the allowlist form withholds the secret on
-                # pull_request AND merge_group. A `!= 'pull_request'` form or
-                # a leading `== ... && ''` form forwards it on some event
-                # while keeping every substring present, so substrings
-                # cannot pin this gate.
+                # pull_request, merge_group, and any ref off `main`. A
+                # `!= 'pull_request'` form, an event-only form, or a leading
+                # `== ... && ''` form forwards it on some dispatch while
+                # keeping every substring present, so substrings cannot pin
+                # this gate.
                 self.assertEqual(
                     str(job["secrets"][key]),
-                    "${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets." + key + " || '' }}",
+                    "${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets." + key + " || '' }}",
                 )
 
     def test_required_nextest_caller_shape_is_pinned(self):
