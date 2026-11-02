@@ -14367,13 +14367,14 @@ async fn a_confirmed_import_turns_creation_off_at_the_worker_without_a_reload() 
         "off".to_owned()
     ));
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let creates = trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.as_str() == "create")
+        .count();
     assert_eq!(
-        trace
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|line| line.as_str() == "create")
-            .count(),
+        creates,
         1,
         "the confirmed import stopped creation at the worker: {:?}",
         trace.lock().unwrap()
